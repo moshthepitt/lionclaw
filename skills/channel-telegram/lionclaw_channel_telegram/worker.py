@@ -1725,7 +1725,11 @@ class TelegramWorker:
             return False
         if response.outcome == "pending_approval":
             await self._set_inbound_reaction(update, REACTION_RECEIVED)
-            await self._notify_pending_approval(update, response.pairing_code)
+            await self._notify_pending_approval(
+                update,
+                response.reason_code,
+                response.pairing_code,
+            )
         if response.outcome == "queued":
             self._remember_typing_route(update)
             await self._remember_active_turn(update, response)
@@ -1752,6 +1756,8 @@ class TelegramWorker:
         update: TelegramInboundUpdate,
         command: TelegramCommand,
     ) -> bool:
+        if not await self._authorize_local_command(update, command):
+            return True
         if command.name == "stop":
             await self._stop_active_turn(update)
             return True
@@ -1763,6 +1769,30 @@ class TelegramWorker:
             return True
         await self._send_help(update)
         return True
+
+    async def _authorize_local_command(
+        self,
+        update: TelegramInboundUpdate,
+        command: TelegramCommand,
+    ) -> bool:
+        if _is_private_update(update) and command.name in {"help", "settings"}:
+            return True
+        try:
+            response = await self.lionclaw_api.authorize_actor(update)
+        except Exception:
+            logger.exception(
+                "lionclaw command authorization failed for update_id=%s",
+                update.update_id,
+            )
+            await self._reply(update, "I could not verify Telegram access.")
+            return False
+        if response.authorized:
+            return True
+        if response.reason_code == "blocked_grant":
+            await self._reply(update, "This Telegram access is blocked.")
+            return False
+        await self._notify_pending_approval(update, response.reason_code, None)
+        return False
 
     async def _stop_active_turn(self, update: TelegramInboundUpdate) -> None:
         active = self._active_turn_for_route(update.conversation_ref, update.thread_ref)
@@ -2016,6 +2046,7 @@ class TelegramWorker:
     async def _notify_pending_approval(
         self,
         update: TelegramInboundUpdate,
+        reason_code: str | None,
         pairing_code: str | None,
     ) -> None:
         if _is_private_update(update):
@@ -2024,6 +2055,12 @@ class TelegramWorker:
                 text = (
                     f"This Telegram chat needs approval. Pairing code: {pairing_code}"
                 )
+        elif reason_code == "actor_approval_required":
+            text = (
+                "This group is connected to LionClaw, but this Telegram account "
+                "is not connected as a LionClaw host.\n\n"
+                "Open a DM with this bot and connect your Telegram account first."
+            )
         else:
             text = (
                 "LionClaw is not connected to this group yet.\n\n"

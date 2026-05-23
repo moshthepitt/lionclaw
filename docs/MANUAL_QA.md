@@ -244,6 +244,9 @@ Expected when credentials are available:
   trusted group admin
 - in groups, `/ask@<bot_username> message` strips the Telegram envelope and
   submits only `message` to the runtime
+- in connected groups, only Telegram accounts that are also connected as
+  approved direct hosts can run `/ask@<bot_username>`, runtime slash commands,
+  or LionClaw group controls
 - unknown targeted Telegram groups receive a clean "not connected" setup hint
   without exposing `pc_...` approval codes, and no provider files are downloaded
   before approval

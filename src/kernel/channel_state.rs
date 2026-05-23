@@ -750,6 +750,26 @@ impl ChannelStateStore {
         Ok(None)
     }
 
+    pub(crate) async fn find_approved_direct_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: &str,
+    ) -> Result<Option<ChannelGrantRecord>> {
+        self.get_grant_by_scope_with_status_in_tx(
+            tx,
+            ChannelGrantScopeLookup {
+                channel_id,
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+                status: ChannelGrantStatus::Approved,
+            },
+        )
+        .await
+    }
+
     pub async fn get_grant_by_scope(
         &self,
         channel_id: &str,

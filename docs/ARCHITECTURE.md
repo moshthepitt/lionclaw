@@ -597,7 +597,10 @@ creation may carry a channel-neutral operator actor; the kernel validates that
 actor against an approved direct host grant on the same channel before minting
 the token and records the actor in audit. Conversation grants can be
 conversation-wide (`sender_ref` absent) so a delegated group invite connects the
-group rather than the admin who happened to claim the link. Pairing claim audit
+group rather than the admin who happened to claim the link. Non-direct channel
+routes still require the sender to have an approved direct host grant before a
+turn or local channel control is authorized; the route grant authorizes the
+destination, and the direct grant authorizes the actor. Pairing claim audit
 stores normalized identity and outcome facts only, never raw worker provider
 metadata.
 

@@ -11,20 +11,20 @@ use common::{write_skill_source, TestHome};
 use lionclaw::{
     api::build_router,
     contracts::{
-        ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
-        ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
-        ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
-        ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
-        ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelOperatorActor,
-        ChannelOutboxDeliveryStatusDto, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
-        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
-        ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
-        ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
-        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
-        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionRequest,
-        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
-        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
-        TrustTier,
+        ChannelActorAuthorizeRequest, ChannelAttachmentDescriptor,
+        ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
+        ChannelAttachmentMissingReport, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
+        ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
+        ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome,
+        ChannelInboundRequest, ChannelOperatorActor, ChannelOutboxDeliveryStatusDto,
+        ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
+        ChannelPairingStatus, ChannelRoutingProfile, ChannelStreamAckRequest,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
+        DaemonInfoResponse, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
+        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -2173,6 +2173,8 @@ async fn channels_v2_direct_block_denies_scoped_session_access() {
         thread_pending.pairing_id.expect("thread pairing id"),
     )
     .await;
+    create_pending_pairing(&kernel, "slack", "alice", "direct-block-alice-pending").await;
+    approve_pairing(&kernel, "slack", "alice").await;
 
     let thread = kernel
         .ingest_channel_inbound(v2_text_request(
@@ -2482,7 +2484,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
         .expect("claim group invite");
     assert_eq!(claimed.outcome, ChannelPairingClaimOutcome::Approved);
 
-    let queued = kernel
+    let unauthorized = kernel
         .ingest_channel_inbound(v2_text_request(
             "telegram",
             "msg-group-bob",
@@ -2493,8 +2495,57 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             ChannelTrigger::Mention,
         ))
         .await
-        .expect("group-wide grant admits another sender");
+        .expect("group route grant does not authorize unknown actor");
+    assert_eq!(unauthorized.outcome, ChannelInboundOutcome::PendingApproval);
+    assert_eq!(
+        unauthorized.reason_code.as_deref(),
+        Some("actor_approval_required")
+    );
+    assert!(unauthorized.pairing_id.is_none());
+    assert!(unauthorized.pairing_code.is_none());
+
+    let denied_status = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "telegram".to_string(),
+            sender_ref: "telegram:user:bob".to_string(),
+            conversation_ref: "telegram:chat:-1001".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+        })
+        .await
+        .expect("authorize group command for unknown actor");
+    assert!(!denied_status.authorized);
+    assert_eq!(denied_status.reason_code, "actor_approval_required");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "msg-group-host",
+            "telegram:user:host",
+            "telegram:chat:-1001",
+            None,
+            "/ask hello",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("group-wide grant admits approved host actor");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+
+    let allowed_status = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "telegram".to_string(),
+            sender_ref: "telegram:user:host".to_string(),
+            conversation_ref: "telegram:chat:-1001".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+        })
+        .await
+        .expect("authorize group command for host actor");
+    assert!(allowed_status.authorized);
+    assert_eq!(
+        allowed_status.session_key.as_deref(),
+        Some("channel:telegram:conversation:telegram%3Achat%3A-1001")
+    );
 }
 
 #[tokio::test]
@@ -3308,6 +3359,9 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         .await
         .expect("approve conversation by id");
 
+    create_pending_pairing(&kernel, "slack", "alice", "alice-direct-pending").await;
+    approve_pairing(&kernel, "slack", "alice").await;
+
     let queued_topic = kernel
         .ingest_channel_inbound(v2_text_request(
             "slack",
@@ -3409,6 +3463,9 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         })
         .await
         .expect("approve thread");
+
+    create_pending_pairing(&kernel, "slack", "bob", "bob-direct-pending").await;
+    approve_pairing(&kernel, "slack", "bob").await;
 
     let queued_thread = kernel
         .ingest_channel_inbound(v2_text_request(
@@ -3586,6 +3643,14 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         })
         .await
         .expect("approve colon thread");
+    create_pending_pairing(
+        &kernel,
+        "slack",
+        "telegram:user:456",
+        "colon-actor-direct-pending",
+    )
+    .await;
+    approve_pairing(&kernel, "slack", "telegram:user:456").await;
     let colon_queued = kernel
         .ingest_channel_inbound(v2_text_request(
             "slack",
@@ -6949,7 +7014,10 @@ async fn approve_pairing(kernel: &Kernel, channel_id: &str, peer_id: &str) {
     let pairing_id = pairings
         .pairings
         .iter()
-        .find(|value| value.sender_ref.as_deref() == Some(peer_id))
+        .find(|value| {
+            value.sender_ref.as_deref() == Some(peer_id)
+                && value.status == ChannelPairingStatus::Pending
+        })
         .map(|pairing| pairing.pairing_id)
         .expect("pairing id");
     kernel

@@ -19,6 +19,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Update
 
 from lionclaw_channel_telegram.api import (
+    ActorAuthorizeResponse,
     AttachmentFinalizeResponse,
     AttachmentMissingReport,
     AttachmentStageResponse,
@@ -1120,6 +1121,55 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
                 "conversation_ref": "telegram:chat:42",
                 "thread_ref": None,
                 "provider_metadata": {"source": "message"},
+            },
+        )
+        await api.close()
+
+    async def test_authorize_actor_uses_channel_authorize_endpoint(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["payload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "authorized": False,
+                    "reason_code": "actor_approval_required",
+                    "grant_id": None,
+                    "session_key": None,
+                },
+            )
+
+        client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:8979",
+            transport=httpx.MockTransport(handler),
+        )
+        api = build_api(client)
+        update = TelegramInboundUpdate(
+            update_id=1,
+            event_id="telegram:update:1",
+            sender_ref="telegram:user:42",
+            conversation_ref="telegram:chat:-10042",
+            message_ref="telegram:message:1",
+            text="/status@lionclaw_bot",
+            trigger="mention",
+            provider_metadata={"chat_type": "supergroup"},
+        )
+
+        response = await api.authorize_actor(update)
+
+        self.assertFalse(response.authorized)
+        self.assertEqual(response.reason_code, "actor_approval_required")
+        self.assertEqual(captured["path"], "/v0/channels/authorize")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "channel_id": "telegram",
+                "sender_ref": "telegram:user:42",
+                "conversation_ref": "telegram:chat:-10042",
+                "thread_ref": None,
+                "trigger": "mention",
             },
         )
         await api.close()
@@ -4756,6 +4806,103 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/model", telegram.sent_messages[0][1])
         self.assertEqual(telegram.sent_buttons[0], [])
 
+    async def test_group_local_commands_require_approved_actor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="actor_approval_required",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91011,
+                            "message": {
+                                "message_id": 111,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/status@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/status@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertIn("not connected as a LionClaw host", telegram.sent_messages[0][1])
+
+    async def test_group_local_commands_report_blocked_actor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="blocked_grant",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91012,
+                            "message": {
+                                "message_id": 112,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/status@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/status@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(
+            telegram.sent_messages[0][1], "This Telegram access is blocked."
+        )
+
     async def test_private_settings_includes_connect_group_button(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -5056,6 +5203,54 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("pc_abcdef12", telegram.sent_messages[-1][1])
         self.assertIn("not connected to this group", telegram.sent_messages[-1][1])
+
+    async def test_connected_group_rejects_unapproved_actor_without_pairing_code(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_outcome="pending_approval",
+                inbound_reason_code="actor_approval_required",
+                inbound_pairing_code="pc_abcdef12",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9109,
+                            "message": {
+                                "message_id": 109,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask@lionclaw_bot hello",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertNotIn("pc_abcdef12", telegram.sent_messages[-1][1])
+        self.assertIn("not connected as a LionClaw host", telegram.sent_messages[-1][1])
 
     async def test_bare_retry_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10714,6 +10909,8 @@ class FakeLionClawApi:
         outbox_deliveries: list[OutboxDelivery] | None = None,
         inbound_outcome: str = "queued",
         inbound_pairing_code: str | None = None,
+        inbound_reason_code: str | None = None,
+        authorize_actor_response: ActorAuthorizeResponse | None = None,
         claim_outcome: str = "approved",
         invite_error: Exception | None = None,
         report_accepted: bool = True,
@@ -10729,6 +10926,8 @@ class FakeLionClawApi:
         self.outbox_deliveries = list(outbox_deliveries or [])
         self.inbound_outcome = inbound_outcome
         self.inbound_pairing_code = inbound_pairing_code
+        self.inbound_reason_code = inbound_reason_code
+        self.authorize_actor_response = authorize_actor_response
         self.claim_outcome = claim_outcome
         self.invite_error = invite_error
         self.report_accepted = report_accepted
@@ -10740,6 +10939,7 @@ class FakeLionClawApi:
         self.cancel_turn_id = cancel_turn_id
         self.outbox_report_errors = list(outbox_report_errors or [])
         self.sent_inbound: list[TelegramInboundUpdate] = []
+        self.authorized_actors: list[TelegramInboundUpdate] = []
         self.cancel_calls: list[tuple[str, str, str | None, str]] = []
         self.claims: list[TelegramPairingClaim] = []
         self.group_invites: list[tuple[str, str | None]] = []
@@ -10766,10 +10966,21 @@ class FakeLionClawApi:
         self.sent_inbound.append(update)
         return InboundResponse(
             outcome=self.inbound_outcome,
+            reason_code=self.inbound_reason_code,
             pairing_code=self.inbound_pairing_code,
             turn_id=self.inbound_turn_id,
             session_id=self.inbound_session_id,
             session_key=self.inbound_session_key,
+        )
+
+    async def authorize_actor(
+        self,
+        update: TelegramInboundUpdate,
+    ) -> ActorAuthorizeResponse:
+        self.authorized_actors.append(update)
+        return self.authorize_actor_response or ActorAuthorizeResponse(
+            authorized=True,
+            reason_code="authorized",
         )
 
     async def cancel_active_turn(

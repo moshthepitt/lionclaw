@@ -112,6 +112,9 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
   payload to the bot. Approved Telegram hosts can create a short-lived one-use
   group link from `/settings` in DM; unconnected groups are instructed to use
   that link path rather than exposing `pc_...` operator approval codes.
+  Connected groups authorize the destination only. The Telegram sender must also
+  have an approved direct host grant before group prompts, runtime slash
+  commands, or local group controls run.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and
   `start_mode=resume`, so unacked progress events are replayed after worker
   restart. `LIONCLAW_STREAM_START_MODE` accepts `resume` or `tail`.

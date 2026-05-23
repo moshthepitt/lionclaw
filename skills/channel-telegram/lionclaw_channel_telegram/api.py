@@ -26,6 +26,14 @@ class InboundResponse:
 
 
 @dataclass(slots=True, frozen=True)
+class ActorAuthorizeResponse:
+    authorized: bool
+    reason_code: str
+    grant_id: str | None = None
+    session_key: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class PairingClaimResponse:
     outcome: str
     grant_id: str | None = None
@@ -178,6 +186,29 @@ class LionClawApi:
             pairing_code=payload.get("pairing_code"),
             turn_id=payload.get("turn_id"),
             session_id=payload.get("session_id"),
+            session_key=payload.get("session_key"),
+        )
+
+    async def authorize_actor(
+        self,
+        update: TelegramInboundUpdate,
+    ) -> ActorAuthorizeResponse:
+        response = await self._client.post(
+            "/v0/channels/authorize",
+            json={
+                "channel_id": self.channel_id,
+                "sender_ref": update.sender_ref,
+                "conversation_ref": update.conversation_ref,
+                "thread_ref": update.thread_ref,
+                "trigger": update.trigger,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return ActorAuthorizeResponse(
+            authorized=payload["authorized"],
+            reason_code=payload["reason_code"],
+            grant_id=payload.get("grant_id"),
             session_key=payload.get("session_key"),
         )
 

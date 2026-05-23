@@ -28,30 +28,30 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor,
-    ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
-    ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
-    ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
-    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
-    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
-    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
-    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
-    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
-    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
-    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
-    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
-    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
-    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
-    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
-    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
-    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
-    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
-    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    AuditEventView, AuditQueryResponse, ChannelActorAuthorizeRequest,
+    ChannelActorAuthorizeResponse, ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
+    ChannelAttachmentFinalizeRequest, ChannelAttachmentFinalizeResponse,
+    ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelBindingView,
+    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
+    ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
+    ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
+    ChannelListResponse, ChannelOutboxAttachmentDto, ChannelOutboxAttemptStatusDto,
+    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
+    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
+    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
+    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
+    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
+    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
+    ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamAckResponse,
+    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
+    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
+    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
+    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
+    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
+    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
+    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
+    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -2577,6 +2577,29 @@ impl Kernel {
         self.process_channel_inbound(req).await
     }
 
+    pub async fn authorize_channel_actor(
+        &self,
+        req: ChannelActorAuthorizeRequest,
+    ) -> Result<ChannelActorAuthorizeResponse, KernelError> {
+        let input = validate_channel_actor_authorize_request(req)?;
+        self.require_active_channel_binding(&input.channel_id)
+            .await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let authorization = self.authorize_channel_actor_in_tx(&mut tx, &input).await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        Ok(ChannelActorAuthorizeResponse {
+            authorized: authorization.outcome == ChannelActorAuthorizationOutcome::Authorized,
+            reason_code: authorization.outcome.reason_code().to_string(),
+            grant_id: authorization.grant.map(|grant| grant.grant_id),
+            session_key: authorization.session_key,
+        })
+    }
+
     pub async fn stage_channel_attachment(
         &self,
         input: ChannelAttachmentStageInput,
@@ -3867,24 +3890,23 @@ impl Kernel {
             ));
         }
 
-        if self
-            .channel_state
-            .find_blocking_grant_in_tx(
-                &mut tx,
-                &inbound.channel_id,
-                &inbound.sender_ref,
-                &inbound.conversation_ref,
-                inbound.thread_ref.as_deref(),
-            )
-            .await
-            .map_err(internal)?
-            .is_some()
-        {
+        let auth_input = ValidatedChannelActorAuthorization {
+            channel_id: inbound.channel_id.clone(),
+            sender_ref: inbound.sender_ref.clone(),
+            conversation_ref: inbound.conversation_ref.clone(),
+            thread_ref: inbound.thread_ref.clone(),
+            trigger: inbound.trigger,
+        };
+        let authorization = self
+            .authorize_channel_actor_in_tx(&mut tx, &auth_input)
+            .await?;
+        let authorization_outcome = authorization.outcome;
+        if authorization_outcome == ChannelActorAuthorizationOutcome::Blocked {
             self.audit_channel_inbound_in_tx(
                 &mut tx,
                 "channel.inbound.blocked",
                 &inbound,
-                "blocked_grant",
+                authorization_outcome.reason_code(),
                 None,
                 None,
             )
@@ -3892,7 +3914,7 @@ impl Kernel {
             tx.commit().await.map_err(|err| internal(err.into()))?;
             return Ok(channel_inbound_response(
                 ChannelInboundOutcome::Blocked,
-                "blocked_grant",
+                authorization_outcome.reason_code(),
                 None,
                 None,
                 None,
@@ -3900,27 +3922,34 @@ impl Kernel {
                 None,
             ));
         }
-
-        if inbound.trigger == ChannelTrigger::None {
+        if authorization_outcome == ChannelActorAuthorizationOutcome::TriggerInsufficient {
             self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
                 .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
             return Ok(channel_trigger_ignored_response());
         }
-
-        let grant = self
-            .channel_state
-            .find_approved_grant_in_tx(
+        if authorization_outcome == ChannelActorAuthorizationOutcome::ActorApprovalRequired {
+            self.audit_channel_inbound_in_tx(
                 &mut tx,
-                &inbound.channel_id,
-                &inbound.sender_ref,
-                &inbound.conversation_ref,
-                inbound.thread_ref.as_deref(),
-                inbound.trigger,
+                "channel.inbound.pending",
+                &inbound,
+                authorization_outcome.reason_code(),
+                None,
+                None,
             )
-            .await
-            .map_err(internal)?;
-        let Some(grant) = grant else {
+            .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::PendingApproval,
+                authorization_outcome.reason_code(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        if authorization_outcome == ChannelActorAuthorizationOutcome::RouteApprovalRequired {
             let requested_profile =
                 default_pending_profile(inbound.trigger, inbound.thread_ref.as_deref());
             let pending_scope = pending_scope_for_profile(&inbound, requested_profile)?;
@@ -3945,7 +3974,7 @@ impl Kernel {
                 &mut tx,
                 "channel.inbound.pending",
                 &inbound,
-                "approval_required",
+                authorization_outcome.reason_code(),
                 Some(pairing.pairing_id),
                 None,
             )
@@ -3955,23 +3984,22 @@ impl Kernel {
                 .await;
             return Ok(channel_inbound_response(
                 ChannelInboundOutcome::PendingApproval,
-                "approval_required",
+                authorization_outcome.reason_code(),
                 Some(pairing.pairing_id),
                 created.then_some(pairing_code),
                 None,
                 None,
                 None,
             ));
-        };
-
-        if !trigger_allows(grant.routing_profile, inbound.trigger) {
-            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
-                .await?;
-            tx.commit().await.map_err(|err| internal(err.into()))?;
-            return Ok(channel_trigger_ignored_response());
         }
-
-        let session_key = session_key_for_grant(&grant)?;
+        let grant = authorization
+            .grant
+            .ok_or_else(|| internal(anyhow::anyhow!("authorized channel actor missing grant")))?;
+        let session_key = authorization.session_key.ok_or_else(|| {
+            internal(anyhow::anyhow!(
+                "authorized channel actor missing session key"
+            ))
+        })?;
         let runtime_id = self.resolve_runtime_id(None)?;
         let session = match self
             .sessions
@@ -4194,6 +4222,90 @@ impl Kernel {
             )
             .await
             .map_err(internal)
+    }
+
+    async fn authorize_channel_actor_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: &ValidatedChannelActorAuthorization,
+    ) -> Result<ChannelActorAuthorization, KernelError> {
+        if self
+            .channel_state
+            .find_blocking_grant_in_tx(
+                tx,
+                &input.channel_id,
+                &input.sender_ref,
+                &input.conversation_ref,
+                input.thread_ref.as_deref(),
+            )
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::Blocked,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        if input.trigger == ChannelTrigger::None {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        let Some(grant) = self
+            .channel_state
+            .find_approved_grant_in_tx(
+                tx,
+                &input.channel_id,
+                &input.sender_ref,
+                &input.conversation_ref,
+                input.thread_ref.as_deref(),
+                input.trigger,
+            )
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::RouteApprovalRequired,
+                grant: None,
+                session_key: None,
+            });
+        };
+
+        if !trigger_allows(grant.routing_profile, input.trigger) {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        if route_grant_requires_direct_actor_host(&grant)
+            && self
+                .channel_state
+                .find_approved_direct_grant_in_tx(tx, &input.channel_id, &input.sender_ref)
+                .await
+                .map_err(internal)?
+                .is_none()
+        {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::ActorApprovalRequired,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        let session_key = session_key_for_grant(&grant)?;
+        Ok(ChannelActorAuthorization {
+            outcome: ChannelActorAuthorizationOutcome::Authorized,
+            grant: Some(grant),
+            session_key: Some(session_key),
+        })
     }
 
     async fn audit_channel_inbound_in_tx(
@@ -7685,6 +7797,42 @@ struct ValidatedChannelInbound {
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedChannelActorAuthorization {
+    channel_id: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    trigger: ChannelTrigger,
+}
+
+struct ChannelActorAuthorization {
+    outcome: ChannelActorAuthorizationOutcome,
+    grant: Option<ChannelGrantRecord>,
+    session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelActorAuthorizationOutcome {
+    Authorized,
+    Blocked,
+    RouteApprovalRequired,
+    ActorApprovalRequired,
+    TriggerInsufficient,
+}
+
+impl ChannelActorAuthorizationOutcome {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Authorized => "authorized",
+            Self::Blocked => "blocked_grant",
+            Self::RouteApprovalRequired => "approval_required",
+            Self::ActorApprovalRequired => "actor_approval_required",
+            Self::TriggerInsufficient => "trigger_insufficient",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ValidatedChannelHealthReport {
     channel_id: String,
     reporter_id: String,
@@ -7995,6 +8143,18 @@ fn validate_channel_inbound_request(
         trigger: req.trigger,
         received_at: req.received_at.unwrap_or_else(Utc::now),
         provider_metadata,
+    })
+}
+
+fn validate_channel_actor_authorize_request(
+    req: ChannelActorAuthorizeRequest,
+) -> Result<ValidatedChannelActorAuthorization, KernelError> {
+    Ok(ValidatedChannelActorAuthorization {
+        channel_id: trim_required(req.channel_id, "channel_id")?,
+        sender_ref: trim_required(req.sender_ref, "sender_ref")?,
+        conversation_ref: trim_required(req.conversation_ref, "conversation_ref")?,
+        thread_ref: trim_optional(req.thread_ref),
+        trigger: req.trigger,
     })
 }
 
@@ -8627,6 +8787,13 @@ fn trigger_allows(profile: ChannelRoutingProfile, trigger: ChannelTrigger) -> bo
         ),
         ChannelRoutingProfile::Outbound => false,
     }
+}
+
+fn route_grant_requires_direct_actor_host(grant: &ChannelGrantRecord) -> bool {
+    matches!(
+        grant.routing_profile,
+        ChannelRoutingProfile::Conversation | ChannelRoutingProfile::Thread
+    )
 }
 
 fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelError> {

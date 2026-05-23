@@ -903,6 +903,27 @@ pub struct ChannelPairingListParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChannelActorAuthorizeRequest {
+    pub channel_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub trigger: ChannelTrigger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelActorAuthorizeResponse {
+    pub authorized: bool,
+    pub reason_code: String,
+    #[serde(default)]
+    pub grant_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelPairingInviteRequest {
     pub channel_id: String,
     pub requested_profile: ChannelRoutingProfile,
