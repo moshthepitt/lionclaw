@@ -553,8 +553,7 @@ impl ActivitySummary {
                 self.close_progress_item();
                 let text = normalize_activity_text(text);
                 let kind = classify_activity_status(&text);
-                self.count_activity_kind(kind);
-                self.push_item(kind, text);
+                self.push_counted_item(kind, text);
             }
             (StreamEventKindDto::Error, _, Some(text))
                 if is_non_failure_terminal_code(event.code.as_deref()) =>
@@ -603,6 +602,14 @@ impl ActivitySummary {
         }
     }
 
+    fn push_counted_item(&mut self, kind: ActivityItemKind, text: String) -> Option<usize> {
+        let index = self.push_item(kind, text);
+        if index.is_some() {
+            self.count_activity_kind(kind);
+        }
+        index
+    }
+
     fn push_normalized_item(&mut self, kind: ActivityItemKind, text: &str) -> Option<usize> {
         self.push_item(kind, normalize_activity_text(text))
     }
@@ -644,7 +651,7 @@ impl ActivitySummary {
     }
 
     fn push_item(&mut self, kind: ActivityItemKind, text: String) -> Option<usize> {
-        if text.trim().is_empty() {
+        if !is_useful_activity_text(&text) {
             return None;
         }
         self.items.push(ActivityItem { kind, text });
@@ -2164,6 +2171,24 @@ fn classify_activity_status(text: &str) -> ActivityItemKind {
 fn contains_activity_marker(text: &str, markers: &[&str]) -> bool {
     text.split_whitespace()
         .any(|token| markers.iter().any(|marker| token.starts_with(marker)))
+}
+
+fn is_useful_activity_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !is_marker_only_activity_text(&lower, ACTIVITY_COMMAND_MARKERS)
+        && !is_marker_only_activity_text(&lower, ACTIVITY_DONE_MARKERS)
+        && !is_marker_only_activity_text(&lower, ACTIVITY_PROGRESS_MARKERS)
+}
+
+fn is_marker_only_activity_text(text: &str, markers: &[&str]) -> bool {
+    markers
+        .iter()
+        .filter(|marker| marker.ends_with(':'))
+        .any(|marker| text == *marker)
 }
 
 fn plural_s(count: usize) -> &'static str {

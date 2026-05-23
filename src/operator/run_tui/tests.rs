@@ -257,6 +257,30 @@ fn activity_text_normalization_removes_redundant_runtime_source() {
 }
 
 #[test]
+fn marker_only_activity_statuses_are_ignored() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+    activity.record_stream_event(&StreamEventDto {
+        kind: StreamEventKindDto::Status,
+        lane: None,
+        code: None,
+        text: Some("codex searched: ".to_string()),
+        file_change: None,
+    });
+    activity.record_stream_event(&StreamEventDto {
+        kind: StreamEventKindDto::Status,
+        lane: None,
+        code: None,
+        text: Some("codex searched: Ratatui scrollbar docs".to_string()),
+        file_change: None,
+    });
+
+    assert_eq!(activity.command_count, 1);
+    assert_eq!(activity.items.len(), 1);
+    assert_eq!(activity.items[0].text, "searched: Ratatui scrollbar docs");
+}
+
+#[test]
 fn file_change_statuses_are_first_class_activity() {
     let mut activity = ActivitySummary::new();
     activity.start();

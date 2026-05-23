@@ -1788,22 +1788,58 @@ fn codex_file_change_item(item: &Value) -> Option<RuntimeFileChange> {
 }
 
 fn describe_web_search_item(item: &Value) -> Option<String> {
-    let query = item
-        .get("query")
-        .and_then(Value::as_str)
-        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/url").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/refId").and_then(Value::as_str))?;
     let action = item
         .pointer("/action/type")
         .and_then(Value::as_str)
         .unwrap_or("search");
-    let verb = match action {
-        "open_page" => "opened",
-        "find_in_page" => "found",
-        _ => "searched",
+    let (verb, target) = match action {
+        "open_page" => ("opened", web_search_open_target(item)?),
+        "find_in_page" => ("found", web_search_find_target(item)?),
+        _ => web_search_query_target(item)
+            .map(|target| ("searched", target))
+            .or_else(|| web_search_open_target(item).map(|target| ("opened", target)))?,
     };
-    Some(format!("codex {verb}: {}", query.trim()))
+    Some(format!("codex {verb}: {target}"))
+}
+
+fn web_search_query_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/query",
+            "/queries",
+            "/action/query",
+            "/action/queries",
+            "/action/searchQuery",
+        ],
+    )
+}
+
+fn web_search_open_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/url",
+            "/urls",
+            "/refId",
+            "/action/url",
+            "/action/urls",
+            "/action/refId",
+        ],
+    )
+}
+
+fn web_search_find_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/pattern",
+            "/query",
+            "/action/pattern",
+            "/action/query",
+            "/action/refId",
+        ],
+    )
 }
 
 fn describe_image_view_item(item: &Value) -> Option<String> {
@@ -1824,6 +1860,24 @@ fn describe_collab_tool_call_item(item: &Value) -> Option<String> {
 fn non_empty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn first_non_empty_json_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer))
+        .find_map(non_empty_json_string)
+}
+
+fn non_empty_json_string(value: &Value) -> Option<String> {
+    value.as_str().and_then(non_empty).or_else(|| {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find_map(non_empty)
+    })
 }
 
 fn shell_word_display(value: &str) -> String {
@@ -2337,6 +2391,47 @@ mod tests {
                 }
             })),
             Some("codex searched: ratatui scrollbar".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "query": "",
+                    "action": {
+                        "type": "search",
+                        "queries": ["official Ratatui scrollbar docs Scrollbar ratatui widgets"]
+                    }
+                }
+            })),
+            Some(
+                "codex searched: official Ratatui scrollbar docs Scrollbar ratatui widgets"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "query": "",
+                    "action": {"type": "search", "queries": ["", "  "]}
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "action": {
+                        "type": "open_page",
+                        "url": "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html"
+                    }
+                }
+            })),
+            Some(
+                "codex opened: https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html"
+                    .to_string()
+            )
         );
         assert_eq!(
             super::describe_app_server_item(&json!({
