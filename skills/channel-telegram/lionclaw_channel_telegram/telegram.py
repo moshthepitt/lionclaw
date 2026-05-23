@@ -13,6 +13,9 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     FSInputFile,
     InaccessibleMessage,
     InlineKeyboardButton,
@@ -291,13 +294,25 @@ class AiogramTelegramTransport:
         )
 
     async def configure_commands(self) -> None:
+        await self._bot.delete_my_commands(scope=BotCommandScopeDefault())
         await self._bot.set_my_commands(
             [
                 BotCommand(command="help", description="Show LionClaw controls"),
                 BotCommand(command="status", description="Show current turn status"),
                 BotCommand(command="stop", description="Stop the active turn"),
                 BotCommand(command="settings", description="Show Telegram settings"),
-            ]
+            ],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await self._bot.set_my_commands(
+            [
+                BotCommand(command="ask", description="Ask LionClaw"),
+                BotCommand(command="help", description="Show group commands"),
+                BotCommand(command="status", description="Show current turn status"),
+                BotCommand(command="stop", description="Stop the active turn"),
+                BotCommand(command="settings", description="Show Telegram settings"),
+            ],
+            scope=BotCommandScopeAllGroupChats(),
         )
 
     async def download_attachment(
@@ -1286,18 +1301,21 @@ def _command_targets_bot(fragment: str, bot_username: str) -> bool:
     return _username_matches(target, bot_username)
 
 
-def _leading_command_target(message: Message) -> str | None:
+def _leading_bot_command_text(message: Message) -> str | None:
     text = _content_text(message)
     if text is None:
         return None
-    return _leading_command_target_from_text(text)
+    for entity in _message_entities(message):
+        if entity.offset != 0 or str(entity.type) != "bot_command":
+            continue
+        return _extract_entity_text(entity, text)
+    return None
 
 
-def _leading_command_target_from_text(text: str) -> str | None:
-    if not text.startswith("/"):
+def _leading_command_target_from_text(command_text: str | None) -> str | None:
+    if command_text is None or not command_text.startswith("/"):
         return None
-    token = text.split(maxsplit=1)[0]
-    command = token.removeprefix("/")
+    command = command_text.split(maxsplit=1)[0].removeprefix("/")
     if "@" not in command:
         return None
     _, target = command.split("@", 1)
@@ -1317,7 +1335,8 @@ def _provider_metadata(
     edited: bool,
     bot_identity: TelegramBotIdentity | None,
 ) -> dict[str, Any]:
-    command_target = _leading_command_target(message)
+    leading_command = _leading_bot_command_text(message)
+    command_target = _leading_command_target_from_text(leading_command)
     leading_bot_mention = _leading_bot_mention_text(message, bot_identity)
     message_date_epoch = _message_date_epoch(message)
     metadata: dict[str, Any] = {
@@ -1337,6 +1356,10 @@ def _provider_metadata(
     if leading_bot_mention is not None:
         metadata["leading_mention_targets_bot"] = True
         metadata["leading_mention_text"] = leading_bot_mention
+    if leading_command is not None:
+        metadata["leading_command"] = (
+            leading_command.removeprefix("/").split("@", 1)[0].casefold()
+        )
     if command_target is not None:
         metadata["command_target"] = command_target
         metadata["command_targets_bot"] = _username_matches(

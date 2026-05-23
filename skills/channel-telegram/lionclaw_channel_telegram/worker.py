@@ -98,6 +98,7 @@ LOCAL_TELEGRAM_COMMANDS = {
     "settings",
 }
 TELEGRAM_PROMPT_COMMANDS = {"ask"}
+GROUP_MENU_COMMANDS = LOCAL_TELEGRAM_COMMANDS | TELEGRAM_PROMPT_COMMANDS
 ACTIVE_STATUS_CODES = {
     "queue.started": "Queued",
     "runtime.started": "Working",
@@ -114,7 +115,7 @@ CALLBACK_ACTION_CODES = {
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
 CALLBACK_MAC_BYTES = 12
 REACTION_RECEIVED = "👀"
-REACTION_COMPLETED = "✅"
+REACTION_COMPLETED = "👍"
 REACTION_STOPPED = "👌"
 REACTION_FAILED = "😢"
 
@@ -2935,12 +2936,22 @@ class TelegramWorker:
                 delivery.turn_id,
             )
             return
-        await self._complete_successful_progress_turn(turn)
+        await self._complete_successful_progress_turn(turn, final_delivery=True)
 
-    async def _complete_successful_progress_turn(self, turn: ActiveTurn) -> None:
+    async def _complete_successful_progress_turn(
+        self,
+        turn: ActiveTurn,
+        *,
+        final_delivery: bool = False,
+    ) -> None:
         if turn.provisional_message_ref is not None:
-            await self._mark_successful_progress_message(turn)
-            await self._delete_progress_message(turn)
+            if final_delivery:
+                deleted = await self._delete_progress_message(turn)
+                if not deleted and turn.provisional_message_ref is not None:
+                    await self._mark_successful_progress_message(turn)
+            else:
+                await self._mark_successful_progress_message(turn)
+                await self._delete_progress_message(turn)
         await self._set_turn_reaction(turn, REACTION_COMPLETED)
         turn.terminal = True
         self._forget_turn(turn)
@@ -3688,6 +3699,11 @@ def _telegram_command_is_addressed(
             and command.target_username == bot_username.removeprefix("@").casefold()
         )
     if update.provider_metadata.get("chat_type") == "private":
+        return True
+    if (
+        command.name in GROUP_MENU_COMMANDS
+        and update.provider_metadata.get("leading_command") == command.name
+    ):
         return True
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
 

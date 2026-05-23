@@ -2446,7 +2446,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(
-            ("telegram:chat:77", "telegram:message:62", "✅"),
+            ("telegram:chat:77", "telegram:message:62", "👍"),
             telegram.reactions,
         )
 
@@ -4805,6 +4805,95 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/compact", telegram.sent_messages[0][1])
         self.assertNotIn("/model", telegram.sent_messages[0][1])
         self.assertEqual(telegram.sent_buttons[0], [])
+
+    async def test_group_menu_ask_command_is_addressed_without_bot_suffix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91010,
+                            "message": {
+                                "message_id": 110,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask hello from menu",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "hello from menu")
+
+    async def test_group_menu_local_command_is_addressed_without_bot_suffix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91013,
+                            "message": {
+                                "message_id": 113,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/status",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/status"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertIn("No active LionClaw turn", telegram.sent_messages[0][1])
 
     async def test_group_local_commands_require_approved_actor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7717,7 +7806,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             telegram.deleted_messages,
             [("telegram:chat:77", "telegram:message:101")],
         )
-        self.assertIn(
+        self.assertNotIn(
             ("telegram:chat:77", "telegram:message:101", "Finished."),
             telegram.edited_messages,
         )
@@ -7942,7 +8031,6 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("telegram:chat:77", "telegram:message:101", "Working..."),
                 ("telegram:chat:77", "telegram:message:101", "Finishing..."),
-                ("telegram:chat:77", "telegram:message:101", "Finished."),
             ],
         )
         self.assertEqual(
@@ -10211,6 +10299,31 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
 
 
 class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configure_commands_uses_private_and_group_scopes(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.configure_commands()
+
+        self.assertEqual(
+            [type(call["scope"]).__name__ for call in bot.deleted_command_scopes],
+            ["BotCommandScopeDefault"],
+        )
+        self.assertEqual(
+            [type(call["scope"]).__name__ for call in bot.command_sets],
+            ["BotCommandScopeAllPrivateChats", "BotCommandScopeAllGroupChats"],
+        )
+        self.assertEqual(
+            [command.command for command in bot.command_sets[0]["commands"]],
+            ["help", "status", "stop", "settings"],
+        )
+        self.assertEqual(
+            [command.command for command in bot.command_sets[1]["commands"]],
+            ["ask", "help", "status", "stop", "settings"],
+        )
+
     async def test_malformed_send_refs_raise_before_provider_call(self) -> None:
         bot = RecordingAiogramBot()
         transport = object.__new__(AiogramTelegramTransport)
@@ -11154,9 +11267,19 @@ class RecordingAiogramBot:
         self.sent_chat_actions: list[dict[str, object]] = []
         self.answered_callbacks: list[dict[str, object]] = []
         self.reactions: list[dict[str, object]] = []
+        self.command_sets: list[dict[str, object]] = []
+        self.deleted_command_scopes: list[dict[str, object]] = []
         self.send_photo_error = send_photo_error
         self.send_media_group_error = send_media_group_error
         self.send_message_errors = list(send_message_errors or [])
+
+    async def set_my_commands(self, commands, **params) -> bool:
+        self.command_sets.append({"commands": commands, **dict(params)})
+        return True
+
+    async def delete_my_commands(self, **params) -> bool:
+        self.deleted_command_scopes.append(dict(params))
+        return True
 
     async def send_message(self, **params) -> RecordingAiogramMessage:
         if self.send_message_errors:
