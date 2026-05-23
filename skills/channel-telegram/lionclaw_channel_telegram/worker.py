@@ -138,6 +138,18 @@ class OwnedWaitFailure:
 type OwnedWaitOutcome[T] = OwnedWaitResult[T] | OwnedWaitFailure
 
 
+class ProgressDeleteResult(Enum):
+    SKIPPED = "skipped"
+    DELETED = "deleted"
+    PENDING = "pending"
+
+
+@dataclass(slots=True, frozen=True)
+class OutboxSendReceipt:
+    provider_receipt: dict[str, object]
+    progress_delete: ProgressDeleteResult
+
+
 @dataclass(slots=True, frozen=True)
 class TypingTarget:
     conversation_ref: str
@@ -2792,6 +2804,7 @@ class TelegramWorker:
             await self._report_delivered_outbox_when_durable(
                 delivery,
                 receipt_record.provider_receipt,
+                progress_delete=ProgressDeleteResult.SKIPPED,
             )
             return
 
@@ -2801,7 +2814,7 @@ class TelegramWorker:
             restore_cancellation = outcome.was_cancelled
             if isinstance(outcome, OwnedWaitFailure):
                 raise outcome.error
-            receipt = outcome.value
+            send_receipt = outcome.value
         except asyncio.CancelledError:
             raise
         except TelegramPartialSendError as err:
@@ -2819,8 +2832,16 @@ class TelegramWorker:
                 raise asyncio.CancelledError
             return
 
-        self._remember_outbox_receipt(delivery.delivery_id, "delivered", receipt)
-        await self._report_delivered_outbox_when_durable(delivery, receipt)
+        self._remember_outbox_receipt(
+            delivery.delivery_id,
+            "delivered",
+            send_receipt.provider_receipt,
+        )
+        await self._report_delivered_outbox_when_durable(
+            delivery,
+            send_receipt.provider_receipt,
+            progress_delete=send_receipt.progress_delete,
+        )
         if restore_cancellation:
             raise asyncio.CancelledError
 
@@ -2828,28 +2849,9 @@ class TelegramWorker:
         self,
         delivery: OutboxDelivery,
         receipt_record: OutboxReceiptRecord | None,
-    ) -> OwnedWaitResult[dict[str, object]] | OwnedWaitFailure:
+    ) -> OwnedWaitResult[OutboxSendReceipt] | OwnedWaitFailure:
         sending = asyncio.create_task(
-            self.telegram.send_message(
-                delivery.conversation_ref,
-                delivery.content.text,
-                delivery.reply_to_ref,
-                delivery.thread_ref,
-                format_hint=delivery.content.format_hint,
-                attachments=[
-                    TelegramOutboundAttachment(
-                        path=attachment.path,
-                        filename=attachment.filename,
-                        mime_type=attachment.mime_type,
-                    )
-                    for attachment in delivery.content.attachments
-                ],
-                resume_receipt=(
-                    receipt_record.provider_receipt
-                    if receipt_record is not None and receipt_record.status == "partial"
-                    else None
-                ),
-            ),
+            self._send_outbox_message_and_cleanup_progress(delivery, receipt_record),
             name="telegram-outbox-send",
         )
         return await self._wait_for_owned_outcome(
@@ -2859,14 +2861,62 @@ class TelegramWorker:
             ),
         )
 
+    async def _send_outbox_message_and_cleanup_progress(
+        self,
+        delivery: OutboxDelivery,
+        receipt_record: OutboxReceiptRecord | None,
+    ) -> OutboxSendReceipt:
+        receipt = await self.telegram.send_message(
+            delivery.conversation_ref,
+            delivery.content.text,
+            delivery.reply_to_ref,
+            delivery.thread_ref,
+            format_hint=delivery.content.format_hint,
+            attachments=[
+                TelegramOutboundAttachment(
+                    path=attachment.path,
+                    filename=attachment.filename,
+                    mime_type=attachment.mime_type,
+                )
+                for attachment in delivery.content.attachments
+            ],
+            resume_receipt=(
+                receipt_record.provider_receipt
+                if receipt_record is not None and receipt_record.status == "partial"
+                else None
+            ),
+        )
+        return OutboxSendReceipt(
+            provider_receipt=receipt,
+            progress_delete=await self._delete_delivered_progress_message(delivery),
+        )
+
+    async def _delete_delivered_progress_message(
+        self,
+        delivery: OutboxDelivery,
+    ) -> ProgressDeleteResult:
+        if delivery.turn_id is None:
+            return ProgressDeleteResult.SKIPPED
+        turn = self._active_turns.get(delivery.turn_id)
+        if turn is None or not _same_delivery_route(turn, delivery):
+            return ProgressDeleteResult.SKIPPED
+        if await self._delete_progress_message(turn):
+            return ProgressDeleteResult.DELETED
+        return ProgressDeleteResult.PENDING
+
     async def _report_delivered_outbox_when_durable(
         self,
         delivery: OutboxDelivery,
         provider_receipt: dict[str, object],
+        *,
+        progress_delete: ProgressDeleteResult,
     ) -> None:
         if not self._save_outbox_receipts():
             return
-        await self._complete_progress_for_delivery(delivery)
+        await self._complete_progress_for_delivery(
+            delivery,
+            progress_delete=progress_delete,
+        )
         if not self._flush_turn_state():
             return
         accepted = await self._report_outbox_with_retry(
@@ -2990,7 +3040,12 @@ class TelegramWorker:
         self._outbox_receipts_dirty = False
         return True
 
-    async def _complete_progress_for_delivery(self, delivery: OutboxDelivery) -> None:
+    async def _complete_progress_for_delivery(
+        self,
+        delivery: OutboxDelivery,
+        *,
+        progress_delete: ProgressDeleteResult,
+    ) -> None:
         if delivery.turn_id is None:
             return
         turn = self._active_turns.get(delivery.turn_id)
@@ -3002,17 +3057,25 @@ class TelegramWorker:
                 delivery.turn_id,
             )
             return
-        await self._complete_successful_progress_turn(turn, final_delivery=True)
+        await self._complete_successful_progress_turn(
+            turn,
+            final_delivery=True,
+            progress_delete=progress_delete,
+        )
 
     async def _complete_successful_progress_turn(
         self,
         turn: ActiveTurn,
         *,
         final_delivery: bool = False,
+        progress_delete: ProgressDeleteResult = ProgressDeleteResult.SKIPPED,
     ) -> None:
         if turn.provisional_message_ref is not None:
             if final_delivery:
-                deleted = await self._delete_progress_message(turn)
+                if progress_delete == ProgressDeleteResult.SKIPPED:
+                    deleted = await self._delete_progress_message(turn)
+                else:
+                    deleted = progress_delete == ProgressDeleteResult.DELETED
                 if not deleted and turn.provisional_message_ref is not None:
                     await self._mark_successful_progress_message(turn)
             else:

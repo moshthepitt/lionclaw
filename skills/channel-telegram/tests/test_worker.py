@@ -8323,6 +8323,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                         content=OutboxContent(text="final answer"),
                     )
                 )
+            self.assertEqual(
+                first_telegram.edited_messages[-1],
+                ("telegram:chat:77", progress_ref, "Finished."),
+            )
             expected_pending_delete = {
                 ("telegram:chat:77", progress_ref): PendingProgressDelete(
                     turn_id="turn-1",
@@ -8456,6 +8460,64 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [("telegram:chat:77", "telegram:message:101")],
         )
         self.assertEqual(api.outbox_reports[0][2], "delivered")
+
+    async def test_final_outbox_deletes_progress_before_reporting_delivery(
+        self,
+    ) -> None:
+        class RecordingReportApi(FakeLionClawApi):
+            def __init__(self, telegram: FakeTelegramTransport) -> None:
+                super().__init__()
+                self.telegram = telegram
+                self.deleted_before_report = False
+
+            async def report_outbox(
+                self,
+                delivery: OutboxDelivery,
+                outcome: str,
+                *,
+                provider_receipt: dict[str, object] | None = None,
+                error_code: str | None = None,
+                error_text: str | None = None,
+            ):
+                self.deleted_before_report = bool(self.telegram.deleted_messages)
+                return await super().report_outbox(
+                    delivery,
+                    outcome,
+                    provider_receipt=provider_receipt,
+                    error_code=error_code,
+                    error_text=error_text,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = FakeTelegramTransport()
+            api = RecordingReportApi(telegram)
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            progress_ref = await self._remember_visible_progress(worker)
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-dm-final",
+                    attempt_id="attempt-dm-final",
+                    conversation_ref="telegram:user:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
+
+        self.assertTrue(api.deleted_before_report)
+        self.assertNotIn(
+            ("telegram:chat:77", progress_ref, "Finished."),
+            telegram.edited_messages,
+        )
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", progress_ref)],
+        )
 
     async def test_old_outbox_delivery_does_not_delete_new_active_progress(
         self,
@@ -9329,6 +9391,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 attachments: Sequence[TelegramOutboundAttachment] = (),
                 resume_receipt: dict[str, object] | None = None,
                 buttons: Sequence[TelegramActionButton] = (),
+                reply_prompt: str | None = None,
             ) -> dict[str, object]:
                 async def provider_send() -> dict[str, object]:
                     self.started.set()
@@ -9443,6 +9506,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 attachments: Sequence[TelegramOutboundAttachment] = (),
                 resume_receipt: dict[str, object] | None = None,
                 buttons: Sequence[TelegramActionButton] = (),
+                reply_prompt: str | None = None,
             ) -> dict[str, object]:
                 async def provider_send() -> dict[str, object]:
                     self.started.set()
@@ -9516,6 +9580,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 attachments: Sequence[TelegramOutboundAttachment] = (),
                 resume_receipt: dict[str, object] | None = None,
                 buttons: Sequence[TelegramActionButton] = (),
+                reply_prompt: str | None = None,
             ) -> dict[str, object]:
                 await super().send_message(
                     conversation_ref,
@@ -9526,6 +9591,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     attachments,
                     resume_receipt,
                     buttons,
+                    reply_prompt,
                 )
                 return {
                     "message_id": 101,
