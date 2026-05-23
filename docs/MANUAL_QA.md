@@ -234,6 +234,9 @@ Expected when credentials are available:
 - the token is stored in selected-instance private channel env
 - `doctor` does not print the token and shows the latest Telegram worker health
   report after the worker has submitted one
+- `connect telegram` prints a one-use direct connection link when the worker
+  reports the bot identity, so the first host can click instead of typing
+  `/start`
 - a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
   claims through the kernel and does not start an agent turn
 - a group invite shaped like

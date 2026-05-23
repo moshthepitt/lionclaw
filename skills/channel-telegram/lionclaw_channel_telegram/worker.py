@@ -3242,13 +3242,13 @@ class TelegramWorker:
                 code="telegram.bot_identity",
                 status="warning",
                 message="getMe succeeded without a bot id",
-                details={"username": identity.username},
+                details=_bot_identity_health_details(identity),
             )
         return HealthCheck(
             code="telegram.bot_identity",
             status="ok",
             message="getMe succeeded",
-            details={"bot_id": identity.user_id, "username": identity.username},
+            details=_bot_identity_health_details(identity),
         )
 
     def _polling_health_check(self) -> HealthCheck:
@@ -4063,6 +4063,26 @@ def _telegram_startgroup_link(username: str, token: str) -> str:
     encoded_username = quote(bot_username, safe="")
     encoded_token = quote(token, safe="")
     return f"https://t.me/{encoded_username}?startgroup={encoded_token}"
+
+
+def _telegram_start_pairing_template(username: str) -> str:
+    bot_username = username.removeprefix("@")
+    encoded_username = quote(bot_username, safe="")
+    return f"https://t.me/{encoded_username}?start={{token}}"
+
+
+def _bot_identity_health_details(
+    identity: TelegramBotIdentity,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "bot_id": identity.user_id,
+        "username": identity.username,
+    }
+    if identity.username:
+        details["pairing_url_template"] = _telegram_start_pairing_template(
+            identity.username
+        )
+    return details
 
 
 def _overall_health_status(checks: list[HealthCheck]) -> str:

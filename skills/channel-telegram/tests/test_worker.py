@@ -10497,6 +10497,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(check.status == "ok" for check in checks))
         self.assertEqual(checks[0].details["bot_id"], BOT.user_id)
+        self.assertEqual(
+            checks[0].details["pairing_url_template"],
+            "https://t.me/lionclaw_bot?start={token}",
+        )
 
     async def test_delivery_failure_is_reported_in_worker_health(self) -> None:
         api = FakeLionClawApi(

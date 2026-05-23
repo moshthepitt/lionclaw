@@ -15,11 +15,11 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{
-        ChannelGrantView, ChannelPairingInviteRequest, ChannelPairingListResponse,
-        ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile,
-        ContinuityDraftActionRequest, ContinuityDraftListRequest, ContinuityPathRequest,
-        ContinuitySearchRequest, JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto,
-        TrustTier,
+        ChannelGrantView, ChannelHealthCheck, ChannelPairingInviteRequest,
+        ChannelPairingListResponse, ChannelPairingStatus, ChannelPairingView,
+        ChannelRoutingProfile, ContinuityDraftActionRequest, ContinuityDraftListRequest,
+        ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest, JobRefRequest,
+        JobRunsRequest, JobScheduleDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -769,6 +769,7 @@ pub async fn run() -> Result<ExitCode> {
             let target = resolved_target
                 .as_ref()
                 .ok_or_else(|| anyhow!("connect requires a resolved LionClaw target"))?;
+            let connect_started_at = Utc::now();
             let stdin = std::io::stdin();
             let interactive = stdin.is_terminal();
             let mut input = BufReader::new(stdin);
@@ -793,7 +794,7 @@ pub async fn run() -> Result<ExitCode> {
                 &mut output,
             )
             .await?;
-            print_connect_outcome(&target.instance_home, &outcome);
+            print_connect_outcome(&target.instance_home, &outcome, connect_started_at).await?;
         }
         Command::Run(args) => {
             let target = resolved_target
@@ -1860,7 +1861,16 @@ fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcom
     println!("default runtime set to {}", outcome.runtime_id);
 }
 
-fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
+const CONNECT_LINK_HEALTH_ATTEMPTS: usize = 80;
+const CONNECT_LINK_HEALTH_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_LINK_EXPIRES_IN_MS: u64 = 15 * 60 * 1000;
+const PAIRING_URL_TOKEN_PLACEHOLDER: &str = "{token}";
+
+async fn print_connect_outcome(
+    home: &LionClawHome,
+    outcome: &ConnectOutcome,
+    health_not_before: DateTime<Utc>,
+) -> Result<()> {
     println!(
         "connected channel {} using skill {} ({})",
         outcome.channel_id,
@@ -1873,6 +1883,13 @@ fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
         }
         ChannelLaunchMode::Background => {
             println!("background channel worker is running");
+            if let Some(link) =
+                create_direct_pairing_link(home, &outcome.channel_id, health_not_before).await
+            {
+                println!("start and connect with this one-use link:");
+                println!("  {link}");
+                println!("treat it like an access link; it expires in 15 minutes");
+            }
             println!("pair or approve peers with:");
             println!(
                 "  {}",
@@ -1880,6 +1897,87 @@ fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
             );
         }
     }
+    Ok(())
+}
+
+async fn create_direct_pairing_link(
+    home: &LionClawHome,
+    channel_id: &str,
+    health_not_before: DateTime<Utc>,
+) -> Option<String> {
+    let template = wait_for_pairing_url_template(home, channel_id, health_not_before).await?;
+    let invite = pairing_invite(
+        home,
+        ChannelPairingInviteRequest {
+            channel_id: channel_id.to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: Some("Direct channel link".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: Some(CONNECT_LINK_EXPIRES_IN_MS),
+            max_claims: Some(1),
+            operator_actor: None,
+        },
+    )
+    .await
+    .ok()?;
+    render_pairing_url(&template, &invite.token)
+}
+
+async fn wait_for_pairing_url_template(
+    home: &LionClawHome,
+    channel_id: &str,
+    health_not_before: DateTime<Utc>,
+) -> Option<String> {
+    let config = OperatorConfig::load(home).await.ok()?;
+    let kernel = open_kernel(home, &config, None).await.ok()?;
+    for attempt in 0..CONNECT_LINK_HEALTH_ATTEMPTS {
+        if let Ok(health) = kernel.get_channel_health(channel_id).await {
+            if let Some(report) = health.latest_report {
+                if report.observed_at >= health_not_before {
+                    if let Some(template) = pairing_url_template(&report.checks) {
+                        return Some(template);
+                    }
+                }
+            }
+        }
+        if attempt + 1 < CONNECT_LINK_HEALTH_ATTEMPTS {
+            tokio::time::sleep(CONNECT_LINK_HEALTH_DELAY).await;
+        }
+    }
+    None
+}
+
+fn pairing_url_template(checks: &[ChannelHealthCheck]) -> Option<String> {
+    checks
+        .iter()
+        .find_map(|check| safe_pairing_url_template(&check.details))
+}
+
+fn safe_pairing_url_template(details: &serde_json::Value) -> Option<String> {
+    let template = details.get("pairing_url_template")?.as_str()?.trim();
+    if !safe_public_https_url(template) {
+        return None;
+    }
+    if !template.contains(PAIRING_URL_TOKEN_PLACEHOLDER) {
+        return None;
+    }
+    Some(template.to_string())
+}
+
+fn render_pairing_url(template: &str, token: &str) -> Option<String> {
+    if token.is_empty() || token.chars().any(char::is_control) {
+        return None;
+    }
+    let rendered = template.replace(PAIRING_URL_TOKEN_PLACEHOLDER, token);
+    safe_public_https_url(&rendered).then_some(rendered)
+}
+
+fn safe_public_https_url(url: &str) -> bool {
+    !url.is_empty()
+        && url.len() <= 2048
+        && url.starts_with("https://")
+        && !url.chars().any(char::is_control)
 }
 
 fn channel_pairing_list_command(home: &LionClawHome, channel_id: &str) -> String {
@@ -2819,6 +2917,43 @@ mod tests {
         assert!(command.contains(&home.root().display().to_string()));
         assert!(command.contains("channel pairing list --channel-id telegram"));
         assert!(!command.starts_with("lionclaw channel pairing"));
+    }
+
+    #[test]
+    fn channel_pairing_link_template_renders_one_use_token() {
+        let template = "https://t.me/lionclaw_bot?start={token}";
+
+        let rendered = render_pairing_url(template, "lc_0123456789abcdef").expect("rendered url");
+
+        assert_eq!(
+            rendered,
+            "https://t.me/lionclaw_bot?start=lc_0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn channel_pairing_link_template_rejects_unsafe_values() {
+        let good = serde_json::json!({
+            "pairing_url_template": "https://t.me/lionclaw_bot?start={token}"
+        });
+        let missing_token = serde_json::json!({
+            "pairing_url_template": "https://t.me/lionclaw_bot"
+        });
+        let non_https = serde_json::json!({
+            "pairing_url_template": "tg://resolve?domain=lionclaw_bot&start={token}"
+        });
+        let multiline = serde_json::json!({
+            "pairing_url_template": "https://t.me/lionclaw_bot?start={token}\nnext"
+        });
+
+        assert_eq!(
+            safe_pairing_url_template(&good).as_deref(),
+            Some("https://t.me/lionclaw_bot?start={token}")
+        );
+        assert!(safe_pairing_url_template(&missing_token).is_none());
+        assert!(safe_pairing_url_template(&non_https).is_none());
+        assert!(safe_pairing_url_template(&multiline).is_none());
+        assert!(render_pairing_url("https://t.me/lionclaw_bot?start={token}", "bad\n").is_none());
     }
 
     #[test]
