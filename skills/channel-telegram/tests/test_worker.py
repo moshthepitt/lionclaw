@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Update
+from aiogram.types import ForceReply, Update
 
 from lionclaw_channel_telegram.api import (
     ActorAuthorizeResponse,
@@ -5251,7 +5251,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.sent_inbound[0].text, "how are you?")
         self.assertEqual(api.sent_inbound[0].trigger, "command")
 
-    async def test_empty_group_ask_gets_usage_without_runtime_submit(self) -> None:
+    async def test_empty_group_ask_opens_reply_prompt_without_runtime_submit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -5291,7 +5293,96 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(api.sent_inbound, [])
-        self.assertIn("Use /ask", telegram.sent_messages[0][1])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertEqual(api.authorized_actors[0].trigger, "command")
+        self.assertIn("Reply with the message", telegram.sent_messages[0][1])
+        self.assertEqual(telegram.sent_reply_prompts[0], "Ask LionClaw")
+
+    async def test_empty_group_ask_requires_approved_actor_before_reply_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="actor_approval_required",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91071,
+                            "message": {
+                                "message_id": 171,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(telegram.sent_reply_prompts, [None])
+        self.assertIn("not connected as a LionClaw host", telegram.sent_messages[0][1])
+
+    async def test_private_ask_command_passes_through_to_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91072,
+                            "message": {
+                                "message_id": 172,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask hello",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/ask hello")
+        self.assertEqual(telegram.sent_messages, [])
 
     async def test_unconnected_group_pending_approval_hides_pairing_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10387,6 +10478,23 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             ["ask", "help", "status", "stop", "settings"],
         )
 
+    async def test_send_message_can_request_force_reply(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:-10077",
+            "Reply with the message for LionClaw.",
+            reply_prompt="Ask LionClaw",
+        )
+
+        reply_markup = bot.sent_messages[0]["reply_markup"]
+        self.assertIsInstance(reply_markup, ForceReply)
+        self.assertTrue(reply_markup.selective)
+        self.assertEqual(reply_markup.input_field_placeholder, "Ask LionClaw")
+
     async def test_malformed_send_refs_raise_before_provider_call(self) -> None:
         bot = RecordingAiogramBot()
         transport = object.__new__(AiogramTelegramTransport)
@@ -11449,6 +11557,7 @@ class FakeTelegramTransport:
             []
         )
         self.sent_buttons: list[list[TelegramActionButton]] = []
+        self.sent_reply_prompts: list[str | None] = []
         self.resume_receipts: list[dict[str, object] | None] = []
         self.edited_messages: list[tuple[str, str, str]] = []
         self.edited_buttons: list[list[TelegramActionButton]] = []
@@ -11519,8 +11628,10 @@ class FakeTelegramTransport:
         attachments: Sequence[TelegramOutboundAttachment] = (),
         resume_receipt: dict[str, object] | None = None,
         buttons: Sequence[TelegramActionButton] = (),
+        reply_prompt: str | None = None,
     ) -> dict[str, object]:
         self.sent_buttons.append(list(buttons))
+        self.sent_reply_prompts.append(reply_prompt)
         self.resume_receipts.append(resume_receipt)
         if self.send_message_error is not None:
             raise self.send_message_error

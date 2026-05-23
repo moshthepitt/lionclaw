@@ -1717,10 +1717,19 @@ class TelegramWorker:
         if command is not None:
             command_is_addressed = _telegram_command_is_addressed(update, command)
             prompt_command_handled = False
-            if command.name in TELEGRAM_PROMPT_COMMANDS and command_is_addressed:
+            if (
+                command.name in TELEGRAM_PROMPT_COMMANDS
+                and command_is_addressed
+                and not _is_private_update(update)
+            ):
                 update = _with_command_trigger(update, command)
                 if not command.arguments and not update.attachments:
-                    await self._reply(update, _ask_usage(update))
+                    if await self._authorize_command_actor(update):
+                        await self._reply(
+                            update,
+                            _ask_prompt_text(),
+                            reply_prompt="Ask LionClaw",
+                        )
                     return True
                 update = replace(update, text=command.arguments or None)
                 prompt_command_handled = True
@@ -1812,6 +1821,9 @@ class TelegramWorker:
             "settings",
         }:
             return True
+        return await self._authorize_command_actor(update)
+
+    async def _authorize_command_actor(self, update: TelegramInboundUpdate) -> bool:
         try:
             response = await self.lionclaw_api.authorize_actor(update)
         except Exception:
@@ -1970,6 +1982,7 @@ class TelegramWorker:
         text: str,
         *,
         buttons: list[TelegramActionButton] | None = None,
+        reply_prompt: str | None = None,
     ) -> None:
         try:
             await self.telegram.send_message(
@@ -1978,6 +1991,7 @@ class TelegramWorker:
                 reply_to_ref=update.message_ref,
                 thread_ref=update.thread_ref,
                 buttons=buttons or [],
+                reply_prompt=reply_prompt,
             )
         except Exception:
             logger.exception(
@@ -3783,12 +3797,8 @@ def _is_private_update(update: TelegramInboundUpdate) -> bool:
     return update.provider_metadata.get("chat_type") == "private"
 
 
-def _bot_command_suffix(update: TelegramInboundUpdate) -> str:
-    return _bot_command_suffix_from_metadata(update.provider_metadata)
-
-
-def _ask_usage(update: TelegramInboundUpdate) -> str:
-    return "Use /ask followed by the message for LionClaw."
+def _ask_prompt_text() -> str:
+    return "Reply with the message for LionClaw."
 
 
 def _progress_threshold_seconds(update: TelegramInboundUpdate) -> float:
@@ -3913,13 +3923,6 @@ def _pairing_claim_reply(claim: TelegramPairingClaim, outcome: str) -> str:
     if outcome == "scope_mismatch":
         return "That group connection link is not valid for this chat."
     return "That group connection link is invalid."
-
-
-def _bot_command_suffix_from_metadata(metadata: dict[str, object]) -> str:
-    bot_username = metadata.get("bot_username")
-    if isinstance(bot_username, str) and bot_username:
-        return f"@{bot_username}"
-    return "@Bot"
 
 
 def _telegram_startgroup_link(username: str, token: str) -> str:

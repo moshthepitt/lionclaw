@@ -18,6 +18,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    ForceReply,
     FSInputFile,
     InaccessibleMessage,
     InlineKeyboardButton,
@@ -230,6 +231,7 @@ class TelegramTransport(Protocol):
         attachments: Sequence[TelegramOutboundAttachment] = (),
         resume_receipt: dict[str, Any] | None = None,
         buttons: Sequence[TelegramActionButton] = (),
+        reply_prompt: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def send_typing(
@@ -362,11 +364,12 @@ class AiogramTelegramTransport:
         attachments: Sequence[TelegramOutboundAttachment] = (),
         resume_receipt: dict[str, Any] | None = None,
         buttons: Sequence[TelegramActionButton] = (),
+        reply_prompt: str | None = None,
     ) -> dict[str, Any]:
         chat_id = _coerce_chat_id(conversation_ref)
         reply_parameters = _reply_parameters(reply_to_ref)
         message_thread_id = _coerce_thread_id(thread_ref, omit_general=True)
-        reply_markup = _inline_keyboard(buttons)
+        reply_markup = _reply_markup(buttons, reply_prompt)
         sent_messages = _receipt_messages(resume_receipt, chat_id=chat_id)
         resume_count = len(sent_messages)
         if sent_messages:
@@ -468,7 +471,7 @@ class AiogramTelegramTransport:
         chunk: TelegramTextChunk,
         reply_parameters: ReplyParameters | None,
         message_thread_id: int | None,
-        reply_markup: InlineKeyboardMarkup | None,
+        reply_markup: InlineKeyboardMarkup | ForceReply | None,
     ) -> Message:
         params: dict[str, Any] = {
             "chat_id": chat_id,
@@ -497,7 +500,7 @@ class AiogramTelegramTransport:
         reply_parameters: ReplyParameters | None,
         message_thread_id: int | None,
         caption: TelegramTextChunk | None = None,
-        reply_markup: InlineKeyboardMarkup | None = None,
+        reply_markup: InlineKeyboardMarkup | ForceReply | None = None,
     ) -> Message:
         path = Path(attachment.path)
         file = FSInputFile(path, filename=attachment.filename or path.name)
@@ -1614,6 +1617,27 @@ def _inline_keyboard(
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _reply_markup(
+    buttons: Sequence[TelegramActionButton],
+    reply_prompt: str | None,
+) -> InlineKeyboardMarkup | ForceReply | None:
+    if reply_prompt is None:
+        return _inline_keyboard(buttons)
+    if buttons:
+        raise TelegramReferenceError(
+            "telegram force reply cannot be combined with inline buttons"
+        )
+    placeholder = reply_prompt.strip()
+    if len(placeholder) > 64:
+        raise TelegramReferenceError(
+            "telegram force reply placeholder exceeds 64 characters"
+        )
+    return ForceReply(
+        selective=True,
+        input_field_placeholder=placeholder or None,
+    )
 
 
 def _can_send_native_album(
