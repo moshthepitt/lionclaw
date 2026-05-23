@@ -13,8 +13,10 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
     FSInputFile,
     InaccessibleMessage,
@@ -210,6 +212,8 @@ class TelegramTransport(Protocol):
 
     async def configure_commands(self) -> None: ...
 
+    async def configure_group_commands(self, conversation_ref: str) -> None: ...
+
     async def download_attachment(
         self,
         attachment: TelegramInboundAttachment,
@@ -295,24 +299,29 @@ class AiogramTelegramTransport:
 
     async def configure_commands(self) -> None:
         await self._bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await self._bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+        await self._bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
         await self._bot.set_my_commands(
             [
                 BotCommand(command="help", description="Show LionClaw controls"),
                 BotCommand(command="status", description="Show current turn status"),
                 BotCommand(command="stop", description="Stop the active turn"),
                 BotCommand(command="settings", description="Show Telegram settings"),
+                BotCommand(command="connections", description="Manage connections"),
             ],
             scope=BotCommandScopeAllPrivateChats(),
         )
+
+    async def configure_group_commands(self, conversation_ref: str) -> None:
         await self._bot.set_my_commands(
             [
                 BotCommand(command="ask", description="Ask LionClaw"),
                 BotCommand(command="help", description="Show group commands"),
                 BotCommand(command="status", description="Show current turn status"),
                 BotCommand(command="stop", description="Stop the active turn"),
-                BotCommand(command="settings", description="Show Telegram settings"),
+                BotCommand(command="settings", description="Show group settings"),
             ],
-            scope=BotCommandScopeAllGroupChats(),
+            scope=BotCommandScopeChat(chat_id=_coerce_chat_id(conversation_ref)),
         )
 
     async def download_attachment(

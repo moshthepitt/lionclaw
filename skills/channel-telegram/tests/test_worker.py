@@ -4801,7 +4801,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(api.sent_inbound, [])
-        self.assertIn("/ask@lionclaw_bot message", telegram.sent_messages[0][1])
+        self.assertIn("/ask message", telegram.sent_messages[0][1])
         self.assertNotIn("/compact", telegram.sent_messages[0][1])
         self.assertNotIn("/model", telegram.sent_messages[0][1])
         self.assertEqual(telegram.sent_buttons[0], [])
@@ -4849,6 +4849,8 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "hello from menu")
+        self.assertEqual(api.sent_inbound[0].trigger, "command")
+        self.assertEqual(telegram.group_commands_configured, ["telegram:chat:-10077"])
 
     async def test_group_menu_local_command_is_addressed_without_bot_suffix(
         self,
@@ -4893,6 +4895,8 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(api.sent_inbound, [])
         self.assertEqual(len(api.authorized_actors), 1)
+        self.assertEqual(api.authorized_actors[0].trigger, "command")
+        self.assertEqual(telegram.group_commands_configured, ["telegram:chat:-10077"])
         self.assertIn("No active LionClaw turn", telegram.sent_messages[0][1])
 
     async def test_group_local_commands_require_approved_actor(self) -> None:
@@ -4992,7 +4996,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             telegram.sent_messages[0][1], "This Telegram access is blocked."
         )
 
-    async def test_private_settings_includes_connect_group_button(self) -> None:
+    async def test_private_settings_is_account_focused(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -5025,7 +5029,47 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(api.sent_inbound, [])
-        self.assertIn("Connect a group", telegram.sent_messages[0][1])
+        self.assertIn("Direct messages here are ready", telegram.sent_messages[0][1])
+        self.assertIn("Other slash commands", telegram.sent_messages[0][1])
+        self.assertNotIn("Connect a group", telegram.sent_messages[0][1])
+        self.assertEqual(telegram.sent_buttons[0], [])
+
+    async def test_private_connections_command_includes_connect_group_button(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91020,
+                            "message": {
+                                "message_id": 120,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/connections",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertIn("Telegram connections", telegram.sent_messages[0][1])
         self.assertEqual(
             [button.text for button in telegram.sent_buttons[0]], ["Connect group"]
         )
@@ -5048,7 +5092,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "/settings",
+                                "text": "/connections",
                             },
                         }
                     )
@@ -5085,7 +5129,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "first_name": "LionClaw",
                                     "username": "lionclaw_bot",
                                 },
-                                "text": "Telegram channel settings",
+                                "text": "Telegram connections",
                             },
                         },
                     }
@@ -5205,6 +5249,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "how are you?")
+        self.assertEqual(api.sent_inbound[0].trigger, "command")
 
     async def test_empty_group_ask_gets_usage_without_runtime_submit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5246,7 +5291,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(api.sent_inbound, [])
-        self.assertIn("Use /ask@lionclaw_bot", telegram.sent_messages[0][1])
+        self.assertIn("Use /ask", telegram.sent_messages[0][1])
 
     async def test_unconnected_group_pending_approval_hides_pairing_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7458,7 +7503,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     (
                         "telegram:chat:-44",
                         "LionClaw is not connected to this group yet.\n\n"
-                        "Ask a connected LionClaw host to open /settings in DM and "
+                        "Ask a connected LionClaw host to open /connections in DM and "
                         "create a group connection link.",
                         "telegram:message:5",
                         None,
@@ -10309,18 +10354,36 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [type(call["scope"]).__name__ for call in bot.deleted_command_scopes],
-            ["BotCommandScopeDefault"],
+            [
+                "BotCommandScopeDefault",
+                "BotCommandScopeAllGroupChats",
+                "BotCommandScopeAllChatAdministrators",
+            ],
         )
         self.assertEqual(
             [type(call["scope"]).__name__ for call in bot.command_sets],
-            ["BotCommandScopeAllPrivateChats", "BotCommandScopeAllGroupChats"],
+            ["BotCommandScopeAllPrivateChats"],
         )
         self.assertEqual(
             [command.command for command in bot.command_sets[0]["commands"]],
-            ["help", "status", "stop", "settings"],
+            ["help", "status", "stop", "settings", "connections"],
         )
+
+    async def test_configure_group_commands_uses_chat_scope(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.configure_group_commands("telegram:chat:-10077")
+
         self.assertEqual(
-            [command.command for command in bot.command_sets[1]["commands"]],
+            [type(call["scope"]).__name__ for call in bot.command_sets],
+            ["BotCommandScopeChat"],
+        )
+        self.assertEqual(bot.command_sets[0]["scope"].chat_id, -10077)
+        self.assertEqual(
+            [command.command for command in bot.command_sets[0]["commands"]],
             ["ask", "help", "status", "stop", "settings"],
         )
 
@@ -11393,6 +11456,7 @@ class FakeTelegramTransport:
         self.answered_callbacks: list[tuple[str, str | None]] = []
         self.reactions: list[tuple[str, str, str]] = []
         self.commands_configured = False
+        self.group_commands_configured: list[str] = []
         self.sent_format_hints: list[str] = []
         self.typing_peers: list[str] = []
         self.typing_calls: list[tuple[str, str | None]] = []
@@ -11426,6 +11490,9 @@ class FakeTelegramTransport:
 
     async def configure_commands(self) -> None:
         self.commands_configured = True
+
+    async def configure_group_commands(self, conversation_ref: str) -> None:
+        self.group_commands_configured.append(conversation_ref)
 
     async def download_attachment(
         self,

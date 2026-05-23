@@ -92,13 +92,16 @@ WEBHOOK_COALESCE_DELAY_SECONDS = 0.35
 MAX_WEBHOOK_RECENT_UPDATE_IDS = 4096
 
 LOCAL_TELEGRAM_COMMANDS = {
+    "connections",
     "help",
     "status",
     "stop",
     "settings",
 }
 TELEGRAM_PROMPT_COMMANDS = {"ask"}
-GROUP_MENU_COMMANDS = LOCAL_TELEGRAM_COMMANDS | TELEGRAM_PROMPT_COMMANDS
+GROUP_MENU_COMMANDS = (
+    LOCAL_TELEGRAM_COMMANDS - {"connections"}
+) | TELEGRAM_PROMPT_COMMANDS
 ACTIVE_STATUS_CODES = {
     "queue.started": "Queued",
     "runtime.started": "Working",
@@ -787,6 +790,7 @@ class TelegramWorker:
         self._webhook_recent_update_ids_dirty = False
         self._webhook_accepting_updates = True
         self._webhook_state_lock = asyncio.Lock()
+        self._configured_group_command_refs: set[str] = set()
 
     async def process_updates(self) -> None:
         self._poll_in_flight_started_at = _loop_time()
@@ -1506,7 +1510,25 @@ class TelegramWorker:
                 "telegram pairing acknowledgement failed for update_id=%s",
                 claim.update_id,
             )
+        if (
+            response.outcome == "approved"
+            and claim.provider_metadata.get("chat_type") != "private"
+        ):
+            await self._ensure_group_commands(claim.conversation_ref)
         return True
+
+    async def _ensure_group_commands(self, conversation_ref: str) -> None:
+        if conversation_ref in self._configured_group_command_refs:
+            return
+        try:
+            await self.telegram.configure_group_commands(conversation_ref)
+        except Exception:
+            logger.exception(
+                "telegram group command configuration failed for conversation_ref=%s",
+                conversation_ref,
+            )
+            return
+        self._configured_group_command_refs.add(conversation_ref)
 
     async def _handle_callback_action(self, callback: TelegramCallbackAction) -> bool:
         parsed = _parse_callback_action(callback.action)
@@ -1696,6 +1718,7 @@ class TelegramWorker:
             command_is_addressed = _telegram_command_is_addressed(update, command)
             prompt_command_handled = False
             if command.name in TELEGRAM_PROMPT_COMMANDS and command_is_addressed:
+                update = _with_command_trigger(update, command)
                 if not command.arguments and not update.attachments:
                     await self._reply(update, _ask_usage(update))
                     return True
@@ -1703,9 +1726,11 @@ class TelegramWorker:
                 prompt_command_handled = True
             if not prompt_command_handled:
                 if command.name in LOCAL_TELEGRAM_COMMANDS and command_is_addressed:
+                    update = _with_command_trigger(update, command)
                     return await self._handle_telegram_command(update, command)
                 if command_is_addressed:
                     runtime_text = _telegram_runtime_command_text(command)
+                    update = _with_command_trigger(update, command)
                     if runtime_text != update.text:
                         update = replace(update, text=runtime_text)
 
@@ -1732,6 +1757,8 @@ class TelegramWorker:
                 response.pairing_code,
             )
         if response.outcome == "queued":
+            if not _is_private_update(update):
+                await self._ensure_group_commands(update.conversation_ref)
             self._remember_typing_route(update)
             await self._remember_active_turn(update, response)
             await self._start_typing(
@@ -1765,6 +1792,9 @@ class TelegramWorker:
         if command.name == "status":
             await self._send_status(update)
             return True
+        if command.name == "connections":
+            await self._send_connections(update)
+            return True
         if command.name == "settings":
             await self._send_settings(update)
             return True
@@ -1776,7 +1806,11 @@ class TelegramWorker:
         update: TelegramInboundUpdate,
         command: TelegramCommand,
     ) -> bool:
-        if _is_private_update(update) and command.name in {"help", "settings"}:
+        if _is_private_update(update) and command.name in {
+            "connections",
+            "help",
+            "settings",
+        }:
             return True
         try:
             response = await self.lionclaw_api.authorize_actor(update)
@@ -1788,6 +1822,8 @@ class TelegramWorker:
             await self._reply(update, "I could not verify Telegram access.")
             return False
         if response.authorized:
+            if not _is_private_update(update):
+                await self._ensure_group_commands(update.conversation_ref)
             return True
         if response.reason_code == "blocked_grant":
             await self._reply(update, "This Telegram access is blocked.")
@@ -1865,7 +1901,30 @@ class TelegramWorker:
             await self._reply(
                 update,
                 "Telegram channel settings\n\n"
-                "Connect a group with a short-lived one-use link.",
+                "This Telegram account is connected to LionClaw.\n"
+                "Direct messages here are ready.\n\n"
+                "Other slash commands are passed to the runtime agent.\n\n"
+                "Use a leading space before / to send literal slash text.",
+            )
+            return
+
+        await self._reply(
+            update,
+            "Telegram channel settings\n"
+            "Mode: groups use addressed commands and replies.\n\n"
+            "/ask message - ask LionClaw\n"
+            "/status - current turn\n"
+            "/stop - stop active turn\n\n"
+            "To connect a new group, ask a connected LionClaw host to open "
+            "/connections in DM and create a group connection link.",
+        )
+
+    async def _send_connections(self, update: TelegramInboundUpdate) -> None:
+        if _is_private_update(update):
+            await self._reply(
+                update,
+                "Telegram connections\n\n"
+                "Create a short-lived one-use link for a trusted group.",
                 buttons=[
                     TelegramActionButton(
                         "Connect group",
@@ -1875,28 +1934,21 @@ class TelegramWorker:
             )
             return
 
-        command_suffix = _bot_command_suffix(update)
         await self._reply(
             update,
-            "Telegram channel settings\n"
-            "Mode: groups use addressed commands and replies.\n\n"
-            f"/ask{command_suffix} message - ask LionClaw\n"
-            f"/status{command_suffix} - current turn\n"
-            f"/stop{command_suffix} - stop active turn\n\n"
-            "To connect a new group, ask a connected LionClaw host to open "
-            "/settings in DM and create a group connection link.",
+            "This group is connected to LionClaw.\n\n"
+            "New group connection links are created in a private chat with this bot.",
         )
 
     async def _send_help(self, update: TelegramInboundUpdate) -> None:
         if not _is_private_update(update):
-            command_suffix = _bot_command_suffix(update)
             await self._reply(
                 update,
                 "LionClaw in groups\n\n"
-                f"/ask{command_suffix} message - ask LionClaw\n"
-                f"/status{command_suffix} - current turn\n"
-                f"/stop{command_suffix} - stop active turn\n"
-                f"/settings{command_suffix} - group settings\n\n"
+                "/ask message - ask LionClaw\n"
+                "/status - current turn\n"
+                "/stop - stop active turn\n"
+                "/settings - group settings\n\n"
                 "Reply to a LionClaw message to continue that conversation.",
             )
             return
@@ -1904,7 +1956,7 @@ class TelegramWorker:
         await self._reply(
             update,
             "LionClaw controls\n"
-            "/status, /stop, /settings\n"
+            "/status, /stop, /settings, /connections\n"
             "/lionclaw reset - fresh session\n"
             "/lionclaw retry - retry last turn\n\n"
             "Runtime controls\n"
@@ -2065,7 +2117,7 @@ class TelegramWorker:
         else:
             text = (
                 "LionClaw is not connected to this group yet.\n\n"
-                "Ask a connected LionClaw host to open /settings in DM and "
+                "Ask a connected LionClaw host to open /connections in DM and "
                 "create a group connection link."
             )
         try:
@@ -3708,6 +3760,25 @@ def _telegram_command_is_addressed(
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
 
 
+def _with_command_trigger(
+    update: TelegramInboundUpdate,
+    command: TelegramCommand,
+) -> TelegramInboundUpdate:
+    if update.provider_metadata.get("chat_type") == "private":
+        return update
+    if command.target_username is not None and _telegram_command_is_addressed(
+        update,
+        command,
+    ):
+        return replace(update, trigger="command")
+    if (
+        command.name in GROUP_MENU_COMMANDS
+        and update.provider_metadata.get("leading_command") == command.name
+    ):
+        return replace(update, trigger="command")
+    return update
+
+
 def _is_private_update(update: TelegramInboundUpdate) -> bool:
     return update.provider_metadata.get("chat_type") == "private"
 
@@ -3717,8 +3788,7 @@ def _bot_command_suffix(update: TelegramInboundUpdate) -> str:
 
 
 def _ask_usage(update: TelegramInboundUpdate) -> str:
-    command_suffix = _bot_command_suffix(update)
-    return f"Use /ask{command_suffix} followed by the message for LionClaw."
+    return "Use /ask followed by the message for LionClaw."
 
 
 def _progress_threshold_seconds(update: TelegramInboundUpdate) -> float:
@@ -3832,10 +3902,8 @@ def _is_permanent_delete_failure(err: Exception) -> bool:
 def _pairing_claim_reply(claim: TelegramPairingClaim, outcome: str) -> str:
     if outcome == "approved":
         if claim.provider_metadata.get("chat_type") != "private":
-            command_suffix = _bot_command_suffix_from_metadata(claim.provider_metadata)
             return (
-                "LionClaw is connected to this group.\n\n"
-                f"Use /ask{command_suffix} message to start."
+                "LionClaw is connected to this group.\n\n" "Use /ask message to start."
             )
         return "LionClaw is connected. You can send a message now."
     if outcome == "already_claimed":
