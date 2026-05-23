@@ -5888,6 +5888,89 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 }
 
 #[tokio::test]
+async fn channel_direct_turn_delivery_uses_inbound_conversation_route() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "direct-route-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let sender_ref = "telegram:user:direct-route";
+    let conversation_ref = "telegram:chat:direct-route";
+    let pairing = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "direct-route-pairing",
+            sender_ref,
+            conversation_ref,
+            None,
+            "seed pairing",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("create pending direct pairing");
+    assert_eq!(pairing.outcome, ChannelInboundOutcome::PendingApproval);
+    approve_pairing(&kernel, "terminal", sender_ref).await;
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "direct-route-message",
+            sender_ref,
+            conversation_ref,
+            None,
+            "reply on the inbound conversation route",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue direct route turn");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let session_id = queued.session_id.expect("queued session id");
+    let turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| turn.turn_id == turn_id && turn.status == SessionTurnStatus::Completed,
+        "completed direct route turn",
+    )
+    .await;
+
+    let stream = wait_for_stream_events(&kernel, "terminal", "direct-route-stream", |events| {
+        let codes = events
+            .iter()
+            .filter_map(|event| event.code.as_deref())
+            .collect::<Vec<_>>();
+        codes.contains(&"queue.completed") && stream_has_completed_and_done(events, turn_id)
+    })
+    .await;
+    assert_turn_completed_before_done(&stream.events, turn_id, "direct route turn");
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "terminal".to_string(),
+            worker_id: "direct-route-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull direct route outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, conversation_ref);
+    assert_eq!(outbox.deliveries[0].thread_ref, None);
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("direct-route-message")
+    );
+    assert_eq!(outbox.deliveries[0].turn_id, Some(turn_id));
+}
+
+#[tokio::test]
 async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "loopback", "lionclaw-action-skill").await;
@@ -6184,6 +6267,16 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
         "completed bare runtime-owned slash command",
     )
     .await;
+
+    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-bare-runtime", |events| {
+        stream_has_completed_and_done(events, queued_turn_id)
+    })
+    .await;
+    assert_turn_completed_before_done(
+        &stream.events,
+        queued_turn_id,
+        "bare runtime-owned slash command",
+    );
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {

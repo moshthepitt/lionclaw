@@ -52,6 +52,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramUnsupportedContent,
     extract_inbound_event,
     normalize_telegram_receipt,
+    same_telegram_conversation_ref,
 )
 from lionclaw_channel_telegram.webhook import TelegramWebhookServer
 
@@ -79,6 +80,7 @@ PROGRESS_REFRESH_SECONDS = 0.5
 PROGRESS_EDIT_MIN_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_BASE_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
+SUCCESS_PROGRESS_TEXT = "Finished."
 COMPACT_STATUS_TEXT_LIMIT = 96
 MAX_OUTBOX_RECEIPTS = 256
 OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
@@ -1750,7 +1752,7 @@ class TelegramWorker:
             "/lionclaw reset - fresh session\n"
             "/lionclaw retry - retry last turn\n\n"
             "Runtime controls\n"
-            "/compact and other runtime slash commands go to the runtime.\n"
+            "Other slash commands are passed to the runtime agent.\n\n"
             "Use a leading space before / to send literal slash text.",
         )
 
@@ -2477,18 +2479,13 @@ class TelegramWorker:
             return
         if turn.provisional_message_ref is not None:
             if not turn.expects_outbox_delivery:
-                await self._delete_progress_message(turn)
-                await self._set_turn_reaction(turn, REACTION_COMPLETED)
-                turn.terminal = True
-                self._forget_turn(turn)
+                await self._complete_successful_progress_turn(turn)
                 return
             turn.status_text = "Finishing"
             self._save_active_turns()
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
             return
-        await self._set_turn_reaction(turn, REACTION_COMPLETED)
-        turn.terminal = True
-        self._forget_turn(turn)
+        await self._complete_successful_progress_turn(turn)
 
     def _forget_turn(self, turn: ActiveTurn) -> None:
         self._active_turns.pop(turn.turn_id, None)
@@ -2735,17 +2732,33 @@ class TelegramWorker:
         turn = self._active_turns.get(delivery.turn_id)
         if turn is None:
             return
-        if turn.target.key != (delivery.conversation_ref, delivery.thread_ref):
+        if not _same_delivery_route(turn, delivery):
             logger.warning(
                 "outbox delivery route did not match active turn for turn_id=%s",
                 delivery.turn_id,
             )
             return
+        await self._complete_successful_progress_turn(turn)
+
+    async def _complete_successful_progress_turn(self, turn: ActiveTurn) -> None:
         if turn.provisional_message_ref is not None:
+            await self._mark_successful_progress_message(turn)
             await self._delete_progress_message(turn)
         await self._set_turn_reaction(turn, REACTION_COMPLETED)
         turn.terminal = True
         self._forget_turn(turn)
+
+    async def _mark_successful_progress_message(self, turn: ActiveTurn) -> bool:
+        if turn.provisional_message_ref is None:
+            return True
+        turn.terminal_text = SUCCESS_PROGRESS_TEXT
+        turn.visible_after = min(turn.visible_after, _loop_time())
+        self._save_active_turns()
+        return await self._edit_progress_message(
+            turn,
+            SUCCESS_PROGRESS_TEXT,
+            force=True,
+        )
 
     async def _terminalize_progress_for_delivery_failure(
         self,
@@ -2757,7 +2770,7 @@ class TelegramWorker:
         turn = self._active_turns.get(delivery.turn_id)
         if turn is None:
             return
-        if turn.target.key != (delivery.conversation_ref, delivery.thread_ref):
+        if not _same_delivery_route(turn, delivery):
             logger.warning(
                 "telegram outbox failure route mismatch for turn_id=%s "
                 "delivery_id=%s active_route=%s delivery_route=%s",
@@ -3096,6 +3109,16 @@ def _delivery_failure_progress_text(error_code: str) -> str:
     if error_code == "telegram.send_rejected":
         return "Delivery failed: Telegram rejected the message."
     return "Delivery failed."
+
+
+def _same_delivery_route(turn: ActiveTurn, delivery: OutboxDelivery) -> bool:
+    return (
+        turn.target.thread_ref == delivery.thread_ref
+        and same_telegram_conversation_ref(
+            turn.target.conversation_ref,
+            delivery.conversation_ref,
+        )
+    )
 
 
 def _is_permanent_send_failure(err: Exception) -> bool:

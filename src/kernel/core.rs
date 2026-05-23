@@ -11539,23 +11539,28 @@ impl Kernel {
         session_peer_id: &str,
         turn_id: Uuid,
     ) -> Result<ResolvedChannelRoute, KernelError> {
-        let (conversation_ref, thread_ref) =
+        let (mut conversation_ref, mut thread_ref) =
             delivery_route_for_session_key(channel_id, session_peer_id);
-        let reply_to_ref = match self
+        let mut reply_to_ref = None;
+
+        if let Some(turn) = self
             .channel_state
             .get_turn(turn_id)
             .await
             .map_err(internal)?
             .filter(|turn| turn.channel_id == channel_id)
         {
-            Some(turn) => self
+            if let Some(event) = self
                 .channel_state
                 .get_inbound_event(channel_id, &turn.inbound_event_id)
                 .await
                 .map_err(internal)?
-                .and_then(|event| event.message_ref),
-            None => None,
-        };
+            {
+                conversation_ref = event.conversation_ref;
+                thread_ref = event.thread_ref;
+                reply_to_ref = event.message_ref;
+            }
+        }
 
         Ok(ResolvedChannelRoute {
             conversation_ref,

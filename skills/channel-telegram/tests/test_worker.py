@@ -4656,7 +4656,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.sent_inbound, [])
         self.assertIn("LionClaw controls", telegram.sent_messages[0][1])
         self.assertIn("/lionclaw retry", telegram.sent_messages[0][1])
-        self.assertIn("/compact", telegram.sent_messages[0][1])
+        self.assertIn("Other slash commands", telegram.sent_messages[0][1])
+        self.assertIn("\n\nUse a leading space", telegram.sent_messages[0][1])
+        self.assertNotIn("/compact", telegram.sent_messages[0][1])
         self.assertNotIn("/model", telegram.sent_messages[0][1])
         self.assertEqual(telegram.sent_buttons[0], [])
 
@@ -7067,6 +7069,13 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             telegram.deleted_messages,
             [("telegram:chat:77", "telegram:message:101")],
         )
+        self.assertEqual(
+            telegram.edited_messages,
+            [
+                ("telegram:chat:77", "telegram:message:101", "Finishing..."),
+                ("telegram:chat:77", "telegram:message:101", "Finished."),
+            ],
+        )
         self.assertEqual(worker._active_turns, {})
         self.assertEqual(worker._route_turns, {})
 
@@ -7115,6 +7124,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             telegram.deleted_messages,
             [("telegram:chat:77", "telegram:message:101")],
+        )
+        self.assertIn(
+            ("telegram:chat:77", "telegram:message:101", "Finished."),
+            telegram.edited_messages,
         )
         self.assertEqual(worker._active_turns, {})
         self.assertEqual(worker._route_turns, {})
@@ -7337,6 +7350,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("telegram:chat:77", "telegram:message:101", "Working..."),
                 ("telegram:chat:77", "telegram:message:101", "Finishing..."),
+                ("telegram:chat:77", "telegram:message:101", "Finished."),
             ],
         )
         self.assertEqual(
@@ -7373,6 +7387,11 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertNotIn("turn-1", worker._active_turns)
             self.assertEqual(telegram.deleted_messages, [])
+            self.assertEqual(
+                telegram.edited_messages[-1],
+                ("telegram:chat:77", progress_ref, "Finished."),
+            )
+            self.assertEqual(telegram.edited_buttons[-1], [])
             self.assertEqual(len(worker._pending_progress_deletes), 1)
             pending = next(iter(worker._pending_progress_deletes.values()))
             self.assertEqual(pending.message_ref, progress_ref)
@@ -7590,6 +7609,37 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.deleted_messages, [])
         self.assertIn("turn-1", worker._active_turns)
         self.assertEqual(telegram.sent_messages[-1][1], "scheduled summary")
+
+    async def test_delivered_dm_outbox_clears_progress_for_equivalent_chat_ref(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await self._remember_visible_progress(worker)
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-dm-final",
+                    attempt_id="attempt-dm-final",
+                    conversation_ref="telegram:user:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
+
+        self.assertNotIn("turn-1", worker._active_turns)
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", "telegram:message:101")],
+        )
+        self.assertEqual(api.outbox_reports[0][2], "delivered")
 
     async def test_old_outbox_delivery_does_not_delete_new_active_progress(
         self,

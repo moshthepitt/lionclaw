@@ -76,6 +76,13 @@ class TelegramReferenceError(ValueError):
     pass
 
 
+def same_telegram_conversation_ref(left: str, right: str) -> bool:
+    try:
+        return _coerce_chat_id(left) == _coerce_chat_id(right)
+    except TelegramReferenceError:
+        return left == right
+
+
 class TelegramPartialSendError(RuntimeError):
     def __init__(
         self,
