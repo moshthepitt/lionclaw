@@ -67,10 +67,12 @@ lionclaw run
 ```
 
 LionClaw opens the project operator console when attached to a terminal. The
-console keeps the current context in the top ribbon, switchable project objects
-on the left, durable conversation in the transcript, selected details in the
-inspector, and prompt input in the composer. Runtime stream detail is summarized
-as inspectable activity instead of being mixed into the conversation.
+console keeps the current context in the top ribbon and the everyday turn flow
+in one Run surface: durable transcript, prompt input, live runtime status, and
+recent file-change feedback. On wide terminals, project objects stay visible
+beside Run and the right column keeps the inspector and changed-files pane
+visible together. Runtime stream detail is shown inline for the active turn and
+as inspectable activity instead of being mixed into the durable conversation.
 
 Use the plain line-oriented path when scripting or when a terminal UI is not
 wanted:
@@ -108,10 +110,14 @@ lionclaw run
 In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
 for the line-oriented interactive path.
 
-Inside the console, `Tab` and `Shift+Tab` move focus, `Enter` activates the
-focused item, `Ctrl+P` opens commands and help, `Ctrl+C` interrupts an active
-turn, and `Ctrl+D` exits when idle. When the inspector is focused, `Left` and
-`Right` cycle instance, runtime, boundary, activity, and audit views.
+Inside the console, `Tab` and `Shift+Tab` move between Run and controls.
+`Ctrl+O` focuses controls, `Left` and `Right` cycle project, runtime, boundary,
+activity, audit, and files, `Ctrl+X` maximizes Run or the active control pane,
+`Ctrl+P` opens commands and help, `Ctrl+C` interrupts an active turn, and
+`Ctrl+D` exits when idle. `Enter` submits the prompt or activates a selected
+project item when project controls are active. After a prompt is submitted,
+Run remains the active scroll surface; typing printable text continues prompt
+editing in that same surface.
 
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or

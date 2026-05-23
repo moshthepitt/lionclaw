@@ -267,6 +267,23 @@ pub struct RuntimeArtifact {
     pub mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFileChangeStatus {
+    Editing,
+    Edited,
+    Failed,
+    Declined,
+    Changed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFileChange {
+    pub runtime: String,
+    pub status: RuntimeFileChangeStatus,
+    pub paths: Vec<String>,
+    pub total_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     MessageDelta {
@@ -282,6 +299,9 @@ pub enum RuntimeEvent {
     },
     Artifact {
         artifact: RuntimeArtifact,
+    },
+    FileChange {
+        change: RuntimeFileChange,
     },
     Done,
     Error {

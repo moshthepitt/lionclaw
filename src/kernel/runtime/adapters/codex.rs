@@ -15,9 +15,12 @@ use crate::kernel::runtime::{
     spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnMode, RuntimeTurnResult,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnMode,
+    RuntimeTurnResult,
 };
+
+const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -1045,12 +1048,8 @@ where
                 }
             }
             "item/started" | "item/completed" | "item/updated" => {
-                let status = self.record_app_server_item(method, params);
-                if let Some(status) = status {
-                    drop(events.send(RuntimeEvent::Status {
-                        code: None,
-                        text: status,
-                    }));
+                for event in self.record_app_server_item(method, params) {
+                    drop(events.send(event));
                 }
             }
             "error" => {
@@ -1119,12 +1118,15 @@ where
         }))
     }
 
-    fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+    fn record_app_server_item(&mut self, method: &str, params: &Value) -> Vec<RuntimeEvent> {
         self.record_agent_message_item(method, params);
         self.record_answer_item_completion(method, params);
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
-                Some("codex context compaction started".to_string())
+                vec![RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compaction started".to_string(),
+                }]
             }
             ("item/completed", Some("contextCompaction")) => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
@@ -1132,10 +1134,13 @@ where
                 } else {
                     self.unmatched_context_compaction_completed = true;
                 }
-                Some("codex context compacted".to_string())
+                vec![RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compacted".to_string(),
+                }]
             }
-            (_, Some(_)) => describe_app_server_item(params),
-            (_, None) => None,
+            (_, Some(_)) => app_server_item_events(params),
+            (_, None) => Vec::new(),
         }
     }
 
@@ -1638,12 +1643,31 @@ fn error_notification_will_retry(params: &Value) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn describe_app_server_item(params: &Value) -> Option<String> {
+    describe_app_server_status_item(params)
+}
+
+fn app_server_item_events(params: &Value) -> Vec<RuntimeEvent> {
+    let item = app_server_item(params);
+    match app_server_item_type(params) {
+        Some("fileChange") => codex_file_change_item(item)
+            .map(|change| RuntimeEvent::FileChange { change })
+            .into_iter()
+            .collect(),
+        Some(_) => describe_app_server_status_item(params)
+            .map(|text| RuntimeEvent::Status { code: None, text })
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn describe_app_server_status_item(params: &Value) -> Option<String> {
     let item = app_server_item(params);
     match app_server_item_type(params)? {
-        "agentMessage" | "reasoning" | "userMessage" | "plan" => None,
+        "agentMessage" | "reasoning" | "userMessage" | "plan" | "fileChange" => None,
         "commandExecution" => describe_command_execution_item(item),
-        "fileChange" => describe_file_change_item(item),
         "webSearch" => describe_web_search_item(item),
         "imageView" => describe_image_view_item(item),
         "collabToolCall" => describe_collab_tool_call_item(item),
@@ -1735,36 +1759,32 @@ fn command_actions_display(value: &Value) -> Option<String> {
     (!rendered.is_empty()).then(|| rendered.join(" && "))
 }
 
-fn describe_file_change_item(item: &Value) -> Option<String> {
+fn codex_file_change_item(item: &Value) -> Option<RuntimeFileChange> {
     let changes = item.get("changes").and_then(Value::as_array)?;
     let status = item
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    let verb = match status {
-        "inProgress" => "editing",
-        "completed" => "edited",
-        "failed" => "edit failed",
-        "declined" => "edit declined",
-        _ => "file change",
+    let status = match status {
+        "inProgress" => RuntimeFileChangeStatus::Editing,
+        "completed" => RuntimeFileChangeStatus::Edited,
+        "failed" => RuntimeFileChangeStatus::Failed,
+        "declined" => RuntimeFileChangeStatus::Declined,
+        _ => RuntimeFileChangeStatus::Changed,
     };
     let paths = changes
         .iter()
         .filter_map(|change| change.get("path").and_then(Value::as_str))
         .filter(|path| !path.trim().is_empty())
         .map(compact_path)
-        .take(3)
+        .take(FILE_CHANGE_PATH_EVENT_LIMIT)
         .collect::<Vec<_>>();
-    if paths.is_empty() {
-        Some(format!("codex {verb}: {} files", changes.len()))
-    } else {
-        let suffix = if changes.len() > paths.len() {
-            format!(" +{}", changes.len() - paths.len())
-        } else {
-            String::new()
-        };
-        Some(format!("codex {verb}: {}{}", paths.join(", "), suffix))
-    }
+    Some(RuntimeFileChange {
+        runtime: "codex".to_string(),
+        status,
+        paths,
+        total_count: changes.len(),
+    })
 }
 
 fn describe_web_search_item(item: &Value) -> Option<String> {
@@ -2083,8 +2103,8 @@ mod tests {
         append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
         EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
-        RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeFileChangeStatus,
+        RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -2291,19 +2311,24 @@ mod tests {
             })),
             Some("codex searched: rg \"operator console\"".to_string())
         );
-        assert_eq!(
-            super::describe_app_server_item(&json!({
-                "item": {
-                    "type": "fileChange",
-                    "status": "completed",
-                    "changes": [
-                        {"path": "src/operator/run_tui.rs", "kind": "update"},
-                        {"path": "Cargo.toml", "kind": "update"}
-                    ],
-                }
-            })),
-            Some("codex edited: src/operator/run_tui.rs, Cargo.toml".to_string())
-        );
+        let file_change_events = super::app_server_item_events(&json!({
+            "item": {
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [
+                    {"path": "/workspace/src/operator/run_tui.rs", "kind": "update"},
+                    {"path": "Cargo.toml", "kind": "update"}
+                ],
+            }
+        }));
+        assert!(matches!(
+            file_change_events.as_slice(),
+            [RuntimeEvent::FileChange { change }]
+                if change.runtime == "codex"
+                    && change.status == RuntimeFileChangeStatus::Edited
+                    && change.paths == ["src/operator/run_tui.rs", "Cargo.toml"]
+                    && change.total_count == 2
+        ));
         assert_eq!(
             super::describe_app_server_item(&json!({
                 "item": {

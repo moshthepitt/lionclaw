@@ -30,6 +30,31 @@ fn rendered_line_strings(lines: &[Line<'_>]) -> Vec<String> {
         .collect()
 }
 
+fn file_change_event(paths: &[&str], total_count: usize) -> StreamEventDto {
+    StreamEventDto {
+        kind: StreamEventKindDto::FileChange,
+        lane: None,
+        code: None,
+        text: None,
+        file_change: Some(StreamFileChangeDto {
+            runtime: "codex".to_string(),
+            status: StreamFileChangeStatusDto::Edited,
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            total_count,
+        }),
+    }
+}
+
+fn answer_delta_event(text: &str) -> StreamEventDto {
+    StreamEventDto {
+        kind: StreamEventKindDto::MessageDelta,
+        lane: Some(StreamLaneDto::Answer),
+        code: None,
+        text: Some(text.to_string()),
+        file_change: None,
+    }
+}
+
 #[test]
 fn stream_events_append_answers_and_summarize_runtime_activity() {
     let mut transcript = Vec::new();
@@ -43,6 +68,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
             lane: Some(StreamLaneDto::Answer),
             code: None,
             text: Some("hello".to_string()),
+            file_change: None,
         },
     );
     push_stream_event(
@@ -53,6 +79,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
             lane: Some(StreamLaneDto::Answer),
             code: None,
             text: Some(" world".to_string()),
+            file_change: None,
         },
     );
     push_stream_event(
@@ -63,6 +90,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
             lane: None,
             code: None,
             text: Some("codex ran: cargo test".to_string()),
+            file_change: None,
         },
     );
     push_stream_event(
@@ -73,6 +101,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
             lane: Some(StreamLaneDto::Reasoning),
             code: None,
             text: Some("checking project state".to_string()),
+            file_change: None,
         },
     );
 
@@ -132,6 +161,7 @@ fn answer_boundaries_preserve_streamed_message_blocks() {
             lane: Some(StreamLaneDto::Answer),
             code: None,
             text: Some("I'll inspect the docs first.".to_string()),
+            file_change: None,
         },
     );
     push_stream_event(
@@ -142,6 +172,7 @@ fn answer_boundaries_preserve_streamed_message_blocks() {
             lane: Some(StreamLaneDto::Answer),
             code: None,
             text: None,
+            file_change: None,
         },
     );
     push_stream_event(
@@ -152,6 +183,7 @@ fn answer_boundaries_preserve_streamed_message_blocks() {
             lane: Some(StreamLaneDto::Answer),
             code: None,
             text: Some("**Project**".to_string()),
+            file_change: None,
         },
     );
 
@@ -179,6 +211,7 @@ fn activity_classification_accepts_runtime_neutral_summaries() {
             lane: None,
             code: None,
             text: Some(text.to_string()),
+            file_change: None,
         });
     }
 
@@ -191,6 +224,30 @@ fn activity_classification_accepts_runtime_neutral_summaries() {
 }
 
 #[test]
+fn file_change_statuses_are_first_class_activity() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+
+    activity.record_stream_event(&file_change_event(
+        &["src/operator/run_tui/render.rs", "Cargo.toml"],
+        4,
+    ));
+
+    assert_eq!(activity.file_change_count, 4);
+    assert_eq!(activity.items[0].kind, ActivityItemKind::FileChange);
+    assert_eq!(activity.file_changes.len(), 1);
+    assert_eq!(activity.file_changes[0].status, FileChangeStatus::Edited);
+    assert_eq!(
+        activity.file_changes[0].paths,
+        vec![
+            "src/operator/run_tui/render.rs".to_string(),
+            "Cargo.toml".to_string()
+        ]
+    );
+    assert_eq!(activity.file_changes[0].hidden_count(), 2);
+}
+
+#[test]
 fn cancellation_error_events_do_not_mark_activity_failed() {
     let mut activity = ActivitySummary::new();
     activity.start();
@@ -200,12 +257,14 @@ fn cancellation_error_events_do_not_mark_activity_failed() {
         lane: None,
         code: Some("runtime.cancelled".to_string()),
         text: Some("operator stop".to_string()),
+        file_change: None,
     });
     activity.record_stream_event(&StreamEventDto {
         kind: StreamEventKindDto::Done,
         lane: None,
         code: None,
         text: None,
+        file_change: None,
     });
 
     assert_eq!(activity.status, ActivityStatus::Complete);
@@ -224,6 +283,7 @@ fn reasoning_deltas_coalesce_into_one_activity_progress_item() {
             lane: Some(StreamLaneDto::Reasoning),
             code: None,
             text: Some(text.to_string()),
+            file_change: None,
         });
     }
 
@@ -243,12 +303,14 @@ fn reasoning_deltas_coalesce_into_one_activity_progress_item() {
         lane: Some(StreamLaneDto::Reasoning),
         code: None,
         text: None,
+        file_change: None,
     });
     activity.record_stream_event(&StreamEventDto {
         kind: StreamEventKindDto::MessageDelta,
         lane: Some(StreamLaneDto::Reasoning),
         code: None,
         text: Some("then report".to_string()),
+        file_change: None,
     });
 
     assert_eq!(activity.progress_count, 2);
@@ -286,6 +348,40 @@ fn transcript_rendering_uses_message_blocks() {
         rendered,
         vec!["you", "/compact", "", "lionclaw", "ok", "", "error", "failed"]
     );
+}
+
+#[test]
+fn transcript_rendering_inserts_live_activity_after_active_prompt() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+    activity.record_stream_event(&StreamEventDto {
+        kind: StreamEventKindDto::Status,
+        lane: None,
+        code: None,
+        text: Some("codex running: cargo test".to_string()),
+        file_change: None,
+    });
+
+    let lines = transcript_with_activity_lines(
+        &[
+            TranscriptLine::new(TranscriptLineKind::User, "please test"),
+            TranscriptLine::new(TranscriptLineKind::Answer, "working"),
+        ],
+        Some(&activity),
+        Some(0),
+    );
+    let rendered = rendered_line_strings(&lines);
+
+    let runtime_index = rendered
+        .iter()
+        .position(|line| line.contains("runtime"))
+        .expect("runtime activity line");
+    let answer_index = rendered
+        .iter()
+        .position(|line| line.contains("lionclaw"))
+        .expect("answer heading");
+    assert!(runtime_index < answer_index);
+    assert!(rendered.iter().any(|line| line.contains("codex running")));
 }
 
 #[test]
@@ -372,7 +468,7 @@ async fn rendered_markdown_transcript_stays_inside_run_tui_palette() {
         "1. Read [the docs](https://example.com)\n2. Keep **important** words readable.\n```rust\nfn main() {}\n```",
     )])
     .await;
-    app.focus = Focus::Transcript;
+    app.focus = Focus::Run;
 
     let colors = render_to_foreground_colors(&mut app, 120, 32);
     let unexpected = colors
@@ -432,11 +528,14 @@ fn blocked_instance_renders_launch_blocker() {
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Transcript,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
@@ -449,7 +548,7 @@ fn blocked_instance_renders_launch_blocker() {
     };
 
     let rendered = render_to_text(&mut app, 100, 30);
-    assert!(rendered.contains("Transcript"));
+    assert!(rendered.contains("Run"));
     assert!(rendered.contains("Launch blocked for main"));
     assert!(rendered.contains("missing runtime"));
 }
@@ -465,7 +564,7 @@ fn launch_blocker_rendering_preserves_embedded_newlines() {
                 "no default runtime configured for instance \"main\"\nRun:\n  lionclaw configure --runtime codex",
             ),
         };
-    app.focus = Focus::Transcript;
+    app.focus = Focus::Run;
 
     let rendered = render_to_text(&mut app, 120, 30);
 
@@ -496,7 +595,7 @@ fn activity_items_render_multiline_text_with_continuation_indent() {
 }
 
 #[tokio::test]
-async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer() {
+async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let kernel = Kernel::new_with_options(
         &temp_dir.path().join("lionclaw.db"),
@@ -558,7 +657,9 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Composer,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: vec![
@@ -569,6 +670,7 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
             TranscriptLine::new(TranscriptLineKind::Answer, "Summary\nLooks good overall."),
         ],
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
@@ -586,10 +688,12 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
     assert!(rendered.contains("net:none"));
     assert!(rendered.contains("Project"));
     assert!(rendered.contains("Instances"));
-    assert!(rendered.contains("Transcript"));
-    assert!(rendered.contains("Inspector  Instance"));
-    assert!(rendered.contains("session"));
-    assert!(rendered.contains("work root"));
+    assert!(rendered.contains("Run"));
+    assert!(rendered.contains("Inspector"));
+    assert!(rendered.contains("Files"));
+    assert!(rendered.contains("No file changes reported"));
+    assert!(rendered.contains("Please review the changes"));
+    assert!(rendered.contains("Looks good overall"));
     assert!(rendered.contains("turn:2h"));
     assert!(!rendered.contains("/lionclaw/skills"));
     assert!(!rendered.contains("runtime.plan.allow"));
@@ -597,6 +701,8 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
     assert!(!rendered.contains("runtime controls pass through"));
     assert!(rendered.contains("Ctrl+P"));
     assert!(rendered.contains("Commands"));
+    assert!(rendered.contains("Ctrl+O"));
+    assert!(rendered.contains("Controls"));
     assert!(rendered.contains("Ctrl+D"));
     assert_eq!(rendered.lines().count(), 50);
 }
@@ -604,18 +710,16 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
 #[tokio::test]
 async fn runtime_boundary_and_audit_inspectors_render_real_context() {
     let mut app = ready_test_app(Vec::new()).await;
-    app.focus = Focus::Inspectors;
-
-    app.inspector_subject = InspectorSubject::Runtime;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Runtime));
     let runtime = render_to_text(&mut app, 120, 32);
-    assert!(runtime.contains("Inspector  Runtime"));
+    assert!(runtime.contains("Runtime"));
     assert!(runtime.contains("profile"));
     assert!(runtime.contains("codex"));
     assert!(runtime.contains("executable"));
 
-    app.inspector_subject = InspectorSubject::Boundary;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Boundary));
     let boundary = render_to_text(&mut app, 120, 32);
-    assert!(boundary.contains("Inspector  Boundary"));
+    assert!(boundary.contains("Boundary"));
     assert!(boundary.contains("workspace"));
     assert!(boundary.contains("read-write"));
     assert!(boundary.contains("skills"));
@@ -630,11 +734,12 @@ async fn runtime_boundary_and_audit_inspectors_render_real_context() {
         timestamp: "12:34:56 UTC".to_string(),
         summary: "session opened: local-cli  local-project".to_string(),
     }]);
-    app.inspector_subject = InspectorSubject::Audit;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Audit));
     let audit = render_to_text(&mut app, 120, 32);
-    assert!(audit.contains("Inspector  Audit"));
+    assert!(audit.contains("Audit"));
     assert!(audit.contains("Recent Audit"));
-    assert!(audit.contains("session opened"));
+    assert!(audit.contains("session"));
+    assert!(audit.contains("opened"));
     assert!(audit.contains("actor api"));
 }
 
@@ -685,7 +790,7 @@ async fn project_pane_scrolls_and_marks_long_session_lists() {
     let target = sessions.last().expect("session").session_id;
     app.project_objects.sessions = ProjectObjectSection::Ready(sessions);
     app.project_cursor = ProjectSelection::Session(target);
-    app.focus = Focus::Project;
+    app.open_control_pane(ControlPane::Project);
 
     let rendered = render_to_text(&mut app, 100, 28);
 
@@ -702,7 +807,7 @@ async fn transcript_scroll_is_bounded_to_wrapped_content_and_renders_scrollbar()
         .collect::<Vec<_>>()
         .join("\n");
     let mut app = ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
-    app.focus = Focus::Transcript;
+    app.focus = Focus::Run;
     app.transcript_scroll.offset = usize::MAX;
 
     let rendered = render_to_text(&mut app, 100, 24);
@@ -712,6 +817,55 @@ async fn transcript_scroll_is_bounded_to_wrapped_content_and_renders_scrollbar()
     assert!(rendered.contains("visible-line-39"));
     assert!(rendered.contains("^"));
     assert!(rendered.contains("v"));
+}
+
+#[tokio::test]
+async fn run_turn_autoscrolls_transcript_until_operator_scrolls_away() {
+    let body = (0..80)
+        .map(|index| format!("history-line-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
+
+    render_to_text(&mut app, 100, 24);
+    app.scroll_transcript_to_top();
+    assert!(!app.transcript_scroll.follow_tail);
+
+    app.begin_run_turn("new prompt", "running turn");
+    push_stream_event(
+        &mut app.transcript,
+        &mut app.activity,
+        &answer_delta_event("\nstreamed-tail-line-00"),
+    );
+    let rendered = render_to_text(&mut app, 100, 24);
+
+    assert!(app.transcript_scroll.follow_tail);
+    assert_eq!(app.transcript_scroll.offset, app.transcript_scroll.limit);
+    assert!(rendered.contains("streamed-tail-line-00"));
+
+    app.scroll_transcript_up(5);
+    assert!(!app.transcript_scroll.follow_tail);
+    push_stream_event(
+        &mut app.transcript,
+        &mut app.activity,
+        &answer_delta_event("\nstreamed-tail-line-01"),
+    );
+    render_to_text(&mut app, 100, 24);
+
+    assert!(!app.transcript_scroll.follow_tail);
+    assert!(app.transcript_scroll.offset < app.transcript_scroll.limit);
+
+    app.scroll_transcript_to_bottom();
+    push_stream_event(
+        &mut app.transcript,
+        &mut app.activity,
+        &answer_delta_event("\nstreamed-tail-line-02"),
+    );
+    let rendered = render_to_text(&mut app, 100, 24);
+
+    assert!(app.transcript_scroll.follow_tail);
+    assert_eq!(app.transcript_scroll.offset, app.transcript_scroll.limit);
+    assert!(rendered.contains("streamed-tail-line-02"));
 }
 
 #[test]
@@ -726,8 +880,7 @@ fn scrollbar_position_maps_pane_bottom_to_ratatui_bottom() {
 #[tokio::test]
 async fn activity_inspector_follows_tail_and_renders_scrollbar() {
     let mut app = ready_test_app(Vec::new()).await;
-    app.focus = Focus::Inspectors;
-    app.inspector_subject = InspectorSubject::Activity;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Activity));
     app.activity.start();
     for index in 0..80 {
         app.activity.push_item(
@@ -749,8 +902,7 @@ async fn activity_inspector_follows_tail_and_renders_scrollbar() {
 async fn activity_inspector_keyboard_scroll_is_bounded() {
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
     let mut app = ready_test_app(Vec::new()).await;
-    app.focus = Focus::Inspectors;
-    app.inspector_subject = InspectorSubject::Activity;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Activity));
     app.activity_scroll.limit = 30;
     app.activity_scroll.offset = 30;
     app.activity_scroll.page_size = 7;
@@ -789,6 +941,90 @@ async fn activity_inspector_keyboard_scroll_is_bounded() {
     )
     .await;
     assert_eq!(app.activity_scroll.offset, 30);
+}
+
+#[tokio::test]
+async fn empty_prompt_navigation_scrolls_transcript() {
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+    let mut app = ready_test_app(Vec::new()).await;
+    app.focus = Focus::Run;
+    app.transcript_scroll.limit = 30;
+    app.transcript_scroll.offset = 30;
+    app.transcript_scroll.page_size = 6;
+    app.transcript_scroll.follow_tail = true;
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(app.focus, Focus::Run);
+    assert_eq!(app.transcript_scroll.offset, 29);
+    assert!(!app.transcript_scroll.follow_tail);
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(app.transcript_scroll.offset, 0);
+
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(app.transcript_scroll.offset, 30);
+    assert!(app.transcript_scroll.follow_tail);
+
+    app.composer.insert_str("draft");
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(app.transcript_scroll.offset, 30);
+}
+
+#[tokio::test]
+async fn files_pane_renders_changed_files() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.activity.start();
+    app.activity
+        .record_stream_event(&file_change_event(&["src/render.rs", "Cargo.toml"], 2));
+    app.open_control_pane(ControlPane::Files);
+
+    let rendered = render_to_text(&mut app, 120, 32);
+
+    assert!(rendered.contains("Files"));
+    assert!(rendered.contains("Changed Files"));
+    assert!(rendered.contains("src"));
+    assert!(rendered.contains("render.rs"));
+    assert!(rendered.contains("Cargo.toml"));
+}
+
+#[tokio::test]
+async fn maximized_control_pane_uses_the_full_body_width() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.activity.start();
+    app.activity
+        .record_stream_event(&file_change_event(&["tui-change.txt"], 1));
+    app.open_control_pane(ControlPane::Files);
+    app.toggle_maximize();
+
+    let rendered = render_to_text(&mut app, 120, 36);
+    let body_top = rendered.lines().nth(4).expect("body top border");
+
+    assert!(body_top.starts_with('┌'));
+    assert!(body_top.ends_with('┐'));
+    assert_eq!(body_top.chars().count(), 120);
+    assert!(!body_top.contains("┐ ┌"));
+    assert!(rendered.contains("▶ Files"));
+    assert!(rendered.contains("tui-change.txt"));
 }
 
 #[tokio::test]
@@ -832,7 +1068,7 @@ async fn project_mode_lists_instances_and_selects_requested_instance() {
 }
 
 #[tokio::test]
-async fn project_console_starts_with_composer_focused() {
+async fn project_console_starts_with_run_focused() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let project = crate::operator::target::init_project(temp_dir.path()).expect("init");
     let target = crate::operator::target::resolve_target(
@@ -854,7 +1090,7 @@ async fn project_console_starts_with_composer_focused() {
     .await
     .expect("console");
 
-    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(app.focus, Focus::Run);
     assert_eq!(app.project_cursor, ProjectSelection::Instance(0));
 }
 
@@ -1065,7 +1301,7 @@ async fn project_session_activation_switches_selected_session() {
     let (mut app, current_session_id, next_session_id, _temp_dir) =
         ready_project_session_app().await;
     app.project_cursor = ProjectSelection::Session(next_session_id);
-    app.focus = Focus::Project;
+    app.open_control_pane(ControlPane::Project);
 
     handle_key(
         &mut app,
@@ -1086,12 +1322,12 @@ async fn project_session_activation_switches_selected_session() {
 }
 
 #[tokio::test]
-async fn project_session_activation_confirms_before_clearing_composer() {
+async fn project_session_activation_confirms_before_clearing_prompt() {
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
     let (mut app, current_session_id, next_session_id, _temp_dir) =
         ready_project_session_app().await;
     app.project_cursor = ProjectSelection::Session(next_session_id);
-    app.focus = Focus::Project;
+    app.open_control_pane(ControlPane::Project);
     app.composer = ConsoleComposer::from_text("unsent prompt");
 
     handle_key(
@@ -1247,6 +1483,18 @@ fn documented_global_shortcuts_route_through_keymap() {
         Some(GlobalCommand::PreviousFocus)
     );
     assert_eq!(
+        global_command_for(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        Some(GlobalCommand::FocusControls)
+    );
+    assert_eq!(
+        global_command_for(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert_eq!(
+        global_command_for(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Some(GlobalCommand::ToggleMaximize)
+    );
+    assert_eq!(
         global_command_for(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Some(GlobalCommand::InterruptOrConfirmExit)
     );
@@ -1260,6 +1508,7 @@ fn documented_global_shortcuts_route_through_keymap() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
     assert!(footer.contains("Ctrl+P Commands"));
+    assert!(footer.contains("Ctrl+O Controls"));
     assert!(footer.contains("Tab Focus"));
     assert!(footer.contains("Ctrl+C Interrupt"));
     assert!(footer.contains("Ctrl+D Exit"));
@@ -1331,22 +1580,22 @@ fn question_mark_is_printable_and_ctrl_p_opens_commands() {
         .expect("test runtime");
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
 
-    let mut composer_app = blocked_test_app();
-    composer_app.focus = Focus::Composer;
-    composer_app.composer = ConsoleComposer::from_text("Is this ok");
+    let mut prompt_app = blocked_test_app();
+    prompt_app.focus = Focus::Run;
+    prompt_app.composer = ConsoleComposer::from_text("Is this ok");
     runtime.block_on(async {
         handle_key(
-            &mut composer_app,
+            &mut prompt_app,
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
             &backend_tx,
         )
         .await;
     });
-    assert_eq!(composer_app.composer.text(), "Is this ok?");
-    assert!(composer_app.overlay.is_none());
+    assert_eq!(prompt_app.composer.text(), "Is this ok?");
+    assert!(prompt_app.overlay.is_none());
 
     let mut nav_app = blocked_test_app();
-    nav_app.focus = Focus::Project;
+    nav_app.open_control_pane(ControlPane::Project);
     runtime.block_on(async {
         handle_key(
             &mut nav_app,
@@ -1356,7 +1605,7 @@ fn question_mark_is_printable_and_ctrl_p_opens_commands() {
         .await;
     });
     assert_eq!(nav_app.composer.text(), "?");
-    assert_eq!(nav_app.focus, Focus::Composer);
+    assert_eq!(nav_app.focus, Focus::Run);
     assert!(nav_app.overlay.is_none());
 
     runtime.block_on(async {
@@ -1371,7 +1620,7 @@ fn question_mark_is_printable_and_ctrl_p_opens_commands() {
 }
 
 #[test]
-fn composer_handles_multiline_editing_and_bracketed_paste() {
+fn prompt_handles_multiline_editing_and_bracketed_paste() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1401,19 +1650,19 @@ fn composer_handles_multiline_editing_and_bracketed_paste() {
     });
 
     assert_eq!(app.composer.text(), "first line\nsecond line\nthird line");
-    assert_eq!(app.focus, Focus::Composer);
+    assert_eq!(app.focus, Focus::Run);
     assert_eq!(app.status, "pasted 10 characters");
 }
 
 #[test]
-fn composer_height_expands_for_multiline_input() {
+fn run_prompt_height_expands_for_multiline_input() {
     let mut app = blocked_test_app();
     app.composer = ConsoleComposer::from_text("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
 
-    assert_eq!(app.composer_height(80), COMPOSER_MAX_HEIGHT);
+    assert_eq!(app.run_prompt_height(80), RUN_PROMPT_MAX_HEIGHT);
 
     app.composer = ConsoleComposer::new();
-    assert_eq!(app.composer_height(80), COMPOSER_MIN_HEIGHT);
+    assert_eq!(app.run_prompt_height(80), RUN_PROMPT_MIN_HEIGHT);
 }
 
 #[test]
@@ -1434,16 +1683,15 @@ fn tab_moves_focus_and_render_marks_focused_pane() {
         .await;
     });
 
-    assert_eq!(app.focus, Focus::Transcript);
-    assert_eq!(app.status, "focus: transcript");
+    assert_eq!(app.focus, Focus::Run);
+    assert_eq!(app.status, "focus: run");
     let rendered = render_to_text(&mut app, 100, 30);
-    assert!(rendered.contains("▶ Transcript"));
+    assert!(rendered.contains("▶ Run"));
 }
 
 #[test]
-fn inspector_left_right_cycles_subjects() {
+fn left_right_cycles_control_panes() {
     let mut app = blocked_test_app();
-    app.focus = Focus::Inspectors;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1458,8 +1706,11 @@ fn inspector_left_right_cycles_subjects() {
         )
         .await;
     });
-    assert_eq!(app.inspector_subject, InspectorSubject::Runtime);
-    assert_eq!(app.status, "inspector: Runtime");
+    assert_eq!(
+        app.control_pane,
+        ControlPane::Inspector(InspectorSubject::Selection)
+    );
+    assert_eq!(app.status, "controls: Instance");
 
     runtime.block_on(async {
         handle_key(
@@ -1469,7 +1720,7 @@ fn inspector_left_right_cycles_subjects() {
         )
         .await;
     });
-    assert_eq!(app.inspector_subject, InspectorSubject::Selection);
+    assert_eq!(app.control_pane, ControlPane::Project);
 
     runtime.block_on(async {
         handle_key(
@@ -1479,7 +1730,7 @@ fn inspector_left_right_cycles_subjects() {
         )
         .await;
     });
-    assert_eq!(app.inspector_subject, InspectorSubject::Audit);
+    assert_eq!(app.control_pane, ControlPane::Files);
 
     runtime.block_on(async {
         handle_key(
@@ -1489,7 +1740,39 @@ fn inspector_left_right_cycles_subjects() {
         )
         .await;
     });
-    assert_eq!(app.inspector_subject, InspectorSubject::Selection);
+    assert_eq!(app.control_pane, ControlPane::Project);
+}
+
+#[test]
+fn left_right_stay_in_prompt_while_editing() {
+    let mut app = blocked_test_app();
+    app.focus = Focus::Run;
+    app.control_pane = ControlPane::Project;
+    app.composer = ConsoleComposer::from_text("draft");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+
+    assert_eq!(app.focus, Focus::Run);
+    assert_eq!(app.control_pane, ControlPane::Project);
+    assert_eq!(app.composer.text(), "draft");
 }
 
 async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempDir) {
@@ -1567,11 +1850,14 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempD
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Composer,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
@@ -1621,11 +1907,14 @@ fn blocked_test_app() -> ConsoleApp {
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Project,
+        focus: Focus::Controls,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
@@ -1756,11 +2045,14 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Composer,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript,
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),

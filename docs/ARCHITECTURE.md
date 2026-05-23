@@ -155,6 +155,10 @@ runtime-specific parsing.
 plain text from `message_delta` events should ignore it; consumers that render
 conversation structure may use it as a paragraph/message-item break. Literal
 `message_delta` text is otherwise preserved as emitted by the runtime adapter.
+Runtime adapters can emit `file_change` events with structured
+`file_change` payloads (`runtime`, `status`, `paths`, `total_count`) when the
+runtime reports edits. The text field remains a compact display summary, but
+operator UIs should read the structured payload instead of parsing status text.
 Channel streams also emit a kernel-owned `turn_completed` event after the turn
 record is finalized. Its `text` field is the canonical persisted assistant
 reply and lets channel UIs reconcile live deltas against durable turn state
@@ -287,9 +291,10 @@ validation, and planner all validate the configured mounts so hand-edited config
 cannot bypass planner safety checks.
 
 The operator console treats the transcript as durable conversation: user prompts
-and assistant answer deltas are rendered as message blocks. Runtime status,
-reasoning, command, and progress events are summarized as activity and exposed
-through the inspector instead of being appended as transcript lines.
+and assistant answer deltas are rendered as message blocks in the main scroll
+surface. Runtime status, reasoning, command, progress, and file-change events
+are summarized as live activity for the active turn and exposed through control
+panes instead of being appended as transcript lines.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and

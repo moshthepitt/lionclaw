@@ -294,6 +294,7 @@ impl StreamLaneDto {
 pub enum StreamEventKindDto {
     MessageDelta,
     MessageBoundary,
+    FileChange,
     Status,
     Error,
     TurnCompleted,
@@ -305,12 +306,44 @@ impl StreamEventKindDto {
         match self {
             Self::MessageDelta => "message_delta",
             Self::MessageBoundary => "message_boundary",
+            Self::FileChange => "file_change",
             Self::Status => "status",
             Self::Error => "error",
             Self::TurnCompleted => "turn_completed",
             Self::Done => "done",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFileChangeStatusDto {
+    Editing,
+    Edited,
+    Failed,
+    Declined,
+    Changed,
+}
+
+impl StreamFileChangeStatusDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Editing => "editing",
+            Self::Edited => "edited",
+            Self::Failed => "failed",
+            Self::Declined => "declined",
+            Self::Changed => "changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFileChangeDto {
+    pub runtime: String,
+    pub status: StreamFileChangeStatusDto,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +355,8 @@ pub struct StreamEventDto {
     pub code: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub file_change: Option<StreamFileChangeDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1289,6 +1324,8 @@ pub struct ChannelStreamEventView {
     pub code: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub file_change: Option<StreamFileChangeDto>,
     pub created_at: DateTime<Utc>,
 }
 

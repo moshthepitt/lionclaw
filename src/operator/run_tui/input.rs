@@ -10,11 +10,16 @@ pub(super) async fn handle_terminal_event(
             handle_key(app, key, backend_tx).await;
         }
         Event::Paste(text) => {
-            app.focus = Focus::Composer;
+            app.focus = Focus::Run;
             let char_count = text.chars().count();
             app.composer.insert_str(&text);
             app.status = format!("pasted {char_count} characters");
         }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => scroll_up(app, mouse_scroll_amount(app)),
+            MouseEventKind::ScrollDown => scroll_down(app, mouse_scroll_amount(app)),
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -30,7 +35,7 @@ pub(super) async fn handle_key(
     }
 
     if is_composer_newline_key(key) {
-        app.focus = Focus::Composer;
+        app.focus = Focus::Run;
         app.composer.insert_newline();
         return;
     }
@@ -42,84 +47,66 @@ pub(super) async fn handle_key(
 
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
-            app.composer.clear();
-            app.status = "composer cleared".to_string();
+            if app.focus == Focus::Controls {
+                app.leave_controls();
+            } else {
+                app.composer.clear();
+                app.status = "prompt cleared".to_string();
+            }
         }
-        (KeyCode::Enter, _) if app.focus == Focus::Project => {
+        (KeyCode::Enter, _)
+            if app.focus == Focus::Controls && app.control_pane == ControlPane::Project =>
+        {
             app.activate_project_cursor().await;
         }
+        (KeyCode::Enter, _) if app.focus == Focus::Controls => {}
         (KeyCode::Enter, _) => app.submit_composer(backend_tx),
-        (KeyCode::Up, _) if app.focus == Focus::Project => {
+        (KeyCode::Up, _)
+            if app.focus == Focus::Controls && app.control_pane == ControlPane::Project =>
+        {
             app.move_project_cursor(-1);
         }
-        (KeyCode::Down, _) if app.focus == Focus::Project => {
+        (KeyCode::Down, _)
+            if app.focus == Focus::Controls && app.control_pane == ControlPane::Project =>
+        {
             app.move_project_cursor(1);
         }
-        (KeyCode::Up, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_up(1);
+        (KeyCode::Left, _) if app.focus == Focus::Controls || app.composer.is_blank() => {
+            app.previous_control_pane();
         }
-        (KeyCode::PageUp, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_up(app.transcript_scroll.page_size);
+        (KeyCode::Right, _) if app.focus == Focus::Controls || app.composer.is_blank() => {
+            app.next_control_pane();
         }
-        (KeyCode::Down, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_down(1);
+        (KeyCode::Up, _) if app.focus == Focus::Run && app.composer.is_blank() => {
+            scroll_up(app, 1);
         }
-        (KeyCode::PageDown, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_down(app.transcript_scroll.page_size);
+        (KeyCode::Down, _) if app.focus == Focus::Run && app.composer.is_blank() => {
+            scroll_down(app, 1);
         }
-        (KeyCode::Home, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_to_top();
+        (KeyCode::PageUp, _) => {
+            let amount = active_page_size(app);
+            scroll_up(app, amount);
         }
-        (KeyCode::End, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_to_bottom();
+        (KeyCode::PageDown, _) => {
+            let amount = active_page_size(app);
+            scroll_down(app, amount);
         }
-        (KeyCode::Left, _) if app.focus == Focus::Inspectors => {
-            app.previous_inspector_subject();
+        (KeyCode::Home, _) if app.focus == Focus::Run && app.composer.is_blank() => {
+            scroll_to_top(app);
         }
-        (KeyCode::Right, _) if app.focus == Focus::Inspectors => {
-            app.next_inspector_subject();
+        (KeyCode::End, _) if app.focus == Focus::Run && app.composer.is_blank() => {
+            scroll_to_bottom(app);
         }
-        (KeyCode::Up, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_up(1);
+        (KeyCode::Home | KeyCode::End, _) if app.focus == Focus::Run => {
+            app.composer.handle_key(key);
         }
-        (KeyCode::PageUp, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_up(app.activity_scroll.page_size);
-        }
-        (KeyCode::Down, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_down(1);
-        }
-        (KeyCode::PageDown, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_down(app.activity_scroll.page_size);
-        }
-        (KeyCode::Home, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_to_top();
-        }
-        (KeyCode::End, _)
-            if app.focus == Focus::Inspectors
-                && app.inspector_subject == InspectorSubject::Activity =>
-        {
-            app.scroll_activity_to_bottom();
-        }
-        _ if app.focus == Focus::Composer => {
+        (KeyCode::Home, _) => scroll_to_top(app),
+        (KeyCode::End, _) => scroll_to_bottom(app),
+        _ if app.focus == Focus::Run => {
             app.composer.handle_key(key);
         }
         _ if key_starts_composer(key) => {
-            app.focus = Focus::Composer;
+            app.focus = Focus::Run;
             app.composer.handle_key(key);
         }
         _ => {}
@@ -136,12 +123,14 @@ pub(super) fn global_command_for(key: KeyEvent) -> Option<GlobalCommand> {
 fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
     match command {
         GlobalCommand::Commands => app.overlay = Some(Overlay::Help),
+        GlobalCommand::FocusControls => app.focus_controls(),
+        GlobalCommand::ToggleMaximize => app.toggle_maximize(),
         GlobalCommand::NextFocus => {
-            app.focus = app.focus.next(app.project_mode());
+            app.focus = app.focus.next();
             app.status = format!("focus: {}", app.focus.label());
         }
         GlobalCommand::PreviousFocus => {
-            app.focus = app.focus.previous(app.project_mode());
+            app.focus = app.focus.previous();
             app.status = format!("focus: {}", app.focus.label());
         }
         GlobalCommand::InterruptOrConfirmExit => {
@@ -166,6 +155,45 @@ fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
                 app.should_quit = true;
             }
         }
+    }
+}
+
+fn active_page_size(app: &ConsoleApp) -> usize {
+    match app.selected_scroll_target() {
+        ScrollTarget::Transcript => app.transcript_scroll.page_size,
+        ScrollTarget::Activity => app.activity_scroll.page_size,
+    }
+}
+
+fn mouse_scroll_amount(app: &ConsoleApp) -> usize {
+    (active_page_size(app) / 3).max(1)
+}
+
+fn scroll_up(app: &mut ConsoleApp, amount: usize) {
+    match app.selected_scroll_target() {
+        ScrollTarget::Transcript => app.scroll_transcript_up(amount),
+        ScrollTarget::Activity => app.scroll_activity_up(amount),
+    }
+}
+
+fn scroll_down(app: &mut ConsoleApp, amount: usize) {
+    match app.selected_scroll_target() {
+        ScrollTarget::Transcript => app.scroll_transcript_down(amount),
+        ScrollTarget::Activity => app.scroll_activity_down(amount),
+    }
+}
+
+fn scroll_to_top(app: &mut ConsoleApp) {
+    match app.selected_scroll_target() {
+        ScrollTarget::Transcript => app.scroll_transcript_to_top(),
+        ScrollTarget::Activity => app.scroll_activity_to_top(),
+    }
+}
+
+fn scroll_to_bottom(app: &mut ConsoleApp) {
+    match app.selected_scroll_target() {
+        ScrollTarget::Transcript => app.scroll_transcript_to_bottom(),
+        ScrollTarget::Activity => app.scroll_activity_to_bottom(),
     }
 }
 

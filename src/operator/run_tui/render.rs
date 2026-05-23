@@ -3,7 +3,6 @@ use super::*;
 pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
     let area = frame.area();
 
-    let composer_height = app.composer_height(area.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -11,19 +10,16 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
             Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(1),
-            Constraint::Length(composer_height),
-            Constraint::Length(1),
             Constraint::Length(3),
         ])
         .split(area);
 
-    let [header_area, _, body_area, _, composer_area, _, footer_area] = chunks.as_ref() else {
+    let [header_area, _, body_area, _, footer_area] = chunks.as_ref() else {
         return;
     };
 
     render_header(frame, *header_area, app);
     render_body(frame, *body_area, app);
-    render_composer(frame, *composer_area, app);
     render_footer(frame, *footer_area, app);
 
     if let Some(overlay) = app.overlay {
@@ -85,39 +81,155 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    if app.project_mode() {
+    match app.view_mode {
+        ViewMode::Maximized(Surface::Run) => {
+            render_run_surface(frame, area, app);
+            return;
+        }
+        ViewMode::Maximized(Surface::Controls) => {
+            render_active_control_pane(frame, area, app);
+            return;
+        }
+        ViewMode::Normal => {}
+    }
+
+    if wide_control_panel(area.width) {
+        let project_width = project_pane_width(area.width);
+        let inspector_width = inspector_pane_width(area.width);
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(44),
+                Constraint::Length(project_width),
                 Constraint::Length(1),
-                Constraint::Min(40),
+                Constraint::Min(48),
                 Constraint::Length(1),
-                Constraint::Length(44),
+                Constraint::Length(inspector_width),
             ])
             .split(area);
-        let [instances_area, _, transcript_area, _, inspector_area] = chunks.as_ref() else {
-            render_transcript(frame, area, app);
+        let [project_area, _, transcript_pane_area, _, inspector_area] = chunks.as_ref() else {
+            render_run_surface(frame, area, app);
             return;
         };
-        render_instances(frame, *instances_area, app);
-        render_transcript(frame, *transcript_area, app);
-        render_inspector(frame, *inspector_area, app);
+        render_project_pane(frame, *project_area, app);
+        render_run_surface(frame, *transcript_pane_area, app);
+        render_side_control_stack(frame, *inspector_area, app);
+    } else if compact_control_panel_visible(app) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(48),
+                Constraint::Length(1),
+                Constraint::Length(compact_control_pane_width(area.width)),
+            ])
+            .split(area);
+        let [transcript_pane_area, _, control_area] = chunks.as_ref() else {
+            render_run_surface(frame, area, app);
+            return;
+        };
+        render_run_surface(frame, *transcript_pane_area, app);
+        render_active_control_pane(frame, *control_area, app);
     } else {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(40),
-                Constraint::Length(1),
-                Constraint::Length(44),
-            ])
-            .split(area);
-        let [transcript_area, _, inspector_area] = chunks.as_ref() else {
-            render_transcript(frame, area, app);
-            return;
-        };
-        render_transcript(frame, *transcript_area, app);
-        render_inspector(frame, *inspector_area, app);
+        render_run_surface(frame, area, app);
+    }
+}
+
+fn wide_control_panel(total_width: u16) -> bool {
+    total_width >= 118
+}
+
+fn compact_control_panel_visible(app: &ConsoleApp) -> bool {
+    app.focus == Focus::Controls || app.control_pane != ControlPane::Project
+}
+
+fn project_pane_width(total_width: u16) -> u16 {
+    total_width
+        .saturating_mul(23)
+        .saturating_div(100)
+        .clamp(28, 44)
+}
+
+fn inspector_pane_width(total_width: u16) -> u16 {
+    total_width
+        .saturating_mul(23)
+        .saturating_div(100)
+        .clamp(32, 48)
+}
+
+fn compact_control_pane_width(total_width: u16) -> u16 {
+    total_width
+        .saturating_mul(2)
+        .saturating_div(5)
+        .clamp(34, 52)
+}
+
+fn render_active_control_pane(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    match app.control_pane {
+        ControlPane::Project => render_project_pane(frame, area, app),
+        ControlPane::Inspector(subject) => render_inspector_subject(frame, area, app, subject),
+        ControlPane::Files => render_files_pane(frame, area, app),
+    }
+}
+
+fn render_side_control_pane(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    match app.control_pane {
+        ControlPane::Project => {
+            render_inspector_subject(frame, area, app, app.inspector_subject);
+        }
+        ControlPane::Inspector(subject) => render_inspector_subject(frame, area, app, subject),
+        ControlPane::Files => render_files_pane(frame, area, app),
+    }
+}
+
+fn render_side_control_stack(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    if area.height < 22 {
+        render_side_control_pane(frame, area, app);
+        return;
+    }
+
+    let files_focused = app.control_pane == ControlPane::Files;
+    let files_height = stacked_files_pane_height(area.height, files_focused);
+    let inspector_height = area.height.saturating_sub(files_height).saturating_sub(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(inspector_height),
+            Constraint::Length(1),
+            Constraint::Length(files_height),
+        ])
+        .split(area);
+    let [inspector_area, _, files_area] = chunks.as_ref() else {
+        render_side_control_pane(frame, area, app);
+        return;
+    };
+
+    render_inspector_subject(frame, *inspector_area, app, side_inspector_subject(app));
+    render_files_pane(frame, *files_area, app);
+}
+
+fn stacked_files_pane_height(total_height: u16, focused: bool) -> u16 {
+    let minimum_inspector_height = if focused { 8 } else { 12 };
+    let maximum_files_height = total_height
+        .saturating_sub(minimum_inspector_height)
+        .saturating_sub(1);
+    let desired_files_height = if focused {
+        total_height
+            .saturating_mul(3)
+            .saturating_div(5)
+            .clamp(12, 20)
+    } else {
+        total_height
+            .saturating_mul(3)
+            .saturating_div(10)
+            .clamp(8, 14)
+    };
+
+    desired_files_height.min(maximum_files_height)
+}
+
+fn side_inspector_subject(app: &ConsoleApp) -> InspectorSubject {
+    match app.control_pane {
+        ControlPane::Inspector(subject) => subject,
+        ControlPane::Project | ControlPane::Files => app.inspector_subject,
     }
 }
 
@@ -281,8 +393,13 @@ fn project_object_line(name: &str, detail: &str, muted: bool, width: usize) -> L
     )
 }
 
-fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    let content = render_panel_shell(frame, area, "Project", app.focus == Focus::Project);
+fn render_project_pane(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    let content = render_panel_shell(
+        frame,
+        area,
+        "Project",
+        app.focus == Focus::Controls && app.control_pane == ControlPane::Project,
+    );
     if content.width < 8 || content.height < 2 {
         return;
     }
@@ -310,8 +427,39 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     );
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    let content = render_panel_shell(frame, area, "Transcript", app.focus == Focus::Transcript);
+fn render_run_surface(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    let content = render_panel_shell(frame, area, "Run", app.focus == Focus::Run);
+    let prompt_height = app.run_prompt_height(content.height);
+    if prompt_height == 0 {
+        render_transcript_content(frame, content, app);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(prompt_height),
+        ])
+        .split(content);
+    let [transcript_area, divider_area, prompt_area] = chunks.as_ref() else {
+        render_transcript_content(frame, content, app);
+        return;
+    };
+
+    render_transcript_content(frame, *transcript_area, app);
+    draw_horizontal_rule(
+        frame,
+        divider_area.x,
+        divider_area.y,
+        divider_area.width,
+        PANEL_LINE,
+    );
+    render_run_prompt(frame, *prompt_area, app);
+}
+
+fn render_transcript_content(frame: &mut Frame<'_>, content: Rect, app: &mut ConsoleApp) {
     if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
         let text = Text::from(launch_blocker_lines(blocker));
         frame.render_widget(
@@ -328,18 +476,19 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
 
     let lines = if app.transcript.is_empty() {
         vec![Line::styled(
-            "No turns yet. Submit a prompt from the composer.",
+            "No turns yet. Submit a prompt below.",
             Style::default().fg(PANEL_MUTED),
         )]
+    } else if let Some(activity) = live_activity_for_transcript(app) {
+        transcript_with_activity_lines(&app.transcript, Some(activity), app.active_turn_anchor)
     } else {
         transcript_render_lines(&app.transcript)
     };
-    let activity_rows = if app.activity.is_empty() { 0 } else { 3 };
     let transcript_viewport = Rect {
         x: content.x,
         y: content.y,
         width: content.width,
-        height: content.height.saturating_sub(activity_rows),
+        height: content.height,
     };
     let (transcript_area, scrollbar_area) = split_scrollable_area(transcript_viewport);
     if transcript_area.width == 0 || transcript_area.height == 0 {
@@ -357,49 +506,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
         transcript_area,
     );
     render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
-    if activity_rows > 0 && content.height > activity_rows {
-        let rule_y = content.y + content.height - activity_rows;
-        draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_LINE);
-        let mut spans = vec![
-            Span::styled(
-                "activity",
-                Style::default()
-                    .fg(PANEL_BORDER)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ▸  "),
-            Span::styled(app.activity.status.label(), app.activity.status.style()),
-            Span::raw(format!("    {} events", app.activity.event_count)),
-        ];
-        if app.activity.command_count > 0 {
-            spans.push(Span::raw(format!(
-                "    {} commands",
-                app.activity.command_count
-            )));
-        }
-        if app.activity.progress_count > 0 {
-            spans.push(Span::raw(format!(
-                "    {} progress notes",
-                app.activity.progress_count
-            )));
-        }
-        if let Some(elapsed) = app.activity.elapsed_label() {
-            spans.push(Span::styled(
-                format!("    {elapsed}"),
-                Style::default().fg(PANEL_BORDER),
-            ));
-        }
-        let activity = Line::from(spans);
-        frame.render_widget(
-            Paragraph::new(activity).style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG)),
-            Rect {
-                x: content.x,
-                y: rule_y.saturating_add(1),
-                width: content.width,
-                height: 1,
-            },
-        );
-    }
 }
 
 fn launch_blocker_lines(blocker: &LaunchBlocker) -> Vec<Line<'static>> {
@@ -426,39 +532,130 @@ fn launch_blocker_lines(blocker: &LaunchBlocker) -> Vec<Line<'static>> {
 pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if index > 0 {
-            rendered.push(Line::raw(""));
-        }
-        let (role, style) = match line.kind {
-            TranscriptLineKind::User => (
-                "you",
-                Style::default()
-                    .fg(PANEL_BORDER)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            TranscriptLineKind::Answer => (
-                "lionclaw",
-                Style::default()
-                    .fg(PANEL_BORDER)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            TranscriptLineKind::Status => ("note", Style::default().fg(PANEL_MUTED)),
-            TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
-        };
-        rendered.push(Line::styled(role.to_string(), style));
-        match line.kind {
-            TranscriptLineKind::Answer => rendered.extend(transcript_markdown_lines(&line.text)),
-            TranscriptLineKind::User | TranscriptLineKind::Status | TranscriptLineKind::Error => {
-                rendered.extend(multiline_prefixed_lines(
-                    "",
-                    "",
-                    Style::default().fg(PANEL_TEXT),
-                    &line.text,
-                ));
+        push_transcript_line(&mut rendered, index, line);
+    }
+    rendered
+}
+
+pub(crate) fn transcript_with_activity_lines(
+    lines: &[TranscriptLine],
+    activity: Option<&ActivitySummary>,
+    activity_anchor: Option<usize>,
+) -> Vec<Line<'static>> {
+    let mut rendered = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        push_transcript_line(&mut rendered, index, line);
+        if activity_anchor == Some(index) {
+            if let Some(activity) = activity {
+                rendered.push(Line::raw(""));
+                rendered.extend(live_activity_lines(activity));
             }
         }
     }
     rendered
+}
+
+fn push_transcript_line(rendered: &mut Vec<Line<'static>>, index: usize, line: &TranscriptLine) {
+    if index > 0 {
+        rendered.push(Line::raw(""));
+    }
+    let (role, style) = match line.kind {
+        TranscriptLineKind::User => (
+            "you",
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TranscriptLineKind::Answer => (
+            "lionclaw",
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TranscriptLineKind::Status => ("note", Style::default().fg(PANEL_MUTED)),
+        TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
+    };
+    rendered.push(Line::styled(role.to_string(), style));
+    match line.kind {
+        TranscriptLineKind::Answer => rendered.extend(transcript_markdown_lines(&line.text)),
+        TranscriptLineKind::User | TranscriptLineKind::Status | TranscriptLineKind::Error => {
+            rendered.extend(multiline_prefixed_lines(
+                "",
+                "",
+                Style::default().fg(PANEL_TEXT),
+                &line.text,
+            ));
+        }
+    }
+}
+
+fn live_activity_for_transcript(app: &ConsoleApp) -> Option<&ActivitySummary> {
+    if app.active() || app.activity.status == ActivityStatus::Failed {
+        (!app.activity.is_empty()).then_some(&app.activity)
+    } else {
+        None
+    }
+}
+
+fn live_activity_lines(activity: &ActivitySummary) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "runtime",
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(activity.status.label(), activity.status.style()),
+        Span::raw(format!("  {} events", activity.event_count)),
+    ])];
+    let mut detail = Vec::new();
+    if let Some(elapsed) = activity.elapsed_label() {
+        detail.push(format!("elapsed {elapsed}"));
+    }
+    if let Some(last) = activity.last_event_at {
+        detail.push(format!("last event {}", format_event_age(last.elapsed())));
+    }
+    if activity.command_count > 0 {
+        detail.push(format!("{} commands", activity.command_count));
+    }
+    if activity.file_change_count > 0 {
+        detail.push(format!(
+            "{} file{}",
+            activity.file_change_count,
+            plural_s(activity.file_change_count)
+        ));
+    }
+    if activity.progress_count > 0 {
+        detail.push(format!("{} progress", activity.progress_count));
+    }
+    if !detail.is_empty() {
+        lines.push(Line::styled(
+            detail.join("  "),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    if let Some(change) = activity.file_changes.last() {
+        lines.push(Line::styled(
+            format!("files  {}", change.label()),
+            Style::default().fg(PANEL_TEXT),
+        ));
+    }
+    if let Some(item) = activity.items.last() {
+        lines.push(Line::styled(
+            format!("latest  {}", item.text),
+            Style::default().fg(PANEL_TEXT),
+        ));
+    }
+    lines
+}
+
+fn format_event_age(age: Duration) -> String {
+    if age < Duration::from_secs(2) {
+        "now".to_string()
+    } else {
+        format!("{} ago", format_elapsed(age))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -696,18 +893,25 @@ fn multiline_prefixed_lines(
         .collect()
 }
 
-fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    let title = format!("Inspector  {}", app.inspector_subject.label(app));
-    let content = render_panel_shell(frame, area, &title, app.focus == Focus::Inspectors);
+fn render_inspector_subject(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut ConsoleApp,
+    subject: InspectorSubject,
+) {
+    let title = format!("Inspector  {}", subject.label(app));
+    let content = render_panel_shell(
+        frame,
+        area,
+        &title,
+        app.focus == Focus::Controls && app.control_pane == ControlPane::Inspector(subject),
+    );
     if content.width < 8 || content.height < 4 {
         return;
     }
 
-    match app.inspector_subject {
-        InspectorSubject::Selection if app.focus == Focus::Project => {
-            render_project_cursor_inspector(frame, content, app)
-        }
-        InspectorSubject::Selection => render_instance_inspector(frame, content, app),
+    match subject {
+        InspectorSubject::Selection => render_project_cursor_inspector(frame, content, app),
         InspectorSubject::Runtime => render_runtime_inspector(frame, content, app),
         InspectorSubject::Boundary => render_boundary_inspector(frame, content, app),
         InspectorSubject::Activity => render_activity_inspector(frame, content, app),
@@ -831,58 +1035,6 @@ fn render_inspector_lines(frame: &mut Frame<'_>, content: Rect, lines: Vec<Line<
     );
 }
 
-fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
-    if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
-        let text = Text::from(vec![
-            section_line("!", "Selected"),
-            Line::raw(""),
-            kv_line("instance", app.selected_name()),
-            kv_line("state", "blocked"),
-            kv_line("reason", &blocker.title),
-            Line::raw(""),
-            Line::styled(
-                "Launch guidance is shown in the transcript pane.",
-                Style::default().fg(PANEL_MUTED),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
-                .wrap(Wrap { trim: false }),
-            inspector_body(content),
-        );
-        return;
-    }
-
-    let SelectedInstanceState::Ready(ready) = &app.selected else {
-        return;
-    };
-    let row_width = inspector_body(content).width as usize;
-    let mut lines = vec![
-        section_line("●", "Selected"),
-        Line::raw(""),
-        kv_line("instance", app.selected_name()),
-        kv_line("runtime", &app.runtime_label()),
-        kv_line("kind", &app.runtime_kind_label()),
-        kv_line("session", &short_session_id(ready.session_id)),
-    ];
-    if let Some(work_root) = ready.summary.work_root.as_ref() {
-        lines.push(kv_path_line("work root", work_root, row_width));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Use Left/Right in the inspector for runtime, boundary, activity, and audit details.",
-        Style::default().fg(PANEL_MUTED),
-    ));
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
-            .wrap(Wrap { trim: false }),
-        inspector_body(content),
-    );
-}
-
 fn render_runtime_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
     let SelectedInstanceState::Ready(ready) = &app.selected else {
         render_inspector_lines(
@@ -942,29 +1094,24 @@ fn render_boundary_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     render_inspector_lines(frame, content, lines);
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let border_style = if app.focus == Focus::Composer {
-        Style::default().fg(PANEL_BORDER)
-    } else {
-        Style::default().fg(PANEL_LINE)
-    };
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .style(Style::default().bg(PANEL_BG)),
-        area,
-    );
-    if area.width < 4 || area.height < 4 {
+fn render_run_prompt(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    if area.width < 4 || area.height == 0 {
         return;
     }
 
+    let status_height = u16::from(area.height >= 3);
+    let rule_height = u16::from(area.height >= 3);
+    let input_height = area
+        .height
+        .saturating_sub(status_height)
+        .saturating_sub(rule_height)
+        .max(1);
     frame.render_widget(
         Paragraph::new(Line::styled(">", Style::default().fg(PANEL_BORDER)))
             .style(Style::default().bg(PANEL_BG)),
         Rect {
-            x: area.x.saturating_add(2),
-            y: area.y.saturating_add(1),
+            x: area.x,
+            y: area.y,
             width: 1,
             height: 1,
         },
@@ -972,21 +1119,31 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     frame.render_widget(
         app.composer.widget(),
         Rect {
-            x: area.x.saturating_add(5),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(7),
-            height: area.height.saturating_sub(4),
+            x: area.x.saturating_add(3),
+            y: area.y,
+            width: area.width.saturating_sub(3),
+            height: input_height,
         },
     );
 
-    let rule_y = area.y + area.height - 3;
-    draw_horizontal_rule(
-        frame,
-        area.x.saturating_add(1),
-        rule_y,
-        area.width.saturating_sub(2),
-        PANEL_LINE,
+    if rule_height == 0 || status_height == 0 {
+        return;
+    }
+
+    let rule_y = area.y.saturating_add(input_height);
+    draw_horizontal_rule(frame, area.x, rule_y, area.width, PANEL_LINE);
+    frame.render_widget(
+        Paragraph::new(run_status_line(app)).style(Style::default().bg(PANEL_BG)),
+        Rect {
+            x: area.x,
+            y: rule_y.saturating_add(1),
+            width: area.width,
+            height: 1,
+        },
     );
+}
+
+fn run_status_line(app: &ConsoleApp) -> Line<'static> {
     let mode = if app.active() { "running" } else { "normal" };
     let mode_style = if app.active() {
         Style::default()
@@ -995,16 +1152,30 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     } else {
         Style::default().fg(PANEL_MUTED)
     };
-    let status = Line::from(vec![Span::styled(mode, mode_style)]);
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().bg(PANEL_BG)),
-        Rect {
-            x: area.x.saturating_add(2),
-            y: rule_y.saturating_add(1),
-            width: area.width.saturating_sub(4),
-            height: 1,
-        },
-    );
+    let mut spans = vec![Span::styled(mode, mode_style)];
+    if !app.status.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            app.status.clone(),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    if let Some(change) = app.activity.file_changes.last() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("files {}", change.label()),
+            Style::default().fg(PANEL_TEXT),
+        ));
+    } else if app.active() {
+        if let Some(item) = app.activity.items.last() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("latest {}", item.text),
+                Style::default().fg(PANEL_TEXT),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut ConsoleApp) {
@@ -1024,6 +1195,12 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut Con
             lines.push(Line::raw(format!(
                 "commands {}",
                 app.activity.command_count
+            )));
+        }
+        if app.activity.file_change_count > 0 {
+            lines.push(Line::raw(format!(
+                "file changes {}",
+                app.activity.file_change_count
             )));
         }
         if app.activity.progress_count > 0 {
@@ -1081,6 +1258,68 @@ fn render_audit_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp
     render_inspector_lines(frame, content, lines);
 }
 
+fn render_files_pane(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    let content = render_panel_shell(
+        frame,
+        area,
+        "Files",
+        app.focus == Focus::Controls && app.control_pane == ControlPane::Files,
+    );
+    render_inspector_lines(frame, content, file_change_pane_lines(app));
+}
+
+fn file_change_pane_lines(app: &ConsoleApp) -> Vec<Line<'static>> {
+    if app.activity.file_changes.is_empty() {
+        return vec![Line::styled(
+            "No file changes reported for the current turn.",
+            Style::default().fg(PANEL_MUTED),
+        )];
+    }
+
+    let mut lines = vec![
+        section_line("▤", "Changed Files"),
+        Line::raw(""),
+        kv_line("reported", &app.activity.file_change_count.to_string()),
+        Line::raw(""),
+    ];
+    for change in &app.activity.file_changes {
+        lines.push(Line::styled(
+            file_change_heading(change),
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for path in &change.paths {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(PANEL_MUTED)),
+                Span::styled(path.clone(), Style::default().fg(PANEL_TEXT)),
+            ]));
+        }
+        let hidden_count = change.hidden_count();
+        if hidden_count > 0 {
+            lines.push(Line::styled(
+                format!("  +{hidden_count} more"),
+                Style::default().fg(PANEL_MUTED),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn file_change_heading(change: &FileChangeSummary) -> String {
+    if change.path_count() > 1 {
+        format!(
+            "{} {} {} files",
+            change.runtime,
+            change.status.label(),
+            change.path_count()
+        )
+    } else {
+        format!("{} {}", change.runtime, change.status.label())
+    }
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     frame.render_widget(
         Block::default()
@@ -1093,7 +1332,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         return;
     }
     let mut spans = footer_hint_spans();
-    if app.focus == Focus::Project {
+    if app.focus == Focus::Controls && app.control_pane == ControlPane::Project {
         spans.push(Span::raw("  "));
         spans.push(key_span("Enter"));
         spans.push(Span::styled(
@@ -1271,6 +1510,7 @@ pub(super) fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
     let (icon, style) = match item.kind {
         ActivityItemKind::Done => ("✓", Style::default().fg(PANEL_READY)),
         ActivityItemKind::Command => ("→", Style::default().fg(PANEL_BORDER)),
+        ActivityItemKind::FileChange => ("▤", Style::default().fg(PANEL_BORDER)),
         ActivityItemKind::Progress => ("•", Style::default().fg(PANEL_BORDER)),
         ActivityItemKind::Status => ("→", Style::default().fg(PANEL_MUTED)),
         ActivityItemKind::Error => ("!", Style::default().fg(PANEL_ERROR)),
@@ -1398,7 +1638,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
                         "Switch from {} to {target_name}?",
                         app.selected_name()
                     )),
-                    Line::from("This changes the active runtime context, transcript, composer, and activity."),
+                    Line::from("This changes the active runtime context, transcript, prompt, and activity."),
                     Line::from("Press y to switch."),
                     Line::from("Press Esc to stay on the current instance."),
                 ],
@@ -1408,7 +1648,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
             " Switch Session ",
             vec![
                 Line::from(format!("Open session {}?", short_session_id(session_id))),
-                Line::from("This clears the current composer text and loads that transcript."),
+                Line::from("This clears the current prompt text and loads that transcript."),
                 Line::from("Press y to switch."),
                 Line::from("Press Esc to stay on the current session."),
             ],

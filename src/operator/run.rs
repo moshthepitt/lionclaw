@@ -597,6 +597,9 @@ fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result
         (StreamEventKindDto::Status, _, Some(text)) => {
             writeln!(output, "[status] {text}")?;
         }
+        (StreamEventKindDto::FileChange, _, Some(text)) => {
+            writeln!(output, "[files] {text}")?;
+        }
         (StreamEventKindDto::Error, _, Some(text)) => {
             writeln!(output, "[error] {text}")?;
         }
@@ -1423,30 +1426,35 @@ exit 7
                     lane: None,
                     code: None,
                     text: Some("runtime started".to_string()),
+                    file_change: None,
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::MessageDelta,
                     lane: Some(StreamLaneDto::Reasoning),
                     code: None,
                     text: Some("planning next step".to_string()),
+                    file_change: None,
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::MessageDelta,
                     lane: Some(StreamLaneDto::Answer),
                     code: None,
                     text: Some("hello\nworld".to_string()),
+                    file_change: None,
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::Error,
                     lane: None,
                     code: None,
                     text: Some("something failed".to_string()),
+                    file_change: None,
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::Done,
                     lane: None,
                     code: None,
                     text: None,
+                    file_change: None,
                 },
             ],
             &mut output,
