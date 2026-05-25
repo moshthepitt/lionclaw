@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
@@ -26,8 +27,8 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
 pub use execution::{
-    resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
-    validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
+    execute_attached, resolve_oci_image_compatibility_identity, skill_mount_target,
+    spawn_interactive, validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
     EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionOutput,
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
     ExecutionPreset, ExecutionRequest, ExecutionSession, MountAccess, MountSpec, NetworkMode,
@@ -127,6 +128,33 @@ pub struct RuntimeSessionStartInput {
 pub struct RuntimeSessionHandle {
     pub runtime_session_id: String,
     pub resumes_existing_session: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeTerminalTranscriptInput {
+    pub session_id: Uuid,
+    pub runtime_state_root: PathBuf,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTerminalTurnStatus {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTerminalTurn {
+    pub source_id: String,
+    pub display_user_text: String,
+    pub prompt_user_text: String,
+    pub assistant_text: String,
+    pub status: RuntimeTerminalTurnStatus,
+    pub error_code: Option<String>,
+    pub error_text: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +394,15 @@ pub trait RuntimeAdapter: Send + Sync {
     }
     fn build_turn_program(&self, _input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not support program-backed turns"))
+    }
+    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
+        Err(anyhow!("runtime does not expose a native terminal UI"))
+    }
+    async fn export_terminal_transcript(
+        &self,
+        _input: RuntimeTerminalTranscriptInput,
+    ) -> Result<Vec<RuntimeTerminalTurn>> {
+        Ok(Vec::new())
     }
     fn program_output_parser(
         &self,

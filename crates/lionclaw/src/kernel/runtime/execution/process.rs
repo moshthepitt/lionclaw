@@ -130,6 +130,40 @@ where
     })
 }
 
+pub async fn run_process_attached(invocation: &ProcessInvocation) -> Result<ProcessOutput> {
+    let mut command = Command::new(&invocation.executable);
+    command.args(&invocation.args);
+
+    if let Some(working_dir) = invocation.working_dir.as_deref() {
+        command.current_dir(working_dir);
+    }
+    if !invocation.environment.is_empty() {
+        command.envs(
+            invocation
+                .environment
+                .iter()
+                .map(|(key, value)| (key, value)),
+        );
+    }
+    command.kill_on_drop(true);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = spawn_with_retry(&mut command, &invocation.executable).await?;
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for subprocess")?;
+
+    Ok(ProcessOutput {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        exit_code: status.code(),
+    })
+}
+
 pub struct ProcessSession {
     child: Child,
     stdin: Option<ChildStdin>,

@@ -73,7 +73,7 @@ use crate::{
         PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
     },
     runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
-    workspace::{read_workspace_sections, GENERATED_AGENTS_FILE},
+    workspace::{read_workspace_sections, AGENTS_FILE, GENERATED_AGENTS_FILE},
 };
 
 use super::{
@@ -124,12 +124,14 @@ use super::{
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
         skill_mount_target, EffectiveExecutionPlan, EscapeClass, ExecutionPlanPurpose,
         ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
-        HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact,
-        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeControlExecution,
-        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
+        RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
+        RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -141,7 +143,10 @@ use super::{
         remove_open_loop_from_summary_state, render_compaction_summary, render_turns_for_prompt,
         turns_to_history_views, CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
-    session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
+    session_turns::{
+        ImportedSessionTurn, NewSessionTurn, SessionTurnCompletion, SessionTurnRecord,
+        SessionTurnStore,
+    },
     sessions::SessionStore,
     skills::validate_skill_alias,
 };
@@ -480,6 +485,13 @@ impl Default for KernelOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachedRuntimeLaunchInput {
+    pub session_id: Uuid,
+    pub runtime_id: String,
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct Kernel {
     sessions: SessionStore,
@@ -681,6 +693,294 @@ impl Kernel {
 
         kernel.bootstrap().await;
         Ok(kernel)
+    }
+
+    pub async fn prepare_attached_runtime_launch(
+        &self,
+        input: AttachedRuntimeLaunchInput,
+    ) -> Result<ExecutionRequest, KernelError> {
+        let AttachedRuntimeLaunchInput {
+            session_id,
+            runtime_id,
+            timeout_ms,
+        } = input;
+        let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
+            KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
+        })?;
+        let runtime_kind = adapter.info().await.id;
+        let program = adapter
+            .build_terminal_program()
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let RuntimeExecutionSkills {
+            mounts: skill_mounts,
+            ..
+        } = self
+            .resolve_runtime_execution_skills(RuntimeTurnMode::ProgramBacked)
+            .await?;
+        let execution_plan = self
+            .resolve_runtime_execution_plan(
+                session_id,
+                &runtime_id,
+                ExecutionPlanRequest {
+                    session_id: Some(session_id),
+                    runtime_id: runtime_id.clone(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    skill_mounts,
+                    extra_mounts: Vec::new(),
+                    timeout_ms,
+                },
+            )
+            .await?;
+        self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
+            .await?;
+        self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
+            .await?;
+        self.reconcile_attached_runtime_transcript_best_effort(
+            session_id,
+            &runtime_id,
+            &execution_plan,
+            None,
+            "before_launch",
+        )
+        .await;
+        self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
+            .await?;
+        let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
+        self.audit
+            .append(
+                "runtime.tui.launch",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_kind": runtime_kind,
+                    "program_executable": program.executable.clone(),
+                    "program_arg_count": program.args.len(),
+                    "preset_name": execution_plan.preset_name.clone(),
+                    "confinement_backend": execution_plan.confinement.backend().as_str(),
+                    "network_mode": execution_plan.network_mode.as_str(),
+                    "mount_runtime_secrets": execution_plan.mount_runtime_secrets,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ExecutionRequest {
+            plan: execution_plan,
+            program,
+            runtime_secrets_mount,
+            codex_home_override: self.codex_home_override.clone(),
+        })
+    }
+
+    async fn materialize_attached_runtime_context(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(());
+        };
+        let session = self.get_scoped_session(session_id).await?;
+        let mut sections = self.build_prompt_sections().await?;
+        sections.push(String::from(
+            "## Native Runtime TUI Session\n\nYou are running in the selected runtime's native terminal UI through LionClaw. Treat prompts typed here as part of this LionClaw session. LionClaw stores completed native UI turns after they are written to the runtime's durable transcript, so use the prior turns below for continuity when relevant.",
+        ));
+        sections.extend(
+            self.render_session_history_for_prompt(&session, 12, None)
+                .await
+                .map_err(internal)?,
+        );
+        sections.push(
+            "## Draft Outputs\n\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.".to_string(),
+        );
+        sections.push(
+            "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
+        );
+
+        let rendered = render_attached_runtime_context_file(runtime_id, &sections);
+        for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
+            tokio::fs::write(runtime_state_root.join(file_name), &rendered)
+                .await
+                .map_err(|err| internal(err.into()))?;
+        }
+        Ok(())
+    }
+
+    pub async fn finish_attached_runtime_launch(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        plan: &EffectiveExecutionPlan,
+        exit_code: Option<i32>,
+    ) -> Result<(), KernelError> {
+        self.reconcile_attached_runtime_transcript_best_effort(
+            session_id,
+            runtime_id,
+            plan,
+            exit_code,
+            "after_exit",
+        )
+        .await;
+        if exit_code == Some(0) {
+            self.mark_runtime_session_ready(plan).await;
+        }
+        self.audit
+            .append(
+                "runtime.tui.exit",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "exit_code": exit_code,
+                    "success": exit_code == Some(0),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn reconcile_attached_runtime_transcript_best_effort(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        plan: &EffectiveExecutionPlan,
+        exit_code: Option<i32>,
+        phase: &'static str,
+    ) {
+        match self
+            .reconcile_attached_runtime_transcript(session_id, runtime_id, plan, exit_code)
+            .await
+        {
+            Ok(imported_count) => {
+                self.append_audit_event_best_effort(
+                    "runtime.tui.reconcile",
+                    Some(session_id),
+                    "kernel",
+                    json!({
+                        "runtime_id": runtime_id,
+                        "phase": phase,
+                        "exit_code": exit_code,
+                        "imported_turn_count": imported_count,
+                    }),
+                )
+                .await;
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    runtime_id,
+                    session_id = %session_id,
+                    phase,
+                    "failed to reconcile attached runtime transcript"
+                );
+                self.append_audit_event_best_effort(
+                    "runtime.tui.reconcile_error",
+                    Some(session_id),
+                    "kernel",
+                    json!({
+                        "runtime_id": runtime_id,
+                        "phase": phase,
+                        "exit_code": exit_code,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn reconcile_attached_runtime_transcript(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        plan: &EffectiveExecutionPlan,
+        exit_code: Option<i32>,
+    ) -> Result<usize, KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
+            return Ok(0);
+        };
+        let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
+            KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
+        })?;
+        let mut turns = adapter
+            .export_terminal_transcript(RuntimeTerminalTranscriptInput {
+                session_id,
+                runtime_state_root,
+                exit_code,
+            })
+            .await
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        turns.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
+
+        let mut imported_count = 0usize;
+        for turn in turns {
+            let Some(imported) = self
+                .insert_attached_runtime_turn(session_id, runtime_id, turn)
+                .await?
+            else {
+                continue;
+            };
+            imported_count += 1;
+            self.sessions
+                .record_turn(imported.session_id)
+                .await
+                .map_err(internal)?;
+        }
+        if imported_count > 0 {
+            let session = self.get_scoped_session(session_id).await?;
+            self.maybe_compact_session_transcript_best_effort(&session)
+                .await;
+        }
+
+        Ok(imported_count)
+    }
+
+    async fn insert_attached_runtime_turn(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        turn: RuntimeTerminalTurn,
+    ) -> Result<Option<SessionTurnRecord>, KernelError> {
+        if turn.display_user_text.trim().is_empty()
+            || turn.prompt_user_text.trim().is_empty()
+            || turn.assistant_text.trim().is_empty()
+        {
+            return Ok(None);
+        }
+        let status = match turn.status {
+            RuntimeTerminalTurnStatus::Completed => SessionTurnStatus::Completed,
+            RuntimeTerminalTurnStatus::Failed => SessionTurnStatus::Failed,
+            RuntimeTerminalTurnStatus::Interrupted => SessionTurnStatus::Interrupted,
+        };
+        let turn_id = attached_runtime_turn_id(session_id, runtime_id, &turn.source_id);
+        self.session_turns
+            .insert_imported_turn_if_absent(ImportedSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                status,
+                display_user_text: turn.display_user_text,
+                prompt_user_text: turn.prompt_user_text,
+                assistant_text: turn.assistant_text,
+                error_code: turn.error_code,
+                error_text: turn.error_text,
+                attachment_source_turn_id: None,
+                runtime_id: runtime_id.to_string(),
+                started_at: turn.started_at,
+                finished_at: Some(turn.finished_at),
+            })
+            .await
+            .map_err(internal)
     }
 
     async fn bootstrap(&self) {
@@ -6338,6 +6638,24 @@ mod tests {
         assert!(debug.contains("/tmp/lionclaw-home"));
     }
 
+    #[test]
+    fn attached_runtime_context_file_wraps_sections() {
+        let rendered = render_attached_runtime_context_file(
+            "codex",
+            &[
+                "## MEMORY.md\n\nremember this".to_string(),
+                "## Prior Turn 1\n\n### User\n\nhello".to_string(),
+            ],
+        );
+
+        assert!(rendered.starts_with("# LionClaw Generated Agent Context"));
+        assert!(rendered.contains("runtime 'codex'"));
+        assert!(rendered.contains("<!-- LIONCLAW:START -->"));
+        assert!(rendered.contains("## MEMORY.md\n\nremember this"));
+        assert!(rendered.contains("## Prior Turn 1\n\n### User\n\nhello"));
+        assert!(rendered.ends_with("<!-- LIONCLAW:END -->\n"));
+    }
+
     fn test_execution_plan(runtime_id: &str) -> EffectiveExecutionPlan {
         EffectiveExecutionPlan {
             runtime_id: runtime_id.to_string(),
@@ -10832,6 +11150,18 @@ fn generate_pairing_code() -> String {
 
 fn generate_pairing_token() -> String {
     format!("lc_{}", Uuid::new_v4().simple())
+}
+
+fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str) -> Uuid {
+    let material = format!("lionclaw:runtime-tui-turn:{session_id}:{runtime_id}:{source_id}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, material.as_bytes())
+}
+
+fn render_attached_runtime_context_file(runtime_id: &str, sections: &[String]) -> String {
+    format!(
+        "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n\n<!-- LIONCLAW:START -->\n{}\n<!-- LIONCLAW:END -->\n",
+        sections.join("\n\n")
+    )
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {

@@ -20,7 +20,10 @@ use super::{
     },
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
-    process::{run_process_streaming, spawn_process_session, ProcessInvocation, ProcessSession},
+    process::{
+        run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
+        ProcessSession,
+    },
     runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
@@ -151,6 +154,35 @@ impl ExecutionBackend for OciExecutionBackend {
             process,
             runtime_secrets,
         }))
+    }
+
+    async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+        let prepared = prepare_oci_process_launch(
+            &request,
+            runtime_secrets
+                .as_ref()
+                .map(|secrets| secrets.secret_name.as_str()),
+        )?;
+        let invocation = build_oci_attached_process_invocation(prepared, &runtime_auth_environment);
+        let result = run_process_attached(&invocation).await;
+        let runtime_secrets_cleanup_result = match runtime_secrets {
+            Some(cleanup) => cleanup.shutdown().await,
+            None => Ok(()),
+        };
+
+        match (result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(err)) => {
+                warn!(
+                    error = %err,
+                    "runtime secret cleanup failed after attached OCI runtime"
+                );
+                Ok(output)
+            }
+            (Err(err), _) => Err(err),
+        }
     }
 }
 
@@ -472,7 +504,25 @@ fn build_oci_process_invocation(
     prepared: PreparedOciProcessLaunch,
     runtime_auth_environment: &[(String, String)],
 ) -> ProcessInvocation {
+    build_oci_process_invocation_with_terminal(prepared, runtime_auth_environment, false)
+}
+
+fn build_oci_attached_process_invocation(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth_environment: &[(String, String)],
+) -> ProcessInvocation {
+    build_oci_process_invocation_with_terminal(prepared, runtime_auth_environment, true)
+}
+
+fn build_oci_process_invocation_with_terminal(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth_environment: &[(String, String)],
+    attach_terminal: bool,
+) -> ProcessInvocation {
     let mut args = prepared.args;
+    if attach_terminal {
+        args.push("--tty".to_string());
+    }
 
     append_bind_mount_identity_args(&mut args);
 
