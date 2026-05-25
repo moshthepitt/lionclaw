@@ -555,6 +555,7 @@ mod tests {
             launch_mode,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(home).await.expect("save config");
     }
@@ -640,6 +641,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
 

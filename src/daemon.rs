@@ -5,6 +5,8 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use std::collections::BTreeSet;
+
 use crate::{
     api::build_router,
     applied::{compute_daemon_fingerprint, AppliedState},
@@ -15,7 +17,10 @@ use crate::{
     operator::{
         config::OperatorConfig,
         runtime::{register_configured_runtimes, resolve_runtime_execution_context},
-        target::project_instance_runtime_context_for_project_instance,
+        target::{
+            project_instance_runtime_context_for_project_instance,
+            project_instance_runtime_context_with_contacts,
+        },
     },
 };
 
@@ -49,6 +54,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             &project_instance.project_root,
             &project_instance.instance_name,
         )?),
+        None => None,
+    };
+    let project_instance_runtime = match project_instance_runtime {
+        Some(context) => {
+            let sender_channel_ids = applied_state
+                .channels()
+                .iter()
+                .map(|channel| channel.id.clone())
+                .collect::<BTreeSet<_>>();
+            Some(
+                project_instance_runtime_context_with_contacts(context, &sender_channel_ids)
+                    .await?,
+            )
+        }
         None => None,
     };
     let daemon_fingerprint =

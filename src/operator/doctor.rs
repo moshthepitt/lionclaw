@@ -2471,6 +2471,7 @@ mod tests {
             launch_mode,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         let db = crate::kernel::db::Db::connect_file(&home.db_path())
             .await
@@ -4220,6 +4221,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         let manager = FakeUnitManager::default();
         manager

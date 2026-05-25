@@ -17,7 +17,7 @@ use crate::{
         skills::{derive_skill_id, parse_skill_frontmatter, validate_skill_alias},
     },
     operator::{
-        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
     },
 };
@@ -245,6 +245,19 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
             hasher.update(b"required_env\0");
             hasher.update(key.as_bytes());
             hasher.update(b"\0");
+        }
+        if let Some(contact) = &channel.contact {
+            hasher.update(b"contact\0");
+            if let Some(conversation_ref) = &contact.conversation_ref {
+                hasher.update(b"conversation_ref\0");
+                hasher.update(conversation_ref.as_bytes());
+                hasher.update(b"\0");
+            }
+            if let Some(thread_ref) = &contact.thread_ref {
+                hasher.update(b"thread_ref\0");
+                hasher.update(thread_ref.as_bytes());
+                hasher.update(b"\0");
+            }
         }
     }
 
@@ -594,6 +607,7 @@ pub struct AppliedChannel {
     pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
+    pub contact: Option<ChannelContactConfig>,
 }
 
 impl AppliedChannel {
@@ -604,6 +618,7 @@ impl AppliedChannel {
             worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
+            contact: config.contact.clone(),
         }
     }
 }
@@ -756,6 +771,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
 
@@ -793,6 +809,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save first config");
 
@@ -804,6 +821,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save second config");
 

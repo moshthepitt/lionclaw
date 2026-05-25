@@ -92,6 +92,7 @@ impl TestHome {
             discovered.metadata.launch,
             discovered.metadata.worker.clone(),
             discovered.metadata.env.clone(),
+            None,
         )
         .await
         .expect("bind channel fixture");
