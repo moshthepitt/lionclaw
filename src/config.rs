@@ -5,6 +5,14 @@ use crate::runtime_timeouts::RuntimeTurnTimeouts;
 
 const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_BIND_PORT: &str = "8979";
+pub const DAEMON_PROJECT_ROOT_ENV: &str = "LIONCLAW_DAEMON_PROJECT_ROOT";
+pub const DAEMON_PROJECT_INSTANCE_ENV: &str = "LIONCLAW_DAEMON_PROJECT_INSTANCE";
+
+#[derive(Debug, Clone)]
+pub struct ConfiguredProjectInstance {
+    pub project_root: PathBuf,
+    pub instance_name: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +24,7 @@ pub struct Config {
     pub default_runtime_id: Option<String>,
     pub workspace_root: PathBuf,
     pub project_workspace_root: Option<PathBuf>,
+    pub project_instance: Option<ConfiguredProjectInstance>,
     pub codex_home_override: Option<PathBuf>,
 }
 
@@ -55,6 +64,7 @@ impl Config {
             Some(path) => Some(canonicalize_project_workspace_root(path)?),
             None => resolve_project_workspace_root().ok(),
         };
+        let project_instance = resolve_configured_project_instance()?;
         let codex_home_override = resolve_optional_env_override_path("CODEX_HOME")?;
 
         Ok(Self {
@@ -66,6 +76,7 @@ impl Config {
             default_runtime_id,
             workspace_root,
             project_workspace_root,
+            project_instance,
             codex_home_override,
         })
     }
@@ -121,6 +132,47 @@ fn configured_project_workspace_root() -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn resolve_configured_project_instance() -> std::io::Result<Option<ConfiguredProjectInstance>> {
+    resolve_configured_project_instance_from_values(
+        configured_daemon_project_root(),
+        configured_daemon_project_instance_name(),
+    )
+}
+
+fn resolve_configured_project_instance_from_values(
+    project_root: Option<PathBuf>,
+    instance_name: Option<String>,
+) -> std::io::Result<Option<ConfiguredProjectInstance>> {
+    match (project_root, instance_name) {
+        (Some(project_root), Some(instance_name)) => Ok(Some(ConfiguredProjectInstance {
+            project_root: canonicalize_project_workspace_root(project_root)?,
+            instance_name,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{DAEMON_PROJECT_ROOT_ENV} and {DAEMON_PROJECT_INSTANCE_ENV} must be set together"
+            ),
+        )),
+    }
+}
+
+fn configured_daemon_project_root() -> Option<PathBuf> {
+    std::env::var(DAEMON_PROJECT_ROOT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn configured_daemon_project_instance_name() -> Option<String> {
+    std::env::var(DAEMON_PROJECT_INSTANCE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn canonicalize_project_workspace_root(path: PathBuf) -> std::io::Result<PathBuf> {
@@ -185,8 +237,8 @@ fn join_host_port(host: &str, port: &str) -> String {
 mod tests {
     use super::{
         canonicalize_project_workspace_root, join_host_port, resolve_bind_addr,
-        resolve_optional_override_path, resolve_runtime_turn_timeout_ms, DEFAULT_BIND_HOST,
-        DEFAULT_BIND_PORT,
+        resolve_configured_project_instance_from_values, resolve_optional_override_path,
+        resolve_runtime_turn_timeout_ms, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
     };
     use tempfile::tempdir;
 
@@ -236,6 +288,34 @@ mod tests {
             .expect("resolve absolute path");
 
         assert_eq!(resolved, project_root);
+    }
+
+    #[test]
+    fn configured_project_instance_requires_root_and_name_together() {
+        let err = resolve_configured_project_instance_from_values(
+            Some(std::path::PathBuf::from("/tmp")),
+            None,
+        )
+        .expect_err("missing instance name should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn configured_project_instance_resolves_project_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root).expect("create project");
+
+        let project_instance = resolve_configured_project_instance_from_values(
+            Some(project_root.clone()),
+            Some("main".to_string()),
+        )
+        .expect("resolve project instance")
+        .expect("project instance");
+
+        assert_eq!(project_instance.project_root, project_root);
+        assert_eq!(project_instance.instance_name, "main");
     }
 
     #[test]

@@ -143,6 +143,8 @@ Confined runtime layout:
 - `/workspace`: selected work root
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
+- `/lionclaw/project/instances.json`: read-only project instance inventory,
+  present for project-backed program runtimes
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets
 - `/mnt/<target>`: optional operator-configured extra directories
 
@@ -179,6 +181,10 @@ Each project instance records a default work root. `project init` points `main`
 at the project root, and `instance create <name>` does the same unless you pass
 `--work-root PATH`. The confined runtime sees the selected work root at
 `/workspace`.
+
+Project-backed runtimes also receive `LIONCLAW_PROJECT_INSTANCE` and
+`LIONCLAW_PROJECT_INSTANCES_FILE`. The file is a read-only generated projection
+of configured project instance names, not a mount of raw `.lionclaw` metadata.
 
 Without `--home` or `--project`, LionClaw discovers only the current directory
 and its immediate parent. Use `--home PATH` when you need to target one exact

@@ -181,6 +181,15 @@ async fn try_open_selected_instance(
         &config,
         Some(runtime_id.clone()),
         work_root,
+        match (project_root, summary.name.as_deref()) {
+            (Some(project_root), Some(instance_name)) => Some(
+                crate::operator::target::project_instance_runtime_context_for_project_instance(
+                    project_root,
+                    instance_name,
+                )?,
+            ),
+            _ => None,
+        },
         Some(effective_timeouts),
     )
     .await?;

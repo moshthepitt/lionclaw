@@ -7,7 +7,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::home::LionClawHome;
+use crate::{
+    home::LionClawHome,
+    project_inventory::{ProjectInstanceInventory, ProjectInstanceRuntimeContext},
+};
 
 pub const PROJECT_DIR: &str = ".lionclaw";
 pub const PROJECT_FILE: &str = "project.toml";
@@ -42,6 +45,17 @@ impl TargetContext {
         self.work_root
             .as_deref()
             .ok_or_else(|| anyhow!("target does not have a resolved work root"))
+    }
+
+    pub fn project_instance_runtime_context(
+        &self,
+    ) -> Result<Option<ProjectInstanceRuntimeContext>> {
+        let (Some(project_root), Some(instance_name)) =
+            (self.project_root.as_deref(), self.instance_name.as_deref())
+        else {
+            return Ok(None);
+        };
+        project_instance_runtime_context_for_project_instance(project_root, instance_name).map(Some)
     }
 }
 
@@ -372,6 +386,83 @@ pub fn list_project_instance_statuses(project_root: &Path) -> Result<Vec<Instanc
             }
         })
         .collect())
+}
+
+pub fn runtime_project_instance_inventory(project_root: &Path) -> Result<ProjectInstanceInventory> {
+    let project_root = canonical_existing_dir(project_root, "project root")?;
+    let config = load_project_config(&project_root)?;
+    let names = valid_runtime_inventory_instance_names(&project_root)?;
+    let default_instance = config
+        .default_instance
+        .filter(|default| names.iter().any(|name| name == default));
+    Ok(ProjectInstanceInventory::new(default_instance, names))
+}
+
+pub fn project_instance_runtime_context_for_home(
+    home: &LionClawHome,
+) -> Result<Option<ProjectInstanceRuntimeContext>> {
+    let home_root = match fs::canonicalize(home.root()) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to resolve instance home {}", home.root().display())
+            });
+        }
+    };
+    let Some((project_root, instance_name)) = project_instance_home_parts(&home_root) else {
+        return Ok(None);
+    };
+    project_instance_runtime_context_for_project_instance(&project_root, &instance_name).map(Some)
+}
+
+pub fn project_instance_runtime_context_for_project_instance(
+    project_root: &Path,
+    instance_name: &str,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let inventory = runtime_project_instance_inventory(project_root)?;
+    if !inventory.contains_instance(instance_name) {
+        bail!(
+            "selected project instance '{instance_name}' is not a valid instance in {}",
+            project_root.display()
+        );
+    }
+    Ok(ProjectInstanceRuntimeContext {
+        instance_name: instance_name.to_string(),
+        inventory,
+    })
+}
+
+pub fn project_instance_name_for_home_in_project(
+    project_root: &Path,
+    home: &LionClawHome,
+) -> Result<String> {
+    let expected_project_root = canonical_existing_dir(project_root, "project root")?;
+    let home_root = fs::canonicalize(home.root())
+        .with_context(|| format!("failed to resolve instance home {}", home.root().display()))?;
+    let Some((home_project_root, instance_name)) = project_instance_home_parts(&home_root) else {
+        bail!(
+            "selected home '{}' is not a project instance home under {}",
+            home.root().display(),
+            expected_project_root.display()
+        );
+    };
+    if home_project_root != expected_project_root {
+        bail!(
+            "selected home '{}' belongs to {}, not {}",
+            home.root().display(),
+            home_project_root.display(),
+            expected_project_root.display()
+        );
+    }
+    let inventory = runtime_project_instance_inventory(&expected_project_root)?;
+    if !inventory.contains_instance(&instance_name) {
+        bail!(
+            "selected project instance '{instance_name}' is not a valid instance in {}",
+            expected_project_root.display()
+        );
+    }
+    Ok(instance_name)
 }
 
 pub fn inspect_target_work_root(target: &TargetContext) -> WorkRootInspection {
@@ -858,6 +949,41 @@ fn list_instance_names(project_root: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+fn valid_runtime_inventory_instance_names(project_root: &Path) -> Result<Vec<String>> {
+    let instances = instances_dir(project_root);
+    if !instances.exists() {
+        return Ok(Vec::new());
+    }
+    ensure_directory_not_symlink(&instances, "instances directory")?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&instances)
+        .with_context(|| format!("failed to read {}", instances.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to iterate {}", instances.display()))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if validate_instance_name(name).is_err() {
+            continue;
+        }
+        if inspect_project_instance_work_root(project_root, &path)
+            .finding
+            .is_none()
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 fn canonical_project_root(project_root: &Path) -> Result<PathBuf> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     load_project_config(&project_root)?;
@@ -998,6 +1124,23 @@ fn containing_project_instance_home(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+fn project_instance_home_parts(home_root: &Path) -> Option<(PathBuf, String)> {
+    let name = home_root.file_name()?.to_str()?.to_string();
+    if validate_instance_name(&name).is_err() {
+        return None;
+    }
+    let instances_root = home_root.parent()?;
+    if instances_root.file_name().and_then(|value| value.to_str()) != Some(INSTANCES_DIR) {
+        return None;
+    }
+    let metadata_root = instances_root.parent()?;
+    if metadata_root.file_name().and_then(|value| value.to_str()) != Some(PROJECT_DIR) {
+        return None;
+    }
+    let project_root = metadata_root.parent()?;
+    Some((project_root.to_path_buf(), name))
+}
+
 fn project_dir(project_root: &Path) -> PathBuf {
     project_root.join(PROJECT_DIR)
 }
@@ -1085,8 +1228,10 @@ mod tests {
     use super::{
         adopt_project_instance, create_project_instance, discover_diagnostic_project_root_from_cwd,
         init_project, list_project_instances, normalize_project_default_instance,
-        resolve_project_setup_root_from_cwd, resolve_target_from_cwd, TargetSelection,
-        WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
+        project_instance_name_for_home_in_project, project_instance_runtime_context_for_home,
+        resolve_project_setup_root_from_cwd, resolve_target_from_cwd,
+        runtime_project_instance_inventory, TargetSelection, WorkRootRequirement, DEFAULT_INSTANCE,
+        PROJECT_DIR,
     };
 
     #[test]
@@ -1495,6 +1640,114 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.shared_work_root_count == 2));
+    }
+
+    #[test]
+    fn runtime_inventory_lists_valid_instances_sorted() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        create_project_instance(temp_dir.path(), "qa", None, false).expect("create qa");
+
+        let inventory = runtime_project_instance_inventory(temp_dir.path()).expect("inventory");
+        let names = inventory
+            .instances
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_value(&inventory).expect("json value");
+
+        assert_eq!(inventory.schema_version, 1);
+        assert_eq!(inventory.default_instance.as_deref(), Some("main"));
+        assert_eq!(names, vec!["main", "qa", "reviewer"]);
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "schema_version": 1,
+                "default_instance": "main",
+                "instances": [
+                    { "name": "main" },
+                    { "name": "qa" },
+                    { "name": "reviewer" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_inventory_omits_broken_instances_and_invalid_default() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        let outside = tempdir().expect("outside");
+        create_project_instance(temp_dir.path(), "broken", None, false).expect("create broken");
+        fs::write(
+            temp_dir
+                .path()
+                .join(".lionclaw/instances/broken/config/instance.toml"),
+            format!(
+                "version = 1\nwork_root = \"{}\"\n",
+                outside.path().display()
+            ),
+        )
+        .expect("break instance config");
+        fs::create_dir_all(temp_dir.path().join(".lionclaw/instances/not path safe"))
+            .expect("invalid instance dir");
+        fs::write(
+            temp_dir.path().join(".lionclaw/project.toml"),
+            "version = 1\ndefault_instance = \"broken\"\n",
+        )
+        .expect("point default at broken instance");
+
+        let inventory = runtime_project_instance_inventory(temp_dir.path()).expect("inventory");
+        let names = inventory
+            .instances
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(inventory.default_instance, None);
+        assert_eq!(names, vec!["main"]);
+    }
+
+    #[test]
+    fn runtime_context_for_project_instance_home_uses_existing_instance_name() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        let home = crate::home::LionClawHome::new(
+            temp_dir
+                .path()
+                .join(".lionclaw/instances/reviewer")
+                .canonicalize()
+                .expect("canonical reviewer home"),
+        );
+
+        let context = project_instance_runtime_context_for_home(&home)
+            .expect("context")
+            .expect("project context");
+
+        assert_eq!(context.instance_name, "reviewer");
+        assert!(context.inventory.contains_instance("main"));
+        assert!(context.inventory.contains_instance("reviewer"));
+    }
+
+    #[test]
+    fn project_instance_name_for_home_requires_matching_project() {
+        let left = tempdir().expect("left project");
+        let right = tempdir().expect("right project");
+        init_project(left.path()).expect("init left project");
+        init_project(right.path()).expect("init right project");
+        let home = crate::home::LionClawHome::new(
+            left.path()
+                .join(".lionclaw/instances/main")
+                .canonicalize()
+                .expect("canonical main home"),
+        );
+
+        let err = project_instance_name_for_home_in_project(right.path(), &home)
+            .expect_err("home from another project should fail");
+
+        assert!(err.to_string().contains("belongs to"));
     }
 
     #[test]

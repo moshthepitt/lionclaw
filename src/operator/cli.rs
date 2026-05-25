@@ -46,7 +46,7 @@ use crate::{
             pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
             remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
         },
-        run::run_local,
+        run::{run_local, RunLocalInvocation},
         run_tui::{
             run_console, run_launch_blocker, run_project_launch_blocker, LaunchBlocker,
             RunConsoleInvocation,
@@ -69,9 +69,11 @@ use crate::{
         target::{
             adopt_project_instance, create_project_instance, discover_project_root, init_project,
             list_project_instance_statuses, list_project_instances, resolve_existing_project_root,
-            resolve_project_setup_root, resolve_target, TargetSelection, WorkRootRequirement,
+            resolve_project_setup_root, resolve_target, TargetContext, TargetSelection,
+            WorkRootRequirement,
         },
     },
+    project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
 };
 
@@ -817,15 +819,16 @@ pub async fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             } else {
-                run_local(
-                    &target.instance_home,
-                    target.project_root.as_deref(),
-                    target.require_work_root()?,
-                    target.instance_name.as_deref(),
-                    args.runtime,
-                    args.continue_last_session,
+                run_local(RunLocalInvocation {
+                    home: &target.instance_home,
+                    project_root: target.project_root.as_deref(),
+                    work_root: target.require_work_root()?,
+                    instance_name: target.instance_name.as_deref(),
+                    project_instance_runtime: target.project_instance_runtime_context()?,
+                    requested_runtime: args.runtime,
+                    continue_last_session: args.continue_last_session,
                     timeout_override,
-                )
+                })
                 .await?;
             }
         }
@@ -1282,9 +1285,19 @@ pub async fn run() -> Result<ExitCode> {
                 ContinuityCommand::Drafts { command } => {
                     let work_root =
                         required_command_work_root(&resolved_target, "continuity drafts")?;
-                    let kernel =
-                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
-                            .await?;
+                    let project_instance_runtime = required_project_instance_runtime_context(
+                        &resolved_target,
+                        "continuity drafts",
+                    )?;
+                    let kernel = open_runtime_kernel_for_work_root(
+                        &home,
+                        &config,
+                        None,
+                        work_root,
+                        project_instance_runtime,
+                        None,
+                    )
+                    .await?;
                     match command {
                         ContinuityDraftCommand::Ls(args) => {
                             let response = kernel
@@ -1444,9 +1457,17 @@ pub async fn run() -> Result<ExitCode> {
             match command {
                 JobCommand::Run(args) => {
                     let work_root = required_command_work_root(&resolved_target, "job run")?;
-                    let kernel =
-                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
-                            .await?;
+                    let project_instance_runtime =
+                        required_project_instance_runtime_context(&resolved_target, "job run")?;
+                    let kernel = open_runtime_kernel_for_work_root(
+                        &home,
+                        &config,
+                        None,
+                        work_root,
+                        project_instance_runtime,
+                        None,
+                    )
+                    .await?;
                     let job_id = parse_job_id(&args.job_id)?;
                     let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
                     println!(
@@ -1456,9 +1477,17 @@ pub async fn run() -> Result<ExitCode> {
                 }
                 JobCommand::Tick => {
                     let work_root = required_command_work_root(&resolved_target, "job tick")?;
-                    let kernel =
-                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
-                            .await?;
+                    let project_instance_runtime =
+                        required_project_instance_runtime_context(&resolved_target, "job tick")?;
+                    let kernel = open_runtime_kernel_for_work_root(
+                        &home,
+                        &config,
+                        None,
+                        work_root,
+                        project_instance_runtime,
+                        None,
+                    )
+                    .await?;
                     let response = kernel.scheduler_tick().await?;
                     println!("claimed {} scheduled runs", response.claimed_runs);
                 }
@@ -1716,13 +1745,23 @@ fn resolve_command_target(
 }
 
 fn required_command_work_root<'a>(
-    resolved_target: &'a Option<crate::operator::target::TargetContext>,
+    resolved_target: &'a Option<TargetContext>,
     command: &str,
 ) -> Result<&'a Path> {
     let target = resolved_target
         .as_ref()
         .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
     target.require_work_root()
+}
+
+fn required_project_instance_runtime_context(
+    resolved_target: &Option<TargetContext>,
+    command: &str,
+) -> Result<Option<ProjectInstanceRuntimeContext>> {
+    let target = resolved_target
+        .as_ref()
+        .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
+    target.project_instance_runtime_context()
 }
 
 fn validate_project_wide_target(command: &str, selection: &TargetSelection) -> Result<()> {

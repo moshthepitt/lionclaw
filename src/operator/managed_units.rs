@@ -10,6 +10,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    config::{DAEMON_PROJECT_INSTANCE_ENV, DAEMON_PROJECT_ROOT_ENV},
     home::LionClawHome,
     operator::private_paths::{
         create_private_dir_all, ensure_private_file_readable, ensure_private_file_write_target,
@@ -81,8 +82,15 @@ pub struct DaemonUnitSpec<'a> {
     pub runtime_id: &'a str,
     pub workspace: &'a str,
     pub project_workspace_root: &'a Path,
+    pub project_instance: Option<DaemonProjectInstanceSpec<'a>>,
     pub daemon_fingerprint: &'a str,
     pub codex_home_override: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonProjectInstanceSpec<'a> {
+    pub project_root: &'a Path,
+    pub instance_name: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +424,16 @@ pub fn render_daemon_unit(
             spec.daemon_fingerprint.to_string(),
         ),
     ];
+    if let Some(project_instance) = spec.project_instance {
+        env_lines.push((
+            DAEMON_PROJECT_ROOT_ENV.to_string(),
+            project_instance.project_root.display().to_string(),
+        ));
+        env_lines.push((
+            DAEMON_PROJECT_INSTANCE_ENV.to_string(),
+            project_instance.instance_name.to_string(),
+        ));
+    }
     if let Some(codex_home_override) = spec.codex_home_override {
         env_lines.push((
             "CODEX_HOME".to_string(),
@@ -1192,6 +1210,10 @@ mod tests {
                 runtime_id: "codex",
                 workspace: "main",
                 project_workspace_root: Path::new("/tmp/project"),
+                project_instance: Some(super::DaemonProjectInstanceSpec {
+                    project_root: Path::new("/tmp/project"),
+                    instance_name: "main",
+                }),
                 daemon_fingerprint: "daemon-state-test",
                 codex_home_override: Some(Path::new("/tmp/custom-codex-home")),
             },
@@ -1204,6 +1226,12 @@ mod tests {
         assert!(daemon
             .env_content
             .contains("LIONCLAW_WORKSPACE_ROOT=\"/tmp/project\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_DAEMON_PROJECT_ROOT=\"/tmp/project\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_DAEMON_PROJECT_INSTANCE=\"main\""));
         assert!(daemon
             .env_content
             .contains("LIONCLAW_DAEMON_FINGERPRINT=\"daemon-state-test\""));
