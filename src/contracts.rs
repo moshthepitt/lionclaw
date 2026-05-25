@@ -730,6 +730,7 @@ impl FromStr for ChannelRoutingProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ChannelTrigger {
     Dm,
+    Command,
     Mention,
     ReplyToBot,
     ThreadContinuation,
@@ -740,6 +741,7 @@ impl ChannelTrigger {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dm => "dm",
+            Self::Command => "command",
             Self::Mention => "mention",
             Self::ReplyToBot => "reply_to_bot",
             Self::ThreadContinuation => "thread_continuation",
@@ -754,6 +756,7 @@ impl FromStr for ChannelTrigger {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "dm" => Ok(Self::Dm),
+            "command" => Ok(Self::Command),
             "mention" => Ok(Self::Mention),
             "reply_to_bot" => Ok(Self::ReplyToBot),
             "thread_continuation" => Ok(Self::ThreadContinuation),
@@ -903,6 +906,27 @@ pub struct ChannelPairingListParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChannelActorAuthorizeRequest {
+    pub channel_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub trigger: ChannelTrigger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelActorAuthorizeResponse {
+    pub authorized: bool,
+    pub reason_code: String,
+    #[serde(default)]
+    pub grant_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelPairingInviteRequest {
     pub channel_id: String,
     pub requested_profile: ChannelRoutingProfile,
@@ -916,6 +940,8 @@ pub struct ChannelPairingInviteRequest {
     pub expires_in_ms: Option<u64>,
     #[serde(default)]
     pub max_claims: Option<u32>,
+    #[serde(default)]
+    pub operator_actor: Option<ChannelOperatorActor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -926,6 +952,12 @@ pub struct ChannelPairingInviteResponse {
     pub requested_profile: ChannelRoutingProfile,
     pub expires_at: DateTime<Utc>,
     pub max_claims: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelOperatorActor {
+    pub sender_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -20,6 +20,17 @@ class InboundResponse:
     reason_code: str | None = None
     pairing_id: str | None = None
     pairing_code: str | None = None
+    turn_id: str | None = None
+    session_id: str | None = None
+    session_key: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ActorAuthorizeResponse:
+    authorized: bool
+    reason_code: str
+    grant_id: str | None = None
+    session_key: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -27,6 +38,14 @@ class PairingClaimResponse:
     outcome: str
     grant_id: str | None = None
     reason_code: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PairingInviteResponse:
+    pairing_id: str
+    token: str
+    expires_at: str
+    max_claims: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,6 +85,12 @@ class HealthReportResponse:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionActionResult:
+    session_id: str
+    turn_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class StreamEvent:
     sequence: int
     peer_id: str
@@ -99,6 +124,8 @@ class OutboxDelivery:
     content: OutboxContent
     thread_ref: str | None = None
     reply_to_ref: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -157,6 +184,58 @@ class LionClawApi:
             reason_code=payload.get("reason_code"),
             pairing_id=payload.get("pairing_id"),
             pairing_code=payload.get("pairing_code"),
+            turn_id=payload.get("turn_id"),
+            session_id=payload.get("session_id"),
+            session_key=payload.get("session_key"),
+        )
+
+    async def authorize_actor(
+        self,
+        update: TelegramInboundUpdate,
+    ) -> ActorAuthorizeResponse:
+        response = await self._client.post(
+            "/v0/channels/authorize",
+            json={
+                "channel_id": self.channel_id,
+                "sender_ref": update.sender_ref,
+                "conversation_ref": update.conversation_ref,
+                "thread_ref": update.thread_ref,
+                "trigger": update.trigger,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return ActorAuthorizeResponse(
+            authorized=payload["authorized"],
+            reason_code=payload["reason_code"],
+            grant_id=payload.get("grant_id"),
+            session_key=payload.get("session_key"),
+        )
+
+    async def cancel_active_turn(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        expected_turn_id: str | None,
+        reason: str,
+    ) -> SessionActionResult:
+        response = await self._client.post(
+            "/v0/sessions/action",
+            json={
+                "action": "cancel_active_turn",
+                "session_id": session_id,
+                "channel_id": self.channel_id,
+                "session_key": session_key,
+                "expected_turn_id": expected_turn_id,
+                "reason": reason,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return SessionActionResult(
+            session_id=payload["session_id"],
+            turn_id=payload.get("turn_id"),
         )
 
     async def claim_pairing(self, claim: TelegramPairingClaim) -> PairingClaimResponse:
@@ -177,6 +256,35 @@ class LionClawApi:
             outcome=payload["outcome"],
             grant_id=payload.get("grant_id"),
             reason_code=payload.get("reason_code"),
+        )
+
+    async def create_group_invite(
+        self,
+        *,
+        operator_sender_ref: str,
+        label: str | None = None,
+        expires_in_ms: int = 10 * 60 * 1000,
+    ) -> PairingInviteResponse:
+        response = await self._client.post(
+            "/v0/channels/pairing/invite",
+            json={
+                "channel_id": self.channel_id,
+                "requested_profile": "conversation",
+                "label": label,
+                "conversation_ref": None,
+                "thread_ref": None,
+                "expires_in_ms": expires_in_ms,
+                "max_claims": 1,
+                "operator_actor": {"sender_ref": operator_sender_ref},
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return PairingInviteResponse(
+            pairing_id=payload["pairing_id"],
+            token=payload["token"],
+            expires_at=payload["expires_at"],
+            max_claims=payload["max_claims"],
         )
 
     async def stage_attachment(
@@ -248,11 +356,11 @@ class LionClawApi:
         checks: list[HealthCheck],
         observed_at: datetime | None = None,
     ) -> HealthReportResponse:
-        observed_at = observed_at or datetime.now(timezone.utc)
+        observed_at = observed_at or datetime.now(UTC)
         if observed_at.tzinfo is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
+            observed_at = observed_at.replace(tzinfo=UTC)
         else:
-            observed_at = observed_at.astimezone(timezone.utc)
+            observed_at = observed_at.astimezone(UTC)
         response = await self._client.post(
             "/v0/channels/health/report",
             json={
@@ -303,7 +411,7 @@ class LionClawApi:
                 turn_id=item.get("turn_id", ""),
                 lane=item.get("lane"),
                 code=item.get("code"),
-                text=item.get("text", ""),
+                text=_optional_event_text(item),
             )
             for item in events
         ]
@@ -355,6 +463,8 @@ class LionClawApi:
                     conversation_ref=item["conversation_ref"],
                     thread_ref=item.get("thread_ref"),
                     reply_to_ref=item.get("reply_to_ref"),
+                    session_id=item.get("session_id"),
+                    turn_id=item.get("turn_id"),
                     content=OutboxContent(
                         text=content["text"],
                         format_hint=content.get("format_hint") or "plain",
@@ -413,6 +523,15 @@ def _raise_for_status(response: httpx.Response) -> None:
                 f"{response.status_code} {response.reason_phrase}: {body}"
             ) from err
         raise
+
+
+def _optional_event_text(item: dict[str, Any]) -> str:
+    text = item.get("text")
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        raise RuntimeError("stream event text must be a string when present")
+    return text
 
 
 def _attachment_descriptor(attachment: TelegramInboundAttachment) -> dict[str, Any]:

@@ -1046,7 +1046,7 @@ async fn project_objects_load_real_sessions() {
 
 #[tokio::test]
 async fn audit_loads_real_session_events() {
-    let (mut app, current_session_id, _) = ready_project_session_app().await;
+    let (mut app, current_session_id, _, _temp_dir) = ready_project_session_app().await;
 
     app.refresh_audit().await;
 
@@ -1062,7 +1062,8 @@ async fn audit_loads_real_session_events() {
 #[tokio::test]
 async fn project_session_activation_switches_selected_session() {
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
-    let (mut app, current_session_id, next_session_id) = ready_project_session_app().await;
+    let (mut app, current_session_id, next_session_id, _temp_dir) =
+        ready_project_session_app().await;
     app.project_cursor = ProjectSelection::Session(next_session_id);
     app.focus = Focus::Project;
 
@@ -1087,7 +1088,8 @@ async fn project_session_activation_switches_selected_session() {
 #[tokio::test]
 async fn project_session_activation_confirms_before_clearing_composer() {
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
-    let (mut app, current_session_id, next_session_id) = ready_project_session_app().await;
+    let (mut app, current_session_id, next_session_id, _temp_dir) =
+        ready_project_session_app().await;
     app.project_cursor = ProjectSelection::Session(next_session_id);
     app.focus = Focus::Project;
     app.composer = ConsoleComposer::from_text("unsent prompt");
@@ -1490,7 +1492,7 @@ fn inspector_left_right_cycles_subjects() {
     assert_eq!(app.inspector_subject, InspectorSubject::Selection);
 }
 
-async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
+async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let workspace_root = temp_dir.path().join("workspace");
     let runtime_root = temp_dir.path().join("runtime");
@@ -1580,7 +1582,12 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
         saw_ready_instance: true,
         should_quit: false,
     };
-    (app, first_session.session_id, next_session.session_id)
+    (
+        app,
+        first_session.session_id,
+        next_session.session_id,
+        temp_dir,
+    )
 }
 
 fn blocked_test_app() -> ConsoleApp {

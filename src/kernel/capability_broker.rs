@@ -10,8 +10,15 @@ const FS_READ_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CapabilityExecutionContext<'a> {
-    pub session_channel_id: &'a str,
-    pub session_peer_id: &'a str,
+    pub channel_send_route: Option<CapabilityChannelSendRoute<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CapabilityChannelSendRoute<'a> {
+    pub channel_id: &'a str,
+    pub conversation_ref: &'a str,
+    pub thread_ref: Option<&'a str>,
+    pub reply_to_ref: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +243,30 @@ struct ChannelSendRequest {
     channel_id: Option<String>,
     #[serde(default)]
     conversation_ref: Option<String>,
+    #[serde(default)]
+    thread_ref: Option<String>,
+    #[serde(default)]
+    reply_to_ref: Option<String>,
     content: String,
+}
+
+impl ChannelSendRequest {
+    fn route_override_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.channel_id.is_some() {
+            fields.push("channel_id");
+        }
+        if self.conversation_ref.is_some() {
+            fields.push("conversation_ref");
+        }
+        if self.thread_ref.is_some() {
+            fields.push("thread_ref");
+        }
+        if self.reply_to_ref.is_some() {
+            fields.push("reply_to_ref");
+        }
+        fields
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,35 +279,51 @@ async fn build_channel_send_intent(
     payload: &Value,
 ) -> Result<Value> {
     let request: ChannelSendRequest = parse_payload(payload, Capability::ChannelSend)?;
+    let route = context
+        .channel_send_route
+        .ok_or_else(|| anyhow!("channel.send is only available in channel sessions"))?;
+    let override_fields = request.route_override_fields();
+    if !override_fields.is_empty() {
+        return Err(anyhow!(
+            "channel.send route is derived from the current channel session; remove {}",
+            override_fields.join(", ")
+        ));
+    }
+
     if request.content.trim().is_empty() {
         return Err(anyhow!("channel.send content cannot be empty"));
     }
 
-    let channel_id = request
-        .channel_id
-        .as_deref()
-        .unwrap_or(context.session_channel_id)
-        .trim()
-        .to_string();
+    let channel_id = route.channel_id.trim();
     if channel_id.is_empty() {
         return Err(anyhow!("channel.send channel_id cannot be empty"));
     }
 
-    let conversation_ref = request
-        .conversation_ref
-        .as_deref()
-        .unwrap_or(context.session_peer_id)
-        .trim()
-        .to_string();
+    let conversation_ref = route.conversation_ref.trim();
     if conversation_ref.is_empty() {
         return Err(anyhow!("channel.send conversation_ref cannot be empty"));
     }
 
-    Ok(json!({
-        "channel_id": channel_id,
-        "conversation_ref": conversation_ref,
-        "content": request.content,
-    }))
+    let mut intent = serde_json::Map::from_iter([
+        ("channel_id".to_string(), json!(channel_id)),
+        ("conversation_ref".to_string(), json!(conversation_ref)),
+        ("content".to_string(), json!(request.content)),
+    ]);
+    if let Some(thread_ref) = route
+        .thread_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        intent.insert("thread_ref".to_string(), json!(thread_ref));
+    }
+    if let Some(reply_to_ref) = route
+        .reply_to_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        intent.insert("reply_to_ref".to_string(), json!(reply_to_ref));
+    }
+    Ok(Value::Object(intent))
 }
 
 fn parse_payload<T>(payload: &Value, capability: Capability) -> Result<T>

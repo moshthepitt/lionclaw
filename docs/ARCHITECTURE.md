@@ -184,10 +184,10 @@ persisted as `runtime_control` turns. The kernel records
 `runtime.control.outcome` audit events around those turns. Runtime adapters
 decide whether a control is handled, unsupported, interactive-only, or failed.
 
-This keeps native runtime commands such as Codex `/model`, `/rename`, and
-`/compact` native to the selected runtime without teaching the kernel
-runtime-specific command semantics. Leading-space slash input and path-like
-slash input remain ordinary prompts.
+This keeps native runtime commands such as `/compact` and `/rename` native to
+the selected runtime without teaching the kernel runtime-specific command
+semantics. Leading-space slash input and path-like slash input remain ordinary
+prompts.
 
 ## Direct Runtime And Brokered Capability Flow
 
@@ -202,6 +202,11 @@ Direct runtimes may submit `RuntimeCapabilityRequest` items. Kernel flow:
 This broker is not the normal filesystem and shell path for program-backed
 runtimes. It is reserved for explicit LionClaw-owned actions, direct runtimes,
 narrow non-runtime surfaces, and tests.
+
+Brokered `channel.send` is route-bound to the current channel session. Runtime
+payloads provide content only; the kernel derives channel, conversation, topic,
+and reply routing from the approved session and active turn before enqueueing an
+outbox delivery.
 
 ## Program-Backed `channel.send`
 
@@ -586,10 +591,21 @@ turn signals the in-memory runtime cancellation token, calls the adapter's
 the same terminalization path.
 Proactive pairing invites reuse `channel_pairing_requests` with
 `claim_policy = token_claim`; raw invite tokens are never stored, claim counts
-advance inside the same transaction that creates the scoped grant, and expired
-blocked, or over-claimed tokens cannot authorize a channel sender. Pairing claim
-audit stores normalized identity and outcome facts only, never raw worker
-provider metadata.
+advance inside the same transaction that creates the scoped grant, and expired,
+blocked, or over-claimed tokens cannot authorize a channel sender. Invite
+creation may carry a channel-neutral operator actor; the kernel validates that
+actor against an approved direct host grant on the same channel before minting
+the token and records the actor in audit. Channel workers may publish a public
+`pairing_url_template` in health-check details; operator commands can fill its
+`{token}` placeholder with a one-use invite token without hard-coding provider
+URL rules in the kernel or CLI. Conversation grants can be
+conversation-wide (`sender_ref` absent) so a delegated group invite connects the
+group rather than the admin who happened to claim the link. Non-direct channel
+routes still require the sender to have an approved direct host grant before a
+turn or local channel control is authorized; the route grant authorizes the
+destination, and the direct grant authorizes the actor. Pairing claim audit
+stores normalized identity and outcome facts only, never raw worker provider
+metadata.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused. Durable pending channel turns are

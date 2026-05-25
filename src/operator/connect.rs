@@ -119,7 +119,7 @@ where
         .find(|channel| channel.id == channel_id)
         .cloned();
     let rollback = ConnectRollback::capture(home, &channel_id, previous_channel, &discovered)?;
-    let required_env = match ensure_required_env(
+    if let Err(err) = ensure_required_env(
         RequiredEnvRequest {
             home,
             channel_id: &channel_id,
@@ -131,9 +131,8 @@ where
         input,
         output,
     ) {
-        Ok(outcome) => outcome,
-        Err(err) => return Err(rollback.restore_channel_env_only(home, &channel_id, err)),
-    };
+        return Err(rollback.restore_channel_env_only(home, &channel_id, err));
+    }
     let skill_alias = match install_or_select_skill(home, &discovered, &config).await {
         Ok(skill_alias) => skill_alias,
         Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
@@ -184,7 +183,7 @@ where
             {
                 return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
-            if required_env.changed && channel_was_active {
+            if channel_was_active {
                 if let Err(err) = restart_background_channel(home, manager, &channel_id).await {
                     return rollback_all_and_return(home, &channel_id, rollback, err).await;
                 }
@@ -555,16 +554,11 @@ struct RequiredEnvRequest<'a> {
     hide_prompt_input: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RequiredEnvOutcome {
-    changed: bool,
-}
-
 fn ensure_required_env<R: BufRead, W: Write>(
     request: RequiredEnvRequest<'_>,
     input: &mut R,
     output: &mut W,
-) -> Result<RequiredEnvOutcome> {
+) -> Result<()> {
     let RequiredEnvRequest {
         home,
         channel_id,
@@ -574,7 +568,6 @@ fn ensure_required_env<R: BufRead, W: Write>(
         hide_prompt_input,
     } = request;
     let mut updates = ChannelEnv::new();
-    let mut changed = false;
     if let Some(path) = env_inputs.env_file.as_deref() {
         let file_updates = parse_env_file(path)?;
         validate_declared_env_updates(channel_id, required_env, &file_updates, "env file")?;
@@ -584,14 +577,14 @@ fn ensure_required_env<R: BufRead, W: Write>(
     updates.extend(collect_from_process_env(&env_inputs.from_env)?);
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     if !updates.is_empty() {
-        changed |= merge_changed_channel_env(home, channel_id, &updates)?;
+        merge_channel_env_if_changed(home, channel_id, &updates)?;
     }
 
     let stored = load_channel_env(home, channel_id)?;
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
-        return Ok(RequiredEnvOutcome { changed });
+        return Ok(());
     }
     let repair_command = lionclaw_home_command_prefix(home);
     if !interactive {
@@ -603,12 +596,12 @@ fn ensure_required_env<R: BufRead, W: Write>(
     }
 
     let prompted = prompt_required_env(channel_id, &missing, hide_prompt_input, input, output)?;
-    changed |= merge_changed_channel_env(home, channel_id, &prompted)?;
+    merge_channel_env_if_changed(home, channel_id, &prompted)?;
     let stored = load_channel_env(home, channel_id)?;
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
-        Ok(RequiredEnvOutcome { changed })
+        Ok(())
     } else {
         Err(anyhow!(render_missing_env_repair(
             &repair_command,
@@ -618,11 +611,11 @@ fn ensure_required_env<R: BufRead, W: Write>(
     }
 }
 
-fn merge_changed_channel_env(
+fn merge_channel_env_if_changed(
     home: &LionClawHome,
     channel_id: &str,
     updates: &ChannelEnv,
-) -> Result<bool> {
+) -> Result<()> {
     let existing = load_channel_env(home, channel_id)?;
     let changed = updates
         .iter()
@@ -630,7 +623,7 @@ fn merge_changed_channel_env(
     if changed {
         merge_channel_env(home, channel_id, updates)?;
     }
-    Ok(changed)
+    Ok(())
 }
 
 fn prompt_required_env<R: BufRead, W: Write>(

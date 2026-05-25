@@ -8,8 +8,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelTrigger, JobCreateRequest,
-        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelInboundRequest, ChannelOutboxPullRequest, ChannelPairingApproveRequest,
+        ChannelTrigger, JobCreateRequest, PolicyGrantRequest, SessionOpenRequest,
+        SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -231,27 +232,7 @@ async fn runtime_cannot_override_kernel_selected_scope() {
 #[tokio::test]
 async fn channel_send_capability_uses_session_channel_defaults() {
     let env = TestHome::new().await;
-    let runtime_skill = write_skill_source(
-        env.temp_dir(),
-        "broker-channel-send",
-        "Capability broker channel send skill",
-        false,
-    );
-    let channel_skill = write_skill_source(
-        env.temp_dir(),
-        "channel-local-cli",
-        "local channel worker",
-        true,
-    );
-    env.install_skill("broker-channel-send", &runtime_skill)
-        .await;
-    env.install_skill("channel-local-cli", &channel_skill).await;
-    env.add_channel(
-        "local-cli",
-        "channel-local-cli",
-        lionclaw::operator::config::ChannelLaunchMode::Background,
-    )
-    .await;
+    install_broker_channel_send_skills(&env, "broker-channel-send").await;
     let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
@@ -264,36 +245,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .await;
 
     let peer_id = "peer-cap-broker-channel";
-    let _ = kernel
-        .ingest_channel_inbound(v2_text_request(
-            "local-cli",
-            "cap-broker-9101",
-            peer_id,
-            "seed pairing",
-        ))
-        .await
-        .expect("seed pairing state");
-    let pairings = kernel
-        .list_channel_pairings(Some("local-cli".to_string()), None)
-        .await
-        .expect("list pairings");
-    let pairing_id = pairings
-        .pairings
-        .iter()
-        .find(|pairing| pairing.sender_ref.as_deref() == Some(peer_id))
-        .map(|pairing| pairing.pairing_id)
-        .expect("pending pairing id");
-    kernel
-        .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "local-cli".to_string(),
-            pairing_id: Some(pairing_id),
-            pairing_code: None,
-            routing_profile: None,
-            trust_tier: Some(TrustTier::Main),
-            label: None,
-        })
-        .await
-        .expect("approve pairing");
+    approve_channel_sender(&kernel, peer_id).await;
     let (session_id, _runtime_skill_id) =
         prepare_session_with_skill(env.home(), &kernel, peer_id, "broker-channel-send").await;
     grant_capability(&kernel, "broker-channel-send", "channel.send").await;
@@ -329,6 +281,202 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         Some(peer_id)
     );
     assert!(details["output_summary"]["delivery_id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn channel_send_capability_rejects_runtime_route_overrides() {
+    let env = TestHome::new().await;
+    install_broker_channel_send_skills(&env, "broker-channel-send-override").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "single-capability",
+            Arc::new(SingleCapabilityRuntimeAdapter::new(
+                Capability::ChannelSend,
+                json!({
+                    "channel_id": "local-cli",
+                    "conversation_ref": "other-peer",
+                    "content": "route override attempt"
+                }),
+            )),
+        )
+        .await;
+
+    let peer_id = "peer-cap-broker-route-override";
+    approve_channel_sender(&kernel, peer_id).await;
+    let (session_id, _runtime_skill_id) =
+        prepare_session_with_skill(env.home(), &kernel, peer_id, "broker-channel-send-override")
+            .await;
+    grant_capability(&kernel, "broker-channel-send-override", "channel.send").await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: "attempt broker-channel-send override".to_string(),
+            runtime_id: Some("single-capability".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete with denied capability result");
+
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
+
+    let details = latest_capability_result(&kernel, session_id).await;
+    assert_eq!(details["allowed"].as_bool(), Some(false));
+    assert!(details["reason"]
+        .as_str()
+        .expect("reason present")
+        .contains("channel.send route is derived from the current channel session"));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "capability-broker-route-override-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull channel outbox");
+    assert!(
+        outbox.deliveries.is_empty(),
+        "denied route overrides must not enqueue deliveries"
+    );
+}
+
+#[tokio::test]
+async fn channel_send_capability_requires_channel_session() {
+    let env = TestHome::new().await;
+    let runtime_skill = write_skill_source(
+        env.temp_dir(),
+        "broker-channel-send-no-channel",
+        "Capability broker channel send skill",
+        false,
+    );
+    env.install_skill("broker-channel-send-no-channel", &runtime_skill)
+        .await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "single-capability",
+            Arc::new(SingleCapabilityRuntimeAdapter::new(
+                Capability::ChannelSend,
+                json!({"content": "not from a channel session"}),
+            )),
+        )
+        .await;
+
+    let (session_id, _runtime_skill_id) = prepare_session_with_skill(
+        env.home(),
+        &kernel,
+        "peer-cap-broker-no-channel",
+        "broker-channel-send-no-channel",
+    )
+    .await;
+    grant_capability(&kernel, "broker-channel-send-no-channel", "channel.send").await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: "attempt broker-channel-send outside a channel".to_string(),
+            runtime_id: Some("single-capability".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete with denied capability result");
+
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
+
+    let details = latest_capability_result(&kernel, session_id).await;
+    assert_eq!(details["allowed"].as_bool(), Some(false));
+    assert!(details["reason"]
+        .as_str()
+        .expect("reason present")
+        .contains("channel.send is only available in channel sessions"));
+}
+
+#[tokio::test]
+async fn channel_send_capability_preserves_thread_route_from_session() {
+    let env = TestHome::new().await;
+    install_broker_channel_send_skills(&env, "broker-channel-send-thread").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "single-capability",
+            Arc::new(SingleCapabilityRuntimeAdapter::new(
+                Capability::ChannelSend,
+                json!({"content": "hello thread from capability broker"}),
+            )),
+        )
+        .await;
+
+    approve_channel_sender_in_thread(&kernel, "alice", "room-1", "topic-a").await;
+    let session_key = thread_session_key("local-cli", "room-1", "topic-a", "alice");
+    let (session_id, _runtime_skill_id) = prepare_session_with_skill_for_session_key(
+        env.home(),
+        &kernel,
+        &session_key,
+        "broker-channel-send-thread",
+    )
+    .await;
+    grant_capability(&kernel, "broker-channel-send-thread", "channel.send").await;
+
+    let _response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: "run broker-channel-send in thread".to_string(),
+            runtime_id: Some("single-capability".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let details = latest_capability_result(&kernel, session_id).await;
+    assert_eq!(details["allowed"].as_bool(), Some(true));
+    assert_eq!(
+        details["output_summary"]["conversation_ref"].as_str(),
+        Some("room-1")
+    );
+    assert_eq!(
+        details["output_summary"]["thread_ref"].as_str(),
+        Some("topic-a")
+    );
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "capability-broker-thread-route-test".to_string(),
+            conversation_ref: Some("room-1".to_string()),
+            thread_ref: Some("topic-a".to_string()),
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull channel outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    let delivery = &outbox.deliveries[0];
+    assert_eq!(delivery.conversation_ref, "room-1");
+    assert_eq!(delivery.thread_ref.as_deref(), Some("topic-a"));
+    assert_eq!(delivery.content.text, "hello thread from capability broker");
 }
 
 struct SingleCapabilityRuntimeAdapter {
@@ -444,10 +592,25 @@ async fn prepare_session_with_skill(
     peer_id: &str,
     skill_alias: &str,
 ) -> (Uuid, String) {
+    prepare_session_with_skill_for_session_key(
+        home,
+        kernel,
+        &direct_session_key("local-cli", peer_id),
+        skill_alias,
+    )
+    .await
+}
+
+async fn prepare_session_with_skill_for_session_key(
+    home: &lionclaw::home::LionClawHome,
+    kernel: &Kernel,
+    session_key: &str,
+    skill_alias: &str,
+) -> (Uuid, String) {
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "local-cli".to_string(),
-            peer_id: format!("channel:local-cli:direct:{peer_id}"),
+            peer_id: session_key.to_string(),
             trust_tier: TrustTier::Main,
             history_policy: None,
         })
@@ -463,6 +626,98 @@ async fn prepare_session_with_skill(
     (session.session_id, skill_id)
 }
 
+async fn install_broker_channel_send_skills(env: &TestHome, runtime_skill_alias: &str) {
+    let runtime_skill = write_skill_source(
+        env.temp_dir(),
+        runtime_skill_alias,
+        "Capability broker channel send skill",
+        false,
+    );
+    let channel_skill = write_skill_source(
+        env.temp_dir(),
+        "channel-local-cli",
+        "local channel worker",
+        true,
+    );
+    env.install_skill(runtime_skill_alias, &runtime_skill).await;
+    env.install_skill("channel-local-cli", &channel_skill).await;
+    env.add_channel(
+        "local-cli",
+        "channel-local-cli",
+        lionclaw::operator::config::ChannelLaunchMode::Background,
+    )
+    .await;
+}
+
+async fn approve_channel_sender(kernel: &Kernel, sender_ref: &str) {
+    approve_channel_sender_for_scope(kernel, sender_ref, sender_ref, None, ChannelTrigger::Dm)
+        .await;
+}
+
+async fn approve_channel_sender_in_thread(
+    kernel: &Kernel,
+    sender_ref: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+) {
+    approve_channel_sender_for_scope(
+        kernel,
+        sender_ref,
+        conversation_ref,
+        Some(thread_ref),
+        ChannelTrigger::ThreadContinuation,
+    )
+    .await;
+}
+
+async fn approve_channel_sender_for_scope(
+    kernel: &Kernel,
+    sender_ref: &str,
+    conversation_ref: &str,
+    thread_ref: Option<&str>,
+    trigger: ChannelTrigger,
+) {
+    let event_id = format!("cap-broker-pairing-{sender_ref}-{conversation_ref}");
+    let _ = kernel
+        .ingest_channel_inbound(v2_scoped_text_request(
+            "local-cli",
+            &event_id,
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+            "seed pairing",
+            trigger,
+        ))
+        .await
+        .expect("seed pairing state");
+    let pairings = kernel
+        .list_channel_pairings(Some("local-cli".to_string()), None)
+        .await
+        .expect("list pairings");
+    let pairing_id = pairings
+        .pairings
+        .iter()
+        .find(|pairing| {
+            pairing.sender_ref.as_deref() == Some(sender_ref)
+                && pairing.conversation_ref.as_deref()
+                    == (conversation_ref != sender_ref).then_some(conversation_ref)
+                && pairing.thread_ref.as_deref() == thread_ref
+        })
+        .map(|pairing| pairing.pairing_id)
+        .expect("pending pairing id");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "local-cli".to_string(),
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve pairing");
+}
+
 async fn grant_capability(kernel: &Kernel, skill_alias: &str, capability: &str) {
     kernel
         .grant_policy(PolicyGrantRequest {
@@ -475,23 +730,48 @@ async fn grant_capability(kernel: &Kernel, skill_alias: &str, capability: &str) 
         .expect("grant capability");
 }
 
-fn v2_text_request(
+fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
+    format!("channel:{channel_id}:direct:{}", session_key_part(peer_id))
+}
+
+fn thread_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+    sender_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:thread:{}:{}:sender:{}",
+        session_key_part(conversation_ref),
+        session_key_part(thread_ref),
+        session_key_part(sender_ref)
+    )
+}
+
+fn session_key_part(value: &str) -> String {
+    value.replace('%', "%25").replace(':', "%3A")
+}
+
+fn v2_scoped_text_request(
     channel_id: &str,
     event_id: &str,
     sender_ref: &str,
+    conversation_ref: &str,
+    thread_ref: Option<&str>,
     text: &str,
+    trigger: ChannelTrigger,
 ) -> ChannelInboundRequest {
     ChannelInboundRequest {
         channel_id: channel_id.to_string(),
         event_id: event_id.to_string(),
         sender_ref: sender_ref.to_string(),
-        conversation_ref: sender_ref.to_string(),
-        thread_ref: None,
+        conversation_ref: conversation_ref.to_string(),
+        thread_ref: thread_ref.map(str::to_string),
         message_ref: Some(event_id.to_string()),
         text: Some(text.to_string()),
         attachments: Vec::new(),
         reply_to_ref: None,
-        trigger: ChannelTrigger::Dm,
+        trigger,
         received_at: None,
         provider_metadata: serde_json::json!({}),
     }

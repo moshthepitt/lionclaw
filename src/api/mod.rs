@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     contracts::{
-        AuditQueryParams, AuditQueryResponse, ChannelAttachmentFinalizeRequest,
+        AuditQueryParams, AuditQueryResponse, ChannelActorAuthorizeRequest,
+        ChannelActorAuthorizeResponse, ChannelAttachmentFinalizeRequest,
         ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelGrantResponse,
         ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelHealthReportRequest,
         ChannelHealthReportResponse, ChannelInboundRequest, ChannelInboundResponse,
@@ -75,6 +76,7 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/channels/pairing/claim", post(claim_channel_pairing))
         .route("/v0/channels/pairing/block", post(block_channel_pairing))
         .route("/v0/channels/grants/revoke", post(revoke_channel_grant))
+        .route("/v0/channels/authorize", post(authorize_channel_actor))
         .route("/v0/channels/inbound", post(channel_inbound))
         .route(
             "/v0/channels/attachments/stage",
@@ -235,6 +237,14 @@ async fn revoke_channel_grant(
     Json(req): Json<ChannelGrantRevokeRequest>,
 ) -> Result<Json<ChannelGrantRevokeResponse>, ApiError> {
     let result = state.kernel.revoke_channel_grant(req).await?;
+    Ok(Json(result))
+}
+
+async fn authorize_channel_actor(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelActorAuthorizeRequest>,
+) -> Result<Json<ChannelActorAuthorizeResponse>, ApiError> {
+    let result = state.kernel.authorize_channel_actor(req).await?;
     Ok(Json(result))
 }
 

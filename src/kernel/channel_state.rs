@@ -538,13 +538,11 @@ impl ChannelStateStore {
         thread_ref: Option<&str>,
         routing_profile: ChannelRoutingProfile,
     ) -> Result<Option<ChannelGrantRecord>> {
-        let Some(sender_ref) = sender_ref else {
-            return Ok(None);
-        };
-
         match routing_profile {
             ChannelRoutingProfile::Thread => {
-                if let (Some(conversation_ref), Some(thread_ref)) = (conversation_ref, thread_ref) {
+                if let (Some(sender_ref), Some(conversation_ref), Some(thread_ref)) =
+                    (sender_ref, conversation_ref, thread_ref)
+                {
                     if let Some(grant) = self
                         .get_blocking_grant_by_scope_in_tx(
                             tx,
@@ -578,6 +576,9 @@ impl ChannelStateStore {
                 .await
             }
             ChannelRoutingProfile::Direct => {
+                let Some(sender_ref) = sender_ref else {
+                    return Ok(None);
+                };
                 self.get_blocking_grant_by_scope_in_tx(
                     tx,
                     channel_id,
@@ -596,7 +597,7 @@ impl ChannelStateStore {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
-        sender_ref: &str,
+        sender_ref: Option<&str>,
         conversation_ref: Option<&str>,
     ) -> Result<Option<ChannelGrantRecord>> {
         if let Some(conversation_ref) = conversation_ref {
@@ -604,7 +605,7 @@ impl ChannelStateStore {
                 .get_blocking_grant_by_scope_in_tx(
                     tx,
                     channel_id,
-                    Some(sender_ref),
+                    None,
                     Some(conversation_ref),
                     None,
                     ChannelRoutingProfile::Conversation,
@@ -613,8 +614,27 @@ impl ChannelStateStore {
             {
                 return Ok(Some(grant));
             }
+
+            if let Some(sender_ref) = sender_ref {
+                if let Some(grant) = self
+                    .get_blocking_grant_by_scope_in_tx(
+                        tx,
+                        channel_id,
+                        Some(sender_ref),
+                        Some(conversation_ref),
+                        None,
+                        ChannelRoutingProfile::Conversation,
+                    )
+                    .await?
+                {
+                    return Ok(Some(grant));
+                }
+            }
         }
 
+        let Some(sender_ref) = sender_ref else {
+            return Ok(None);
+        };
         self.get_blocking_grant_by_scope_in_tx(
             tx,
             channel_id,
@@ -694,6 +714,23 @@ impl ChannelStateStore {
             return Ok(Some(grant));
         }
 
+        if let Some(grant) = self
+            .get_grant_by_scope_with_status_in_tx(
+                tx,
+                ChannelGrantScopeLookup {
+                    channel_id,
+                    sender_ref: None,
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                    status: ChannelGrantStatus::Approved,
+                },
+            )
+            .await?
+        {
+            return Ok(Some(grant));
+        }
+
         if trigger == ChannelTrigger::Dm {
             return self
                 .get_grant_by_scope_with_status_in_tx(
@@ -711,6 +748,26 @@ impl ChannelStateStore {
         }
 
         Ok(None)
+    }
+
+    pub(crate) async fn find_approved_direct_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: &str,
+    ) -> Result<Option<ChannelGrantRecord>> {
+        self.get_grant_by_scope_with_status_in_tx(
+            tx,
+            ChannelGrantScopeLookup {
+                channel_id,
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+                status: ChannelGrantStatus::Approved,
+            },
+        )
+        .await
     }
 
     pub async fn get_grant_by_scope(

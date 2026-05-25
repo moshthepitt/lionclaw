@@ -28,30 +28,30 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor,
-    ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
-    ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
-    ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
-    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
-    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
-    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
-    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
-    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
-    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
-    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
-    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
-    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
-    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
-    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
-    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
-    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
-    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
-    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    AuditEventView, AuditQueryResponse, ChannelActorAuthorizeRequest,
+    ChannelActorAuthorizeResponse, ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
+    ChannelAttachmentFinalizeRequest, ChannelAttachmentFinalizeResponse,
+    ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelBindingView,
+    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
+    ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
+    ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
+    ChannelListResponse, ChannelOutboxAttachmentDto, ChannelOutboxAttemptStatusDto,
+    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
+    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
+    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
+    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
+    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
+    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
+    ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamAckResponse,
+    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
+    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
+    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
+    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
+    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
+    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
+    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
+    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -73,7 +73,7 @@ use crate::{
 use super::{
     audit::AuditLog,
     cancellation::{normalize_cancel_reason, TurnCancellation},
-    capability_broker::{CapabilityBroker, CapabilityExecutionContext},
+    capability_broker::{CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext},
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
         ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
@@ -1621,6 +1621,27 @@ impl Kernel {
         Ok(approved.trust_tier)
     }
 
+    async fn require_channel_operator_actor(
+        &self,
+        channel_id: &str,
+        sender_ref: &str,
+    ) -> Result<(), KernelError> {
+        let trust_tier = self
+            .require_channel_grant_scope_approved(
+                channel_id,
+                SessionKeyScope::Direct {
+                    sender_ref: sender_ref.to_string(),
+                },
+            )
+            .await?;
+        if !matches!(trust_tier, TrustTier::Main) {
+            return Err(KernelError::BadRequest(
+                "channel operator actor must have an approved direct host grant".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn find_channel_session_blocking_grant(
         &self,
         channel_id: &str,
@@ -1892,6 +1913,10 @@ impl Kernel {
         let invite = validate_channel_pairing_invite(req)?;
         self.require_active_channel_binding(&invite.channel_id)
             .await?;
+        if let Some(actor_sender_ref) = invite.operator_actor_sender_ref.as_deref() {
+            self.require_channel_operator_actor(&invite.channel_id, actor_sender_ref)
+                .await?;
+        }
 
         let token = generate_pairing_token();
         let token_hash = hash_pairing_code(&token);
@@ -1933,6 +1958,7 @@ impl Kernel {
                     "thread_ref": pairing.thread_ref,
                     "max_claims": pairing.max_claims,
                     "expires_at": pairing.expires_at,
+                    "operator_actor_sender_ref": invite.operator_actor_sender_ref,
                 }),
             )
             .await
@@ -2061,7 +2087,10 @@ impl Kernel {
             .find_blocking_grant_for_scope_in_tx(
                 &mut tx,
                 &claim.channel_id,
-                grant_scope.sender_ref.as_deref(),
+                grant_scope
+                    .sender_ref
+                    .as_deref()
+                    .or(Some(claim.sender_ref.as_str())),
                 grant_scope.conversation_ref.as_deref(),
                 grant_scope.thread_ref.as_deref(),
                 pairing.requested_profile,
@@ -2546,6 +2575,29 @@ impl Kernel {
         req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
         self.process_channel_inbound(req).await
+    }
+
+    pub async fn authorize_channel_actor(
+        &self,
+        req: ChannelActorAuthorizeRequest,
+    ) -> Result<ChannelActorAuthorizeResponse, KernelError> {
+        let input = validate_channel_actor_authorize_request(req)?;
+        self.require_active_channel_binding(&input.channel_id)
+            .await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let authorization = self.authorize_channel_actor_in_tx(&mut tx, &input).await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        Ok(ChannelActorAuthorizeResponse {
+            authorized: authorization.outcome == ChannelActorAuthorizationOutcome::Authorized,
+            reason_code: authorization.outcome.reason_code().to_string(),
+            grant_id: authorization.grant.map(|grant| grant.grant_id),
+            session_key: authorization.session_key,
+        })
     }
 
     pub async fn stage_channel_attachment(
@@ -3838,24 +3890,23 @@ impl Kernel {
             ));
         }
 
-        if self
-            .channel_state
-            .find_blocking_grant_in_tx(
-                &mut tx,
-                &inbound.channel_id,
-                &inbound.sender_ref,
-                &inbound.conversation_ref,
-                inbound.thread_ref.as_deref(),
-            )
-            .await
-            .map_err(internal)?
-            .is_some()
-        {
+        let auth_input = ValidatedChannelActorAuthorization {
+            channel_id: inbound.channel_id.clone(),
+            sender_ref: inbound.sender_ref.clone(),
+            conversation_ref: inbound.conversation_ref.clone(),
+            thread_ref: inbound.thread_ref.clone(),
+            trigger: inbound.trigger,
+        };
+        let authorization = self
+            .authorize_channel_actor_in_tx(&mut tx, &auth_input)
+            .await?;
+        let authorization_outcome = authorization.outcome;
+        if authorization_outcome == ChannelActorAuthorizationOutcome::Blocked {
             self.audit_channel_inbound_in_tx(
                 &mut tx,
                 "channel.inbound.blocked",
                 &inbound,
-                "blocked_grant",
+                authorization_outcome.reason_code(),
                 None,
                 None,
             )
@@ -3863,7 +3914,7 @@ impl Kernel {
             tx.commit().await.map_err(|err| internal(err.into()))?;
             return Ok(channel_inbound_response(
                 ChannelInboundOutcome::Blocked,
-                "blocked_grant",
+                authorization_outcome.reason_code(),
                 None,
                 None,
                 None,
@@ -3871,27 +3922,34 @@ impl Kernel {
                 None,
             ));
         }
-
-        if inbound.trigger == ChannelTrigger::None {
+        if authorization_outcome == ChannelActorAuthorizationOutcome::TriggerInsufficient {
             self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
                 .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
             return Ok(channel_trigger_ignored_response());
         }
-
-        let grant = self
-            .channel_state
-            .find_approved_grant_in_tx(
+        if authorization_outcome == ChannelActorAuthorizationOutcome::ActorApprovalRequired {
+            self.audit_channel_inbound_in_tx(
                 &mut tx,
-                &inbound.channel_id,
-                &inbound.sender_ref,
-                &inbound.conversation_ref,
-                inbound.thread_ref.as_deref(),
-                inbound.trigger,
+                "channel.inbound.pending",
+                &inbound,
+                authorization_outcome.reason_code(),
+                None,
+                None,
             )
-            .await
-            .map_err(internal)?;
-        let Some(grant) = grant else {
+            .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::PendingApproval,
+                authorization_outcome.reason_code(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        if authorization_outcome == ChannelActorAuthorizationOutcome::RouteApprovalRequired {
             let requested_profile =
                 default_pending_profile(inbound.trigger, inbound.thread_ref.as_deref());
             let pending_scope = pending_scope_for_profile(&inbound, requested_profile)?;
@@ -3916,7 +3974,7 @@ impl Kernel {
                 &mut tx,
                 "channel.inbound.pending",
                 &inbound,
-                "approval_required",
+                authorization_outcome.reason_code(),
                 Some(pairing.pairing_id),
                 None,
             )
@@ -3926,23 +3984,22 @@ impl Kernel {
                 .await;
             return Ok(channel_inbound_response(
                 ChannelInboundOutcome::PendingApproval,
-                "approval_required",
+                authorization_outcome.reason_code(),
                 Some(pairing.pairing_id),
                 created.then_some(pairing_code),
                 None,
                 None,
                 None,
             ));
-        };
-
-        if !trigger_allows(grant.routing_profile, inbound.trigger) {
-            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
-                .await?;
-            tx.commit().await.map_err(|err| internal(err.into()))?;
-            return Ok(channel_trigger_ignored_response());
         }
-
-        let session_key = session_key_for_grant(&grant)?;
+        let grant = authorization
+            .grant
+            .ok_or_else(|| internal(anyhow::anyhow!("authorized channel actor missing grant")))?;
+        let session_key = authorization.session_key.ok_or_else(|| {
+            internal(anyhow::anyhow!(
+                "authorized channel actor missing session key"
+            ))
+        })?;
         let runtime_id = self.resolve_runtime_id(None)?;
         let session = match self
             .sessions
@@ -4165,6 +4222,90 @@ impl Kernel {
             )
             .await
             .map_err(internal)
+    }
+
+    async fn authorize_channel_actor_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: &ValidatedChannelActorAuthorization,
+    ) -> Result<ChannelActorAuthorization, KernelError> {
+        if self
+            .channel_state
+            .find_blocking_grant_in_tx(
+                tx,
+                &input.channel_id,
+                &input.sender_ref,
+                &input.conversation_ref,
+                input.thread_ref.as_deref(),
+            )
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::Blocked,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        if input.trigger == ChannelTrigger::None {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        let Some(grant) = self
+            .channel_state
+            .find_approved_grant_in_tx(
+                tx,
+                &input.channel_id,
+                &input.sender_ref,
+                &input.conversation_ref,
+                input.thread_ref.as_deref(),
+                input.trigger,
+            )
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::RouteApprovalRequired,
+                grant: None,
+                session_key: None,
+            });
+        };
+
+        if !trigger_allows(grant.routing_profile, input.trigger) {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        if route_grant_requires_direct_actor_host(&grant)
+            && self
+                .channel_state
+                .find_approved_direct_grant_in_tx(tx, &input.channel_id, &input.sender_ref)
+                .await
+                .map_err(internal)?
+                .is_none()
+        {
+            return Ok(ChannelActorAuthorization {
+                outcome: ChannelActorAuthorizationOutcome::ActorApprovalRequired,
+                grant: None,
+                session_key: None,
+            });
+        }
+
+        let session_key = session_key_for_grant(&grant)?;
+        Ok(ChannelActorAuthorization {
+            outcome: ChannelActorAuthorizationOutcome::Authorized,
+            grant: Some(grant),
+            session_key: Some(session_key),
+        })
     }
 
     async fn audit_channel_inbound_in_tx(
@@ -6883,10 +7024,14 @@ fn channel_pairing_continuity_scope(pairing: &ChannelPairingRequestRecord) -> St
             pairing.sender_ref.as_deref().unwrap_or("unknown")
         ),
         ChannelRoutingProfile::Conversation => format!(
-            "{}/conversation:{}/sender:{}",
+            "{}/conversation:{}{}",
             pairing.channel_id,
             pairing.conversation_ref.as_deref().unwrap_or("unknown"),
-            pairing.sender_ref.as_deref().unwrap_or("unknown")
+            pairing
+                .sender_ref
+                .as_deref()
+                .map(|sender_ref| format!("/sender:{sender_ref}"))
+                .unwrap_or_default()
         ),
         ChannelRoutingProfile::Thread => format!(
             "{}/thread:{}/{}",
@@ -7652,6 +7797,42 @@ struct ValidatedChannelInbound {
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedChannelActorAuthorization {
+    channel_id: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    trigger: ChannelTrigger,
+}
+
+struct ChannelActorAuthorization {
+    outcome: ChannelActorAuthorizationOutcome,
+    grant: Option<ChannelGrantRecord>,
+    session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelActorAuthorizationOutcome {
+    Authorized,
+    Blocked,
+    RouteApprovalRequired,
+    ActorApprovalRequired,
+    TriggerInsufficient,
+}
+
+impl ChannelActorAuthorizationOutcome {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Authorized => "authorized",
+            Self::Blocked => "blocked_grant",
+            Self::RouteApprovalRequired => "approval_required",
+            Self::ActorApprovalRequired => "actor_approval_required",
+            Self::TriggerInsufficient => "trigger_insufficient",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ValidatedChannelHealthReport {
     channel_id: String,
     reporter_id: String,
@@ -7684,6 +7865,7 @@ struct ValidatedPairingInvite {
     thread_ref: Option<String>,
     expires_at: DateTime<Utc>,
     max_claims: u32,
+    operator_actor_sender_ref: Option<String>,
 }
 
 struct GrantScope {
@@ -7779,6 +7961,10 @@ fn validate_channel_pairing_invite(
     let label = trim_optional(req.label);
     let conversation_ref = trim_optional(req.conversation_ref);
     let thread_ref = trim_optional(req.thread_ref);
+    let operator_actor_sender_ref = req
+        .operator_actor
+        .map(|actor| trim_required(actor.sender_ref, "operator_actor.sender_ref"))
+        .transpose()?;
     validate_invite_profile_scope(
         req.requested_profile,
         conversation_ref.as_deref(),
@@ -7805,6 +7991,11 @@ fn validate_channel_pairing_invite(
             "max_claims must be greater than zero".to_string(),
         ));
     }
+    if req.requested_profile == ChannelRoutingProfile::Conversation && max_claims != 1 {
+        return Err(KernelError::BadRequest(
+            "conversation invites connect one conversation and must use max_claims=1".to_string(),
+        ));
+    }
 
     Ok(ValidatedPairingInvite {
         channel_id,
@@ -7814,6 +8005,7 @@ fn validate_channel_pairing_invite(
         thread_ref,
         expires_at,
         max_claims,
+        operator_actor_sender_ref,
     })
 }
 
@@ -7951,6 +8143,18 @@ fn validate_channel_inbound_request(
         trigger: req.trigger,
         received_at: req.received_at.unwrap_or_else(Utc::now),
         provider_metadata,
+    })
+}
+
+fn validate_channel_actor_authorize_request(
+    req: ChannelActorAuthorizeRequest,
+) -> Result<ValidatedChannelActorAuthorization, KernelError> {
+    Ok(ValidatedChannelActorAuthorization {
+        channel_id: trim_required(req.channel_id, "channel_id")?,
+        sender_ref: trim_required(req.sender_ref, "sender_ref")?,
+        conversation_ref: trim_required(req.conversation_ref, "conversation_ref")?,
+        thread_ref: trim_optional(req.thread_ref),
+        trigger: req.trigger,
     })
 }
 
@@ -8388,7 +8592,7 @@ fn pending_scope_for_profile(
             thread_ref: None,
         }),
         ChannelRoutingProfile::Conversation => Ok(GrantScope {
-            sender_ref: Some(inbound.sender_ref.clone()),
+            sender_ref: None,
             conversation_ref: Some(inbound.conversation_ref.clone()),
             thread_ref: None,
         }),
@@ -8450,7 +8654,7 @@ fn grant_scope_from_token_claim(
                 return Err("conversation_ref_mismatch");
             }
             Ok(GrantScope {
-                sender_ref: Some(claim.sender_ref.clone()),
+                sender_ref: pairing.sender_ref.clone(),
                 conversation_ref: Some(claim.conversation_ref.clone()),
                 thread_ref: None,
             })
@@ -8512,14 +8716,11 @@ fn grant_scope_from_pairing(
             })
         }
         ChannelRoutingProfile::Conversation => {
-            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
-                KernelError::BadRequest("conversation grant requires sender_ref".to_string())
-            })?;
             let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
             })?;
             Ok(GrantScope {
-                sender_ref: Some(sender_ref),
+                sender_ref: pairing.sender_ref.clone(),
                 conversation_ref: Some(conversation_ref),
                 thread_ref: None,
             })
@@ -8575,17 +8776,25 @@ fn trigger_allows(profile: ChannelRoutingProfile, trigger: ChannelTrigger) -> bo
         ChannelRoutingProfile::Conversation => {
             matches!(
                 trigger,
-                ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
+                ChannelTrigger::Command | ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
             )
         }
         ChannelRoutingProfile::Thread => matches!(
             trigger,
-            ChannelTrigger::Mention
+            ChannelTrigger::Command
+                | ChannelTrigger::Mention
                 | ChannelTrigger::ReplyToBot
                 | ChannelTrigger::ThreadContinuation
         ),
         ChannelRoutingProfile::Outbound => false,
     }
+}
+
+fn route_grant_requires_direct_actor_host(grant: &ChannelGrantRecord) -> bool {
+    matches!(
+        grant.routing_profile,
+        ChannelRoutingProfile::Conversation | ChannelRoutingProfile::Thread
+    )
 }
 
 fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelError> {
@@ -8601,18 +8810,21 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             ))
         }
         ChannelRoutingProfile::Conversation => {
-            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
-                KernelError::Internal("conversation grant missing sender_ref".to_string())
-            })?;
             let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
                 KernelError::Internal("conversation grant missing conversation_ref".to_string())
             })?;
-            Ok(format!(
-                "channel:{}:conversation:{}:sender:{}",
+            let conversation_key = format!(
+                "channel:{}:conversation:{}",
                 grant.channel_id,
-                encode_session_key_part(conversation_ref),
-                encode_session_key_part(sender_ref)
-            ))
+                encode_session_key_part(conversation_ref)
+            );
+            match grant.sender_ref.as_deref() {
+                Some(sender_ref) => Ok(format!(
+                    "{conversation_key}:sender:{}",
+                    encode_session_key_part(sender_ref)
+                )),
+                None => Ok(conversation_key),
+            }
         }
         ChannelRoutingProfile::Thread => {
             let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
@@ -8687,29 +8899,16 @@ fn decode_session_key_part(raw: &str) -> String {
 }
 
 fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
-    let direct_prefix = format!("channel:{channel_id}:direct:");
-    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
-        return decode_session_key_part(sender_ref);
+    match parse_session_key_scope(channel_id, session_peer_id) {
+        Some(SessionKeyScope::Direct { sender_ref }) => sender_ref,
+        Some(SessionKeyScope::Conversation {
+            conversation_ref, ..
+        })
+        | Some(SessionKeyScope::Thread {
+            conversation_ref, ..
+        }) => conversation_ref,
+        None => session_peer_id.to_string(),
     }
-
-    let conversation_prefix = format!("channel:{channel_id}:conversation:");
-    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
-        if let Some((conversation_ref, _sender_ref)) = rest.split_once(":sender:") {
-            return decode_session_key_part(conversation_ref);
-        }
-    }
-
-    let thread_prefix = format!("channel:{channel_id}:thread:");
-    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
-        if let Some((thread_scope, _sender_ref)) = rest.split_once(":sender:") {
-            let Some((conversation_ref, _thread_ref)) = thread_scope.split_once(':') else {
-                return session_peer_id.to_string();
-            };
-            return decode_session_key_part(conversation_ref);
-        }
-    }
-
-    session_peer_id.to_string()
 }
 
 fn delivery_route_for_session_key(
@@ -8740,9 +8939,14 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
 
     let conversation_prefix = format!("channel:{channel_id}:conversation:");
     if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
-        let (conversation_ref, sender_ref) = rest.split_once(":sender:")?;
+        let (conversation_ref, sender_ref) = match rest.split_once(":sender:") {
+            Some((conversation_ref, sender_ref)) => {
+                (conversation_ref, Some(decode_session_key_part(sender_ref)))
+            }
+            None => (rest, None),
+        };
         return Some(SessionKeyScope::Conversation {
-            sender_ref: decode_session_key_part(sender_ref),
+            sender_ref,
             conversation_ref: decode_session_key_part(conversation_ref),
         });
     }
@@ -9311,6 +9515,8 @@ fn summarize_capability_output(
         Capability::ChannelSend => json!({
             "channel_id": output.get("channel_id"),
             "conversation_ref": output.get("conversation_ref"),
+            "thread_ref": output.get("thread_ref"),
+            "reply_to_ref": output.get("reply_to_ref"),
             "delivery_id": output.get("delivery_id"),
         }),
         _ => json!({
@@ -9573,13 +9779,20 @@ struct ChannelStreamContext {
     turn_id: Uuid,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedChannelRoute {
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+}
+
 #[derive(Debug)]
 enum SessionKeyScope {
     Direct {
         sender_ref: String,
     },
     Conversation {
-        sender_ref: String,
+        sender_ref: Option<String>,
         conversation_ref: String,
     },
     Thread {
@@ -9609,7 +9822,7 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
             sender_ref,
             conversation_ref,
         } => ChannelSessionGrantLookup {
-            sender_ref: Some(sender_ref),
+            sender_ref: sender_ref.as_deref(),
             conversation_ref: Some(conversation_ref),
             thread_ref: None,
             routing_profile: ChannelRoutingProfile::Conversation,
@@ -9630,15 +9843,18 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
 fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
     match scope {
         SessionKeyScope::Direct { .. } => vec![exact_session_grant_lookup(scope)],
-        SessionKeyScope::Conversation { sender_ref, .. } => vec![
-            exact_session_grant_lookup(scope),
-            ChannelSessionGrantLookup {
-                sender_ref: Some(sender_ref),
-                conversation_ref: None,
-                thread_ref: None,
-                routing_profile: ChannelRoutingProfile::Direct,
-            },
-        ],
+        SessionKeyScope::Conversation { sender_ref, .. } => {
+            let mut lookups = vec![exact_session_grant_lookup(scope)];
+            if let Some(sender_ref) = sender_ref {
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: None,
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Direct,
+                });
+            }
+            lookups
+        }
         SessionKeyScope::Thread {
             sender_ref,
             conversation_ref,
@@ -9647,6 +9863,12 @@ fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
             exact_session_grant_lookup(scope),
             ChannelSessionGrantLookup {
                 sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            },
+            ChannelSessionGrantLookup {
+                sender_ref: None,
                 conversation_ref: Some(conversation_ref),
                 thread_ref: None,
                 routing_profile: ChannelRoutingProfile::Conversation,
@@ -10677,29 +10899,19 @@ impl Kernel {
             if !artifacts.saw_error
                 && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
             {
-                let source_id = turn_id.to_string();
                 let mut outbox_attachments = outbox_attachments;
-                let delivery = self
-                    .create_channel_delivery_content(
-                        ChannelDeliveryRoute {
-                            channel_id: &stream_context.channel_id,
-                            conversation_ref: &stream_context.conversation_ref,
-                            thread_ref: stream_context.thread_ref.as_deref(),
-                            reply_to_ref: stream_context.reply_to_ref.as_deref(),
-                        },
-                        Some(session.session_id),
-                        Some(turn_id),
-                        Some("session_turn"),
-                        Some(&source_id),
-                        ChannelDeliveryContent {
-                            text: artifacts.assistant_text.clone(),
-                            format_hint: "plain".to_string(),
-                            attachments: outbox_attachments.as_slice().to_vec(),
-                        },
-                    )
-                    .await?;
+                self.enqueue_channel_turn_delivery(
+                    stream_context,
+                    session.session_id,
+                    turn_id,
+                    ChannelDeliveryContent {
+                        text: artifacts.assistant_text.clone(),
+                        format_hint: "markdown".to_string(),
+                        attachments: outbox_attachments.as_slice().to_vec(),
+                    },
+                )
+                .await?;
                 outbox_attachments.mark_persisted();
-                self.audit_channel_outbox_created(&delivery).await?;
             }
         }
 
@@ -10974,6 +11186,17 @@ impl Kernel {
             RuntimeControlOutcome::Handled { .. }
         ) {
             self.mark_runtime_session_ready(&execution_plan).await;
+        }
+        if status == SessionTurnStatus::Completed {
+            if let Some(stream_context) = &channel_stream_context {
+                self.enqueue_channel_turn_text_delivery(
+                    stream_context,
+                    session.session_id,
+                    turn_id,
+                    &assistant_text,
+                )
+                .await?;
+            }
         }
 
         self.audit
@@ -11508,33 +11731,55 @@ impl Kernel {
             return Ok(None);
         }
 
-        let (conversation_ref, thread_ref) =
+        let route = self
+            .resolved_channel_route_for_session(channel_id, session_peer_id, turn_id)
+            .await?;
+
+        Ok(Some(ChannelStreamContext {
+            channel_id: channel_id.to_string(),
+            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+            conversation_ref: route.conversation_ref,
+            thread_ref: route.thread_ref,
+            reply_to_ref: route.reply_to_ref,
+            session_id,
+            turn_id,
+        }))
+    }
+
+    async fn resolved_channel_route_for_session(
+        &self,
+        channel_id: &str,
+        session_peer_id: &str,
+        turn_id: Uuid,
+    ) -> Result<ResolvedChannelRoute, KernelError> {
+        let (mut conversation_ref, mut thread_ref) =
             delivery_route_for_session_key(channel_id, session_peer_id);
-        let reply_to_ref = match self
+        let mut reply_to_ref = None;
+
+        if let Some(turn) = self
             .channel_state
             .get_turn(turn_id)
             .await
             .map_err(internal)?
             .filter(|turn| turn.channel_id == channel_id)
         {
-            Some(turn) => self
+            if let Some(event) = self
                 .channel_state
                 .get_inbound_event(channel_id, &turn.inbound_event_id)
                 .await
                 .map_err(internal)?
-                .and_then(|event| event.message_ref),
-            None => None,
-        };
+            {
+                conversation_ref = event.conversation_ref;
+                thread_ref = event.thread_ref;
+                reply_to_ref = event.message_ref;
+            }
+        }
 
-        Ok(Some(ChannelStreamContext {
-            channel_id: channel_id.to_string(),
-            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+        Ok(ResolvedChannelRoute {
             conversation_ref,
             thread_ref,
             reply_to_ref,
-            session_id,
-            turn_id,
-        }))
+        })
     }
 
     async fn emit_queued_channel_turn_status(
@@ -11935,6 +12180,55 @@ impl Kernel {
             .await?;
         self.audit_channel_outbox_created(&delivery).await?;
         Ok(delivery.delivery_id)
+    }
+
+    async fn enqueue_channel_turn_text_delivery(
+        &self,
+        context: &ChannelStreamContext,
+        session_id: Uuid,
+        turn_id: Uuid,
+        text: &str,
+    ) -> Result<(), KernelError> {
+        self.enqueue_channel_turn_delivery(
+            context,
+            session_id,
+            turn_id,
+            ChannelDeliveryContent {
+                text: text.to_string(),
+                format_hint: "markdown".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn enqueue_channel_turn_delivery(
+        &self,
+        context: &ChannelStreamContext,
+        session_id: Uuid,
+        turn_id: Uuid,
+        content: ChannelDeliveryContent,
+    ) -> Result<(), KernelError> {
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return Ok(());
+        }
+        let source_id = turn_id.to_string();
+        let delivery = self
+            .create_channel_delivery_content(
+                ChannelDeliveryRoute {
+                    channel_id: &context.channel_id,
+                    conversation_ref: &context.conversation_ref,
+                    thread_ref: context.thread_ref.as_deref(),
+                    reply_to_ref: context.reply_to_ref.as_deref(),
+                },
+                Some(session_id),
+                Some(turn_id),
+                Some("session_turn"),
+                Some(&source_id),
+                content,
+            )
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await
     }
 
     async fn create_channel_delivery_content(
@@ -13065,9 +13359,10 @@ impl Kernel {
         message: String,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
+        let turn_id = prepared_turn.turn_id;
         self.session_turns
             .complete_turn(
-                prepared_turn.turn_id,
+                turn_id,
                 SessionTurnCompletion {
                     status: SessionTurnStatus::Completed,
                     assistant_text: message.clone(),
@@ -13084,8 +13379,19 @@ impl Kernel {
         if let Some(context) = &stream_context {
             self.emit_turn_completed_snapshot(context, &message).await?;
         }
-        self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
-            .await;
+        if let Some(context) = &stream_context {
+            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, &message)
+                .await?;
+        }
+        self.terminalize_queued_turn(
+            turn,
+            QueuedTurnTerminal::Completed {
+                runtime_id: turn.runtime_id.clone(),
+                assistant_text_len: message.len(),
+            },
+            stream_context.clone(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -13111,28 +13417,6 @@ impl Kernel {
             .ok_or_else(|| {
                 KernelError::Internal("queued LionClaw control turn was not running".to_string())
             })
-    }
-
-    async fn complete_queued_turn(
-        &self,
-        turn: &ChannelTurnRecord,
-        runtime_id: &str,
-        assistant_text_len: usize,
-        stream_context: Option<ChannelStreamContext>,
-    ) {
-        if let Err(err) = self
-            .terminalize_queued_turn(
-                turn,
-                QueuedTurnTerminal::Completed {
-                    runtime_id: runtime_id.to_string(),
-                    assistant_text_len,
-                },
-                stream_context,
-            )
-            .await
-        {
-            warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
-        }
     }
 
     async fn fail_queued_turn(
@@ -14479,15 +14763,30 @@ impl Kernel {
             }
 
             if reason.is_none() {
-                let broker_session_peer_id = if capability == Capability::ChannelSend {
-                    stream_peer_ref_for_session_peer(session_channel_id, session_peer_id)
+                let resolved_channel_route = if capability == Capability::ChannelSend
+                    && self.applied_channel(session_channel_id).is_some()
+                {
+                    Some(
+                        self.resolved_channel_route_for_session(
+                            session_channel_id,
+                            session_peer_id,
+                            turn_id,
+                        )
+                        .await?,
+                    )
                 } else {
-                    session_peer_id.to_string()
+                    None
                 };
-                let context = CapabilityExecutionContext {
-                    session_channel_id,
-                    session_peer_id: &broker_session_peer_id,
-                };
+                let channel_send_route =
+                    resolved_channel_route
+                        .as_ref()
+                        .map(|route| CapabilityChannelSendRoute {
+                            channel_id: session_channel_id,
+                            conversation_ref: route.conversation_ref.as_str(),
+                            thread_ref: route.thread_ref.as_deref(),
+                            reply_to_ref: route.reply_to_ref.as_deref(),
+                        });
+                let context = CapabilityExecutionContext { channel_send_route };
                 executed = true;
                 match self
                     .capability_broker

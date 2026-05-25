@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn classifies_runtime_control_without_knowing_runtime_commands() {
-        for command in ["/compact", "/rename project", "/model", "/permissions"] {
+        for command in ["/compact", "/rename project", "/permissions"] {
             assert!(matches!(
                 classify_input(command),
                 ClassifiedInput::RuntimeControl(_)
