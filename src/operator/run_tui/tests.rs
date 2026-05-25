@@ -1908,6 +1908,54 @@ fn tab_keeps_maximized_surface_with_focus() {
     assert!(rendered_run.contains("▶ Run"));
 }
 
+#[tokio::test]
+async fn composer_entry_from_maximized_controls_focuses_visible_run_surface() {
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+    let mut printable_app = maximized_controls_test_app();
+    handle_key(
+        &mut printable_app,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(printable_app.composer.text(), "a");
+    assert_run_surface_is_maximized(&printable_app);
+
+    let mut paste_app = maximized_controls_test_app();
+    handle_terminal_event(
+        &mut paste_app,
+        Event::Paste("pasted text".to_string()),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(paste_app.composer.text(), "pasted text");
+    assert_run_surface_is_maximized(&paste_app);
+
+    let mut newline_app = maximized_controls_test_app();
+    handle_key(
+        &mut newline_app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        &backend_tx,
+    )
+    .await;
+    assert_eq!(newline_app.composer.text(), "\n");
+    assert_run_surface_is_maximized(&newline_app);
+}
+
+#[tokio::test]
+async fn begin_run_turn_from_maximized_controls_focuses_visible_run_surface() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.open_control_pane(ControlPane::Project);
+    app.toggle_maximize();
+    assert_eq!(app.focus, Focus::Controls);
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Controls));
+
+    app.begin_run_turn("new prompt", "running turn");
+
+    assert_run_surface_is_maximized(&app);
+}
+
 #[test]
 fn left_right_cycles_control_panes() {
     let mut app = blocked_test_app();
@@ -2146,6 +2194,20 @@ fn blocked_test_app() -> ConsoleApp {
         saw_ready_instance: false,
         should_quit: false,
     }
+}
+
+fn maximized_controls_test_app() -> ConsoleApp {
+    let mut app = blocked_test_app();
+    app.open_control_pane(ControlPane::Project);
+    app.toggle_maximize();
+    assert_eq!(app.focus, Focus::Controls);
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Controls));
+    app
+}
+
+fn assert_run_surface_is_maximized(app: &ConsoleApp) {
+    assert_eq!(app.focus, Focus::Run);
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Run));
 }
 
 #[cfg(unix)]

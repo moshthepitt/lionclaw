@@ -1369,17 +1369,17 @@ impl ConsoleApp {
     }
 
     fn open_control_pane(&mut self, pane: ControlPane) {
+        let keep_maximized_controls = self.view_mode == ViewMode::Maximized(Surface::Controls);
         match pane {
             ControlPane::Project => self.inspector_subject = InspectorSubject::Selection,
             ControlPane::Inspector(subject) => self.inspector_subject = subject,
             ControlPane::Files => {}
         }
         self.control_pane = pane;
-        self.focus = Focus::Controls;
-        self.view_mode = match self.view_mode {
-            ViewMode::Maximized(Surface::Controls) => ViewMode::Maximized(Surface::Controls),
-            _ => ViewMode::Normal,
-        };
+        self.set_focus(Focus::Controls);
+        if !keep_maximized_controls {
+            self.view_mode = ViewMode::Normal;
+        }
         self.status = format!("controls: {}", pane.label(self));
     }
 
@@ -1394,7 +1394,7 @@ impl ConsoleApp {
     fn leave_controls(&mut self) {
         if self.focus == Focus::Controls {
             let was_maximized_controls = self.view_mode == ViewMode::Maximized(Surface::Controls);
-            self.focus = Focus::Run;
+            self.focus_run();
             if was_maximized_controls {
                 self.view_mode = ViewMode::Normal;
             }
@@ -1449,6 +1449,10 @@ impl ConsoleApp {
     fn focus_previous(&mut self) {
         self.set_focus(self.focus.previous());
         self.status = format!("focus: {}", self.focus.label());
+    }
+
+    fn focus_run(&mut self) {
+        self.set_focus(Focus::Run);
     }
 
     fn set_focus(&mut self, focus: Focus) {
@@ -1886,7 +1890,7 @@ impl ConsoleApp {
         self.activity.start();
         self.activity_scroll.reset_tail();
         self.show_runtime_activity_inspector();
-        self.focus = Focus::Run;
+        self.focus_run();
         self.status = status.into();
     }
 

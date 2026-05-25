@@ -10,7 +10,7 @@ pub(super) async fn handle_terminal_event(
             handle_key(app, key, backend_tx).await;
         }
         Event::Paste(text) => {
-            app.focus = Focus::Run;
+            app.focus_run();
             let char_count = text.chars().count();
             app.composer.insert_str(&text);
             app.status = format!("pasted {char_count} characters");
@@ -35,7 +35,7 @@ pub(super) async fn handle_key(
     }
 
     if is_composer_newline_key(key) {
-        app.focus = Focus::Run;
+        app.focus_run();
         app.composer.insert_newline();
         return;
     }
@@ -106,7 +106,7 @@ pub(super) async fn handle_key(
             app.composer.handle_key(key);
         }
         _ if key_starts_composer(key) => {
-            app.focus = Focus::Run;
+            app.focus_run();
             app.composer.handle_key(key);
         }
         _ => {}
