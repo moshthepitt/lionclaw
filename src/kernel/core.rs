@@ -42,16 +42,17 @@ use crate::contracts::{
     ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
     ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
     ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
-    ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamAckResponse,
-    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
-    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
-    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
-    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
-    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
-    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
-    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
-    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    ChannelPairingView, ChannelRoutingProfile, ChannelSessionBinding, ChannelStreamAckRequest,
+    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
+    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
+    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
+    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
+    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
+    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -94,11 +95,11 @@ use super::{
         MAX_CHANNEL_OUTBOX_LEASE_MS, MAX_CHANNEL_OUTBOX_PULL_LIMIT,
     },
     channel_state::{
-        ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
-        ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, ChannelTurnTerminalUpdate,
-        NewChannelHealthReport, NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
-        StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
+        ChannelGrantRecord, ChannelGrantScopeLookup, ChannelGrantStatus, ChannelGrantUpsert,
+        ChannelPairingRequestRecord, ChannelStateStore, ChannelStreamEventInsert,
+        ChannelStreamEventKind, ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus,
+        ChannelTurnTerminalUpdate, NewChannelHealthReport, NewChannelInboundEvent, NewChannelTurn,
+        OperatorPairingUpsert, StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
         CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
         PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
     },
@@ -1621,13 +1622,25 @@ impl Kernel {
         }
 
         let approved = self
-            .get_channel_session_grant(
+            .first_channel_session_grant(
                 channel_id,
-                exact_session_grant_lookup(&scope),
+                approved_session_grant_lookups(&scope),
                 ChannelGrantStatus::Approved,
             )
             .await?
             .ok_or_else(|| KernelError::BadRequest("channel grant is not approved".to_string()))?;
+
+        if let Some(sender_ref) = session_scope_direct_actor_ref(&scope) {
+            self.get_channel_session_grant(
+                channel_id,
+                direct_session_grant_lookup(sender_ref),
+                ChannelGrantStatus::Approved,
+            )
+            .await?
+            .ok_or_else(|| {
+                KernelError::BadRequest("channel actor grant is not approved".to_string())
+            })?;
+        }
 
         Ok(approved.trust_tier)
     }
@@ -1669,6 +1682,41 @@ impl Kernel {
         Ok(None)
     }
 
+    async fn first_channel_session_grant(
+        &self,
+        channel_id: &str,
+        lookups: Vec<ChannelSessionGrantLookup<'_>>,
+        status: ChannelGrantStatus,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        for lookup in lookups {
+            if let Some(grant) = self
+                .get_channel_session_grant(channel_id, lookup, status)
+                .await?
+            {
+                return Ok(Some(grant));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn first_channel_session_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        lookups: Vec<ChannelSessionGrantLookup<'_>>,
+        status: ChannelGrantStatus,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        for lookup in lookups {
+            if let Some(grant) = self
+                .get_channel_session_grant_in_tx(tx, channel_id, lookup, status)
+                .await?
+            {
+                return Ok(Some(grant));
+            }
+        }
+        Ok(None)
+    }
+
     async fn get_channel_session_grant(
         &self,
         channel_id: &str,
@@ -1683,6 +1731,29 @@ impl Kernel {
                 lookup.thread_ref,
                 lookup.routing_profile,
                 status,
+            )
+            .await
+            .map_err(internal)
+    }
+
+    async fn get_channel_session_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        lookup: ChannelSessionGrantLookup<'_>,
+        status: ChannelGrantStatus,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        self.channel_state
+            .get_grant_by_scope_with_status_in_tx(
+                tx,
+                ChannelGrantScopeLookup {
+                    channel_id,
+                    sender_ref: lookup.sender_ref,
+                    conversation_ref: lookup.conversation_ref,
+                    thread_ref: lookup.thread_ref,
+                    routing_profile: lookup.routing_profile,
+                    status,
+                },
             )
             .await
             .map_err(internal)
@@ -2606,7 +2677,7 @@ impl Kernel {
         Ok(ChannelActorAuthorizeResponse {
             authorized: authorization.outcome == ChannelActorAuthorizationOutcome::Authorized,
             reason_code: authorization.outcome.reason_code().to_string(),
-            grant_id: authorization.grant.map(|grant| grant.grant_id),
+            grant_id: authorization.admission_grant.map(|grant| grant.grant_id),
             session_key: authorization.session_key,
         })
     }
@@ -3862,19 +3933,28 @@ impl Kernel {
                 .get_turn_by_inbound_event(&inbound.channel_id, &inbound.event_id)
                 .await
                 .map_err(internal)?
-                .filter(|turn| turn.status == ChannelTurnStatus::WaitingForAttachments)
             {
+                let waiting_for_attachments =
+                    turn.status == ChannelTurnStatus::WaitingForAttachments;
+                let outcome = if waiting_for_attachments {
+                    ChannelInboundOutcome::WaitingForAttachments
+                } else {
+                    ChannelInboundOutcome::Duplicate
+                };
+                let reason_code = if waiting_for_attachments {
+                    "waiting_for_attachments"
+                } else {
+                    "duplicate_event"
+                };
                 self.audit_channel_inbound(
-                    "channel.inbound.duplicate",
                     &inbound,
-                    "waiting_for_attachments",
-                    None,
-                    Some(turn.turn_id),
+                    ChannelInboundAuditDetails::new("channel.inbound.duplicate", reason_code)
+                        .with_turn(turn.turn_id, Some(turn.session_key.as_str())),
                 )
                 .await?;
                 return Ok(channel_inbound_response(
-                    ChannelInboundOutcome::WaitingForAttachments,
-                    "waiting_for_attachments",
+                    outcome,
+                    reason_code,
                     None,
                     None,
                     Some(turn.session_id),
@@ -3883,11 +3963,8 @@ impl Kernel {
                 ));
             }
             self.audit_channel_inbound(
-                "channel.inbound.duplicate",
                 &inbound,
-                "duplicate_event",
-                None,
-                None,
+                ChannelInboundAuditDetails::new("channel.inbound.duplicate", "duplicate_event"),
             )
             .await?;
             return Ok(channel_inbound_response(
@@ -3907,6 +3984,7 @@ impl Kernel {
             conversation_ref: inbound.conversation_ref.clone(),
             thread_ref: inbound.thread_ref.clone(),
             trigger: inbound.trigger,
+            session_binding: inbound.session_binding,
         };
         let authorization = self
             .authorize_channel_actor_in_tx(&mut tx, &auth_input)
@@ -3915,11 +3993,11 @@ impl Kernel {
         if authorization_outcome == ChannelActorAuthorizationOutcome::Blocked {
             self.audit_channel_inbound_in_tx(
                 &mut tx,
-                "channel.inbound.blocked",
                 &inbound,
-                authorization_outcome.reason_code(),
-                None,
-                None,
+                ChannelInboundAuditDetails::new(
+                    "channel.inbound.blocked",
+                    authorization_outcome.reason_code(),
+                ),
             )
             .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
@@ -3942,11 +4020,11 @@ impl Kernel {
         if authorization_outcome == ChannelActorAuthorizationOutcome::ActorApprovalRequired {
             self.audit_channel_inbound_in_tx(
                 &mut tx,
-                "channel.inbound.pending",
                 &inbound,
-                authorization_outcome.reason_code(),
-                None,
-                None,
+                ChannelInboundAuditDetails::new(
+                    "channel.inbound.pending",
+                    authorization_outcome.reason_code(),
+                ),
             )
             .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
@@ -3983,11 +4061,12 @@ impl Kernel {
                 .map_err(internal)?;
             self.audit_channel_inbound_in_tx(
                 &mut tx,
-                "channel.inbound.pending",
                 &inbound,
-                authorization_outcome.reason_code(),
-                Some(pairing.pairing_id),
-                None,
+                ChannelInboundAuditDetails::new(
+                    "channel.inbound.pending",
+                    authorization_outcome.reason_code(),
+                )
+                .with_pairing_id(pairing.pairing_id),
             )
             .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
@@ -4004,7 +4083,7 @@ impl Kernel {
             ));
         }
         let grant = authorization
-            .grant
+            .admission_grant
             .ok_or_else(|| internal(anyhow::anyhow!("authorized channel actor missing grant")))?;
         let session_key = authorization.session_key.ok_or_else(|| {
             internal(anyhow::anyhow!(
@@ -4128,11 +4207,9 @@ impl Kernel {
         };
         self.audit_channel_inbound_in_tx(
             &mut tx,
-            event_type,
             &inbound,
-            reason_code,
-            None,
-            Some(turn_id),
+            ChannelInboundAuditDetails::new(event_type, reason_code)
+                .with_turn(turn_id, Some(&session_key)),
         )
         .await?;
         if has_attachments && !waiting_for_attachments {
@@ -4164,6 +4241,7 @@ impl Kernel {
                 json!({
                     "channel_id": inbound.channel_id,
                     "session_key": session_key,
+                    "session_binding": inbound.session_binding.as_str(),
                     "runtime_id": runtime_id,
                     "turn_id": turn_id,
                     "inbound_event_id": inbound.event_id,
@@ -4203,11 +4281,8 @@ impl Kernel {
 
     async fn audit_channel_inbound(
         &self,
-        event_type: &str,
         inbound: &ValidatedChannelInbound,
-        reason_code: &str,
-        pairing_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
+        details: ChannelInboundAuditDetails<'_>,
     ) -> Result<(), KernelError> {
         let edited = inbound
             .provider_metadata
@@ -4216,7 +4291,7 @@ impl Kernel {
             .unwrap_or(false);
         self.audit
             .append(
-                event_type,
+                details.event_type,
                 None,
                 Some("kernel".to_string()),
                 json!({
@@ -4225,9 +4300,11 @@ impl Kernel {
                     "sender_ref": inbound.sender_ref,
                     "conversation_ref": inbound.conversation_ref,
                     "thread_ref": inbound.thread_ref,
-                    "reason_code": reason_code,
-                    "pairing_id": pairing_id,
-                    "turn_id": turn_id,
+                    "reason_code": details.reason_code,
+                    "pairing_id": details.pairing_id,
+                    "turn_id": details.turn_id,
+                    "session_binding": inbound.session_binding.as_str(),
+                    "session_key": details.session_key,
                     "edited": edited,
                 }),
             )
@@ -4255,7 +4332,7 @@ impl Kernel {
         {
             return Ok(ChannelActorAuthorization {
                 outcome: ChannelActorAuthorizationOutcome::Blocked,
-                grant: None,
+                admission_grant: None,
                 session_key: None,
             });
         }
@@ -4263,7 +4340,7 @@ impl Kernel {
         if input.trigger == ChannelTrigger::None {
             return Ok(ChannelActorAuthorization {
                 outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
-                grant: None,
+                admission_grant: None,
                 session_key: None,
             });
         }
@@ -4283,7 +4360,7 @@ impl Kernel {
         else {
             return Ok(ChannelActorAuthorization {
                 outcome: ChannelActorAuthorizationOutcome::RouteApprovalRequired,
-                grant: None,
+                admission_grant: None,
                 session_key: None,
             });
         };
@@ -4291,7 +4368,7 @@ impl Kernel {
         if !trigger_allows(grant.routing_profile, input.trigger) {
             return Ok(ChannelActorAuthorization {
                 outcome: ChannelActorAuthorizationOutcome::TriggerInsufficient,
-                grant: None,
+                admission_grant: None,
                 session_key: None,
             });
         }
@@ -4306,27 +4383,72 @@ impl Kernel {
         {
             return Ok(ChannelActorAuthorization {
                 outcome: ChannelActorAuthorizationOutcome::ActorApprovalRequired,
-                grant: None,
+                admission_grant: None,
                 session_key: None,
             });
         }
 
-        let session_key = session_key_for_grant(&grant)?;
+        let session_scope = session_key_scope_for_binding(&grant, input)?;
+        self.require_channel_session_binding_scope_approved_in_tx(
+            tx,
+            &input.channel_id,
+            input.session_binding,
+            &session_scope,
+        )
+        .await?;
+        let session_key = session_key_for_scope(&input.channel_id, &session_scope);
         Ok(ChannelActorAuthorization {
             outcome: ChannelActorAuthorizationOutcome::Authorized,
-            grant: Some(grant),
+            admission_grant: Some(grant),
             session_key: Some(session_key),
         })
+    }
+
+    async fn require_channel_session_binding_scope_approved_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        binding: ChannelSessionBinding,
+        scope: &SessionKeyScope,
+    ) -> Result<(), KernelError> {
+        self.first_channel_session_grant_in_tx(
+            tx,
+            channel_id,
+            approved_session_grant_lookups(scope),
+            ChannelGrantStatus::Approved,
+        )
+        .await?
+        .ok_or_else(|| {
+            KernelError::BadRequest(format!(
+                "session_binding '{}' is not covered by an approved grant",
+                binding.as_str()
+            ))
+        })?;
+
+        if let Some(sender_ref) = session_scope_direct_actor_ref(scope) {
+            self.get_channel_session_grant_in_tx(
+                tx,
+                channel_id,
+                direct_session_grant_lookup(sender_ref),
+                ChannelGrantStatus::Approved,
+            )
+            .await?
+            .ok_or_else(|| {
+                KernelError::BadRequest(format!(
+                    "session_binding '{}' requires an approved actor grant",
+                    binding.as_str()
+                ))
+            })?;
+        }
+
+        Ok(())
     }
 
     async fn audit_channel_inbound_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        event_type: &str,
         inbound: &ValidatedChannelInbound,
-        reason_code: &str,
-        pairing_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
+        details: ChannelInboundAuditDetails<'_>,
     ) -> Result<(), KernelError> {
         let edited = inbound
             .provider_metadata
@@ -4336,7 +4458,7 @@ impl Kernel {
         self.audit
             .append_in_tx(
                 tx,
-                event_type,
+                details.event_type,
                 None,
                 Some("kernel".to_string()),
                 json!({
@@ -4345,9 +4467,11 @@ impl Kernel {
                     "sender_ref": inbound.sender_ref,
                     "conversation_ref": inbound.conversation_ref,
                     "thread_ref": inbound.thread_ref,
-                    "reason_code": reason_code,
-                    "pairing_id": pairing_id,
-                    "turn_id": turn_id,
+                    "reason_code": details.reason_code,
+                    "pairing_id": details.pairing_id,
+                    "turn_id": details.turn_id,
+                    "session_binding": inbound.session_binding.as_str(),
+                    "session_key": details.session_key,
                     "edited": edited,
                 }),
             )
@@ -4362,11 +4486,11 @@ impl Kernel {
     ) -> Result<(), KernelError> {
         self.audit_channel_inbound_in_tx(
             tx,
-            "channel.inbound.trigger_ignored",
             inbound,
-            "trigger_insufficient",
-            None,
-            None,
+            ChannelInboundAuditDetails::new(
+                "channel.inbound.trigger_ignored",
+                "trigger_insufficient",
+            ),
         )
         .await
     }
@@ -8168,6 +8292,7 @@ struct ValidatedChannelInbound {
     stageable_attachment_count: usize,
     reply_to_ref: Option<String>,
     trigger: ChannelTrigger,
+    session_binding: ChannelSessionBinding,
     received_at: DateTime<Utc>,
     provider_metadata: serde_json::Value,
 }
@@ -8179,12 +8304,45 @@ struct ValidatedChannelActorAuthorization {
     conversation_ref: String,
     thread_ref: Option<String>,
     trigger: ChannelTrigger,
+    session_binding: ChannelSessionBinding,
 }
 
 struct ChannelActorAuthorization {
     outcome: ChannelActorAuthorizationOutcome,
-    grant: Option<ChannelGrantRecord>,
+    admission_grant: Option<ChannelGrantRecord>,
     session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelInboundAuditDetails<'a> {
+    event_type: &'a str,
+    reason_code: &'a str,
+    pairing_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    session_key: Option<&'a str>,
+}
+
+impl<'a> ChannelInboundAuditDetails<'a> {
+    fn new(event_type: &'a str, reason_code: &'a str) -> Self {
+        Self {
+            event_type,
+            reason_code,
+            pairing_id: None,
+            turn_id: None,
+            session_key: None,
+        }
+    }
+
+    fn with_pairing_id(mut self, pairing_id: Uuid) -> Self {
+        self.pairing_id = Some(pairing_id);
+        self
+    }
+
+    fn with_turn(mut self, turn_id: Uuid, session_key: Option<&'a str>) -> Self {
+        self.turn_id = Some(turn_id);
+        self.session_key = session_key;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8452,6 +8610,12 @@ fn validate_channel_inbound_request(
     let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
     let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
     let thread_ref = trim_optional(req.thread_ref);
+    validate_channel_session_binding_refs(
+        req.session_binding,
+        Some(sender_ref.as_str()),
+        Some(conversation_ref.as_str()),
+        thread_ref.as_deref(),
+    )?;
     let message_ref = trim_optional(req.message_ref);
     let reply_to_ref = trim_optional(req.reply_to_ref);
     let text = trim_optional(req.text);
@@ -8517,6 +8681,7 @@ fn validate_channel_inbound_request(
         stageable_attachment_count,
         reply_to_ref,
         trigger: req.trigger,
+        session_binding: req.session_binding,
         received_at: req.received_at.unwrap_or_else(Utc::now),
         provider_metadata,
     })
@@ -8525,13 +8690,71 @@ fn validate_channel_inbound_request(
 fn validate_channel_actor_authorize_request(
     req: ChannelActorAuthorizeRequest,
 ) -> Result<ValidatedChannelActorAuthorization, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
+    let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
+    let thread_ref = trim_optional(req.thread_ref);
+    validate_channel_session_binding_refs(
+        req.session_binding,
+        Some(sender_ref.as_str()),
+        Some(conversation_ref.as_str()),
+        thread_ref.as_deref(),
+    )?;
+
     Ok(ValidatedChannelActorAuthorization {
-        channel_id: trim_required(req.channel_id, "channel_id")?,
-        sender_ref: trim_required(req.sender_ref, "sender_ref")?,
-        conversation_ref: trim_required(req.conversation_ref, "conversation_ref")?,
-        thread_ref: trim_optional(req.thread_ref),
+        channel_id,
+        sender_ref,
+        conversation_ref,
+        thread_ref,
         trigger: req.trigger,
+        session_binding: req.session_binding,
     })
+}
+
+fn validate_channel_session_binding_refs(
+    binding: ChannelSessionBinding,
+    sender_ref: Option<&str>,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> Result<(), KernelError> {
+    let requires_sender = matches!(
+        binding,
+        ChannelSessionBinding::Actor
+            | ChannelSessionBinding::ConversationActor
+            | ChannelSessionBinding::ThreadActor
+    );
+    let requires_conversation = matches!(
+        binding,
+        ChannelSessionBinding::Conversation
+            | ChannelSessionBinding::Thread
+            | ChannelSessionBinding::ConversationActor
+            | ChannelSessionBinding::ThreadActor
+    );
+    let requires_thread = matches!(
+        binding,
+        ChannelSessionBinding::Thread | ChannelSessionBinding::ThreadActor
+    );
+
+    if requires_sender && sender_ref.is_none_or(str::is_empty) {
+        return Err(KernelError::BadRequest(format!(
+            "session_binding '{}' requires sender_ref",
+            binding.as_str()
+        )));
+    }
+    if requires_conversation && conversation_ref.is_none_or(str::is_empty) {
+        return Err(KernelError::BadRequest(format!(
+            "session_binding '{}' requires conversation_ref",
+            binding.as_str()
+        )));
+    }
+    if requires_thread && thread_ref.is_none_or(str::is_empty) {
+        return Err(KernelError::BadRequest(format!(
+            "session_binding '{}' requires thread_ref",
+            binding.as_str()
+        )));
+    }
+
+    Ok(())
 }
 
 fn normalize_attachment_descriptor(
@@ -9212,56 +9435,139 @@ fn route_grant_requires_direct_actor_host(grant: &ChannelGrantRecord) -> bool {
     )
 }
 
-fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelError> {
+fn session_key_scope_for_grant(grant: &ChannelGrantRecord) -> Result<SessionKeyScope, KernelError> {
     match grant.routing_profile {
         ChannelRoutingProfile::Direct => {
-            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+            let sender_ref = grant.sender_ref.clone().ok_or_else(|| {
                 KernelError::Internal("direct grant missing sender_ref".to_string())
             })?;
-            Ok(format!(
-                "channel:{}:direct:{}",
-                grant.channel_id,
-                encode_session_key_part(sender_ref)
-            ))
+            Ok(SessionKeyScope::Direct { sender_ref })
         }
         ChannelRoutingProfile::Conversation => {
-            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+            let conversation_ref = grant.conversation_ref.clone().ok_or_else(|| {
                 KernelError::Internal("conversation grant missing conversation_ref".to_string())
             })?;
-            let conversation_key = format!(
-                "channel:{}:conversation:{}",
-                grant.channel_id,
-                encode_session_key_part(conversation_ref)
-            );
-            match grant.sender_ref.as_deref() {
-                Some(sender_ref) => Ok(format!(
-                    "{conversation_key}:sender:{}",
-                    encode_session_key_part(sender_ref)
-                )),
-                None => Ok(conversation_key),
-            }
+            Ok(SessionKeyScope::Conversation {
+                sender_ref: grant.sender_ref.clone(),
+                conversation_ref,
+            })
         }
         ChannelRoutingProfile::Thread => {
-            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+            let sender_ref = grant.sender_ref.clone().ok_or_else(|| {
                 KernelError::Internal("thread grant missing sender_ref".to_string())
             })?;
-            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+            let conversation_ref = grant.conversation_ref.clone().ok_or_else(|| {
                 KernelError::Internal("thread grant missing conversation_ref".to_string())
             })?;
-            let thread_ref = grant.thread_ref.as_deref().ok_or_else(|| {
+            let thread_ref = grant.thread_ref.clone().ok_or_else(|| {
                 KernelError::Internal("thread grant missing thread_ref".to_string())
             })?;
-            Ok(format!(
-                "channel:{}:thread:{}:{}:sender:{}",
-                grant.channel_id,
-                encode_session_key_part(conversation_ref),
-                encode_session_key_part(thread_ref),
-                encode_session_key_part(sender_ref)
-            ))
+            Ok(SessionKeyScope::Thread {
+                sender_ref: Some(sender_ref),
+                conversation_ref,
+                thread_ref,
+            })
         }
         ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
             "outbound grants do not accept inbound turns".to_string(),
         )),
+    }
+}
+
+fn session_key_scope_for_binding(
+    grant: &ChannelGrantRecord,
+    input: &ValidatedChannelActorAuthorization,
+) -> Result<SessionKeyScope, KernelError> {
+    match input.session_binding {
+        ChannelSessionBinding::Grant => session_key_scope_for_grant(grant),
+        ChannelSessionBinding::Actor => Ok(SessionKeyScope::Actor {
+            sender_ref: input.sender_ref.clone(),
+        }),
+        ChannelSessionBinding::Conversation => Ok(SessionKeyScope::Conversation {
+            sender_ref: None,
+            conversation_ref: input.conversation_ref.clone(),
+        }),
+        ChannelSessionBinding::Thread => {
+            let thread_ref = input.thread_ref.as_deref().ok_or_else(|| {
+                KernelError::BadRequest("session_binding 'thread' requires thread_ref".to_string())
+            })?;
+            Ok(SessionKeyScope::Thread {
+                sender_ref: None,
+                conversation_ref: input.conversation_ref.clone(),
+                thread_ref: thread_ref.to_string(),
+            })
+        }
+        ChannelSessionBinding::ConversationActor => Ok(SessionKeyScope::Conversation {
+            sender_ref: Some(input.sender_ref.clone()),
+            conversation_ref: input.conversation_ref.clone(),
+        }),
+        ChannelSessionBinding::ThreadActor => {
+            let thread_ref = input.thread_ref.as_deref().ok_or_else(|| {
+                KernelError::BadRequest(
+                    "session_binding 'thread_actor' requires thread_ref".to_string(),
+                )
+            })?;
+            Ok(SessionKeyScope::Thread {
+                sender_ref: Some(input.sender_ref.clone()),
+                conversation_ref: input.conversation_ref.clone(),
+                thread_ref: thread_ref.to_string(),
+            })
+        }
+    }
+}
+
+fn session_key_for_scope(channel_id: &str, scope: &SessionKeyScope) -> String {
+    match scope {
+        SessionKeyScope::Direct { sender_ref } => {
+            format!(
+                "channel:{channel_id}:direct:{}",
+                encode_session_key_part(sender_ref)
+            )
+        }
+        SessionKeyScope::Actor { sender_ref } => {
+            format!(
+                "channel:{channel_id}:actor:{}",
+                encode_session_key_part(sender_ref)
+            )
+        }
+        SessionKeyScope::Conversation {
+            sender_ref,
+            conversation_ref,
+        } => {
+            let conversation_key = format!(
+                "channel:{channel_id}:conversation:{}",
+                encode_session_key_part(conversation_ref)
+            );
+            match sender_ref {
+                Some(sender_ref) => {
+                    format!(
+                        "{conversation_key}:sender:{}",
+                        encode_session_key_part(sender_ref)
+                    )
+                }
+                None => conversation_key,
+            }
+        }
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+        } => {
+            let thread_key = format!(
+                "channel:{channel_id}:thread:{}:{}",
+                encode_session_key_part(conversation_ref),
+                encode_session_key_part(thread_ref)
+            );
+            match sender_ref {
+                Some(sender_ref) => {
+                    format!(
+                        "{thread_key}:sender:{}",
+                        encode_session_key_part(sender_ref)
+                    )
+                }
+                None => thread_key,
+            }
+        }
     }
 }
 
@@ -9315,7 +9621,9 @@ fn decode_session_key_part(raw: &str) -> String {
 
 fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
     match parse_session_key_scope(channel_id, session_peer_id) {
-        Some(SessionKeyScope::Direct { sender_ref }) => sender_ref,
+        Some(SessionKeyScope::Direct { sender_ref } | SessionKeyScope::Actor { sender_ref }) => {
+            sender_ref
+        }
         Some(SessionKeyScope::Conversation {
             conversation_ref, ..
         })
@@ -9331,7 +9639,9 @@ fn delivery_route_for_session_key(
     session_peer_id: &str,
 ) -> (String, Option<String>) {
     match parse_session_key_scope(channel_id, session_peer_id) {
-        Some(SessionKeyScope::Direct { sender_ref }) => (sender_ref, None),
+        Some(SessionKeyScope::Direct { sender_ref } | SessionKeyScope::Actor { sender_ref }) => {
+            (sender_ref, None)
+        }
         Some(SessionKeyScope::Conversation {
             conversation_ref, ..
         }) => (conversation_ref, None),
@@ -9345,6 +9655,14 @@ fn delivery_route_for_session_key(
 }
 
 fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<SessionKeyScope> {
+    let scope = parse_session_key_scope_unchecked(channel_id, session_peer_id)?;
+    (session_key_for_scope(channel_id, &scope) == session_peer_id).then_some(scope)
+}
+
+fn parse_session_key_scope_unchecked(
+    channel_id: &str,
+    session_peer_id: &str,
+) -> Option<SessionKeyScope> {
     let direct_prefix = format!("channel:{channel_id}:direct:");
     if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
         return Some(SessionKeyScope::Direct {
@@ -9352,14 +9670,16 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
         });
     }
 
+    let actor_prefix = format!("channel:{channel_id}:actor:");
+    if let Some(sender_ref) = session_peer_id.strip_prefix(&actor_prefix) {
+        return Some(SessionKeyScope::Actor {
+            sender_ref: decode_session_key_part(sender_ref),
+        });
+    }
+
     let conversation_prefix = format!("channel:{channel_id}:conversation:");
     if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
-        let (conversation_ref, sender_ref) = match rest.split_once(":sender:") {
-            Some((conversation_ref, sender_ref)) => {
-                (conversation_ref, Some(decode_session_key_part(sender_ref)))
-            }
-            None => (rest, None),
-        };
+        let (conversation_ref, sender_ref) = split_session_sender_suffix(rest);
         return Some(SessionKeyScope::Conversation {
             sender_ref,
             conversation_ref: decode_session_key_part(conversation_ref),
@@ -9368,16 +9688,23 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
 
     let thread_prefix = format!("channel:{channel_id}:thread:");
     if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
-        let (thread_scope, sender_ref) = rest.split_once(":sender:")?;
+        let (thread_scope, sender_ref) = split_session_sender_suffix(rest);
         let (conversation_ref, thread_ref) = thread_scope.split_once(':')?;
         return Some(SessionKeyScope::Thread {
-            sender_ref: decode_session_key_part(sender_ref),
+            sender_ref,
             conversation_ref: decode_session_key_part(conversation_ref),
             thread_ref: decode_session_key_part(thread_ref),
         });
     }
 
     None
+}
+
+fn split_session_sender_suffix(raw: &str) -> (&str, Option<String>) {
+    if let Some((scope, sender_ref)) = raw.split_once(":sender:") {
+        return (scope, Some(decode_session_key_part(sender_ref)));
+    }
+    (raw, None)
 }
 
 fn draft_request_error(err: anyhow::Error) -> KernelError {
@@ -10206,12 +10533,15 @@ enum SessionKeyScope {
     Direct {
         sender_ref: String,
     },
+    Actor {
+        sender_ref: String,
+    },
     Conversation {
         sender_ref: Option<String>,
         conversation_ref: String,
     },
     Thread {
-        sender_ref: String,
+        sender_ref: Option<String>,
         conversation_ref: String,
         thread_ref: String,
     },
@@ -10227,12 +10557,9 @@ struct ChannelSessionGrantLookup<'a> {
 
 fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLookup<'_> {
     match scope {
-        SessionKeyScope::Direct { sender_ref } => ChannelSessionGrantLookup {
-            sender_ref: Some(sender_ref),
-            conversation_ref: None,
-            thread_ref: None,
-            routing_profile: ChannelRoutingProfile::Direct,
-        },
+        SessionKeyScope::Direct { sender_ref } | SessionKeyScope::Actor { sender_ref } => {
+            direct_session_grant_lookup(sender_ref)
+        }
         SessionKeyScope::Conversation {
             sender_ref,
             conversation_ref,
@@ -10247,7 +10574,7 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
             conversation_ref,
             thread_ref,
         } => ChannelSessionGrantLookup {
-            sender_ref: Some(sender_ref),
+            sender_ref: sender_ref.as_deref(),
             conversation_ref: Some(conversation_ref),
             thread_ref: Some(thread_ref),
             routing_profile: ChannelRoutingProfile::Thread,
@@ -10255,18 +10582,110 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
     }
 }
 
-fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
+fn direct_session_grant_lookup(sender_ref: &str) -> ChannelSessionGrantLookup<'_> {
+    ChannelSessionGrantLookup {
+        sender_ref: Some(sender_ref),
+        conversation_ref: None,
+        thread_ref: None,
+        routing_profile: ChannelRoutingProfile::Direct,
+    }
+}
+
+fn approved_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
     match scope {
-        SessionKeyScope::Direct { .. } => vec![exact_session_grant_lookup(scope)],
-        SessionKeyScope::Conversation { sender_ref, .. } => {
-            let mut lookups = vec![exact_session_grant_lookup(scope)];
+        SessionKeyScope::Direct { .. } | SessionKeyScope::Actor { .. } => {
+            vec![exact_session_grant_lookup(scope)]
+        }
+        SessionKeyScope::Conversation {
+            sender_ref,
+            conversation_ref,
+        } => {
+            let mut lookups = Vec::new();
             if let Some(sender_ref) = sender_ref {
                 lookups.push(ChannelSessionGrantLookup {
                     sender_ref: Some(sender_ref),
-                    conversation_ref: None,
+                    conversation_ref: Some(conversation_ref),
                     thread_ref: None,
-                    routing_profile: ChannelRoutingProfile::Direct,
+                    routing_profile: ChannelRoutingProfile::Conversation,
                 });
+            }
+            lookups.push(ChannelSessionGrantLookup {
+                sender_ref: None,
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            });
+            lookups
+        }
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+        } => {
+            let mut lookups = Vec::new();
+            if let Some(sender_ref) = sender_ref {
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: Some(thread_ref),
+                    routing_profile: ChannelRoutingProfile::Thread,
+                });
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                });
+            }
+            lookups.push(ChannelSessionGrantLookup {
+                sender_ref: None,
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            });
+            lookups
+        }
+    }
+}
+
+fn session_scope_direct_actor_ref(scope: &SessionKeyScope) -> Option<&str> {
+    match scope {
+        SessionKeyScope::Direct { .. } | SessionKeyScope::Actor { .. } => None,
+        SessionKeyScope::Conversation {
+            sender_ref: Some(sender_ref),
+            ..
+        }
+        | SessionKeyScope::Thread {
+            sender_ref: Some(sender_ref),
+            ..
+        } => Some(sender_ref),
+        SessionKeyScope::Conversation {
+            sender_ref: None, ..
+        }
+        | SessionKeyScope::Thread {
+            sender_ref: None, ..
+        } => None,
+    }
+}
+
+fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
+    match scope {
+        SessionKeyScope::Direct { .. } | SessionKeyScope::Actor { .. } => {
+            vec![exact_session_grant_lookup(scope)]
+        }
+        SessionKeyScope::Conversation {
+            sender_ref,
+            conversation_ref,
+        } => {
+            let mut lookups = vec![exact_session_grant_lookup(scope)];
+            if let Some(sender_ref) = sender_ref {
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: None,
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                });
+                lookups.push(direct_session_grant_lookup(sender_ref));
             }
             lookups
         }
@@ -10274,27 +10693,25 @@ fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
             sender_ref,
             conversation_ref,
             ..
-        } => vec![
-            exact_session_grant_lookup(scope),
-            ChannelSessionGrantLookup {
-                sender_ref: Some(sender_ref),
-                conversation_ref: Some(conversation_ref),
-                thread_ref: None,
-                routing_profile: ChannelRoutingProfile::Conversation,
-            },
-            ChannelSessionGrantLookup {
+        } => {
+            let mut lookups = vec![exact_session_grant_lookup(scope)];
+            if let Some(sender_ref) = sender_ref {
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                });
+                lookups.push(direct_session_grant_lookup(sender_ref));
+            }
+            lookups.push(ChannelSessionGrantLookup {
                 sender_ref: None,
                 conversation_ref: Some(conversation_ref),
                 thread_ref: None,
                 routing_profile: ChannelRoutingProfile::Conversation,
-            },
-            ChannelSessionGrantLookup {
-                sender_ref: Some(sender_ref),
-                conversation_ref: None,
-                thread_ref: None,
-                routing_profile: ChannelRoutingProfile::Direct,
-            },
-        ],
+            });
+            lookups
+        }
     }
 }
 

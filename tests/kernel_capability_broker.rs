@@ -9,8 +9,8 @@ use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
         ChannelInboundRequest, ChannelOutboxPullRequest, ChannelPairingApproveRequest,
-        ChannelTrigger, JobCreateRequest, PolicyGrantRequest, SessionOpenRequest,
-        SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelSessionBinding, ChannelTrigger, JobCreateRequest, PolicyGrantRequest,
+        SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -479,6 +479,61 @@ async fn channel_send_capability_preserves_thread_route_from_session() {
     assert_eq!(delivery.content.text, "hello thread from capability broker");
 }
 
+#[tokio::test]
+async fn channel_send_capability_preserves_thread_binding_route_without_actor() {
+    let env = TestHome::new().await;
+    install_broker_channel_send_skills(&env, "broker-channel-send-thread-binding").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "single-capability",
+            Arc::new(SingleCapabilityRuntimeAdapter::new(
+                Capability::ChannelSend,
+                json!({"content": "hello thread binding from capability broker"}),
+            )),
+        )
+        .await;
+
+    approve_channel_conversation(&kernel, "alice", "room-1").await;
+    let session_key = thread_binding_session_key("local-cli", "room-1", "topic-a");
+    let (session_id, _runtime_skill_id) = prepare_session_with_skill_for_session_key(
+        env.home(),
+        &kernel,
+        &session_key,
+        "broker-channel-send-thread-binding",
+    )
+    .await;
+    grant_capability(
+        &kernel,
+        "broker-channel-send-thread-binding",
+        "channel.send",
+    )
+    .await;
+
+    let _response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: "run broker-channel-send in bound thread".to_string(),
+            runtime_id: Some("single-capability".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let details = latest_capability_result(&kernel, session_id).await;
+    assert_eq!(details["allowed"].as_bool(), Some(true));
+    assert_eq!(
+        details["output_summary"]["conversation_ref"].as_str(),
+        Some("room-1")
+    );
+    assert_eq!(
+        details["output_summary"]["thread_ref"].as_str(),
+        Some("topic-a")
+    );
+}
+
 struct SingleCapabilityRuntimeAdapter {
     capability: Capability,
     scope: Option<String>,
@@ -654,12 +709,41 @@ async fn approve_channel_sender(kernel: &Kernel, sender_ref: &str) {
         .await;
 }
 
+async fn approve_channel_conversation(kernel: &Kernel, sender_ref: &str, conversation_ref: &str) {
+    let event_id = format!("cap-broker-conversation-pairing-{sender_ref}-{conversation_ref}");
+    let response = kernel
+        .ingest_channel_inbound(v2_scoped_text_request(
+            "local-cli",
+            &event_id,
+            sender_ref,
+            conversation_ref,
+            None,
+            "seed conversation pairing",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("seed conversation pairing state");
+    let pairing_id = response.pairing_id.expect("conversation pairing id");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "local-cli".to_string(),
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve conversation pairing");
+}
+
 async fn approve_channel_sender_in_thread(
     kernel: &Kernel,
     sender_ref: &str,
     conversation_ref: &str,
     thread_ref: &str,
 ) {
+    approve_channel_sender(kernel, sender_ref).await;
     approve_channel_sender_for_scope(
         kernel,
         sender_ref,
@@ -748,6 +832,18 @@ fn thread_session_key(
     )
 }
 
+fn thread_binding_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:thread:{}:{}",
+        session_key_part(conversation_ref),
+        session_key_part(thread_ref)
+    )
+}
+
 fn session_key_part(value: &str) -> String {
     value.replace('%', "%25").replace(':', "%3A")
 }
@@ -772,6 +868,7 @@ fn v2_scoped_text_request(
         attachments: Vec::new(),
         reply_to_ref: None,
         trigger,
+        session_binding: ChannelSessionBinding::Grant,
         received_at: None,
         provider_metadata: serde_json::json!({}),
     }

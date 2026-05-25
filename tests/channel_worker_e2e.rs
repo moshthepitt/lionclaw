@@ -12,10 +12,10 @@ use lionclaw::{
         ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
         ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
         ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
-        ChannelPairingApproveRequest, ChannelStreamAckRequest, ChannelStreamAckResponse,
-        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, StreamEventKindDto,
-        StreamLaneDto, TrustTier,
+        ChannelPairingApproveRequest, ChannelSessionBinding, ChannelStreamAckRequest,
+        ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+        ChannelStreamPullResponse, ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{Kernel, KernelOptions},
 };
@@ -201,6 +201,7 @@ fn inbound_request(event_id: &str, text: &str) -> ChannelInboundRequest {
         attachments: Vec::new(),
         reply_to_ref: None,
         trigger: ChannelTrigger::Dm,
+        session_binding: ChannelSessionBinding::Grant,
         received_at: None,
         provider_metadata: serde_json::json!({}),
     }

@@ -15,10 +15,10 @@ use lionclaw::{
     applied::AppliedState,
     contracts::{
         ChannelInboundRequest, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
-        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelTrigger, JobCreateRequest,
-        JobRefRequest, JobRunsRequest, SchedulerJobDeliveryStatusDto, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
-        TrustTier,
+        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelSessionBinding,
+        ChannelTrigger, JobCreateRequest, JobRefRequest, JobRunsRequest,
+        SchedulerJobDeliveryStatusDto, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -1505,6 +1505,7 @@ async fn approve_channel_grant(kernel: &Kernel, channel_id: &str, peer_id: &str)
             attachments: Vec::new(),
             reply_to_ref: None,
             trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::Grant,
             received_at: None,
             provider_metadata: serde_json::json!({}),
         })

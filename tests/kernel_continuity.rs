@@ -14,9 +14,9 @@ use lionclaw::{
     applied::AppliedState,
     contracts::{
         ChannelGrantRevokeRequest, ChannelInboundRequest, ChannelPairingApproveRequest,
-        ChannelPairingStatus, ChannelTrigger, ContinuityPathRequest, ContinuitySearchRequest,
-        JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest,
-        SessionTurnRequest, TrustTier,
+        ChannelPairingStatus, ChannelSessionBinding, ChannelTrigger, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
+        SessionOpenRequest, SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -2222,6 +2222,7 @@ fn v2_text_request(
         attachments: Vec::new(),
         reply_to_ref: None,
         trigger: ChannelTrigger::Dm,
+        session_binding: ChannelSessionBinding::Grant,
         received_at: None,
         provider_metadata: serde_json::json!({}),
     }
