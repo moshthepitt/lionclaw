@@ -7438,6 +7438,7 @@ fn to_stream_file_change_dto(change: RuntimeFileChange) -> StreamFileChangeDto {
     let total_count = change.total_count.max(change.paths.len());
     StreamFileChangeDto {
         runtime: change.runtime,
+        operation_id: change.operation_id,
         status: to_stream_file_change_status_dto(&change.status),
         paths: change.paths,
         total_count,

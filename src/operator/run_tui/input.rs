@@ -125,14 +125,8 @@ fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
         GlobalCommand::Commands => app.overlay = Some(Overlay::Help),
         GlobalCommand::FocusControls => app.focus_controls(),
         GlobalCommand::ToggleMaximize => app.toggle_maximize(),
-        GlobalCommand::NextFocus => {
-            app.focus = app.focus.next();
-            app.status = format!("focus: {}", app.focus.label());
-        }
-        GlobalCommand::PreviousFocus => {
-            app.focus = app.focus.previous();
-            app.status = format!("focus: {}", app.focus.label());
-        }
+        GlobalCommand::NextFocus => app.focus_next(),
+        GlobalCommand::PreviousFocus => app.focus_previous(),
         GlobalCommand::InterruptOrConfirmExit => {
             if app.active() {
                 if let Some(cancellation) = app.active_turn_cancel.take() {
@@ -159,10 +153,7 @@ fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
 }
 
 fn active_page_size(app: &ConsoleApp) -> usize {
-    match app.selected_scroll_target() {
-        ScrollTarget::Transcript => app.transcript_scroll.page_size,
-        ScrollTarget::Activity => app.activity_scroll.page_size,
-    }
+    app.selected_scroll().page_size
 }
 
 fn mouse_scroll_amount(app: &ConsoleApp) -> usize {
@@ -170,31 +161,19 @@ fn mouse_scroll_amount(app: &ConsoleApp) -> usize {
 }
 
 fn scroll_up(app: &mut ConsoleApp, amount: usize) {
-    match app.selected_scroll_target() {
-        ScrollTarget::Transcript => app.scroll_transcript_up(amount),
-        ScrollTarget::Activity => app.scroll_activity_up(amount),
-    }
+    app.selected_scroll_mut().scroll_up(amount);
 }
 
 fn scroll_down(app: &mut ConsoleApp, amount: usize) {
-    match app.selected_scroll_target() {
-        ScrollTarget::Transcript => app.scroll_transcript_down(amount),
-        ScrollTarget::Activity => app.scroll_activity_down(amount),
-    }
+    app.selected_scroll_mut().scroll_down(amount);
 }
 
 fn scroll_to_top(app: &mut ConsoleApp) {
-    match app.selected_scroll_target() {
-        ScrollTarget::Transcript => app.scroll_transcript_to_top(),
-        ScrollTarget::Activity => app.scroll_activity_to_top(),
-    }
+    app.selected_scroll_mut().scroll_to_top();
 }
 
 fn scroll_to_bottom(app: &mut ConsoleApp) {
-    match app.selected_scroll_target() {
-        ScrollTarget::Transcript => app.scroll_transcript_to_bottom(),
-        ScrollTarget::Activity => app.scroll_activity_to_bottom(),
-    }
+    app.selected_scroll_mut().scroll_to_bottom();
 }
 
 fn is_composer_newline_key(key: KeyEvent) -> bool {

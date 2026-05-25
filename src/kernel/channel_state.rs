@@ -2503,6 +2503,7 @@ mod tests {
         let store = ChannelStateStore::new(db.pool());
         let file_change = StreamFileChangeDto {
             runtime: "codex".to_string(),
+            operation_id: Some("edit-1".to_string()),
             status: crate::contracts::StreamFileChangeStatusDto::Edited,
             paths: vec!["src/main.rs".to_string()],
             total_count: 1,

@@ -1649,9 +1649,8 @@ fn describe_app_server_item(params: &Value) -> Option<String> {
 }
 
 fn app_server_item_events(params: &Value) -> Vec<RuntimeEvent> {
-    let item = app_server_item(params);
     match app_server_item_type(params) {
-        Some("fileChange") => codex_file_change_item(item)
+        Some("fileChange") => codex_file_change_item(params)
             .map(|change| RuntimeEvent::FileChange { change })
             .into_iter()
             .collect(),
@@ -1759,7 +1758,8 @@ fn command_actions_display(value: &Value) -> Option<String> {
     (!rendered.is_empty()).then(|| rendered.join(" && "))
 }
 
-fn codex_file_change_item(item: &Value) -> Option<RuntimeFileChange> {
+fn codex_file_change_item(params: &Value) -> Option<RuntimeFileChange> {
+    let item = app_server_item(params);
     let changes = item.get("changes").and_then(Value::as_array)?;
     let status = item
         .get("status")
@@ -1781,6 +1781,7 @@ fn codex_file_change_item(item: &Value) -> Option<RuntimeFileChange> {
         .collect::<Vec<_>>();
     Some(RuntimeFileChange {
         runtime: "codex".to_string(),
+        operation_id: extract_app_server_item_id(params),
         status,
         paths,
         total_count: changes.len(),
@@ -2367,6 +2368,7 @@ mod tests {
         );
         let file_change_events = super::app_server_item_events(&json!({
             "item": {
+                "id": "edit-1",
                 "type": "fileChange",
                 "status": "completed",
                 "changes": [
@@ -2379,6 +2381,7 @@ mod tests {
             file_change_events.as_slice(),
             [RuntimeEvent::FileChange { change }]
                 if change.runtime == "codex"
+                    && change.operation_id.as_deref() == Some("edit-1")
                     && change.status == RuntimeFileChangeStatus::Edited
                     && change.paths == ["src/operator/run_tui.rs", "Cargo.toml"]
                     && change.total_count == 2

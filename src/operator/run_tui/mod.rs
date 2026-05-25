@@ -96,6 +96,7 @@ const ACTIVITY_ITEM_HISTORY_LIMIT: usize = 200;
 const FILE_CHANGE_HISTORY_LIMIT: usize = 100;
 const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
 const DEFAULT_ACTIVITY_PAGE_SCROLL: usize = 8;
+const DEFAULT_FILES_PAGE_SCROLL: usize = 8;
 const RUN_PROMPT_MIN_HEIGHT: u16 = 4;
 const RUN_PROMPT_MAX_HEIGHT: u16 = 8;
 const RUN_PROMPT_CHROME_HEIGHT: u16 = 2;
@@ -390,6 +391,7 @@ impl FileChangeStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileChangeSummary {
     runtime: String,
+    operation_id: Option<String>,
     status: FileChangeStatus,
     paths: Vec<String>,
     total_count: usize,
@@ -405,6 +407,7 @@ impl FileChangeSummary {
             .collect::<Vec<_>>();
         Self {
             runtime: change.runtime.clone(),
+            operation_id: change.operation_id.clone(),
             status: FileChangeStatus::from_stream(&change.status),
             total_count: change.total_count.max(paths.len()),
             paths,
@@ -442,6 +445,18 @@ impl FileChangeSummary {
                 self.paths.join(", "),
                 suffix
             )
+        }
+    }
+
+    fn is_update_for(&self, other: &Self) -> bool {
+        match (self.operation_id.as_deref(), other.operation_id.as_deref()) {
+            (Some(left), Some(right)) => self.runtime == other.runtime && left == right,
+            (None, None) => {
+                self.runtime == other.runtime
+                    && self.total_count == other.total_count
+                    && self.paths == other.paths
+            }
+            _ => false,
         }
     }
 }
@@ -575,19 +590,33 @@ impl ActivitySummary {
     }
 
     fn record_file_change(&mut self, file_change: FileChangeSummary) {
-        self.file_change_count = self
-            .file_change_count
-            .saturating_add(file_change.path_count());
         let text = file_change.label();
-        self.file_changes.push(file_change);
-        let overflow = self
+        if let Some(existing) = self
             .file_changes
-            .len()
-            .saturating_sub(FILE_CHANGE_HISTORY_LIMIT);
-        if overflow > 0 {
-            self.file_changes.drain(0..overflow);
+            .iter_mut()
+            .find(|existing| existing.is_update_for(&file_change))
+        {
+            *existing = file_change;
+        } else {
+            self.file_changes.push(file_change);
+            let overflow = self
+                .file_changes
+                .len()
+                .saturating_sub(FILE_CHANGE_HISTORY_LIMIT);
+            if overflow > 0 {
+                self.file_changes.drain(0..overflow);
+            }
         }
+        self.refresh_file_change_count();
         self.push_item(ActivityItemKind::FileChange, text);
+    }
+
+    fn refresh_file_change_count(&mut self) {
+        self.file_change_count = self
+            .file_changes
+            .iter()
+            .map(FileChangeSummary::path_count)
+            .sum();
     }
 
     fn count_activity_kind(&mut self, kind: ActivityItemKind) {
@@ -1040,6 +1069,13 @@ impl Focus {
             Self::Controls => Self::Run,
         }
     }
+
+    fn surface(self) -> Surface {
+        match self {
+            Self::Run => Surface::Run,
+            Self::Controls => Surface::Controls,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1058,6 +1094,7 @@ enum ViewMode {
 enum ScrollTarget {
     Transcript,
     Activity,
+    Files,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1183,6 +1220,7 @@ pub(crate) struct ConsoleApp {
     active_turn_anchor: Option<usize>,
     activity: ActivitySummary,
     activity_scroll: VerticalScroll,
+    files_scroll: VerticalScroll,
     audit: AuditTrail,
     inspector_subject: InspectorSubject,
     status: String,
@@ -1226,6 +1264,7 @@ impl ConsoleApp {
             active_turn_anchor: None,
             activity: ActivitySummary::new(),
             activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+            files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
             audit,
             inspector_subject: InspectorSubject::Selection,
             status: "idle".to_string(),
@@ -1315,46 +1354,18 @@ impl ConsoleApp {
         self.status = format!("project: {}", self.project_cursor_label());
     }
 
-    fn scroll_transcript_up(&mut self, amount: usize) {
-        self.transcript_scroll.scroll_up(amount);
-    }
-
-    fn scroll_transcript_down(&mut self, amount: usize) {
-        self.transcript_scroll.scroll_down(amount);
-    }
-
-    fn scroll_transcript_to_top(&mut self) {
-        self.transcript_scroll.scroll_to_top();
-    }
-
-    fn scroll_transcript_to_bottom(&mut self) {
-        self.transcript_scroll.scroll_to_bottom();
-    }
-
     fn set_transcript_viewport(&mut self, line_count: usize, viewport_height: u16) {
         self.transcript_scroll
             .set_viewport(line_count, viewport_height);
     }
 
-    fn scroll_activity_up(&mut self, amount: usize) {
-        self.activity_scroll.scroll_up(amount);
-    }
-
-    fn scroll_activity_down(&mut self, amount: usize) {
-        self.activity_scroll.scroll_down(amount);
-    }
-
-    fn scroll_activity_to_top(&mut self) {
-        self.activity_scroll.scroll_to_top();
-    }
-
-    fn scroll_activity_to_bottom(&mut self) {
-        self.activity_scroll.scroll_to_bottom();
-    }
-
     fn set_activity_viewport(&mut self, line_count: usize, viewport_height: u16) {
         self.activity_scroll
             .set_viewport(line_count, viewport_height);
+    }
+
+    fn set_files_viewport(&mut self, line_count: usize, viewport_height: u16) {
+        self.files_scroll.set_viewport(line_count, viewport_height);
     }
 
     fn open_control_pane(&mut self, pane: ControlPane) {
@@ -1373,7 +1384,7 @@ impl ConsoleApp {
     }
 
     fn focus_controls(&mut self) {
-        self.focus = Focus::Controls;
+        self.set_focus(Focus::Controls);
         if self.view_mode != ViewMode::Maximized(Surface::Controls) {
             self.view_mode = ViewMode::Normal;
         }
@@ -1382,8 +1393,9 @@ impl ConsoleApp {
 
     fn leave_controls(&mut self) {
         if self.focus == Focus::Controls {
+            let was_maximized_controls = self.view_mode == ViewMode::Maximized(Surface::Controls);
             self.focus = Focus::Run;
-            if self.view_mode == ViewMode::Maximized(Surface::Controls) {
+            if was_maximized_controls {
                 self.view_mode = ViewMode::Normal;
             }
             self.status = "focus: run".to_string();
@@ -1429,14 +1441,48 @@ impl ConsoleApp {
         };
     }
 
+    fn focus_next(&mut self) {
+        self.set_focus(self.focus.next());
+        self.status = format!("focus: {}", self.focus.label());
+    }
+
+    fn focus_previous(&mut self) {
+        self.set_focus(self.focus.previous());
+        self.status = format!("focus: {}", self.focus.label());
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        if matches!(self.view_mode, ViewMode::Maximized(_)) {
+            self.view_mode = ViewMode::Maximized(focus.surface());
+        }
+    }
+
     fn selected_scroll_target(&self) -> ScrollTarget {
         if self.focus == Focus::Controls {
             match self.control_pane {
                 ControlPane::Inspector(InspectorSubject::Activity) => ScrollTarget::Activity,
+                ControlPane::Files => ScrollTarget::Files,
                 _ => ScrollTarget::Transcript,
             }
         } else {
             ScrollTarget::Transcript
+        }
+    }
+
+    fn selected_scroll(&self) -> &VerticalScroll {
+        match self.selected_scroll_target() {
+            ScrollTarget::Transcript => &self.transcript_scroll,
+            ScrollTarget::Activity => &self.activity_scroll,
+            ScrollTarget::Files => &self.files_scroll,
+        }
+    }
+
+    fn selected_scroll_mut(&mut self) -> &mut VerticalScroll {
+        match self.selected_scroll_target() {
+            ScrollTarget::Transcript => &mut self.transcript_scroll,
+            ScrollTarget::Activity => &mut self.activity_scroll,
+            ScrollTarget::Files => &mut self.files_scroll,
         }
     }
 
@@ -1952,6 +1998,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("Launch blocked".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "launch blocked".to_string(),
@@ -1995,6 +2042,7 @@ pub(crate) async fn run_project_launch_blocker(
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("No configured instances".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "no instances configured".to_string(),

@@ -156,9 +156,12 @@ plain text from `message_delta` events should ignore it; consumers that render
 conversation structure may use it as a paragraph/message-item break. Literal
 `message_delta` text is otherwise preserved as emitted by the runtime adapter.
 Runtime adapters can emit `file_change` events with structured
-`file_change` payloads (`runtime`, `status`, `paths`, `total_count`) when the
-runtime reports edits. The text field remains a compact display summary, but
-operator UIs should read the structured payload instead of parsing status text.
+`file_change` payloads (`runtime`, optional `operation_id`, `status`, `paths`,
+`total_count`) when the runtime reports edits. The text field remains a compact
+display summary, but operator UIs should read the structured payload instead of
+parsing status text. When present, `operation_id` identifies updates for the
+same runtime edit operation so UIs can replace in-progress file-change rows
+with their completed status instead of double-counting them.
 Channel streams also emit a kernel-owned `turn_completed` event after the turn
 record is finalized. Its `text` field is the canonical persisted assistant
 reply and lets channel UIs reconcile live deltas against durable turn state

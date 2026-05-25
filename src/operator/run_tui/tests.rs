@@ -38,7 +38,29 @@ fn file_change_event(paths: &[&str], total_count: usize) -> StreamEventDto {
         text: None,
         file_change: Some(StreamFileChangeDto {
             runtime: "codex".to_string(),
+            operation_id: None,
             status: StreamFileChangeStatusDto::Edited,
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            total_count,
+        }),
+    }
+}
+
+fn file_change_operation_event(
+    operation_id: &str,
+    status: StreamFileChangeStatusDto,
+    paths: &[&str],
+    total_count: usize,
+) -> StreamEventDto {
+    StreamEventDto {
+        kind: StreamEventKindDto::FileChange,
+        lane: None,
+        code: None,
+        text: None,
+        file_change: Some(StreamFileChangeDto {
+            runtime: "codex".to_string(),
+            operation_id: Some(operation_id.to_string()),
+            status,
             paths: paths.iter().map(|path| (*path).to_string()).collect(),
             total_count,
         }),
@@ -302,6 +324,33 @@ fn file_change_statuses_are_first_class_activity() {
         ]
     );
     assert_eq!(activity.file_changes[0].hidden_count(), 2);
+}
+
+#[test]
+fn file_change_operations_update_in_place() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+
+    activity.record_stream_event(&file_change_operation_event(
+        "edit-1",
+        StreamFileChangeStatusDto::Editing,
+        &["src/operator/run_tui/render.rs"],
+        1,
+    ));
+    activity.record_stream_event(&file_change_operation_event(
+        "edit-1",
+        StreamFileChangeStatusDto::Edited,
+        &["src/operator/run_tui/render.rs"],
+        1,
+    ));
+
+    assert_eq!(activity.file_change_count, 1);
+    assert_eq!(activity.file_changes.len(), 1);
+    assert_eq!(activity.file_changes[0].status, FileChangeStatus::Edited);
+    assert_eq!(
+        activity.file_changes[0].operation_id.as_deref(),
+        Some("edit-1")
+    );
 }
 
 #[test]
@@ -598,6 +647,7 @@ fn blocked_instance_renders_launch_blocker() {
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "launch blocked".to_string(),
@@ -733,6 +783,7 @@ async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
@@ -888,7 +939,7 @@ async fn run_turn_autoscrolls_transcript_until_operator_scrolls_away() {
     let mut app = ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
 
     render_to_text(&mut app, 100, 24);
-    app.scroll_transcript_to_top();
+    app.transcript_scroll.scroll_to_top();
     assert!(!app.transcript_scroll.follow_tail);
 
     app.begin_run_turn("new prompt", "running turn");
@@ -903,7 +954,7 @@ async fn run_turn_autoscrolls_transcript_until_operator_scrolls_away() {
     assert_eq!(app.transcript_scroll.offset, app.transcript_scroll.limit);
     assert!(rendered.contains("streamed-tail-line-00"));
 
-    app.scroll_transcript_up(5);
+    app.transcript_scroll.scroll_up(5);
     assert!(!app.transcript_scroll.follow_tail);
     push_stream_event(
         &mut app.transcript,
@@ -915,7 +966,7 @@ async fn run_turn_autoscrolls_transcript_until_operator_scrolls_away() {
     assert!(!app.transcript_scroll.follow_tail);
     assert!(app.transcript_scroll.offset < app.transcript_scroll.limit);
 
-    app.scroll_transcript_to_bottom();
+    app.transcript_scroll.scroll_to_bottom();
     push_stream_event(
         &mut app.transcript,
         &mut app.activity,
@@ -1102,6 +1153,34 @@ async fn files_pane_renders_changed_files() {
     assert!(rendered.contains("src"));
     assert!(rendered.contains("render.rs"));
     assert!(rendered.contains("Cargo.toml"));
+}
+
+#[tokio::test]
+async fn files_pane_scrolls_changed_files() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.activity.start();
+    for index in 0..30 {
+        let path = format!("src/generated/file-{index:02}.rs");
+        app.activity
+            .record_stream_event(&file_change_event(&[&path], 1));
+    }
+    app.open_control_pane(ControlPane::Files);
+
+    let initial = render_to_text(&mut app, 120, 26);
+    assert!(initial.contains("file-00.rs"));
+    assert!(!initial.contains("file-29.rs"));
+
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        &backend_tx,
+    )
+    .await;
+    let scrolled = render_to_text(&mut app, 120, 26);
+
+    assert!(app.files_scroll.offset > 0);
+    assert!(scrolled.contains("file-29.rs"));
 }
 
 #[tokio::test]
@@ -1787,6 +1866,49 @@ fn tab_moves_focus_and_render_marks_focused_pane() {
 }
 
 #[test]
+fn tab_keeps_maximized_surface_with_focus() {
+    let mut app = blocked_test_app();
+    app.focus = Focus::Run;
+    app.toggle_maximize();
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Run));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+
+    assert_eq!(app.focus, Focus::Controls);
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Controls));
+    let rendered_controls = render_to_text(&mut app, 100, 30);
+    assert!(rendered_controls.contains("▶ Project"));
+    assert!(!rendered_controls.contains("Launch blocked for main"));
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+
+    assert_eq!(app.focus, Focus::Run);
+    assert_eq!(app.view_mode, ViewMode::Maximized(Surface::Run));
+    let rendered_run = render_to_text(&mut app, 100, 30);
+    assert!(rendered_run.contains("▶ Run"));
+}
+
+#[test]
 fn left_right_cycles_control_panes() {
     let mut app = blocked_test_app();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1957,6 +2079,7 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempD
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
@@ -2014,6 +2137,7 @@ fn blocked_test_app() -> ConsoleApp {
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
@@ -2152,6 +2276,7 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("not loaded".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),

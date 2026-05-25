@@ -340,6 +340,8 @@ impl StreamFileChangeStatusDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamFileChangeDto {
     pub runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     pub status: StreamFileChangeStatusDto,
     #[serde(default)]
     pub paths: Vec<String>,

@@ -279,6 +279,7 @@ pub enum RuntimeFileChangeStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFileChange {
     pub runtime: String,
+    pub operation_id: Option<String>,
     pub status: RuntimeFileChangeStatus,
     pub paths: Vec<String>,
     pub total_count: usize,

@@ -1224,17 +1224,13 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut Con
         app.set_activity_viewport(0, text_area.height);
         return;
     }
-    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let rendered_line_count = paragraph.line_count(text_area.width);
-    app.set_activity_viewport(rendered_line_count, text_area.height);
-    let scroll = app.activity_scroll.offset;
-    frame.render_widget(
-        paragraph
-            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+    render_scrollable_lines(
+        frame,
         text_area,
+        scrollbar_area,
+        lines,
+        &mut app.activity_scroll,
     );
-    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
 }
 
 fn render_audit_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
@@ -1258,14 +1254,46 @@ fn render_audit_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp
     render_inspector_lines(frame, content, lines);
 }
 
-fn render_files_pane(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+fn render_files_pane(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let content = render_panel_shell(
         frame,
         area,
         "Files",
         app.focus == Focus::Controls && app.control_pane == ControlPane::Files,
     );
-    render_inspector_lines(frame, content, file_change_pane_lines(app));
+    let viewport = inspector_body(content);
+    let (text_area, scrollbar_area) = split_scrollable_area(viewport);
+    if text_area.width == 0 || text_area.height == 0 {
+        app.set_files_viewport(0, text_area.height);
+        return;
+    }
+    render_scrollable_lines(
+        frame,
+        text_area,
+        scrollbar_area,
+        file_change_pane_lines(app),
+        &mut app.files_scroll,
+    );
+}
+
+fn render_scrollable_lines(
+    frame: &mut Frame<'_>,
+    text_area: Rect,
+    scrollbar_area: Rect,
+    lines: Vec<Line<'static>>,
+    scroll: &mut VerticalScroll,
+) {
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rendered_line_count = paragraph.line_count(text_area.width);
+    scroll.set_viewport(rendered_line_count, text_area.height);
+    let offset = scroll.offset;
+    frame.render_widget(
+        paragraph
+            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        text_area,
+    );
+    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, offset);
 }
 
 fn file_change_pane_lines(app: &ConsoleApp) -> Vec<Line<'static>> {
