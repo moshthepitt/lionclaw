@@ -1,16 +1,26 @@
 use std::sync::RwLock;
 use std::{collections::HashMap, path::Path};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row,
+};
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
     ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
     RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+    RuntimeSessionStartInput, RuntimeTerminalTranscriptInput, RuntimeTerminalTurn,
+    RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
 };
+
+const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
+const OPENCODE_RUNTIME_DATABASE_PATH: &[&str] =
+    &["home", ".local", "share", "opencode", "opencode.db"];
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -107,6 +117,17 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         parse_opencode_output_line(line)
     }
 
+    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
+        Ok(build_opencode_terminal_program(&self.config))
+    }
+
+    async fn export_terminal_transcript(
+        &self,
+        input: RuntimeTerminalTranscriptInput,
+    ) -> Result<Vec<RuntimeTerminalTurn>> {
+        export_opencode_terminal_transcript(&input.runtime_state_root).await
+    }
+
     fn format_program_exit_error(
         &self,
         output: &ExecutionOutput,
@@ -190,6 +211,257 @@ fn build_opencode_run_args(
     args.push(prompt.to_string());
 
     args
+}
+
+fn build_opencode_terminal_program(config: &OpenCodeRuntimeConfig) -> RuntimeProgramSpec {
+    let mut args = Vec::new();
+    if let Some(model) = &config.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    if let Some(agent) = &config.agent {
+        args.push("--agent".to_string());
+        args.push(agent.clone());
+    }
+
+    RuntimeProgramSpec {
+        executable: config.executable.clone(),
+        args,
+        environment: vec![(
+            "OPENCODE_CONFIG_DIR".to_string(),
+            OPENCODE_RUNTIME_CONFIG_DIR.to_string(),
+        )],
+        stdin: String::new(),
+        auth: None,
+    }
+}
+
+#[derive(Debug)]
+struct OpenCodeStoredMessage {
+    id: String,
+    session_id: String,
+    role: String,
+    time_created_ms: i64,
+    time_updated_ms: i64,
+    data: Value,
+}
+
+async fn export_opencode_terminal_transcript(
+    runtime_state_root: &Path,
+) -> Result<Vec<RuntimeTerminalTurn>> {
+    let database_path = OPENCODE_RUNTIME_DATABASE_PATH
+        .iter()
+        .fold(runtime_state_root.to_path_buf(), |path, segment| {
+            path.join(segment)
+        });
+    if !database_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let options = SqliteConnectOptions::new()
+        .filename(&database_path)
+        .read_only(true)
+        .create_if_missing(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to open OpenCode database {}",
+                database_path.display()
+            )
+        })?;
+
+    let messages = read_opencode_messages(&pool).await?;
+    let parts_by_message = read_opencode_text_parts(&pool).await?;
+    pool.close().await;
+
+    let messages_by_id = messages
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect::<HashMap<_, _>>();
+    let mut turns = Vec::new();
+
+    for assistant in messages
+        .iter()
+        .filter(|message| message.role.as_str() == "assistant")
+    {
+        let Some(parent_id) = assistant
+            .data
+            .get("parentID")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(user) = messages_by_id.get(parent_id) else {
+            continue;
+        };
+        if user.role.as_str() != "user" {
+            continue;
+        }
+
+        let display_user_text = opencode_message_text(&parts_by_message, &user.id);
+        let assistant_text = opencode_message_text(&parts_by_message, &assistant.id);
+        if display_user_text.trim().is_empty() || assistant_text.trim().is_empty() {
+            continue;
+        }
+
+        let (error_code, error_text) = opencode_assistant_error(&assistant.data);
+        turns.push(RuntimeTerminalTurn {
+            source_id: format!(
+                "opencode-sqlite:{}:{}:{}",
+                assistant.session_id, user.id, assistant.id
+            ),
+            prompt_user_text: display_user_text.clone(),
+            display_user_text,
+            assistant_text,
+            status: opencode_assistant_status(&assistant.data),
+            error_code,
+            error_text,
+            started_at: opencode_message_time(&user.data, user.time_created_ms)?,
+            finished_at: opencode_assistant_finished_time(assistant)?,
+        });
+    }
+
+    Ok(turns)
+}
+
+async fn read_opencode_messages(pool: &sqlx::SqlitePool) -> Result<Vec<OpenCodeStoredMessage>> {
+    let rows = sqlx::query(
+        "SELECT id, session_id, time_created, time_updated, data FROM message ORDER BY time_created ASC, id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read OpenCode messages")?;
+    let mut messages = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let id = row.try_get::<String, _>("id")?;
+        let data_raw = row.try_get::<String, _>("data")?;
+        let data = serde_json::from_str::<Value>(&data_raw)
+            .with_context(|| format!("failed to parse OpenCode message {id}"))?;
+        let Some(role) = data.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        messages.push(OpenCodeStoredMessage {
+            id,
+            session_id: row.try_get("session_id")?,
+            role: role.to_string(),
+            time_created_ms: row.try_get("time_created")?,
+            time_updated_ms: row.try_get("time_updated")?,
+            data,
+        });
+    }
+
+    Ok(messages)
+}
+
+async fn read_opencode_text_parts(pool: &sqlx::SqlitePool) -> Result<HashMap<String, Vec<String>>> {
+    let rows = sqlx::query("SELECT message_id, data FROM part ORDER BY message_id ASC, id ASC")
+        .fetch_all(pool)
+        .await
+        .context("failed to read OpenCode message parts")?;
+    let mut parts_by_message = HashMap::<String, Vec<String>>::new();
+
+    for row in rows {
+        let message_id = row.try_get::<String, _>("message_id")?;
+        let data_raw = row.try_get::<String, _>("data")?;
+        let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
+            continue;
+        };
+        if data.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if data.get("ignored").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(text) = data
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        else {
+            continue;
+        };
+        parts_by_message
+            .entry(message_id)
+            .or_default()
+            .push(text.to_string());
+    }
+
+    Ok(parts_by_message)
+}
+
+fn opencode_message_text(
+    parts_by_message: &HashMap<String, Vec<String>>,
+    message_id: &str,
+) -> String {
+    parts_by_message
+        .get(message_id)
+        .map(|parts| parts.join("\n"))
+        .unwrap_or_default()
+}
+
+fn opencode_assistant_status(data: &Value) -> RuntimeTerminalTurnStatus {
+    if let Some(error) = data.get("error") {
+        let name = error
+            .get("name")
+            .or_else(|| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return if name.contains("abort") || name.contains("interrupt") {
+            RuntimeTerminalTurnStatus::Interrupted
+        } else {
+            RuntimeTerminalTurnStatus::Failed
+        };
+    }
+
+    if data.get("finish").is_some() || data.pointer("/time/completed").is_some() {
+        RuntimeTerminalTurnStatus::Completed
+    } else {
+        RuntimeTerminalTurnStatus::Interrupted
+    }
+}
+
+fn opencode_assistant_error(data: &Value) -> (Option<String>, Option<String>) {
+    let Some(error) = data.get("error") else {
+        return (None, None);
+    };
+    let code = error
+        .get("name")
+        .or_else(|| error.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let text = [
+        "/message",
+        "/data/message",
+        "/cause/message",
+        "/error/message",
+    ]
+    .iter()
+    .find_map(|pointer| error.pointer(pointer).and_then(Value::as_str))
+    .filter(|message| !message.trim().is_empty())
+    .map(str::to_string);
+
+    (code, text)
+}
+
+fn opencode_assistant_finished_time(message: &OpenCodeStoredMessage) -> Result<DateTime<Utc>> {
+    let fallback_ms = message.time_updated_ms.max(message.time_created_ms);
+    opencode_message_time(&message.data, fallback_ms)
+}
+
+fn opencode_message_time(data: &Value, fallback_ms: i64) -> Result<DateTime<Utc>> {
+    let ms = data
+        .pointer("/time/completed")
+        .or_else(|| data.pointer("/time/created"))
+        .and_then(Value::as_i64)
+        .unwrap_or(fallback_ms);
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .ok_or_else(|| anyhow!("invalid OpenCode timestamp {ms}"))
 }
 
 fn get_runtime_session(
@@ -418,10 +690,13 @@ fn collect_texts(value: &Value) -> Vec<String> {
 mod tests {
     use crate::kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput, RuntimeTurnInput,
+        RuntimeTurnMode,
     };
 
     use super::{parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
+    use serde_json::json;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -470,6 +745,178 @@ mod tests {
         );
         assert!(program.environment.is_empty());
         assert!(program.stdin.is_empty());
+    }
+
+    #[test]
+    fn opencode_adapter_builds_terminal_program_spec() {
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
+            executable: "opencode".to_string(),
+            model: Some("gpt-5".to_string()),
+            agent: Some("builder".to_string()),
+        });
+
+        let program = adapter.build_terminal_program().expect("program");
+
+        assert_eq!(program.executable, "opencode");
+        assert_eq!(
+            program.args,
+            vec![
+                "--model".to_string(),
+                "gpt-5".to_string(),
+                "--agent".to_string(),
+                "builder".to_string(),
+            ]
+        );
+        assert_eq!(
+            program.environment,
+            vec![("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string())]
+        );
+        assert!(program.stdin.is_empty());
+        assert!(program.auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_export_reads_native_sqlite_turns() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let database_dir = runtime_state_root
+            .join("home")
+            .join(".local")
+            .join("share")
+            .join("opencode");
+        std::fs::create_dir_all(&database_dir).expect("create database dir");
+        let database_path = database_dir.join("opencode.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open sqlite");
+
+        sqlx::query(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create message table");
+        sqlx::query(
+            "CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create part table");
+
+        sqlx::query(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind("msg-user")
+        .bind("opencode-session")
+        .bind(1_000_i64)
+        .bind(1_000_i64)
+        .bind(
+            json!({
+                "role": "user",
+                "time": { "created": 1000 },
+                "agent": "build",
+                "model": { "providerID": "openai", "modelID": "gpt-5" }
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user message");
+        sqlx::query(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind("part-user")
+        .bind("msg-user")
+        .bind("opencode-session")
+        .bind(1_000_i64)
+        .bind(1_000_i64)
+        .bind(json!({ "type": "text", "text": "hello opencode" }).to_string())
+        .execute(&pool)
+        .await
+        .expect("insert user part");
+        sqlx::query(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind("msg-assistant")
+        .bind("opencode-session")
+        .bind(2_000_i64)
+        .bind(3_000_i64)
+        .bind(
+            json!({
+                "role": "assistant",
+                "time": { "created": 2000, "completed": 3000 },
+                "parentID": "msg-user",
+                "modelID": "gpt-5",
+                "providerID": "openai",
+                "mode": "build",
+                "agent": "build",
+                "path": { "cwd": "/workspace", "root": "/workspace" },
+                "cost": 0,
+                "tokens": {
+                    "input": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                },
+                "finish": "stop"
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .expect("insert assistant message");
+        sqlx::query(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind("part-assistant")
+        .bind("msg-assistant")
+        .bind("opencode-session")
+        .bind(2_000_i64)
+        .bind(3_000_i64)
+        .bind(json!({ "type": "text", "text": "hello from native sqlite" }).to_string())
+        .execute(&pool)
+        .await
+        .expect("insert assistant part");
+        pool.close().await;
+
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let turns = adapter
+            .export_terminal_transcript(RuntimeTerminalTranscriptInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+                exit_code: Some(0),
+            })
+            .await
+            .expect("export transcript");
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.display_user_text, "hello opencode");
+        assert_eq!(turn.prompt_user_text, "hello opencode");
+        assert_eq!(turn.assistant_text, "hello from native sqlite");
+        assert_eq!(turn.started_at.timestamp_millis(), 1_000);
+        assert_eq!(turn.finished_at.timestamp_millis(), 3_000);
+        assert!(turn
+            .source_id
+            .contains("opencode-sqlite:opencode-session:msg-user:msg-assistant"));
     }
 
     #[test]
