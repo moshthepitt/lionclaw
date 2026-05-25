@@ -1908,11 +1908,13 @@ mod tests {
         init_project(temp_dir.path()).expect("init project");
         create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
         let home = crate::home::LionClawHome::new(instance_home_path(temp_dir.path(), "reviewer"));
-        let mut config = OperatorConfig::default();
-        config.channels = vec![
-            test_channel("team-local", Some(("member:reviewer", None))),
-            test_channel("email", Some(("reviewer@example.com", None))),
-        ];
+        let config = OperatorConfig {
+            channels: vec![
+                test_channel("team-local", Some(("member:reviewer", None))),
+                test_channel("email", Some(("reviewer@example.com", None))),
+            ],
+            ..OperatorConfig::default()
+        };
         config.save(&home).await.expect("save config");
         let context =
             project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
@@ -1959,11 +1961,13 @@ mod tests {
         thread_ref: Option<&str>,
     ) {
         let home = crate::home::LionClawHome::new(instance_home_path(project_root, instance_name));
-        let mut config = OperatorConfig::default();
-        config.channels = vec![test_channel(
-            channel_id,
-            Some((conversation_ref, thread_ref)),
-        )];
+        let config = OperatorConfig {
+            channels: vec![test_channel(
+                channel_id,
+                Some((conversation_ref, thread_ref)),
+            )],
+            ..OperatorConfig::default()
+        };
         config.save(&home).await.expect("save config");
     }
 

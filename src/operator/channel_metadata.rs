@@ -250,22 +250,31 @@ fn validate_contact_template(template: &str) -> Result<()> {
     if template.is_empty() {
         bail!("contact conversation_ref_template is required");
     }
-    let mut rest = template;
-    while let Some(start) = rest.find(['{', '}']) {
-        let marker = rest.as_bytes()[start] as char;
-        if marker == '}' {
-            bail!("contact conversation_ref_template contains an unmatched '}}'");
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '}' => bail!("contact conversation_ref_template contains an unmatched '}}'"),
+            '{' => {
+                let mut variable = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    variable.push(inner);
+                }
+                if !closed {
+                    bail!("contact conversation_ref_template contains an unmatched '{{'");
+                }
+                if variable != "instance" {
+                    bail!(
+                        "contact conversation_ref_template uses unsupported variable '{{{variable}}}'; supported variable: '{{instance}}'"
+                    );
+                }
+            }
+            _ => {}
         }
-        let Some(end) = rest[start + 1..].find('}') else {
-            bail!("contact conversation_ref_template contains an unmatched '{{'");
-        };
-        let variable = &rest[start + 1..start + 1 + end];
-        if variable != "instance" {
-            bail!(
-                "contact conversation_ref_template uses unsupported variable '{{{variable}}}'; supported variable: '{{instance}}'"
-            );
-        }
-        rest = &rest[start + 1 + end + 1..];
     }
     Ok(())
 }
