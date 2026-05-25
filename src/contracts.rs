@@ -763,6 +763,31 @@ impl FromStr for ChannelRoutingProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelSessionBinding {
+    #[default]
+    Grant,
+    Actor,
+    Conversation,
+    Thread,
+    ConversationActor,
+    ThreadActor,
+}
+
+impl ChannelSessionBinding {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Actor => "actor",
+            Self::Conversation => "conversation",
+            Self::Thread => "thread",
+            Self::ConversationActor => "conversation_actor",
+            Self::ThreadActor => "thread_actor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelTrigger {
@@ -950,6 +975,8 @@ pub struct ChannelActorAuthorizeRequest {
     #[serde(default)]
     pub thread_ref: Option<String>,
     pub trigger: ChannelTrigger,
+    #[serde(default)]
+    pub session_binding: ChannelSessionBinding,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1233,6 +1260,8 @@ pub struct ChannelInboundRequest {
     #[serde(default)]
     pub reply_to_ref: Option<String>,
     pub trigger: ChannelTrigger,
+    #[serde(default)]
+    pub session_binding: ChannelSessionBinding,
     #[serde(default)]
     pub received_at: Option<DateTime<Utc>>,
     #[serde(default)]

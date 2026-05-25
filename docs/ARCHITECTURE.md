@@ -387,6 +387,7 @@ with the CLI.
 - `POST /v0/channels/pairing/approve`
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/revoke`
+- `POST /v0/channels/authorize`
 - `POST /v0/channels/inbound`
 - `POST /v0/channels/attachments/stage` (multipart worker upload)
 - `POST /v0/channels/attachments/finalize`
@@ -440,12 +441,27 @@ metadata endpoint used to classify a listener before reusing it.
 
 External channel skills integrate over HTTP:
 
+Channel routing keeps four concepts separate:
+
+- channel instance/provider account: `channel_id`
+- actor admission identity: normalized `sender_ref` plus direct grants and blocks
+- route approval: conversation/thread grants over normalized route refs
+- session binding: the deterministic session target for an already-admitted turn
+
+Workers may request only a constrained `session_binding`: `grant` (default),
+`actor`, `conversation`, `thread`, `conversation_actor`, or `thread_actor`. The
+kernel validates the required normalized refs, confirms the requested binding
+does not broaden the approved grant scope, then derives the session key itself.
+Workers never supply raw session keys, templates, or metadata-derived session
+identity.
+
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
    a deterministic `(channel_id, session_key)`.
 2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
    grants queue a channel turn and receive an explicit outcome. Inbound v2
    carries attachment descriptors first; workers fetch binary files only after
-   admission.
+   admission. Workers may include optional `session_binding`; omission preserves
+   `grant` binding.
 3. If the inbound outcome is `waiting_for_attachments`, the worker uploads each
    admitted file with `POST /v0/channels/attachments/stage`, then calls
    `POST /v0/channels/attachments/finalize`. Finalization rejects missing or
@@ -548,10 +564,13 @@ Stream events produced by actual runtime turns include `session_id` and
 `turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
 typing/progress only; durable outbound routing uses the outbox fields
 `conversation_ref`, `thread_ref`, and `reply_to_ref`. Internal session identity
-is carried by `session_key` and the session row. Channel session keys are grant
-scoped: direct sessions include the sender, conversation sessions include the
-conversation and sender, and thread sessions include the conversation, thread,
-and sender.
+is carried by `session_key` and the session row. With the default
+`session_binding = grant`, channel session keys preserve the approved grant's
+scope: direct sessions include the sender, conversation sessions include the
+conversation and optional sender, and thread sessions include the conversation,
+thread, and sender. Non-default bindings derive from normalized request refs
+after authorization succeeds: actor, conversation, thread,
+conversation+actor, or thread+actor.
 
 Outbox `content` is provider-neutral JSON with `text`, a `format_hint`
 (`plain`, `markdown`, or `html`; default `plain`), and an `attachments` array. Outbound
@@ -598,10 +617,10 @@ Channel-backed running turns also persist the exact stream sequence through
 which the durable assistant checkpoint is synchronized. Channels v2 stores
 normalized provider facts, including text and attachment descriptors, in
 `channel_inbound_events`, admits work through scoped grants, and derives
-deterministic session keys such as
-`channel:<channel_id>:direct:<sender_ref>`. Worker-supplied runtime selection is
-not part of the inbound channel contract; the kernel resolves runtime execution
-from the instance/default runtime configuration.
+deterministic session keys from either the approved grant or the constrained
+`session_binding`. Worker-supplied runtime selection is not part of the inbound
+channel contract; the kernel resolves runtime execution from the
+instance/default runtime configuration.
 Session-key components escape `:` and `%` so provider refs such as
 `telegram:chat:-123` remain unambiguous.
 Channel turn state is terminalized independently from the session turn state so
@@ -625,9 +644,10 @@ conversation-wide (`sender_ref` absent) so a delegated group invite connects the
 group rather than the admin who happened to claim the link. Non-direct channel
 routes still require the sender to have an approved direct host grant before a
 turn or local channel control is authorized; the route grant authorizes the
-destination, and the direct grant authorizes the actor. Pairing claim audit
-stores normalized identity and outcome facts only, never raw worker provider
-metadata.
+destination, and the direct grant authorizes the actor. `session_binding` is
+applied only after those admission checks pass and cannot authorize an actor,
+route, trigger, or attachment. Pairing claim audit stores normalized identity
+and outcome facts only, never raw worker provider metadata.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused. Durable pending channel turns are

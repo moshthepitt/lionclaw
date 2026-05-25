@@ -168,13 +168,13 @@ pub(crate) struct TokenPairingCreate<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ChannelGrantScopeLookup<'a> {
-    channel_id: &'a str,
-    sender_ref: Option<&'a str>,
-    conversation_ref: Option<&'a str>,
-    thread_ref: Option<&'a str>,
-    routing_profile: ChannelRoutingProfile,
-    status: ChannelGrantStatus,
+pub(crate) struct ChannelGrantScopeLookup<'a> {
+    pub(crate) channel_id: &'a str,
+    pub(crate) sender_ref: Option<&'a str>,
+    pub(crate) conversation_ref: Option<&'a str>,
+    pub(crate) thread_ref: Option<&'a str>,
+    pub(crate) routing_profile: ChannelRoutingProfile,
+    pub(crate) status: ChannelGrantStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -807,7 +807,7 @@ impl ChannelStateStore {
         row.map(map_grant_row).transpose()
     }
 
-    async fn get_grant_by_scope_with_status_in_tx(
+    pub(crate) async fn get_grant_by_scope_with_status_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         lookup: ChannelGrantScopeLookup<'_>,

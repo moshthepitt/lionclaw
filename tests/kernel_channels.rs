@@ -20,11 +20,12 @@ use lionclaw::{
         ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
         ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
         ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
-        ChannelPairingStatus, ChannelRoutingProfile, ChannelStreamAckRequest,
-        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
-        DaemonInfoResponse, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
-        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelPairingStatus, ChannelRoutingProfile, ChannelSessionBinding,
+        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
+        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -2511,6 +2512,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             conversation_ref: "telegram:chat:-1001".to_string(),
             thread_ref: None,
             trigger: ChannelTrigger::Command,
+            session_binding: ChannelSessionBinding::Grant,
         })
         .await
         .expect("authorize group command for unknown actor");
@@ -2538,6 +2540,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             conversation_ref: "telegram:chat:-1001".to_string(),
             thread_ref: None,
             trigger: ChannelTrigger::Command,
+            session_binding: ChannelSessionBinding::Grant,
         })
         .await
         .expect("authorize group command for host actor");
@@ -3275,6 +3278,990 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
     .await
     .expect("query legacy channel message table count");
     assert_eq!(legacy_message_tables, 0);
+}
+
+#[tokio::test]
+async fn channel_session_binding_defaults_to_grant_and_preserves_session_keys() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-defaults", "binding-defaults-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let direct_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-defaults",
+            "binding-default-direct-pending",
+            "alice",
+            "alice",
+            None,
+            "pair direct",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("create direct pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-defaults",
+        direct_pending.pairing_id.expect("direct pairing id"),
+    )
+    .await;
+
+    let direct_request: ChannelActorAuthorizeRequest = serde_json::from_value(serde_json::json!({
+        "channel_id": "binding-defaults",
+        "sender_ref": "alice",
+        "conversation_ref": "alice",
+        "trigger": "dm"
+    }))
+    .expect("missing session_binding defaults on authorize request");
+    assert_eq!(direct_request.session_binding, ChannelSessionBinding::Grant);
+    let direct = kernel
+        .authorize_channel_actor(direct_request)
+        .await
+        .expect("authorize direct default binding");
+    assert!(direct.authorized);
+    assert_eq!(
+        direct.session_key.as_deref(),
+        Some(direct_session_key("binding-defaults", "alice").as_str())
+    );
+
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-defaults",
+            "binding-default-conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-defaults",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let conversation_request: ChannelActorAuthorizeRequest =
+        serde_json::from_value(serde_json::json!({
+            "channel_id": "binding-defaults",
+            "sender_ref": "alice",
+            "conversation_ref": "room-1",
+            "trigger": "mention"
+        }))
+        .expect("missing session_binding defaults on conversation authorize request");
+    assert_eq!(
+        conversation_request.session_binding,
+        ChannelSessionBinding::Grant
+    );
+    let conversation = kernel
+        .authorize_channel_actor(conversation_request)
+        .await
+        .expect("authorize conversation default binding");
+    assert!(conversation.authorized);
+    assert_eq!(
+        conversation.session_key.as_deref(),
+        Some("channel:binding-defaults:conversation:room-1")
+    );
+
+    let bob_direct = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-defaults",
+            "binding-default-bob-direct-pending",
+            "bob",
+            "bob",
+            None,
+            "pair bob direct",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("create bob direct pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-defaults",
+        bob_direct.pairing_id.expect("bob direct pairing id"),
+    )
+    .await;
+    let thread_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-defaults",
+            "binding-default-thread-pending",
+            "bob",
+            "room-2",
+            Some("topic-b"),
+            "pair thread",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("create thread pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-defaults",
+        thread_pending.pairing_id.expect("thread pairing id"),
+    )
+    .await;
+
+    let thread_request: ChannelActorAuthorizeRequest = serde_json::from_value(serde_json::json!({
+        "channel_id": "binding-defaults",
+        "sender_ref": "bob",
+        "conversation_ref": "room-2",
+        "thread_ref": "topic-b",
+        "trigger": "thread_continuation"
+    }))
+    .expect("missing session_binding defaults on thread authorize request");
+    assert_eq!(thread_request.session_binding, ChannelSessionBinding::Grant);
+    let thread = kernel
+        .authorize_channel_actor(thread_request)
+        .await
+        .expect("authorize thread default binding");
+    assert!(thread.authorized);
+    assert_eq!(
+        thread.session_key.as_deref(),
+        Some(thread_session_key("binding-defaults", "room-2", "topic-b", "bob").as_str())
+    );
+
+    let inbound_request: ChannelInboundRequest = serde_json::from_value(serde_json::json!({
+        "channel_id": "binding-defaults",
+        "event_id": "binding-default-direct-queued",
+        "sender_ref": "alice",
+        "conversation_ref": "alice",
+        "text": "run direct",
+        "trigger": "dm"
+    }))
+    .expect("missing session_binding defaults on inbound request");
+    assert_eq!(
+        inbound_request.session_binding,
+        ChannelSessionBinding::Grant
+    );
+    let queued = kernel
+        .ingest_channel_inbound(inbound_request)
+        .await
+        .expect("queue default inbound");
+    assert_eq!(
+        queued.session_key.as_deref(),
+        Some(direct_session_key("binding-defaults", "alice").as_str())
+    );
+
+    let duplicate_request: ChannelInboundRequest = serde_json::from_value(serde_json::json!({
+        "channel_id": "binding-defaults",
+        "event_id": "binding-default-direct-queued",
+        "sender_ref": "alice",
+        "conversation_ref": "alice",
+        "text": "run direct again",
+        "trigger": "dm",
+        "session_binding": "actor"
+    }))
+    .expect("duplicate request with different binding still parses");
+    let duplicate = kernel
+        .ingest_channel_inbound(duplicate_request)
+        .await
+        .expect("duplicate accepted inbound");
+    assert_eq!(duplicate.outcome, ChannelInboundOutcome::Duplicate);
+    assert_eq!(duplicate.turn_id, queued.turn_id);
+    assert_eq!(duplicate.session_id, queued.session_id);
+    assert_eq!(duplicate.session_key, queued.session_key);
+}
+
+#[tokio::test]
+async fn channel_session_binding_derives_requested_keys_after_authorization() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-modes", "binding-modes-skill").await;
+    let kernel = env.kernel().await;
+
+    let sender_ref = "alice:1%";
+    let conversation_ref = "room:1%";
+    let thread_ref = "topic:A%";
+
+    create_pending_pairing(
+        &kernel,
+        "binding-modes",
+        sender_ref,
+        "binding-modes-direct-pending",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-modes", sender_ref).await;
+
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-modes",
+            "binding-modes-conversation-pending",
+            sender_ref,
+            conversation_ref,
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation route pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-modes",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let cases = [
+        (
+            ChannelSessionBinding::Actor,
+            None,
+            actor_binding_session_key("binding-modes", sender_ref),
+        ),
+        (
+            ChannelSessionBinding::Conversation,
+            None,
+            conversation_binding_session_key("binding-modes", conversation_ref),
+        ),
+        (
+            ChannelSessionBinding::Thread,
+            Some(thread_ref),
+            thread_binding_session_key("binding-modes", conversation_ref, thread_ref),
+        ),
+        (
+            ChannelSessionBinding::ConversationActor,
+            None,
+            conversation_actor_binding_session_key("binding-modes", conversation_ref, sender_ref),
+        ),
+        (
+            ChannelSessionBinding::ThreadActor,
+            Some(thread_ref),
+            thread_actor_binding_session_key(
+                "binding-modes",
+                conversation_ref,
+                thread_ref,
+                sender_ref,
+            ),
+        ),
+    ];
+
+    for (binding, thread_ref, expected_session_key) in cases {
+        let response = kernel
+            .authorize_channel_actor(ChannelActorAuthorizeRequest {
+                channel_id: "binding-modes".to_string(),
+                sender_ref: sender_ref.to_string(),
+                conversation_ref: conversation_ref.to_string(),
+                thread_ref: thread_ref.map(str::to_string),
+                trigger: ChannelTrigger::Mention,
+                session_binding: binding,
+            })
+            .await
+            .expect("authorize binding mode");
+        assert!(
+            response.authorized,
+            "binding {} should authorize after route admission",
+            binding.as_str()
+        );
+        assert_eq!(
+            response.session_key.as_deref(),
+            Some(expected_session_key.as_str()),
+            "binding {} should derive expected session key",
+            binding.as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn channel_session_binding_accepts_only_canonical_session_keys() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-canonical", "binding-canonical-skill").await;
+    let kernel = env.kernel().await;
+
+    let sender_ref = "alice:ops";
+    create_pending_pairing(
+        &kernel,
+        "binding-canonical",
+        sender_ref,
+        "binding-canonical-direct-pending",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-canonical", sender_ref).await;
+
+    let canonical_actor_key = actor_binding_session_key("binding-canonical", sender_ref);
+    let actor_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-canonical".to_string(),
+            peer_id: canonical_actor_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("canonical actor binding session opens");
+    assert_eq!(actor_session.peer_id, canonical_actor_key);
+
+    let raw_actor_alias = format!("channel:binding-canonical:actor:{sender_ref}");
+    let raw_actor_alias_err = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-canonical".to_string(),
+            peer_id: raw_actor_alias,
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect_err("raw ':' actor alias must not parse as an approved scope");
+    assert!(
+        matches!(raw_actor_alias_err, KernelError::BadRequest(message) if message.contains("not scoped to an approved grant"))
+    );
+
+    let conversation_ref = "room:actor:alice";
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-canonical",
+            "binding-canonical-conversation-pending",
+            sender_ref,
+            conversation_ref,
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-canonical",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let canonical_conversation_key =
+        conversation_binding_session_key("binding-canonical", conversation_ref);
+    let conversation_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-canonical".to_string(),
+            peer_id: canonical_conversation_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("canonical conversation binding session opens");
+    assert_eq!(conversation_session.peer_id, canonical_conversation_key);
+
+    let raw_conversation_alias =
+        format!("channel:binding-canonical:conversation:{conversation_ref}");
+    let raw_conversation_alias_err = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-canonical".to_string(),
+            peer_id: raw_conversation_alias,
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect_err("raw ':' conversation alias must not parse as an approved scope");
+    assert!(
+        matches!(raw_conversation_alias_err, KernelError::BadRequest(message) if message.contains("not scoped to an approved grant"))
+    );
+}
+
+#[tokio::test]
+async fn channel_session_binding_preserves_admission_grant_trust_tier() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-trust", "binding-trust-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "binding-trust",
+        "alice",
+        "binding-trust-alice-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-trust", "alice").await;
+
+    let actor_route_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-trust",
+            "binding-trust-actor-route-pending",
+            "alice",
+            "room-1",
+            Some("topic-1"),
+            "pair actor-scoped route",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("create actor-scoped route pairing");
+    let actor_route_grant = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "binding-trust".to_string(),
+            pairing_id: Some(
+                actor_route_pending
+                    .pairing_id
+                    .expect("actor route pairing id"),
+            ),
+            pairing_code: None,
+            routing_profile: Some(ChannelRoutingProfile::Conversation),
+            trust_tier: Some(TrustTier::Untrusted),
+            label: None,
+        })
+        .await
+        .expect("approve actor-scoped route")
+        .grant;
+    assert_eq!(actor_route_grant.sender_ref.as_deref(), Some("alice"));
+    assert_eq!(actor_route_grant.trust_tier.as_str(), "untrusted");
+
+    let conversation_wide_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-trust",
+            "binding-trust-conversation-wide-pending",
+            "bob",
+            "room-1",
+            None,
+            "pair conversation-wide route",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation-wide route pairing");
+    let conversation_wide_grant = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "binding-trust".to_string(),
+            pairing_id: Some(
+                conversation_wide_pending
+                    .pairing_id
+                    .expect("conversation-wide pairing id"),
+            ),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve conversation-wide route")
+        .grant;
+    assert!(conversation_wide_grant.sender_ref.is_none());
+    assert_eq!(conversation_wide_grant.trust_tier.as_str(), "main");
+
+    let session_key = conversation_binding_session_key("binding-trust", "room-1");
+    let authorization = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-trust".to_string(),
+            sender_ref: "alice".to_string(),
+            conversation_ref: "room-1".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+            session_binding: ChannelSessionBinding::Conversation,
+        })
+        .await
+        .expect("authorize actor with conversation binding");
+    assert!(authorization.authorized);
+    assert_eq!(authorization.grant_id, Some(actor_route_grant.grant_id));
+    assert_eq!(
+        authorization.session_key.as_deref(),
+        Some(session_key.as_str())
+    );
+
+    let mut inbound = v2_text_request(
+        "binding-trust",
+        "binding-trust-queued",
+        "alice",
+        "room-1",
+        None,
+        "run in conversation binding",
+        ChannelTrigger::Mention,
+    );
+    inbound.session_binding = ChannelSessionBinding::Conversation;
+    let queued = kernel
+        .ingest_channel_inbound(inbound)
+        .await
+        .expect("queue conversation-bound turn");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(queued.session_key.as_deref(), Some(session_key.as_str()));
+
+    let snapshot = kernel
+        .latest_session_snapshot(SessionLatestQuery {
+            channel_id: "binding-trust".to_string(),
+            peer_id: session_key,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("latest session snapshot");
+    assert_eq!(
+        snapshot.session.expect("session").trust_tier.as_str(),
+        "untrusted"
+    );
+}
+
+#[tokio::test]
+async fn channel_session_binding_keeps_admission_gates_and_blocking_precedence() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-gates", "binding-gates-skill").await;
+    let kernel = env.kernel().await;
+
+    create_pending_pairing(
+        &kernel,
+        "binding-gates",
+        "alice",
+        "binding-gates-alice-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-gates", "alice").await;
+
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-gates",
+            "binding-gates-conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-gates",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let unapproved_actor = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-gates".to_string(),
+            sender_ref: "mallory".to_string(),
+            conversation_ref: "room-1".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+            session_binding: ChannelSessionBinding::Conversation,
+        })
+        .await
+        .expect("authorize unapproved actor against route grant");
+    assert!(!unapproved_actor.authorized);
+    assert_eq!(unapproved_actor.reason_code, "actor_approval_required");
+    assert!(unapproved_actor.session_key.is_none());
+
+    create_pending_pairing(
+        &kernel,
+        "binding-gates",
+        "trent",
+        "binding-gates-trent-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-gates", "trent").await;
+    let unapproved_route = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-gates".to_string(),
+            sender_ref: "trent".to_string(),
+            conversation_ref: "room-2".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+            session_binding: ChannelSessionBinding::Conversation,
+        })
+        .await
+        .expect("authorize actor without route grant");
+    assert!(!unapproved_route.authorized);
+    assert_eq!(unapproved_route.reason_code, "approval_required");
+    assert!(unapproved_route.session_key.is_none());
+
+    expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "binding-gates".to_string(),
+                pairing_id: None,
+                sender_ref: Some("blocked".to_string()),
+                conversation_ref: None,
+                thread_ref: None,
+                reason: Some("test_block".to_string()),
+            })
+            .await
+            .expect("block sender"),
+    );
+
+    for binding in [
+        ChannelSessionBinding::Grant,
+        ChannelSessionBinding::Actor,
+        ChannelSessionBinding::Conversation,
+        ChannelSessionBinding::Thread,
+        ChannelSessionBinding::ConversationActor,
+        ChannelSessionBinding::ThreadActor,
+    ] {
+        let blocked = kernel
+            .authorize_channel_actor(ChannelActorAuthorizeRequest {
+                channel_id: "binding-gates".to_string(),
+                sender_ref: "blocked".to_string(),
+                conversation_ref: "room-1".to_string(),
+                thread_ref: matches!(
+                    binding,
+                    ChannelSessionBinding::Thread | ChannelSessionBinding::ThreadActor
+                )
+                .then(|| "topic-1".to_string()),
+                trigger: ChannelTrigger::Mention,
+                session_binding: binding,
+            })
+            .await
+            .expect("authorize blocked sender");
+        assert!(
+            !blocked.authorized,
+            "binding {} must not bypass blocks",
+            binding.as_str()
+        );
+        assert_eq!(blocked.reason_code, "blocked_grant");
+        assert!(blocked.session_key.is_none());
+    }
+
+    create_pending_pairing(
+        &kernel,
+        "binding-gates",
+        "thread-only",
+        "binding-gates-thread-only-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-gates", "thread-only").await;
+    let thread_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-gates",
+            "binding-gates-thread-only-route",
+            "thread-only",
+            "room-thread-only",
+            Some("topic-only"),
+            "pair thread route",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("create thread-only route pairing");
+    approve_pairing_id(
+        &kernel,
+        "binding-gates",
+        thread_pending.pairing_id.expect("thread pairing id"),
+    )
+    .await;
+
+    let broadened_thread = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-gates".to_string(),
+            sender_ref: "thread-only".to_string(),
+            conversation_ref: "room-thread-only".to_string(),
+            thread_ref: Some("topic-only".to_string()),
+            trigger: ChannelTrigger::ThreadContinuation,
+            session_binding: ChannelSessionBinding::Thread,
+        })
+        .await
+        .expect_err("actorless thread binding must not broaden an actor-scoped grant");
+    assert!(
+        matches!(broadened_thread, KernelError::BadRequest(message) if message.contains("not covered by an approved grant"))
+    );
+
+    let broadened_thread_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-gates".to_string(),
+            peer_id: thread_binding_session_key("binding-gates", "room-thread-only", "topic-only"),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect_err("actorless thread session must not open from an actor-scoped grant");
+    assert!(
+        matches!(broadened_thread_session, KernelError::BadRequest(message) if message.contains("channel grant is not approved"))
+    );
+
+    let scoped_thread = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-gates".to_string(),
+            sender_ref: "thread-only".to_string(),
+            conversation_ref: "room-thread-only".to_string(),
+            thread_ref: Some("topic-only".to_string()),
+            trigger: ChannelTrigger::ThreadContinuation,
+            session_binding: ChannelSessionBinding::ThreadActor,
+        })
+        .await
+        .expect("thread_actor binding preserves actor-scoped grant");
+    assert!(scoped_thread.authorized);
+    assert_eq!(
+        scoped_thread.session_key.as_deref(),
+        Some(
+            thread_actor_binding_session_key(
+                "binding-gates",
+                "room-thread-only",
+                "topic-only",
+                "thread-only",
+            )
+            .as_str()
+        )
+    );
+}
+
+#[tokio::test]
+async fn channel_session_binding_validates_refs_and_preserves_attachment_replay() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-validation", "binding-validation-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let invalid_authorize = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-validation".to_string(),
+            sender_ref: "alice".to_string(),
+            conversation_ref: "room-1".to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Mention,
+            session_binding: ChannelSessionBinding::Thread,
+        })
+        .await
+        .expect_err("thread binding requires thread_ref for authorize");
+    assert!(
+        matches!(invalid_authorize, KernelError::BadRequest(message) if message.contains("requires thread_ref"))
+    );
+
+    let invalid_inbound = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            session_binding: ChannelSessionBinding::ThreadActor,
+            ..v2_text_request(
+                "binding-validation",
+                "binding-validation-invalid-inbound",
+                "alice",
+                "room-1",
+                None,
+                "invalid thread binding",
+                ChannelTrigger::Mention,
+            )
+        })
+        .await
+        .expect_err("thread_actor binding requires thread_ref for inbound");
+    assert!(
+        matches!(invalid_inbound, KernelError::BadRequest(message) if message.contains("requires thread_ref"))
+    );
+
+    let unapproved_attachment = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            text: None,
+            attachments: vec![captioned_attachment_descriptor(
+                "unapproved-att",
+                "pending image",
+            )],
+            session_binding: ChannelSessionBinding::Conversation,
+            ..v2_text_request(
+                "binding-validation",
+                "binding-validation-unapproved-attachment",
+                "mallory",
+                "room-1",
+                None,
+                "pending image",
+                ChannelTrigger::Mention,
+            )
+        })
+        .await
+        .expect("unapproved attachment waits for admission");
+    assert_eq!(
+        unapproved_attachment.outcome,
+        ChannelInboundOutcome::PendingApproval
+    );
+    assert!(unapproved_attachment.turn_id.is_none());
+    assert!(unapproved_attachment.session_key.is_none());
+
+    create_pending_pairing(
+        &kernel,
+        "binding-validation",
+        "alice",
+        "binding-validation-alice-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-validation", "alice").await;
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-validation",
+            "binding-validation-conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation route");
+    approve_pairing_id(
+        &kernel,
+        "binding-validation",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let attachment_request = ChannelInboundRequest {
+        text: None,
+        attachments: vec![captioned_attachment_descriptor(
+            "binding-att",
+            "bound image",
+        )],
+        session_binding: ChannelSessionBinding::Conversation,
+        ..v2_text_request(
+            "binding-validation",
+            "binding-validation-attachment",
+            "alice",
+            "room-1",
+            None,
+            "bound image",
+            ChannelTrigger::Mention,
+        )
+    };
+    let waiting = kernel
+        .ingest_channel_inbound(attachment_request.clone())
+        .await
+        .expect("authorized attachment waits for staging");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    assert_eq!(
+        waiting.session_key.as_deref(),
+        Some(conversation_binding_session_key("binding-validation", "room-1").as_str())
+    );
+
+    let duplicate_waiting = kernel
+        .ingest_channel_inbound(attachment_request)
+        .await
+        .expect("duplicate attachment replay preserves waiting turn");
+    assert_eq!(
+        duplicate_waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    assert_eq!(duplicate_waiting.turn_id, waiting.turn_id);
+    assert_eq!(duplicate_waiting.session_id, waiting.session_id);
+    assert_eq!(duplicate_waiting.session_key, waiting.session_key);
+
+    let waiting_audit =
+        wait_for_audit_event_count(&kernel, "channel.inbound.waiting_for_attachments", 1).await;
+    assert!(waiting_audit.events.iter().any(|event| {
+        event.details["event_id"].as_str() == Some("binding-validation-attachment")
+            && event.details["session_binding"].as_str() == Some("conversation")
+            && event.details["session_key"].as_str()
+                == Some(conversation_binding_session_key("binding-validation", "room-1").as_str())
+    }));
+}
+
+#[tokio::test]
+async fn channel_session_binding_round_trips_actions_and_stream_routes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-actions", "binding-actions-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("slow-answer".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "slow-answer",
+            std::sync::Arc::new(SlowAnswerAdapter {
+                answer: "bound action completed".to_string(),
+                delay: Duration::from_millis(10),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "binding-actions",
+        "alice",
+        "binding-actions-alice-direct",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-actions", "alice").await;
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "binding-actions",
+            "binding-actions-conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "pair conversation",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation route");
+    approve_pairing_id(
+        &kernel,
+        "binding-actions",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            session_binding: ChannelSessionBinding::ConversationActor,
+            ..v2_text_request(
+                "binding-actions",
+                "binding-actions-bound-turn",
+                "alice",
+                "room-1",
+                None,
+                "run bound turn",
+                ChannelTrigger::Mention,
+            )
+        })
+        .await
+        .expect("queue conversation actor bound turn");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        queued.session_key.as_deref(),
+        Some(conversation_actor_binding_session_key("binding-actions", "room-1", "alice").as_str())
+    );
+    let session_id = queued.session_id.expect("bound session id");
+    let turn_id = queued.turn_id.expect("bound turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| turn.turn_id == turn_id && turn.status == SessionTurnStatus::Completed,
+        "completed bound turn",
+    )
+    .await;
+
+    let retried = kernel
+        .session_action(SessionActionRequest::RetryLastTurn { session_id })
+        .await
+        .expect("retry non-default bound session");
+    let retry_turn_id = retried.turn_id.expect("retry turn id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| turn.turn_id == retry_turn_id && turn.status == SessionTurnStatus::Completed,
+        "completed bound retry",
+    )
+    .await;
+
+    let stream = wait_for_stream_events(
+        &kernel,
+        "binding-actions",
+        "binding-actions-worker",
+        |events| {
+            events
+                .iter()
+                .any(|event| event.turn_id == Some(retry_turn_id) && event.peer_id == "room-1")
+        },
+    )
+    .await;
+    assert!(stream
+        .events
+        .iter()
+        .any(|event| { event.turn_id == Some(retry_turn_id) && event.peer_id == "room-1" }));
+
+    let reset = kernel
+        .session_action(SessionActionRequest::ResetSession { session_id })
+        .await
+        .expect("reset non-default bound session");
+    assert_ne!(reset.session_id, session_id);
+    assert!(reset.turn_id.is_none());
 }
 
 #[tokio::test]
@@ -5388,6 +6375,7 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
             attachments: Vec::new(),
             reply_to_ref: None,
             trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::Grant,
             received_at: None,
             provider_metadata: serde_json::json!({"update_id": 7252}),
         })
@@ -5937,6 +6925,7 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
             attachments: Vec::new(),
             reply_to_ref: None,
             trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::Grant,
             received_at: None,
             provider_metadata: serde_json::json!({"update_id": 7302}),
         })
@@ -6779,6 +7768,58 @@ fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
     format!("channel:{channel_id}:direct:{}", session_key_part(peer_id))
 }
 
+fn actor_binding_session_key(channel_id: &str, sender_ref: &str) -> String {
+    format!(
+        "channel:{channel_id}:actor:{}",
+        session_key_part(sender_ref)
+    )
+}
+
+fn conversation_binding_session_key(channel_id: &str, conversation_ref: &str) -> String {
+    format!(
+        "channel:{channel_id}:conversation:{}",
+        session_key_part(conversation_ref)
+    )
+}
+
+fn thread_binding_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:thread:{}:{}",
+        session_key_part(conversation_ref),
+        session_key_part(thread_ref)
+    )
+}
+
+fn conversation_actor_binding_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    sender_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:conversation:{}:sender:{}",
+        session_key_part(conversation_ref),
+        session_key_part(sender_ref)
+    )
+}
+
+fn thread_actor_binding_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+    sender_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:thread:{}:{}:sender:{}",
+        session_key_part(conversation_ref),
+        session_key_part(thread_ref),
+        session_key_part(sender_ref)
+    )
+}
+
 fn conversation_session_key(channel_id: &str, conversation_ref: &str, sender_ref: &str) -> String {
     format!(
         "channel:{channel_id}:conversation:{}:sender:{}",
@@ -6825,6 +7866,7 @@ fn v2_text_request(
         attachments: Vec::new(),
         reply_to_ref: None,
         trigger,
+        session_binding: ChannelSessionBinding::Grant,
         received_at: None,
         provider_metadata: serde_json::json!({}),
     }
