@@ -8899,29 +8899,16 @@ fn decode_session_key_part(raw: &str) -> String {
 }
 
 fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
-    let direct_prefix = format!("channel:{channel_id}:direct:");
-    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
-        return decode_session_key_part(sender_ref);
+    match parse_session_key_scope(channel_id, session_peer_id) {
+        Some(SessionKeyScope::Direct { sender_ref }) => sender_ref,
+        Some(SessionKeyScope::Conversation {
+            conversation_ref, ..
+        })
+        | Some(SessionKeyScope::Thread {
+            conversation_ref, ..
+        }) => conversation_ref,
+        None => session_peer_id.to_string(),
     }
-
-    let conversation_prefix = format!("channel:{channel_id}:conversation:");
-    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
-        if let Some((conversation_ref, _sender_ref)) = rest.split_once(":sender:") {
-            return decode_session_key_part(conversation_ref);
-        }
-    }
-
-    let thread_prefix = format!("channel:{channel_id}:thread:");
-    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
-        if let Some((thread_scope, _sender_ref)) = rest.split_once(":sender:") {
-            let Some((conversation_ref, _thread_ref)) = thread_scope.split_once(':') else {
-                return session_peer_id.to_string();
-            };
-            return decode_session_key_part(conversation_ref);
-        }
-    }
-
-    session_peer_id.to_string()
 }
 
 fn delivery_route_for_session_key(

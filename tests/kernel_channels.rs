@@ -3379,6 +3379,20 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         queued_topic.session_key.as_deref(),
         Some("channel:slack:conversation:room-1")
     );
+    let queued_topic_turn_id = queued_topic.turn_id.expect("conversation turn id");
+    let conversation_stream =
+        wait_for_stream_events(&kernel, "slack", "conversation-worker", |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_topic_turn_id) && event.peer_id == "room-1"
+            })
+        })
+        .await;
+    assert!(
+        conversation_stream.events.iter().any(|event| {
+            event.turn_id == Some(queued_topic_turn_id) && event.peer_id == "room-1"
+        }),
+        "conversation-wide session stream events should expose the conversation ref, not the raw session key"
+    );
 
     let queued_command = kernel
         .ingest_channel_inbound(v2_text_request(
