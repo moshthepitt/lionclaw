@@ -354,6 +354,22 @@ fn file_change_operations_update_in_place() {
 }
 
 #[test]
+fn file_change_events_without_operation_id_remain_distinct() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+
+    activity.record_stream_event(&file_change_event(&["src/operator/run_tui/render.rs"], 1));
+    activity.record_stream_event(&file_change_event(&["src/operator/run_tui/render.rs"], 1));
+
+    assert_eq!(activity.file_change_count, 2);
+    assert_eq!(activity.file_changes.len(), 2);
+    assert!(activity
+        .file_changes
+        .iter()
+        .all(|change| change.operation_id.is_none()));
+}
+
+#[test]
 fn cancellation_error_events_do_not_mark_activity_failed() {
     let mut activity = ActivitySummary::new();
     activity.start();

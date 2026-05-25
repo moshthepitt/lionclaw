@@ -449,15 +449,9 @@ impl FileChangeSummary {
     }
 
     fn is_update_for(&self, other: &Self) -> bool {
-        match (self.operation_id.as_deref(), other.operation_id.as_deref()) {
-            (Some(left), Some(right)) => self.runtime == other.runtime && left == right,
-            (None, None) => {
-                self.runtime == other.runtime
-                    && self.total_count == other.total_count
-                    && self.paths == other.paths
-            }
-            _ => false,
-        }
+        self.runtime == other.runtime
+            && self.operation_id.is_some()
+            && self.operation_id == other.operation_id
     }
 }
 
