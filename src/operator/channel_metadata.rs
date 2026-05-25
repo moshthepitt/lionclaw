@@ -250,6 +250,7 @@ fn validate_contact_template(template: &str) -> Result<()> {
     if template.is_empty() {
         bail!("contact conversation_ref_template is required");
     }
+    let mut saw_instance = false;
     let mut chars = template.chars();
     while let Some(ch) = chars.next() {
         match ch {
@@ -272,9 +273,13 @@ fn validate_contact_template(template: &str) -> Result<()> {
                         "contact conversation_ref_template uses unsupported variable '{{{variable}}}'; supported variable: '{{instance}}'"
                     );
                 }
+                saw_instance = true;
             }
             _ => {}
         }
+    }
+    if !saw_instance {
+        bail!("contact conversation_ref_template must include '{{instance}}'");
     }
     Ok(())
 }
@@ -593,6 +598,22 @@ mod tests {
         let err = load_channel_metadata(&skill).expect_err("unknown variable should fail");
 
         assert!(err.to_string().contains("unsupported variable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_static_contact_template_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-team-local", "team-local");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"team-local\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[contact]\nconversation_ref_template = \"member:reviewer\"\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("static template should fail");
+
+        assert!(err.to_string().contains("must include '{instance}'"));
     }
 
     #[cfg(unix)]

@@ -340,10 +340,11 @@ Channel metadata can provide a default contact template for `--contact`:
 conversation_ref_template = "member:{instance}"
 ```
 
-Only the `{instance}` variable is supported. Operators may also pass an explicit
-`--conversation-ref`; `--thread-ref` stays optional. `--contact` requires a
-project instance target because direct homes do not have a stable project
-instance identity for template rendering or neighbor projection.
+Only the `{instance}` variable is supported, and default templates must include
+it. Operators may also pass an explicit `--conversation-ref` for static provider
+routes; `--thread-ref` stays optional. `--contact` requires a project instance
+target because direct homes do not have a stable project instance identity for
+template rendering or neighbor projection.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The

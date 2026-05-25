@@ -452,6 +452,42 @@ pub async fn project_instance_runtime_context_with_contacts(
     Ok(context)
 }
 
+pub async fn project_instance_runtime_context_for_project_instance_with_contacts(
+    project_root: &Path,
+    instance_name: &str,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let context =
+        project_instance_runtime_context_for_project_instance(project_root, instance_name)?;
+    project_instance_runtime_context_with_contacts(context, sender_channel_ids).await
+}
+
+pub async fn project_instance_runtime_context_for_home_in_project_with_contacts(
+    project_root: &Path,
+    home: &LionClawHome,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let instance_name = project_instance_name_for_home_in_project(project_root, home)?;
+    project_instance_runtime_context_for_project_instance_with_contacts(
+        project_root,
+        &instance_name,
+        sender_channel_ids,
+    )
+    .await
+}
+
+pub async fn project_instance_runtime_context_for_home_with_contacts(
+    home: &LionClawHome,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<Option<ProjectInstanceRuntimeContext>> {
+    let Some(context) = project_instance_runtime_context_for_home(home)? else {
+        return Ok(None);
+    };
+    project_instance_runtime_context_with_contacts(context, sender_channel_ids)
+        .await
+        .map(Some)
+}
+
 async fn runtime_project_instance_channel_send_inventory(
     context: &ProjectInstanceRuntimeContext,
     sender_channel_ids: &BTreeSet<String>,
@@ -1351,8 +1387,11 @@ mod tests {
         resolve_target_from_cwd, runtime_project_instance_inventory, TargetSelection,
         WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
     };
-    use crate::operator::config::{
-        ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+    use crate::{
+        applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
+        operator::config::{
+            ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        },
     };
 
     #[test]
@@ -1929,6 +1968,63 @@ mod tests {
             encoded["instances"][1]["channel_send"],
             serde_json::json!({ "status": "misconfigured" })
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_fingerprint_changes_when_neighbor_contact_route_changes() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        let sender_channels = BTreeSet::from(["team-local".to_string()]);
+        let applied_state = AppliedState::from_home_read_only(
+            &crate::home::LionClawHome::new(project.instance.home),
+            &OperatorConfig::default(),
+        )
+        .expect("applied state");
+
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "team-local",
+            "member:reviewer",
+            None,
+        )
+        .await;
+        let first_context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+        let first_context =
+            project_instance_runtime_context_with_contacts(first_context, &sender_channels)
+                .await
+                .expect("contact context");
+        let first_fingerprint = compute_daemon_fingerprint_with_project_context(
+            "runtime",
+            &applied_state,
+            Some(&first_context),
+        );
+
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "team-local",
+            "member:reviewer-v2",
+            None,
+        )
+        .await;
+        let second_context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+        let second_context =
+            project_instance_runtime_context_with_contacts(second_context, &sender_channels)
+                .await
+                .expect("contact context");
+        let second_fingerprint = compute_daemon_fingerprint_with_project_context(
+            "runtime",
+            &applied_state,
+            Some(&second_context),
+        );
+
+        assert_ne!(first_fingerprint, second_fingerprint);
     }
 
     #[test]

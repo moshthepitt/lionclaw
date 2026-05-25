@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 pub const PROJECT_INSTANCE_ENV: &str = "LIONCLAW_PROJECT_INSTANCE";
 pub const PROJECT_INSTANCES_FILE_ENV: &str = "LIONCLAW_PROJECT_INSTANCES_FILE";
@@ -186,4 +187,74 @@ impl ProjectInstanceRuntimeContext {
         self.channel_send_inventory = channel_send_inventory;
         self
     }
+
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"lionclaw-project-instance-runtime-context-v1\0");
+        hash_str(&mut hasher, &self.instance_name);
+        hash_inventory(&mut hasher, b"inventory", &self.inventory);
+        hash_inventory(
+            &mut hasher,
+            b"channel_send_inventory",
+            &self.channel_send_inventory,
+        );
+        hex::encode(hasher.finalize())
+    }
+}
+
+fn hash_inventory(hasher: &mut Sha256, label: &[u8], inventory: &ProjectInstanceInventory) {
+    hasher.update(label);
+    hasher.update(b"\0");
+    hasher.update(inventory.schema_version.to_le_bytes());
+    hash_option_str(hasher, inventory.default_instance.as_deref());
+    hasher.update(inventory.instances.len().to_le_bytes());
+    for instance in &inventory.instances {
+        hash_str(hasher, &instance.name);
+        hash_channel_send(hasher, instance.channel_send.as_ref());
+    }
+}
+
+fn hash_channel_send(hasher: &mut Sha256, channel_send: Option<&ProjectInstanceChannelSend>) {
+    let Some(channel_send) = channel_send else {
+        hasher.update(b"channel_send:none\0");
+        return;
+    };
+
+    hasher.update(b"channel_send:some\0");
+    hash_channel_send_status(hasher, channel_send.status);
+    hash_option_str(hasher, channel_send.channel_id.as_deref());
+    hash_option_str(hasher, channel_send.conversation_ref.as_deref());
+    match channel_send.thread_ref.as_ref() {
+        None => hasher.update(b"thread_ref:absent\0"),
+        Some(None) => hasher.update(b"thread_ref:null\0"),
+        Some(Some(value)) => {
+            hasher.update(b"thread_ref:value\0");
+            hash_str(hasher, value);
+        }
+    }
+}
+
+fn hash_channel_send_status(hasher: &mut Sha256, status: ProjectInstanceChannelSendStatus) {
+    let status = match status {
+        ProjectInstanceChannelSendStatus::Unconfigured => "unconfigured",
+        ProjectInstanceChannelSendStatus::Configured => "configured",
+        ProjectInstanceChannelSendStatus::ChannelMissing => "channel_missing",
+        ProjectInstanceChannelSendStatus::Misconfigured => "misconfigured",
+    };
+    hash_str(hasher, status);
+}
+
+fn hash_option_str(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(b"some\0");
+            hash_str(hasher, value);
+        }
+        None => hasher.update(b"none\0"),
+    }
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value.as_bytes());
 }

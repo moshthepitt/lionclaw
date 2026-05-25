@@ -189,6 +189,16 @@ When the active preset allows program-backed `channel.send`, the same projection
 can include restart-bound neighbor contact status; only configured neighbor
 routes expose channel and provider refs.
 
+Configure a preferred contact from the recipient instance:
+
+```bash
+lionclaw --instance reviewer connect ./channels/team-local --contact
+lionclaw --instance reviewer channel add team-local --skill team-local --contact --conversation-ref member:reviewer
+```
+
+`connect --contact` can use a channel skill's `{instance}` contact template.
+Pass `--conversation-ref` when you want to set the provider route explicitly.
+
 Without `--home` or `--project`, LionClaw discovers only the current directory
 and its immediate parent. Use `--home PATH` when you need to target one exact
 instance home and bypass project discovery. Use `lionclaw instance --help` for

@@ -8,7 +8,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    applied::{compute_daemon_fingerprint, AppliedState},
+    applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     contracts::{
         ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
         ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
@@ -39,7 +39,7 @@ use crate::{
         },
         snapshot::{install_snapshot, resolve_local_source},
         target::{
-            project_instance_name_for_home_in_project,
+            project_instance_runtime_context_for_home_in_project_with_contacts,
             project_instance_runtime_context_with_contacts,
         },
     },
@@ -175,7 +175,7 @@ pub async fn add_channel_with_contact(
         &skill_dir,
         Some(crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER),
     )?;
-    let metadata = if contact.enabled {
+    let metadata = if contact.needs_metadata_template() {
         load_optional_channel_metadata(&skill_dir)?
     } else {
         None
@@ -210,6 +210,18 @@ pub struct ChannelContactSetup {
     pub conversation_ref: Option<String>,
     pub thread_ref: Option<String>,
     pub instance_name: Option<String>,
+}
+
+impl ChannelContactSetup {
+    fn needs_metadata_template(&self) -> bool {
+        self.enabled
+            && self
+                .conversation_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+    }
 }
 
 pub async fn add_channel_with_worker(
@@ -325,8 +337,23 @@ pub async fn up_for_work_root<M: UnitManager>(
     let home_id = home.ensure_home_id().await?;
     let project_scope = runtime_project_partition_key(Some(work_root));
     let runtime_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
-    let expected_daemon_fingerprint =
-        compute_daemon_fingerprint(&runtime_config_fingerprint, &state.applied_state);
+    let sender_channel_ids = state.applied_state.channel_ids();
+    let project_instance_runtime = match project_root {
+        Some(project_root) => Some(
+            project_instance_runtime_context_for_home_in_project_with_contacts(
+                project_root,
+                home,
+                &sender_channel_ids,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let expected_daemon_fingerprint = compute_daemon_fingerprint_with_project_context(
+        &runtime_config_fingerprint,
+        &state.applied_state,
+        project_instance_runtime.as_ref(),
+    );
     match classify_daemon(
         &config.daemon.bind,
         &home_id,
@@ -383,16 +410,13 @@ pub async fn up_for_work_root<M: UnitManager>(
         Some(work_root),
     )
     .await?;
-    let project_instance_name = project_root
-        .map(|project_root| project_instance_name_for_home_in_project(project_root, home))
-        .transpose()?;
-    let project_instance = match (project_root, project_instance_name.as_deref()) {
-        (Some(project_root), Some(instance_name)) => Some(DaemonProjectInstanceSpec {
-            project_root,
-            instance_name,
-        }),
-        _ => None,
-    };
+    let project_instance =
+        project_instance_runtime
+            .as_ref()
+            .map(|context| DaemonProjectInstanceSpec {
+                project_root: context.project_root.as_path(),
+                instance_name: context.instance_name.as_str(),
+            });
     render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
@@ -1648,6 +1672,43 @@ mod tests {
         let contact = config.channels[0].contact.as_ref().expect("contact");
         assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
         assert_eq!(contact.thread_ref.as_deref(), Some("thread-a"));
+    }
+
+    #[tokio::test]
+    async fn add_channel_contact_explicit_route_does_not_load_default_template() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        write_channel_metadata(&skill_source, "team-local", Some("member:{handle}"));
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: true,
+                conversation_ref: Some("member:reviewer".to_string()),
+                thread_ref: None,
+                instance_name: Some("reviewer".to_string()),
+            },
+        )
+        .await
+        .expect("explicit route should not parse default template");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let contact = config.channels[0].contact.as_ref().expect("contact");
+        assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
     }
 
     #[tokio::test]
