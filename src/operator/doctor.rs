@@ -2938,6 +2938,7 @@ mod tests {
                 runtime_id: "codex",
                 workspace: crate::home::DEFAULT_WORKSPACE,
                 project_workspace_root: work_root,
+                project_instance: None,
                 daemon_fingerprint,
                 codex_home_override: None,
             },

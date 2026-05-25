@@ -64,7 +64,12 @@ use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        runtime_project_partition_key, LionClawHome, RUNTIME_SESSION_READY_MARKER,
+        runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
+        RUNTIME_SESSION_READY_MARKER,
+    },
+    project_inventory::{
+        ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
+        PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
     },
     runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
     workspace::{read_workspace_sections, GENERATED_AGENTS_FILE},
@@ -163,6 +168,7 @@ const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const PROJECT_INSTANCE_PROJECTIONS_DIR: &str = "project-instance-projections";
 const MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS: usize = 16;
 const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -410,6 +416,7 @@ pub struct KernelOptions {
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
     pub workspace_name: Option<String>,
+    pub project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub scheduler: SchedulerConfig,
     pub applied_state: AppliedState,
 }
@@ -437,6 +444,7 @@ impl fmt::Debug for KernelOptions {
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
             .field("workspace_name", &self.workspace_name)
+            .field("project_instance_runtime", &self.project_instance_runtime)
             .field("scheduler", &self.scheduler)
             .field("applied_state", &"..")
             .finish()
@@ -461,6 +469,7 @@ impl Default for KernelOptions {
             project_workspace_root: None,
             runtime_root: None,
             workspace_name: None,
+            project_instance_runtime: None,
             scheduler: SchedulerConfig::default(),
             applied_state: AppliedState::default(),
         }
@@ -495,6 +504,7 @@ pub struct Kernel {
     session_scope: String,
     runtime_root: Option<PathBuf>,
     workspace_name: Option<String>,
+    project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     applied_state: AppliedState,
     continuity: Option<ContinuityLayout>,
     hidden_compaction_turn_timeout: Duration,
@@ -659,6 +669,7 @@ impl Kernel {
             session_scope,
             runtime_root: options.runtime_root,
             workspace_name: options.workspace_name,
+            project_instance_runtime: options.project_instance_runtime,
             applied_state: options.applied_state,
             continuity,
             hidden_compaction_turn_timeout,
@@ -6011,6 +6022,7 @@ mod tests {
     use super::*;
     use crate::kernel::continuity::title_file_name;
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
+    use crate::project_inventory::ProjectInstanceInventory;
 
     #[test]
     fn kernel_options_debug_reports_runtime_secret_home() {
@@ -6023,6 +6035,26 @@ mod tests {
         let debug = format!("{options:?}");
         assert!(debug.contains("runtime_secrets_home"));
         assert!(debug.contains("/tmp/lionclaw-home"));
+    }
+
+    fn test_execution_plan(runtime_id: &str) -> EffectiveExecutionPlan {
+        EffectiveExecutionPlan {
+            runtime_id: runtime_id.to_string(),
+            preset_name: "everyday".to_string(),
+            confinement: crate::kernel::runtime::ConfinementConfig::Oci(
+                crate::kernel::runtime::OciConfinementConfig::default(),
+            ),
+            workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
+            network_mode: crate::kernel::runtime::NetworkMode::On,
+            working_dir: None,
+            environment: Vec::new(),
+            idle_timeout: Duration::from_secs(30),
+            hard_timeout: Duration::from_secs(60),
+            mounts: Vec::new(),
+            mount_runtime_secrets: false,
+            escape_classes: std::collections::BTreeSet::new(),
+            limits: crate::kernel::runtime::ExecutionLimits::default(),
+        }
     }
 
     #[tokio::test]
@@ -6378,39 +6410,24 @@ mod tests {
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
-        let plan = EffectiveExecutionPlan {
-            runtime_id: "work-codex".to_string(),
-            preset_name: "everyday".to_string(),
-            confinement: crate::kernel::runtime::ConfinementConfig::Oci(
-                crate::kernel::runtime::OciConfinementConfig::default(),
-            ),
-            workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
-            network_mode: crate::kernel::runtime::NetworkMode::On,
-            working_dir: None,
-            environment: Vec::new(),
-            idle_timeout: Duration::from_secs(30),
-            hard_timeout: Duration::from_secs(60),
-            mounts: vec![
-                MountSpec {
-                    source: temp_dir.path().join("workspace"),
-                    target: "/workspace".to_string(),
-                    access: MountAccess::ReadWrite,
-                },
-                MountSpec {
-                    source: runtime_state_root.clone(),
-                    target: "/runtime".to_string(),
-                    access: MountAccess::ReadWrite,
-                },
-                MountSpec {
-                    source: temp_dir.path().join("skills/loopback"),
-                    target: "/lionclaw/skills/loopback".to_string(),
-                    access: MountAccess::ReadOnly,
-                },
-            ],
-            mount_runtime_secrets: false,
-            escape_classes: std::collections::BTreeSet::new(),
-            limits: crate::kernel::runtime::ExecutionLimits::default(),
-        };
+        let mut plan = test_execution_plan("work-codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: temp_dir.path().join("workspace"),
+                target: "/workspace".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: temp_dir.path().join("skills/loopback"),
+                target: "/lionclaw/skills/loopback".to_string(),
+                access: MountAccess::ReadOnly,
+            },
+        ];
 
         kernel
             .materialize_runtime_plan("work-codex", "codex", &plan)
@@ -6424,6 +6441,269 @@ mod tests {
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
         );
+    }
+
+    #[tokio::test]
+    async fn project_instance_inventory_is_mounted_read_only_for_program_backed_turns() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let project_root = temp_dir.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(project_root.clone()),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
+                    instance_name: "reviewer".to_string(),
+                    inventory: ProjectInstanceInventory::new(
+                        Some("main".to_string()),
+                        vec!["main".to_string(), "reviewer".to_string()],
+                    ),
+                }),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid");
+        let turn_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("uuid");
+        let mut plan = test_execution_plan("codex");
+
+        kernel
+            .maybe_mount_project_instance_inventory(
+                session_id,
+                turn_id,
+                "codex",
+                RuntimeTurnMode::ProgramBacked,
+                &mut plan,
+            )
+            .await
+            .expect("mount inventory");
+
+        let mount = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == PROJECT_INSTANCE_INVENTORY_DIR)
+            .expect("project inventory mount");
+        let content = tokio::fs::read_to_string(mount.source.join(PROJECT_INSTANCES_FILE_NAME))
+            .await
+            .expect("read inventory projection");
+
+        assert_eq!(mount.access, MountAccess::ReadOnly);
+        assert!(mount.source.starts_with(runtime_root));
+        assert_eq!(
+            plan.environment,
+            vec![
+                (PROJECT_INSTANCE_ENV.to_string(), "reviewer".to_string()),
+                (
+                    PROJECT_INSTANCES_FILE_ENV.to_string(),
+                    PROJECT_INSTANCES_FILE_PATH.to_string()
+                )
+            ]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "default_instance": "main",
+                "instances": [
+                    { "name": "main" },
+                    { "name": "reviewer" }
+                ]
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_instance_inventory_projection_rejects_runtime_path_symlinks() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let outside_root = temp_dir.path().join("outside");
+        let project_root = temp_dir.path().join("project");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir(&outside_root).expect("outside root");
+        fs::create_dir(&project_root).expect("project root");
+        std::os::unix::fs::symlink(&outside_root, runtime_root.join("codex"))
+            .expect("runtime id symlink");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(project_root.clone()),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
+                    instance_name: "main".to_string(),
+                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                }),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid");
+        let turn_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("uuid");
+        let mut plan = test_execution_plan("codex");
+
+        let err = kernel
+            .maybe_mount_project_instance_inventory(
+                session_id,
+                turn_id,
+                "codex",
+                RuntimeTurnMode::ProgramBacked,
+                &mut plan,
+            )
+            .await
+            .expect_err("reject symlinked runtime path");
+
+        assert!(
+            err.to_string().contains("not a regular directory"),
+            "unexpected error: {err:#}"
+        );
+        let outside_entries = fs::read_dir(&outside_root)
+            .expect("read outside root")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("outside entries");
+        assert!(
+            outside_entries.is_empty(),
+            "inventory projection must not follow runtime-owned symlinks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_instance_inventory_projection_rejects_symlinked_file_leaf() {
+        let temp_dir = tempdir().expect("temp dir");
+        let projection_dir = temp_dir.path().join("projection");
+        let outside_file = temp_dir.path().join("outside.json");
+        let projection_file = projection_dir.join(PROJECT_INSTANCES_FILE_NAME);
+        fs::create_dir(&projection_dir).expect("projection dir");
+        std::os::unix::fs::symlink(&outside_file, projection_file.as_path())
+            .expect("inventory file symlink");
+
+        let err = write_new_runtime_projection_file(
+            &projection_file,
+            "{}",
+            "project instance inventory projection file",
+        )
+        .await
+        .expect_err("reject symlinked inventory file");
+
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside_file.exists(),
+            "inventory projection must not follow symlinked file leaves"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_instance_inventory_projection_uses_fresh_directory_per_attempt() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let project_root = temp_dir.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(project_root),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
+                    instance_name: "main".to_string(),
+                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                }),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid");
+        let turn_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("uuid");
+        let mut first_plan = test_execution_plan("codex");
+        let mut second_plan = test_execution_plan("codex");
+
+        kernel
+            .maybe_mount_project_instance_inventory(
+                session_id,
+                turn_id,
+                "codex",
+                RuntimeTurnMode::ProgramBacked,
+                &mut first_plan,
+            )
+            .await
+            .expect("first projection");
+        kernel
+            .maybe_mount_project_instance_inventory(
+                session_id,
+                turn_id,
+                "codex",
+                RuntimeTurnMode::ProgramBacked,
+                &mut second_plan,
+            )
+            .await
+            .expect("second projection");
+
+        let first_mount = first_plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == PROJECT_INSTANCE_INVENTORY_DIR)
+            .expect("first inventory mount");
+        let second_mount = second_plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == PROJECT_INSTANCE_INVENTORY_DIR)
+            .expect("second inventory mount");
+
+        assert_ne!(first_mount.source, second_mount.source);
+        assert!(first_mount
+            .source
+            .join(PROJECT_INSTANCES_FILE_NAME)
+            .exists());
+        assert!(second_mount
+            .source
+            .join(PROJECT_INSTANCES_FILE_NAME)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn project_instance_inventory_is_not_mounted_for_direct_turns() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(temp_dir.path().join("runtime")),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(temp_dir.path().join("project")),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
+                    instance_name: "main".to_string(),
+                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                }),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("mock");
+
+        kernel
+            .maybe_mount_project_instance_inventory(
+                Uuid::nil(),
+                Uuid::nil(),
+                "mock",
+                RuntimeTurnMode::Direct,
+                &mut plan,
+            )
+            .await
+            .expect("direct plan");
+
+        assert!(plan.mounts.is_empty());
+        assert!(plan.environment.is_empty());
     }
 
     #[tokio::test]
@@ -8601,6 +8881,45 @@ async fn ensure_safe_child_directory(
     }
 
     Ok(current)
+}
+
+async fn write_new_runtime_projection_file(
+    path: &Path,
+    contents: &str,
+    label: &str,
+) -> Result<(), KernelError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|err| {
+            if err.kind() == ErrorKind::AlreadyExists {
+                KernelError::Conflict(format!("{label} '{}' already exists", path.display()))
+            } else {
+                KernelError::Internal(format!(
+                    "failed to create {label} '{}': {err}",
+                    path.display()
+                ))
+            }
+        })?;
+
+    if let Err(err) = file.write_all(contents.as_bytes()).await {
+        remove_file_best_effort(path).await;
+        return Err(KernelError::Internal(format!(
+            "failed to write {label} '{}': {err}",
+            path.display()
+        )));
+    }
+    if let Err(err) = file.flush().await {
+        remove_file_best_effort(path).await;
+        return Err(KernelError::Internal(format!(
+            "failed to flush {label} '{}': {err}",
+            path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 async fn ensure_existing_directory_is_safe(path: &Path) -> Result<(), KernelError> {
@@ -11510,6 +11829,95 @@ impl Kernel {
             .map(|mount| mount.source.as_path())
     }
 
+    async fn maybe_mount_project_instance_inventory(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        runtime_turn_mode: RuntimeTurnMode,
+        plan: &mut EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        plan.environment
+            .retain(|(key, _)| key != PROJECT_INSTANCE_ENV && key != PROJECT_INSTANCES_FILE_ENV);
+        plan.mounts
+            .retain(|mount| mount.target != PROJECT_INSTANCE_INVENTORY_DIR);
+
+        if runtime_turn_mode != RuntimeTurnMode::ProgramBacked {
+            return Ok(());
+        }
+        let Some(context) = self.project_instance_runtime.as_ref() else {
+            return Ok(());
+        };
+        if !context.inventory.contains_instance(&context.instance_name) {
+            return Err(KernelError::Runtime(format!(
+                "project instance inventory does not include selected instance '{}'",
+                context.instance_name
+            )));
+        }
+
+        let runtime_root = self.runtime_root.as_deref().ok_or_else(|| {
+            KernelError::Runtime(
+                "project instance inventory requires a configured runtime root".to_string(),
+            )
+        })?;
+        let workspace_name = self.workspace_name.as_deref().ok_or_else(|| {
+            KernelError::Runtime(
+                "project instance inventory requires a configured workspace name".to_string(),
+            )
+        })?;
+        let project_key = runtime_project_partition_key(self.project_workspace_root.as_deref());
+        let session_component = session_id.to_string();
+        let turn_component = turn_id.to_string();
+        let projection_component = Uuid::new_v4().to_string();
+        let projection_dir = ensure_safe_child_directory(
+            runtime_root,
+            &[
+                runtime_id,
+                workspace_name,
+                RUNTIME_PROJECTS_DIR,
+                project_key.as_str(),
+                PROJECT_INSTANCE_PROJECTIONS_DIR,
+                session_component.as_str(),
+                turn_component.as_str(),
+                projection_component.as_str(),
+            ],
+        )
+        .await?;
+        let projection_dir = tokio::fs::canonicalize(&projection_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve project instance inventory projection '{}': {err}",
+                    projection_dir.display()
+                ))
+            })?;
+        let encoded = context
+            .inventory
+            .to_pretty_json()
+            .map_err(|err| internal(err.into()))?;
+        write_new_runtime_projection_file(
+            &projection_dir.join(PROJECT_INSTANCES_FILE_NAME),
+            &encoded,
+            "project instance inventory projection file",
+        )
+        .await?;
+
+        plan.mounts.push(MountSpec {
+            source: projection_dir,
+            target: PROJECT_INSTANCE_INVENTORY_DIR.to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        plan.environment.push((
+            PROJECT_INSTANCE_ENV.to_string(),
+            context.instance_name.clone(),
+        ));
+        plan.environment.push((
+            PROJECT_INSTANCES_FILE_ENV.to_string(),
+            PROJECT_INSTANCES_FILE_PATH.to_string(),
+        ));
+        Ok(())
+    }
+
     async fn start_runtime_channel_send_bridge(
         &self,
         context: RuntimeChannelSendContext,
@@ -13916,6 +14324,20 @@ impl Kernel {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
+        self.maybe_mount_project_instance_inventory(
+            session_id,
+            turn_id,
+            runtime_id,
+            runtime_turn_mode,
+            &mut execution_plan,
+        )
+        .await
+        .map_err(|err| FailedRuntimeTurn {
+            events: Vec::new(),
+            status: SessionTurnStatus::Failed,
+            error_code: "runtime.error".to_string(),
+            error_text: err.to_string(),
+        })?;
         let runtime_secrets_mount = self
             .resolve_runtime_secrets_mount(&execution_plan)
             .await
@@ -14216,6 +14638,22 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
 
+        let mut execution_plan = execution_plan;
+        let runtime_turn_mode = adapter.turn_mode();
+        self.maybe_mount_project_instance_inventory(
+            session_id,
+            turn_id,
+            runtime_id,
+            runtime_turn_mode,
+            &mut execution_plan,
+        )
+        .await
+        .map_err(|err| FailedRuntimeTurn {
+            events: Vec::new(),
+            status: SessionTurnStatus::Failed,
+            error_code: "runtime.error".to_string(),
+            error_text: err.to_string(),
+        })?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         let runtime_secrets_mount = self

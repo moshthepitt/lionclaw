@@ -23,36 +23,16 @@ use crate::{
         reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites_for_work_root},
     },
+    project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
 };
 
-pub async fn run_local(
-    home: &LionClawHome,
-    project_root: Option<&Path>,
-    work_root: &Path,
-    instance_name: Option<&str>,
-    requested_runtime: Option<String>,
-    continue_last_session: bool,
-    timeout_override: Option<RuntimeTurnTimeouts>,
-) -> Result<()> {
+pub(crate) async fn run_local(invocation: RunLocalInvocation<'_>) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = BufReader::new(stdin);
     let mut output = stdout;
-    run_local_with_io_and_timeouts(
-        RunLocalInvocation {
-            home,
-            project_root,
-            work_root,
-            instance_name,
-            requested_runtime,
-            continue_last_session,
-            timeout_override,
-        },
-        &mut input,
-        &mut output,
-    )
-    .await
+    run_local_with_io_and_timeouts(invocation, &mut input, &mut output).await
 }
 
 #[cfg(test)]
@@ -71,6 +51,7 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
             project_root: None,
             work_root: &work_root,
             instance_name: Some("main"),
+            project_instance_runtime: None,
             requested_runtime,
             continue_last_session,
             timeout_override: None,
@@ -86,6 +67,7 @@ pub(crate) struct RunLocalInvocation<'a> {
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) work_root: &'a Path,
     pub(crate) instance_name: Option<&'a str>,
+    pub(crate) project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub(crate) requested_runtime: Option<String>,
     pub(crate) continue_last_session: bool,
     pub(crate) timeout_override: Option<RuntimeTurnTimeouts>,
@@ -101,6 +83,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         project_root,
         work_root,
         instance_name,
+        project_instance_runtime,
         requested_runtime,
         continue_last_session,
         timeout_override,
@@ -127,6 +110,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         &config,
         Some(runtime_id.clone()),
         work_root,
+        project_instance_runtime,
         Some(effective_timeouts),
     )
     .await?;
@@ -733,6 +717,70 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn run_local_home_target_inside_project_instances_does_not_expose_project_inventory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = crate::operator::target::init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let stub = temp_dir.path().join("codex-stub.sh");
+        let engine = temp_dir.path().join("podman");
+        let engine_log = temp_dir.path().join("podman.args");
+        write_codex_app_server_stub(
+            &stub,
+            &[
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"home mode"}}"#,
+            ],
+            0,
+        );
+        write_fake_podman(&engine, Some(&engine_log));
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: stub.display().to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.display().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        save_prepared_config(&home, &config).await;
+        write_codex_runtime_auth(&home).await;
+
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io_and_timeouts(
+            RunLocalInvocation {
+                home: &home,
+                project_root: None,
+                work_root: project.instance.work_root.as_path(),
+                instance_name: None,
+                project_instance_runtime: None,
+                requested_runtime: None,
+                continue_last_session: false,
+                timeout_override: None,
+            },
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("run local");
+
+        let invocation_args = fs::read_to_string(&engine_log).expect("read podman args");
+        assert!(
+            !invocation_args.contains("/lionclaw/project"),
+            "standalone --home runs must not receive project inventory mounts: {invocation_args}"
+        );
+        assert!(
+            !invocation_args.contains("LIONCLAW_PROJECT_INSTANCE"),
+            "standalone --home runs must not receive project inventory env: {invocation_args}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn run_local_timeout_override_sets_kernel_turn_limit() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -759,6 +807,7 @@ sleep 1
                 project_root: None,
                 work_root: &work_root,
                 instance_name: Some("main"),
+                project_instance_runtime: None,
                 requested_runtime: None,
                 continue_last_session: false,
                 timeout_override: Some(RuntimeTurnTimeouts::with_turn_timeout(
@@ -1563,19 +1612,38 @@ done
     fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
         let engine = reference.parent().expect("stub parent").join("podman");
         if !engine.exists() {
-            write_script(
-                &engine,
+            write_fake_podman(&engine, None);
+        }
+        engine
+    }
+
+    #[cfg(unix)]
+    fn write_fake_podman(path: &std::path::Path, log_path: Option<&std::path::Path>) {
+        let log_args = log_path
+            .map(|path| {
+                let path = path.display().to_string();
+                assert!(
+                    !path.contains('\''),
+                    "test log path cannot contain single quotes"
+                );
+                format!("printf '%s\\n' \"$@\" >> '{path}'\n")
+            })
+            .unwrap_or_default();
+        write_script(
+            path,
+            &format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
+{log_args}
 
-command_name="${1:-}"
+command_name="${{1:-}}"
 shift || true
 
-case "${command_name}" in
+case "${{command_name}}" in
   image)
-    subcommand="${1:-}"
+    subcommand="${{1:-}}"
     shift || true
-    case "${subcommand}" in
+    case "${{subcommand}}" in
       inspect)
         printf 'sha256:test-runtime-image\n'
         exit 0
@@ -1616,7 +1684,7 @@ case "${command_name}" in
           ;;
       esac
     done
-    if [ "$#" -eq 1 ] || [ "${1:-}" = "-lc" ]; then
+    if [ "$#" -eq 1 ] || [ "${{1:-}}" = "-lc" ]; then
       exit 0
     fi
     exec "$@"
@@ -1626,9 +1694,8 @@ case "${command_name}" in
     ;;
 esac
 "#,
-            );
-        }
-        engine
+            ),
+        );
     }
 
     fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {

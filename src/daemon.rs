@@ -15,6 +15,7 @@ use crate::{
     operator::{
         config::OperatorConfig,
         runtime::{register_configured_runtimes, resolve_runtime_execution_context},
+        target::project_instance_runtime_context_for_project_instance,
     },
 };
 
@@ -43,6 +44,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     )
     .await?;
     let applied_state = AppliedState::load(&config.home).await?;
+    let project_instance_runtime = match config.project_instance.as_ref() {
+        Some(project_instance) => Some(project_instance_runtime_context_for_project_instance(
+            &project_instance.project_root,
+            &project_instance.instance_name,
+        )?),
+        None => None,
+    };
     let daemon_fingerprint =
         compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, &applied_state);
 
@@ -69,6 +77,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),
                 workspace_name: Some(operator_config.daemon.workspace.clone()),
+                project_instance_runtime,
                 applied_state,
                 ..KernelOptions::default()
             },

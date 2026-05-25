@@ -799,6 +799,10 @@ mod tests {
         OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
+    use crate::project_inventory::{
+        PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV,
+        PROJECT_INSTANCE_INVENTORY_DIR,
+    };
     #[cfg(unix)]
     use rustix::process::{getgid, getuid};
     use tempfile::tempdir;
@@ -1003,6 +1007,48 @@ mod tests {
             pair == [
                 "--env".to_string(),
                 "LIONCLAW_CHANNEL_SEND_SOCKET=/runtime/lionclaw/channel-send.sock".to_string(),
+            ]
+        }));
+    }
+
+    #[test]
+    fn oci_backend_emits_project_instance_inventory_mount_and_env() {
+        let mut request = sample_execution_request();
+        request.plan.mounts.push(MountSpec {
+            source: "/host/runtime/project-instance-projections/session/turn".into(),
+            target: PROJECT_INSTANCE_INVENTORY_DIR.to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        request.plan.environment.extend([
+            (PROJECT_INSTANCE_ENV.to_string(), "reviewer".to_string()),
+            (
+                PROJECT_INSTANCES_FILE_ENV.to_string(),
+                PROJECT_INSTANCES_FILE_PATH.to_string(),
+            ),
+        ]);
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--volume".to_string(),
+                "/host/runtime/project-instance-projections/session/turn:/lionclaw/project:ro,Z"
+                    .to_string(),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                format!("{PROJECT_INSTANCE_ENV}=reviewer"),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                format!("{PROJECT_INSTANCES_FILE_ENV}={PROJECT_INSTANCES_FILE_PATH}"),
             ]
         }));
     }

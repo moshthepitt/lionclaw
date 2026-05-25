@@ -177,11 +177,16 @@ mkdir -p shared-work reviewer-work
 "$LIONCLAW_BIN" instance create reviewer --work-root "$PROJ_A/reviewer-work"
 "$LIONCLAW_BIN" instance create shared --work-root "$PROJ_A/shared-work"
 "$LIONCLAW_BIN" instance create shared-two --work-root "$PROJ_A/shared-work"
+"$LIONCLAW_BIN" --instance reviewer configure --runtime codex
 "$LIONCLAW_BIN" instance list
 "$LIONCLAW_BIN" --instance reviewer status
 "$LIONCLAW_BIN" --instance shared status
 "$LIONCLAW_BIN" status --all
 "$LIONCLAW_BIN" doctor --all
+cat <<'EOF' | "$LIONCLAW_BIN" --instance reviewer run
+Read LIONCLAW_PROJECT_INSTANCE and the JSON file named by LIONCLAW_PROJECT_INSTANCES_FILE. Reply with exactly INVENTORY_OK if the current instance is reviewer and the instances are main, reviewer, shared, and shared-two.
+/lionclaw exit
+EOF
 ```
 
 Expected:
@@ -191,6 +196,9 @@ Expected:
 - `--instance reviewer` targets only the reviewer instance
 - `status --all` and `doctor --all` enumerate project instances explicitly
 - shared work roots are reported as shared, not treated as corruption
+- the reviewer runtime has `LIONCLAW_PROJECT_INSTANCE=reviewer` and can read a
+  read-only `LIONCLAW_PROJECT_INSTANCES_FILE` JSON listing `main`, `reviewer`,
+  `shared`, and `shared-two`
 
 ## Phase 4: Project Isolation
 

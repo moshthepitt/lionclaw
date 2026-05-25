@@ -23,8 +23,8 @@ use crate::{
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             daemon_unit_name, ensure_unit_identity, render_channel_unit, render_daemon_unit,
-            unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec, ManagedUnit, UnitIdentity,
-            UnitManager,
+            unit_status_is_active, ChannelUnitSpec, DaemonProjectInstanceSpec, DaemonUnitSpec,
+            ManagedUnit, UnitIdentity, UnitManager,
         },
         redaction::SecretRedactor,
         runtime::{
@@ -32,7 +32,9 @@ use crate::{
             validate_runtime_launch_prerequisites_for_work_root,
         },
         snapshot::{install_snapshot, resolve_local_source},
+        target::project_instance_name_for_home_in_project,
     },
+    project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
     workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
 };
@@ -54,6 +56,7 @@ pub struct StackBinaryPaths {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ManagedDaemonContext<'a> {
     pub work_root: &'a Path,
+    pub project_instance: Option<DaemonProjectInstanceSpec<'a>>,
     pub fingerprint: &'a str,
     pub codex_home_override: Option<&'a Path>,
 }
@@ -265,6 +268,16 @@ pub async fn up_for_work_root<M: UnitManager>(
         Some(work_root),
     )
     .await?;
+    let project_instance_name = project_root
+        .map(|project_root| project_instance_name_for_home_in_project(project_root, home))
+        .transpose()?;
+    let project_instance = match (project_root, project_instance_name.as_deref()) {
+        (Some(project_root), Some(instance_name)) => Some(DaemonProjectInstanceSpec {
+            project_root,
+            instance_name,
+        }),
+        _ => None,
+    };
     render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
@@ -275,6 +288,7 @@ pub async fn up_for_work_root<M: UnitManager>(
         &unit_identity,
         ManagedDaemonContext {
             work_root,
+            project_instance,
             fingerprint: &expected_daemon_fingerprint,
             codex_home_override: runtime_context.codex_home_override.as_deref(),
         },
@@ -518,6 +532,7 @@ pub(crate) fn build_managed_units(
             runtime_id,
             workspace: &config.daemon.workspace,
             project_workspace_root: daemon_context.work_root,
+            project_instance: daemon_context.project_instance,
             daemon_fingerprint: daemon_context.fingerprint,
             codex_home_override: daemon_context.codex_home_override,
         },
@@ -809,7 +824,7 @@ pub(crate) async fn open_kernel(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
-    open_kernel_with_project_root(home, config, default_runtime_id, None, None).await
+    open_kernel_with_project_root(home, config, default_runtime_id, None, None, None).await
 }
 
 pub(crate) async fn open_runtime_kernel_for_work_root(
@@ -817,6 +832,7 @@ pub(crate) async fn open_runtime_kernel_for_work_root(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
     work_root: &Path,
+    project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
     open_kernel_with_project_root(
@@ -824,6 +840,7 @@ pub(crate) async fn open_runtime_kernel_for_work_root(
         config,
         default_runtime_id,
         Some(work_root.to_path_buf()),
+        project_instance_runtime,
         timeout_override,
     )
     .await
@@ -834,6 +851,7 @@ async fn open_kernel_with_project_root(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
     project_workspace_root: Option<PathBuf>,
+    project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
     home.ensure_base_dirs().await?;
@@ -861,6 +879,7 @@ async fn open_kernel_with_project_root(
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
             workspace_name: Some(config.daemon.workspace.clone()),
+            project_instance_runtime,
             applied_state,
             ..KernelOptions::default()
         },
@@ -959,6 +978,7 @@ mod tests {
                 runtime_id: "codex",
                 workspace: "main",
                 project_workspace_root: Path::new("/tmp/project"),
+                project_instance: None,
                 daemon_fingerprint: "test-fingerprint",
                 codex_home_override: None,
             },
@@ -1155,7 +1175,7 @@ mod tests {
         open_kernel(&home, &config, None)
             .await
             .expect("state kernel should open without a project root");
-        open_kernel_with_project_root(&home, &config, None, None, None)
+        open_kernel_with_project_root(&home, &config, None, None, None, None)
             .await
             .expect("state kernel helper should allow a missing project root");
     }
@@ -1168,7 +1188,7 @@ mod tests {
             .await
             .expect("load default config");
 
-        open_kernel_with_project_root(&home, &config, None, None, None)
+        open_kernel_with_project_root(&home, &config, None, None, None, None)
             .await
             .expect("state kernel helper should initialize a fresh home");
 
@@ -1659,6 +1679,16 @@ mod tests {
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());
+        let daemon_unit = manager
+            .managed_unit(&test_daemon_unit_name(&home))
+            .expect("managed unit lookup")
+            .expect("daemon unit");
+        assert!(!daemon_unit
+            .env_content
+            .contains(crate::config::DAEMON_PROJECT_ROOT_ENV));
+        assert!(!daemon_unit
+            .env_content
+            .contains(crate::config::DAEMON_PROJECT_INSTANCE_ENV));
     }
 
     #[tokio::test]

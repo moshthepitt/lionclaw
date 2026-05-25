@@ -262,6 +262,8 @@ The everyday runtime layout is mount-first:
 - `/workspace`: selected work root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
+- `/lionclaw/project/instances.json`: generated read-only project instance
+  inventory for project-backed program-backed runtime launches
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets mounted read-only
 - `/attachments`: read-only channel attachment files for the current inbound
   event, present only after attachment finalization staged files for that turn
@@ -276,6 +278,18 @@ instance's existing home, work root, runtime config, sessions, and audit scope;
 it does not mutate project, instance, runtime, channel, skill, or default
 configuration. The selected work root is mounted at `/workspace`. The instance
 home remains LionClaw's state root and is not the project tree or work root.
+
+Project-backed runtimes that launch confined programs get their selected
+instance name through
+`LIONCLAW_PROJECT_INSTANCE` and discover neighbors through
+`LIONCLAW_PROJECT_INSTANCES_FILE=/lionclaw/project/instances.json`. The JSON
+contract is intentionally small: `schema_version`, `default_instance`, and a
+sorted `instances` array with `{ "name": ... }` entries. LionClaw generates this
+from `.lionclaw/project.toml` and valid `.lionclaw/instances/<name>` homes, then
+mounts only the generated projection read-only. The raw `.lionclaw` directory
+remains masked from `/workspace` and blocked as a configured extra mount.
+Already-running runtimes do not receive live updates when operators add or repair
+instances; normal process or unit restart boundaries pick up the new inventory.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
