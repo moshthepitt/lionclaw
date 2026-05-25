@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
@@ -16,11 +18,14 @@ use crate::kernel::runtime::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
     RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnMode,
-    RuntimeTurnResult,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalTranscriptInput, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+    RuntimeTurnMode, RuntimeTurnResult,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
+const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
+const CODEX_RUNTIME_SESSIONS_DIR: &[&str] = &["home", ".codex", "sessions"];
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -438,6 +443,17 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         self.run_app_server_turn(execution, events).await
     }
 
+    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
+        Ok(build_codex_terminal_program(&self.config))
+    }
+
+    async fn export_terminal_transcript(
+        &self,
+        input: RuntimeTerminalTranscriptInput,
+    ) -> Result<Vec<RuntimeTerminalTurn>> {
+        export_codex_terminal_transcript(&input.runtime_state_root)
+    }
+
     async fn runtime_control(
         &self,
         execution: RuntimeControlExecution,
@@ -516,6 +532,283 @@ fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgram
         stdin: String::new(),
         auth: Some(RuntimeAuthKind::Codex),
     }
+}
+
+fn build_codex_terminal_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+    let mut args = vec![
+        "--sandbox".to_string(),
+        "danger-full-access".to_string(),
+        "--ask-for-approval".to_string(),
+        "never".to_string(),
+        "-c".to_string(),
+        format!("model_instructions_file=\"{LIONCLAW_RUNTIME_CONTEXT_PATH}\""),
+    ];
+    if let Some(model) = &config.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+
+    RuntimeProgramSpec {
+        executable: config.executable.clone(),
+        args,
+        environment: Vec::new(),
+        stdin: String::new(),
+        auth: Some(RuntimeAuthKind::Codex),
+    }
+}
+
+fn export_codex_terminal_transcript(runtime_state_root: &Path) -> Result<Vec<RuntimeTerminalTurn>> {
+    let sessions_root = CODEX_RUNTIME_SESSIONS_DIR
+        .iter()
+        .fold(runtime_state_root.to_path_buf(), |path, segment| {
+            path.join(segment)
+        });
+    let files = codex_terminal_session_files(&sessions_root)?;
+    let mut turns = Vec::new();
+    for file in files {
+        turns.extend(parse_codex_terminal_session_file(&sessions_root, &file)?);
+    }
+    turns.sort_by(|left, right| {
+        left.started_at
+            .cmp(&right.started_at)
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    Ok(turns)
+}
+
+fn codex_terminal_session_files(sessions_root: &Path) -> Result<Vec<PathBuf>> {
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut dirs = vec![sessions_root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect Codex session dir '{}'", dir.display())
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read Codex session dir '{}'", dir.display()))?
+        {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to read Codex session dir entry in '{}'",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to inspect Codex session path '{}'", path.display())
+                    })
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                dirs.push(path);
+            } else if metadata.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[derive(Default)]
+struct PendingCodexTerminalTurn {
+    source_turn_id: Option<String>,
+    source_index: usize,
+    user_text: String,
+    assistant_text: String,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+}
+
+fn parse_codex_terminal_session_file(
+    sessions_root: &Path,
+    file: &Path,
+) -> Result<Vec<RuntimeTerminalTurn>> {
+    let source_file = file
+        .strip_prefix(sessions_root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let file = fs::File::open(file)
+        .with_context(|| format!("failed to open Codex session file '{}'", file.display()))?;
+    let reader = BufReader::new(file);
+    let mut turns = Vec::new();
+    let mut active_turn_id = None;
+    let mut active_started_at = None;
+    let mut source_index = 0usize;
+    let mut pending: Option<PendingCodexTerminalTurn> = None;
+
+    for line in reader.lines() {
+        let line =
+            line.with_context(|| format!("failed to read Codex session file '{}'", source_file))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = codex_record_timestamp(&value);
+        let record_type = value.get("type").and_then(Value::as_str);
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let payload_type = payload.get("type").and_then(Value::as_str);
+
+        if record_type == Some("event_msg") && payload_type == Some("task_started") {
+            active_turn_id = payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            active_started_at = timestamp;
+            continue;
+        }
+
+        if record_type == Some("event_msg") && payload_type == Some("user_message") {
+            if let Some(completed) =
+                finish_pending_codex_terminal_turn(pending.take(), &source_file)
+            {
+                turns.push(completed);
+            }
+            let Some(message) = payload.get("message").and_then(Value::as_str) else {
+                continue;
+            };
+            if message.trim().is_empty() {
+                continue;
+            }
+            source_index += 1;
+            pending = Some(PendingCodexTerminalTurn {
+                source_turn_id: active_turn_id.clone(),
+                source_index,
+                user_text: message.to_string(),
+                assistant_text: String::new(),
+                started_at: active_started_at.or(timestamp),
+                finished_at: None,
+            });
+            continue;
+        }
+
+        if record_type == Some("response_item") {
+            if let Some(text) = codex_response_assistant_text(payload) {
+                if let Some(pending) = pending.as_mut() {
+                    if pending.assistant_text.trim().is_empty() {
+                        pending.assistant_text = text;
+                        pending.finished_at = timestamp;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if record_type == Some("event_msg") && payload_type == Some("agent_message") {
+            if let Some(pending) = pending.as_mut() {
+                if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    pending.assistant_text = message.to_string();
+                    pending.finished_at = timestamp;
+                }
+            }
+            if let Some(completed) =
+                finish_pending_codex_terminal_turn(pending.take(), &source_file)
+            {
+                turns.push(completed);
+            }
+            continue;
+        }
+
+        if record_type == Some("event_msg") && payload_type == Some("task_complete") {
+            if let Some(pending) = pending.as_mut() {
+                pending.finished_at = pending.finished_at.or(timestamp);
+            }
+            if let Some(completed) =
+                finish_pending_codex_terminal_turn(pending.take(), &source_file)
+            {
+                turns.push(completed);
+            }
+        }
+    }
+
+    if let Some(completed) = finish_pending_codex_terminal_turn(pending, &source_file) {
+        turns.push(completed);
+    }
+
+    Ok(turns)
+}
+
+fn finish_pending_codex_terminal_turn(
+    pending: Option<PendingCodexTerminalTurn>,
+    source_file: &str,
+) -> Option<RuntimeTerminalTurn> {
+    let pending = pending?;
+    let user_text = pending.user_text.trim_end().to_string();
+    let assistant_text = pending.assistant_text.trim_end().to_string();
+    if user_text.trim().is_empty() || assistant_text.trim().is_empty() {
+        return None;
+    }
+    let started_at = pending.started_at.unwrap_or_else(Utc::now);
+    let finished_at = pending.finished_at.unwrap_or(started_at);
+    let source_turn_id = pending
+        .source_turn_id
+        .unwrap_or_else(|| format!("turn-{}", pending.source_index));
+
+    Some(RuntimeTerminalTurn {
+        source_id: format!("codex-jsonl:{source_file}:{source_turn_id}"),
+        display_user_text: user_text.clone(),
+        prompt_user_text: user_text,
+        assistant_text,
+        status: RuntimeTerminalTurnStatus::Completed,
+        error_code: None,
+        error_text: None,
+        started_at,
+        finished_at,
+    })
+}
+
+fn codex_record_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn codex_response_assistant_text(payload: &Value) -> Option<String> {
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    let text = payload
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("output_text") | Some("text") => item.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 #[async_trait]
@@ -2157,16 +2450,18 @@ mod tests {
     use crate::kernel::runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
         EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
-        OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeFileChangeStatus,
-        RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
+        OciConfinementConfig, RuntimeAdapter, RuntimeAuthKind, RuntimeControlExecution,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTerminalTurnStatus, WorkspaceAccess,
     };
     use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::{json, Value};
 
     use super::{
-        build_codex_app_server_program, AppServerTransport, CodexAppServerClient,
+        build_codex_app_server_program, build_codex_terminal_program,
+        export_codex_terminal_transcript, AppServerTransport, CodexAppServerClient,
         CodexRuntimeAdapter, CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
     };
     use uuid::Uuid;
@@ -2301,6 +2596,70 @@ mod tests {
             }
         }
         text
+    }
+
+    #[test]
+    fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
+        let program = build_codex_terminal_program(&CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+        });
+
+        assert_eq!(program.executable, "codex");
+        assert_eq!(
+            program.args,
+            vec![
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+                "--ask-for-approval".to_string(),
+                "never".to_string(),
+                "-c".to_string(),
+                "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+            ]
+        );
+        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
+        assert!(program.environment.is_empty());
+        assert!(program.stdin.is_empty());
+    }
+
+    #[test]
+    fn codex_terminal_transcript_export_reads_native_jsonl_turns() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp_dir
+            .path()
+            .join("home")
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("25");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        std::fs::write(
+            sessions_dir.join("rollout.jsonl"),
+            r#"{"timestamp":"2026-05-25T10:00:00Z","type":"session_meta","payload":{"id":"session-1"}}
+{"timestamp":"2026-05-25T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-05-25T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}
+{"timestamp":"2026-05-25T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"draft"}]}}
+{"timestamp":"2026-05-25T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}
+{"timestamp":"2026-05-25T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
+"#,
+        )
+        .expect("write jsonl");
+
+        let turns = export_codex_terminal_transcript(temp_dir.path()).expect("transcript");
+
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(
+            turn.source_id,
+            "codex-jsonl:2026/05/25/rollout.jsonl:turn-1"
+        );
+        assert_eq!(turn.display_user_text, "hello");
+        assert_eq!(turn.prompt_user_text, "hello");
+        assert_eq!(turn.assistant_text, "answer");
+        assert_eq!(turn.status, RuntimeTerminalTurnStatus::Completed);
     }
 
     #[test]
