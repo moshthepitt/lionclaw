@@ -128,6 +128,9 @@ curl, jq, Python, archive helpers, PDF text tools, and ffmpeg/ffprobe for
 basic media inspection without bundling browsers, SDKs, OCR language packs, or
 local model weights.
 
+Container image recipes, including the Rust-enabled LionClaw development image,
+are documented in `containers/README.md`.
+
 `doctor` checks setup and prints the next run command when setup is no longer
 blocked. `run` checks launch. Use `lionclaw --help` and subcommand `--help`
 for current syntax.
