@@ -58,7 +58,7 @@ use crate::contracts::{
     SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
     SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
     SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
-    StreamEventKindDto, StreamLaneDto, TrustTier,
+    StreamEventKindDto, StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
@@ -120,9 +120,9 @@ use super::{
         HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact,
         RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeControlExecution,
         RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -7075,6 +7075,7 @@ fn to_channel_stream_event_view(event: ChannelStreamEventRecord) -> ChannelStrea
         lane: event.lane.map(to_stream_lane_dto),
         code: event.code,
         text: event.text,
+        file_change: event.file_change,
         created_at: event.created_at,
     }
 }
@@ -7401,6 +7402,7 @@ fn to_stream_event_kind_dto(kind: ChannelStreamEventKind) -> StreamEventKindDto 
     match kind {
         ChannelStreamEventKind::MessageDelta => StreamEventKindDto::MessageDelta,
         ChannelStreamEventKind::MessageBoundary => StreamEventKindDto::MessageBoundary,
+        ChannelStreamEventKind::FileChange => StreamEventKindDto::FileChange,
         ChannelStreamEventKind::Status => StreamEventKindDto::Status,
         ChannelStreamEventKind::Error => StreamEventKindDto::Error,
         ChannelStreamEventKind::TurnCompleted => StreamEventKindDto::TurnCompleted,
@@ -7415,50 +7417,144 @@ fn to_stream_lane_dto(lane: ChannelStreamLane) -> StreamLaneDto {
     }
 }
 
-fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
+fn to_channel_stream_lane(lane: RuntimeMessageLane) -> ChannelStreamLane {
+    match lane {
+        RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
+        RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
+    }
+}
+
+fn to_stream_file_change_status_dto(status: &RuntimeFileChangeStatus) -> StreamFileChangeStatusDto {
+    match status {
+        RuntimeFileChangeStatus::Editing => StreamFileChangeStatusDto::Editing,
+        RuntimeFileChangeStatus::Edited => StreamFileChangeStatusDto::Edited,
+        RuntimeFileChangeStatus::Failed => StreamFileChangeStatusDto::Failed,
+        RuntimeFileChangeStatus::Declined => StreamFileChangeStatusDto::Declined,
+        RuntimeFileChangeStatus::Changed => StreamFileChangeStatusDto::Changed,
+    }
+}
+
+fn to_stream_file_change_dto(change: RuntimeFileChange) -> StreamFileChangeDto {
+    let total_count = change.total_count.max(change.paths.len());
+    StreamFileChangeDto {
+        runtime: change.runtime,
+        operation_id: change.operation_id,
+        status: to_stream_file_change_status_dto(&change.status),
+        paths: change.paths,
+        total_count,
+    }
+}
+
+fn stream_file_change_text(change: &StreamFileChangeDto) -> String {
+    let total_count = change.total_count.max(change.paths.len());
+    if change.paths.is_empty() {
+        return format!(
+            "{} {} {} file{}",
+            change.runtime,
+            change.status.as_str(),
+            total_count,
+            plural_s(total_count)
+        );
+    }
+
+    let visible = change.paths.iter().take(3).cloned().collect::<Vec<_>>();
+    let hidden_count = total_count.saturating_sub(visible.len());
+    let suffix = if hidden_count > 0 {
+        format!(" +{hidden_count}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {}: {}{}",
+        change.runtime,
+        change.status.as_str(),
+        visible.join(", "),
+        suffix
+    )
+}
+
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStreamEvent {
+    kind: ChannelStreamEventKind,
+    lane: Option<ChannelStreamLane>,
+    code: Option<String>,
+    text: Option<String>,
+    file_change: Option<StreamFileChangeDto>,
+}
+
+fn runtime_stream_event(event: RuntimeEvent) -> RuntimeStreamEvent {
     match event {
-        RuntimeEvent::MessageDelta { lane, text } => StreamEventDto {
-            kind: StreamEventKindDto::MessageDelta,
-            lane: Some(match lane {
-                RuntimeMessageLane::Answer => StreamLaneDto::Answer,
-                RuntimeMessageLane::Reasoning => StreamLaneDto::Reasoning,
-            }),
+        RuntimeEvent::MessageDelta { lane, text } => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::MessageDelta,
+            lane: Some(to_channel_stream_lane(lane)),
             code: None,
             text: Some(text),
+            file_change: None,
         },
-        RuntimeEvent::MessageBoundary { lane } => StreamEventDto {
-            kind: StreamEventKindDto::MessageBoundary,
-            lane: Some(match lane {
-                RuntimeMessageLane::Answer => StreamLaneDto::Answer,
-                RuntimeMessageLane::Reasoning => StreamLaneDto::Reasoning,
-            }),
+        RuntimeEvent::MessageBoundary { lane } => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::MessageBoundary,
+            lane: Some(to_channel_stream_lane(lane)),
             code: None,
             text: None,
+            file_change: None,
         },
-        RuntimeEvent::Status { code, text } => StreamEventDto {
-            kind: StreamEventKindDto::Status,
+        RuntimeEvent::Status { code, text } => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::Status,
             lane: None,
             code,
             text: Some(text),
+            file_change: None,
         },
-        RuntimeEvent::Artifact { artifact } => StreamEventDto {
-            kind: StreamEventKindDto::Status,
+        RuntimeEvent::Artifact { artifact } => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::Status,
             lane: None,
             code: Some("runtime.artifact".to_string()),
             text: Some(runtime_artifact_status_text(&artifact)),
+            file_change: None,
         },
-        RuntimeEvent::Error { code, text } => StreamEventDto {
-            kind: StreamEventKindDto::Error,
+        RuntimeEvent::FileChange { change } => {
+            let file_change = to_stream_file_change_dto(change);
+            RuntimeStreamEvent {
+                kind: ChannelStreamEventKind::FileChange,
+                lane: None,
+                code: None,
+                text: Some(stream_file_change_text(&file_change)),
+                file_change: Some(file_change),
+            }
+        }
+        RuntimeEvent::Error { code, text } => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::Error,
             lane: None,
             code,
             text: Some(text),
+            file_change: None,
         },
-        RuntimeEvent::Done => StreamEventDto {
-            kind: StreamEventKindDto::Done,
+        RuntimeEvent::Done => RuntimeStreamEvent {
+            kind: ChannelStreamEventKind::Done,
             lane: None,
             code: None,
             text: None,
+            file_change: None,
         },
+    }
+}
+
+fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
+    let event = runtime_stream_event(event);
+    StreamEventDto {
+        kind: to_stream_event_kind_dto(event.kind),
+        lane: event.lane.map(to_stream_lane_dto),
+        code: event.code,
+        text: event.text,
+        file_change: event.file_change,
     }
 }
 
@@ -11902,59 +11998,18 @@ impl Kernel {
         context: &ChannelStreamContext,
         event: &RuntimeEvent,
     ) -> Result<i64, KernelError> {
-        let artifact_status_text;
-        let (kind, lane, code, text) = match event {
-            RuntimeEvent::MessageDelta { lane, text } => (
-                ChannelStreamEventKind::MessageDelta,
-                Some(match lane {
-                    RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
-                    RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
-                }),
-                None,
-                Some(text.as_str()),
-            ),
-            RuntimeEvent::MessageBoundary { lane } => (
-                ChannelStreamEventKind::MessageBoundary,
-                Some(match lane {
-                    RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
-                    RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
-                }),
-                None,
-                None,
-            ),
-            RuntimeEvent::Status { code, text } => (
-                ChannelStreamEventKind::Status,
-                None,
-                code.as_deref(),
-                Some(text.as_str()),
-            ),
-            RuntimeEvent::Artifact { artifact } => {
-                artifact_status_text = runtime_artifact_status_text(artifact);
-                (
-                    ChannelStreamEventKind::Status,
-                    None,
-                    Some("runtime.artifact"),
-                    Some(artifact_status_text.as_str()),
-                )
-            }
-            RuntimeEvent::Error { code, text } => (
-                ChannelStreamEventKind::Error,
-                None,
-                code.as_deref(),
-                Some(text.as_str()),
-            ),
-            RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None, None),
-        };
+        let event = runtime_stream_event(event.clone());
 
         self.append_channel_stream_event(ChannelStreamEventInsert {
             channel_id: &context.channel_id,
             peer_id: &context.peer_id,
             session_id: Some(context.session_id),
             turn_id: Some(context.turn_id),
-            kind,
-            lane,
-            code,
-            text,
+            kind: event.kind,
+            lane: event.lane,
+            code: event.code.as_deref(),
+            text: event.text.as_deref(),
+            file_change: event.file_change.as_ref(),
         })
         .await
     }
@@ -11973,6 +12028,7 @@ impl Kernel {
             lane: Some(ChannelStreamLane::Answer),
             code: None,
             text: Some(assistant_text),
+            file_change: None,
         })
         .await
     }
@@ -12001,6 +12057,7 @@ impl Kernel {
             lane: None,
             code: Some(error_code),
             text: Some(error_text),
+            file_change: None,
         })
         .await?;
 
@@ -12028,6 +12085,7 @@ impl Kernel {
             lane: None,
             code: None,
             text: None,
+            file_change: None,
         })
         .await?;
 

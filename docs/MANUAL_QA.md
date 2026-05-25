@@ -113,15 +113,20 @@ cd "$PROJ_A"
 Expected on a TTY:
 
 - a full-screen operator console opens
-- the instance list shows the configured project instances
 - the top ribbon shows the selected project instance, runtime, boundary flags,
   and timeout
-- the transcript pane shows durable user and assistant messages without raw
-  runtime event spam
-- the inspector shows selected instance, runtime, boundary, activity, and
-  honest audit details; `Left`/`Right` cycle those views when it is focused
-- the composer accepts printable characters such as `?`; `Tab` visibly moves
-  focus, and `Ctrl+D` exits when idle
+- the Run surface shows durable user and assistant messages, prompt input,
+  live runtime status, and recent file-change feedback without raw runtime
+  event spam in the durable transcript
+- on a wide terminal, Project, Run, Inspector, and Files panes are visible
+  together
+- `Ctrl+O` focuses controls; `Left`/`Right` cycle project, selected instance,
+  runtime, boundary, activity, audit, and files
+- the prompt accepts printable characters such as `?`; `Tab` visibly moves
+  between Run and controls; `Ctrl+X` maximizes Run or the current control
+  pane; `Ctrl+D` exits when idle
+- after submitting a prompt, Run scrolls without tabbing away from prompt
+  entry; printable input continues prompt editing in the same surface
 - while a turn is active, `Ctrl+C` requests a turn stop instead of exiting the
   console; the status changes to stopping and the console returns to idle after
   the cancelled turn is recorded

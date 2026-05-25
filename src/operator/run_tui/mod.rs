@@ -7,8 +7,8 @@ use std::{
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -32,7 +32,8 @@ use crate::{
     contracts::{
         AuditEventView, SessionActionKind, SessionActionRequest, SessionHistoryRequest,
         SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView,
-        StreamEventDto, StreamEventKindDto, StreamLaneDto,
+        StreamEventDto, StreamEventKindDto, StreamFileChangeDto, StreamFileChangeStatusDto,
+        StreamLaneDto,
     },
     home::LionClawHome,
     kernel::{
@@ -76,7 +77,7 @@ use input::{global_command_for, handle_key};
 #[cfg(test)]
 use render::{
     activity_item_lines, boundary_display_rows, footer_hint_spans,
-    scrollbar_position_for_pane_offset, transcript_render_lines,
+    scrollbar_position_for_pane_offset, transcript_render_lines, transcript_with_activity_lines,
 };
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
@@ -92,11 +93,13 @@ const PANEL_READY: Color = Color::Rgb(142, 163, 122);
 const PANEL_WARN: Color = Color::Rgb(216, 145, 53);
 const PANEL_ERROR: Color = Color::Rgb(196, 85, 48);
 const ACTIVITY_ITEM_HISTORY_LIMIT: usize = 200;
+const FILE_CHANGE_HISTORY_LIMIT: usize = 100;
 const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
 const DEFAULT_ACTIVITY_PAGE_SCROLL: usize = 8;
-const COMPOSER_MIN_HEIGHT: u16 = 6;
-const COMPOSER_MAX_HEIGHT: u16 = 12;
-const COMPOSER_CHROME_HEIGHT: u16 = 4;
+const DEFAULT_FILES_PAGE_SCROLL: usize = 8;
+const RUN_PROMPT_MIN_HEIGHT: u16 = 4;
+const RUN_PROMPT_MAX_HEIGHT: u16 = 8;
+const RUN_PROMPT_CHROME_HEIGHT: u16 = 2;
 const KV_LABEL_WIDTH: usize = 16;
 const LOCAL_CLI_CHANNEL_ID: &str = "local-cli";
 const PROJECT_SESSION_LIMIT: usize = 5;
@@ -108,21 +111,23 @@ const ACTIVITY_DONE_MARKERS: &[&str] = &[
     "mounted",
     "granted",
     "compacted",
-    " edited:",
+    "edited:",
 ];
 const ACTIVITY_COMMAND_MARKERS: &[&str] = &[
     "command",
     "exec",
-    " running:",
-    " ran:",
-    " searched:",
-    " read:",
-    " inspected:",
-    " opened:",
-    " found:",
+    "running:",
+    "ran:",
+    "searched:",
+    "read:",
+    "inspected:",
+    "opened:",
+    "found:",
+    "viewed:",
 ];
 const ACTIVITY_PROGRESS_MARKERS: &[&str] =
-    &["progress", "checking", "reading", "research", " editing:"];
+    &["progress", "checking", "reading", "research", "editing:"];
+const ACTIVITY_RUNTIME_SOURCES: &[&str] = &["codex", "opencode", "claude", "gemini"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerticalScroll {
@@ -340,6 +345,7 @@ impl ActivityStatus {
 enum ActivityItemKind {
     Done,
     Command,
+    FileChange,
     Progress,
     Status,
     Error,
@@ -351,15 +357,116 @@ struct ActivityItem {
     text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileChangeStatus {
+    Editing,
+    Edited,
+    Failed,
+    Declined,
+    Unknown,
+}
+
+impl FileChangeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Editing => "editing",
+            Self::Edited => "edited",
+            Self::Failed => "failed",
+            Self::Declined => "declined",
+            Self::Unknown => "changed",
+        }
+    }
+
+    fn from_stream(status: &StreamFileChangeStatusDto) -> Self {
+        match status {
+            StreamFileChangeStatusDto::Editing => Self::Editing,
+            StreamFileChangeStatusDto::Edited => Self::Edited,
+            StreamFileChangeStatusDto::Failed => Self::Failed,
+            StreamFileChangeStatusDto::Declined => Self::Declined,
+            StreamFileChangeStatusDto::Changed => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileChangeSummary {
+    runtime: String,
+    operation_id: Option<String>,
+    status: FileChangeStatus,
+    paths: Vec<String>,
+    total_count: usize,
+}
+
+impl FileChangeSummary {
+    fn from_stream(change: &StreamFileChangeDto) -> Self {
+        let paths = change
+            .paths
+            .iter()
+            .filter(|path| !path.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        Self {
+            runtime: change.runtime.clone(),
+            operation_id: change.operation_id.clone(),
+            status: FileChangeStatus::from_stream(&change.status),
+            total_count: change.total_count.max(paths.len()),
+            paths,
+        }
+    }
+
+    fn path_count(&self) -> usize {
+        self.total_count
+    }
+
+    fn hidden_count(&self) -> usize {
+        self.total_count.saturating_sub(self.paths.len())
+    }
+
+    fn label(&self) -> String {
+        if self.paths.is_empty() {
+            format!(
+                "{} {} {} file{}",
+                self.runtime,
+                self.status.label(),
+                self.total_count,
+                plural_s(self.total_count)
+            )
+        } else {
+            let hidden_count = self.hidden_count();
+            let suffix = if hidden_count > 0 {
+                format!(" +{hidden_count}")
+            } else {
+                String::new()
+            };
+            format!(
+                "{} {}: {}{}",
+                self.runtime,
+                self.status.label(),
+                self.paths.join(", "),
+                suffix
+            )
+        }
+    }
+
+    fn is_update_for(&self, other: &Self) -> bool {
+        self.runtime == other.runtime
+            && self.operation_id.is_some()
+            && self.operation_id == other.operation_id
+    }
+}
+
 #[derive(Debug)]
 struct ActivitySummary {
     status: ActivityStatus,
     event_count: usize,
     command_count: usize,
+    file_change_count: usize,
     progress_count: usize,
     started_at: Option<Instant>,
     ended_at: Option<Instant>,
+    last_event_at: Option<Instant>,
     items: Vec<ActivityItem>,
+    file_changes: Vec<FileChangeSummary>,
     open_progress_item: Option<usize>,
     open_progress_text: String,
 }
@@ -370,10 +477,13 @@ impl ActivitySummary {
             status: ActivityStatus::Idle,
             event_count: 0,
             command_count: 0,
+            file_change_count: 0,
             progress_count: 0,
             started_at: None,
             ended_at: None,
+            last_event_at: None,
             items: Vec::new(),
+            file_changes: Vec::new(),
             open_progress_item: None,
             open_progress_text: String::new(),
         }
@@ -383,10 +493,13 @@ impl ActivitySummary {
         self.status = ActivityStatus::Running;
         self.event_count = 0;
         self.command_count = 0;
+        self.file_change_count = 0;
         self.progress_count = 0;
         self.started_at = Some(Instant::now());
         self.ended_at = None;
+        self.last_event_at = None;
         self.items.clear();
+        self.file_changes.clear();
         self.open_progress_item = None;
         self.open_progress_text.clear();
     }
@@ -404,7 +517,10 @@ impl ActivitySummary {
     }
 
     fn is_empty(&self) -> bool {
-        self.event_count == 0 && self.items.is_empty()
+        self.status == ActivityStatus::Idle
+            && self.event_count == 0
+            && self.items.is_empty()
+            && self.file_changes.is_empty()
     }
 
     fn elapsed_label(&self) -> Option<String> {
@@ -418,6 +534,7 @@ impl ActivitySummary {
     }
 
     fn record_stream_event(&mut self, event: &StreamEventDto) {
+        self.last_event_at = Some(Instant::now());
         if event.kind == StreamEventKindDto::MessageBoundary {
             if event.lane == Some(StreamLaneDto::Reasoning) {
                 self.close_progress_item();
@@ -429,27 +546,34 @@ impl ActivitySummary {
             (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
                 self.record_progress_delta(text);
             }
+            (StreamEventKindDto::FileChange, _, _) => {
+                self.close_progress_item();
+                if let Some(file_change) = event
+                    .file_change
+                    .as_ref()
+                    .map(FileChangeSummary::from_stream)
+                {
+                    self.record_file_change(file_change);
+                } else if let Some(text) = event.text.as_deref() {
+                    self.push_normalized_item(ActivityItemKind::FileChange, text);
+                }
+            }
             (StreamEventKindDto::Status, _, Some(text)) => {
                 self.close_progress_item();
-                let kind = classify_activity_status(text);
-                if kind == ActivityItemKind::Command {
-                    self.command_count = self.command_count.saturating_add(1);
-                }
-                if kind == ActivityItemKind::Progress {
-                    self.progress_count = self.progress_count.saturating_add(1);
-                }
-                self.push_item(kind, normalize_activity_text(text));
+                let text = normalize_activity_text(text);
+                let kind = classify_activity_status(&text);
+                self.push_counted_item(kind, text);
             }
             (StreamEventKindDto::Error, _, Some(text))
                 if is_non_failure_terminal_code(event.code.as_deref()) =>
             {
                 self.close_progress_item();
-                self.push_item(ActivityItemKind::Status, normalize_activity_text(text));
+                self.push_normalized_item(ActivityItemKind::Status, text);
             }
             (StreamEventKindDto::Error, _, Some(text)) => {
                 self.close_progress_item();
                 self.fail();
-                self.push_item(ActivityItemKind::Error, normalize_activity_text(text));
+                self.push_normalized_item(ActivityItemKind::Error, text);
             }
             (StreamEventKindDto::TurnCompleted | StreamEventKindDto::Done, _, _) => {
                 self.close_progress_item();
@@ -457,6 +581,60 @@ impl ActivitySummary {
             }
             _ => {}
         }
+    }
+
+    fn record_file_change(&mut self, file_change: FileChangeSummary) {
+        let text = file_change.label();
+        if let Some(existing) = self
+            .file_changes
+            .iter_mut()
+            .find(|existing| existing.is_update_for(&file_change))
+        {
+            *existing = file_change;
+        } else {
+            self.file_changes.push(file_change);
+            let overflow = self
+                .file_changes
+                .len()
+                .saturating_sub(FILE_CHANGE_HISTORY_LIMIT);
+            if overflow > 0 {
+                self.file_changes.drain(0..overflow);
+            }
+        }
+        self.refresh_file_change_count();
+        self.push_item(ActivityItemKind::FileChange, text);
+    }
+
+    fn refresh_file_change_count(&mut self) {
+        self.file_change_count = self
+            .file_changes
+            .iter()
+            .map(FileChangeSummary::path_count)
+            .sum();
+    }
+
+    fn count_activity_kind(&mut self, kind: ActivityItemKind) {
+        match kind {
+            ActivityItemKind::Command => {
+                self.command_count = self.command_count.saturating_add(1);
+            }
+            ActivityItemKind::Progress => {
+                self.progress_count = self.progress_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_counted_item(&mut self, kind: ActivityItemKind, text: String) -> Option<usize> {
+        let index = self.push_item(kind, text);
+        if index.is_some() {
+            self.count_activity_kind(kind);
+        }
+        index
+    }
+
+    fn push_normalized_item(&mut self, kind: ActivityItemKind, text: &str) -> Option<usize> {
+        self.push_item(kind, normalize_activity_text(text))
     }
 
     fn record_progress_delta(&mut self, delta: &str) {
@@ -496,7 +674,7 @@ impl ActivitySummary {
     }
 
     fn push_item(&mut self, kind: ActivityItemKind, text: String) -> Option<usize> {
-        if text.trim().is_empty() {
+        if !is_useful_activity_text(&text) {
             return None;
         }
         self.items.push(ActivityItem { kind, text });
@@ -520,26 +698,44 @@ enum InspectorSubject {
     Audit,
 }
 
-const INSPECTOR_SUBJECTS: &[InspectorSubject] = &[
-    InspectorSubject::Selection,
-    InspectorSubject::Runtime,
-    InspectorSubject::Boundary,
-    InspectorSubject::Activity,
-    InspectorSubject::Audit,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPane {
+    Project,
+    Inspector(InspectorSubject),
+    Files,
+}
+
+const CONTROL_PANES: &[ControlPane] = &[
+    ControlPane::Project,
+    ControlPane::Inspector(InspectorSubject::Selection),
+    ControlPane::Inspector(InspectorSubject::Runtime),
+    ControlPane::Inspector(InspectorSubject::Boundary),
+    ControlPane::Inspector(InspectorSubject::Activity),
+    ControlPane::Inspector(InspectorSubject::Audit),
+    ControlPane::Files,
 ];
 
 impl InspectorSubject {
     fn label(self, app: &ConsoleApp) -> &'static str {
         match self {
-            Self::Selection if app.focus == Focus::Project => match app.project_cursor {
+            Self::Selection => match app.project_cursor {
                 ProjectSelection::Instance(_) => "Instance",
                 ProjectSelection::Session(_) => "Session",
             },
-            Self::Selection => "Instance",
             Self::Runtime => "Runtime",
             Self::Boundary => "Boundary",
             Self::Activity => "Activity",
             Self::Audit => "Audit",
+        }
+    }
+}
+
+impl ControlPane {
+    fn label(self, app: &ConsoleApp) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::Inspector(subject) => subject.label(app),
+            Self::Files => "Files",
         }
     }
 }
@@ -713,6 +909,8 @@ impl KeyHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalCommand {
     Commands,
+    FocusControls,
+    ToggleMaximize,
     NextFocus,
     PreviousFocus,
     InterruptOrConfirmExit,
@@ -767,18 +965,26 @@ const GLOBAL_KEY_BINDINGS: &[GlobalKeyBinding] = &[
         true,
     ),
     GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        KeyHint::new("Ctrl+O", "Controls", "focus the control panes"),
+        GlobalCommand::FocusControls,
+        true,
+    ),
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyHint::new("Ctrl+X", "Max", "maximize run or active control pane"),
+        GlobalCommand::ToggleMaximize,
+        false,
+    ),
+    GlobalKeyBinding::new(
         KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
-        KeyHint::new("Tab", "Focus", "move focus to the next pane"),
+        KeyHint::new("Tab", "Focus", "move between run and controls"),
         GlobalCommand::NextFocus,
         true,
     ),
     GlobalKeyBinding::new(
         KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE),
-        KeyHint::new(
-            "Shift+Tab",
-            "Previous focus",
-            "move focus to the previous pane",
-        ),
+        KeyHint::new("Shift+Tab", "Previous", "move to the previous surface"),
         GlobalCommand::PreviousFocus,
         false,
     ),
@@ -804,70 +1010,85 @@ const HELP_CONTEXT_KEY_HINTS: &[KeyHint] = &[
     KeyHint::new(
         "Enter",
         "Submit / Open",
-        "submit the composer or activate a project item",
+        "submit the prompt or activate a project item",
     ),
-    KeyHint::new("Shift+Enter", "Newline", "insert a composer newline"),
-    KeyHint::new("Alt+Enter", "Newline", "insert a composer newline"),
+    KeyHint::new("Shift+Enter", "Newline", "insert a prompt newline"),
+    KeyHint::new("Alt+Enter", "Newline", "insert a prompt newline"),
     KeyHint::new(
         "Up / Down",
         "Move",
-        "scroll the focused pane or move the project cursor",
+        "scroll the run transcript, edit the prompt, or move a project item",
     ),
     KeyHint::new(
         "PageUp / PageDown",
         "Page",
-        "scroll the focused pane by a page",
-    ),
-    KeyHint::new(
-        "Home / End",
-        "Bounds",
-        "jump to the top or bottom of a scrollable pane",
+        "scroll Run or activity by a page",
     ),
     KeyHint::new(
         "Left / Right",
-        "Inspector",
-        "cycle inspector subjects while the inspector is focused",
+        "Controls",
+        "cycle project, runtime, boundary, activity, audit, and files",
     ),
-    KeyHint::new("Esc", "Cancel", "close overlays or clear the composer"),
+    KeyHint::new(
+        "Esc",
+        "Cancel",
+        "close overlays, leave controls, or clear the prompt",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
-    Project,
-    Transcript,
-    Composer,
-    Inspectors,
+    Run,
+    Controls,
 }
 
 impl Focus {
     fn label(self) -> &'static str {
         match self {
-            Self::Project => "project",
-            Self::Transcript => "transcript",
-            Self::Composer => "composer",
-            Self::Inspectors => "inspector",
+            Self::Run => "run",
+            Self::Controls => "controls",
         }
     }
 
-    fn next(self, project_mode: bool) -> Self {
-        match (self, project_mode) {
-            (Self::Project, _) => Self::Transcript,
-            (Self::Transcript, _) => Self::Composer,
-            (Self::Composer, _) => Self::Inspectors,
-            (Self::Inspectors, true) => Self::Project,
-            (Self::Inspectors, false) => Self::Transcript,
+    fn next(self) -> Self {
+        match self {
+            Self::Run => Self::Controls,
+            Self::Controls => Self::Run,
         }
     }
 
-    fn previous(self, project_mode: bool) -> Self {
-        match (self, project_mode) {
-            (Self::Project, _) => Self::Inspectors,
-            (Self::Transcript, true) => Self::Project,
-            (Self::Transcript, false) => Self::Inspectors,
-            (Self::Composer, _) => Self::Transcript,
-            (Self::Inspectors, _) => Self::Composer,
+    fn previous(self) -> Self {
+        match self {
+            Self::Run => Self::Controls,
+            Self::Controls => Self::Run,
         }
     }
+
+    fn surface(self) -> Surface {
+        match self {
+            Self::Run => Surface::Run,
+            Self::Controls => Surface::Controls,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Run,
+    Controls,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Normal,
+    Maximized(Surface),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Transcript,
+    Activity,
+    Files,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,6 +1172,10 @@ impl ConsoleComposer {
         self.input.clone().into_lines().join("\n")
     }
 
+    fn is_blank(&self) -> bool {
+        self.text().trim().is_empty()
+    }
+
     fn take_text(&mut self) -> String {
         let text = self.text();
         *self = Self::new();
@@ -980,12 +1205,16 @@ pub(crate) struct ConsoleApp {
     project_list_state: ListState,
     launch: ConsoleLaunchOptions,
     focus: Focus,
+    control_pane: ControlPane,
+    view_mode: ViewMode,
     overlay: Option<Overlay>,
     composer: ConsoleComposer,
     transcript: Vec<TranscriptLine>,
     transcript_scroll: VerticalScroll,
+    active_turn_anchor: Option<usize>,
     activity: ActivitySummary,
     activity_scroll: VerticalScroll,
+    files_scroll: VerticalScroll,
     audit: AuditTrail,
     inspector_subject: InspectorSubject,
     status: String,
@@ -1019,13 +1248,17 @@ impl ConsoleApp {
             project_cursor: ProjectSelection::Instance(selected_index),
             project_list_state: ListState::default(),
             launch,
-            focus: Focus::Composer,
+            focus: Focus::Run,
+            control_pane: ControlPane::Project,
+            view_mode: ViewMode::Normal,
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
             transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+            active_turn_anchor: None,
             activity: ActivitySummary::new(),
             activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+            files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
             audit,
             inspector_subject: InspectorSubject::Selection,
             status: "idle".to_string(),
@@ -1115,41 +1348,9 @@ impl ConsoleApp {
         self.status = format!("project: {}", self.project_cursor_label());
     }
 
-    fn scroll_transcript_up(&mut self, amount: usize) {
-        self.transcript_scroll.scroll_up(amount);
-    }
-
-    fn scroll_transcript_down(&mut self, amount: usize) {
-        self.transcript_scroll.scroll_down(amount);
-    }
-
-    fn scroll_transcript_to_top(&mut self) {
-        self.transcript_scroll.scroll_to_top();
-    }
-
-    fn scroll_transcript_to_bottom(&mut self) {
-        self.transcript_scroll.scroll_to_bottom();
-    }
-
     fn set_transcript_viewport(&mut self, line_count: usize, viewport_height: u16) {
         self.transcript_scroll
             .set_viewport(line_count, viewport_height);
-    }
-
-    fn scroll_activity_up(&mut self, amount: usize) {
-        self.activity_scroll.scroll_up(amount);
-    }
-
-    fn scroll_activity_down(&mut self, amount: usize) {
-        self.activity_scroll.scroll_down(amount);
-    }
-
-    fn scroll_activity_to_top(&mut self) {
-        self.activity_scroll.scroll_to_top();
-    }
-
-    fn scroll_activity_to_bottom(&mut self) {
-        self.activity_scroll.scroll_to_bottom();
     }
 
     fn set_activity_viewport(&mut self, line_count: usize, viewport_height: u16) {
@@ -1157,37 +1358,147 @@ impl ConsoleApp {
             .set_viewport(line_count, viewport_height);
     }
 
-    fn next_inspector_subject(&mut self) {
-        self.move_inspector_subject(1);
+    fn set_files_viewport(&mut self, line_count: usize, viewport_height: u16) {
+        self.files_scroll.set_viewport(line_count, viewport_height);
     }
 
-    fn previous_inspector_subject(&mut self) {
-        self.move_inspector_subject(-1);
+    fn open_control_pane(&mut self, pane: ControlPane) {
+        let keep_maximized_controls = self.view_mode == ViewMode::Maximized(Surface::Controls);
+        match pane {
+            ControlPane::Project => self.inspector_subject = InspectorSubject::Selection,
+            ControlPane::Inspector(subject) => self.inspector_subject = subject,
+            ControlPane::Files => {}
+        }
+        self.control_pane = pane;
+        self.set_focus(Focus::Controls);
+        if !keep_maximized_controls {
+            self.view_mode = ViewMode::Normal;
+        }
+        self.status = format!("controls: {}", pane.label(self));
     }
 
-    fn move_inspector_subject(&mut self, delta: isize) {
-        let current = INSPECTOR_SUBJECTS
+    fn focus_controls(&mut self) {
+        self.set_focus(Focus::Controls);
+        if self.view_mode != ViewMode::Maximized(Surface::Controls) {
+            self.view_mode = ViewMode::Normal;
+        }
+        self.status = format!("controls: {}", self.control_pane.label(self));
+    }
+
+    fn leave_controls(&mut self) {
+        if self.focus == Focus::Controls {
+            let was_maximized_controls = self.view_mode == ViewMode::Maximized(Surface::Controls);
+            self.focus_run();
+            if was_maximized_controls {
+                self.view_mode = ViewMode::Normal;
+            }
+            self.status = "focus: run".to_string();
+        }
+    }
+
+    fn next_control_pane(&mut self) {
+        self.move_control_pane(1);
+    }
+
+    fn previous_control_pane(&mut self) {
+        self.move_control_pane(-1);
+    }
+
+    fn move_control_pane(&mut self, delta: isize) {
+        let current = CONTROL_PANES
             .iter()
-            .position(|subject| *subject == self.inspector_subject)
+            .position(|pane| *pane == self.control_pane)
             .unwrap_or(0);
-        let len = INSPECTOR_SUBJECTS.len() as isize;
+        let len = CONTROL_PANES.len() as isize;
         let next = (current as isize + delta).rem_euclid(len) as usize;
-        self.inspector_subject = INSPECTOR_SUBJECTS
+        let pane = CONTROL_PANES
             .get(next)
             .copied()
-            .unwrap_or(InspectorSubject::Selection);
-        self.status = format!("inspector: {}", self.inspector_subject.label(self));
+            .unwrap_or(ControlPane::Project);
+        self.open_control_pane(pane);
     }
 
-    fn composer_height(&self, terminal_height: u16) -> u16 {
+    fn toggle_maximize(&mut self) {
+        let surface = if self.focus == Focus::Controls {
+            Surface::Controls
+        } else {
+            Surface::Run
+        };
+        self.view_mode = match self.view_mode {
+            ViewMode::Maximized(current) if current == surface => ViewMode::Normal,
+            _ => ViewMode::Maximized(surface),
+        };
+        self.status = match self.view_mode {
+            ViewMode::Normal => "normal layout".to_string(),
+            ViewMode::Maximized(Surface::Run) => "run maximized".to_string(),
+            ViewMode::Maximized(Surface::Controls) => "controls maximized".to_string(),
+        };
+    }
+
+    fn focus_next(&mut self) {
+        self.set_focus(self.focus.next());
+        self.status = format!("focus: {}", self.focus.label());
+    }
+
+    fn focus_previous(&mut self) {
+        self.set_focus(self.focus.previous());
+        self.status = format!("focus: {}", self.focus.label());
+    }
+
+    fn focus_run(&mut self) {
+        self.set_focus(Focus::Run);
+    }
+
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        if matches!(self.view_mode, ViewMode::Maximized(_)) {
+            self.view_mode = ViewMode::Maximized(focus.surface());
+        }
+    }
+
+    fn selected_scroll_target(&self) -> ScrollTarget {
+        if self.focus == Focus::Controls {
+            match self.control_pane {
+                ControlPane::Inspector(InspectorSubject::Activity) => ScrollTarget::Activity,
+                ControlPane::Files => ScrollTarget::Files,
+                _ => ScrollTarget::Transcript,
+            }
+        } else {
+            ScrollTarget::Transcript
+        }
+    }
+
+    fn selected_scroll(&self) -> &VerticalScroll {
+        match self.selected_scroll_target() {
+            ScrollTarget::Transcript => &self.transcript_scroll,
+            ScrollTarget::Activity => &self.activity_scroll,
+            ScrollTarget::Files => &self.files_scroll,
+        }
+    }
+
+    fn selected_scroll_mut(&mut self) -> &mut VerticalScroll {
+        match self.selected_scroll_target() {
+            ScrollTarget::Transcript => &mut self.transcript_scroll,
+            ScrollTarget::Activity => &mut self.activity_scroll,
+            ScrollTarget::Files => &mut self.files_scroll,
+        }
+    }
+
+    fn run_prompt_height(&self, available_height: u16) -> u16 {
+        let max_height = available_height
+            .saturating_sub(2)
+            .min(RUN_PROMPT_MAX_HEIGHT);
+        if max_height == 0 {
+            return 0;
+        }
+
         let content_height = self.composer.line_count().min(usize::from(u16::MAX)) as u16;
         let desired = content_height
-            .saturating_add(COMPOSER_CHROME_HEIGHT)
-            .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
-        let available = terminal_height
-            .saturating_sub(16)
-            .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
-        desired.min(available)
+            .saturating_add(RUN_PROMPT_CHROME_HEIGHT)
+            .clamp(RUN_PROMPT_MIN_HEIGHT, RUN_PROMPT_MAX_HEIGHT);
+        desired
+            .min(max_height)
+            .max(RUN_PROMPT_MIN_HEIGHT.min(max_height))
     }
 
     fn selected_name(&self) -> &str {
@@ -1225,13 +1536,6 @@ impl ConsoleApp {
                 .default_runtime
                 .clone()
                 .unwrap_or_else(|| "blocked".to_string()),
-        }
-    }
-
-    fn runtime_kind_label(&self) -> String {
-        match &self.selected {
-            SelectedInstanceState::Ready(ready) => ready.runtime_kind.clone(),
-            SelectedInstanceState::Blocked { .. } => "-".to_string(),
         }
     }
 
@@ -1335,6 +1639,7 @@ impl ConsoleApp {
         self.composer.clear();
         self.transcript.clear();
         self.transcript_scroll.reset_top();
+        self.active_turn_anchor = None;
         self.activity = ActivitySummary::new();
         self.activity_scroll.reset_tail();
         self.inspector_subject = InspectorSubject::Selection;
@@ -1366,6 +1671,7 @@ impl ConsoleApp {
         }
         self.transcript.clear();
         self.transcript_scroll.reset_top();
+        self.active_turn_anchor = None;
         self.activity = ActivitySummary::new();
         self.activity_scroll.reset_tail();
         self.inspector_subject = InspectorSubject::Selection;
@@ -1446,7 +1752,7 @@ impl ConsoleApp {
         let text = self.composer.take_text();
         match classify_input(&text) {
             ClassifiedInput::Empty => {
-                self.status = "composer is empty".to_string();
+                self.status = "prompt is empty".to_string();
                 self.composer.restore_text(text);
             }
             ClassifiedInput::Prompt(prompt) => self.start_prompt_turn(prompt, backend_tx),
@@ -1473,14 +1779,7 @@ impl ConsoleApp {
         let runtime_id = ready.runtime_id.clone();
         let instance_name = ready.summary.display_name().to_string();
 
-        self.transcript.push(TranscriptLine::new(
-            TranscriptLineKind::User,
-            prompt.clone(),
-        ));
-        self.activity.start();
-        self.activity_scroll.reset_tail();
-        self.inspector_subject = InspectorSubject::Activity;
-        self.status = format!("running turn on {instance_name}");
+        self.begin_run_turn(prompt.clone(), format!("running turn on {instance_name}"));
         let (handle, cancellation) = spawn_streamed_turn(
             kernel,
             session_id,
@@ -1545,12 +1844,7 @@ impl ConsoleApp {
         let session_id = ready.session_id;
         let runtime_id = ready.runtime_id.clone();
 
-        self.transcript
-            .push(TranscriptLine::new(TranscriptLineKind::User, label));
-        self.activity.start();
-        self.activity_scroll.reset_tail();
-        self.inspector_subject = InspectorSubject::Activity;
-        self.status = format!("running {label}");
+        self.begin_run_turn(label, format!("running {label}"));
         let (handle, cancellation) = spawn_streamed_turn(
             kernel,
             session_id,
@@ -1570,14 +1864,7 @@ impl ConsoleApp {
         let kernel = ready.kernel.clone();
         let session_id = ready.session_id;
 
-        self.transcript.push(TranscriptLine::new(
-            TranscriptLineKind::User,
-            "/lionclaw reset",
-        ));
-        self.activity.start();
-        self.activity_scroll.reset_tail();
-        self.inspector_subject = InspectorSubject::Activity;
-        self.status = "resetting session".to_string();
+        self.begin_run_turn("/lionclaw reset", "resetting session");
         let backend_tx = backend_tx.clone();
         self.active_turn = Some(tokio::spawn(async move {
             let result = kernel
@@ -1587,6 +1874,25 @@ impl ConsoleApp {
                 .map_err(|err| err.to_string());
             drop(backend_tx.send(BackendEvent::SessionReset(result)));
         }));
+    }
+
+    fn begin_run_turn(&mut self, user_text: impl Into<String>, status: impl Into<String>) {
+        self.transcript
+            .push(TranscriptLine::new(TranscriptLineKind::User, user_text));
+        self.active_turn_anchor = self.transcript.len().checked_sub(1);
+        self.transcript_scroll.reset_tail();
+        self.activity.start();
+        self.activity_scroll.reset_tail();
+        self.show_runtime_activity_inspector();
+        self.focus_run();
+        self.status = status.into();
+    }
+
+    fn show_runtime_activity_inspector(&mut self) {
+        self.inspector_subject = InspectorSubject::Activity;
+        if matches!(self.control_pane, ControlPane::Inspector(_)) {
+            self.control_pane = ControlPane::Inspector(InspectorSubject::Activity);
+        }
     }
 
     fn ready_instance(&self) -> Option<&ReadyInstance> {
@@ -1634,6 +1940,7 @@ impl ConsoleApp {
                             ready.session_id = session_id;
                         }
                         self.transcript.clear();
+                        self.active_turn_anchor = None;
                         self.activity.complete();
                         self.activity.push_item(
                             ActivityItemKind::Done,
@@ -1679,13 +1986,17 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Composer,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("Launch blocked".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "launch blocked".to_string(),
@@ -1719,13 +2030,17 @@ pub(crate) async fn run_project_launch_blocker(
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         launch: ConsoleLaunchOptions::default(),
-        focus: Focus::Composer,
+        focus: Focus::Run,
+        control_pane: ControlPane::Project,
+        view_mode: ViewMode::Normal,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+        active_turn_anchor: None,
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+        files_scroll: VerticalScroll::top(DEFAULT_FILES_PAGE_SCROLL),
         audit: AuditTrail::Unavailable("No configured instances".to_string()),
         inspector_subject: InspectorSubject::Selection,
         status: "no instances configured".to_string(),
@@ -1759,6 +2074,8 @@ fn enter_terminal() -> Result<ConsoleTerminal> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     guard.entered_alternate_screen = true;
+    execute!(stdout, EnableMouseCapture)?;
+    guard.enabled_mouse_capture = true;
     execute!(stdout, EnableBracketedPaste)?;
     guard.enabled_bracketed_paste = true;
     let backend = CrosstermBackend::new(stdout);
@@ -1772,6 +2089,7 @@ fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1782,6 +2100,7 @@ struct TerminalSetupGuard {
     raw_mode: bool,
     entered_alternate_screen: bool,
     enabled_bracketed_paste: bool,
+    enabled_mouse_capture: bool,
 }
 
 impl TerminalSetupGuard {
@@ -1791,6 +2110,7 @@ impl TerminalSetupGuard {
             raw_mode: true,
             entered_alternate_screen: false,
             enabled_bracketed_paste: false,
+            enabled_mouse_capture: false,
         })
     }
 
@@ -1798,6 +2118,7 @@ impl TerminalSetupGuard {
         self.raw_mode = false;
         self.entered_alternate_screen = false;
         self.enabled_bracketed_paste = false;
+        self.enabled_mouse_capture = false;
     }
 }
 
@@ -1806,6 +2127,9 @@ impl Drop for TerminalSetupGuard {
         let mut stdout = io::stdout();
         if self.enabled_bracketed_paste {
             drop(execute!(stdout, DisableBracketedPaste));
+        }
+        if self.enabled_mouse_capture {
+            drop(execute!(stdout, DisableMouseCapture));
         }
         if self.entered_alternate_screen {
             drop(execute!(stdout, LeaveAlternateScreen));
@@ -1877,29 +2201,86 @@ fn is_non_failure_terminal_code(code: Option<&str>) -> bool {
 
 fn classify_activity_status(text: &str) -> ActivityItemKind {
     let lower = text.to_ascii_lowercase();
-    if contains_any(&lower, ACTIVITY_ERROR_MARKERS) {
+    if contains_activity_marker(&lower, ACTIVITY_ERROR_MARKERS) {
         ActivityItemKind::Error
-    } else if contains_any(&lower, ACTIVITY_DONE_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_DONE_MARKERS) {
         ActivityItemKind::Done
-    } else if contains_any(&lower, ACTIVITY_COMMAND_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_COMMAND_MARKERS) {
         ActivityItemKind::Command
-    } else if contains_any(&lower, ACTIVITY_PROGRESS_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_PROGRESS_MARKERS) {
         ActivityItemKind::Progress
     } else {
         ActivityItemKind::Status
     }
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn contains_activity_marker(text: &str, markers: &[&str]) -> bool {
+    text.split_whitespace()
+        .any(|token| markers.iter().any(|marker| token.starts_with(marker)))
+}
+
+fn is_useful_activity_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    !is_marker_only_activity_text(&lower, ACTIVITY_COMMAND_MARKERS)
+        && !is_marker_only_activity_text(&lower, ACTIVITY_DONE_MARKERS)
+        && !is_marker_only_activity_text(&lower, ACTIVITY_PROGRESS_MARKERS)
+}
+
+fn is_marker_only_activity_text(text: &str, markers: &[&str]) -> bool {
+    markers
+        .iter()
+        .filter(|marker| marker.ends_with(':'))
+        .any(|marker| text == *marker)
+}
+
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn normalize_activity_text(text: &str) -> String {
     let trimmed = text.trim();
-    trimmed
-        .strip_prefix("codex item: ")
-        .map(|item| format!("codex {item}"))
-        .unwrap_or(trimmed.to_string())
+    let item_text = trimmed.strip_prefix("codex item: ").unwrap_or(trimmed);
+    strip_activity_source_label(item_text).to_string()
+}
+
+fn strip_activity_source_label(text: &str) -> &str {
+    for source in ACTIVITY_RUNTIME_SOURCES {
+        let Some(prefix) = text.get(..source.len()) else {
+            continue;
+        };
+        let Some(rest) = text.get(source.len()..) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(source) {
+            continue;
+        };
+        if let Some(stripped) = rest.strip_prefix(':') {
+            return stripped.trim_start();
+        }
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            let stripped = stripped.trim_start();
+            if is_known_activity_phrase(stripped) {
+                return stripped;
+            }
+        }
+    }
+    text
+}
+
+fn is_known_activity_phrase(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_activity_marker(&lower, ACTIVITY_ERROR_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_DONE_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_COMMAND_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_PROGRESS_MARKERS)
 }
 
 fn summarize_activity_text(prefix: &str, text: &str) -> String {

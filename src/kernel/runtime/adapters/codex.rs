@@ -15,9 +15,12 @@ use crate::kernel::runtime::{
     spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnMode, RuntimeTurnResult,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnMode,
+    RuntimeTurnResult,
 };
+
+const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -1045,12 +1048,8 @@ where
                 }
             }
             "item/started" | "item/completed" | "item/updated" => {
-                let status = self.record_app_server_item(method, params);
-                if let Some(status) = status {
-                    drop(events.send(RuntimeEvent::Status {
-                        code: None,
-                        text: status,
-                    }));
+                for event in self.record_app_server_item(method, params) {
+                    drop(events.send(event));
                 }
             }
             "error" => {
@@ -1119,12 +1118,15 @@ where
         }))
     }
 
-    fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+    fn record_app_server_item(&mut self, method: &str, params: &Value) -> Vec<RuntimeEvent> {
         self.record_agent_message_item(method, params);
         self.record_answer_item_completion(method, params);
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
-                Some("codex context compaction started".to_string())
+                vec![RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compaction started".to_string(),
+                }]
             }
             ("item/completed", Some("contextCompaction")) => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
@@ -1132,10 +1134,13 @@ where
                 } else {
                     self.unmatched_context_compaction_completed = true;
                 }
-                Some("codex context compacted".to_string())
+                vec![RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compacted".to_string(),
+                }]
             }
-            (_, Some(_)) => describe_app_server_item(params),
-            (_, None) => None,
+            (_, Some(_)) => app_server_item_events(params),
+            (_, None) => Vec::new(),
         }
     }
 
@@ -1638,12 +1643,30 @@ fn error_notification_will_retry(params: &Value) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn describe_app_server_item(params: &Value) -> Option<String> {
+    describe_app_server_status_item(params)
+}
+
+fn app_server_item_events(params: &Value) -> Vec<RuntimeEvent> {
+    match app_server_item_type(params) {
+        Some("fileChange") => codex_file_change_item(params)
+            .map(|change| RuntimeEvent::FileChange { change })
+            .into_iter()
+            .collect(),
+        Some(_) => describe_app_server_status_item(params)
+            .map(|text| RuntimeEvent::Status { code: None, text })
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn describe_app_server_status_item(params: &Value) -> Option<String> {
     let item = app_server_item(params);
     match app_server_item_type(params)? {
-        "agentMessage" | "reasoning" | "userMessage" | "plan" => None,
+        "agentMessage" | "reasoning" | "userMessage" | "plan" | "fileChange" => None,
         "commandExecution" => describe_command_execution_item(item),
-        "fileChange" => describe_file_change_item(item),
         "webSearch" => describe_web_search_item(item),
         "imageView" => describe_image_view_item(item),
         "collabToolCall" => describe_collab_tool_call_item(item),
@@ -1735,55 +1758,89 @@ fn command_actions_display(value: &Value) -> Option<String> {
     (!rendered.is_empty()).then(|| rendered.join(" && "))
 }
 
-fn describe_file_change_item(item: &Value) -> Option<String> {
+fn codex_file_change_item(params: &Value) -> Option<RuntimeFileChange> {
+    let item = app_server_item(params);
     let changes = item.get("changes").and_then(Value::as_array)?;
     let status = item
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    let verb = match status {
-        "inProgress" => "editing",
-        "completed" => "edited",
-        "failed" => "edit failed",
-        "declined" => "edit declined",
-        _ => "file change",
+    let status = match status {
+        "inProgress" => RuntimeFileChangeStatus::Editing,
+        "completed" => RuntimeFileChangeStatus::Edited,
+        "failed" => RuntimeFileChangeStatus::Failed,
+        "declined" => RuntimeFileChangeStatus::Declined,
+        _ => RuntimeFileChangeStatus::Changed,
     };
     let paths = changes
         .iter()
         .filter_map(|change| change.get("path").and_then(Value::as_str))
         .filter(|path| !path.trim().is_empty())
         .map(compact_path)
-        .take(3)
+        .take(FILE_CHANGE_PATH_EVENT_LIMIT)
         .collect::<Vec<_>>();
-    if paths.is_empty() {
-        Some(format!("codex {verb}: {} files", changes.len()))
-    } else {
-        let suffix = if changes.len() > paths.len() {
-            format!(" +{}", changes.len() - paths.len())
-        } else {
-            String::new()
-        };
-        Some(format!("codex {verb}: {}{}", paths.join(", "), suffix))
-    }
+    Some(RuntimeFileChange {
+        runtime: "codex".to_string(),
+        operation_id: extract_app_server_item_id(params),
+        status,
+        paths,
+        total_count: changes.len(),
+    })
 }
 
 fn describe_web_search_item(item: &Value) -> Option<String> {
-    let query = item
-        .get("query")
-        .and_then(Value::as_str)
-        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/url").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/refId").and_then(Value::as_str))?;
     let action = item
         .pointer("/action/type")
         .and_then(Value::as_str)
         .unwrap_or("search");
-    let verb = match action {
-        "open_page" => "opened",
-        "find_in_page" => "found",
-        _ => "searched",
+    let (verb, target) = match action {
+        "open_page" => ("opened", web_search_open_target(item)?),
+        "find_in_page" => ("found", web_search_find_target(item)?),
+        _ => web_search_query_target(item)
+            .map(|target| ("searched", target))
+            .or_else(|| web_search_open_target(item).map(|target| ("opened", target)))?,
     };
-    Some(format!("codex {verb}: {}", query.trim()))
+    Some(format!("codex {verb}: {target}"))
+}
+
+fn web_search_query_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/query",
+            "/queries",
+            "/action/query",
+            "/action/queries",
+            "/action/searchQuery",
+        ],
+    )
+}
+
+fn web_search_open_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/url",
+            "/urls",
+            "/refId",
+            "/action/url",
+            "/action/urls",
+            "/action/refId",
+        ],
+    )
+}
+
+fn web_search_find_target(item: &Value) -> Option<String> {
+    first_non_empty_json_string(
+        item,
+        &[
+            "/pattern",
+            "/query",
+            "/action/pattern",
+            "/action/query",
+            "/action/refId",
+        ],
+    )
 }
 
 fn describe_image_view_item(item: &Value) -> Option<String> {
@@ -1804,6 +1861,24 @@ fn describe_collab_tool_call_item(item: &Value) -> Option<String> {
 fn non_empty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn first_non_empty_json_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer))
+        .find_map(non_empty_json_string)
+}
+
+fn non_empty_json_string(value: &Value) -> Option<String> {
+    value.as_str().and_then(non_empty).or_else(|| {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find_map(non_empty)
+    })
 }
 
 fn shell_word_display(value: &str) -> String {
@@ -2083,8 +2158,8 @@ mod tests {
         append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
         EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
-        RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeFileChangeStatus,
+        RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -2291,19 +2366,26 @@ mod tests {
             })),
             Some("codex searched: rg \"operator console\"".to_string())
         );
-        assert_eq!(
-            super::describe_app_server_item(&json!({
-                "item": {
-                    "type": "fileChange",
-                    "status": "completed",
-                    "changes": [
-                        {"path": "src/operator/run_tui.rs", "kind": "update"},
-                        {"path": "Cargo.toml", "kind": "update"}
-                    ],
-                }
-            })),
-            Some("codex edited: src/operator/run_tui.rs, Cargo.toml".to_string())
-        );
+        let file_change_events = super::app_server_item_events(&json!({
+            "item": {
+                "id": "edit-1",
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [
+                    {"path": "/workspace/src/operator/run_tui.rs", "kind": "update"},
+                    {"path": "Cargo.toml", "kind": "update"}
+                ],
+            }
+        }));
+        assert!(matches!(
+            file_change_events.as_slice(),
+            [RuntimeEvent::FileChange { change }]
+                if change.runtime == "codex"
+                    && change.operation_id.as_deref() == Some("edit-1")
+                    && change.status == RuntimeFileChangeStatus::Edited
+                    && change.paths == ["src/operator/run_tui.rs", "Cargo.toml"]
+                    && change.total_count == 2
+        ));
         assert_eq!(
             super::describe_app_server_item(&json!({
                 "item": {
@@ -2312,6 +2394,47 @@ mod tests {
                 }
             })),
             Some("codex searched: ratatui scrollbar".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "query": "",
+                    "action": {
+                        "type": "search",
+                        "queries": ["official Ratatui scrollbar docs Scrollbar ratatui widgets"]
+                    }
+                }
+            })),
+            Some(
+                "codex searched: official Ratatui scrollbar docs Scrollbar ratatui widgets"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "query": "",
+                    "action": {"type": "search", "queries": ["", "  "]}
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "action": {
+                        "type": "open_page",
+                        "url": "https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html"
+                    }
+                }
+            })),
+            Some(
+                "codex opened: https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html"
+                    .to_string()
+            )
         );
         assert_eq!(
             super::describe_app_server_item(&json!({

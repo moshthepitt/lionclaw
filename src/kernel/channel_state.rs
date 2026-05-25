@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     contracts::{
         ChannelAttachmentDescriptor, ChannelHealthCheck, ChannelHealthStatus, ChannelPairingStatus,
-        ChannelRoutingProfile, ChannelTrigger, TrustTier,
+        ChannelRoutingProfile, ChannelTrigger, StreamFileChangeDto, TrustTier,
     },
     kernel::db::{datetime_to_ms, ms_to_datetime, now_ms},
 };
@@ -211,6 +211,7 @@ pub struct ChannelStreamEventRecord {
     pub lane: Option<StreamMessageLane>,
     pub code: Option<String>,
     pub text: Option<String>,
+    pub file_change: Option<StreamFileChangeDto>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -224,12 +225,14 @@ pub struct ChannelStreamEventInsert<'a> {
     pub lane: Option<StreamMessageLane>,
     pub code: Option<&'a str>,
     pub text: Option<&'a str>,
+    pub file_change: Option<&'a StreamFileChangeDto>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelStreamEventKind {
     MessageDelta,
     MessageBoundary,
+    FileChange,
     Status,
     Error,
     TurnCompleted,
@@ -241,6 +244,7 @@ impl ChannelStreamEventKind {
         match self {
             Self::MessageDelta => "message_delta",
             Self::MessageBoundary => "message_boundary",
+            Self::FileChange => "file_change",
             Self::Status => "status",
             Self::Error => "error",
             Self::TurnCompleted => "turn_completed",
@@ -256,6 +260,7 @@ impl FromStr for ChannelStreamEventKind {
         match value {
             "message_delta" => Ok(Self::MessageDelta),
             "message_boundary" => Ok(Self::MessageBoundary),
+            "file_change" => Ok(Self::FileChange),
             "status" => Ok(Self::Status),
             "error" => Ok(Self::Error),
             "turn_completed" => Ok(Self::TurnCompleted),
@@ -1405,11 +1410,16 @@ impl ChannelStateStore {
         insert: ChannelStreamEventInsert<'_>,
     ) -> Result<ChannelStreamEventRecord> {
         let now = now_ms();
+        let file_change_json = insert
+            .file_change
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize stream file change")?;
 
         let done = sqlx::query(
             "INSERT INTO channel_stream_events \
-             (channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (channel_id, peer_id, session_id, turn_id, kind, lane, code, text, file_change_json, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(insert.channel_id)
         .bind(insert.peer_id)
@@ -1419,6 +1429,7 @@ impl ChannelStateStore {
         .bind(insert.lane.map(StreamMessageLane::as_str))
         .bind(insert.code)
         .bind(insert.text)
+        .bind(file_change_json)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -1426,7 +1437,7 @@ impl ChannelStateStore {
 
         let sequence = done.last_insert_rowid();
         let row = sqlx::query(
-            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms \
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, file_change_json, created_at_ms \
              FROM channel_stream_events WHERE sequence = ?1",
         )
         .bind(sequence)
@@ -1539,7 +1550,7 @@ impl ChannelStateStore {
     ) -> Result<Vec<ChannelStreamEventRecord>> {
         let query_limit = i64::try_from(limit).context("invalid channel stream limit")?;
         let rows = sqlx::query(
-            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms \
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, file_change_json, created_at_ms \
              FROM channel_stream_events \
              WHERE channel_id = ?1 AND sequence > ?2 \
              ORDER BY sequence ASC \
@@ -2401,6 +2412,13 @@ fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
                 .map_err(|err| anyhow!("invalid stream message lane: {err}"))
         })
         .transpose()?;
+    let file_change = row
+        .get::<Option<String>, _>("file_change_json")
+        .map(|raw| {
+            serde_json::from_str::<StreamFileChangeDto>(&raw)
+                .map_err(|err| anyhow!("invalid stream file change payload: {err}"))
+        })
+        .transpose()?;
 
     Ok(ChannelStreamEventRecord {
         sequence: row.get("sequence"),
@@ -2412,6 +2430,7 @@ fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
         lane,
         code: row.get("code"),
         text: row.get("text"),
+        file_change,
         created_at,
     })
 }
@@ -2475,6 +2494,45 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn stream_file_change_events_round_trip() {
+        let db = crate::kernel::db::Db::connect_memory()
+            .await
+            .expect("open in-memory db");
+        let store = ChannelStateStore::new(db.pool());
+        let file_change = StreamFileChangeDto {
+            runtime: "codex".to_string(),
+            operation_id: Some("edit-1".to_string()),
+            status: crate::contracts::StreamFileChangeStatusDto::Edited,
+            paths: vec!["src/main.rs".to_string()],
+            total_count: 1,
+        };
+
+        let inserted = store
+            .append_stream_event(ChannelStreamEventInsert {
+                channel_id: "terminal",
+                peer_id: "alice",
+                session_id: Some(Uuid::new_v4()),
+                turn_id: Some(Uuid::new_v4()),
+                kind: ChannelStreamEventKind::FileChange,
+                lane: None,
+                code: None,
+                text: Some("codex edited: src/main.rs"),
+                file_change: Some(&file_change),
+            })
+            .await
+            .expect("append file change");
+        let listed = store
+            .list_stream_events_after("terminal", 0, 10)
+            .await
+            .expect("list stream events");
+
+        assert_eq!(inserted.kind, ChannelStreamEventKind::FileChange);
+        assert_eq!(inserted.file_change, Some(file_change.clone()));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_change, Some(file_change));
+    }
 
     #[tokio::test]
     async fn terminalize_unclaimed_turn_does_not_terminalize_running_turn() {
