@@ -158,6 +158,35 @@ Expected:
 - piped non-TTY usage avoids the console
 - `--plain` uses the line-oriented prompt even on a TTY
 
+Check the selected runtime's native terminal UI:
+
+```bash
+printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_MEMORY_OK\n' >> \
+  .lionclaw/instances/main/workspaces/main/MEMORY.md
+"$LIONCLAW_BIN" run --runtime-tui
+```
+
+Prompt inside the native runtime UI:
+
+```text
+Reply with exactly the LionClaw native runtime TUI memory sentinel from your instructions.
+```
+
+Expected:
+
+- the selected runtime's own terminal UI opens inside the LionClaw launch
+  boundary
+- Codex shows `/workspace` as the directory and no inner Codex sandbox prompt
+- OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
+- the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
+- exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
+  audit events
+- completed Codex and OpenCode native UI turns are present in LionClaw session
+  history and are available to later `lionclaw run`, `run --plain`, and
+  channel context
+- relaunching the native UI reconciles durable runtime transcript state without
+  duplicating already imported turns
+
 Use these prompts:
 
 ```text

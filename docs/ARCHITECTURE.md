@@ -10,9 +10,11 @@ runtime configuration, confinement, policy, and audit.
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
 path is designed for Linux/macOS-style Unix environments. When attached to a
 terminal, `run` opens the project operator console; `run --plain` and
-non-terminal use keep the command on the line-oriented interactive path. Managed background
-paths, including `lionclaw up` and channel auto-start, currently use the
-systemd user manager; launchd support is a future portability item.
+non-terminal use keep the command on the line-oriented interactive path;
+`run --runtime-tui` attaches the selected runtime's native terminal UI inside
+the same LionClaw boundary. Managed background paths, including
+`lionclaw up` and channel auto-start, currently use the systemd user manager;
+launchd support is a future portability item.
 
 ## System Shape
 
@@ -105,6 +107,8 @@ Runtime adapters implement:
 - `session_start()`
 - `turn()`
 - `program_backed_turn()`
+- `build_terminal_program()`
+- `export_terminal_transcript()`
 - `runtime_control()`
 - `resolve_capability_requests()`
 - `cancel()`
@@ -176,6 +180,58 @@ fallback path. Codex app-server request/notification assumptions are pinned by
 checked-in protocol fixtures under `tests/fixtures/codex_app_server`, including
 the target Codex CLI version and immutable source commit; update those fixtures
 with the adapter when the target app-server contract changes.
+
+## Native Runtime TUI Flow
+
+`lionclaw run --runtime-tui` is an explicit attached-runtime path for operators
+who want the selected harness's own terminal UI. It is not the default
+line-oriented turn path and it is not used by channels or scheduled jobs.
+
+Flow:
+
+1. The operator CLI resolves the normal LionClaw project, runtime, and durable
+   interactive session.
+2. The kernel renders the same runtime cache and generated context used by
+   program-backed turns, then writes it into runtime-private state as both
+   `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
+3. The runtime adapter supplies a terminal program through
+   `build_terminal_program()`.
+4. The execution planner compiles and materializes the same confined runtime
+   layout, staged auth, mounts, network mode, and secret policy.
+5. The OCI backend attaches the operator's terminal to the runtime process with
+   a TTY.
+6. On launch and exit, the kernel writes `runtime.tui.launch`,
+   `runtime.tui.exit`, and transcript reconciliation audit events.
+
+For Codex, the attached terminal program runs the real Codex CLI in
+danger-full-access mode with approval disabled. That is intentional: LionClaw's
+outer container, mounts, runtime state root, network preset, auth staging, and
+audit trail are the active boundary. Codex also receives
+`/runtime/AGENTS.generated.md` as its model instructions file, so LionClaw
+memory, active context, prior LionClaw session history, skills, and project
+continuity are included without shadowing `/workspace/AGENTS.md`.
+
+For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime`. OpenCode's
+native instruction loader then reads `/runtime/AGENTS.md` as global runtime
+instructions while project-level `.opencode` and `AGENTS.md` files remain
+project-owned.
+
+LionClaw does not scrape terminal output. Native TUI transcript import is an
+adapter contract over runtime-owned durable state. Codex exports completed turns
+from its JSONL session logs under the runtime-private `.codex/sessions` tree.
+OpenCode exports completed turns from its SQLite message store under
+`/runtime/home/.local/share/opencode/opencode.db`.
+The kernel imports those turns into canonical `session_turns` with deterministic
+source-derived ids, so reconciliation is idempotent. Reconciliation runs before
+each attached launch and after process exit; if LionClaw itself exits before an
+after-exit pass, the next launch recovers any completed runtime turns already
+written by the harness. Reconciliation errors are audited and logged but do not
+prevent the operator from leaving the native TUI cleanly.
+
+Native TUI mode does not provide typed live answer/reasoning events to
+channels. The normal operator console, `run --plain`, channel turns, and
+scheduled jobs remain the paths that stream typed runtime events directly into
+LionClaw while a turn is active.
 
 ## Runtime Control Commands
 
