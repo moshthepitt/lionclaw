@@ -137,6 +137,11 @@ pub struct RuntimeTerminalTranscriptInput {
     pub exit_code: Option<i32>,
 }
 
+#[async_trait]
+pub trait RuntimeTerminalTranscriptProgramExecutor: Send {
+    async fn execute(&mut self, program: RuntimeProgramSpec) -> Result<ExecutionOutput>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTerminalTurnStatus {
     Completed,
@@ -403,6 +408,13 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: RuntimeTerminalTranscriptInput,
     ) -> Result<Vec<RuntimeTerminalTurn>> {
         Ok(Vec::new())
+    }
+    async fn export_terminal_transcript_with_executor(
+        &self,
+        _input: RuntimeTerminalTranscriptInput,
+        _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
+    ) -> Result<Option<Vec<RuntimeTerminalTurn>>> {
+        Ok(None)
     }
     fn program_output_parser(
         &self,

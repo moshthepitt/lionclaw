@@ -120,18 +120,19 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        append_streamed_text_boundary, append_streamed_text_delta, project_runtime_skills,
-        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        skill_mount_target, EffectiveExecutionPlan, EscapeClass, ExecutionPlanPurpose,
-        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
-        ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
-        RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
-        RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult,
+        append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
+        project_runtime_skills, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionProfile,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -490,6 +491,34 @@ pub struct AttachedRuntimeLaunchInput {
     pub session_id: Uuid,
     pub runtime_id: String,
     pub timeout_ms: Option<u64>,
+}
+
+struct AttachedRuntimeTranscriptProgramExecutor {
+    plan: EffectiveExecutionPlan,
+    codex_home_override: Option<PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgramExecutor {
+    async fn execute(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionOutput> {
+        let hard_timeout = self.plan.hard_timeout;
+        timeout(
+            hard_timeout,
+            execute_attached(ExecutionRequest {
+                plan: self.plan.clone(),
+                program,
+                runtime_secrets_mount: None,
+                codex_home_override: self.codex_home_override.clone(),
+            }),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {}s while exporting attached runtime transcript",
+                hard_timeout.as_secs_f32()
+            )
+        })?
+    }
 }
 
 #[derive(Clone)]
@@ -908,14 +937,26 @@ impl Kernel {
         let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
-        let mut turns = adapter
-            .export_terminal_transcript(RuntimeTerminalTranscriptInput {
-                session_id,
-                runtime_state_root,
-                exit_code,
-            })
+        let transcript_input = RuntimeTerminalTranscriptInput {
+            session_id,
+            runtime_state_root,
+            exit_code,
+        };
+        let mut executor = AttachedRuntimeTranscriptProgramExecutor {
+            plan: plan.clone(),
+            codex_home_override: self.codex_home_override.clone(),
+        };
+        let mut turns = match adapter
+            .export_terminal_transcript_with_executor(transcript_input.clone(), &mut executor)
             .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+            .map_err(|err| KernelError::Runtime(err.to_string()))?
+        {
+            Some(turns) => turns,
+            None => adapter
+                .export_terminal_transcript(transcript_input)
+                .await
+                .map_err(|err| KernelError::Runtime(err.to_string()))?,
+        };
         turns.sort_by(|left, right| {
             left.started_at
                 .cmp(&right.started_at)
