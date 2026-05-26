@@ -207,7 +207,7 @@ fn hash_inventory(hasher: &mut Sha256, label: &[u8], inventory: &ProjectInstance
     hasher.update(b"\0");
     hasher.update(inventory.schema_version.to_le_bytes());
     hash_option_str(hasher, inventory.default_instance.as_deref());
-    hasher.update(inventory.instances.len().to_le_bytes());
+    hash_len(hasher, inventory.instances.len());
     for instance in &inventory.instances {
         hash_str(hasher, &instance.name);
         hash_channel_send(hasher, instance.channel_send.as_ref());
@@ -255,6 +255,10 @@ fn hash_option_str(hasher: &mut Sha256, value: Option<&str>) {
 }
 
 fn hash_str(hasher: &mut Sha256, value: &str) {
-    hasher.update(value.len().to_le_bytes());
+    hash_len(hasher, value.len());
     hasher.update(value.as_bytes());
+}
+
+fn hash_len(hasher: &mut Sha256, len: usize) {
+    hasher.update((len as u64).to_le_bytes());
 }
