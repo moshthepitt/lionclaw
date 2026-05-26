@@ -15,26 +15,27 @@ use crate::{
     contracts::{
         AuditQueryParams, AuditQueryResponse, ChannelActorAuthorizeRequest,
         ChannelActorAuthorizeResponse, ChannelAttachmentFinalizeRequest,
-        ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelGrantResponse,
-        ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelHealthReportRequest,
-        ChannelHealthReportResponse, ChannelInboundRequest, ChannelInboundResponse,
-        ChannelListResponse, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
-        ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
-        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimRequest,
-        ChannelPairingClaimResponse, ChannelPairingInviteRequest, ChannelPairingInviteResponse,
-        ChannelPairingListParams, ChannelPairingListResponse, ChannelStreamAckRequest,
-        ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-        ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityGetResponse,
-        ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityPathRequest,
-        ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchRequest,
-        ContinuitySearchResponse, ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest,
-        JobCreateResponse, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-        JobRemoveResponse, JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse,
-        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
-        SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
-        SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
-        SessionTurnRequest, SessionTurnResponse,
+        ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse,
+        ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
+        ChannelGrantRevokeResponse, ChannelHealthReportRequest, ChannelHealthReportResponse,
+        ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
+        ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportRequest,
+        ChannelOutboxReportResponse, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListParams,
+        ChannelPairingListResponse, ChannelStreamAckRequest, ChannelStreamAckResponse,
+        ChannelStreamPullRequest, ChannelStreamPullResponse, ContinuityDraftActionRequest,
+        ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+        ContinuityDraftPromoteResponse, ContinuityGetResponse, ContinuityOpenLoopActionResponse,
+        ContinuityOpenLoopListResponse, ContinuityPathRequest, ContinuityProposalActionResponse,
+        ContinuityProposalListResponse, ContinuitySearchRequest, ContinuitySearchResponse,
+        ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest, JobCreateResponse,
+        JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
+        JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse, PolicyGrantRequest,
+        PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest,
+        SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
+        SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
+        SessionTurnResponse,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -75,6 +76,7 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/channels/pairing/invite", post(invite_channel_pairing))
         .route("/v0/channels/pairing/claim", post(claim_channel_pairing))
         .route("/v0/channels/pairing/block", post(block_channel_pairing))
+        .route("/v0/channels/grants/approve", post(approve_channel_grant))
         .route("/v0/channels/grants/revoke", post(revoke_channel_grant))
         .route("/v0/channels/authorize", post(authorize_channel_actor))
         .route("/v0/channels/inbound", post(channel_inbound))
@@ -229,6 +231,14 @@ async fn block_channel_pairing(
     Json(req): Json<ChannelPairingBlockRequest>,
 ) -> Result<Json<ChannelPairingBlockResponse>, ApiError> {
     let result = state.kernel.block_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
+async fn approve_channel_grant(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelGrantApproveRequest>,
+) -> Result<Json<ChannelGrantResponse>, ApiError> {
+    let result = state.kernel.approve_channel_grant(req).await?;
     Ok(Json(result))
 }
 

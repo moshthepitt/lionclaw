@@ -13,10 +13,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelGrantRevokeRequest, ChannelInboundRequest, ChannelPairingApproveRequest,
-        ChannelPairingStatus, ChannelSessionBinding, ChannelTrigger, ContinuityPathRequest,
-        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
-        SessionOpenRequest, SessionTurnRequest, TrustTier,
+        ChannelGrantApproveRequest, ChannelGrantRevokeRequest, ChannelInboundRequest,
+        ChannelPairingApproveRequest, ChannelPairingStatus, ChannelRoutingProfile,
+        ChannelSessionBinding, ChannelTrigger, ContinuityPathRequest, ContinuitySearchRequest,
+        JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest,
+        SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -625,6 +626,75 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
         .find(|pairing| pairing.sender_ref.as_deref() == Some("alice"))
         .expect("alice pairing");
     assert_eq!(alice.status, ChannelPairingStatus::Pending);
+}
+
+#[tokio::test]
+async fn approve_channel_grant_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    install_and_bind_channel(&env, "loopback").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        })
+        .await;
+    seed_pending_pairing(&kernel, "loopback", "alice").await;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .approve_channel_grant(ChannelGrantApproveRequest {
+            channel_id: "loopback".to_string(),
+            sender_ref: Some("alice".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+            trust_tier: Some(TrustTier::Main),
+            label: Some("Alice".to_string()),
+            reason: None,
+        })
+        .await
+        .expect_err("direct grant approval should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let grant_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM channel_grants \
+         WHERE channel_id = ?1 AND sender_ref = ?2",
+    )
+    .bind("loopback")
+    .bind("alice")
+    .fetch_one(&pool)
+    .await
+    .expect("query grants after rollback");
+    assert_eq!(
+        grant_count, 0,
+        "direct grant row should roll back with audit"
+    );
+
+    let pending = kernel
+        .list_channel_pairings(
+            Some("loopback".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
+        .await
+        .expect("list pairings after rollback");
+    assert!(
+        pending
+            .pairings
+            .iter()
+            .any(|pairing| pairing.sender_ref.as_deref() == Some("alice")),
+        "matching pending pairing should roll back with audit"
+    );
 }
 
 #[tokio::test]

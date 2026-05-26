@@ -156,6 +156,15 @@ pub(crate) struct OperatorPairingUpsert<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct ChannelPendingPairingScope<'a> {
+    pub channel_id: &'a str,
+    pub sender_ref: Option<&'a str>,
+    pub conversation_ref: Option<&'a str>,
+    pub thread_ref: Option<&'a str>,
+    pub requested_profile: ChannelRoutingProfile,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct TokenPairingCreate<'a> {
     pub channel_id: &'a str,
     pub code_hash: &'a str,
@@ -1175,11 +1184,38 @@ impl ChannelStateStore {
     pub(crate) async fn mark_matching_pending_pairings_blocked_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        channel_id: &str,
-        sender_ref: Option<&str>,
-        conversation_ref: Option<&str>,
-        thread_ref: Option<&str>,
-        requested_profile: ChannelRoutingProfile,
+        scope: ChannelPendingPairingScope<'_>,
+    ) -> Result<Vec<Uuid>> {
+        self.mark_matching_pending_operator_pairings_in_tx(
+            tx,
+            scope,
+            ChannelPairingStatus::Blocked,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn mark_matching_pending_pairings_approved_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        scope: ChannelPendingPairingScope<'_>,
+        label: Option<&str>,
+    ) -> Result<Vec<Uuid>> {
+        self.mark_matching_pending_operator_pairings_in_tx(
+            tx,
+            scope,
+            ChannelPairingStatus::Approved,
+            label,
+        )
+        .await
+    }
+
+    async fn mark_matching_pending_operator_pairings_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        scope: ChannelPendingPairingScope<'_>,
+        status: ChannelPairingStatus,
+        label: Option<&str>,
     ) -> Result<Vec<Uuid>> {
         let rows = sqlx::query(
             "SELECT pairing_id \
@@ -1192,11 +1228,11 @@ impl ChannelStateStore {
                AND requested_profile = ?5 \
                AND status = 'pending'",
         )
-        .bind(channel_id)
-        .bind(sender_ref)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(requested_profile.as_str())
+        .bind(scope.channel_id)
+        .bind(scope.sender_ref)
+        .bind(scope.conversation_ref)
+        .bind(scope.thread_ref)
+        .bind(scope.requested_profile.as_str())
         .fetch_all(&mut **tx)
         .await
         .context("failed to query pending channel pairings by scope")?;
@@ -1214,9 +1250,17 @@ impl ChannelStateStore {
         }
 
         let now = now_ms();
+        let claimed_at = if status == ChannelPairingStatus::Approved {
+            Some(now)
+        } else {
+            None
+        };
         sqlx::query(
             "UPDATE channel_pairing_requests \
-             SET status = 'blocked', updated_at_ms = ?6 \
+             SET status = ?6, \
+                 label = COALESCE(?7, label), \
+                 claimed_at_ms = COALESCE(?8, claimed_at_ms), \
+                 updated_at_ms = ?9 \
              WHERE channel_id = ?1 \
                AND claim_policy = 'operator_approval' \
                AND COALESCE(sender_ref, '') = COALESCE(?2, '') \
@@ -1225,15 +1269,18 @@ impl ChannelStateStore {
                AND requested_profile = ?5 \
                AND status = 'pending'",
         )
-        .bind(channel_id)
-        .bind(sender_ref)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(requested_profile.as_str())
+        .bind(scope.channel_id)
+        .bind(scope.sender_ref)
+        .bind(scope.conversation_ref)
+        .bind(scope.thread_ref)
+        .bind(scope.requested_profile.as_str())
+        .bind(status.as_str())
+        .bind(label)
+        .bind(claimed_at)
         .bind(now)
         .execute(&mut **tx)
         .await
-        .context("failed to block pending channel pairings by scope")?;
+        .context("failed to update pending channel pairings by scope")?;
 
         Ok(pairing_ids)
     }

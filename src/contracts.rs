@@ -1109,6 +1109,25 @@ pub struct ChannelPairingBlockResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChannelGrantApproveRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub routing_profile: ChannelRoutingProfile,
+    #[serde(default)]
+    pub trust_tier: Option<TrustTier>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelGrantRevokeRequest {
     pub channel_id: String,
     pub grant_id: Uuid,
