@@ -882,7 +882,7 @@ impl Kernel {
             )
             .await;
         if reconciled {
-            self.mark_attached_runtime_reconciled(plan).await;
+            self.mark_attached_runtime_launch_clean(plan).await;
         }
         if exit_code == Some(0) && reconciled {
             self.mark_runtime_session_ready(plan).await;
@@ -6750,6 +6750,8 @@ mod tests {
         }
     }
 
+    const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
+
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
     }
@@ -6758,7 +6760,7 @@ mod tests {
     impl RuntimeAdapter for CountingTerminalRuntimeAdapter {
         async fn info(&self) -> RuntimeAdapterInfo {
             RuntimeAdapterInfo {
-                id: "counting-terminal".to_string(),
+                id: TEST_TERMINAL_RUNTIME_ID.to_string(),
                 version: "test".to_string(),
                 healthy: true,
             }
@@ -6776,7 +6778,7 @@ mod tests {
 
         fn build_terminal_program(&self) -> anyhow::Result<RuntimeProgramSpec> {
             Ok(RuntimeProgramSpec {
-                executable: "counting-terminal".to_string(),
+                executable: TEST_TERMINAL_RUNTIME_ID.to_string(),
                 ..RuntimeProgramSpec::default()
             })
         }
@@ -6847,13 +6849,30 @@ mod tests {
         let exports = Arc::new(AtomicUsize::new(0));
         kernel
             .register_runtime_adapter(
-                "counting-terminal",
+                TEST_TERMINAL_RUNTIME_ID,
                 Arc::new(CountingTerminalRuntimeAdapter {
                     exports: Arc::clone(&exports),
                 }),
             )
             .await;
         (kernel, exports)
+    }
+
+    fn test_attached_runtime_launch_input(session_id: Uuid) -> AttachedRuntimeLaunchInput {
+        AttachedRuntimeLaunchInput {
+            session_id,
+            runtime_id: TEST_TERMINAL_RUNTIME_ID.to_string(),
+            timeout_ms: None,
+        }
+    }
+
+    async fn assert_runtime_tui_state(runtime_state_root: &Path, expected: &str) {
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read runtime TUI state"),
+            format!("{expected}\n")
+        );
     }
 
     #[tokio::test]
@@ -7323,11 +7342,7 @@ mod tests {
         let session_id = open_test_session(&kernel).await;
 
         let first = kernel
-            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
-                session_id,
-                runtime_id: "counting-terminal".to_string(),
-                timeout_ms: None,
-            })
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare first launch");
         let runtime_state_root = Kernel::runtime_state_root(&first.plan)
@@ -7335,45 +7350,31 @@ mod tests {
             .to_path_buf();
 
         assert_eq!(exports.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read TUI state"),
-            "running\n"
-        );
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
 
         kernel
-            .finish_attached_runtime_launch(session_id, "counting-terminal", &first.plan, Some(0))
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &first.plan,
+                Some(0),
+            )
             .await
             .expect("finish first launch");
 
         assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read clean TUI state"),
-            "clean\n"
-        );
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_CLEAN).await;
         assert!(runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
             .is_file());
 
         let second = kernel
-            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
-                session_id,
-                runtime_id: "counting-terminal".to_string(),
-                timeout_ms: None,
-            })
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare clean relaunch");
 
         assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read running TUI state"),
-            "running\n"
-        );
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
         assert!(!runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
             .exists());
@@ -7390,11 +7391,7 @@ mod tests {
         let session_id = open_test_session(&kernel).await;
 
         let first = kernel
-            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
-                session_id,
-                runtime_id: "counting-terminal".to_string(),
-                timeout_ms: None,
-            })
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare first launch");
         let runtime_state_root = Kernel::runtime_state_root(&first.plan)
@@ -7402,29 +7399,15 @@ mod tests {
             .to_path_buf();
 
         assert_eq!(exports.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read TUI state"),
-            "running\n"
-        );
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
 
         let second = kernel
-            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
-                session_id,
-                runtime_id: "counting-terminal".to_string(),
-                timeout_ms: None,
-            })
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare recovery launch");
 
         assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read recovered TUI state"),
-            "running\n"
-        );
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
         assert_eq!(
             Kernel::runtime_state_root(&second.plan),
             Some(runtime_state_root.as_path())
@@ -13798,7 +13781,7 @@ impl Kernel {
             .await
     }
 
-    async fn mark_attached_runtime_reconciled(&self, plan: &EffectiveExecutionPlan) {
+    async fn mark_attached_runtime_launch_clean(&self, plan: &EffectiveExecutionPlan) {
         if let Err(err) = self
             .write_runtime_tui_state(plan, RUNTIME_TUI_STATE_CLEAN)
             .await
