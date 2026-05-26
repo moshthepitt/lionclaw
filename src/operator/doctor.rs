@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::{
-    applied::{compute_daemon_fingerprint, AppliedState},
+    applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     contracts::ChannelHealthStatus,
     home::{runtime_project_partition_key, LionClawHome},
     kernel::channel_state::{ChannelHealthRecord, ChannelHealthReportRecord, ChannelStateStore},
@@ -35,6 +35,7 @@ use crate::{
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
             normalize_project_default_instance, project_dir_path, project_file_path,
+            project_instance_runtime_context_for_home_with_contacts,
             validate_home_target_exclusive, validate_instance_name, TargetSelection,
         },
     },
@@ -1793,9 +1794,13 @@ async fn expected_daemon_fingerprint(
 ) -> Result<String> {
     let runtime_context =
         resolve_runtime_execution_context(home, config, config.defaults.runtime.as_deref()).await?;
-    Ok(compute_daemon_fingerprint(
+    let sender_channel_ids = applied_state.channel_ids();
+    let project_instance_runtime =
+        project_instance_runtime_context_for_home_with_contacts(home, &sender_channel_ids).await?;
+    Ok(compute_daemon_fingerprint_with_project_context(
         &runtime_context.daemon_config_fingerprint,
         applied_state,
+        project_instance_runtime.as_ref(),
     ))
 }
 
@@ -2403,6 +2408,7 @@ mod tests {
     use axum::{http::StatusCode, routing::get, Json, Router};
 
     use super::*;
+    use crate::applied::compute_daemon_fingerprint;
     use crate::contracts::DaemonInfoResponse;
     use crate::kernel::runtime::{ConfinementConfig, MountAccess, MountSpec, OciConfinementConfig};
     use crate::operator::config::{daemon_compat_fingerprint, RuntimeProfileConfig};
@@ -2411,7 +2417,7 @@ mod tests {
         DaemonUnitSpec, FakeUnitManager, UnitManager,
     };
     use crate::operator::runtime_integration::configure_runtime_profile_with_engine_resolver;
-    use crate::operator::target::init_project;
+    use crate::operator::target::{create_project_instance, init_project, instance_home_path};
 
     async fn configured_bind_fixture() -> (
         tempfile::TempDir,
@@ -2471,6 +2477,7 @@ mod tests {
             launch_mode,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         let db = crate::kernel::db::Db::connect_file(&home.db_path())
             .await
@@ -2593,6 +2600,27 @@ mod tests {
         expected_daemon_fingerprint(home, config, &applied_state)
             .await
             .expect("daemon fingerprint")
+    }
+
+    async fn save_project_instance_contact(
+        project_root: &Path,
+        instance_name: &str,
+        conversation_ref: &str,
+    ) {
+        let home = LionClawHome::new(instance_home_path(project_root, instance_name));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+            contact: Some(crate::operator::config::ChannelContactConfig::new(
+                conversation_ref.to_string(),
+                None,
+            )),
+        });
+        config.save(&home).await.expect("save instance contact");
     }
 
     #[tokio::test]
@@ -3640,6 +3668,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_daemon_fingerprint_changes_when_neighbor_contact_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("reviewer");
+        let home = LionClawHome::new(project.instance.home);
+        write_doctor_channel_skill(
+            &home,
+            "team-local",
+            "team-local",
+            ChannelLaunchMode::Background,
+        );
+        fs::write(
+            home.skills_dir().join("team-local/SKILL.md"),
+            "---\nname: team-local\ndescription: team-local\n---\n",
+        )
+        .expect("skill metadata");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+            contact: None,
+        });
+        let applied_state =
+            AppliedState::from_home_read_only(&home, &config).expect("applied state");
+
+        save_project_instance_contact(temp_dir.path(), "reviewer", "member:reviewer").await;
+        let first = expected_daemon_fingerprint(&home, &config, &applied_state)
+            .await
+            .expect("first fingerprint");
+
+        save_project_instance_contact(temp_dir.path(), "reviewer", "member:reviewer-v2").await;
+        let second = expected_daemon_fingerprint(&home, &config, &applied_state)
+            .await
+            .expect("second fingerprint");
+
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
     async fn doctor_reports_stale_managed_daemon_on_configured_bind() {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         let home_id = home.ensure_home_id().await.expect("home id");
@@ -4220,6 +4290,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         let manager = FakeUnitManager::default();
         manager

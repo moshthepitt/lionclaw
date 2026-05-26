@@ -42,9 +42,10 @@ use crate::{
             LogFilter, LogOptions, StackOperation,
         },
         reconcile::{
-            add_channel, add_skill, open_kernel, open_runtime_kernel_for_work_root,
+            add_channel_with_contact, add_skill, open_kernel, open_runtime_kernel_for_work_root,
             pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
             remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
+            ChannelContactSetup,
         },
         run::{run_local, RunLocalInvocation},
         run_tui::{
@@ -178,6 +179,12 @@ struct ConnectArgs {
     env_file: Option<PathBuf>,
     #[arg(long = "from-env", value_name = "NAME")]
     from_env: Vec<String>,
+    #[arg(long)]
+    contact: bool,
+    #[arg(long = "conversation-ref", value_name = "REF")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref", value_name = "REF")]
+    thread_ref: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -415,6 +422,12 @@ struct ChannelAddArgs {
     launch: String,
     #[arg(long = "required-env")]
     required_env: Vec<String>,
+    #[arg(long)]
+    contact: bool,
+    #[arg(long = "conversation-ref", value_name = "REF")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref", value_name = "REF")]
+    thread_ref: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -789,6 +802,12 @@ pub async fn run() -> Result<ExitCode> {
                         env_file: args.env_file,
                         from_env: args.from_env,
                     },
+                    contact: ChannelContactSetup {
+                        enabled: args.contact,
+                        conversation_ref: args.conversation_ref,
+                        thread_ref: args.thread_ref,
+                        instance_name: target.instance_name.clone(),
+                    },
                     interactive,
                     hide_prompt_input: interactive,
                 },
@@ -1101,12 +1120,20 @@ pub async fn run() -> Result<ExitCode> {
                 let skill = args.skill.unwrap_or_else(|| args.id.clone());
                 let launch_mode =
                     ChannelLaunchMode::from_str(&args.launch).map_err(anyhow::Error::msg)?;
-                add_channel(
+                add_channel_with_contact(
                     &home,
                     args.id.clone(),
                     skill.clone(),
                     launch_mode,
                     args.required_env,
+                    ChannelContactSetup {
+                        enabled: args.contact,
+                        conversation_ref: args.conversation_ref,
+                        thread_ref: args.thread_ref,
+                        instance_name: resolved_target
+                            .as_ref()
+                            .and_then(|target| target.instance_name.clone()),
+                    },
                 )
                 .await?;
                 println!(
@@ -3218,6 +3245,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Interactive,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "telegram".to_string(),
@@ -3225,6 +3253,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save config");
         let manager = crate::operator::managed_units::FakeUnitManager::default();
@@ -3257,6 +3286,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save config");
         let manager = crate::operator::managed_units::FakeUnitManager::default();
@@ -3284,6 +3314,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save config");
         let identity = ensure_unit_identity(&home).expect("unit identity");

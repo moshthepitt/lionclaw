@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::{
     api::build_router,
-    applied::{compute_daemon_fingerprint, AppliedState},
+    applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     config::Config,
     contracts::DaemonInfoResponse,
     home::runtime_project_partition_key,
@@ -15,7 +15,7 @@ use crate::{
     operator::{
         config::OperatorConfig,
         runtime::{register_configured_runtimes, resolve_runtime_execution_context},
-        target::project_instance_runtime_context_for_project_instance,
+        target::project_instance_runtime_context_for_project_instance_with_contacts,
     },
 };
 
@@ -45,14 +45,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     .await?;
     let applied_state = AppliedState::load(&config.home).await?;
     let project_instance_runtime = match config.project_instance.as_ref() {
-        Some(project_instance) => Some(project_instance_runtime_context_for_project_instance(
-            &project_instance.project_root,
-            &project_instance.instance_name,
-        )?),
+        Some(project_instance) => {
+            let sender_channel_ids = applied_state.channel_ids();
+            Some(
+                project_instance_runtime_context_for_project_instance_with_contacts(
+                    &project_instance.project_root,
+                    &project_instance.instance_name,
+                    &sender_channel_ids,
+                )
+                .await?,
+            )
+        }
         None => None,
     };
-    let daemon_fingerprint =
-        compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, &applied_state);
+    let daemon_fingerprint = compute_daemon_fingerprint_with_project_context(
+        &runtime_context.daemon_config_fingerprint,
+        &applied_state,
+        project_instance_runtime.as_ref(),
+    );
 
     let kernel = Arc::new(
         Kernel::new_with_options(

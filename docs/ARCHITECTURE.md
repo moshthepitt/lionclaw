@@ -291,6 +291,61 @@ remains masked from `/workspace` and blocked as a configured extra mount.
 Already-running runtimes do not receive live updates when operators add or repair
 instances; normal process or unit restart boundaries pick up the new inventory.
 
+When the effective execution preset also includes `channel-send`, the same
+projection path uses `schema_version = 2` and may include contact-aware
+`channel_send` state for neighbor instances. The selected instance entry remains
+identity-only (`{ "name": "main" }`) because the runtime already knows itself
+through `LIONCLAW_PROJECT_INSTANCE`. Neighbor entries contain one of:
+`unconfigured`, `configured`, `channel_missing`, or `misconfigured`. Only
+`configured` exposes route fields:
+
+```json
+{
+  "name": "reviewer",
+  "channel_send": {
+    "status": "configured",
+    "channel_id": "team-local",
+    "conversation_ref": "member:reviewer",
+    "thread_ref": null
+  }
+}
+```
+
+`channel_missing` means the neighbor has a preferred contact on a channel that
+is not present in the selected sender's active applied channel bindings, so the
+runtime is not handed an immediately failing route. `misconfigured` means the
+neighbor contact config is invalid, unreadable, or ambiguous. The contact-aware
+projection is captured when the kernel/runtime context is built; it is not a
+fresh config scan on every runtime turn.
+
+Preferred contacts are selected in the recipient instance's channel config. A
+new contact marker clears any older preferred marker in the same instance:
+
+```toml
+[[channels]]
+id = "team-local"
+skill = "team-local"
+launch_mode = "background"
+worker = "scripts/worker"
+
+[channels.contact]
+conversation_ref = "member:reviewer"
+# thread_ref is omitted when absent; TOML has no null value.
+```
+
+Channel metadata can provide a default contact template for `--contact`:
+
+```toml
+[contact]
+conversation_ref_template = "member:{instance}"
+```
+
+Only the `{instance}` variable is supported, and default templates must include
+it. Operators may also pass an explicit `--conversation-ref` for static provider
+routes; `--thread-ref` stays optional. `--contact` requires a project instance
+target because direct homes do not have a stable project instance identity for
+template rendering or neighbor projection.
+
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
 positional mount value is target identity: a path-safe token resolves to

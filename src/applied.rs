@@ -17,9 +17,10 @@ use crate::{
         skills::{derive_skill_id, parse_skill_frontmatter, validate_skill_alias},
     },
     operator::{
-        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
     },
+    project_inventory::ProjectInstanceRuntimeContext,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +58,13 @@ impl AppliedState {
 
     pub fn channels(&self) -> &[AppliedChannel] {
         &self.channels
+    }
+
+    pub fn channel_ids(&self) -> BTreeSet<String> {
+        self.channels
+            .iter()
+            .map(|channel| channel.id.clone())
+            .collect()
     }
 
     pub fn skill_by_id(&self, skill_id: &str) -> Option<&AppliedSkill> {
@@ -245,6 +253,19 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
             hasher.update(b"required_env\0");
             hasher.update(key.as_bytes());
             hasher.update(b"\0");
+        }
+        if let Some(contact) = &channel.contact {
+            hasher.update(b"contact\0");
+            if let Some(conversation_ref) = &contact.conversation_ref {
+                hasher.update(b"conversation_ref\0");
+                hasher.update(conversation_ref.as_bytes());
+                hasher.update(b"\0");
+            }
+            if let Some(thread_ref) = &contact.thread_ref {
+                hasher.update(b"thread_ref\0");
+                hasher.update(thread_ref.as_bytes());
+                hasher.update(b"\0");
+            }
         }
     }
 
@@ -482,6 +503,32 @@ pub fn compute_daemon_fingerprint(
     runtime_config_fingerprint: &str,
     applied_state: &AppliedState,
 ) -> String {
+    compute_daemon_fingerprint_with_project_context(runtime_config_fingerprint, applied_state, None)
+}
+
+pub fn compute_daemon_fingerprint_with_project_context(
+    runtime_config_fingerprint: &str,
+    applied_state: &AppliedState,
+    project_instance_runtime: Option<&ProjectInstanceRuntimeContext>,
+) -> String {
+    let Some(project_instance_runtime) = project_instance_runtime else {
+        return raw_daemon_fingerprint(runtime_config_fingerprint, applied_state);
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"lionclaw-daemon-fingerprint-v2\0");
+    hasher.update(runtime_config_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(applied_state.fingerprint().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(project_instance_runtime.fingerprint().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn raw_daemon_fingerprint(
+    runtime_config_fingerprint: &str,
+    applied_state: &AppliedState,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"lionclaw-daemon-fingerprint-v1\0");
     hasher.update(runtime_config_fingerprint.as_bytes());
@@ -594,6 +641,7 @@ pub struct AppliedChannel {
     pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
+    pub contact: Option<ChannelContactConfig>,
 }
 
 impl AppliedChannel {
@@ -604,6 +652,7 @@ impl AppliedChannel {
             worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
+            contact: config.contact.clone(),
         }
     }
 }
@@ -756,6 +805,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
 
@@ -793,6 +843,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save first config");
 
@@ -804,6 +855,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save second config");
 

@@ -26,8 +26,8 @@ use crate::{
         managed_units::UnitManager,
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
-            add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
-            StackBinaryPaths,
+            add_channel_with_worker, add_skill, resolve_channel_contact_config,
+            resolve_stack_binaries, up_for_work_root, ChannelContactSetup, StackBinaryPaths,
         },
         runtime::resolve_runtime_id,
     },
@@ -46,6 +46,7 @@ pub struct ConnectChannelRequest<'a, M> {
     pub work_root: &'a Path,
     pub channel_or_path: &'a str,
     pub env_inputs: ConnectEnvInputs,
+    pub contact: ChannelContactSetup,
     pub interactive: bool,
     pub hide_prompt_input: bool,
 }
@@ -96,6 +97,7 @@ where
         work_root,
         channel_or_path,
         env_inputs,
+        contact,
         interactive,
         hide_prompt_input,
     } = request;
@@ -113,12 +115,9 @@ where
 
     let discovered = discover_channel_skill(home, channel_or_path)?;
     let channel_id = discovered.metadata.id.clone();
-    let previous_channel = config
-        .channels
-        .iter()
-        .find(|channel| channel.id == channel_id)
-        .cloned();
-    let rollback = ConnectRollback::capture(home, &channel_id, previous_channel, &discovered)?;
+    let contact = resolve_channel_contact_config(contact, Some(&discovered.metadata), &channel_id)?;
+    let rollback =
+        ConnectRollback::capture(home, &channel_id, config.channels.clone(), &discovered)?;
     if let Err(err) = ensure_required_env(
         RequiredEnvRequest {
             home,
@@ -144,6 +143,7 @@ where
         discovered.metadata.launch,
         discovered.metadata.worker.clone(),
         discovered.metadata.env.clone(),
+        contact,
     )
     .await
     {
@@ -265,7 +265,7 @@ fn validate_channel_skill_alias_install_target(
 }
 
 struct ConnectRollback {
-    previous_channel: Option<ManagedChannelConfig>,
+    previous_channels: Vec<ManagedChannelConfig>,
     previous_env: ChannelEnvSnapshot,
     skill: SkillRollback,
 }
@@ -274,11 +274,11 @@ impl ConnectRollback {
     fn capture(
         home: &LionClawHome,
         channel_id: &str,
-        previous_channel: Option<ManagedChannelConfig>,
+        previous_channels: Vec<ManagedChannelConfig>,
         discovered: &DiscoveredChannelSkill,
     ) -> Result<Self> {
         Ok(Self {
-            previous_channel,
+            previous_channels,
             previous_env: ChannelEnvSnapshot::capture(home, channel_id)?,
             skill: SkillRollback::capture(home, discovered)?,
         })
@@ -303,7 +303,7 @@ impl ConnectRollback {
     }
 
     async fn rollback_all(self, home: &LionClawHome, channel_id: &str) -> Result<()> {
-        restore_channel_config(home, channel_id, self.previous_channel).await?;
+        restore_channel_config(home, self.previous_channels).await?;
         self.previous_env.restore(home, channel_id)?;
         self.skill.restore()?;
         Ok(())
@@ -426,21 +426,11 @@ async fn rollback_all_and_return<T>(
 
 async fn restore_channel_config(
     home: &LionClawHome,
-    channel_id: &str,
-    previous_channel: Option<ManagedChannelConfig>,
+    previous_channels: Vec<ManagedChannelConfig>,
 ) -> Result<()> {
     let mut config = OperatorConfig::load(home).await?;
-    match previous_channel {
-        Some(channel) => {
-            config.upsert_channel(channel);
-            config.save(home).await?;
-        }
-        None => {
-            if config.remove_channel(channel_id) {
-                config.save(home).await?;
-            }
-        }
-    }
+    config.channels = previous_channels;
+    config.save(home).await?;
     Ok(())
 }
 
@@ -770,12 +760,15 @@ mod tests {
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
-            config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            config::{
+                ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+                RuntimeProfileConfig,
+            },
             managed_units::{
                 channel_unit_name, daemon_unit_name, ensure_unit_identity, FakeUnitManager,
                 UnitManager,
             },
-            reconcile::{add_skill, StackBinaryPaths},
+            reconcile::{add_skill, ChannelContactSetup, StackBinaryPaths},
         },
     };
 
@@ -844,6 +837,11 @@ mod tests {
 
     #[cfg(unix)]
     fn write_channel_skill(root: &Path, skill_name: &str, token: &str) {
+        write_channel_skill_with_id(root, skill_name, "telegram", token);
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_id(root: &Path, skill_name: &str, channel_id: &str, token: &str) {
         fs::create_dir_all(root.join("scripts")).expect("scripts dir");
         fs::write(
             root.join("SKILL.md"),
@@ -852,14 +850,16 @@ mod tests {
         .expect("skill md");
         fs::write(
             root.join("lionclaw.toml"),
-            r#"version = 1
+            format!(
+                r#"version = 1
 
 [channel]
-id = "telegram"
+id = "{channel_id}"
 launch = "background"
 worker = "scripts/worker"
 env = ["TELEGRAM_BOT_TOKEN"]
 "#,
+            ),
         )
         .expect("channel metadata");
         write_executable(
@@ -1054,6 +1054,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1101,6 +1102,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs::default(),
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1125,6 +1127,180 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn connect_contact_requires_project_instance_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let manager = FakeUnitManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs::default(),
+                contact: ChannelContactSetup {
+                    enabled: true,
+                    conversation_ref: Some("member:reviewer".to_string()),
+                    thread_ref: None,
+                    instance_name: None,
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("contact without project instance should fail");
+
+        assert!(err
+            .to_string()
+            .contains("requires a project instance target"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_contact_stores_explicit_route() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeUnitManager::default();
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                contact: ChannelContactSetup {
+                    enabled: true,
+                    conversation_ref: Some("member:reviewer".to_string()),
+                    thread_ref: Some("thread-a".to_string()),
+                    instance_name: Some("reviewer".to_string()),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("connect telegram contact");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let channel = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "telegram")
+            .expect("telegram channel");
+        let contact = channel.contact.as_ref().expect("contact");
+        assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
+        assert_eq!(contact.thread_ref.as_deref(), Some("thread-a"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_contact_connect_restores_previous_preferred_contact() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let old_skill = temp_dir.path().join("email-skill");
+        write_channel_skill_with_id(&old_skill, "Email", "email", "old email snapshot");
+        add_skill(
+            &home,
+            "email".to_string(),
+            old_skill.display().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install email skill");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.upsert_channel(ManagedChannelConfig {
+            id: "email".to_string(),
+            skill: "email".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+            contact: Some(ChannelContactConfig::new(
+                "reviewer@example.com".to_string(),
+                Some("inbox".to_string()),
+            )),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
+        config.daemon.bind = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("listener addr").port()
+        );
+        config.daemon.bind_configured = true;
+        config.save(&home).await.expect("save config");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeUnitManager::default();
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                contact: ChannelContactSetup {
+                    enabled: true,
+                    conversation_ref: Some("member:reviewer".to_string()),
+                    thread_ref: None,
+                    instance_name: Some("reviewer".to_string()),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("reserved non-LionClaw listener should block background startup");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+        let email = config
+            .channels
+            .iter()
+            .find(|channel| channel.id == "email")
+            .expect("email channel");
+        let contact = email.contact.as_ref().expect("restored contact");
+        assert_eq!(
+            contact.conversation_ref.as_deref(),
+            Some("reviewer@example.com")
+        );
+        assert_eq!(contact.thread_ref.as_deref(), Some("inbox"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn background_connect_rejects_empty_required_env_without_persisting_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -1144,6 +1320,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1198,6 +1375,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1251,6 +1429,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1304,6 +1483,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1383,6 +1563,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1431,6 +1612,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(first_env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1458,6 +1640,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                     env_file: Some(second_env_file),
                     from_env: Vec::new(),
                 },
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },
@@ -1528,6 +1711,7 @@ worker = "scripts/worker"
                 work_root: temp_dir.path(),
                 channel_or_path: skill_source.to_str().expect("utf8 skill source"),
                 env_inputs: ConnectEnvInputs::default(),
+                contact: ChannelContactSetup::default(),
                 interactive: false,
                 hide_prompt_input: false,
             },

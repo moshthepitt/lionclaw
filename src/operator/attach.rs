@@ -10,7 +10,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
-    applied::compute_daemon_fingerprint,
+    applied::compute_daemon_fingerprint_with_project_context,
     home::runtime_project_partition_key,
     home::LionClawHome,
     operator::{
@@ -25,6 +25,7 @@ use crate::{
             resolve_runtime_execution_context, resolve_runtime_id,
             validate_runtime_launch_prerequisites_for_work_root,
         },
+        target::project_instance_runtime_context_for_home_in_project_with_contacts,
     },
 };
 
@@ -182,9 +183,22 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
         resolve_runtime_execution_context(home, &initial_config, Some(&initial_runtime_id))
             .await?
             .daemon_config_fingerprint;
-    let expected_daemon_fingerprint = compute_daemon_fingerprint(
+    let sender_channel_ids = local_state.applied_state.channel_ids();
+    let project_instance_runtime = match project_root {
+        Some(project_root) => Some(
+            project_instance_runtime_context_for_home_in_project_with_contacts(
+                project_root,
+                home,
+                &sender_channel_ids,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let expected_daemon_fingerprint = compute_daemon_fingerprint_with_project_context(
         &expected_runtime_config_fingerprint,
         &local_state.applied_state,
+        project_instance_runtime.as_ref(),
     );
     let home_id = home.ensure_home_id().await?;
     let mut started_managed_units = false;

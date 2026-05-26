@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     home::LionClawHome,
-    project_inventory::{ProjectInstanceInventory, ProjectInstanceRuntimeContext},
+    operator::{
+        channel_metadata::validate_channel_id,
+        config::{ChannelContactConfig, OperatorConfig},
+    },
+    project_inventory::{
+        ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
+        ProjectInstanceRuntimeContext,
+    },
 };
 
 pub const PROJECT_DIR: &str = ".lionclaw";
@@ -420,17 +427,162 @@ pub fn project_instance_runtime_context_for_project_instance(
     project_root: &Path,
     instance_name: &str,
 ) -> Result<ProjectInstanceRuntimeContext> {
-    let inventory = runtime_project_instance_inventory(project_root)?;
+    let project_root = canonical_existing_dir(project_root, "project root")?;
+    let inventory = runtime_project_instance_inventory(&project_root)?;
     if !inventory.contains_instance(instance_name) {
         bail!(
             "selected project instance '{instance_name}' is not a valid instance in {}",
             project_root.display()
         );
     }
-    Ok(ProjectInstanceRuntimeContext {
-        instance_name: instance_name.to_string(),
+    Ok(ProjectInstanceRuntimeContext::new(
+        project_root,
+        instance_name.to_string(),
         inventory,
-    })
+    ))
+}
+
+pub async fn project_instance_runtime_context_with_contacts(
+    mut context: ProjectInstanceRuntimeContext,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let channel_send_inventory =
+        runtime_project_instance_channel_send_inventory(&context, sender_channel_ids).await;
+    context = context.with_channel_send_inventory(channel_send_inventory);
+    Ok(context)
+}
+
+pub async fn project_instance_runtime_context_for_project_instance_with_contacts(
+    project_root: &Path,
+    instance_name: &str,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let context =
+        project_instance_runtime_context_for_project_instance(project_root, instance_name)?;
+    project_instance_runtime_context_with_contacts(context, sender_channel_ids).await
+}
+
+pub async fn project_instance_runtime_context_for_home_in_project_with_contacts(
+    project_root: &Path,
+    home: &LionClawHome,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceRuntimeContext> {
+    let instance_name = project_instance_name_for_home_in_project(project_root, home)?;
+    project_instance_runtime_context_for_project_instance_with_contacts(
+        project_root,
+        &instance_name,
+        sender_channel_ids,
+    )
+    .await
+}
+
+pub async fn project_instance_runtime_context_for_home_with_contacts(
+    home: &LionClawHome,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<Option<ProjectInstanceRuntimeContext>> {
+    let Some(context) = project_instance_runtime_context_for_home(home)? else {
+        return Ok(None);
+    };
+    project_instance_runtime_context_with_contacts(context, sender_channel_ids)
+        .await
+        .map(Some)
+}
+
+async fn runtime_project_instance_channel_send_inventory(
+    context: &ProjectInstanceRuntimeContext,
+    sender_channel_ids: &BTreeSet<String>,
+) -> ProjectInstanceInventory {
+    let mut entries = Vec::with_capacity(context.inventory.instances.len());
+    for instance in &context.inventory.instances {
+        if instance.name == context.instance_name {
+            entries.push(ProjectInstanceInventoryEntry::identity(
+                instance.name.clone(),
+            ));
+            continue;
+        }
+
+        let channel_send =
+            match load_instance_contact(&context.project_root, &instance.name, sender_channel_ids)
+                .await
+            {
+                Ok(channel_send) => channel_send,
+                Err(_) => ProjectInstanceChannelSend::misconfigured(),
+            };
+        entries.push(ProjectInstanceInventoryEntry::with_channel_send(
+            instance.name.clone(),
+            channel_send,
+        ));
+    }
+
+    ProjectInstanceInventory::new_channel_send(context.inventory.default_instance.clone(), entries)
+}
+
+async fn load_instance_contact(
+    project_root: &Path,
+    instance_name: &str,
+    sender_channel_ids: &BTreeSet<String>,
+) -> Result<ProjectInstanceChannelSend> {
+    let home = LionClawHome::new(instance_home(project_root, instance_name));
+    let config = OperatorConfig::load(&home).await?;
+    Ok(resolve_instance_contact(&config, sender_channel_ids))
+}
+
+fn resolve_instance_contact(
+    config: &OperatorConfig,
+    sender_channel_ids: &BTreeSet<String>,
+) -> ProjectInstanceChannelSend {
+    let contacts = config
+        .channels
+        .iter()
+        .filter(|channel| channel.contact.is_some())
+        .collect::<Vec<_>>();
+    match contacts.as_slice() {
+        [] => ProjectInstanceChannelSend::unconfigured(),
+        [channel] => resolve_channel_contact(
+            channel.id.as_str(),
+            channel.contact.as_ref(),
+            sender_channel_ids,
+        ),
+        _ => ProjectInstanceChannelSend::misconfigured(),
+    }
+}
+
+fn resolve_channel_contact(
+    channel_id: &str,
+    contact: Option<&ChannelContactConfig>,
+    sender_channel_ids: &BTreeSet<String>,
+) -> ProjectInstanceChannelSend {
+    let channel_id = channel_id.trim();
+    if validate_channel_id(channel_id).is_err() {
+        return ProjectInstanceChannelSend::misconfigured();
+    }
+    let Some(contact) = contact else {
+        return ProjectInstanceChannelSend::unconfigured();
+    };
+    let Some(conversation_ref) = contact
+        .conversation_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ProjectInstanceChannelSend::misconfigured();
+    };
+    let thread_ref = contact
+        .thread_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if sender_channel_ids.contains(channel_id) {
+        ProjectInstanceChannelSend::configured(
+            channel_id.to_string(),
+            conversation_ref.to_string(),
+            thread_ref,
+        )
+    } else {
+        ProjectInstanceChannelSend::channel_missing()
+    }
 }
 
 pub fn project_instance_name_for_home_in_project(
@@ -1221,17 +1373,25 @@ fn ensure_instance_base_dirs(home: &LionClawHome) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeSet, fs};
 
     use tempfile::tempdir;
 
     use super::{
         adopt_project_instance, create_project_instance, discover_diagnostic_project_root_from_cwd,
-        init_project, list_project_instances, normalize_project_default_instance,
-        project_instance_name_for_home_in_project, project_instance_runtime_context_for_home,
-        resolve_project_setup_root_from_cwd, resolve_target_from_cwd,
-        runtime_project_instance_inventory, TargetSelection, WorkRootRequirement, DEFAULT_INSTANCE,
-        PROJECT_DIR,
+        init_project, instance_home_path, list_project_instances,
+        normalize_project_default_instance, project_instance_name_for_home_in_project,
+        project_instance_runtime_context_for_home,
+        project_instance_runtime_context_for_project_instance,
+        project_instance_runtime_context_with_contacts, resolve_project_setup_root_from_cwd,
+        resolve_target_from_cwd, runtime_project_instance_inventory, TargetSelection,
+        WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
+    };
+    use crate::{
+        applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
+        operator::config::{
+            ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        },
     };
 
     #[test]
@@ -1709,6 +1869,164 @@ mod tests {
         assert_eq!(names, vec!["main"]);
     }
 
+    #[tokio::test]
+    async fn contact_inventory_projects_neighbor_routes_against_sender_active_channels() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "team-local",
+            "member:reviewer",
+            None,
+        )
+        .await;
+        let context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+        let sender_channels = BTreeSet::from(["team-local".to_string()]);
+
+        let context = project_instance_runtime_context_with_contacts(context, &sender_channels)
+            .await
+            .expect("contact context");
+        let encoded = serde_json::to_value(&context.channel_send_inventory).expect("json");
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "schema_version": 2,
+                "default_instance": "main",
+                "instances": [
+                    { "name": "main" },
+                    {
+                        "name": "reviewer",
+                        "channel_send": {
+                            "status": "configured",
+                            "channel_id": "team-local",
+                            "conversation_ref": "member:reviewer",
+                            "thread_ref": null
+                        }
+                    }
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_inventory_reports_missing_sender_channel_without_route_fields() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "email",
+            "reviewer@example.com",
+            Some("thread-a"),
+        )
+        .await;
+        let context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+
+        let context = project_instance_runtime_context_with_contacts(context, &BTreeSet::new())
+            .await
+            .expect("contact context");
+        let encoded = serde_json::to_value(&context.channel_send_inventory).expect("json");
+
+        assert_eq!(
+            encoded["instances"][1]["channel_send"],
+            serde_json::json!({ "status": "channel_missing" })
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_inventory_reports_manual_multi_contact_misconfiguration() {
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        let home = crate::home::LionClawHome::new(instance_home_path(temp_dir.path(), "reviewer"));
+        let config = OperatorConfig {
+            channels: vec![
+                test_channel("team-local", Some(("member:reviewer", None))),
+                test_channel("email", Some(("reviewer@example.com", None))),
+            ],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        let context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+
+        let context = project_instance_runtime_context_with_contacts(context, &BTreeSet::new())
+            .await
+            .expect("contact context");
+        let encoded = serde_json::to_value(&context.channel_send_inventory).expect("json");
+
+        assert_eq!(
+            encoded["instances"][1]["channel_send"],
+            serde_json::json!({ "status": "misconfigured" })
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_fingerprint_changes_when_neighbor_contact_route_changes() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        create_project_instance(temp_dir.path(), "reviewer", None, false).expect("create reviewer");
+        let sender_channels = BTreeSet::from(["team-local".to_string()]);
+        let applied_state = AppliedState::from_home_read_only(
+            &crate::home::LionClawHome::new(project.instance.home),
+            &OperatorConfig::default(),
+        )
+        .expect("applied state");
+
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "team-local",
+            "member:reviewer",
+            None,
+        )
+        .await;
+        let first_context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+        let first_context =
+            project_instance_runtime_context_with_contacts(first_context, &sender_channels)
+                .await
+                .expect("contact context");
+        let first_fingerprint = compute_daemon_fingerprint_with_project_context(
+            "runtime",
+            &applied_state,
+            Some(&first_context),
+        );
+
+        save_contact_channel(
+            temp_dir.path(),
+            "reviewer",
+            "team-local",
+            "member:reviewer-v2",
+            None,
+        )
+        .await;
+        let second_context =
+            project_instance_runtime_context_for_project_instance(temp_dir.path(), "main")
+                .expect("context");
+        let second_context =
+            project_instance_runtime_context_with_contacts(second_context, &sender_channels)
+                .await
+                .expect("contact context");
+        let second_fingerprint = compute_daemon_fingerprint_with_project_context(
+            "runtime",
+            &applied_state,
+            Some(&second_context),
+        );
+
+        assert_ne!(first_fingerprint, second_fingerprint);
+    }
+
     #[test]
     fn runtime_context_for_project_instance_home_uses_existing_instance_name() {
         let temp_dir = tempdir().expect("temp dir");
@@ -1729,6 +2047,43 @@ mod tests {
         assert_eq!(context.instance_name, "reviewer");
         assert!(context.inventory.contains_instance("main"));
         assert!(context.inventory.contains_instance("reviewer"));
+    }
+
+    async fn save_contact_channel(
+        project_root: &std::path::Path,
+        instance_name: &str,
+        channel_id: &str,
+        conversation_ref: &str,
+        thread_ref: Option<&str>,
+    ) {
+        let home = crate::home::LionClawHome::new(instance_home_path(project_root, instance_name));
+        let config = OperatorConfig {
+            channels: vec![test_channel(
+                channel_id,
+                Some((conversation_ref, thread_ref)),
+            )],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+    }
+
+    fn test_channel(
+        channel_id: &str,
+        contact: Option<(&str, Option<&str>)>,
+    ) -> ManagedChannelConfig {
+        ManagedChannelConfig {
+            id: channel_id.to_string(),
+            skill: channel_id.to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+            contact: contact.map(|(conversation_ref, thread_ref)| {
+                ChannelContactConfig::new(
+                    conversation_ref.to_string(),
+                    thread_ref.map(str::to_string),
+                )
+            }),
+        }
     }
 
     #[test]

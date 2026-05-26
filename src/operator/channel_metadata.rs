@@ -20,6 +20,12 @@ pub struct ChannelMetadata {
     pub launch: ChannelLaunchMode,
     pub worker: String,
     pub env: Vec<String>,
+    pub contact: Option<ChannelContactMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelContactMetadata {
+    pub conversation_ref_template: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +47,8 @@ pub struct DiscoveredChannelSkill {
 struct ChannelMetadataFile {
     version: u32,
     channel: ChannelMetadataSection,
+    #[serde(default)]
+    contact: Option<ChannelContactMetadataSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +59,12 @@ struct ChannelMetadataSection {
     worker: String,
     #[serde(default)]
     env: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelContactMetadataSection {
+    conversation_ref_template: String,
 }
 
 pub fn discover_channel_skill(home: &LionClawHome, raw: &str) -> Result<DiscoveredChannelSkill> {
@@ -141,13 +155,34 @@ pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
     }
     env.sort();
     env.dedup();
+    let contact = parsed
+        .contact
+        .map(|contact| -> Result<ChannelContactMetadata> {
+            let template = contact.conversation_ref_template.trim().to_string();
+            validate_contact_template(&template)?;
+            Ok(ChannelContactMetadata {
+                conversation_ref_template: template,
+            })
+        })
+        .transpose()?;
 
     Ok(ChannelMetadata {
         id,
         launch,
         worker,
         env,
+        contact,
     })
+}
+
+pub fn render_contact_template(template: &str, instance_name: &str) -> Result<String> {
+    validate_contact_template(template)?;
+    let rendered = template.replace("{instance}", instance_name);
+    let rendered = rendered.trim().to_string();
+    if rendered.is_empty() {
+        bail!("contact conversation_ref template rendered an empty value");
+    }
+    Ok(rendered)
 }
 
 pub fn resolve_channel_worker_entrypoint(
@@ -207,6 +242,44 @@ pub fn validate_channel_env_name(name: &str) -> Result<()> {
         bail!(
             "environment variable name '{name}' uses the reserved LionClaw namespace '{RESERVED_CHANNEL_ENV_PREFIX}'"
         );
+    }
+    Ok(())
+}
+
+fn validate_contact_template(template: &str) -> Result<()> {
+    if template.is_empty() {
+        bail!("contact conversation_ref_template is required");
+    }
+    let mut saw_instance = false;
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '}' => bail!("contact conversation_ref_template contains an unmatched '}}'"),
+            '{' => {
+                let mut variable = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    variable.push(inner);
+                }
+                if !closed {
+                    bail!("contact conversation_ref_template contains an unmatched '{{'");
+                }
+                if variable != "instance" {
+                    bail!(
+                        "contact conversation_ref_template uses unsupported variable '{{{variable}}}'; supported variable: '{{instance}}'"
+                    );
+                }
+                saw_instance = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_instance {
+        bail!("contact conversation_ref_template must include '{{instance}}'");
     }
     Ok(())
 }
@@ -394,7 +467,10 @@ fn is_executable_file(metadata: &fs::Metadata) -> bool {
 mod tests {
     use std::fs;
 
-    use super::{discover_channel_skill, load_channel_metadata, validate_channel_env_name};
+    use super::{
+        discover_channel_skill, load_channel_metadata, render_contact_template,
+        validate_channel_env_name,
+    };
     use crate::{home::LionClawHome, operator::snapshot::copy_snapshot_tree};
 
     #[cfg(unix)]
@@ -483,6 +559,61 @@ mod tests {
         let err = load_channel_metadata(&skill).expect_err("reserved env should fail");
 
         assert!(err.to_string().contains("reserved LionClaw namespace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_and_renders_contact_template_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-team-local", "team-local");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"team-local\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[contact]\nconversation_ref_template = \"member:{instance}\"\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+        let template = metadata
+            .contact
+            .expect("contact metadata")
+            .conversation_ref_template;
+
+        assert_eq!(
+            render_contact_template(&template, "reviewer").expect("render template"),
+            "member:reviewer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unknown_contact_template_variables() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-team-local", "team-local");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"team-local\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[contact]\nconversation_ref_template = \"member:{handle}\"\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("unknown variable should fail");
+
+        assert!(err.to_string().contains("unsupported variable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_static_contact_template_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-team-local", "team-local");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"team-local\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[contact]\nconversation_ref_template = \"member:reviewer\"\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("static template should fail");
+
+        assert!(err.to_string().contains("must include '{instance}'"));
     }
 
     #[cfg(unix)]

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::{
     collections::BTreeSet,
     fs,
@@ -8,7 +8,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    applied::{compute_daemon_fingerprint, AppliedState},
+    applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     contracts::{
         ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
         ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
@@ -18,8 +18,14 @@ use crate::{
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
-        channel_metadata::resolve_channel_worker_entrypoint,
-        config::{normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        channel_metadata::{
+            load_channel_metadata, render_contact_template, resolve_channel_worker_entrypoint,
+            ChannelMetadata, CHANNEL_METADATA_FILE,
+        },
+        config::{
+            normalize_local_source, ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig,
+            OperatorConfig,
+        },
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             daemon_unit_name, ensure_unit_identity, render_channel_unit, render_daemon_unit,
@@ -32,7 +38,10 @@ use crate::{
             validate_runtime_launch_prerequisites_for_work_root,
         },
         snapshot::{install_snapshot, resolve_local_source},
-        target::project_instance_name_for_home_in_project,
+        target::{
+            project_instance_runtime_context_for_home_in_project_with_contacts,
+            project_instance_runtime_context_with_contacts,
+        },
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -141,6 +150,37 @@ pub async fn add_channel(
     launch_mode: ChannelLaunchMode,
     required_env: Vec<String>,
 ) -> Result<()> {
+    add_channel_with_contact(
+        home,
+        id,
+        skill,
+        launch_mode,
+        required_env,
+        ChannelContactSetup::default(),
+    )
+    .await
+}
+
+pub async fn add_channel_with_contact(
+    home: &LionClawHome,
+    id: String,
+    skill: String,
+    launch_mode: ChannelLaunchMode,
+    required_env: Vec<String>,
+    contact: ChannelContactSetup,
+) -> Result<()> {
+    validate_skill_alias(&skill)?;
+    let skill_dir = resolve_installed_skill_dir(home, &skill)?;
+    resolve_channel_worker_entrypoint(
+        &skill_dir,
+        Some(crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER),
+    )?;
+    let metadata = if contact.needs_metadata_template() {
+        load_optional_channel_metadata(&skill_dir)?
+    } else {
+        None
+    };
+    let contact = resolve_channel_contact_config(contact, metadata.as_ref(), &id)?;
     add_channel_with_worker(
         home,
         id,
@@ -148,8 +188,40 @@ pub async fn add_channel(
         launch_mode,
         crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
         required_env,
+        contact,
     )
     .await
+}
+
+fn load_optional_channel_metadata(skill_dir: &Path) -> Result<Option<ChannelMetadata>> {
+    let path = skill_dir.join(CHANNEL_METADATA_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => load_channel_metadata(skill_dir).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to stat channel metadata {}", path.display()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChannelContactSetup {
+    pub enabled: bool,
+    pub conversation_ref: Option<String>,
+    pub thread_ref: Option<String>,
+    pub instance_name: Option<String>,
+}
+
+impl ChannelContactSetup {
+    fn needs_metadata_template(&self) -> bool {
+        self.enabled
+            && self
+                .conversation_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+    }
 }
 
 pub async fn add_channel_with_worker(
@@ -159,9 +231,11 @@ pub async fn add_channel_with_worker(
     launch_mode: ChannelLaunchMode,
     worker: String,
     required_env: Vec<String>,
+    contact: Option<ChannelContactConfig>,
 ) -> Result<()> {
     validate_skill_alias(&skill)?;
-    resolve_installed_skill_worker_entrypoint(home, &skill, Some(&worker)).await?;
+    let skill_dir = resolve_installed_skill_dir(home, &skill)?;
+    resolve_channel_worker_entrypoint(&skill_dir, Some(&worker))?;
     let mut config = OperatorConfig::load(home).await?;
     config.upsert_channel(ManagedChannelConfig {
         id,
@@ -169,8 +243,61 @@ pub async fn add_channel_with_worker(
         launch_mode,
         worker,
         required_env,
+        contact,
     });
     config.save(home).await
+}
+
+pub(crate) fn resolve_channel_contact_config(
+    setup: ChannelContactSetup,
+    metadata: Option<&crate::operator::channel_metadata::ChannelMetadata>,
+    channel_id: &str,
+) -> Result<Option<ChannelContactConfig>> {
+    if !setup.enabled {
+        if setup.conversation_ref.is_some() || setup.thread_ref.is_some() {
+            bail!("--conversation-ref and --thread-ref require --contact");
+        }
+        return Ok(None);
+    }
+
+    let instance_name = setup
+        .instance_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("--contact requires a project instance target; run from a LionClaw project instance or pass --instance <name>")
+        })?;
+    let conversation_ref = match setup
+        .conversation_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => {
+            let Some(template) = metadata
+                .and_then(|metadata| metadata.contact.as_ref())
+                .map(|contact| contact.conversation_ref_template.as_str())
+            else {
+                bail!(
+                    "channel '{channel_id}' has no default contact template; pass --conversation-ref <REF> with --contact"
+                );
+            };
+            render_contact_template(template, instance_name)?
+        }
+    };
+    let thread_ref = setup
+        .thread_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Ok(Some(ChannelContactConfig::new(
+        conversation_ref,
+        thread_ref,
+    )))
 }
 
 pub async fn remove_channel(home: &LionClawHome, id: &str) -> Result<bool> {
@@ -210,8 +337,23 @@ pub async fn up_for_work_root<M: UnitManager>(
     let home_id = home.ensure_home_id().await?;
     let project_scope = runtime_project_partition_key(Some(work_root));
     let runtime_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
-    let expected_daemon_fingerprint =
-        compute_daemon_fingerprint(&runtime_config_fingerprint, &state.applied_state);
+    let sender_channel_ids = state.applied_state.channel_ids();
+    let project_instance_runtime = match project_root {
+        Some(project_root) => Some(
+            project_instance_runtime_context_for_home_in_project_with_contacts(
+                project_root,
+                home,
+                &sender_channel_ids,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let expected_daemon_fingerprint = compute_daemon_fingerprint_with_project_context(
+        &runtime_config_fingerprint,
+        &state.applied_state,
+        project_instance_runtime.as_ref(),
+    );
     match classify_daemon(
         &config.daemon.bind,
         &home_id,
@@ -268,16 +410,13 @@ pub async fn up_for_work_root<M: UnitManager>(
         Some(work_root),
     )
     .await?;
-    let project_instance_name = project_root
-        .map(|project_root| project_instance_name_for_home_in_project(project_root, home))
-        .transpose()?;
-    let project_instance = match (project_root, project_instance_name.as_deref()) {
-        (Some(project_root), Some(instance_name)) => Some(DaemonProjectInstanceSpec {
-            project_root,
-            instance_name,
-        }),
-        _ => None,
-    };
+    let project_instance =
+        project_instance_runtime
+            .as_ref()
+            .map(|context| DaemonProjectInstanceSpec {
+                project_root: context.project_root.as_path(),
+                instance_name: context.instance_name.as_str(),
+            });
     render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
@@ -857,6 +996,20 @@ async fn open_kernel_with_project_root(
     home.ensure_base_dirs().await?;
     let workspace_root = config.workspace_root(home);
     let applied_state = AppliedState::load(home).await?;
+    let project_instance_runtime = match project_instance_runtime {
+        Some(context) => {
+            let sender_channel_ids = applied_state
+                .channels()
+                .iter()
+                .map(|channel| channel.id.clone())
+                .collect::<BTreeSet<_>>();
+            Some(
+                project_instance_runtime_context_with_contacts(context, &sender_channel_ids)
+                    .await?,
+            )
+        }
+        None => None,
+    };
     let runtime_context =
         resolve_runtime_execution_context(home, config, default_runtime_id.as_deref()).await?;
     let timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
@@ -897,10 +1050,10 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, down, ensure_managed_bind_configured, logs, open_kernel,
-        open_kernel_with_project_root, render_marker_file, render_runtime_cache,
+        add_channel, add_channel_with_contact, add_skill, down, ensure_managed_bind_configured,
+        logs, open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
         resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
-        resolve_worker_entrypoint, up_for_work_root, StackBinaryPaths,
+        resolve_worker_entrypoint, up_for_work_root, ChannelContactSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1060,6 +1213,23 @@ mod tests {
             make_executable(&worker);
         }
         skill_source
+    }
+
+    fn write_channel_metadata(
+        skill_source: &Path,
+        channel_id: &str,
+        contact_template: Option<&str>,
+    ) {
+        let contact = contact_template
+            .map(|template| format!("\n[contact]\nconversation_ref_template = \"{template}\"\n"))
+            .unwrap_or_default();
+        fs::write(
+            skill_source.join("lionclaw.toml"),
+            format!(
+                "version = 1\n\n[channel]\nid = \"{channel_id}\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n{contact}"
+            ),
+        )
+        .expect("channel metadata");
     }
 
     fn make_executable(path: &Path) {
@@ -1427,6 +1597,192 @@ mod tests {
             !home.root().exists(),
             "failing channel add should not bootstrap home state"
         );
+    }
+
+    #[tokio::test]
+    async fn add_channel_contact_requires_project_instance_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        let err = add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: true,
+                conversation_ref: Some("member:reviewer".to_string()),
+                thread_ref: None,
+                instance_name: None,
+            },
+        )
+        .await
+        .expect_err("contact without project instance should fail");
+
+        assert!(err
+            .to_string()
+            .contains("requires a project instance target"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_channel_contact_stores_explicit_route() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: true,
+                conversation_ref: Some(" member:reviewer ".to_string()),
+                thread_ref: Some(" thread-a ".to_string()),
+                instance_name: Some("reviewer".to_string()),
+            },
+        )
+        .await
+        .expect("add contact channel");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let contact = config.channels[0].contact.as_ref().expect("contact");
+        assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
+        assert_eq!(contact.thread_ref.as_deref(), Some("thread-a"));
+    }
+
+    #[tokio::test]
+    async fn add_channel_contact_explicit_route_does_not_load_default_template() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        write_channel_metadata(&skill_source, "team-local", Some("member:{handle}"));
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: true,
+                conversation_ref: Some("member:reviewer".to_string()),
+                thread_ref: None,
+                instance_name: Some("reviewer".to_string()),
+            },
+        )
+        .await
+        .expect("explicit route should not parse default template");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let contact = config.channels[0].contact.as_ref().expect("contact");
+        assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
+    }
+
+    #[tokio::test]
+    async fn add_channel_contact_renders_metadata_template() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        write_channel_metadata(&skill_source, "team-local", Some("member:{instance}"));
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: true,
+                conversation_ref: None,
+                thread_ref: None,
+                instance_name: Some("reviewer".to_string()),
+            },
+        )
+        .await
+        .expect("add contact channel");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let contact = config.channels[0].contact.as_ref().expect("contact");
+        assert_eq!(contact.conversation_ref.as_deref(), Some("member:reviewer"));
+        assert_eq!(contact.thread_ref, None);
+    }
+
+    #[tokio::test]
+    async fn add_channel_route_fields_require_contact_flag() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-team-local", "team-local", true);
+        add_skill(
+            &home,
+            "team-local".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        let err = add_channel_with_contact(
+            &home,
+            "team-local".to_string(),
+            "team-local".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+            ChannelContactSetup {
+                enabled: false,
+                conversation_ref: Some("member:reviewer".to_string()),
+                thread_ref: None,
+                instance_name: Some("reviewer".to_string()),
+            },
+        )
+        .await
+        .expect_err("route without contact flag should fail");
+
+        assert!(err.to_string().contains("require --contact"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.is_empty());
     }
 
     #[tokio::test]
@@ -1892,6 +2248,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            contact: None,
         });
         config.save(&home).await.expect("save config");
         let mut env = ChannelEnv::new();

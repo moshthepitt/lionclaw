@@ -6146,7 +6146,9 @@ mod tests {
     use super::*;
     use crate::kernel::continuity::title_file_name;
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
-    use crate::project_inventory::ProjectInstanceInventory;
+    use crate::project_inventory::{
+        ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
+    };
 
     #[test]
     fn kernel_options_debug_reports_runtime_secret_home() {
@@ -6515,6 +6517,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
         let kernel = kernel_with_home(&home).await;
@@ -6579,13 +6582,14 @@ mod tests {
                 runtime_root: Some(runtime_root.clone()),
                 workspace_name: Some("main".to_string()),
                 project_workspace_root: Some(project_root.clone()),
-                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
-                    instance_name: "reviewer".to_string(),
-                    inventory: ProjectInstanceInventory::new(
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext::new(
+                    project_root.clone(),
+                    "reviewer".to_string(),
+                    ProjectInstanceInventory::new(
                         Some("main".to_string()),
                         vec!["main".to_string(), "reviewer".to_string()],
                     ),
-                }),
+                )),
                 ..KernelOptions::default()
             },
         )
@@ -6640,6 +6644,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn project_instance_inventory_projects_neighbor_channel_send_only_with_escape() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let project_root = temp_dir.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let identity_inventory = ProjectInstanceInventory::new(
+            Some("main".to_string()),
+            vec!["main".to_string(), "reviewer".to_string()],
+        );
+        let channel_send_inventory = ProjectInstanceInventory::new_channel_send(
+            Some("main".to_string()),
+            vec![
+                ProjectInstanceInventoryEntry::identity("main".to_string()),
+                ProjectInstanceInventoryEntry::with_channel_send(
+                    "reviewer".to_string(),
+                    ProjectInstanceChannelSend::configured(
+                        "team-local".to_string(),
+                        "member:reviewer".to_string(),
+                        None,
+                    ),
+                ),
+            ],
+        );
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(project_root.clone()),
+                project_instance_runtime: Some(
+                    ProjectInstanceRuntimeContext::new(
+                        project_root,
+                        "main".to_string(),
+                        identity_inventory,
+                    )
+                    .with_channel_send_inventory(channel_send_inventory),
+                ),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.escape_classes.insert(EscapeClass::ChannelSend);
+
+        kernel
+            .maybe_mount_project_instance_inventory(
+                Uuid::nil(),
+                Uuid::nil(),
+                "codex",
+                RuntimeTurnMode::ProgramBacked,
+                &mut plan,
+            )
+            .await
+            .expect("mount inventory");
+
+        let mount = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == PROJECT_INSTANCE_INVENTORY_DIR)
+            .expect("project inventory mount");
+        let content = tokio::fs::read_to_string(mount.source.join(PROJECT_INSTANCES_FILE_NAME))
+            .await
+            .expect("read inventory projection");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&content).expect("json"),
+            serde_json::json!({
+                "schema_version": 2,
+                "default_instance": "main",
+                "instances": [
+                    { "name": "main" },
+                    {
+                        "name": "reviewer",
+                        "channel_send": {
+                            "status": "configured",
+                            "channel_id": "team-local",
+                            "conversation_ref": "member:reviewer",
+                            "thread_ref": null
+                        }
+                    }
+                ]
+            })
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn project_instance_inventory_projection_rejects_runtime_path_symlinks() {
@@ -6659,10 +6750,11 @@ mod tests {
                 runtime_root: Some(runtime_root.clone()),
                 workspace_name: Some("main".to_string()),
                 project_workspace_root: Some(project_root.clone()),
-                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
-                    instance_name: "main".to_string(),
-                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
-                }),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext::new(
+                    project_root.clone(),
+                    "main".to_string(),
+                    ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                )),
                 ..KernelOptions::default()
             },
         )
@@ -6737,11 +6829,12 @@ mod tests {
             KernelOptions {
                 runtime_root: Some(runtime_root),
                 workspace_name: Some("main".to_string()),
-                project_workspace_root: Some(project_root),
-                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
-                    instance_name: "main".to_string(),
-                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
-                }),
+                project_workspace_root: Some(project_root.clone()),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext::new(
+                    project_root,
+                    "main".to_string(),
+                    ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                )),
                 ..KernelOptions::default()
             },
         )
@@ -6804,10 +6897,11 @@ mod tests {
                 runtime_root: Some(temp_dir.path().join("runtime")),
                 workspace_name: Some("main".to_string()),
                 project_workspace_root: Some(temp_dir.path().join("project")),
-                project_instance_runtime: Some(ProjectInstanceRuntimeContext {
-                    instance_name: "main".to_string(),
-                    inventory: ProjectInstanceInventory::new(None, vec!["main".to_string()]),
-                }),
+                project_instance_runtime: Some(ProjectInstanceRuntimeContext::new(
+                    temp_dir.path().join("project"),
+                    "main".to_string(),
+                    ProjectInstanceInventory::new(None, vec!["main".to_string()]),
+                )),
                 ..KernelOptions::default()
             },
         )
@@ -12308,8 +12402,12 @@ impl Kernel {
                     projection_dir.display()
                 ))
             })?;
-        let encoded = context
-            .inventory
+        let inventory = if plan.escape_classes.contains(&EscapeClass::ChannelSend) {
+            &context.channel_send_inventory
+        } else {
+            &context.inventory
+        };
+        let encoded = inventory
             .to_pretty_json()
             .map_err(|err| internal(err.into()))?;
         write_new_runtime_projection_file(

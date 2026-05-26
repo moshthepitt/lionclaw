@@ -66,6 +66,13 @@ impl OperatorConfig {
     }
 
     pub fn upsert_channel(&mut self, channel: ManagedChannelConfig) {
+        if channel.contact.is_some() {
+            for existing in &mut self.channels {
+                if existing.id != channel.id {
+                    existing.contact = None;
+                }
+            }
+        }
         self.channels.retain(|existing| existing.id != channel.id);
         self.channels.push(channel);
         self.normalize();
@@ -214,6 +221,18 @@ impl OperatorConfig {
             }
             channel.required_env.sort();
             channel.required_env.dedup();
+            if let Some(contact) = &mut channel.contact {
+                contact.conversation_ref = contact
+                    .conversation_ref
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                contact.thread_ref = contact
+                    .thread_ref
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
         }
     }
 }
@@ -299,6 +318,25 @@ pub struct ManagedChannelConfig {
     pub worker: String,
     #[serde(default)]
     pub required_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<ChannelContactConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelContactConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ref: Option<String>,
+}
+
+impl ChannelContactConfig {
+    pub fn new(conversation_ref: String, thread_ref: Option<String>) -> Self {
+        Self {
+            conversation_ref: Some(conversation_ref),
+            thread_ref,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -788,6 +826,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::default(),
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
 
@@ -810,6 +849,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Interactive,
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            contact: None,
         });
         config.save(&home).await.expect("save config");
 
@@ -819,6 +859,84 @@ mod tests {
             loaded.channels[0].launch_mode,
             ChannelLaunchMode::Interactive
         );
+    }
+
+    #[tokio::test]
+    async fn contact_channel_upsert_clears_previous_contact_marker() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: default_channel_worker(),
+            required_env: Vec::new(),
+            contact: Some(super::ChannelContactConfig::new(
+                "member:reviewer".to_string(),
+                None,
+            )),
+        });
+        config.upsert_channel(ManagedChannelConfig {
+            id: "email".to_string(),
+            skill: "email".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: default_channel_worker(),
+            required_env: Vec::new(),
+            contact: Some(super::ChannelContactConfig::new(
+                "reviewer@example.com".to_string(),
+                None,
+            )),
+        });
+        config.save(&home).await.expect("save config");
+
+        let loaded = OperatorConfig::load(&home).await.expect("load config");
+
+        assert_eq!(loaded.channels.len(), 2);
+        assert!(loaded
+            .channels
+            .iter()
+            .find(|channel| channel.id == "team-local")
+            .expect("team-local")
+            .contact
+            .is_none());
+        assert_eq!(
+            loaded
+                .channels
+                .iter()
+                .find(|channel| channel.id == "email")
+                .expect("email")
+                .contact
+                .as_ref()
+                .and_then(|contact| contact.conversation_ref.as_deref()),
+            Some("reviewer@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_contact_thread_ref_is_omitted_from_config_toml() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: default_channel_worker(),
+            required_env: Vec::new(),
+            contact: Some(super::ChannelContactConfig::new(
+                "member:reviewer".to_string(),
+                None,
+            )),
+        });
+
+        config.save(&home).await.expect("save config");
+        let content = tokio::fs::read_to_string(home.config_path())
+            .await
+            .expect("read config");
+
+        assert!(content.contains("conversation_ref = \"member:reviewer\""));
+        assert!(!content.contains("thread_ref"));
     }
 
     #[test]
