@@ -210,6 +210,10 @@ audit trail are the active boundary. Codex also receives
 `/runtime/AGENTS.generated.md` as its model instructions file, so LionClaw
 memory, active context, prior LionClaw session history, skills, and project
 continuity are included without shadowing `/workspace/AGENTS.md`.
+LionClaw also materializes the runtime-private Codex config with
+`[projects."/workspace"] trust_level = "trusted"`, matching the result of
+approving Codex's own workspace prompt inside the container without mutating the
+host Codex home.
 
 For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime`. OpenCode's
 native instruction loader then reads `/runtime/AGENTS.md` as global runtime
@@ -528,8 +532,10 @@ Host-only runtime auth comes from the host runtime itself. Before a confined
 Codex turn, LionClaw reads the host Codex auth store, normally
 `~/.codex/auth.json`, refreshes that host auth when needed, then stages
 session-local copies of `auth.json` and `config.toml` under
-`/runtime/home/.codex` before launch. The real host Codex home is never mounted
-into the runtime container.
+`/runtime/home/.codex` before launch. The runtime copy of `config.toml` is a
+Codex-compatible merge of the host config plus LionClaw's trusted `/workspace`
+project entry. The real host Codex home is never mounted into the runtime
+container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
 `lionclaw up` persists that same override into the managed daemon environment

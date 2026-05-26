@@ -176,7 +176,8 @@ Expected:
 
 - the selected runtime's own terminal UI opens inside the LionClaw launch
   boundary
-- Codex shows `/workspace` as the directory and no inner Codex sandbox prompt
+- Codex shows `/workspace` as the directory and no inner Codex sandbox or
+  workspace-trust prompt
 - OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
 - the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`

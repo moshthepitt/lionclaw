@@ -13,12 +13,15 @@ use reqwest::StatusCode;
 use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use toml_edit::{DocumentMut, Item, Table};
 use uuid::Uuid;
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
 const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
 const CODEX_AUTH_LOCK_FILE_NAME: &str = ".lionclaw-auth.lock";
+const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
+const CODEX_TRUSTED_LEVEL: &str = "trusted";
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::seconds(120);
@@ -205,19 +208,13 @@ pub async fn sync_codex_home_into_runtime(
         serde_json::to_vec_pretty(&ready.auth).context("failed to encode synced Codex auth")?,
     )
     .await?;
-    match ready.config_contents {
-        Some(config_contents) => {
-            write_runtime_codex_file(
-                &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
-                config_contents,
-            )
-            .await?;
-        }
-        None => {
-            remove_runtime_codex_file_if_exists(&runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
-                .await?;
-        }
-    }
+    let config_contents = runtime_codex_config_contents(ready.config_contents)
+        .context("failed to prepare runtime Codex config")?;
+    write_runtime_codex_file(
+        &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
+        config_contents,
+    )
+    .await?;
     Ok(())
 }
 
@@ -270,6 +267,61 @@ fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
         "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
         store.auth_path.display()
     )
+}
+
+fn runtime_codex_config_contents(host_config_contents: Option<Vec<u8>>) -> Result<Vec<u8>> {
+    let raw = host_config_contents.unwrap_or_default();
+    let raw = std::str::from_utf8(&raw).context("host Codex config.toml is not UTF-8")?;
+    let mut document = raw
+        .parse::<DocumentMut>()
+        .context("failed to parse host Codex config.toml")?;
+    trust_runtime_workspace(&mut document)?;
+    Ok(document.to_string().into_bytes())
+}
+
+fn trust_runtime_workspace(document: &mut DocumentMut) -> Result<()> {
+    let root = document.as_table_mut();
+    let existing_projects = root.get("projects").cloned();
+    if existing_projects
+        .as_ref()
+        .is_none_or(|item| !item.is_table())
+    {
+        let mut projects_table = Table::new();
+        projects_table.set_implicit(true);
+
+        if let Some(inline_projects) = existing_projects
+            .as_ref()
+            .and_then(|item| item.as_inline_table())
+        {
+            for (key, value) in inline_projects.iter() {
+                if let Some(project) = value.as_inline_table() {
+                    projects_table.insert(key, Item::Table(project.clone().into_table()));
+                }
+            }
+        }
+
+        root.insert("projects", Item::Table(projects_table));
+    }
+
+    let projects_table = document["projects"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("projects table missing after initialization"))?;
+    let needs_workspace_table = !projects_table.contains_key(CODEX_RUNTIME_WORKSPACE_PATH)
+        || projects_table
+            .get(CODEX_RUNTIME_WORKSPACE_PATH)
+            .and_then(Item::as_table)
+            .is_none();
+    if needs_workspace_table {
+        projects_table.insert(CODEX_RUNTIME_WORKSPACE_PATH, toml_edit::table());
+    }
+
+    let workspace_table = projects_table
+        .get_mut(CODEX_RUNTIME_WORKSPACE_PATH)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| anyhow!("project table missing for {CODEX_RUNTIME_WORKSPACE_PATH}"))?;
+    workspace_table.set_implicit(false);
+    workspace_table["trust_level"] = toml_edit::value(CODEX_TRUSTED_LEVEL);
+    Ok(())
 }
 
 fn codex_auth_needs_refresh(
@@ -568,31 +620,6 @@ fn private_file_permissions() -> std::fs::Permissions {
     std::fs::metadata(".")
         .map(|metadata| metadata.permissions())
         .unwrap_or_else(|_| std::fs::Permissions::readonly())
-}
-
-async fn remove_runtime_codex_file_if_exists(path: &Path) -> Result<()> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                bail!(
-                    "runtime Codex file '{}' must not be a symlink",
-                    path.display()
-                );
-            }
-            if !metadata.file_type().is_file() {
-                bail!(
-                    "runtime Codex file '{}' must be a regular file",
-                    path.display()
-                );
-            }
-            tokio::fs::remove_file(path)
-                .await
-                .with_context(|| format!("failed to remove {}", path.display()))?;
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    }
 }
 
 #[cfg(unix)]
@@ -1012,7 +1039,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn syncs_host_auth_and_config_into_runtime_home_and_removes_stale_config() {
+    async fn syncs_host_auth_and_materializes_runtime_config() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1045,7 +1072,9 @@ mod tests {
                 .await
                 .expect("read copied config");
         assert!(copied_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
-        assert_eq!(copied_config, "model = \"gpt-5.4\"\n");
+        assert!(copied_config.contains("model = \"gpt-5.4\""));
+        assert!(copied_config.contains("[projects.\"/workspace\"]"));
+        assert!(copied_config.contains("trust_level = \"trusted\""));
 
         let auth_mode = std::fs::metadata(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
             .expect("runtime auth metadata")
@@ -1078,9 +1107,32 @@ mod tests {
         sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
             .await
             .expect("resync runtime home");
-        assert!(
-            !runtime_codex_home.join(CODEX_CONFIG_FILE_NAME).exists(),
-            "missing host config should remove stale runtime copy"
-        );
+        let regenerated_config =
+            tokio::fs::read_to_string(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
+                .await
+                .expect("read regenerated config");
+        assert!(!regenerated_config.contains("stale = true"));
+        assert!(regenerated_config.contains("[projects.\"/workspace\"]"));
+        assert!(regenerated_config.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn runtime_codex_config_preserves_host_projects_and_trusts_workspace() {
+        let config = runtime_codex_config_contents(Some(
+            br#"
+model = "gpt-5.4"
+
+projects = { "/host/repo" = { trust_level = "trusted", marker = "keep" } }
+"#
+            .to_vec(),
+        ))
+        .expect("runtime config");
+        let config = String::from_utf8(config).expect("config utf8");
+
+        assert!(config.contains("model = \"gpt-5.4\""));
+        assert!(config.contains("[projects.\"/host/repo\"]"));
+        assert!(config.contains("marker = \"keep\""));
+        assert!(config.contains("[projects.\"/workspace\"]"));
+        assert!(config.contains("trust_level = \"trusted\""));
     }
 }
