@@ -135,7 +135,6 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTerminalTranscriptInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
-    pub exit_code: Option<i32>,
 }
 
 #[async_trait]
@@ -417,15 +416,11 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn export_terminal_transcript(
         &self,
         _input: RuntimeTerminalTranscriptInput,
-    ) -> Result<Vec<RuntimeTerminalTurn>> {
-        Ok(Vec::new())
-    }
-    async fn export_terminal_transcript_with_executor(
-        &self,
-        _input: RuntimeTerminalTranscriptInput,
         _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<Option<Vec<RuntimeTerminalTurn>>> {
-        Ok(None)
+    ) -> Result<Vec<RuntimeTerminalTurn>> {
+        Err(anyhow!(
+            "runtime does not support native terminal transcript export"
+        ))
     }
     fn program_output_parser(
         &self,

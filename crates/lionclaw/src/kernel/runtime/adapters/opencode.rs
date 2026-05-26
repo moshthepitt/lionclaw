@@ -121,14 +121,12 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         Ok(build_opencode_terminal_program(&self.config))
     }
 
-    async fn export_terminal_transcript_with_executor(
+    async fn export_terminal_transcript(
         &self,
         _input: RuntimeTerminalTranscriptInput,
         executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<Option<Vec<RuntimeTerminalTurn>>> {
-        export_opencode_terminal_transcript_with_cli(&self.config, executor)
-            .await
-            .map(Some)
+    ) -> Result<Vec<RuntimeTerminalTurn>> {
+        export_opencode_terminal_transcript_with_cli(&self.config, executor).await
     }
 
     fn format_program_exit_error(
@@ -981,17 +979,15 @@ mod tests {
 
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
         let turns = adapter
-            .export_terminal_transcript_with_executor(
+            .export_terminal_transcript(
                 RuntimeTerminalTranscriptInput {
                     session_id: Uuid::new_v4(),
                     runtime_state_root,
-                    exit_code: Some(0),
                 },
                 &mut executor,
             )
             .await
-            .expect("export transcript")
-            .expect("cli export path handled");
+            .expect("export transcript");
 
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];

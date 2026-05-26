@@ -898,7 +898,7 @@ impl Kernel {
         phase: &'static str,
     ) {
         match self
-            .reconcile_attached_runtime_transcript(session_id, runtime_id, plan, exit_code)
+            .reconcile_attached_runtime_transcript(session_id, runtime_id, plan)
             .await
         {
             Ok(imported_count) => {
@@ -944,7 +944,6 @@ impl Kernel {
         session_id: Uuid,
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
-        exit_code: Option<i32>,
     ) -> Result<usize, KernelError> {
         let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
             return Ok(0);
@@ -955,23 +954,15 @@ impl Kernel {
         let transcript_input = RuntimeTerminalTranscriptInput {
             session_id,
             runtime_state_root,
-            exit_code,
         };
         let mut executor = AttachedRuntimeTranscriptProgramExecutor {
             plan: plan.clone(),
             codex_home_override: self.codex_home_override.clone(),
         };
-        let mut turns = match adapter
-            .export_terminal_transcript_with_executor(transcript_input.clone(), &mut executor)
+        let mut turns = adapter
+            .export_terminal_transcript(transcript_input, &mut executor)
             .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?
-        {
-            Some(turns) => turns,
-            None => adapter
-                .export_terminal_transcript(transcript_input)
-                .await
-                .map_err(|err| KernelError::Runtime(err.to_string()))?,
-        };
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         turns.sort_by(|left, right| {
             left.started_at
                 .cmp(&right.started_at)
