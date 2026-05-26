@@ -2318,6 +2318,20 @@ async fn channel_direct_grant_approval_refuses_blocked_and_revoked_exact_scopes(
         .expect_err("blocked scope must not be approved");
     assert!(matches!(blocked_err, KernelError::Conflict(message) if message == "scope_blocked"));
 
+    let blocked_route_err = kernel
+        .approve_channel_grant(grant_approval_request(
+            "email",
+            ChannelRoutingProfile::Conversation,
+            Some("email:addr:blocked@example.com"),
+            Some("email:mailbox:support@example.com"),
+            None,
+        ))
+        .await
+        .expect_err("blocked actor scope must not allow a route approval");
+    assert!(
+        matches!(blocked_route_err, KernelError::Conflict(message) if message == "scope_blocked")
+    );
+
     let revoked = kernel
         .approve_channel_grant(grant_approval_request(
             "email",
