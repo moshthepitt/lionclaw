@@ -2173,6 +2173,21 @@ async fn channel_direct_grant_approval_admits_known_email_scope() {
     let sender_ref = "email:addr:alice@example.com";
     let conversation_ref = "email:mailbox:support@example.com";
 
+    let pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "email",
+            "direct-grant-pending-known-sender",
+            sender_ref,
+            sender_ref,
+            None,
+            "approve this known sender",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("create pending direct approval");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
+    let pending_pairing_id = pending.pairing_id.expect("pending pairing id");
+
     let mut actor_req = grant_approval_request(
         "email",
         ChannelRoutingProfile::Direct,
@@ -2189,6 +2204,28 @@ async fn channel_direct_grant_approval_admits_known_email_scope() {
     assert_eq!(actor_grant.sender_ref.as_deref(), Some(sender_ref));
     assert_eq!(actor_grant.status, "approved");
     assert_eq!(actor_grant.label.as_deref(), Some("Alice"));
+
+    let pending_after_direct_approval = kernel
+        .list_channel_pairings(
+            Some("email".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
+        .await
+        .expect("list pending pairings after direct approval");
+    assert!(
+        pending_after_direct_approval.pairings.is_empty(),
+        "direct grant approval should close matching pending approvals"
+    );
+    let access_state = kernel
+        .list_channel_pairings(Some("email".to_string()), None)
+        .await
+        .expect("list channel access state");
+    let closed_pairing = access_state
+        .pairings
+        .iter()
+        .find(|pairing| pairing.pairing_id == pending_pairing_id)
+        .expect("direct approval should keep closed pairing visible");
+    assert_eq!(closed_pairing.status, ChannelPairingStatus::Approved);
 
     let mut route_req = grant_approval_request(
         "email",
@@ -2235,7 +2272,19 @@ async fn channel_direct_grant_approval_admits_known_email_scope() {
     );
 
     let route_grant_id = route_grant.grant_id.to_string();
+    let actor_grant_id = actor_grant.grant_id.to_string();
+    let pending_pairing_id = pending_pairing_id.to_string();
     let audit = wait_for_audit_event_count(&kernel, "channel.grant.approved", 2).await;
+    assert!(audit.events.iter().any(|event| {
+        event.details["grant_id"].as_str() == Some(actor_grant_id.as_str())
+            && event.details["pairing_ids"]
+                .as_array()
+                .is_some_and(|pairing_ids| {
+                    pairing_ids
+                        .iter()
+                        .any(|value| value.as_str() == Some(pending_pairing_id.as_str()))
+                })
+    }));
     assert!(audit.events.iter().any(|event| {
         event.details["grant_id"].as_str() == Some(route_grant_id.as_str())
             && event.details["pairing_id"].is_null()
@@ -2414,6 +2463,26 @@ async fn channel_direct_grant_approval_validates_scope_shapes() {
                 Some("email:thread:1"),
             ),
             "thread grant requires sender_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Thread,
+                Some("email:addr:alice@example.com"),
+                None,
+                Some("email:thread:1"),
+            ),
+            "thread grant requires conversation_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Thread,
+                Some("email:addr:alice@example.com"),
+                Some("email:mailbox:support@example.com"),
+                None,
+            ),
+            "thread grant requires thread_ref",
         ),
         (
             grant_approval_request(

@@ -642,6 +642,7 @@ async fn approve_channel_grant_rolls_back_when_audit_append_fails() {
             ..KernelOptions::default()
         })
         .await;
+    seed_pending_pairing(&kernel, "loopback", "alice").await;
 
     let pool = SqlitePool::connect(&env.db_url())
         .await
@@ -678,6 +679,21 @@ async fn approve_channel_grant_rolls_back_when_audit_append_fails() {
     assert_eq!(
         grant_count, 0,
         "direct grant row should roll back with audit"
+    );
+
+    let pending = kernel
+        .list_channel_pairings(
+            Some("loopback".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
+        .await
+        .expect("list pairings after rollback");
+    assert!(
+        pending
+            .pairings
+            .iter()
+            .any(|pairing| pairing.sender_ref.as_deref() == Some("alice")),
+        "matching pending pairing should roll back with audit"
     );
 }
 

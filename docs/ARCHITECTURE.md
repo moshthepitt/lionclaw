@@ -557,7 +557,8 @@ identity.
 10. Direct grant approval, pairing invite/claim, pairing approve/block, and
    grant revoke endpoints manage channel trust. Direct approval creates a
    durable grant for already-known normalized channel refs without creating a
-   pairing row. Invite tokens are returned once, stored only as hashes, and
+   pairing row, and closes exact matching pending operator approvals in the
+   same transaction. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
    pairing requests. Blocking a token invite by `pairing_id` marks that invite
