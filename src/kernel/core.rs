@@ -32,27 +32,27 @@ use crate::contracts::{
     ChannelActorAuthorizeResponse, ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
     ChannelAttachmentFinalizeRequest, ChannelAttachmentFinalizeResponse,
     ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelBindingView,
-    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
-    ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
-    ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
-    ChannelListResponse, ChannelOutboxAttachmentDto, ChannelOutboxAttemptStatusDto,
-    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
-    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
-    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
-    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
-    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
-    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
-    ChannelPairingView, ChannelRoutingProfile, ChannelSessionBinding, ChannelStreamAckRequest,
-    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
-    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
-    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
-    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
-    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
-    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
-    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
+    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
+    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
+    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
+    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
+    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
+    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
+    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
+    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelSessionBinding,
+    ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamEventView,
+    ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
+    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
+    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
+    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
+    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
+    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
+    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
+    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -2594,6 +2594,126 @@ impl Kernel {
         Ok(ChannelPairingBlockResponse {
             grant: blocked.grant.map(to_channel_grant_view),
             blocked_pairing_ids: blocked.blocked_pairing_ids,
+        })
+    }
+
+    pub async fn approve_channel_grant(
+        &self,
+        req: ChannelGrantApproveRequest,
+    ) -> Result<ChannelGrantResponse, KernelError> {
+        let approval = validate_channel_grant_approval(req)?;
+        self.require_active_channel_binding(&approval.channel_id)
+            .await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+
+        if let Some(existing) = self
+            .channel_state
+            .get_grant_by_scope_in_tx(
+                &mut tx,
+                &approval.channel_id,
+                approval.scope.sender_ref.as_deref(),
+                approval.scope.conversation_ref.as_deref(),
+                approval.scope.thread_ref.as_deref(),
+                approval.routing_profile,
+            )
+            .await
+            .map_err(internal)?
+        {
+            match existing.status {
+                ChannelGrantStatus::Approved => {
+                    tx.commit().await.map_err(|err| internal(err.into()))?;
+                    return Ok(ChannelGrantResponse {
+                        grant: to_channel_grant_view(existing),
+                    });
+                }
+                ChannelGrantStatus::Blocked => {
+                    return Err(KernelError::Conflict("scope_blocked".to_string()));
+                }
+                ChannelGrantStatus::Revoked => {
+                    return Err(KernelError::Conflict("scope_revoked".to_string()));
+                }
+            }
+        }
+
+        if self
+            .channel_state
+            .find_blocking_grant_for_scope_in_tx(
+                &mut tx,
+                &approval.channel_id,
+                approval.scope.sender_ref.as_deref(),
+                approval.scope.conversation_ref.as_deref(),
+                approval.scope.thread_ref.as_deref(),
+                approval.routing_profile,
+            )
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(KernelError::Conflict("scope_blocked".to_string()));
+        }
+
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: &approval.channel_id,
+                    sender_ref: approval.scope.sender_ref.as_deref(),
+                    conversation_ref: approval.scope.conversation_ref.as_deref(),
+                    thread_ref: approval.scope.thread_ref.as_deref(),
+                    routing_profile: approval.routing_profile,
+                    trust_tier: approval.trust_tier.clone(),
+                    status: ChannelGrantStatus::Approved,
+                    label: approval.label.as_deref(),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let reason_code = approval
+            .reason
+            .as_deref()
+            .unwrap_or("operator_direct_approved");
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.grant.approved",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": approval.channel_id,
+                    "event_id": null,
+                    "sender_ref": grant.sender_ref,
+                    "conversation_ref": grant.conversation_ref,
+                    "thread_ref": grant.thread_ref,
+                    "reason_code": reason_code,
+                    "grant_id": grant.grant_id,
+                    "pairing_id": null,
+                    "routing_profile": grant.routing_profile.as_str(),
+                    "trust_tier": grant.trust_tier.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.approved",
+            None,
+            "api",
+            json!({
+                "channel_id": approval.channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": null,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantResponse {
+            grant: to_channel_grant_view(grant),
         })
     }
 
@@ -8496,6 +8616,17 @@ struct ValidatedPairingInvite {
     operator_actor_sender_ref: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedChannelGrantApproval {
+    channel_id: String,
+    scope: GrantScope,
+    routing_profile: ChannelRoutingProfile,
+    trust_tier: TrustTier,
+    label: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct GrantScope {
     sender_ref: Option<String>,
     conversation_ref: Option<String>,
@@ -9430,6 +9561,77 @@ fn existing_token_claim_grant_outcome(
         }
         ChannelGrantStatus::Revoked => None,
     }
+}
+
+fn validate_channel_grant_approval(
+    req: ChannelGrantApproveRequest,
+) -> Result<ValidatedChannelGrantApproval, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let sender_ref = trim_optional(req.sender_ref);
+    let conversation_ref = trim_optional(req.conversation_ref);
+    let thread_ref = trim_optional(req.thread_ref);
+    let scope = match req.routing_profile {
+        ChannelRoutingProfile::Direct => {
+            if conversation_ref.is_some() || thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "direct grant must not include conversation_ref or thread_ref".to_string(),
+                ));
+            }
+            let sender_ref = sender_ref.ok_or_else(|| {
+                KernelError::BadRequest("direct grant requires sender_ref".to_string())
+            })?;
+            GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+            }
+        }
+        ChannelRoutingProfile::Conversation => {
+            if thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "conversation grant must not include thread_ref".to_string(),
+                ));
+            }
+            let conversation_ref = conversation_ref.ok_or_else(|| {
+                KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
+            })?;
+            GrantScope {
+                sender_ref,
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+            }
+        }
+        ChannelRoutingProfile::Thread => {
+            let sender_ref = sender_ref.ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires sender_ref".to_string())
+            })?;
+            let conversation_ref = conversation_ref.ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires conversation_ref".to_string())
+            })?;
+            let thread_ref = thread_ref.ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires thread_ref".to_string())
+            })?;
+            GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: Some(thread_ref),
+            }
+        }
+        ChannelRoutingProfile::Outbound => {
+            return Err(KernelError::BadRequest(
+                "outbound grants cannot be directly approved for inbound admission".to_string(),
+            ));
+        }
+    };
+
+    Ok(ValidatedChannelGrantApproval {
+        channel_id,
+        scope,
+        routing_profile: req.routing_profile,
+        trust_tier: req.trust_tier.unwrap_or(TrustTier::Main),
+        label: trim_optional(req.label),
+        reason: trim_optional(req.reason),
+    })
 }
 
 fn grant_scope_from_pairing(

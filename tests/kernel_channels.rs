@@ -14,6 +14,7 @@ use lionclaw::{
         ChannelActorAuthorizeRequest, ChannelAttachmentDescriptor,
         ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
         ChannelAttachmentMissingReport, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
+        ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
         ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
         ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome,
         ChannelInboundRequest, ChannelOperatorActor, ChannelOutboxDeliveryStatusDto,
@@ -48,6 +49,25 @@ fn expect_blocked_grant(blocked: ChannelPairingBlockResponse) -> ChannelGrantVie
     let grant = blocked.grant.expect("block response should include grant");
     assert_eq!(grant.status, "blocked");
     grant
+}
+
+fn grant_approval_request(
+    channel_id: &str,
+    routing_profile: ChannelRoutingProfile,
+    sender_ref: Option<&str>,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> ChannelGrantApproveRequest {
+    ChannelGrantApproveRequest {
+        channel_id: channel_id.to_string(),
+        sender_ref: sender_ref.map(str::to_string),
+        conversation_ref: conversation_ref.map(str::to_string),
+        thread_ref: thread_ref.map(str::to_string),
+        routing_profile,
+        trust_tier: Some(TrustTier::Main),
+        label: None,
+        reason: None,
+    }
 }
 
 #[tokio::test]
@@ -2143,6 +2163,317 @@ async fn channels_v2_block_by_scope_closes_matching_pending_pairing() {
         .expect("blocked inbound handled");
     assert_eq!(inbound.outcome, ChannelInboundOutcome::Blocked);
     assert_eq!(inbound.reason_code.as_deref(), Some("blocked_grant"));
+}
+
+#[tokio::test]
+async fn channel_direct_grant_approval_admits_known_email_scope() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-email-skill").await;
+    let kernel = env.kernel().await;
+    let sender_ref = "email:addr:alice@example.com";
+    let conversation_ref = "email:mailbox:support@example.com";
+
+    let mut actor_req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some(" email:addr:alice@example.com "),
+        None,
+        None,
+    );
+    actor_req.label = Some(" Alice ".to_string());
+    let actor_grant = kernel
+        .approve_channel_grant(actor_req)
+        .await
+        .expect("approve known actor grant")
+        .grant;
+    assert_eq!(actor_grant.sender_ref.as_deref(), Some(sender_ref));
+    assert_eq!(actor_grant.status, "approved");
+    assert_eq!(actor_grant.label.as_deref(), Some("Alice"));
+
+    let mut route_req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Conversation,
+        Some(sender_ref),
+        Some(conversation_ref),
+        None,
+    );
+    route_req.reason = Some("operator_approved_known_identity".to_string());
+    let route_grant = kernel
+        .approve_channel_grant(route_req)
+        .await
+        .expect("approve known conversation grant")
+        .grant;
+    assert_eq!(
+        route_grant.routing_profile,
+        ChannelRoutingProfile::Conversation
+    );
+    assert_eq!(route_grant.sender_ref.as_deref(), Some(sender_ref));
+    assert_eq!(
+        route_grant.conversation_ref.as_deref(),
+        Some(conversation_ref)
+    );
+    assert_eq!(route_grant.trust_tier.as_str(), "main");
+
+    let authorized = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "email".to_string(),
+            sender_ref: sender_ref.to_string(),
+            conversation_ref: conversation_ref.to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Command,
+            session_binding: ChannelSessionBinding::Grant,
+        })
+        .await
+        .expect("authorize directly approved scope");
+    assert!(authorized.authorized);
+    assert_eq!(authorized.reason_code, "authorized");
+    assert_eq!(authorized.grant_id, Some(route_grant.grant_id));
+    let expected_session_key = conversation_session_key("email", conversation_ref, sender_ref);
+    assert_eq!(
+        authorized.session_key.as_deref(),
+        Some(expected_session_key.as_str())
+    );
+
+    let route_grant_id = route_grant.grant_id.to_string();
+    let audit = wait_for_audit_event_count(&kernel, "channel.grant.approved", 2).await;
+    assert!(audit.events.iter().any(|event| {
+        event.details["grant_id"].as_str() == Some(route_grant_id.as_str())
+            && event.details["pairing_id"].is_null()
+            && event.details["reason_code"].as_str() == Some("operator_approved_known_identity")
+            && event.details["routing_profile"].as_str() == Some("conversation")
+    }));
+}
+
+#[tokio::test]
+async fn channel_direct_grant_approval_is_idempotent_for_existing_approved_scope() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-idempotent-skill").await;
+    let kernel = env.kernel().await;
+
+    let mut req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some("email:addr:alice@example.com"),
+        None,
+        None,
+    );
+    req.label = Some("Alice".to_string());
+    let first = kernel
+        .approve_channel_grant(req.clone())
+        .await
+        .expect("approve direct grant")
+        .grant;
+
+    let mut duplicate = req;
+    duplicate.trust_tier = Some(TrustTier::Untrusted);
+    duplicate.label = Some("Renamed".to_string());
+    duplicate.reason = Some("second approval attempt".to_string());
+    let second = kernel
+        .approve_channel_grant(duplicate)
+        .await
+        .expect("idempotent duplicate approval")
+        .grant;
+
+    assert_eq!(second.grant_id, first.grant_id);
+    assert_eq!(second.status, "approved");
+    assert_eq!(second.trust_tier.as_str(), "main");
+    assert_eq!(second.label.as_deref(), Some("Alice"));
+
+    let audit = wait_for_audit_event_count(&kernel, "channel.grant.approved", 1).await;
+    assert_eq!(
+        audit.events.len(),
+        1,
+        "idempotent approval must not append another audit event"
+    );
+}
+
+#[tokio::test]
+async fn channel_direct_grant_approval_refuses_blocked_and_revoked_exact_scopes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-conflict-skill").await;
+    let kernel = env.kernel().await;
+
+    expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "email".to_string(),
+                pairing_id: None,
+                sender_ref: Some("email:addr:blocked@example.com".to_string()),
+                conversation_ref: None,
+                thread_ref: None,
+                reason: Some("operator_blocked".to_string()),
+            })
+            .await
+            .expect("block direct scope"),
+    );
+    let blocked_err = kernel
+        .approve_channel_grant(grant_approval_request(
+            "email",
+            ChannelRoutingProfile::Direct,
+            Some("email:addr:blocked@example.com"),
+            None,
+            None,
+        ))
+        .await
+        .expect_err("blocked scope must not be approved");
+    assert!(matches!(blocked_err, KernelError::Conflict(message) if message == "scope_blocked"));
+
+    let revoked = kernel
+        .approve_channel_grant(grant_approval_request(
+            "email",
+            ChannelRoutingProfile::Direct,
+            Some("email:addr:revoked@example.com"),
+            None,
+            None,
+        ))
+        .await
+        .expect("approve scope to revoke")
+        .grant;
+    kernel
+        .revoke_channel_grant(ChannelGrantRevokeRequest {
+            channel_id: "email".to_string(),
+            grant_id: revoked.grant_id,
+            reason: Some("operator_revoked".to_string()),
+        })
+        .await
+        .expect("revoke direct grant");
+    let revoked_err = kernel
+        .approve_channel_grant(grant_approval_request(
+            "email",
+            ChannelRoutingProfile::Direct,
+            Some("email:addr:revoked@example.com"),
+            None,
+            None,
+        ))
+        .await
+        .expect_err("revoked scope must require explicit recovery");
+    assert!(matches!(revoked_err, KernelError::Conflict(message) if message == "scope_revoked"));
+}
+
+#[tokio::test]
+async fn channel_direct_grant_approval_validates_scope_shapes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-validation-skill").await;
+    let kernel = env.kernel().await;
+
+    let cases = vec![
+        (
+            grant_approval_request("email", ChannelRoutingProfile::Direct, None, None, None),
+            "direct grant requires sender_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Direct,
+                Some("email:addr:alice@example.com"),
+                Some("email:mailbox:support@example.com"),
+                None,
+            ),
+            "direct grant must not include conversation_ref or thread_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Conversation,
+                Some("email:addr:alice@example.com"),
+                None,
+                None,
+            ),
+            "conversation grant requires conversation_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Conversation,
+                Some("email:addr:alice@example.com"),
+                Some("email:mailbox:support@example.com"),
+                Some("email:thread:1"),
+            ),
+            "conversation grant must not include thread_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Thread,
+                None,
+                Some("email:mailbox:support@example.com"),
+                Some("email:thread:1"),
+            ),
+            "thread grant requires sender_ref",
+        ),
+        (
+            grant_approval_request(
+                "email",
+                ChannelRoutingProfile::Outbound,
+                Some("email:addr:alice@example.com"),
+                Some("email:mailbox:support@example.com"),
+                None,
+            ),
+            "outbound grants cannot be directly approved",
+        ),
+    ];
+
+    for (req, expected_message) in cases {
+        let err = kernel
+            .approve_channel_grant(req)
+            .await
+            .expect_err("invalid direct approval shape should fail");
+        assert!(
+            matches!(&err, KernelError::BadRequest(message) if message.contains(expected_message)),
+            "expected bad request containing {expected_message:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn worker_can_approve_channel_grant_over_http() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-http-skill").await;
+    let kernel = env.kernel().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test api");
+    let bind_addr = listener.local_addr().expect("test api addr").to_string();
+    let app = build_router(
+        std::sync::Arc::new(kernel.clone()),
+        test_daemon_info(&env, bind_addr.clone()),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test api");
+    });
+
+    let mut req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some("email:addr:alice@example.com"),
+        None,
+        None,
+    );
+    req.label = Some("Alice".to_string());
+    let response = reqwest::Client::new()
+        .post(format!("http://{bind_addr}/v0/channels/grants/approve"))
+        .json(&req)
+        .send()
+        .await
+        .expect("approve grant over http");
+    let status = response.status();
+    let text = response.text().await.expect("read grant response");
+    assert!(status.is_success(), "{status}: {text}");
+    let accepted: ChannelGrantResponse =
+        serde_json::from_str(&text).expect("decode grant response");
+    assert_eq!(accepted.grant.channel_id, "email");
+    assert_eq!(
+        accepted.grant.sender_ref.as_deref(),
+        Some("email:addr:alice@example.com")
+    );
+    assert_eq!(
+        accepted.grant.routing_profile,
+        ChannelRoutingProfile::Direct
+    );
+    assert_eq!(accepted.grant.status, "approved");
+    assert_eq!(accepted.grant.label.as_deref(), Some("Alice"));
+
+    server.abort();
 }
 
 #[tokio::test]

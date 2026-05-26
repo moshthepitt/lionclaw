@@ -441,6 +441,7 @@ with the CLI.
 - `POST /v0/channels/pairing/claim`
 - `POST /v0/channels/pairing/approve`
 - `POST /v0/channels/pairing/block`
+- `POST /v0/channels/grants/approve`
 - `POST /v0/channels/grants/revoke`
 - `POST /v0/channels/authorize`
 - `POST /v0/channels/inbound`
@@ -553,8 +554,10 @@ identity.
    oversized identities or timestamps more than two minutes in the future are
    rejected; stored far-future reports are excluded from latest-health selection.
 9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
-10. Pairing invite/claim, approve/block, and grant revoke endpoints manage
-   channel trust. Invite tokens are returned once, stored only as hashes, and
+10. Direct grant approval, pairing invite/claim, pairing approve/block, and
+   grant revoke endpoints manage channel trust. Direct approval creates a
+   durable grant for already-known normalized channel refs without creating a
+   pairing row. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
    pairing requests. Blocking a token invite by `pairing_id` marks that invite
@@ -699,7 +702,10 @@ conversation-wide (`sender_ref` absent) so a delegated group invite connects the
 group rather than the admin who happened to claim the link. Non-direct channel
 routes still require the sender to have an approved direct host grant before a
 turn or local channel control is authorized; the route grant authorizes the
-destination, and the direct grant authorizes the actor. `session_binding` is
+destination, and the direct grant authorizes the actor. Direct grant approval
+uses the same `channel_grants` records for known scopes, audits
+`channel.grant.approved` with no `pairing_id`, and does not bypass the direct
+actor requirement for conversation or thread routes. `session_binding` is
 applied only after those admission checks pass and cannot authorize an actor,
 route, trigger, or attachment. Pairing claim audit stores normalized identity
 and outcome facts only, never raw worker provider metadata.
