@@ -218,8 +218,10 @@ project-owned.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex exports completed turns
-from its JSONL session logs under the runtime-private `.codex/sessions` tree.
-OpenCode exports completed turns by running OpenCode's own
+through Codex's app-server `thread/list` and `thread/read` protocol inside the
+same runtime boundary. If that protocol is unavailable, the adapter can fall
+back to Codex rollout files under the runtime-private `.codex/sessions` tree
+for compatibility. OpenCode exports completed turns by running OpenCode's own
 `session list --format json` and `export <sessionID>` commands inside the same
 runtime boundary after the native TUI exits.
 The kernel imports those turns into canonical `session_turns` with deterministic

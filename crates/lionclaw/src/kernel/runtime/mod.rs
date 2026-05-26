@@ -3,6 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -139,7 +140,17 @@ pub struct RuntimeTerminalTranscriptInput {
 
 #[async_trait]
 pub trait RuntimeTerminalTranscriptProgramExecutor: Send {
+    fn hard_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+
     async fn execute(&mut self, program: RuntimeProgramSpec) -> Result<ExecutionOutput>;
+
+    async fn spawn(&mut self, _program: RuntimeProgramSpec) -> Result<ExecutionSession> {
+        Err(anyhow!(
+            "runtime transcript executor does not support interactive programs"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

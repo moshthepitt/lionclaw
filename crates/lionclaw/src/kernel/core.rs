@@ -122,17 +122,18 @@ use super::{
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         project_runtime_skills, register_builtin_runtime_adapters,
-        resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
-        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
-        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
-        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionProfile,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
+        EffectiveExecutionPlan, EscapeClass, ExecutionOutput, ExecutionPlanPurpose,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        ExecutionRequest, ExecutionSession, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
+        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
+        RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -500,6 +501,10 @@ struct AttachedRuntimeTranscriptProgramExecutor {
 
 #[async_trait::async_trait]
 impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgramExecutor {
+    fn hard_timeout(&self) -> std::time::Duration {
+        self.plan.hard_timeout
+    }
+
     async fn execute(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionOutput> {
         let hard_timeout = self.plan.hard_timeout;
         timeout(
@@ -518,6 +523,16 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
                 hard_timeout.as_secs_f32()
             )
         })?
+    }
+
+    async fn spawn(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionSession> {
+        spawn_interactive(ExecutionRequest {
+            plan: self.plan.clone(),
+            program,
+            runtime_secrets_mount: None,
+            codex_home_override: self.codex_home_override.clone(),
+        })
+        .await
     }
 }
 
