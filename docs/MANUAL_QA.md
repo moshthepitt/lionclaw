@@ -185,8 +185,10 @@ Expected:
 - completed Codex and OpenCode native UI turns are present in LionClaw session
   history and are available to later `lionclaw run`, `run --plain`, and
   channel context
-- relaunching the native UI reconciles durable runtime transcript state without
-  duplicating already imported turns
+- after a clean exit, relaunching the native UI starts without a prelaunch
+  transcript-export pass
+- after an unclean LionClaw exit, relaunching the native UI reconciles durable
+  runtime transcript state without duplicating already imported turns
 
 Use these prompts:
 

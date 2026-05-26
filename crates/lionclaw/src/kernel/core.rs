@@ -66,7 +66,7 @@ use crate::{
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
-        RUNTIME_SESSION_READY_MARKER,
+        RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
     },
     project_inventory::{
         ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
@@ -494,6 +494,9 @@ pub struct AttachedRuntimeLaunchInput {
     pub timeout_ms: Option<u64>,
 }
 
+const RUNTIME_TUI_STATE_RUNNING: &str = "running";
+const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
+
 struct AttachedRuntimeTranscriptProgramExecutor {
     plan: EffectiveExecutionPlan,
     codex_home_override: Option<PathBuf>,
@@ -778,18 +781,23 @@ impl Kernel {
                 },
             )
             .await?;
+        let recover_before_launch = self
+            .attached_runtime_needs_prelaunch_reconcile(&execution_plan)
+            .await;
         self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
         self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
             .await?;
-        self.reconcile_attached_runtime_transcript_best_effort(
-            session_id,
-            &runtime_id,
-            &execution_plan,
-            None,
-            "before_launch",
-        )
-        .await;
+        if recover_before_launch {
+            self.reconcile_attached_runtime_transcript_best_effort(
+                session_id,
+                &runtime_id,
+                &execution_plan,
+                None,
+                "before_launch",
+            )
+            .await;
+        }
         self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
             .await?;
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
@@ -811,6 +819,8 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.mark_attached_runtime_launch_started(&execution_plan)
+            .await?;
 
         Ok(ExecutionRequest {
             plan: execution_plan,
@@ -862,16 +872,22 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
     ) -> Result<(), KernelError> {
-        self.reconcile_attached_runtime_transcript_best_effort(
-            session_id,
-            runtime_id,
-            plan,
-            exit_code,
-            "after_exit",
-        )
-        .await;
-        if exit_code == Some(0) {
+        let reconciled = self
+            .reconcile_attached_runtime_transcript_best_effort(
+                session_id,
+                runtime_id,
+                plan,
+                exit_code,
+                "after_exit",
+            )
+            .await;
+        if reconciled {
+            self.mark_attached_runtime_reconciled(plan).await;
+        }
+        if exit_code == Some(0) && reconciled {
             self.mark_runtime_session_ready(plan).await;
+        } else {
+            self.clear_runtime_session_ready(plan).await;
         }
         self.audit
             .append(
@@ -896,7 +912,7 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
         phase: &'static str,
-    ) {
+    ) -> bool {
         match self
             .reconcile_attached_runtime_transcript(session_id, runtime_id, plan)
             .await
@@ -914,6 +930,7 @@ impl Kernel {
                     }),
                 )
                 .await;
+                true
             }
             Err(err) => {
                 warn!(
@@ -935,6 +952,7 @@ impl Kernel {
                     }),
                 )
                 .await;
+                false
             }
         }
     }
@@ -6660,13 +6678,22 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::Path};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
     use super::*;
     use crate::kernel::continuity::title_file_name;
+    use crate::kernel::runtime::{RuntimeAdapterInfo, RuntimeEventSender};
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::project_inventory::{
         ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
@@ -6721,6 +6748,112 @@ mod tests {
             escape_classes: std::collections::BTreeSet::new(),
             limits: crate::kernel::runtime::ExecutionLimits::default(),
         }
+    }
+
+    struct CountingTerminalRuntimeAdapter {
+        exports: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for CountingTerminalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: "counting-terminal".to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("counting-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        fn build_terminal_program(&self) -> anyhow::Result<RuntimeProgramSpec> {
+            Ok(RuntimeProgramSpec {
+                executable: "counting-terminal".to_string(),
+                ..RuntimeProgramSpec::default()
+            })
+        }
+
+        async fn export_terminal_transcript(
+            &self,
+            _input: RuntimeTerminalTranscriptInput,
+            _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
+        ) -> anyhow::Result<Vec<RuntimeTerminalTurn>> {
+            self.exports.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn open_test_session(kernel: &Kernel) -> Uuid {
+        kernel
+            .open_session(SessionOpenRequest {
+                channel_id: "terminal".to_string(),
+                peer_id: "tester".to_string(),
+                trust_tier: TrustTier::Main,
+                history_policy: None,
+            })
+            .await
+            .expect("open session")
+            .session_id
+    }
+
+    async fn kernel_with_counting_terminal_runtime(
+        temp_dir: &tempfile::TempDir,
+    ) -> (Kernel, Arc<AtomicUsize>) {
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_root)
+            .await
+            .expect("workspace");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let exports = Arc::new(AtomicUsize::new(0));
+        kernel
+            .register_runtime_adapter(
+                "counting-terminal",
+                Arc::new(CountingTerminalRuntimeAdapter {
+                    exports: Arc::clone(&exports),
+                }),
+            )
+            .await;
+        (kernel, exports)
     }
 
     #[tokio::test]
@@ -7180,6 +7313,121 @@ mod tests {
                 .await
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_skips_prelaunch_reconcile_for_clean_state() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let session_id = open_test_session(&kernel).await;
+
+        let first = kernel
+            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
+                session_id,
+                runtime_id: "counting-terminal".to_string(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("prepare first launch");
+        let runtime_state_root = Kernel::runtime_state_root(&first.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        assert_eq!(exports.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read TUI state"),
+            "running\n"
+        );
+
+        kernel
+            .finish_attached_runtime_launch(session_id, "counting-terminal", &first.plan, Some(0))
+            .await
+            .expect("finish first launch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read clean TUI state"),
+            "clean\n"
+        );
+        assert!(runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file());
+
+        let second = kernel
+            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
+                session_id,
+                runtime_id: "counting-terminal".to_string(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("prepare clean relaunch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read running TUI state"),
+            "running\n"
+        );
+        assert!(!runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .exists());
+        assert_eq!(
+            Kernel::runtime_state_root(&second.plan),
+            Some(runtime_state_root.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_recovers_dirty_state_before_relaunch() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let session_id = open_test_session(&kernel).await;
+
+        let first = kernel
+            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
+                session_id,
+                runtime_id: "counting-terminal".to_string(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("prepare first launch");
+        let runtime_state_root = Kernel::runtime_state_root(&first.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        assert_eq!(exports.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read TUI state"),
+            "running\n"
+        );
+
+        let second = kernel
+            .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
+                session_id,
+                runtime_id: "counting-terminal".to_string(),
+                timeout_ms: None,
+            })
+            .await
+            .expect("prepare recovery launch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
+                .await
+                .expect("read recovered TUI state"),
+            "running\n"
+        );
+        assert_eq!(
+            Kernel::runtime_state_root(&second.plan),
+            Some(runtime_state_root.as_path())
         );
     }
 
@@ -13505,6 +13753,73 @@ impl Kernel {
         }
     }
 
+    fn runtime_tui_state_path(plan: &EffectiveExecutionPlan) -> Option<PathBuf> {
+        Some(Self::runtime_state_root(plan)?.join(RUNTIME_TUI_STATE_MARKER))
+    }
+
+    async fn attached_runtime_needs_prelaunch_reconcile(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> bool {
+        let Some(path) = Self::runtime_tui_state_path(plan) else {
+            return false;
+        };
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => match contents.trim() {
+                RUNTIME_TUI_STATE_RUNNING => true,
+                RUNTIME_TUI_STATE_CLEAN => false,
+                other => {
+                    warn!(
+                        path = %path.display(),
+                        state = other,
+                        "unknown runtime TUI state; reconciling before launch"
+                    );
+                    true
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    path = %path.display(),
+                    "failed to read runtime TUI state; reconciling before launch"
+                );
+                true
+            }
+        }
+    }
+
+    async fn mark_attached_runtime_launch_started(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        self.clear_runtime_session_ready(plan).await;
+        self.write_runtime_tui_state(plan, RUNTIME_TUI_STATE_RUNNING)
+            .await
+    }
+
+    async fn mark_attached_runtime_reconciled(&self, plan: &EffectiveExecutionPlan) {
+        if let Err(err) = self
+            .write_runtime_tui_state(plan, RUNTIME_TUI_STATE_CLEAN)
+            .await
+        {
+            warn!(?err, "failed to mark runtime TUI state clean");
+        }
+    }
+
+    async fn write_runtime_tui_state(
+        &self,
+        plan: &EffectiveExecutionPlan,
+        state: &'static str,
+    ) -> Result<(), KernelError> {
+        let Some(path) = Self::runtime_tui_state_path(plan) else {
+            return Ok(());
+        };
+        tokio::fs::write(&path, format!("{state}\n"))
+            .await
+            .map_err(|err| internal(err.into()))
+    }
+
     async fn mark_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return;
@@ -13523,10 +13838,13 @@ impl Kernel {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return;
         };
-        match tokio::fs::remove_file(runtime_state_root.join(RUNTIME_SESSION_READY_MARKER)).await {
+        let path = runtime_state_root.join(RUNTIME_SESSION_READY_MARKER);
+        match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {}
+            Err(err) => {
+                warn!(?err, path = %path.display(), "failed to clear runtime session ready marker");
+            }
         }
     }
 

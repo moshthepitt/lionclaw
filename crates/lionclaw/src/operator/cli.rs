@@ -839,7 +839,6 @@ pub async fn run() -> Result<ExitCode> {
                 }
                 run_runtime_tui(RunRuntimeTuiInvocation {
                     home: &target.instance_home,
-                    project_root: target.project_root.as_deref(),
                     work_root: target.require_work_root()?,
                     instance_name: target.instance_name.as_deref(),
                     project_instance_runtime: target.project_instance_runtime_context()?,

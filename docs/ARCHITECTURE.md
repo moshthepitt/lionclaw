@@ -227,11 +227,13 @@ same runtime boundary. OpenCode exports completed turns by running OpenCode's
 own `session list --format json` and `export <sessionID>` commands inside the
 same runtime boundary after the native TUI exits.
 The kernel imports those turns into canonical `session_turns` with deterministic
-source-derived ids, so reconciliation is idempotent. Reconciliation runs before
-each attached launch and after process exit; if LionClaw itself exits before an
-after-exit pass, the next launch recovers any completed runtime turns already
-written by the harness. Reconciliation errors are audited and logged but do not
-prevent the operator from leaving the native TUI cleanly.
+source-derived ids, so reconciliation is idempotent. Reconciliation runs after
+process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
+shows the prior attached launch did not complete its after-exit pass; that keeps
+normal startup fast while still recovering completed runtime turns already
+written by the harness after an unclean LionClaw exit. Reconciliation errors are
+audited and logged but do not prevent the operator from leaving the native TUI
+cleanly.
 
 Native TUI mode does not provide typed live answer/reasoning events to
 channels. The normal operator console, `run --plain`, channel turns, and

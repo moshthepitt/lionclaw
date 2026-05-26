@@ -12,6 +12,7 @@ pub const RUNTIME_PROJECTS_DIR: &str = "projects";
 pub const RUNTIME_SESSIONS_DIR: &str = "sessions";
 pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
+pub const RUNTIME_TUI_STATE_MARKER: &str = ".lionclaw-runtime-tui-state";
 
 #[derive(Debug, Clone)]
 pub struct LionClawHome {

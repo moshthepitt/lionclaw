@@ -12,7 +12,6 @@ use crate::{
             kernel_to_anyhow, local_peer_id_for_project, resolve_repl_session,
             resolve_run_runtime_id,
         },
-        runtime::validate_runtime_launch_prerequisites_for_work_root,
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -20,7 +19,6 @@ use crate::{
 
 pub(crate) struct RunRuntimeTuiInvocation<'a> {
     pub(crate) home: &'a LionClawHome,
-    pub(crate) project_root: Option<&'a Path>,
     pub(crate) work_root: &'a Path,
     pub(crate) instance_name: Option<&'a str>,
     pub(crate) project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
@@ -32,7 +30,6 @@ pub(crate) struct RunRuntimeTuiInvocation<'a> {
 pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> Result<()> {
     let RunRuntimeTuiInvocation {
         home,
-        project_root,
         work_root,
         instance_name,
         project_instance_runtime,
@@ -46,14 +43,6 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         requested_runtime.as_deref(),
         instance_name.unwrap_or("selected home"),
     )?;
-    validate_runtime_launch_prerequisites_for_work_root(
-        home,
-        &config,
-        &runtime_id,
-        project_root,
-        Some(work_root),
-    )
-    .await?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
