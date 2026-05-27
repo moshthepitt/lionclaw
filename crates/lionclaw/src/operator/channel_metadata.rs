@@ -442,8 +442,10 @@ fn looks_like_path(raw: &str) -> bool {
         || raw.contains('/')
 }
 
-fn bundled_channel_skill_dir(channel_id: &str) -> PathBuf {
+pub(crate) fn bundled_channel_skill_dir(channel_id: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
         .join("skills")
         .join(format!("channel-{channel_id}"))
 }

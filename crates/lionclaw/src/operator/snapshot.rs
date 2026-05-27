@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -37,21 +37,42 @@ pub struct InstalledSnapshot {
     pub skill_md: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SnapshotOverlay {
+    pub source_path: PathBuf,
+    pub relative_path: PathBuf,
+}
+
+impl SnapshotOverlay {
+    pub fn new(source_path: PathBuf, relative_path: PathBuf) -> Self {
+        Self {
+            source_path,
+            relative_path,
+        }
+    }
+}
+
 pub fn install_snapshot(
     home: &LionClawHome,
     alias: &str,
     source: &str,
     reference: &str,
 ) -> Result<InstalledSnapshot> {
+    install_snapshot_with_overlays(home, alias, source, reference, &[])
+}
+
+pub fn install_snapshot_with_overlays(
+    home: &LionClawHome,
+    alias: &str,
+    source: &str,
+    reference: &str,
+    overlays: &[SnapshotOverlay],
+) -> Result<InstalledSnapshot> {
     let source_uri = normalize_local_source(source)?;
     let source_path = resolve_local_source(&source_uri)?;
     let skill_md = read_source_skill_md(&source_path)?;
     let (name, _) = parse_skill_frontmatter(&skill_md);
-    let hash = hash_directory(&source_path)?;
     let snapshot_abs_dir = home.skills_dir().join(alias);
-    let install_id = existing_install_id_for_same_content(&snapshot_abs_dir, &hash)?
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let skill_id = derive_skill_id(&name, &hash, Some(&install_id));
     let staging_dir = home
         .skills_dir()
         .join(format!(".{alias}.tmp-{}", Uuid::new_v4()));
@@ -61,6 +82,11 @@ pub fn install_snapshot(
             .with_context(|| format!("failed to clean {}", staging_dir.display()))?;
     }
     copy_snapshot_tree(&source_path, &staging_dir)?;
+    apply_snapshot_overlays(&staging_dir, overlays)?;
+    let hash = hash_directory(&staging_dir)?;
+    let install_id = existing_install_id_for_same_content(&snapshot_abs_dir, &hash)?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let skill_id = derive_skill_id(&name, &hash, Some(&install_id));
     write_install_metadata(&staging_dir, &source_uri, reference, &install_id)?;
 
     match fs::symlink_metadata(&snapshot_abs_dir) {
@@ -93,6 +119,91 @@ pub fn install_snapshot(
         snapshot_abs_dir,
         skill_md,
     })
+}
+
+fn apply_snapshot_overlays(destination_root: &Path, overlays: &[SnapshotOverlay]) -> Result<()> {
+    for overlay in overlays {
+        validate_overlay_relative_path(&overlay.relative_path)?;
+        let source_metadata = fs::symlink_metadata(&overlay.source_path)
+            .with_context(|| format!("failed to stat {}", overlay.source_path.display()))?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "snapshot overlay source '{}' must not be a symlink",
+                overlay.source_path.display()
+            ));
+        }
+        if !source_metadata.is_file() {
+            return Err(anyhow!(
+                "snapshot overlay source '{}' is not a regular file",
+                overlay.source_path.display()
+            ));
+        }
+
+        let destination = destination_root.join(&overlay.relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(anyhow!(
+                        "snapshot overlay destination '{}' must not be a symlink",
+                        destination.display()
+                    ));
+                }
+                if !metadata.is_file() {
+                    return Err(anyhow!(
+                        "snapshot overlay destination '{}' is not a regular file",
+                        destination.display()
+                    ));
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat {}", destination.display()));
+            }
+        }
+
+        fs::copy(&overlay.source_path, &destination).with_context(|| {
+            format!(
+                "failed to copy snapshot overlay '{}' to '{}'",
+                overlay.source_path.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn validate_overlay_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        return Err(anyhow!(
+            "snapshot overlay path '{}' must be relative",
+            path.display()
+        ));
+    }
+
+    let mut saw_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_component = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "snapshot overlay path '{}' must stay inside the skill snapshot",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if !saw_component {
+        return Err(anyhow!("snapshot overlay path must not be empty"));
+    }
+
+    Ok(())
 }
 
 pub fn resolve_local_source(source_uri: &str) -> Result<PathBuf> {
@@ -394,7 +505,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::install_snapshot;
+    use super::{install_snapshot, install_snapshot_with_overlays, SnapshotOverlay};
 
     fn write_skill_source(root: &Path, name: &str) -> PathBuf {
         let source_dir = root.join(name);
@@ -406,6 +517,17 @@ mod tests {
         .expect("skill");
         fs::write(source_dir.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
         source_dir
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("chmod");
+        }
     }
 
     #[test]
@@ -435,6 +557,55 @@ mod tests {
         assert_eq!(first.skill_id, second.skill_id);
         assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
         assert!(first.snapshot_abs_dir.join("scripts/worker").exists());
+    }
+
+    #[test]
+    fn installs_overlay_files_as_part_of_snapshot_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-team-local");
+        let worker_bin = temp_dir.path().join("lionclaw-channel-team-local");
+        fs::write(&worker_bin, "worker v1\n").expect("worker bin");
+        make_executable(&worker_bin);
+
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+
+        let first = install_snapshot_with_overlays(
+            &home,
+            "team-local",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+            &[SnapshotOverlay::new(
+                worker_bin.clone(),
+                PathBuf::from("bin/lionclaw-channel-team-local"),
+            )],
+        )
+        .expect("snapshot v1");
+        fs::write(&worker_bin, "worker v2\n").expect("worker bin v2");
+        make_executable(&worker_bin);
+        let second = install_snapshot_with_overlays(
+            &home,
+            "team-local",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+            &[SnapshotOverlay::new(
+                worker_bin,
+                PathBuf::from("bin/lionclaw-channel-team-local"),
+            )],
+        )
+        .expect("snapshot v2");
+
+        assert_ne!(first.hash, second.hash);
+        assert_ne!(first.skill_id, second.skill_id);
+        assert_eq!(
+            fs::read_to_string(
+                second
+                    .snapshot_abs_dir
+                    .join("bin/lionclaw-channel-team-local")
+            )
+            .expect("installed worker"),
+            "worker v2\n"
+        );
     }
 
     #[test]

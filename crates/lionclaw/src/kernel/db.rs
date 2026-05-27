@@ -34,7 +34,7 @@ impl Db {
             .await
             .with_context(|| format!("failed to connect sqlite database {}", path.display()))?;
 
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("../../migrations")
             .run(&pool)
             .await
             .context("failed to run database migrations")?;
@@ -55,7 +55,7 @@ impl Db {
             .await
             .context("failed to connect in-memory sqlite database")?;
 
-        sqlx::migrate!("./migrations")
+        sqlx::migrate!("../../migrations")
             .run(&pool)
             .await
             .context("failed to run in-memory database migrations")?;

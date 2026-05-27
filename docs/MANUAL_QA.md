@@ -27,9 +27,9 @@ Run from the repository root:
 
 ```bash
 cargo fmt -- --check
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 bash ./scripts/ci.sh
 ```
 
@@ -57,6 +57,7 @@ export PROJ_A=/tmp/lionclaw-live-$QA_STAMP-project-a
 export PROJ_B=/tmp/lionclaw-live-$QA_STAMP-project-b
 export LIONCLAW_BIN="$PWD/target/debug/lionclaw"
 
+cargo build --workspace
 mkdir -p "$PROJ_A" "$PROJ_B"
 printf 'project-a\n' > "$PROJ_A/project-marker.txt"
 printf 'project-b\n' > "$PROJ_B/project-marker.txt"
@@ -69,6 +70,11 @@ Configure project A:
 ```bash
 cd "$PROJ_A"
 "$LIONCLAW_BIN" project init
+"$LIONCLAW_BIN" instance create reviewer
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/bin/lionclaw-channel-team-local"
+"$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
+"$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" configure --runtime codex
 "$LIONCLAW_BIN" status
 "$LIONCLAW_BIN" doctor
@@ -77,6 +83,8 @@ cd "$PROJ_A"
 Expected:
 
 - project metadata exists under `.lionclaw/`
+- `main` and `reviewer` have the bundled `team-local` channel installed with
+  an embedded worker binary and approved direct sibling grants
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 

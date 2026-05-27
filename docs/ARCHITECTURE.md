@@ -305,7 +305,7 @@ through `LIONCLAW_PROJECT_INSTANCE`. Neighbor entries contain one of:
   "channel_send": {
     "status": "configured",
     "channel_id": "team-local",
-    "conversation_ref": "member:reviewer",
+    "conversation_ref": "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f",
     "thread_ref": null
   }
 }
@@ -329,7 +329,7 @@ launch_mode = "background"
 worker = "scripts/worker"
 
 [channels.contact]
-conversation_ref = "member:reviewer"
+conversation_ref = "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f"
 # thread_ref is omitted when absent; TOML has no null value.
 ```
 
@@ -345,6 +345,34 @@ it. Operators may also pass an explicit `--conversation-ref` for static provider
 routes; `--thread-ref` stays optional. `--contact` requires a project instance
 target because direct homes do not have a stable project instance identity for
 template rendering or neighbor projection.
+
+## Team-Local Channel
+
+`channel-team-local` is bundled as a first-party channel skill. Its installed
+snapshot is self-contained: `scripts/worker` execs
+`bin/lionclaw-channel-team-local` from the skill directory, and install
+plumbing copies the compiled worker binary into that snapshot before computing
+the installed skill hash. The worker is a separate Rust workspace crate named
+`lionclaw-channel-team-local`; it does not depend on the `lionclaw` crate.
+
+Project setup installs and configures `team-local` for project instances by
+default. Each instance publishes its own contact route as
+`team-local:peer:<home-id>`. Setup also approves existing sibling instances with
+ordinary direct channel grants:
+
+```text
+channel_id = team-local
+sender_ref = team-local:instance:<sibling-home-id>
+routing_profile = direct
+trust_tier = main
+```
+
+The worker delivers only through existing channel APIs. It pulls local outbox
+deliveries, resolves the target route from project instance state, verifies the
+target daemon is `lionclawd` with the expected home id and project scope,
+preflights `/v0/channels/authorize`, then posts inbound events and attachments
+to the target daemon. Attachment bytes move through the existing attachment
+stage/finalize endpoints.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
