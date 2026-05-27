@@ -32,6 +32,8 @@ reqwest = { version = "0.12", default-features = false }
 rustix = "1.1"
 serde = "1.0"
 serde_json = "1.0"
+sha2 = "0.11"
+sqlx = "0.8"
 tempfile = "3.27"
 tokio = "1.50"
 toml = "1.1"
