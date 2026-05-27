@@ -369,7 +369,7 @@ trust_tier = main
 
 The worker delivers only through existing channel APIs. It pulls local outbox
 deliveries, resolves the target route from project instance state, verifies the
-target daemon is `lionclawd` with the expected home id and project scope,
+target daemon is `lionclawd` with the expected home id and canonical home path,
 preflights `/v0/channels/authorize`, then posts inbound events and attachments
 to the target daemon. Attachment bytes move through the existing attachment
 stage/finalize endpoints.

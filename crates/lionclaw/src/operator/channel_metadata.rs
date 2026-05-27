@@ -443,11 +443,30 @@ fn looks_like_path(raw: &str) -> bool {
 }
 
 pub(crate) fn bundled_channel_skill_dir(channel_id: &str) -> PathBuf {
+    bundled_channel_skill_dir_from_exe(channel_id, std::env::current_exe().ok().as_deref())
+}
+
+fn bundled_channel_skill_dir_from_exe(channel_id: &str, current_exe: Option<&Path>) -> PathBuf {
+    let skill_dir_name = bundled_channel_skill_name(channel_id);
+    if let Some(exe_dir) = current_exe.and_then(Path::parent) {
+        let installed = exe_dir.join("skills").join(&skill_dir_name);
+        if installed.exists() {
+            return installed;
+        }
+    }
+    source_bundled_channel_skill_dir(&skill_dir_name)
+}
+
+fn source_bundled_channel_skill_dir(skill_dir_name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("skills")
-        .join(format!("channel-{channel_id}"))
+        .join(skill_dir_name)
+}
+
+fn bundled_channel_skill_name(channel_id: &str) -> String {
+    format!("channel-{channel_id}")
 }
 
 fn is_executable_file(metadata: &fs::Metadata) -> bool {
@@ -470,8 +489,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        discover_channel_skill, load_channel_metadata, render_contact_template,
-        validate_channel_env_name,
+        bundled_channel_skill_dir_from_exe, discover_channel_skill, load_channel_metadata,
+        render_contact_template, validate_channel_env_name,
     };
     use crate::{home::LionClawHome, operator::snapshot::copy_snapshot_tree};
 
@@ -616,6 +635,36 @@ mod tests {
         let err = load_channel_metadata(&skill).expect_err("static template should fail");
 
         assert!(err.to_string().contains("must include '{instance}'"));
+    }
+
+    #[test]
+    fn bundled_skill_resolution_prefers_release_layout_next_to_executable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp_dir.path().join("install");
+        let skill_dir = install_dir.join("skills/channel-team-local");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(install_dir.join("lionclaw"), "").expect("exe");
+
+        let resolved =
+            bundled_channel_skill_dir_from_exe("team-local", Some(&install_dir.join("lionclaw")));
+
+        assert_eq!(resolved, skill_dir);
+    }
+
+    #[test]
+    fn bundled_skill_resolution_falls_back_to_source_layout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let resolved = bundled_channel_skill_dir_from_exe(
+            "team-local",
+            Some(&temp_dir.path().join("lionclaw")),
+        );
+
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../skills/channel-team-local")
+        );
     }
 
     #[cfg(unix)]
