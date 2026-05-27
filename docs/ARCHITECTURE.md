@@ -526,30 +526,51 @@ routes; `--thread-ref` stays optional. `--contact` requires a project instance
 target because direct homes do not have a stable project instance identity for
 template rendering or neighbor projection.
 
-## Team-Local Channel
+## Bundled Channel Workers
 
-`channel-team-local` is bundled as a first-party channel skill. Its installed
-snapshot is self-contained: `scripts/worker` execs
-`runtime/team-local/bin/lionclaw-channel-team-local` from the skill directory,
-and install plumbing copies the compiled worker binary into that snapshot
-before computing the installed skill hash. The same binary also backs the
-runtime-facing `runtime/team-local/scripts/list`,
-`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages. The send helper resolves
-routes from the projected inventory and forwards provider-neutral text,
-format hints, reply refs, and `/runtime` attachments to the existing audited
-`channel.send` bridge. Its attachment option is intentionally path-only; the
-kernel derives the delivered filename and media type from the runtime file when
-it prepares the channel-send attachment.
+First-party channels are still skills. Their installed snapshots are
+self-contained: `scripts/worker` execs the compiled worker binary from inside
+the skill directory, and install plumbing copies that binary into the snapshot
+before computing the installed skill hash. The worker crates are separate Rust
+workspace members and do not depend on the `lionclaw` crate.
+
+Bundled channel worker binaries:
+
+- `channel-email` uses `bin/lionclaw-channel-email`.
+- `channel-team-local` uses `runtime/team-local/bin/lionclaw-channel-team-local`.
+
+The same bundled team-local binary also backs the runtime-facing
+`runtime/team-local/scripts/list`, `runtime/team-local/scripts/resolve`, and
+`runtime/team-local/scripts/send` helpers for sender-side team discovery and
+messages. The send helper resolves routes from the projected inventory and
+forwards provider-neutral text, format hints, reply refs, and `/runtime`
+attachments to the existing audited `channel.send` bridge. Its attachment
+option is intentionally path-only; the kernel derives the delivered filename
+and media type from the runtime file when it prepares the channel-send
+attachment.
+
+The Email channel is a strict-whitelist work-inbox skill. Its worker owns IMAP,
+SMTP, mailbox credentials, local held-mail state, and provider-specific email
+handling. It fetches only IMAP envelope/header facts and `BODYSTRUCTURE` before
+calling `/v0/channels/authorize`; full MIME bodies and attachments are fetched
+only after the core grants the sender/thread. Unknown senders are held with
+metadata only, automated/bulk/list mail is suppressed locally, and admitted
+messages are posted through the existing channel inbound and attachment
+endpoints with first-class `thread_ref` and `reply_to_ref` fields.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill
 at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
 Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
-other host-side assets are not projected into the runtime. The worker is a
-separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
-depend on the `lionclaw` crate.
+other host-side assets are not projected into the runtime.
+
+## Team-Local Channel
+
+`channel-team-local` is a first-party local team channel skill. The same bundled
+worker binary also backs the runtime-facing `runtime/team-local/scripts/list`,
+`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
+helpers for sender-side team discovery and messages.
 
 Project setup installs and configures `team-local` for project instances by
 default. It also ensures a `team-local` execution preset with the existing

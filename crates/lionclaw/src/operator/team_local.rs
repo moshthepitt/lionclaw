@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -12,6 +11,7 @@ use crate::{
     home::LionClawHome,
     kernel::{runtime::EscapeClass, Kernel, KernelError, KernelOptions},
     operator::{
+        bundled_channels::worker_binary_path,
         channel_metadata::{bundled_channel_skill_dir, DEFAULT_CHANNEL_WORKER},
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         snapshot::{install_snapshot_with_overlays, SnapshotOverlay},
@@ -43,7 +43,7 @@ struct ProjectMember {
 pub(crate) async fn ensure_project_team_local(
     project_root: &Path,
 ) -> Result<TeamLocalProjectSetup> {
-    let worker_binary = worker_binary_path()?;
+    let worker_binary = worker_binary_path(WORKER_BIN_NAME)?;
     ensure_project_team_local_with_worker(project_root, &worker_binary).await
 }
 
@@ -105,16 +105,6 @@ pub(crate) async fn ensure_project_team_local_with_worker(
         grants_ensured,
         grants_preserved,
     })
-}
-
-pub(crate) fn snapshot_overlays_for_source(source_path: &Path) -> Result<Vec<SnapshotOverlay>> {
-    if !is_bundled_team_local_source(source_path)? {
-        return Ok(Vec::new());
-    }
-    Ok(vec![SnapshotOverlay::new(
-        worker_binary_path()?,
-        PathBuf::from(WORKER_BIN_REL_PATH),
-    )])
 }
 
 pub(crate) fn peer_conversation_ref(home_id: &str) -> String {
@@ -217,42 +207,6 @@ async fn open_channel_admin_kernel(home: &LionClawHome, config: &OperatorConfig)
         },
     )
     .await
-}
-
-fn is_bundled_team_local_source(source_path: &Path) -> Result<bool> {
-    let bundled = bundled_channel_skill_dir(CHANNEL_ID);
-    if !bundled.exists() {
-        return Ok(false);
-    }
-    let source_path = fs::canonicalize(source_path)
-        .with_context(|| format!("failed to resolve {}", source_path.display()))?;
-    let bundled = fs::canonicalize(&bundled)
-        .with_context(|| format!("failed to resolve {}", bundled.display()))?;
-    Ok(source_path == bundled)
-}
-
-fn worker_binary_path() -> Result<PathBuf> {
-    let exe_name = format!("{WORKER_BIN_NAME}{}", std::env::consts::EXE_SUFFIX);
-    let current_exe = std::env::current_exe().context("failed to locate current executable")?;
-    let current_dir = current_exe
-        .parent()
-        .context("current executable path has no parent")?;
-    let sibling = current_dir.join(&exe_name);
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-    if current_dir.file_name().and_then(|value| value.to_str()) == Some("deps") {
-        if let Some(target_dir) = current_dir.parent() {
-            let workspace_sibling = target_dir.join(&exe_name);
-            if workspace_sibling.is_file() {
-                return Ok(workspace_sibling);
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "missing {}; build LionClaw with `cargo build --workspace` before installing the bundled team-local channel",
-        sibling.display()
-    ))
 }
 
 #[cfg(test)]
