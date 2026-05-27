@@ -174,7 +174,7 @@ impl TeamLocalWorker {
             .daemon_info()
             .await
             .map_err(|err| retryable("target_unreachable", err))?;
-        verify_target_daemon(local_info, target, &target_info)
+        verify_target_daemon(target, &target_info)
             .map_err(|err| terminal("target_verification_failed", err))?;
 
         let inbound_sender_ref = sender_ref(&local_info.home_id);
@@ -436,11 +436,7 @@ fn validate_local_daemon(info: &DaemonInfoResponse) -> Result<()> {
     Ok(())
 }
 
-fn verify_target_daemon(
-    local_info: &DaemonInfoResponse,
-    target: &ProjectMember,
-    target_info: &DaemonInfoResponse,
-) -> Result<()> {
+fn verify_target_daemon(target: &ProjectMember, target_info: &DaemonInfoResponse) -> Result<()> {
     if target_info.daemon != "lionclawd" {
         bail!("target endpoint is not lionclawd: {}", target_info.daemon);
     }
@@ -452,13 +448,6 @@ fn verify_target_daemon(
             "target home id mismatch: expected {}, got {}",
             target.home_id,
             target_info.home_id
-        );
-    }
-    if target_info.project_scope != local_info.project_scope {
-        bail!(
-            "target project scope mismatch: expected {}, got {}",
-            local_info.project_scope,
-            target_info.project_scope
         );
     }
     match fs::canonicalize(&target.home) {
@@ -538,14 +527,6 @@ mod tests {
         let target_home = temp_dir.path().join("reviewer");
         std::fs::create_dir_all(&target_home).expect("target home");
         let target_home = std::fs::canonicalize(&target_home).expect("canonical target");
-        let local = DaemonInfoResponse {
-            daemon: "lionclawd".to_string(),
-            status: "ok".to_string(),
-            home_id: "home-main".to_string(),
-            home_root: temp_dir.path().join("main").display().to_string(),
-            bind_addr: "127.0.0.1:9001".to_string(),
-            project_scope: "project-a".to_string(),
-        };
         let target = ProjectMember {
             name: "reviewer".to_string(),
             home: target_home.clone(),
@@ -558,10 +539,9 @@ mod tests {
             home_id: target.home_id.clone(),
             home_root: target_home.display().to_string(),
             bind_addr: "127.0.0.1:9002".to_string(),
-            project_scope: local.project_scope.clone(),
         };
 
-        let err = verify_target_daemon(&local, &target, &target_info)
+        let err = verify_target_daemon(&target, &target_info)
             .expect_err("unhealthy target should fail verification");
 
         assert!(err.to_string().contains("target daemon is not ok"));
@@ -733,7 +713,6 @@ mod tests {
                 home_id: self.local_home_id.clone(),
                 home_root: self.local_home.display().to_string(),
                 bind_addr: "127.0.0.1:9001".to_string(),
-                project_scope: "project-scope".to_string(),
             }
         }
 
@@ -744,7 +723,6 @@ mod tests {
                 home_id: self.target_home_id.clone(),
                 home_root: self.target_home.display().to_string(),
                 bind_addr: "127.0.0.1:9002".to_string(),
-                project_scope: "project-scope".to_string(),
             }
         }
 
@@ -798,7 +776,6 @@ mod tests {
                 home_id: String::new(),
                 home_root: String::new(),
                 bind_addr: String::new(),
-                project_scope: String::new(),
             }
         }
     }
@@ -921,8 +898,7 @@ mod tests {
             "status": info.status,
             "home_id": info.home_id,
             "home_root": info.home_root,
-            "bind_addr": info.bind_addr,
-            "project_scope": info.project_scope
+            "bind_addr": info.bind_addr
         })
     }
 
