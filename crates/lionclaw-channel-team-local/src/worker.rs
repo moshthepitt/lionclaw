@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,6 +25,7 @@ use crate::{
 const INBOUND_TRIGGER: &str = "dm";
 const INBOUND_SESSION_BINDING: &str = "grant";
 const ATTACHMENT_KIND: &str = "document";
+const HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct TeamLocalWorker {
@@ -51,9 +53,11 @@ impl TeamLocalWorker {
     }
 
     pub async fn run(self) -> Result<()> {
+        let mut last_health_report = None;
         loop {
-            if let Err(err) = self.tick().await {
-                error!(error = %err, "team-local worker tick failed");
+            match self.tick(&mut last_health_report).await {
+                Ok(()) => {}
+                Err(err) => error!(error = %err, "team-local worker tick failed"),
             }
             if self.config.once {
                 return Ok(());
@@ -62,33 +66,22 @@ impl TeamLocalWorker {
         }
     }
 
-    async fn tick(&self) -> Result<()> {
+    async fn tick(&self, last_health_report: &mut Option<Instant>) -> Result<()> {
         let discovery = ProjectDiscovery::discover(&self.config.home)?;
         let local_member = discovery.self_member()?;
         let local_info = self.local_api.daemon_info().await?;
         validate_local_daemon(local_member, &local_info)?;
         let worker_id = self.worker_id(&local_member.home_id);
 
-        info!(
+        debug!(
             instance = %discovery.self_instance,
             project = %discovery.project_root.display(),
             "team-local worker is ready"
         );
-        let _ = self
-            .local_api
-            .report_health(
-                &self.config.channel_id,
-                &worker_id,
-                "ok",
-                "team_local.ready",
-                "team-local worker is running",
-                json!({
-                    "project_root": discovery.project_root.display().to_string(),
-                    "instance": discovery.self_instance.as_str(),
-                }),
-            )
-            .await
-            .inspect_err(|err| warn!(error = %err, "failed to report team-local health"));
+        if health_report_due(*last_health_report) {
+            self.report_health(&discovery, &worker_id).await;
+            *last_health_report = Some(Instant::now());
+        }
 
         let deliveries = self
             .local_api
@@ -119,6 +112,24 @@ impl TeamLocalWorker {
         }
 
         Ok(())
+    }
+
+    async fn report_health(&self, discovery: &ProjectDiscovery, worker_id: &str) {
+        let _ = self
+            .local_api
+            .report_health(
+                &self.config.channel_id,
+                worker_id,
+                "ok",
+                "team_local.ready",
+                "team-local worker is running",
+                json!({
+                    "project_root": discovery.project_root.display().to_string(),
+                    "instance": discovery.self_instance.as_str(),
+                }),
+            )
+            .await
+            .inspect_err(|err| warn!(error = %err, "failed to report team-local health"));
     }
 
     async fn deliver(
@@ -479,6 +490,13 @@ fn terminal(code: &'static str, err: anyhow::Error) -> DeliveryResult {
     }
 }
 
+fn health_report_due(last_report: Option<Instant>) -> bool {
+    match last_report {
+        Some(instant) => instant.elapsed() >= HEALTH_REPORT_INTERVAL,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -488,6 +506,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+        time::{Duration, Instant},
     };
 
     use axum::{
@@ -500,7 +519,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
-    use super::{non_empty_text, verify_target_daemon, TeamLocalWorker};
+    use super::{health_report_due, non_empty_text, verify_target_daemon, TeamLocalWorker};
     use crate::{
         api::DaemonInfoResponse,
         config::WorkerConfig,
@@ -512,6 +531,15 @@ mod tests {
     fn non_empty_text_preserves_payload_whitespace() {
         assert_eq!(non_empty_text("  hello  "), Some("  hello  ".to_string()));
         assert_eq!(non_empty_text(" \n\t "), None);
+    }
+
+    #[test]
+    fn health_report_due_on_startup_and_after_interval() {
+        assert!(health_report_due(None));
+        assert!(!health_report_due(Some(Instant::now())));
+        assert!(health_report_due(Some(
+            Instant::now() - Duration::from_secs(61)
+        )));
     }
 
     #[test]
@@ -556,9 +584,10 @@ mod tests {
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect("tick");
 
@@ -610,9 +639,10 @@ mod tests {
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect("tick");
 
@@ -637,11 +667,13 @@ mod tests {
         let local_state = Arc::new(LocalState::empty(fixture.local_info()));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect("tick");
+        assert!(last_health_report.is_some());
 
         assert_eq!(local_state.outbox_pulls.load(Ordering::SeqCst), 1);
         let health = only_request(&local_state.health_reports).await;
@@ -649,6 +681,24 @@ mod tests {
         assert_eq!(health["reporter_id"], "team-local:worker:home-main");
         assert_eq!(health["status"], "ok");
         assert_eq!(health["checks"][0]["details"]["instance"], "main");
+        assert!(local_state.reports.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_worker_skips_health_between_report_intervals() {
+        let fixture = TeamLocalFixture::new().await;
+        let local_state = Arc::new(LocalState::empty(fixture.local_info()));
+        let local_url = spawn_local_server(local_state.clone()).await;
+
+        let mut last_health_report = Some(Instant::now());
+        TeamLocalWorker::new(fixture.worker_config(local_url))
+            .expect("worker")
+            .tick(&mut last_health_report)
+            .await
+            .expect("tick");
+
+        assert_eq!(local_state.outbox_pulls.load(Ordering::SeqCst), 1);
+        assert!(local_state.health_reports.lock().await.is_empty());
         assert!(local_state.reports.lock().await.is_empty());
     }
 
@@ -663,13 +713,15 @@ mod tests {
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         let err = TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect_err("wrong local daemon identity should fail");
 
         assert!(err.to_string().contains("local home id mismatch"));
+        assert!(last_health_report.is_none());
         assert_eq!(local_state.outbox_pulls.load(Ordering::SeqCst), 0);
         assert!(local_state.health_reports.lock().await.is_empty());
         assert!(local_state.reports.lock().await.is_empty());
@@ -691,9 +743,10 @@ mod tests {
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect("tick");
 
@@ -723,9 +776,10 @@ mod tests {
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
+        let mut last_health_report = None;
         TeamLocalWorker::new(fixture.worker_config(local_url))
             .expect("worker")
-            .tick()
+            .tick(&mut last_health_report)
             .await
             .expect("tick");
 
