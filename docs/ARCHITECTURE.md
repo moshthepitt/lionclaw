@@ -226,6 +226,12 @@ while the runtime turn is active; turn completion or timeout removes the socket
 and invalidates open connections. Native runtime controls do not receive this
 bridge.
 
+The host socket is created under the operator's short per-user runtime directory
+rather than under the instance home, so long project paths do not exceed Unix
+socket path limits. OCI launches that mount a Unix socket disable Podman's
+SELinux process label for that turn; otherwise SELinux hosts can expose the
+socket inode but deny `connect(2)`.
+
 The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
 configured channel route, provider-neutral content, and an idempotency key.
@@ -247,6 +253,11 @@ Bridge setup, accept-loop, connection-task, and connection I/O failures are
 audited under `runtime.channel_send.bridge_error`. Request denials, including
 connection pressure over the bridge's concurrent connection cap, are audited as
 `runtime.channel_send.denied`.
+
+When project-instance runtime context is active, `channel.send` requests are
+also checked against the sender-relative `channel_send` projection for that
+selected instance. A project runtime can enqueue only routes that are present as
+configured neighbor routes in its generated inventory.
 
 Idempotency lives on the outbox row. Runtime channel sends use
 `source_kind = "runtime_channel_send"`, a source id scoped to
@@ -305,7 +316,7 @@ through `LIONCLAW_PROJECT_INSTANCE`. Neighbor entries contain one of:
   "channel_send": {
     "status": "configured",
     "channel_id": "team-local",
-    "conversation_ref": "member:reviewer",
+    "conversation_ref": "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f",
     "thread_ref": null
   }
 }
@@ -329,7 +340,7 @@ launch_mode = "background"
 worker = "scripts/worker"
 
 [channels.contact]
-conversation_ref = "member:reviewer"
+conversation_ref = "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f"
 # thread_ref is omitted when absent; TOML has no null value.
 ```
 
@@ -345,6 +356,48 @@ it. Operators may also pass an explicit `--conversation-ref` for static provider
 routes; `--thread-ref` stays optional. `--contact` requires a project instance
 target because direct homes do not have a stable project instance identity for
 template rendering or neighbor projection.
+
+## Team-Local Channel
+
+`channel-team-local` is bundled as a first-party channel skill. Its installed
+snapshot is self-contained: `scripts/worker` execs
+`runtime/team-local/bin/lionclaw-channel-team-local` from the skill directory,
+and install plumbing copies the compiled worker binary into that snapshot
+before computing the installed skill hash. The same binary also backs the
+runtime-facing `runtime/team-local/scripts/list`,
+`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
+helpers for sender-side team discovery and messages.
+
+Channel-bound skill roots remain host-only by default. A channel skill can
+publish a runtime-facing Agent Skill only by including a complete embedded skill
+at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
+Only that embedded skill root is mounted read-only under
+`/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
+other host-side assets are not projected into the runtime. The worker is a
+separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
+depend on the `lionclaw` crate.
+
+Project setup installs and configures `team-local` for project instances by
+default. It also ensures a `team-local` execution preset with the existing
+`channel-send` escape class; that preset becomes the default only when the
+instance has no default preset yet. Each instance publishes its own contact
+route as
+`team-local:peer:<home-id>`. Setup also approves existing sibling instances with
+ordinary direct channel grants:
+
+```text
+channel_id = team-local
+sender_ref = team-local:instance:<sibling-home-id>
+routing_profile = direct
+trust_tier = main
+```
+
+The worker delivers only through existing channel APIs. It pulls local outbox
+deliveries, resolves the target route from project instance state, verifies the
+target daemon is `lionclawd` with the expected home id and canonical home path,
+preflights `/v0/channels/authorize`, then posts inbound events and attachments
+to the target daemon. Attachment bytes move through the existing attachment
+stage/finalize endpoints.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The

@@ -73,6 +73,7 @@ use crate::{
             resolve_project_setup_root, resolve_target, TargetContext, TargetSelection,
             WorkRootRequirement,
         },
+        team_local::ensure_project_team_local,
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
@@ -687,6 +688,7 @@ pub async fn run() -> Result<ExitCode> {
             ProjectCommand::Init => {
                 let project_root = resolve_project_setup_root(&target_selection)?;
                 let result = init_project(&project_root)?;
+                ensure_project_team_local(&result.project_root).await?;
                 println!(
                     "initialized LionClaw project {}",
                     result.project_root.display()
@@ -708,6 +710,7 @@ pub async fn run() -> Result<ExitCode> {
                     args.work_root.as_deref(),
                     args.create_work_root,
                 )?;
+                ensure_project_team_local(&project_root).await?;
                 println!(
                     "created instance {} home={} work-root={}",
                     instance.name,
@@ -753,6 +756,7 @@ pub async fn run() -> Result<ExitCode> {
                     args.work_root.as_deref(),
                     args.create_work_root,
                 )?;
+                ensure_project_team_local(&project_root).await?;
                 println!(
                     "adopted instance {} home={} work-root={}",
                     instance.name,

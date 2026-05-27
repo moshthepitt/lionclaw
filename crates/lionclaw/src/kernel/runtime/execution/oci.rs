@@ -8,6 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 #[cfg(unix)]
 use rustix::process::{getgid, getuid};
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use tokio::{runtime::Handle, time::timeout};
 use tracing::warn;
 
@@ -273,6 +275,11 @@ fn prepare_oci_process_launch(
 
     if config.read_only_rootfs {
         args.push("--read-only".to_string());
+    }
+
+    if plan_mounts_unix_socket(&request.plan.mounts) {
+        args.push("--security-opt".to_string());
+        args.push("label=disable".to_string());
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -739,6 +746,20 @@ fn format_mount_spec(source: &str, mount: &MountSpec) -> String {
     format!("type=bind,src={source},target={},{}", mount.target, access)
 }
 
+#[cfg(unix)]
+fn plan_mounts_unix_socket(mounts: &[MountSpec]) -> bool {
+    mounts.iter().any(|mount| {
+        fs::symlink_metadata(&mount.source)
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(not(unix))]
+fn plan_mounts_unix_socket(_mounts: &[MountSpec]) -> bool {
+    false
+}
+
 fn workspace_lionclaw_metadata_mask_needed(
     mounts: &[MountSpec],
     configured_tmpfs: &[String],
@@ -784,7 +805,7 @@ fn merged_environment(
 mod tests {
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
     use std::time::Duration;
 
     use super::{
@@ -1009,6 +1030,30 @@ mod tests {
                 "LIONCLAW_CHANNEL_SEND_SOCKET=/runtime/lionclaw/channel-send.sock".to_string(),
             ]
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci_backend_disables_selinux_labeling_for_unix_socket_mounts() {
+        let temp_dir = tempdir().expect("temp dir");
+        let socket_path = temp_dir.path().join("channel-send.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+        let mut request = sample_execution_request();
+        request.plan.mounts.push(MountSpec {
+            source: socket_path,
+            target: "/runtime/lionclaw/channel-send.sock".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--security-opt".to_string(), "label=disable".to_string(),] }));
     }
 
     #[test]

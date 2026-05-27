@@ -37,11 +37,12 @@ use crate::{
             register_configured_runtimes, resolve_runtime_execution_context,
             validate_runtime_launch_prerequisites_for_work_root,
         },
-        snapshot::{install_snapshot, resolve_local_source},
+        snapshot::{install_snapshot_with_overlays, resolve_local_source},
         target::{
             project_instance_runtime_context_for_home_in_project_with_contacts,
             project_instance_runtime_context_with_contacts,
         },
+        team_local::snapshot_overlays_for_source,
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -78,9 +79,9 @@ pub async fn add_skill(
 ) -> Result<()> {
     validate_skill_alias(&alias)?;
     let source = normalize_local_source(&source)?;
+    let source_path = resolve_local_source(&source)?;
     let config = OperatorConfig::load(home).await?;
     if config.channels.iter().any(|channel| channel.skill == alias) {
-        let source_path = resolve_local_source(&source)?;
         resolve_worker_entrypoint(&source_path).with_context(|| {
             format!(
                 "skill alias '{alias}' backs a configured channel and must keep a valid 'scripts/worker'"
@@ -88,7 +89,8 @@ pub async fn add_skill(
         })?;
     }
     home.ensure_base_dirs().await?;
-    install_snapshot(home, &alias, &source, &reference)?;
+    let overlays = snapshot_overlays_for_source(&source_path)?;
+    install_snapshot_with_overlays(home, &alias, &source, &reference, &overlays)?;
     Ok(())
 }
 

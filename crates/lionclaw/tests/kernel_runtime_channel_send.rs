@@ -26,6 +26,10 @@ use lionclaw::{
         Kernel, KernelOptions,
     },
     operator::config::ChannelLaunchMode,
+    project_inventory::{
+        ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
+        ProjectInstanceRuntimeContext,
+    },
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -163,14 +167,6 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
 
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-happy").await;
-    let socket_dir = env.home().runtime_dir().join("sockets");
-    tokio::fs::create_dir_all(&socket_dir)
-        .await
-        .expect("create loose socket dir");
-    #[cfg(unix)]
-    tokio::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755))
-        .await
-        .expect("loosen socket dir permissions");
     let kernel = kernel_with_channel_send_preset(&env, true).await;
     let responses = Arc::new(Mutex::new(Vec::new()));
     let socket_paths = Arc::new(Mutex::new(Vec::new()));
@@ -261,14 +257,188 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
     );
     #[cfg(unix)]
     {
-        let mode = tokio::fs::metadata(&socket_dir)
+        let socket_dir = socket.parent().expect("socket parent");
+        let mode = tokio::fs::metadata(socket_dir)
             .await
             .expect("socket dir metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "channel.send socket directory is private");
+        let socket_root_mode = tokio::fs::metadata(socket_dir.parent().expect("socket root"))
+            .await
+            .expect("socket root metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            socket_root_mode, 0o700,
+            "channel.send socket root is private"
+        );
     }
+}
+
+#[tokio::test]
+async fn channel_send_bridge_uses_short_host_socket_root_for_deep_runtime_homes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-deep-home").await;
+    let mut deep_runtime_root = env.temp_dir().join("deep-runtime-root");
+    for index in 0..12 {
+        deep_runtime_root.push(format!("very-long-runtime-root-segment-{index:02}"));
+    }
+    deep_runtime_root.push("runtime");
+    let old_socket_path =
+        deep_runtime_root.join("sockets/channel-send-11111111111111111111111111111111.sock");
+    assert!(
+        old_socket_path.to_string_lossy().len() > 108,
+        "test must model a runtime root too deep for Linux sockaddr_un"
+    );
+    let mut options = channel_send_kernel_options(&env, true);
+    options.runtime_root = Some(deep_runtime_root.clone());
+    let kernel = env.kernel_with_options(options).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let socket_paths = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "deep-runtime-root-send",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "deep root should still send",
+            "format_hint": "plain"
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![request],
+                responses.clone(),
+                socket_paths.clone(),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-deep-home").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send from a deep runtime home".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete despite a deep runtime root");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+    let socket = {
+        let sockets = socket_paths.lock().expect("socket paths lock");
+        sockets[0].clone()
+    };
+    assert!(
+        !socket.starts_with(&deep_runtime_root),
+        "host socket path must not inherit the potentially deep instance runtime path"
+    );
+    assert!(!socket.exists(), "socket should be removed after turn");
+}
+
+#[tokio::test]
+async fn project_instance_channel_send_allows_only_projected_routes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-projected").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            ProjectInstanceInventory::new_channel_send(
+                Some("main".to_string()),
+                vec![
+                    ProjectInstanceInventoryEntry::identity("main".to_string()),
+                    ProjectInstanceInventoryEntry::with_channel_send(
+                        "reviewer".to_string(),
+                        ProjectInstanceChannelSend::configured(
+                            "local-cli".to_string(),
+                            "member:reviewer".to_string(),
+                            Some("team-thread".to_string()),
+                        ),
+                    ),
+                ],
+            ),
+        ))
+        .await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let allowed = json!({
+        "idempotency_key": "allowed",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "thread_ref": "team-thread",
+        "content": { "text": "allowed", "format_hint": "markdown" }
+    });
+    let unprojected = json!({
+        "idempotency_key": "blocked",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:intruder",
+        "content": { "text": "blocked", "format_hint": "markdown" }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![allowed, unprojected],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-projected").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send projected and unprojected channel messages".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+    assert_eq!(responses[1]["ok"].as_bool(), Some(false));
+    assert_eq!(responses[1]["error"]["code"], "route_not_allowed");
+
+    let allowed_outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: Some("team-thread".to_string()),
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull allowed outbox");
+    assert_eq!(allowed_outbox.deliveries.len(), 1);
+
+    let blocked_outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:intruder".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull blocked outbox");
+    assert!(blocked_outbox.deliveries.is_empty());
 }
 
 #[tokio::test]
@@ -680,13 +850,9 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
 async fn channel_send_bridge_audits_setup_failures() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-setup-failure").await;
-    tokio::fs::create_dir_all(env.home().runtime_dir())
-        .await
-        .expect("create runtime root");
-    tokio::fs::write(env.home().runtime_dir().join("sockets"), b"not a directory")
-        .await
-        .expect("block socket directory");
-    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let mut options = channel_send_kernel_options(&env, true);
+    options.runtime_root = None;
+    let kernel = env.kernel_with_options(options).await;
     kernel
         .register_runtime_adapter(
             "channel-send-runtime",
@@ -723,12 +889,12 @@ async fn channel_send_bridge_audits_setup_failures() {
         .expect("query bridge error audit events");
     assert!(
         audit.events.iter().any(|event| {
-            event.details["stage"].as_str() == Some("host_socket_dir")
+            event.details["stage"].as_str() == Some("runtime_state_mount")
                 && event.details["runtime_id"].as_str() == Some("channel-send-runtime")
                 && event.details["turn_id"].as_str().is_some()
                 && event.details["error"]
                     .as_str()
-                    .is_some_and(|error| error.contains("not a regular directory"))
+                    .is_some_and(|error| error.contains("requires a runtime state mount"))
         }),
         "setup failures must be audited under runtime.channel_send.*"
     );
@@ -1580,6 +1746,24 @@ fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
         workspace_name: Some("main".to_string()),
         ..KernelOptions::default()
     }
+}
+
+fn channel_send_kernel_options_with_project_routes(
+    env: &TestHome,
+    channel_send_inventory: ProjectInstanceInventory,
+) -> KernelOptions {
+    let mut options = channel_send_kernel_options(env, true);
+    let project_root = env.temp_dir().to_path_buf();
+    let identity_inventory = ProjectInstanceInventory::new(
+        Some("main".to_string()),
+        vec!["main".to_string(), "reviewer".to_string()],
+    );
+    options.project_workspace_root = Some(project_root.clone());
+    options.project_instance_runtime = Some(
+        ProjectInstanceRuntimeContext::new(project_root, "main".to_string(), identity_inventory)
+            .with_channel_send_inventory(channel_send_inventory),
+    );
+    options
 }
 
 async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: &str) {

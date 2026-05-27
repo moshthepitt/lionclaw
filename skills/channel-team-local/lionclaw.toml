@@ -1,0 +1,7 @@
+version = 1
+
+[channel]
+id = "team-local"
+launch = "background"
+worker = "scripts/worker"
+env = []

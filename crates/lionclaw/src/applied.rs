@@ -14,7 +14,10 @@ use crate::{
     home::LionClawHome,
     kernel::{
         db::ms_to_datetime,
-        skills::{derive_skill_id, parse_skill_frontmatter, validate_skill_alias},
+        skills::{
+            derive_skill_id, parse_skill_frontmatter, validate_agent_skill_name,
+            validate_skill_alias,
+        },
     },
     operator::{
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
@@ -40,7 +43,11 @@ impl AppliedState {
 
     pub fn from_home(home: &LionClawHome, config: &OperatorConfig) -> Result<Self> {
         let inputs = read_applied_state_inputs(home, config)?;
-        let skills = materialize_applied_skills(&inputs.skills_root, inputs.skills)?;
+        let skills = materialize_applied_skills(
+            &inputs.skills_root,
+            inputs.skills,
+            &inputs.channel_skill_aliases,
+        )?;
         Ok(Self::from_parts(skills, inputs.channels))
     }
 
@@ -87,8 +94,13 @@ impl AppliedState {
             .collect::<BTreeSet<_>>();
         self.skills
             .iter()
-            .filter(|skill| !host_only_aliases.contains(skill.alias.as_str()))
-            .cloned()
+            .filter_map(|skill| {
+                if host_only_aliases.contains(skill.alias.as_str()) {
+                    skill.runtime_facet_projection()
+                } else {
+                    Some(skill.clone())
+                }
+            })
             .collect()
     }
 
@@ -127,6 +139,7 @@ struct AppliedStateInputs {
     skills_root: PathBuf,
     skills: Vec<AppliedSkill>,
     channels: Vec<AppliedChannel>,
+    channel_skill_aliases: BTreeSet<String>,
 }
 
 fn read_applied_state_inputs(
@@ -139,6 +152,11 @@ fn read_applied_state_inputs(
     let mut skill_aliases = BTreeSet::new();
     let mut skill_ids = BTreeSet::new();
     let mut channel_ids = BTreeSet::new();
+    let channel_skill_aliases = config
+        .channels
+        .iter()
+        .map(|channel| channel.skill.clone())
+        .collect::<BTreeSet<_>>();
     let mut entries = fs::read_dir(&skills_root)
         .with_context(|| format!("failed to read directory {}", skills_root.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -180,7 +198,11 @@ fn read_applied_state_inputs(
                 entry.path().display()
             ));
         }
-        let skill = AppliedSkill::from_installed(&skills_root, entry.path())?;
+        let skill = AppliedSkill::from_installed(
+            &skills_root,
+            entry.path(),
+            channel_skill_aliases.contains(alias.as_str()),
+        )?;
         if !skill_ids.insert(skill.skill_id.clone()) {
             return Err(anyhow!(
                 "installed skill alias '{}' collides with another installed skill on skill id '{}'",
@@ -213,6 +235,7 @@ fn read_applied_state_inputs(
         skills_root,
         skills,
         channels,
+        channel_skill_aliases,
     })
 }
 
@@ -275,6 +298,7 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
 fn materialize_applied_skills(
     skills_root: &Path,
     skills: Vec<AppliedSkill>,
+    channel_skill_aliases: &BTreeSet<String>,
 ) -> Result<Vec<AppliedSkill>> {
     if skills.is_empty() {
         return Ok(skills);
@@ -294,8 +318,11 @@ fn materialize_applied_skills(
     skills
         .into_iter()
         .map(|skill| {
-            let loaded =
-                AppliedSkill::from_installed(&applied_root, applied_root.join(&skill.alias))?;
+            let loaded = AppliedSkill::from_installed(
+                &applied_root,
+                applied_root.join(&skill.alias),
+                channel_skill_aliases.contains(skill.alias.as_str()),
+            )?;
             validate_materialized_skill(&expected_skills, &loaded)?;
             Ok(loaded)
         })
@@ -560,10 +587,24 @@ pub struct AppliedSkill {
     pub hash: String,
     pub snapshot_path: PathBuf,
     pub installed_at: DateTime<Utc>,
+    runtime_facet: Option<AppliedRuntimeSkillFacet>,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedRuntimeSkillFacet {
+    skill_id: String,
+    name: String,
+    description: String,
+    hash: String,
+    snapshot_path: PathBuf,
 }
 
 impl AppliedSkill {
-    pub(crate) fn from_installed(skills_root: &Path, snapshot_path: PathBuf) -> Result<Self> {
+    pub(crate) fn from_installed(
+        skills_root: &Path,
+        snapshot_path: PathBuf,
+        read_runtime_facet: bool,
+    ) -> Result<Self> {
         let alias = snapshot_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -609,6 +650,11 @@ impl AppliedSkill {
             .as_ref()
             .map(|value| value.install_id.trim())
             .filter(|value| !value.is_empty());
+        let runtime_facet = if read_runtime_facet {
+            read_runtime_skill_facet(&snapshot_path, &alias, install_id)?
+        } else {
+            None
+        };
         let installed_at = metadata
             .as_ref()
             .and_then(|value| value.installed_at_ms.and_then(ms_to_datetime))
@@ -630,8 +676,110 @@ impl AppliedSkill {
             hash,
             snapshot_path,
             installed_at,
+            runtime_facet,
         })
     }
+
+    fn runtime_facet_projection(&self) -> Option<Self> {
+        let facet = self.runtime_facet.as_ref()?;
+        Some(Self {
+            skill_id: facet.skill_id.clone(),
+            alias: self.alias.clone(),
+            name: facet.name.clone(),
+            description: facet.description.clone(),
+            source: self.source.clone(),
+            reference: self.reference.clone(),
+            hash: facet.hash.clone(),
+            snapshot_path: facet.snapshot_path.clone(),
+            installed_at: self.installed_at,
+            runtime_facet: None,
+        })
+    }
+}
+
+fn read_runtime_skill_facet(
+    skill_root: &Path,
+    alias: &str,
+    install_id: Option<&str>,
+) -> Result<Option<AppliedRuntimeSkillFacet>> {
+    let runtime_root = skill_root.join("runtime");
+    let runtime_metadata = match fs::symlink_metadata(&runtime_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", runtime_root.display()));
+        }
+    };
+    if runtime_metadata.file_type().is_symlink() || !runtime_metadata.is_dir() {
+        return Err(anyhow!(
+            "runtime skill facets root '{}' must be a regular directory",
+            runtime_root.display()
+        ));
+    }
+    let runtime_root = fs::canonicalize(&runtime_root)
+        .with_context(|| format!("failed to resolve {}", runtime_root.display()))?;
+
+    let facet_root = runtime_root.join(alias);
+    let facet_metadata = match fs::symlink_metadata(&facet_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", facet_root.display()));
+        }
+    };
+    if facet_metadata.file_type().is_symlink() || !facet_metadata.is_dir() {
+        return Err(anyhow!(
+            "runtime skill facet '{}' must be a regular directory",
+            facet_root.display()
+        ));
+    }
+    let facet_root = fs::canonicalize(&facet_root)
+        .with_context(|| format!("failed to resolve {}", facet_root.display()))?;
+    if facet_root.parent() != Some(runtime_root.as_path()) {
+        return Err(anyhow!(
+            "runtime skill facet '{}' must stay directly under '{}'",
+            facet_root.display(),
+            runtime_root.display()
+        ));
+    }
+
+    let skill_md_path = facet_root.join("SKILL.md");
+    let skill_md_metadata = fs::symlink_metadata(&skill_md_path)
+        .with_context(|| format!("failed to stat {}", skill_md_path.display()))?;
+    if skill_md_metadata.file_type().is_symlink() || !skill_md_metadata.is_file() {
+        return Err(anyhow!(
+            "runtime skill facet '{}' must contain a regular SKILL.md",
+            facet_root.display()
+        ));
+    }
+
+    let skill_md = fs::read_to_string(&skill_md_path)
+        .with_context(|| format!("failed to read {}", skill_md_path.display()))?;
+    if !skill_md.trim_start().starts_with("---") {
+        return Err(anyhow!(
+            "runtime skill facet '{}' must contain SKILL.md frontmatter",
+            facet_root.display()
+        ));
+    }
+    let (name, description) = parse_skill_frontmatter(&skill_md);
+    validate_agent_skill_name(&name)?;
+    if name != alias {
+        return Err(anyhow!(
+            "runtime skill facet '{}' declares name '{}', expected '{}'",
+            facet_root.display(),
+            name,
+            alias
+        ));
+    }
+
+    let hash = hash_directory(&facet_root)?;
+    Ok(Some(AppliedRuntimeSkillFacet {
+        skill_id: derive_skill_id(&name, &hash, install_id),
+        name,
+        description,
+        hash,
+        snapshot_path: facet_root,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +967,67 @@ mod tests {
             .clone();
 
         assert_eq!(initial_snapshot, reloaded_snapshot);
+    }
+
+    #[tokio::test]
+    async fn load_rejects_runtime_skill_facet_name_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+
+        let channel = home.skills_dir().join("team-local");
+        fs::create_dir_all(channel.join("runtime/team-local")).expect("runtime facet dir");
+        fs::write(
+            channel.join("SKILL.md"),
+            "---\nname: channel-team-local\ndescription: channel\n---\n",
+        )
+        .expect("channel skill");
+        fs::write(
+            channel.join("runtime/team-local/SKILL.md"),
+            "---\nname: runtime\ndescription: sender\n---\n",
+        )
+        .expect("runtime skill");
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
+            required_env: Vec::new(),
+            contact: None,
+        });
+        config.save(&home).await.expect("save config");
+
+        let err = AppliedState::load(&home)
+            .await
+            .expect_err("mismatched runtime skill name should fail");
+        assert!(
+            err.to_string().contains("declares name 'runtime'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_ignores_runtime_directory_for_non_channel_skills() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+
+        let skill = home.skills_dir().join("ordinary");
+        fs::create_dir_all(skill.join("runtime/ordinary")).expect("runtime dir");
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: ordinary\ndescription: ordinary\n---\n",
+        )
+        .expect("skill md");
+        fs::write(
+            skill.join("runtime/ordinary/SKILL.md"),
+            "---\nname: invalid runtime name\ndescription: ignored\n---\n",
+        )
+        .expect("runtime skill");
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+        assert!(applied.skill_by_alias("ordinary").is_some());
     }
 
     #[tokio::test]

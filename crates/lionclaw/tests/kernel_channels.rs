@@ -3651,7 +3651,7 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
     .expect("seed legacy v1 channel schema");
 
     sqlx::raw_sql(include_str!(
-        "../migrations/202605140002_channels_v2_core.sql"
+        "../../../migrations/202605140002_channels_v2_core.sql"
     ))
     .execute(&pool)
     .await
@@ -3680,7 +3680,7 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
     assert_eq!(turn_event_ids, event_ids);
 
     sqlx::raw_sql(include_str!(
-        "../migrations/202605140005_channel_outbox.sql"
+        "../../../migrations/202605140005_channel_outbox.sql"
     ))
     .execute(&pool)
     .await

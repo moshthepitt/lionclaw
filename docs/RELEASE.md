@@ -19,6 +19,8 @@ The tarball contains:
 
 - `lionclaw`
 - `lionclawd`
+- `lionclaw-channel-team-local`
+- `skills/channel-team-local/`
 - `LICENSE`
 
 ## Notes

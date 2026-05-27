@@ -21,3 +21,4 @@ pub mod skills;
 pub mod snapshot;
 pub mod status;
 pub mod target;
+pub mod team_local;

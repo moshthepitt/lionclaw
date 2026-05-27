@@ -77,7 +77,7 @@ jobs:
         run: bash ./scripts/ci.sh
 
       - name: Build release binaries
-        run: cargo build --release --bins
+        run: cargo build --workspace --release --bins
 
       - name: Package release assets
         run: |
@@ -87,10 +87,22 @@ jobs:
           RELEASE_DIR="dist/lionclaw-v$VERSION-linux-x86_64"
           ARCHIVE="dist/${{ steps.version.outputs.archive }}"
 
-          mkdir -p "$RELEASE_DIR"
+          mkdir -p "$RELEASE_DIR/skills"
           cp target/release/lionclaw "$RELEASE_DIR/"
           cp target/release/lionclawd "$RELEASE_DIR/"
+          cp target/release/lionclaw-channel-team-local "$RELEASE_DIR/"
+          cp -R skills/channel-team-local "$RELEASE_DIR/skills/"
           cp LICENSE "$RELEASE_DIR/"
+
+          test -x "$RELEASE_DIR/lionclaw"
+          test -x "$RELEASE_DIR/lionclawd"
+          test -x "$RELEASE_DIR/lionclaw-channel-team-local"
+          test -x "$RELEASE_DIR/skills/channel-team-local/scripts/worker"
+          test -f "$RELEASE_DIR/skills/channel-team-local/lionclaw.toml"
+          test -f "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/SKILL.md"
+          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/list"
+          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/resolve"
+          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/send"
 
           tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"
           (

@@ -774,7 +774,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
-            project_workspace_root: Some(std::env::current_dir().expect("current dir")),
+            project_workspace_root: Some(repo_root()),
             ..KernelOptions::default()
         })
         .await;
@@ -1459,6 +1459,13 @@ async fn install_skill(env: &TestEnv, skill_name: &str) -> String {
         .expect("installed skill")
         .skill_id
         .clone()
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
 }
 
 async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &str) {

@@ -27,9 +27,9 @@ Run from the repository root:
 
 ```bash
 cargo fmt -- --check
-cargo check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 bash ./scripts/ci.sh
 ```
 
@@ -57,6 +57,7 @@ export PROJ_A=/tmp/lionclaw-live-$QA_STAMP-project-a
 export PROJ_B=/tmp/lionclaw-live-$QA_STAMP-project-b
 export LIONCLAW_BIN="$PWD/target/debug/lionclaw"
 
+cargo build --workspace
 mkdir -p "$PROJ_A" "$PROJ_B"
 printf 'project-a\n' > "$PROJ_A/project-marker.txt"
 printf 'project-b\n' > "$PROJ_B/project-marker.txt"
@@ -69,6 +70,17 @@ Configure project A:
 ```bash
 cd "$PROJ_A"
 "$LIONCLAW_BIN" project init
+"$LIONCLAW_BIN" instance create reviewer
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/list"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/resolve"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/send"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/list"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/resolve"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/send"
+"$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
+"$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" configure --runtime codex
 "$LIONCLAW_BIN" status
 "$LIONCLAW_BIN" doctor
@@ -77,6 +89,9 @@ cd "$PROJ_A"
 Expected:
 
 - project metadata exists under `.lionclaw/`
+- `main` and `reviewer` have the bundled `team-local` channel installed with
+  an embedded Rust worker/sender binary, runtime list/resolve/send helpers, and
+  approved direct sibling grants
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 
@@ -199,9 +214,10 @@ Expected:
 - the reviewer runtime has `LIONCLAW_PROJECT_INSTANCE=reviewer` and can read a
   read-only `LIONCLAW_PROJECT_INSTANCES_FILE` JSON listing `main`, `reviewer`,
   `shared`, and `shared-two`
-- with a `channel-send` preset and a configured neighbor contact, the projection
-  uses schema version 2, leaves the selected instance entry identity-only, and
-  exposes route fields only for neighbors whose channel is active in the sender
+- fresh team-local setup creates a `team-local` preset with `channel-send`; with
+  that preset active and a configured neighbor contact, the projection uses
+  schema version 2, leaves the selected instance entry identity-only, and exposes
+  route fields only for neighbors whose channel is active in the sender
 
 ## Phase 4: Project Isolation
 

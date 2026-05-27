@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+WORKER="$SKILL_ROOT/runtime/team-local/bin/lionclaw-channel-team-local"
+
+if [[ ! -x "$WORKER" ]]; then
+  echo "missing team-local worker binary: $WORKER" >&2
+  echo "reinstall the bundled team-local channel from a LionClaw build that includes lionclaw-channel-team-local" >&2
+  exit 127
+fi
+
+exec "$WORKER" worker "$@"

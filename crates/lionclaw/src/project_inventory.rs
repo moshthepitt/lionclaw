@@ -142,6 +142,44 @@ impl ProjectInstanceInventory {
         self.instances.iter().any(|instance| instance.name == name)
     }
 
+    pub fn contains_channel_send_route(
+        &self,
+        selected_instance: &str,
+        channel_id: &str,
+        conversation_ref: &str,
+        thread_ref: Option<&str>,
+    ) -> bool {
+        let Some(channel_id) = non_empty_trimmed(channel_id) else {
+            return false;
+        };
+        let Some(conversation_ref) = non_empty_trimmed(conversation_ref) else {
+            return false;
+        };
+        let thread_ref = thread_ref.and_then(non_empty_trimmed);
+        self.instances.iter().any(|instance| {
+            if instance.name == selected_instance {
+                return false;
+            }
+            let Some(channel_send) = &instance.channel_send else {
+                return false;
+            };
+            if channel_send.status != ProjectInstanceChannelSendStatus::Configured {
+                return false;
+            }
+            channel_send
+                .channel_id
+                .as_deref()
+                .and_then(non_empty_trimmed)
+                == Some(channel_id)
+                && channel_send
+                    .conversation_ref
+                    .as_deref()
+                    .and_then(non_empty_trimmed)
+                    == Some(conversation_ref)
+                && projected_thread_ref(channel_send) == thread_ref
+        })
+    }
+
     pub fn to_pretty_json(&self) -> serde_json::Result<String> {
         let mut encoded = serde_json::to_string_pretty(self)?;
         encoded.push('\n');
@@ -259,6 +297,85 @@ fn hash_str(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+fn projected_thread_ref(channel_send: &ProjectInstanceChannelSend) -> Option<&str> {
+    match channel_send.thread_ref.as_ref() {
+        Some(Some(value)) => non_empty_trimmed(value),
+        Some(None) | None => None,
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
 fn hash_len(hasher: &mut Sha256, len: usize) {
     hasher.update((len as u64).to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
+    };
+
+    #[test]
+    fn channel_send_route_lookup_excludes_self_and_unconfigured_routes() {
+        let inventory = ProjectInstanceInventory::new_channel_send(
+            Some("main".to_string()),
+            vec![
+                ProjectInstanceInventoryEntry::with_channel_send(
+                    "main".to_string(),
+                    ProjectInstanceChannelSend::configured(
+                        "team-local".to_string(),
+                        "team-local:peer:self".to_string(),
+                        None,
+                    ),
+                ),
+                ProjectInstanceInventoryEntry::with_channel_send(
+                    "reviewer".to_string(),
+                    ProjectInstanceChannelSend::configured(
+                        "team-local".to_string(),
+                        "team-local:peer:reviewer".to_string(),
+                        Some("thread-1".to_string()),
+                    ),
+                ),
+                ProjectInstanceInventoryEntry::with_channel_send(
+                    "qa".to_string(),
+                    ProjectInstanceChannelSend::unconfigured(),
+                ),
+            ],
+        );
+
+        assert!(inventory.contains_channel_send_route(
+            "main",
+            "team-local",
+            "team-local:peer:reviewer",
+            Some("thread-1"),
+        ));
+        assert!(!inventory.contains_channel_send_route(
+            "main",
+            "team-local",
+            "team-local:peer:reviewer",
+            None,
+        ));
+        assert!(!inventory.contains_channel_send_route(
+            "main",
+            "team-local",
+            "team-local:peer:self",
+            None,
+        ));
+        assert!(!inventory.contains_channel_send_route(
+            "main",
+            "team-local",
+            "team-local:peer:qa",
+            None,
+        ));
+        assert!(!inventory.contains_channel_send_route(
+            "main",
+            " ",
+            "team-local:peer:reviewer",
+            Some("thread-1"),
+        ));
+    }
 }
