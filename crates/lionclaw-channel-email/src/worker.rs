@@ -121,7 +121,17 @@ where
         for candidate in candidates {
             let status = store.mail_status(&candidate.event_id).await?;
             match status {
-                Some(MailStatus::Admitted | MailStatus::Suppressed) => continue,
+                Some(MailStatus::Admitted | MailStatus::Suppressed) => {
+                    if let Err(err) = mailbox.record_seen_or_processed(&candidate).await {
+                        warn!(
+                            event_id = %candidate.event_id,
+                            sender_ref = %candidate.sender_ref,
+                            error = %err,
+                            "failed to mark terminal email candidate processed"
+                        );
+                    }
+                    continue;
+                }
                 Some(MailStatus::Held) | None => {}
             }
             if let Err(err) = self
@@ -158,7 +168,7 @@ where
         match classify_headers(&candidate.facts, &self.config.mailbox.address) {
             MailClassification::Candidate => {}
             MailClassification::Suppressed { reason } => {
-                store.record_suppressed(candidate, &reason).await?;
+                suppress_candidate(store, mailbox, candidate, &reason).await?;
                 return Ok(());
             }
         }
@@ -178,9 +188,13 @@ where
 
         if !authorization.authorized {
             if authorization.reason_code == "blocked_grant" {
-                store
-                    .record_suppressed(candidate, authorization.reason_code.as_str())
-                    .await?;
+                suppress_candidate(
+                    store,
+                    mailbox,
+                    candidate,
+                    authorization.reason_code.as_str(),
+                )
+                .await?;
             } else {
                 store
                     .record_held(
@@ -198,10 +212,15 @@ where
             .fetch_full_message_after_authorize(candidate)
             .await
             .context("failed to fetch authorized email body")?;
-        let parsed =
-            parse_full_message(&fetched.raw).context("failed to parse authorized email")?;
+        let parsed = match parse_full_message(&fetched.raw) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                suppress_candidate(store, mailbox, candidate, "malformed_message").await?;
+                return Err(err.context("failed to parse authorized email"));
+            }
+        };
         if let Err(err) = require_nonempty_body(&parsed) {
-            store.record_suppressed(candidate, "empty_message").await?;
+            suppress_candidate(store, mailbox, candidate, "empty_message").await?;
             return Err(err);
         }
 
@@ -227,7 +246,7 @@ where
                 .await?;
             }
             "blocked" => {
-                store.record_suppressed(candidate, "blocked").await?;
+                suppress_candidate(store, mailbox, candidate, "blocked").await?;
                 return Ok(());
             }
             "pending_approval" | "trigger_ignored" => {
@@ -680,6 +699,16 @@ async fn stage_and_finalize_attachments(
     }
 }
 
+async fn suppress_candidate(
+    store: &EmailStore,
+    mailbox: &mut dyn MailboxEngine,
+    candidate: &CandidateHeader,
+    reason: &str,
+) -> Result<()> {
+    store.record_suppressed(candidate, reason).await?;
+    mailbox.record_seen_or_processed(candidate).await
+}
+
 fn prepare_inbound_attachments(
     mailbox_id: &str,
     candidate: &CandidateHeader,
@@ -1023,6 +1052,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_automated_mail_is_marked_processed_without_full_fetch() {
+        let candidate = candidate_from_headers(
+            "From: Robot <robot@example.com>\r\n\
+             To: Assistant <assistant@example.com>\r\n\
+             Subject: Automated reply\r\n\
+             Message-ID: <auto@example.com>\r\n\
+             Auto-Submitted: auto-replied\r\n\
+             \r\n",
+        );
+        let event_id = candidate.event_id.clone();
+        let fixture = EmailFixture::with_candidate(false, candidate, full_message()).await;
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store.mail_status(&event_id).await.expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_admitted_mail_is_marked_processed_without_requeueing() {
+        let fixture = EmailFixture::new(true).await;
+
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+        worker.tick().await.expect("second tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 2);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_authorized_mail_is_suppressed_and_marked_processed() {
+        let fixture = EmailFixture::with_candidate(
+            true,
+            candidate(),
+            b"Subject: Broken message\r\n\r\nNo usable sender header.".to_vec(),
+        )
+        .await;
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
     async fn held_sender_is_fetched_after_later_authorization() {
         let fixture = EmailFixture::new(false).await;
 
@@ -1077,12 +1178,20 @@ mod tests {
 
     impl EmailFixture {
         async fn new(authorized: bool) -> Self {
+            Self::with_candidate(authorized, candidate(), full_message()).await
+        }
+
+        async fn with_candidate(
+            authorized: bool,
+            candidate: CandidateHeader,
+            raw: Vec<u8>,
+        ) -> Self {
             let root = tempdir().expect("temp dir");
             let state_dir = root.path().join("state");
             let api = Arc::new(ApiState::default());
             api.set_authorized(authorized);
             let api_url = spawn_api(api.clone()).await;
-            let mailbox = FakeMailboxFactory::new(candidate(), full_message());
+            let mailbox = FakeMailboxFactory::new(candidate, raw);
             Self {
                 root,
                 state_dir,
@@ -1303,17 +1412,29 @@ mod tests {
     }
 
     fn candidate() -> CandidateHeader {
-        let facts = parse_headers_for_test(
+        candidate_from_headers(
             "From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
-        );
+        )
+    }
+
+    fn candidate_from_headers(raw_headers: &str) -> CandidateHeader {
+        let facts = parse_headers_for_test(raw_headers);
+        let provider_message_id = facts.message_id.as_deref().unwrap_or("missing-message-id");
+        let root_message_id = facts
+            .references
+            .first()
+            .or(facts.in_reply_to.as_ref())
+            .or(facts.message_id.as_ref())
+            .map(String::as_str)
+            .unwrap_or(provider_message_id);
         CandidateHeader {
             uid_validity: 7,
             uid: 42,
             event_id: "email:imap:assistant-example-com:7:42".to_string(),
-            sender_ref: sender_ref("alice@example.com"),
+            sender_ref: sender_ref(&facts.sender.address),
             conversation_ref: conversation_ref("assistant-example-com"),
-            thread_ref: thread_ref("root@example.com"),
-            message_ref: message_ref("m1@example.com"),
+            thread_ref: thread_ref(root_message_id),
+            message_ref: message_ref(provider_message_id),
             attachment_count: 0,
             facts,
         }
