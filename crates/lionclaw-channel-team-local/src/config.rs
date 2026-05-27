@@ -31,8 +31,22 @@ pub struct SendConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct InventoryConfig {
+    pub self_instance: String,
+    pub instances_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveConfig {
+    pub inventory: InventoryConfig,
+    pub recipient: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum Command {
     Worker(WorkerConfig),
+    List(InventoryConfig),
+    Resolve(ResolveConfig),
     Send(SendConfig),
     Help,
 }
@@ -44,6 +58,14 @@ impl Command {
             Some("worker") => {
                 args.remove(0);
                 CommandName::Worker
+            }
+            Some("list") => {
+                args.remove(0);
+                CommandName::List
+            }
+            Some("resolve") => {
+                args.remove(0);
+                CommandName::Resolve
             }
             Some("send") => {
                 args.remove(0);
@@ -58,6 +80,8 @@ impl Command {
 
         match command {
             CommandName::Worker => Self::worker_from_args(args),
+            CommandName::List => Self::list_from_args(args),
+            CommandName::Resolve => Self::resolve_from_args(args),
             CommandName::Send => Self::send_from_args(args),
         }
     }
@@ -109,6 +133,40 @@ impl Command {
         }))
     }
 
+    fn list_from_args(args: Vec<String>) -> Result<Self> {
+        match args.as_slice() {
+            [] => Ok(Self::List(inventory_config_from_env()?)),
+            [flag] if matches!(flag.as_str(), "-h" | "--help") => {
+                print_list_help();
+                Ok(Self::Help)
+            }
+            [other, ..] => bail!("unknown argument '{other}'"),
+        }
+    }
+
+    fn resolve_from_args(args: Vec<String>) -> Result<Self> {
+        let mut recipient = None;
+        for arg in args {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    print_resolve_help();
+                    return Ok(Self::Help);
+                }
+                other if other.starts_with('-') => bail!("unknown argument '{other}'"),
+                other => {
+                    if recipient.replace(other.to_string()).is_some() {
+                        bail!("team-local resolve accepts exactly one recipient");
+                    }
+                }
+            }
+        }
+
+        Ok(Self::Resolve(ResolveConfig {
+            inventory: inventory_config_from_env()?,
+            recipient: crate::inventory::ensure_single_recipient(recipient)?,
+        }))
+    }
+
     fn send_from_args(args: Vec<String>) -> Result<Self> {
         let mut recipients = Vec::new();
         let mut message_parts = None;
@@ -151,7 +209,16 @@ impl Command {
 #[derive(Debug, Clone, Copy)]
 enum CommandName {
     Worker,
+    List,
+    Resolve,
     Send,
+}
+
+fn inventory_config_from_env() -> Result<InventoryConfig> {
+    Ok(InventoryConfig {
+        self_instance: required_env("LIONCLAW_PROJECT_INSTANCE")?,
+        instances_file: required_env_path("LIONCLAW_PROJECT_INSTANCES_FILE")?,
+    })
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -194,6 +261,8 @@ fn parse_next_string(args: &mut impl Iterator<Item = String>, flag: &str) -> Res
 fn print_help() {
     println!(
         "lionclaw-channel-team-local worker [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS]\n\
+         lionclaw-channel-team-local list\n\
+         lionclaw-channel-team-local resolve <recipient>\n\
          lionclaw-channel-team-local send [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }
@@ -202,6 +271,14 @@ fn print_worker_help() {
     println!(
         "lionclaw-channel-team-local worker [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS]"
     );
+}
+
+fn print_list_help() {
+    println!("lionclaw-channel-team-local list");
+}
+
+fn print_resolve_help() {
+    println!("lionclaw-channel-team-local resolve <recipient>");
 }
 
 fn print_send_help() {

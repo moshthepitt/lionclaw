@@ -364,8 +364,9 @@ snapshot is self-contained: `scripts/worker` execs
 `runtime/team-local/bin/lionclaw-channel-team-local` from the skill directory,
 and install plumbing copies the compiled worker binary into that snapshot
 before computing the installed skill hash. The same binary also backs the
-runtime-facing `runtime/team-local/scripts/send` helper for sender-side team
-messages.
+runtime-facing `runtime/team-local/scripts/list`,
+`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
+helpers for sender-side team discovery and messages.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill

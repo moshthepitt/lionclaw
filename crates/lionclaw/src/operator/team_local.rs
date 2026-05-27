@@ -311,6 +311,18 @@ mod tests {
             &main_home
                 .skills_dir()
                 .join(CHANNEL_ID)
+                .join("runtime/team-local/scripts/list"),
+        );
+        assert_executable(
+            &main_home
+                .skills_dir()
+                .join(CHANNEL_ID)
+                .join("runtime/team-local/scripts/resolve"),
+        );
+        assert_executable(
+            &main_home
+                .skills_dir()
+                .join(CHANNEL_ID)
                 .join("runtime/team-local/scripts/send"),
         );
     }

@@ -14,4 +14,6 @@ uv run --project skills/channel-telegram ruff check skills/channel-telegram/lion
 uv run --project skills/channel-telegram python -m unittest discover -s skills/channel-telegram/tests
 bash -n skills/channel-telegram/scripts/worker
 bash -n skills/channel-team-local/scripts/worker
+bash -n skills/channel-team-local/runtime/team-local/scripts/list
+bash -n skills/channel-team-local/runtime/team-local/scripts/resolve
 bash -n skills/channel-team-local/runtime/team-local/scripts/send

@@ -100,6 +100,8 @@ jobs:
           test -x "$RELEASE_DIR/skills/channel-team-local/scripts/worker"
           test -f "$RELEASE_DIR/skills/channel-team-local/lionclaw.toml"
           test -f "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/SKILL.md"
+          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/list"
+          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/resolve"
           test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/send"
 
           tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"

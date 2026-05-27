@@ -5,10 +5,24 @@ description: Send messages to sibling LionClaw project instances through the tea
 
 # Team Local
 
-Use `scripts/send` to message one or more sibling LionClaw project instances by
-instance name. The helper resolves routes from LionClaw's project inventory and
-sends through the configured channel-send bridge; do not open sockets or edit
-project files directly.
+Use `scripts/list` to see sibling LionClaw project instances and their
+team-local route status.
+
+```bash
+scripts/list
+```
+
+Use `scripts/resolve <instance>` when you need to inspect the concrete
+channel-send route before deciding whether to send.
+
+```bash
+scripts/resolve reviewer
+```
+
+Use `scripts/send` to message one or more sibling instances by instance name.
+The helper resolves routes from LionClaw's project inventory and sends through
+the configured channel-send bridge; do not open sockets or edit project files
+directly.
 
 ```bash
 scripts/send reviewer qa -- "Please check the latest result and reply with your conclusion."

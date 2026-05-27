@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
     path::Path,
@@ -8,9 +7,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::{config::SendConfig, protocol::CHANNEL_ID};
+use crate::{
+    config::SendConfig,
+    inventory::{ProjectInventory, RecipientRoute, RouteError},
+};
 
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -36,42 +38,6 @@ pub struct SendDelivery {
 pub struct SendError {
     pub code: String,
     pub message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectInventory {
-    instances: Vec<ProjectInventoryEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectInventoryEntry {
-    name: String,
-    #[serde(default)]
-    channel_send: Option<ProjectInventoryChannelSend>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectInventoryChannelSend {
-    status: String,
-    #[serde(default)]
-    channel_id: Option<String>,
-    #[serde(default)]
-    conversation_ref: Option<String>,
-    #[serde(default)]
-    thread_ref: Option<Option<String>>,
-}
-
-#[derive(Debug, Clone)]
-struct RecipientRoute {
-    channel_id: String,
-    conversation_ref: String,
-    thread_ref: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RecipientPlan {
-    recipient: String,
-    route: RecipientRoute,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,10 +88,10 @@ fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
     let recipient_count = recipients.len();
     let plan = match inventory.plan(&config.self_instance, &recipients) {
         Ok(plan) => plan,
-        Err(deliveries) => {
+        Err(errors) => {
             return Ok(SendSummary {
                 ok: false,
-                deliveries,
+                deliveries: unresolved_deliveries(&recipients, errors),
             });
         }
     };
@@ -171,6 +137,25 @@ fn idempotency_key_for(base: &str, recipient: &str, recipient_count: usize) -> S
     } else {
         format!("{base}:{recipient}")
     }
+}
+
+fn unresolved_deliveries(
+    recipients: &[String],
+    errors: Vec<(String, RouteError)>,
+) -> Vec<SendDelivery> {
+    let mut errors = errors.into_iter().collect::<BTreeMap<_, _>>();
+    recipients
+        .iter()
+        .map(|recipient| {
+            let error = errors.remove(recipient).map(Into::into).unwrap_or_else(|| {
+                send_error(
+                    "not_sent",
+                    "team-local did not send any messages because at least one recipient could not be resolved",
+                )
+            });
+            SendDelivery::failed(recipient.clone(), error)
+        })
+        .collect()
 }
 
 fn generated_idempotency_key() -> Result<String> {
@@ -245,123 +230,19 @@ fn send_request(
     ChannelSendResponse::parse(&response)
 }
 
-impl ProjectInventory {
-    fn load(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))
-    }
-
-    fn route_for(
-        &self,
-        self_instance: &str,
-        recipient: &str,
-    ) -> std::result::Result<RecipientRoute, SendError> {
-        if recipient == self_instance {
-            return Err(send_error(
-                "self_recipient",
-                "team-local cannot send a message to the selected instance itself",
-            ));
-        }
-        let Some(entry) = self.instances.iter().find(|entry| entry.name == recipient) else {
-            return Err(send_error(
-                "unknown_recipient",
-                format!("project instance '{recipient}' is not in instances.json"),
-            ));
-        };
-        let Some(channel_send) = &entry.channel_send else {
-            return Err(send_error(
-                "recipient_unconfigured",
-                format!("project instance '{recipient}' has no channel_send route"),
-            ));
-        };
-        if channel_send.status != "configured" {
-            return Err(send_error(
-                channel_send.status.as_str(),
-                format!(
-                    "project instance '{recipient}' channel_send status is '{}'",
-                    channel_send.status
-                ),
-            ));
-        }
-        let channel_id =
-            required_route_field(recipient, "channel_id", channel_send.channel_id.as_deref())?;
-        if channel_id != CHANNEL_ID {
-            return Err(send_error(
-                "wrong_channel",
-                format!("project instance '{recipient}' uses channel '{channel_id}'"),
-            ));
-        }
-        let conversation_ref = required_route_field(
-            recipient,
-            "conversation_ref",
-            channel_send.conversation_ref.as_deref(),
-        )?;
-        Ok(RecipientRoute {
-            channel_id: channel_id.to_string(),
-            conversation_ref: conversation_ref.to_string(),
-            thread_ref: channel_send.thread_ref.clone().flatten(),
-        })
-    }
-
-    fn plan(
-        &self,
-        self_instance: &str,
-        recipients: &[String],
-    ) -> std::result::Result<Vec<RecipientPlan>, Vec<SendDelivery>> {
-        let mut plans = Vec::with_capacity(recipients.len());
-        let mut errors = BTreeMap::new();
-        for recipient in recipients {
-            match self.route_for(self_instance, recipient) {
-                Ok(route) => plans.push(RecipientPlan {
-                    recipient: recipient.clone(),
-                    route,
-                }),
-                Err(error) => {
-                    errors.insert(recipient.clone(), error);
-                }
-            }
-        }
-        if errors.is_empty() {
-            Ok(plans)
-        } else {
-            Err(recipients
-                .iter()
-                .map(|recipient| {
-                    let error = errors.remove(recipient).unwrap_or_else(|| {
-                        send_error(
-                            "not_sent",
-                            "team-local did not send any messages because at least one recipient could not be resolved",
-                        )
-                    });
-                    SendDelivery::failed(recipient.clone(), error)
-                })
-                .collect())
-        }
-    }
-}
-
-fn required_route_field<'a>(
-    recipient: &str,
-    field: &str,
-    value: Option<&'a str>,
-) -> std::result::Result<&'a str, SendError> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            send_error(
-                "recipient_misconfigured",
-                format!("project instance '{recipient}' route is missing {field}"),
-            )
-        })
-}
-
 fn send_error(code: impl Into<String>, message: impl Into<String>) -> SendError {
     SendError {
         code: code.into(),
         message: message.into(),
+    }
+}
+
+impl From<RouteError> for SendError {
+    fn from(error: RouteError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
     }
 }
 
