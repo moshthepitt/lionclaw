@@ -93,6 +93,7 @@ jobs:
           cp target/release/lionclaw-channel-email "$RELEASE_DIR/"
           cp target/release/lionclaw-channel-team-local "$RELEASE_DIR/"
           cp -R skills/channel-email "$RELEASE_DIR/skills/"
+          cp -R skills/email-work-inbox "$RELEASE_DIR/skills/"
           cp -R skills/channel-team-local "$RELEASE_DIR/skills/"
           cp LICENSE "$RELEASE_DIR/"
 
@@ -102,6 +103,8 @@ jobs:
           test -x "$RELEASE_DIR/lionclaw-channel-team-local"
           test -x "$RELEASE_DIR/skills/channel-email/scripts/worker"
           test -f "$RELEASE_DIR/skills/channel-email/lionclaw.toml"
+          test -f "$RELEASE_DIR/skills/email-work-inbox/SKILL.md"
+          test -f "$RELEASE_DIR/skills/email-work-inbox/EMAIL_WORKFLOW_GUIDE.md"
           test -x "$RELEASE_DIR/skills/channel-team-local/scripts/worker"
           test -f "$RELEASE_DIR/skills/channel-team-local/lionclaw.toml"
           test -f "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/SKILL.md"

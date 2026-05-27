@@ -32,6 +32,10 @@ impl MailStatus {
 pub struct HeldItem {
     pub held_id: String,
     pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    pub thread_ref: String,
+    pub message_ref: String,
     pub sender_address: String,
     pub sender_name: Option<String>,
     pub subject: String,
@@ -55,6 +59,13 @@ pub struct StoredReceipt {
     pub message_id: String,
     pub recipient: String,
     pub receipt: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingGrantRevocation {
+    pub grant_id: String,
+    pub channel_id: String,
+    pub held_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +142,21 @@ impl EmailStore {
             CREATE TABLE IF NOT EXISTS worker_state (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_grant_revocations (
+                grant_id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                held_id TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
             "#,
         )
@@ -244,8 +270,9 @@ impl EmailStore {
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         let rows = sqlx::query(
             r#"
-            SELECT held_id, event_id, sender_address, sender_name, subject, snippet,
-                   received_at, attachment_count, classification_reason
+            SELECT held_id, event_id, sender_ref, conversation_ref, thread_ref, message_ref,
+                   sender_address, sender_name, subject, snippet, received_at,
+                   attachment_count, classification_reason
             FROM mail_items
             WHERE status = 'held' AND created_at > ?
             ORDER BY created_at ASC
@@ -262,6 +289,10 @@ impl EmailStore {
                 Some(HeldItem {
                     held_id: row.try_get::<Option<String>, _>("held_id").ok()??,
                     event_id: row.try_get("event_id").ok()?,
+                    sender_ref: row.try_get("sender_ref").ok()?,
+                    conversation_ref: row.try_get("conversation_ref").ok()?,
+                    thread_ref: row.try_get("thread_ref").ok()?,
+                    message_ref: row.try_get("message_ref").ok()?,
                     sender_address: row.try_get("sender_address").ok()?,
                     sender_name: row.try_get("sender_name").ok()?,
                     subject: row.try_get("subject").ok()?,
@@ -397,6 +428,67 @@ impl EmailStore {
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn record_pending_grant_revocation(
+        &self,
+        grant_id: &str,
+        channel_id: &str,
+        held_id: &str,
+        last_error: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO pending_grant_revocations (
+                grant_id, channel_id, held_id, last_error, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(grant_id) DO UPDATE SET
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+            "#,
+        )
+        .bind(grant_id)
+        .bind(channel_id)
+        .bind(held_id)
+        .bind(last_error)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_grant_revocations(&self) -> Result<Vec<PendingGrantRevocation>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT grant_id, channel_id, held_id
+            FROM pending_grant_revocations
+            ORDER BY created_at ASC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                Ok(PendingGrantRevocation {
+                    grant_id: row.try_get("grant_id")?,
+                    channel_id: row.try_get("channel_id")?,
+                    held_id: row.try_get("held_id")?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?)
+    }
+
+    pub async fn clear_pending_grant_revocation(&self, grant_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_grant_revocations WHERE grant_id = ?")
+            .bind(grant_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
