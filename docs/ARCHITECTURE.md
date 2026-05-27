@@ -226,6 +226,12 @@ while the runtime turn is active; turn completion or timeout removes the socket
 and invalidates open connections. Native runtime controls do not receive this
 bridge.
 
+The host socket is created under the operator's short per-user runtime directory
+rather than under the instance home, so long project paths do not exceed Unix
+socket path limits. OCI launches that mount a Unix socket disable Podman's
+SELinux process label for that turn; otherwise SELinux hosts can expose the
+socket inode but deny `connect(2)`.
+
 The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
 configured channel route, provider-neutral content, and an idempotency key.

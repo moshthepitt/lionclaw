@@ -170,6 +170,8 @@ const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const CHANNEL_SEND_HOST_SOCKET_ROOT: &str = "lionclaw";
+const CHANNEL_SEND_HOST_SOCKET_DIR: &str = "channel-send";
 const PROJECT_INSTANCE_PROJECTIONS_DIR: &str = "project-instance-projections";
 const MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS: usize = 16;
 const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
@@ -9420,6 +9422,114 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+async fn bind_runtime_channel_send_socket(
+    socket_owner_id: &str,
+    turn_id: Uuid,
+) -> Result<(UnixListener, PathBuf), KernelError> {
+    let filename = format!("cs-{}.sock", turn_id.simple());
+    let mut errors = Vec::new();
+
+    for root in runtime_channel_send_socket_roots() {
+        let socket_dir = match prepare_runtime_channel_send_socket_dir(&root, socket_owner_id).await
+        {
+            Ok(socket_dir) => socket_dir,
+            Err(err) => {
+                errors.push(format!("{}: {err}", root.display()));
+                continue;
+            }
+        };
+        let socket_path = socket_dir.join(&filename);
+        remove_file_best_effort(&socket_path).await;
+        match UnixListener::bind(&socket_path) {
+            Ok(listener) => return Ok((listener, socket_path)),
+            Err(err) => errors.push(format!("{}: {err}", socket_path.display())),
+        }
+    }
+
+    Err(KernelError::Runtime(format!(
+        "failed to bind runtime channel.send socket in any candidate directory: {}",
+        errors.join("; ")
+    )))
+}
+
+async fn prepare_runtime_channel_send_socket_dir(
+    root: &Path,
+    socket_owner_id: &str,
+) -> Result<PathBuf, KernelError> {
+    ensure_safe_child_directory(root, &[]).await?;
+    ensure_owner_private_directory(root).await?;
+    let socket_parent = ensure_safe_child_directory(root, &[CHANNEL_SEND_HOST_SOCKET_DIR]).await?;
+    ensure_owner_private_directory(&socket_parent).await?;
+    let socket_dir = ensure_safe_child_directory(&socket_parent, &[socket_owner_id]).await?;
+    ensure_owner_private_directory(&socket_dir).await?;
+    Ok(socket_dir)
+}
+
+fn runtime_channel_send_socket_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        push_runtime_channel_send_socket_root(
+            &mut roots,
+            runtime_dir.join(CHANNEL_SEND_HOST_SOCKET_ROOT),
+        );
+    }
+
+    #[cfg(unix)]
+    push_runtime_channel_send_socket_root(
+        &mut roots,
+        PathBuf::from(format!(
+            "/run/user/{}/{}",
+            runtime_channel_send_uid_component(),
+            CHANNEL_SEND_HOST_SOCKET_ROOT
+        )),
+    );
+
+    let temp_root = format!(
+        "{}-{}",
+        CHANNEL_SEND_HOST_SOCKET_ROOT,
+        runtime_channel_send_uid_component()
+    );
+    push_runtime_channel_send_socket_root(&mut roots, std::env::temp_dir().join(&temp_root));
+
+    #[cfg(unix)]
+    push_runtime_channel_send_socket_root(&mut roots, PathBuf::from("/tmp").join(temp_root));
+
+    roots
+}
+
+fn push_runtime_channel_send_socket_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if root.as_os_str().is_empty() || !root.is_absolute() || roots.iter().any(|item| item == &root)
+    {
+        return;
+    }
+    roots.push(root);
+}
+
+#[cfg(unix)]
+fn runtime_channel_send_uid_component() -> String {
+    rustix::process::getuid().as_raw().to_string()
+}
+
+#[cfg(not(unix))]
+fn runtime_channel_send_uid_component() -> String {
+    "user".to_string()
+}
+
+fn runtime_channel_send_socket_owner_id(runtime_state_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lionclaw-runtime-channel-send-socket-owner-v1\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(runtime_state_root.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(runtime_state_root.to_string_lossy().as_bytes());
+    let mut digest = hex::encode(hasher.finalize());
+    digest.truncate(16);
+    digest
+}
+
 async fn ensure_safe_child_directory(
     root: &Path,
     components: &[&str],
@@ -12788,48 +12898,16 @@ impl Kernel {
                 .runtime_channel_send_bridge_error(&context, "runtime_socket_dir", err)
                 .await;
         }
-        let Some(socket_root) = self.runtime_root.as_ref() else {
-            return self
-                .runtime_channel_send_bridge_error(
-                    &context,
-                    "runtime_root",
-                    KernelError::Runtime(
-                        "channel.send escape requires a configured runtime root".to_string(),
-                    ),
-                )
-                .await;
-        };
-        let socket_dir = match ensure_safe_child_directory(socket_root, &["sockets"]).await {
-            Ok(socket_dir) => socket_dir,
-            Err(err) => {
-                return self
-                    .runtime_channel_send_bridge_error(&context, "host_socket_dir", err)
-                    .await;
-            }
-        };
-        if let Err(err) = ensure_owner_private_directory(&socket_dir).await {
-            return self
-                .runtime_channel_send_bridge_error(&context, "host_socket_dir_permissions", err)
-                .await;
-        }
-        let socket_path =
-            socket_dir.join(format!("channel-send-{}.sock", context.turn_id.simple()));
-        remove_file_best_effort(&socket_path).await;
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(listener) => listener,
-            Err(err) => {
-                return self
-                    .runtime_channel_send_bridge_error(
-                        &context,
-                        "bind",
-                        KernelError::Runtime(format!(
-                            "failed to bind runtime channel.send socket '{}': {err}",
-                            socket_path.display()
-                        )),
-                    )
-                    .await;
-            }
-        };
+        let socket_owner_id = runtime_channel_send_socket_owner_id(&context.runtime_state_root);
+        let (listener, socket_path) =
+            match bind_runtime_channel_send_socket(&socket_owner_id, context.turn_id).await {
+                Ok(bound) => bound,
+                Err(err) => {
+                    return self
+                        .runtime_channel_send_bridge_error(&context, "host_socket_bind", err)
+                        .await;
+                }
+            };
         plan.mounts.push(MountSpec {
             source: socket_path.clone(),
             target: CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
