@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod discovery;
 mod protocol;
+mod send;
 mod worker;
 
 use anyhow::Result;
@@ -15,8 +16,18 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match config::WorkerCommand::from_env_and_args()? {
-        config::WorkerCommand::Run(config) => worker::TeamLocalWorker::new(config)?.run().await,
-        config::WorkerCommand::Help => Ok(()),
+    match config::Command::from_env_and_args()? {
+        config::Command::Worker(config) => worker::TeamLocalWorker::new(config)?.run().await,
+        config::Command::Send(config) => {
+            let summary = send::run(config)?;
+            let ok = summary.ok;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if ok {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        config::Command::Help => Ok(()),
     }
 }

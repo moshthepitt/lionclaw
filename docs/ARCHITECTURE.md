@@ -350,10 +350,12 @@ template rendering or neighbor projection.
 
 `channel-team-local` is bundled as a first-party channel skill. Its installed
 snapshot is self-contained: `scripts/worker` execs
-`bin/lionclaw-channel-team-local` from the skill directory, and install
+`runtime/bin/lionclaw-channel-team-local` from the skill directory, and install
 plumbing copies the compiled worker binary into that snapshot before computing
-the installed skill hash. The worker is a separate Rust workspace crate named
-`lionclaw-channel-team-local`; it does not depend on the `lionclaw` crate.
+the installed skill hash. The same binary also backs the runtime-facing
+`runtime/scripts/send` helper for sender-side team messages. The worker is a
+separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
+depend on the `lionclaw` crate.
 
 Project setup installs and configures `team-local` for project instances by
 default. Each instance publishes its own contact route as

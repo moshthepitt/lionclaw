@@ -71,8 +71,10 @@ Configure project A:
 cd "$PROJ_A"
 "$LIONCLAW_BIN" project init
 "$LIONCLAW_BIN" instance create reviewer
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/bin/lionclaw-channel-team-local"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/scripts/send"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/scripts/send"
 "$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" configure --runtime codex
@@ -84,7 +86,8 @@ Expected:
 
 - project metadata exists under `.lionclaw/`
 - `main` and `reviewer` have the bundled `team-local` channel installed with
-  an embedded worker binary and approved direct sibling grants
+  an embedded Rust worker/sender binary, runtime send helper, and approved
+  direct sibling grants
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 

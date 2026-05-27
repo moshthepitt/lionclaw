@@ -21,7 +21,7 @@ use crate::{
 
 pub(crate) const CHANNEL_ID: &str = "team-local";
 const WORKER_BIN_NAME: &str = "lionclaw-channel-team-local";
-const WORKER_BIN_REL_PATH: &str = "bin/lionclaw-channel-team-local";
+const WORKER_BIN_REL_PATH: &str = "runtime/bin/lionclaw-channel-team-local";
 const CONTACT_REF_PREFIX: &str = "team-local:peer:";
 const SENDER_REF_PREFIX: &str = "team-local:instance:";
 
@@ -284,11 +284,23 @@ mod tests {
         let reviewer_home = LionClawHome::new(temp_dir.path().join(".lionclaw/instances/reviewer"));
         assert_team_local_configured(&main_home).await;
         assert_team_local_configured(&reviewer_home).await;
+        assert_executable(
+            &main_home
+                .skills_dir()
+                .join(CHANNEL_ID)
+                .join("runtime/bin/lionclaw-channel-team-local"),
+        );
         assert!(main_home
             .skills_dir()
             .join(CHANNEL_ID)
-            .join("bin/lionclaw-channel-team-local")
+            .join("runtime/SKILL.md")
             .exists());
+        assert_executable(
+            &main_home
+                .skills_dir()
+                .join(CHANNEL_ID)
+                .join("runtime/scripts/send"),
+        );
     }
 
     #[tokio::test]
@@ -421,5 +433,16 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("chmod");
         }
+    }
+
+    fn assert_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path).expect("metadata").permissions().mode();
+            assert_ne!(mode & 0o111, 0, "{} is not executable", path.display());
+        }
+        #[cfg(not(unix))]
+        assert!(path.exists(), "{} does not exist", path.display());
     }
 }
