@@ -11,10 +11,12 @@ const BUNDLED_CHANNEL_WORKERS: &[BundledChannelWorker] = &[
     BundledChannelWorker {
         channel_id: "email",
         binary_name: "lionclaw-channel-email",
+        installed_path: "bin/lionclaw-channel-email",
     },
     BundledChannelWorker {
         channel_id: "team-local",
         binary_name: "lionclaw-channel-team-local",
+        installed_path: "runtime/team-local/bin/lionclaw-channel-team-local",
     },
 ];
 
@@ -22,6 +24,7 @@ const BUNDLED_CHANNEL_WORKERS: &[BundledChannelWorker] = &[
 struct BundledChannelWorker {
     channel_id: &'static str,
     binary_name: &'static str,
+    installed_path: &'static str,
 }
 
 pub(crate) fn snapshot_overlays_for_source(source_path: &Path) -> Result<Vec<SnapshotOverlay>> {
@@ -30,7 +33,7 @@ pub(crate) fn snapshot_overlays_for_source(source_path: &Path) -> Result<Vec<Sna
     };
     Ok(vec![SnapshotOverlay::new(
         worker_binary_path(worker.binary_name)?,
-        PathBuf::from(format!("bin/{}", worker.binary_name)),
+        PathBuf::from(worker.installed_path),
     )])
 }
 
@@ -73,4 +76,47 @@ fn worker_for_bundled_source(source_path: &Path) -> Result<Option<BundledChannel
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_worker_overlay_paths_match_skill_scripts() {
+        let email = BUNDLED_CHANNEL_WORKERS
+            .iter()
+            .find(|worker| worker.channel_id == "email")
+            .expect("email bundled worker");
+        assert_eq!(email.installed_path, "bin/lionclaw-channel-email");
+        assert!(
+            include_str!("../../../../skills/channel-email/scripts/worker")
+                .contains(email.installed_path)
+        );
+
+        let team_local = BUNDLED_CHANNEL_WORKERS
+            .iter()
+            .find(|worker| worker.channel_id == "team-local")
+            .expect("team-local bundled worker");
+        assert_eq!(
+            team_local.installed_path,
+            "runtime/team-local/bin/lionclaw-channel-team-local"
+        );
+        assert!(
+            include_str!("../../../../skills/channel-team-local/scripts/worker")
+                .contains(team_local.installed_path)
+        );
+        assert!(include_str!(
+            "../../../../skills/channel-team-local/runtime/team-local/scripts/list"
+        )
+        .contains("bin/lionclaw-channel-team-local"));
+        assert!(include_str!(
+            "../../../../skills/channel-team-local/runtime/team-local/scripts/resolve"
+        )
+        .contains("bin/lionclaw-channel-team-local"));
+        assert!(include_str!(
+            "../../../../skills/channel-team-local/runtime/team-local/scripts/send"
+        )
+        .contains("bin/lionclaw-channel-team-local"));
+    }
 }

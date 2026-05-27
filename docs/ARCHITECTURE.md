@@ -413,7 +413,10 @@ worker-local SQLite state.
 `channel-team-local` is a first-party local team channel skill. The same bundled
 worker binary also backs the runtime-facing `runtime/team-local/scripts/list`,
 `runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages.
+helpers for sender-side team discovery and messages. The outer channel skill
+installs that binary at `runtime/team-local/bin/lionclaw-channel-team-local`;
+inside the projected runtime skill root, the helper scripts address the same
+file as `bin/lionclaw-channel-team-local`.
 
 Project setup installs and configures `team-local` for project instances by
 default. It also ensures a `team-local` execution preset with the existing
