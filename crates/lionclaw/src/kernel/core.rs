@@ -2849,10 +2849,13 @@ impl Kernel {
             .map_err(|err| internal(err.into()))?;
         let authorization = self.authorize_channel_actor_in_tx(&mut tx, &input).await?;
         tx.commit().await.map_err(|err| internal(err.into()))?;
+        let admission_grant = authorization.admission_grant;
         Ok(ChannelActorAuthorizeResponse {
             authorized: authorization.outcome == ChannelActorAuthorizationOutcome::Authorized,
             reason_code: authorization.outcome.reason_code().to_string(),
-            grant_id: authorization.admission_grant.map(|grant| grant.grant_id),
+            grant_id: admission_grant.as_ref().map(|grant| grant.grant_id),
+            grant_routing_profile: admission_grant.as_ref().map(|grant| grant.routing_profile),
+            grant_label: admission_grant.and_then(|grant| grant.label),
             session_key: authorization.session_key,
         })
     }

@@ -396,6 +396,15 @@ Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
 other host-side assets are not projected into the runtime.
 
+The runtime-visible `email-work-inbox` companion skill documents operator-driven
+email administration. Permanent sender approval uses the existing channel grant
+approval API for an exact `email:addr:<normalized-address>` sender ref. One-shot
+held-message release uses an existing thread-scoped grant labeled
+`email-release:<held-id>`; the email worker recognizes that label on the
+authorization response, admits the matching held item once, then revokes the
+grant through `/v0/channels/grants/revoke`. Failed revocations are retried from
+worker-local SQLite state.
+
 ## Team-Local Channel
 
 `channel-team-local` is a first-party local team channel skill. The same bundled

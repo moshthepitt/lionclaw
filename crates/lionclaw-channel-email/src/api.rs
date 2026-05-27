@@ -24,6 +24,22 @@ pub struct ChannelActorAuthorizeResponse {
     pub reason_code: String,
     #[serde(default)]
     pub grant_id: Option<String>,
+    #[serde(default)]
+    pub grant_routing_profile: Option<String>,
+    #[serde(default)]
+    pub grant_label: Option<String>,
+}
+
+impl ChannelActorAuthorizeResponse {
+    pub fn one_shot_release_held_id(&self) -> Option<&str> {
+        if self.grant_routing_profile.as_deref() != Some("thread") {
+            return None;
+        }
+        self.grant_label
+            .as_deref()
+            .and_then(|label| label.strip_prefix("email-release:"))
+            .filter(|held_id| !held_id.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +293,25 @@ impl LionClawApi {
                     "provider_receipt": report.provider_receipt,
                     "error_code": report.error_code,
                     "error_text": report.error_text,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_channel_grant(
+        &self,
+        channel_id: &str,
+        grant_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let _: Value = self
+            .post_json(
+                "/v0/channels/grants/revoke",
+                &serde_json::json!({
+                    "channel_id": channel_id,
+                    "grant_id": grant_id,
+                    "reason": reason,
                 }),
             )
             .await?;

@@ -986,6 +986,10 @@ pub struct ChannelActorAuthorizeResponse {
     #[serde(default)]
     pub grant_id: Option<Uuid>,
     #[serde(default)]
+    pub grant_routing_profile: Option<ChannelRoutingProfile>,
+    #[serde(default)]
+    pub grant_label: Option<String>,
+    #[serde(default)]
     pub session_key: Option<String>,
 }
 

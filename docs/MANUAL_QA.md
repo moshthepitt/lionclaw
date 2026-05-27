@@ -243,6 +243,44 @@ Expected:
 
 ## Phase 5: Provider Channels
 
+Email is credential-gated manual QA. Run it only with a dedicated mailbox, not a
+personal inbox.
+
+```bash
+export LIONCLAW_REPO=/path/to/lionclaw
+cd "$LIONCLAW_REPO"
+cargo build --workspace
+cd "$PROJ_A"
+"$LIONCLAW_BIN" skill add "$LIONCLAW_REPO/skills/channel-email" --alias email
+"$LIONCLAW_BIN" skill add "$LIONCLAW_REPO/skills/email-work-inbox" --alias email-work-inbox
+cat > email.env <<'EOF'
+EMAIL_ADDRESS=assistant@example.com
+EMAIL_IMAP_HOST=imap.example.com
+EMAIL_IMAP_USERNAME=assistant@example.com
+EMAIL_IMAP_PASSWORD=...
+EMAIL_SMTP_HOST=smtp.example.com
+EMAIL_SMTP_USERNAME=assistant@example.com
+EMAIL_SMTP_PASSWORD=...
+EMAIL_ADMIN_DIGEST_TO=operator@example.com
+EOF
+"$LIONCLAW_BIN" connect email --env-file ./email.env
+"$LIONCLAW_BIN" doctor
+```
+
+Expected when credentials are available:
+
+- `doctor` shows email worker health without printing mailbox secrets
+- an exact approved sender queues one channel turn with a structured email
+  envelope, not raw MIME
+- an unknown non-automated sender is held and does not queue runtime work
+- the held-mail digest includes held id, sender, subject, snippet, attachment
+  count, sender/conversation/thread refs, and release guidance
+- a thread-scoped grant labeled `email-release:<held-id>` releases that held
+  item once and the worker revokes the grant after admission
+- automated/list/bounce/no-reply mail is suppressed without auto-reply
+- attachments are staged only after admission
+- repeated outbox delivery attempts do not send duplicate SMTP replies
+
 Telegram is credential-gated manual QA. Run it only when a real bot token and
 chat flow are available; do not fake Telegram with local shims in this
 checklist.
