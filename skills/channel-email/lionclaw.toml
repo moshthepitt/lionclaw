@@ -1,0 +1,15 @@
+version = 1
+
+[channel]
+id = "email"
+launch = "background"
+worker = "scripts/worker"
+env = [
+  "EMAIL_IMAP_HOST",
+  "EMAIL_IMAP_USERNAME",
+  "EMAIL_IMAP_PASSWORD",
+  "EMAIL_SMTP_HOST",
+  "EMAIL_SMTP_USERNAME",
+  "EMAIL_SMTP_PASSWORD",
+  "EMAIL_ADDRESS",
+]

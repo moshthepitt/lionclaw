@@ -1490,6 +1490,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lionclaw-channel-email"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lionclaw-channel-team-local"
 version = "0.6.0"
 dependencies = [

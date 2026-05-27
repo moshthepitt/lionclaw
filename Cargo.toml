@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lionclaw",
+    "crates/lionclaw-channel-email",
     "crates/lionclaw-channel-team-local",
 ]
 resolver = "2"
