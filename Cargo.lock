@@ -1891,6 +1891,8 @@ name = "lionclaw-channel-email"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "chrono",
  "hex",
  "imap-client",
@@ -1899,8 +1901,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
