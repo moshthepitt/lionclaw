@@ -275,8 +275,14 @@ fn runtime_codex_config_contents(host_config_contents: Option<Vec<u8>>) -> Resul
     let mut document = raw
         .parse::<DocumentMut>()
         .context("failed to parse host Codex config.toml")?;
-    trust_runtime_workspace(&mut document)?;
+    configure_runtime_managed_codex(&mut document)?;
     Ok(document.to_string().into_bytes())
+}
+
+fn configure_runtime_managed_codex(document: &mut DocumentMut) -> Result<()> {
+    document["check_for_update_on_startup"] = toml_edit::value(false);
+    trust_runtime_workspace(document)?;
+    Ok(())
 }
 
 fn trust_runtime_workspace(document: &mut DocumentMut) -> Result<()> {
@@ -1073,6 +1079,7 @@ mod tests {
                 .expect("read copied config");
         assert!(copied_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
         assert!(copied_config.contains("model = \"gpt-5.4\""));
+        assert!(copied_config.contains("check_for_update_on_startup = false"));
         assert!(copied_config.contains("[projects.\"/workspace\"]"));
         assert!(copied_config.contains("trust_level = \"trusted\""));
 
@@ -1121,6 +1128,7 @@ mod tests {
         let config = runtime_codex_config_contents(Some(
             br#"
 model = "gpt-5.4"
+check_for_update_on_startup = true
 
 projects = { "/host/repo" = { trust_level = "trusted", marker = "keep" } }
 "#
@@ -1130,6 +1138,8 @@ projects = { "/host/repo" = { trust_level = "trusted", marker = "keep" } }
         let config = String::from_utf8(config).expect("config utf8");
 
         assert!(config.contains("model = \"gpt-5.4\""));
+        assert!(config.contains("check_for_update_on_startup = false"));
+        assert!(!config.contains("check_for_update_on_startup = true"));
         assert!(config.contains("[projects.\"/host/repo\"]"));
         assert!(config.contains("marker = \"keep\""));
         assert!(config.contains("[projects.\"/workspace\"]"));

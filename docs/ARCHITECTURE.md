@@ -211,9 +211,10 @@ audit trail are the active boundary. Codex also receives
 memory, active context, prior LionClaw session history, skills, and project
 continuity are included without shadowing `/workspace/AGENTS.md`.
 LionClaw also materializes the runtime-private Codex config with
-`[projects."/workspace"] trust_level = "trusted"`, matching the result of
-approving Codex's own workspace prompt inside the container without mutating the
-host Codex home.
+`[projects."/workspace"] trust_level = "trusted"` and
+`check_for_update_on_startup = false`, matching the result of approving Codex's
+own workspace prompt inside the container while keeping runtime updates under
+LionClaw's runtime image/update path. The host Codex home is not mutated.
 
 For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime`. OpenCode's
 native instruction loader then reads `/runtime/AGENTS.md` as global runtime
