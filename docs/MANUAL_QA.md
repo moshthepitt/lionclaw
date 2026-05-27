@@ -289,7 +289,6 @@ cd "$LIONCLAW_REPO"
 cargo build --workspace
 cd "$PROJ_A"
 "$LIONCLAW_BIN" skill add "$LIONCLAW_REPO/skills/channel-email" --alias email
-"$LIONCLAW_BIN" skill add "$LIONCLAW_REPO/skills/email-work-inbox" --alias email-work-inbox
 cat > email.env <<'EOF'
 EMAIL_ADDRESS=assistant@example.com
 EMAIL_IMAP_HOST=imap.example.com
@@ -307,6 +306,8 @@ EOF
 Expected when credentials are available:
 
 - `doctor` shows email worker health without printing mailbox secrets
+- the channel-owned runtime skill facet is projected as the `email` skill for
+  runtimes; no separate email companion skill install is needed
 - an exact approved sender queues one channel turn with a structured email
   envelope, not raw MIME
 - an unknown non-automated sender is held and does not queue runtime work
