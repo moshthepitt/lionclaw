@@ -18,5 +18,6 @@ bash -n skills/channel-team-local/scripts/worker
 bash -n skills/channel-team-local/runtime/team-local/scripts/list
 bash -n skills/channel-team-local/runtime/team-local/scripts/resolve
 bash -n skills/channel-team-local/runtime/team-local/scripts/send
-test -f skills/email-work-inbox/SKILL.md
-test -f skills/email-work-inbox/EMAIL_WORKFLOW_GUIDE.md
+test -f skills/channel-email/runtime/email/SKILL.md
+test -f skills/channel-email/runtime/email/EMAIL_WORKFLOW_GUIDE.md
+grep -q '^name: email$' skills/channel-email/runtime/email/SKILL.md

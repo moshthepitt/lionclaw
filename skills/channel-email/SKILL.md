@@ -12,3 +12,8 @@ runtime never receives mailbox credentials.
 The channel admits only exact approved senders through LionClaw channel grants.
 Unknown mail is held or suppressed by the worker and must not become runtime
 work unless the local operator explicitly approves or releases it.
+
+This channel package also carries the runtime-facing `email` Agent Skill at
+`runtime/email/`. LionClaw projects that facet into runtimes when this skill is
+bound as the `email` channel, while keeping the host-side channel package and
+mail transport credentials out of the runtime.

@@ -387,7 +387,10 @@ calling `/v0/channels/authorize`; full MIME bodies and attachments are fetched
 only after the core grants the sender/thread. Unknown senders are held with
 metadata only, automated/bulk/list mail is suppressed locally, and admitted
 messages are posted through the existing channel inbound and attachment
-endpoints with first-class `thread_ref` and `reply_to_ref` fields.
+endpoints with first-class `thread_ref` and `reply_to_ref` fields. The channel
+also publishes a runtime-facing Agent Skill at `runtime/email/`, so runtimes
+learn how to handle email turns without receiving the host-side channel package
+or mailbox credentials.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill
@@ -396,7 +399,7 @@ Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
 other host-side assets are not projected into the runtime.
 
-The runtime-visible `email-work-inbox` companion skill documents operator-driven
+The runtime-visible email facet documents reply behavior and operator-driven
 email administration. Permanent sender approval uses the existing channel grant
 approval API for an exact `email:addr:<normalized-address>` sender ref. One-shot
 held-message release uses an existing thread-scoped grant labeled
