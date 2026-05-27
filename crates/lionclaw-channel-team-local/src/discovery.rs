@@ -128,6 +128,25 @@ impl ProjectDiscovery {
                 .and_then(|home_id| self.members_by_home_id.get(home_id)),
         }
     }
+
+    pub fn self_member(&self) -> Result<&ProjectMember> {
+        let home_id = self
+            .home_id_by_name
+            .get(&self.self_instance)
+            .ok_or_else(|| {
+                anyhow!(
+                    "project instance '{}' is missing from discovered members",
+                    self.self_instance
+                )
+            })?;
+        self.members_by_home_id.get(home_id).ok_or_else(|| {
+            anyhow!(
+                "project instance '{}' references missing home id '{}'",
+                self.self_instance,
+                home_id
+            )
+        })
+    }
 }
 
 fn project_parts_from_home(home: &Path) -> Result<(PathBuf, String)> {

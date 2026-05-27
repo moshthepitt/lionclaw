@@ -63,46 +63,16 @@ impl TeamLocalWorker {
     }
 
     async fn tick(&self) -> Result<()> {
+        let discovery = ProjectDiscovery::discover(&self.config.home)?;
+        let local_member = discovery.self_member()?;
         let local_info = self.local_api.daemon_info().await?;
-        validate_local_daemon(&local_info)?;
-        let worker_id = self.worker_id(&local_info);
-        let deliveries = self
-            .local_api
-            .pull_outbox(
-                &self.config.channel_id,
-                &worker_id,
-                self.config.pull_limit,
-                self.config.lease_ms,
-            )
-            .await?;
-        if deliveries.is_empty() {
-            debug!("team-local outbox is empty");
-            return Ok(());
-        }
+        validate_local_daemon(local_member, &local_info)?;
+        let worker_id = self.worker_id(&local_member.home_id);
 
-        let discovery = match ProjectDiscovery::discover(&self.config.home) {
-            Ok(discovery) => discovery,
-            Err(err) => {
-                let text = err.to_string();
-                for delivery in &deliveries {
-                    self.report_result(
-                        delivery,
-                        &worker_id,
-                        DeliveryResult::RetryableFailed {
-                            code: "project_discovery_failed",
-                            text: text.clone(),
-                        },
-                    )
-                    .await?;
-                }
-                return Ok(());
-            }
-        };
         info!(
-            deliveries = deliveries.len(),
             instance = %discovery.self_instance,
             project = %discovery.project_root.display(),
-            "pulled team-local deliveries"
+            "team-local worker is ready"
         );
         let _ = self
             .local_api
@@ -119,6 +89,27 @@ impl TeamLocalWorker {
             )
             .await
             .inspect_err(|err| warn!(error = %err, "failed to report team-local health"));
+
+        let deliveries = self
+            .local_api
+            .pull_outbox(
+                &self.config.channel_id,
+                &worker_id,
+                self.config.pull_limit,
+                self.config.lease_ms,
+            )
+            .await?;
+        if deliveries.is_empty() {
+            debug!("team-local outbox is empty");
+            return Ok(());
+        }
+
+        info!(
+            deliveries = deliveries.len(),
+            instance = %discovery.self_instance,
+            project = %discovery.project_root.display(),
+            "pulled team-local deliveries"
+        );
 
         for delivery in deliveries {
             let result = self
@@ -180,7 +171,12 @@ impl TeamLocalWorker {
         let inbound_sender_ref = sender_ref(&local_info.home_id);
         let inbound_conversation_ref = peer_conversation_ref(&local_info.home_id);
         let authorization = target_api
-            .authorize(CHANNEL_ID, &inbound_sender_ref, &inbound_conversation_ref)
+            .authorize(
+                CHANNEL_ID,
+                &inbound_sender_ref,
+                &inbound_conversation_ref,
+                delivery.thread_ref.as_deref(),
+            )
             .await
             .map_err(|err| retryable("authorize_failed", err))?;
         if !authorization.authorized {
@@ -210,11 +206,11 @@ impl TeamLocalWorker {
             event_id: event_id.clone(),
             sender_ref: inbound_sender_ref,
             conversation_ref: inbound_conversation_ref,
-            thread_ref: None,
+            thread_ref: delivery.thread_ref.clone(),
             message_ref: Some(inbound_message_ref(&delivery.delivery_id)),
             text: non_empty_text(&delivery.content.text),
             attachments: descriptors,
-            reply_to_ref: None,
+            reply_to_ref: delivery.reply_to_ref.clone(),
             trigger: INBOUND_TRIGGER.to_string(),
             session_binding: INBOUND_SESSION_BINDING.to_string(),
             received_at: None,
@@ -331,9 +327,9 @@ impl TeamLocalWorker {
         }
     }
 
-    fn worker_id(&self, local_info: &DaemonInfoResponse) -> String {
+    fn worker_id(&self, local_home_id: &str) -> String {
         if self.config.worker_id == format!("{CHANNEL_ID}:worker") {
-            format!("{CHANNEL_ID}:worker:{}", local_info.home_id)
+            format!("{CHANNEL_ID}:worker:{local_home_id}")
         } else {
             self.config.worker_id.clone()
         }
@@ -426,44 +422,41 @@ async fn prepare_attachments(
     Ok(prepared)
 }
 
-fn validate_local_daemon(info: &DaemonInfoResponse) -> Result<()> {
-    if info.daemon != "lionclawd" {
-        bail!("local endpoint is not lionclawd: {}", info.daemon);
-    }
-    if info.status != "ok" {
-        bail!("local daemon is not ok: {}", info.status);
-    }
-    Ok(())
+fn validate_local_daemon(local: &ProjectMember, info: &DaemonInfoResponse) -> Result<()> {
+    verify_member_daemon("local", local, info)
 }
 
 fn verify_target_daemon(target: &ProjectMember, target_info: &DaemonInfoResponse) -> Result<()> {
-    if target_info.daemon != "lionclawd" {
-        bail!("target endpoint is not lionclawd: {}", target_info.daemon);
+    verify_member_daemon("target", target, target_info)
+}
+
+fn verify_member_daemon(
+    label: &str,
+    member: &ProjectMember,
+    info: &DaemonInfoResponse,
+) -> Result<()> {
+    if info.daemon != "lionclawd" {
+        bail!("{label} endpoint is not lionclawd: {}", info.daemon);
     }
-    if target_info.status != "ok" {
-        bail!("target daemon is not ok: {}", target_info.status);
+    if info.status != "ok" {
+        bail!("{label} daemon is not ok: {}", info.status);
     }
-    if target_info.home_id != target.home_id {
+    if info.home_id != member.home_id {
         bail!(
-            "target home id mismatch: expected {}, got {}",
-            target.home_id,
-            target_info.home_id
+            "{label} home id mismatch: expected {}, got {}",
+            member.home_id,
+            info.home_id
         );
     }
-    match fs::canonicalize(&target.home) {
-        Ok(expected_home) => {
-            let reported_home = PathBuf::from(&target_info.home_root);
-            match fs::canonicalize(&reported_home) {
-                Ok(reported_home) if reported_home == expected_home => {}
-                Ok(reported_home) => bail!(
-                    "target home root mismatch: expected {}, got {}",
-                    expected_home.display(),
-                    reported_home.display()
-                ),
-                Err(err) => bail!("failed to resolve reported target home root: {err}"),
-            }
-        }
-        Err(err) => bail!("failed to resolve target home root: {err}"),
+    let reported_home = PathBuf::from(&info.home_root);
+    match fs::canonicalize(&reported_home) {
+        Ok(reported_home) if reported_home == member.home => {}
+        Ok(reported_home) => bail!(
+            "{label} home root mismatch: expected {}, got {}",
+            member.home.display(),
+            reported_home.display()
+        ),
+        Err(err) => bail!("failed to resolve reported {label} home root: {err}"),
     }
     Ok(())
 }
@@ -576,6 +569,7 @@ mod tests {
             authorize["conversation_ref"],
             peer_conversation_ref(&fixture.local_home_id)
         );
+        assert!(authorize.get("thread_ref").is_none());
         let inbound = only_request(&target_state.inbound_requests).await;
         assert_eq!(inbound["channel_id"], CHANNEL_ID);
         assert_eq!(inbound["sender_ref"], sender_ref(&fixture.local_home_id));
@@ -593,6 +587,92 @@ mod tests {
             report["provider_receipt"]["target_inbound_outcome"],
             "queued"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_preserves_thread_and_reply_refs() {
+        let fixture = TeamLocalFixture::new().await;
+        let target_state = Arc::new(TargetState {
+            info: fixture.target_info(),
+            inbound_outcomes: vec!["queued"],
+            ..TargetState::default()
+        });
+        let target_url = spawn_target_server(target_state.clone()).await;
+        fixture.write_target_bind(&target_url);
+        let local_state = Arc::new(LocalState::with_delivery(
+            fixture.local_info(),
+            outbox_delivery_with_refs(
+                &fixture.target_home_id,
+                None,
+                Some("thread-alpha"),
+                Some("reply-bravo"),
+            ),
+        ));
+        let local_url = spawn_local_server(local_state.clone()).await;
+
+        TeamLocalWorker::new(fixture.worker_config(local_url))
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        let authorize = only_request(&target_state.authorize_requests).await;
+        assert_eq!(authorize["thread_ref"], "thread-alpha");
+        let inbound = only_request(&target_state.inbound_requests).await;
+        assert_eq!(inbound["thread_ref"], "thread-alpha");
+        assert_eq!(inbound["reply_to_ref"], "reply-bravo");
+        assert_eq!(
+            inbound["provider_metadata"]["sender_thread_ref"],
+            "thread-alpha"
+        );
+        assert_eq!(
+            inbound["provider_metadata"]["sender_reply_to_ref"],
+            "reply-bravo"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_worker_reports_health_after_local_verification() {
+        let fixture = TeamLocalFixture::new().await;
+        let local_state = Arc::new(LocalState::empty(fixture.local_info()));
+        let local_url = spawn_local_server(local_state.clone()).await;
+
+        TeamLocalWorker::new(fixture.worker_config(local_url))
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(local_state.outbox_pulls.load(Ordering::SeqCst), 1);
+        let health = only_request(&local_state.health_reports).await;
+        assert_eq!(health["channel_id"], CHANNEL_ID);
+        assert_eq!(health["reporter_id"], "team-local:worker:home-main");
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["checks"][0]["details"]["instance"], "main");
+        assert!(local_state.reports.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_daemon_identity_mismatch_fails_before_outbox_pull() {
+        let fixture = TeamLocalFixture::new().await;
+        let mut local_info = fixture.local_info();
+        local_info.home_id = "wrong-home".to_string();
+        let local_state = Arc::new(LocalState::with_delivery(
+            local_info,
+            outbox_delivery(&fixture.target_home_id, None),
+        ));
+        let local_url = spawn_local_server(local_state.clone()).await;
+
+        let err = TeamLocalWorker::new(fixture.worker_config(local_url))
+            .expect("worker")
+            .tick()
+            .await
+            .expect_err("wrong local daemon identity should fail");
+
+        assert!(err.to_string().contains("local home id mismatch"));
+        assert_eq!(local_state.outbox_pulls.load(Ordering::SeqCst), 0);
+        assert!(local_state.health_reports.lock().await.is_empty());
+        assert!(local_state.reports.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -743,16 +823,28 @@ mod tests {
     #[derive(Debug)]
     struct LocalState {
         info: DaemonInfoResponse,
-        delivery: Value,
+        deliveries: Vec<Value>,
+        outbox_pulls: AtomicUsize,
         reports: tokio::sync::Mutex<Vec<Value>>,
+        health_reports: tokio::sync::Mutex<Vec<Value>>,
     }
 
     impl LocalState {
         fn with_delivery(info: DaemonInfoResponse, delivery: Value) -> Self {
+            Self::with_deliveries(info, vec![delivery])
+        }
+
+        fn empty(info: DaemonInfoResponse) -> Self {
+            Self::with_deliveries(info, Vec::new())
+        }
+
+        fn with_deliveries(info: DaemonInfoResponse, deliveries: Vec<Value>) -> Self {
             Self {
                 info,
-                delivery,
+                deliveries,
+                outbox_pulls: AtomicUsize::new(0),
                 reports: tokio::sync::Mutex::default(),
+                health_reports: tokio::sync::Mutex::default(),
             }
         }
     }
@@ -785,7 +877,7 @@ mod tests {
             .route("/v0/daemon/info", get(local_info))
             .route("/v0/channels/outbox/pull", post(local_outbox_pull))
             .route("/v0/channels/outbox/report", post(local_outbox_report))
-            .route("/v0/channels/health/report", post(ok))
+            .route("/v0/channels/health/report", post(local_health_report))
             .with_state(state);
         spawn_server(router).await
     }
@@ -815,7 +907,8 @@ mod tests {
     }
 
     async fn local_outbox_pull(State(state): State<Arc<LocalState>>) -> Json<Value> {
-        Json(json!({ "deliveries": [state.delivery.clone()] }))
+        state.outbox_pulls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({ "deliveries": state.deliveries.clone() }))
     }
 
     async fn local_outbox_report(
@@ -823,6 +916,14 @@ mod tests {
         Json(body): Json<Value>,
     ) -> Json<Value> {
         state.reports.lock().await.push(body);
+        Json(json!({ "accepted": true }))
+    }
+
+    async fn local_health_report(
+        State(state): State<Arc<LocalState>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.health_reports.lock().await.push(body);
         Json(json!({ "accepted": true }))
     }
 
@@ -888,10 +989,6 @@ mod tests {
         }))
     }
 
-    async fn ok() -> Json<Value> {
-        Json(json!({}))
-    }
-
     fn daemon_info_json(info: &DaemonInfoResponse) -> Value {
         json!({
             "daemon": info.daemon,
@@ -903,6 +1000,15 @@ mod tests {
     }
 
     fn outbox_delivery(target_home_id: &str, attachment_path: Option<&Path>) -> Value {
+        outbox_delivery_with_refs(target_home_id, attachment_path, None, None)
+    }
+
+    fn outbox_delivery_with_refs(
+        target_home_id: &str,
+        attachment_path: Option<&Path>,
+        thread_ref: Option<&str>,
+        reply_to_ref: Option<&str>,
+    ) -> Value {
         let attachments = attachment_path.map_or_else(Vec::new, |path| {
             vec![json!({
                 "attachment_id": "att-1",
@@ -915,8 +1021,8 @@ mod tests {
             "delivery_id": "delivery-1",
             "attempt_id": "attempt-1",
             "conversation_ref": peer_conversation_ref(target_home_id),
-            "thread_ref": null,
-            "reply_to_ref": null,
+            "thread_ref": thread_ref,
+            "reply_to_ref": reply_to_ref,
             "session_id": null,
             "turn_id": null,
             "content": {

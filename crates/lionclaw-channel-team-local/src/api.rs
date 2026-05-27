@@ -25,6 +25,17 @@ pub struct ChannelActorAuthorizeResponse {
     pub reason_code: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ChannelActorAuthorizeRequest<'a> {
+    channel_id: &'a str,
+    sender_ref: &'a str,
+    conversation_ref: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_ref: Option<&'a str>,
+    trigger: &'static str,
+    session_binding: &'static str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelInboundResponse {
     pub outcome: String,
@@ -159,16 +170,18 @@ impl LionClawApi {
         channel_id: &str,
         sender_ref: &str,
         conversation_ref: &str,
+        thread_ref: Option<&str>,
     ) -> Result<ChannelActorAuthorizeResponse> {
         self.post_json(
             "/v0/channels/authorize",
-            &serde_json::json!({
-                "channel_id": channel_id,
-                "sender_ref": sender_ref,
-                "conversation_ref": conversation_ref,
-                "trigger": "dm",
-                "session_binding": "grant",
-            }),
+            &ChannelActorAuthorizeRequest {
+                channel_id,
+                sender_ref,
+                conversation_ref,
+                thread_ref,
+                trigger: "dm",
+                session_binding: "grant",
+            },
         )
         .await
     }
