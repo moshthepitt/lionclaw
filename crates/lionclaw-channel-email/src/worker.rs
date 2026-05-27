@@ -1,0 +1,1166 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
+
+pub use crate::mailbox::RealMailboxFactory;
+
+use crate::{
+    api::{
+        ChannelAttachmentDescriptor, ChannelAttachmentMissingReport, ChannelInboundRequest,
+        ChannelOutboxAttachment, ChannelOutboxDelivery, ChannelOutboxReportInput,
+        DaemonInfoResponse, LionClawApi,
+    },
+    classifier::{classify_headers, MailClassification},
+    config::WorkerConfig,
+    mailbox::{
+        attachment_provider_ref, CandidateHeader, MailboxEngine, MailboxFactory,
+        OutboundAttachment, OutboundEmail,
+    },
+    mime::{
+        attachment_summary, parse_full_message, require_nonempty_body, ParsedAttachment,
+        ParsedEmail,
+    },
+    protocol::{
+        conversation_ref, generated_message_id, held_body_not_downloaded_text, message_ref,
+        non_empty_text, short_hash, CHANNEL_ID, INBOUND_SESSION_BINDING, INBOUND_TRIGGER,
+    },
+    store::{held_id_for, EmailStore, MailStatus, ThreadContext},
+};
+
+const ATTACHMENT_KIND: &str = "document";
+const DEFAULT_DIGEST_LIMIT: i64 = 20;
+
+#[derive(Debug)]
+pub struct EmailWorker<F>
+where
+    F: MailboxFactory,
+{
+    config: WorkerConfig,
+    api: LionClawApi,
+    mailbox_factory: F,
+}
+
+#[derive(Debug)]
+struct PreparedInboundAttachment {
+    descriptor: ChannelAttachmentDescriptor,
+    content: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum DeliveryResult {
+    Delivered { receipt: Value },
+    RetryableFailed { code: &'static str, text: String },
+    TerminalFailed { code: &'static str, text: String },
+}
+
+impl<F> EmailWorker<F>
+where
+    F: MailboxFactory,
+{
+    pub fn new(config: WorkerConfig, mailbox_factory: F) -> Result<Self> {
+        let api = LionClawApi::new(config.base_url.clone())?;
+        Ok(Self {
+            config,
+            api,
+            mailbox_factory,
+        })
+    }
+
+    pub async fn run(self) -> Result<()> {
+        loop {
+            if let Err(err) = self.tick().await {
+                error!(error = %err, "email worker tick failed");
+            }
+            if self.config.once {
+                return Ok(());
+            }
+            sleep(self.config.poll_interval).await;
+        }
+    }
+
+    async fn tick(&self) -> Result<()> {
+        let daemon = self.api.daemon_info().await?;
+        validate_local_daemon(&daemon)?;
+        let worker_id = self.worker_id(&daemon);
+        let store = EmailStore::open(&self.config.state_dir).await?;
+        let mut mailbox = self.mailbox_factory.open(self.config.mailbox.clone());
+
+        self.report_ready(&worker_id, &daemon).await;
+        self.process_inbound(&store, mailbox.as_mut(), &worker_id)
+            .await?;
+        self.process_outbox(&store, mailbox.as_mut(), &worker_id)
+            .await?;
+        self.process_digest(&store, mailbox.as_mut()).await?;
+
+        Ok(())
+    }
+
+    async fn process_inbound(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        worker_id: &str,
+    ) -> Result<()> {
+        let candidates = mailbox.list_candidate_headers().await?;
+        if candidates.is_empty() {
+            debug!("email inbox has no unread candidate headers");
+            return Ok(());
+        }
+
+        info!(
+            count = candidates.len(),
+            "processing email candidate headers"
+        );
+        for candidate in candidates {
+            match store.mail_status(&candidate.event_id).await? {
+                Some(MailStatus::Admitted | MailStatus::Suppressed) => continue,
+                Some(MailStatus::Held) | None => {}
+            }
+            if let Err(err) = self
+                .process_candidate(store, mailbox, &candidate, worker_id)
+                .await
+            {
+                warn!(
+                    event_id = %candidate.event_id,
+                    sender_ref = %candidate.sender_ref,
+                    error = %err,
+                    "failed to process email candidate"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_candidate(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        candidate: &CandidateHeader,
+        worker_id: &str,
+    ) -> Result<()> {
+        match classify_headers(&candidate.facts, &self.config.mailbox.address) {
+            MailClassification::Candidate => {}
+            MailClassification::Suppressed { reason } => {
+                store.record_suppressed(candidate, &reason).await?;
+                return Ok(());
+            }
+        }
+
+        let authorization = self
+            .api
+            .authorize(
+                &self.config.channel_id,
+                &candidate.sender_ref,
+                &candidate.conversation_ref,
+                Some(&candidate.thread_ref),
+                INBOUND_TRIGGER,
+                INBOUND_SESSION_BINDING,
+            )
+            .await
+            .context("failed to authorize email sender")?;
+
+        if !authorization.authorized {
+            if authorization.reason_code == "blocked_grant" {
+                store
+                    .record_suppressed(candidate, authorization.reason_code.as_str())
+                    .await?;
+            } else {
+                let held_id = held_id_for(&candidate.event_id);
+                store
+                    .record_held(
+                        candidate,
+                        &held_id,
+                        held_body_not_downloaded_text(),
+                        authorization.reason_code.as_str(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        let fetched = mailbox
+            .fetch_full_message_after_authorize(candidate)
+            .await
+            .context("failed to fetch authorized email body")?;
+        let parsed =
+            parse_full_message(&fetched.raw).context("failed to parse authorized email")?;
+        if let Err(err) = require_nonempty_body(&parsed) {
+            store.record_suppressed(candidate, "empty_message").await?;
+            return Err(err);
+        }
+
+        let prepared_attachments =
+            prepare_inbound_attachments(&self.config.mailbox.mailbox_id, candidate, &parsed)?;
+        let inbound = self.build_inbound(candidate, &parsed, &prepared_attachments, &authorization);
+        let response = self
+            .api
+            .inbound(&inbound)
+            .await
+            .context("failed to submit email inbound event")?;
+
+        match response.outcome.as_str() {
+            "queued" | "duplicate" => {}
+            "waiting_for_attachments" => {
+                stage_and_finalize_attachments(
+                    &self.api,
+                    &self.config.channel_id,
+                    &candidate.event_id,
+                    worker_id,
+                    &prepared_attachments,
+                )
+                .await?;
+            }
+            "blocked" => {
+                store.record_suppressed(candidate, "blocked").await?;
+                return Ok(());
+            }
+            "pending_approval" | "trigger_ignored" => {
+                let held_id = held_id_for(&candidate.event_id);
+                let reason = response
+                    .reason_code
+                    .as_deref()
+                    .unwrap_or(response.outcome.as_str());
+                store
+                    .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
+                    .await?;
+                return Ok(());
+            }
+            other => bail!("unexpected inbound outcome '{other}'"),
+        }
+
+        store.record_admitted(candidate, &parsed.snippet).await?;
+        mailbox.record_seen_or_processed(candidate).await?;
+        Ok(())
+    }
+
+    fn build_inbound(
+        &self,
+        candidate: &CandidateHeader,
+        parsed: &ParsedEmail,
+        attachments: &[PreparedInboundAttachment],
+        authorization: &crate::api::ChannelActorAuthorizeResponse,
+    ) -> ChannelInboundRequest {
+        let descriptors = attachments
+            .iter()
+            .map(|attachment| attachment.descriptor.clone())
+            .collect::<Vec<_>>();
+        ChannelInboundRequest {
+            channel_id: self.config.channel_id.clone(),
+            event_id: candidate.event_id.clone(),
+            sender_ref: candidate.sender_ref.clone(),
+            conversation_ref: candidate.conversation_ref.clone(),
+            thread_ref: Some(candidate.thread_ref.clone()),
+            message_ref: Some(candidate.message_ref.clone()),
+            text: non_empty_text(inbound_envelope_text(
+                &self.config.mailbox.address,
+                candidate,
+                parsed,
+            )),
+            attachments: descriptors,
+            reply_to_ref: parsed.facts.in_reply_to.as_deref().map(message_ref),
+            trigger: INBOUND_TRIGGER.to_string(),
+            session_binding: INBOUND_SESSION_BINDING.to_string(),
+            received_at: parsed.facts.received_at,
+            provider_metadata: json!({
+                "provider": "imap",
+                "mailbox_id": self.config.mailbox.mailbox_id,
+                "mailbox_address": self.config.mailbox.address,
+                "uid_validity": candidate.uid_validity,
+                "uid": candidate.uid,
+                "sender_address": parsed.facts.sender.address,
+                "subject": parsed.facts.subject,
+                "message_id": parsed.facts.message_id,
+                "in_reply_to": parsed.facts.in_reply_to,
+                "references": parsed.facts.references,
+                "authorization_reason_code": authorization.reason_code,
+                "grant_id": authorization.grant_id,
+            }),
+        }
+    }
+
+    async fn process_outbox(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        worker_id: &str,
+    ) -> Result<()> {
+        let deliveries = self
+            .api
+            .pull_outbox(
+                &self.config.channel_id,
+                worker_id,
+                self.config.pull_limit,
+                self.config.lease_ms,
+            )
+            .await?;
+        if deliveries.is_empty() {
+            debug!("email outbox is empty");
+            return Ok(());
+        }
+
+        info!(
+            count = deliveries.len(),
+            "processing email outbox deliveries"
+        );
+        for delivery in deliveries {
+            let result = self.deliver_outbox(store, mailbox, &delivery).await;
+            self.report_result(&delivery, worker_id, result).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn deliver_outbox(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        delivery: &ChannelOutboxDelivery,
+    ) -> DeliveryResult {
+        match self.deliver_outbox_inner(store, mailbox, delivery).await {
+            Ok(receipt) => DeliveryResult::Delivered { receipt },
+            Err(err) => err,
+        }
+    }
+
+    async fn deliver_outbox_inner(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        delivery: &ChannelOutboxDelivery,
+    ) -> Result<Value, DeliveryResult> {
+        if delivery.conversation_ref != conversation_ref(&self.config.mailbox.mailbox_id) {
+            return Err(terminal(
+                "unknown_mailbox",
+                anyhow!("delivery conversation_ref does not target this email mailbox"),
+            ));
+        }
+
+        if let Some(stored) = store
+            .receipt(&delivery.delivery_id)
+            .await
+            .map_err(|err| retryable("receipt_lookup_failed", err))?
+        {
+            return Ok(stored.receipt);
+        }
+
+        if delivery.content.text.trim().is_empty() && delivery.content.attachments.is_empty() {
+            return Err(terminal(
+                "empty_delivery",
+                anyhow!("email delivery contains no text or attachments"),
+            ));
+        }
+
+        let context = store
+            .thread_context(
+                delivery.reply_to_ref.as_deref(),
+                delivery.thread_ref.as_deref(),
+            )
+            .await
+            .map_err(|err| retryable("thread_lookup_failed", err))?
+            .ok_or_else(|| {
+                terminal(
+                    "unknown_email_thread",
+                    anyhow!("no admitted email thread matches delivery"),
+                )
+            })?;
+        let attachments = prepare_outbound_attachments(&delivery.content.attachments)
+            .await
+            .map_err(|err| terminal("attachment_unreadable", err))?;
+        let references = reply_references(&context);
+        let outbound = OutboundEmail {
+            delivery_id: delivery.delivery_id.clone(),
+            to: context.sender_address.clone(),
+            subject: reply_subject(&context.subject),
+            text: delivery.content.text.clone(),
+            in_reply_to: context.provider_message_id.clone(),
+            references,
+            attachments,
+        };
+        let mut receipt = mailbox
+            .send_threaded_reply(outbound)
+            .await
+            .map_err(|err| retryable("smtp_send_failed", err))?;
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert("delivery_id".to_string(), json!(delivery.delivery_id));
+            object.insert("attempt_id".to_string(), json!(delivery.attempt_id));
+            object.insert("session_id".to_string(), json!(delivery.session_id));
+            object.insert("turn_id".to_string(), json!(delivery.turn_id));
+        }
+        let message_id = receipt
+            .get("message_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                generated_message_id(&delivery.delivery_id, &self.config.mailbox.address)
+            });
+        store
+            .record_receipt(
+                &delivery.delivery_id,
+                &message_id,
+                &context.sender_address,
+                &receipt,
+            )
+            .await
+            .map_err(|err| retryable("receipt_record_failed", err))?;
+        Ok(receipt)
+    }
+
+    async fn process_digest(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+    ) -> Result<()> {
+        let Some(admin_to) = self.config.digest.admin_to.as_deref() else {
+            return Ok(());
+        };
+        if !store.due_for_digest(self.config.digest.interval).await? {
+            return Ok(());
+        }
+        store.mark_digest_attempt_now().await?;
+
+        let held = store.held_since_last_digest(DEFAULT_DIGEST_LIMIT).await?;
+        let suppressed_count = store.suppressed_count_since_last_digest().await?;
+        if held.is_empty() && suppressed_count == 0 {
+            store.mark_digest_sent_now().await?;
+            return Ok(());
+        }
+
+        let text = digest_text(&self.config.mailbox.address, &held, suppressed_count);
+        let delivery_id = format!(
+            "digest:{}",
+            short_hash(&format!(
+                "{}:{}",
+                self.config.mailbox.mailbox_id,
+                chrono::Utc::now()
+            ))
+        );
+        mailbox
+            .send_threaded_reply(OutboundEmail {
+                delivery_id,
+                to: admin_to.to_string(),
+                subject: format!("LionClaw email digest for {}", self.config.mailbox.address),
+                text,
+                in_reply_to: None,
+                references: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .await
+            .context("failed to send held-mail digest")?;
+        store.mark_digest_sent_now().await?;
+        Ok(())
+    }
+
+    async fn report_result(
+        &self,
+        delivery: &ChannelOutboxDelivery,
+        worker_id: &str,
+        result: DeliveryResult,
+    ) -> Result<()> {
+        match result {
+            DeliveryResult::Delivered { receipt } => {
+                self.api
+                    .report_outbox(ChannelOutboxReportInput {
+                        delivery,
+                        channel_id: &self.config.channel_id,
+                        worker_id,
+                        outcome: "delivered",
+                        provider_receipt: Some(receipt),
+                        error_code: None,
+                        error_text: None,
+                    })
+                    .await
+            }
+            DeliveryResult::RetryableFailed { code, text } => {
+                warn!(delivery_id = %delivery.delivery_id, code, error = %text, "email delivery retryable failure");
+                self.api
+                    .report_outbox(ChannelOutboxReportInput {
+                        delivery,
+                        channel_id: &self.config.channel_id,
+                        worker_id,
+                        outcome: "retryable_failed",
+                        provider_receipt: None,
+                        error_code: Some(code),
+                        error_text: Some(&text),
+                    })
+                    .await
+            }
+            DeliveryResult::TerminalFailed { code, text } => {
+                warn!(delivery_id = %delivery.delivery_id, code, error = %text, "email delivery terminal failure");
+                self.api
+                    .report_outbox(ChannelOutboxReportInput {
+                        delivery,
+                        channel_id: &self.config.channel_id,
+                        worker_id,
+                        outcome: "terminal_failed",
+                        provider_receipt: None,
+                        error_code: Some(code),
+                        error_text: Some(&text),
+                    })
+                    .await
+            }
+        }
+    }
+
+    async fn report_ready(&self, worker_id: &str, daemon: &DaemonInfoResponse) {
+        let _ = self
+            .api
+            .report_health(
+                &self.config.channel_id,
+                worker_id,
+                "ok",
+                "email.ready",
+                "email worker is running",
+                json!({
+                    "mailbox_id": self.config.mailbox.mailbox_id,
+                    "address": self.config.mailbox.address,
+                    "home": self.config.home.display().to_string(),
+                    "daemon_bind_addr": daemon.bind_addr,
+                }),
+            )
+            .await
+            .inspect_err(|err| warn!(error = %err, "failed to report email health"));
+    }
+
+    fn worker_id(&self, daemon: &DaemonInfoResponse) -> String {
+        if self.config.worker_id == format!("{CHANNEL_ID}:worker") {
+            format!(
+                "{CHANNEL_ID}:worker:{}:{}",
+                daemon.home_id, self.config.mailbox.mailbox_id
+            )
+        } else {
+            self.config.worker_id.clone()
+        }
+    }
+}
+
+async fn stage_and_finalize_attachments(
+    api: &LionClawApi,
+    channel_id: &str,
+    event_id: &str,
+    worker_id: &str,
+    attachments: &[PreparedInboundAttachment],
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for attachment in attachments {
+        let staged = api
+            .stage_attachment(
+                channel_id,
+                event_id,
+                &attachment.descriptor,
+                attachment.content.clone(),
+            )
+            .await
+            .context("failed to stage email attachment")?;
+        match staged.status.as_str() {
+            "staged" | "duplicate" => {}
+            "rejected" => missing.push(ChannelAttachmentMissingReport {
+                attachment_id: attachment.descriptor.attachment_id.clone(),
+                reason_code: staged
+                    .reason_code
+                    .unwrap_or_else(|| "attachment_rejected".to_string()),
+                reason_text: None,
+            }),
+            other => missing.push(ChannelAttachmentMissingReport {
+                attachment_id: attachment.descriptor.attachment_id.clone(),
+                reason_code: "unexpected_stage_status".to_string(),
+                reason_text: Some(other.to_string()),
+            }),
+        }
+    }
+    let finalized = api
+        .finalize_attachments(channel_id, event_id, worker_id, &missing)
+        .await
+        .context("failed to finalize email attachments")?;
+    match finalized.outcome.as_str() {
+        "queued" | "already_finalized" => Ok(()),
+        "not_ready" => bail!("email attachments were not ready after staging"),
+        other => bail!("unexpected attachment finalize outcome '{other}'"),
+    }
+}
+
+fn prepare_inbound_attachments(
+    mailbox_id: &str,
+    candidate: &CandidateHeader,
+    parsed: &ParsedEmail,
+) -> Result<Vec<PreparedInboundAttachment>> {
+    parsed
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            prepare_inbound_attachment(mailbox_id, candidate, index, attachment)
+        })
+        .collect()
+}
+
+fn prepare_inbound_attachment(
+    mailbox_id: &str,
+    candidate: &CandidateHeader,
+    index: usize,
+    attachment: &ParsedAttachment,
+) -> Result<PreparedInboundAttachment> {
+    let part_index = index + 1;
+    let size_bytes = i64::try_from(attachment.content.len()).context("attachment too large")?;
+    Ok(PreparedInboundAttachment {
+        descriptor: ChannelAttachmentDescriptor {
+            attachment_id: format!("email-att-{part_index}"),
+            kind: ATTACHMENT_KIND.to_string(),
+            mime_type: attachment.mime_type.clone(),
+            filename: attachment.filename.clone(),
+            size_bytes: Some(size_bytes),
+            provider_file_ref: attachment_provider_ref(
+                mailbox_id,
+                candidate.uid_validity,
+                candidate.uid,
+                part_index,
+            ),
+            caption: attachment.filename.clone(),
+        },
+        content: attachment.content.clone(),
+    })
+}
+
+async fn prepare_outbound_attachments(
+    attachments: &[ChannelOutboxAttachment],
+) -> Result<Vec<OutboundAttachment>> {
+    let mut prepared = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let path = PathBuf::from(&attachment.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to stat attachment {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("attachment {} must not be a symlink", path.display());
+        }
+        if !metadata.is_file() {
+            bail!("attachment {} is not a regular file", path.display());
+        }
+        let content = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read attachment {}", path.display()))?;
+        prepared.push(OutboundAttachment {
+            filename: attachment
+                .filename
+                .clone()
+                .or_else(|| filename_from_path(&path))
+                .unwrap_or_else(|| attachment.attachment_id.clone()),
+            mime_type: attachment
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            content,
+        });
+    }
+    Ok(prepared)
+}
+
+fn filename_from_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+}
+
+fn inbound_envelope_text(
+    mailbox_address: &str,
+    candidate: &CandidateHeader,
+    parsed: &ParsedEmail,
+) -> String {
+    let mut lines = vec![
+        "Email received for LionClaw.".to_string(),
+        String::new(),
+        "Admission: allowed".to_string(),
+        format!("From: {}", display_address(&parsed.facts.sender)),
+        format!("To: {mailbox_address}"),
+        format!("Subject: {}", parsed.facts.subject),
+        format!(
+            "Received: {}",
+            parsed
+                .facts
+                .received_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!("Thread: {}", candidate.thread_ref),
+        String::new(),
+        "Latest message (untrusted external input):".to_string(),
+        parsed.text.clone(),
+    ];
+    let summary = attachment_summary(&parsed.attachments);
+    if !summary.is_empty() {
+        lines.push(String::new());
+        lines.push("Attachments:".to_string());
+        lines.extend(summary.into_iter().map(|item| format!("- {item}")));
+    }
+    lines.join("\n")
+}
+
+fn display_address(address: &crate::mime::EmailAddress) -> String {
+    address.display_name.as_ref().map_or_else(
+        || address.address.clone(),
+        |name| format!("{name} <{}>", address.address),
+    )
+}
+
+fn reply_subject(subject: &str) -> String {
+    if subject.trim_start().to_ascii_lowercase().starts_with("re:") {
+        subject.to_string()
+    } else {
+        format!("Re: {subject}")
+    }
+}
+
+fn reply_references(context: &ThreadContext) -> Vec<String> {
+    let mut references = context.references.clone();
+    if let Some(provider_message_id) = &context.provider_message_id {
+        if !references
+            .iter()
+            .any(|existing| existing == provider_message_id)
+        {
+            references.push(provider_message_id.clone());
+        }
+    }
+    references
+}
+
+fn digest_text(
+    mailbox_address: &str,
+    held: &[crate::store::HeldItem],
+    suppressed_count: i64,
+) -> String {
+    let mut lines = vec![
+        format!("LionClaw email digest for {mailbox_address}"),
+        String::new(),
+        format!("Held messages: {}", held.len()),
+        format!("Suppressed automated messages: {suppressed_count}"),
+    ];
+    if !held.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "Held messages were not downloaded because the sender is not approved.".to_string(),
+        );
+        for item in held {
+            lines.push(String::new());
+            lines.push(format!("Held ID: {}", item.held_id));
+            lines.push(format!("From: {}", item.sender_address));
+            lines.push(format!("Subject: {}", item.subject));
+            if let Some(received_at) = &item.received_at {
+                lines.push(format!("Received: {received_at}"));
+            }
+            if let Some(reason) = &item.classification_reason {
+                lines.push(format!("Reason: {reason}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn validate_local_daemon(info: &DaemonInfoResponse) -> Result<()> {
+    if info.daemon != "lionclawd" {
+        bail!("local endpoint is not lionclawd: {}", info.daemon);
+    }
+    if info.status != "ok" {
+        bail!("local daemon is not ok: {}", info.status);
+    }
+    Ok(())
+}
+
+fn retryable(code: &'static str, err: anyhow::Error) -> DeliveryResult {
+    DeliveryResult::RetryableFailed {
+        code,
+        text: err.to_string(),
+    }
+}
+
+fn terminal(code: &'static str, err: anyhow::Error) -> DeliveryResult {
+    DeliveryResult::TerminalFailed {
+        code,
+        text: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    use async_trait::async_trait;
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::{
+        config::{DigestConfig, ImapTlsMode, MailboxConfig},
+        mailbox::{FetchedMessage, MailboxFactory},
+        mime::parse_headers_for_test,
+        protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
+    };
+
+    #[test]
+    fn reply_subject_keeps_existing_re_prefix() {
+        assert_eq!(reply_subject("Build failed"), "Re: Build failed");
+        assert_eq!(reply_subject("Re: Build failed"), "Re: Build failed");
+    }
+
+    #[test]
+    fn inbound_envelope_wraps_untrusted_body() {
+        let facts = parse_headers_for_test(
+            "From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+        );
+        let candidate = CandidateHeader {
+            uid_validity: 1,
+            uid: 2,
+            event_id: "email:imap:box:1:2".to_string(),
+            sender_ref: "email:addr:alice@example.com".to_string(),
+            conversation_ref: "email:mailbox:box".to_string(),
+            thread_ref: "email:thread:root".to_string(),
+            message_ref: "email:message:m1".to_string(),
+            attachment_count: 0,
+            facts: facts.clone(),
+        };
+        let parsed = ParsedEmail {
+            facts,
+            text: "Please check this.".to_string(),
+            snippet: "Please check this.".to_string(),
+            attachments: Vec::new(),
+        };
+
+        let text = inbound_envelope_text("assistant@example.com", &candidate, &parsed);
+
+        assert!(text.contains("Admission: allowed"));
+        assert!(text.contains("Latest message (untrusted external input):"));
+        assert!(text.contains("Please check this."));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_sender_is_held_without_full_fetch() {
+        let fixture = EmailFixture::new(false).await;
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Held)
+        );
+        let held = store
+            .held_since_last_digest(10)
+            .await
+            .expect("held digest rows");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].snippet, held_body_not_downloaded_text());
+    }
+
+    #[tokio::test]
+    async fn authorized_sender_is_fetched_and_queued() {
+        let fixture = EmailFixture::new(true).await;
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        {
+            let inbound = fixture.api.inbound_requests.lock().unwrap();
+            assert_eq!(inbound.len(), 1);
+            assert_eq!(inbound[0]["sender_ref"], "email:addr:alice@example.com");
+            assert_eq!(inbound[0]["thread_ref"], thread_ref("root@example.com"));
+            assert_eq!(inbound[0]["reply_to_ref"], message_ref("root@example.com"));
+            assert_eq!(
+                inbound[0]["session_binding"],
+                crate::protocol::INBOUND_SESSION_BINDING
+            );
+            assert!(inbound[0]["text"]
+                .as_str()
+                .expect("inbound text")
+                .contains("Please check this."));
+        }
+        {
+            let authorize = fixture.api.authorize_requests.lock().unwrap();
+            assert_eq!(authorize.len(), 1);
+            assert_eq!(authorize[0]["thread_ref"], thread_ref("root@example.com"));
+            assert_eq!(
+                authorize[0]["session_binding"],
+                crate::protocol::INBOUND_SESSION_BINDING
+            );
+        }
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn held_sender_is_fetched_after_later_authorization() {
+        let fixture = EmailFixture::new(false).await;
+
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+
+        fixture.api.set_authorized(true);
+        worker.tick().await.expect("second tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Admitted)
+        );
+    }
+
+    struct EmailFixture {
+        root: tempfile::TempDir,
+        state_dir: PathBuf,
+        api_url: String,
+        api: Arc<ApiState>,
+        mailbox: FakeMailboxFactory,
+    }
+
+    impl EmailFixture {
+        async fn new(authorized: bool) -> Self {
+            let root = tempdir().expect("temp dir");
+            let state_dir = root.path().join("state");
+            let api = Arc::new(ApiState::default());
+            api.set_authorized(authorized);
+            let api_url = spawn_api(api.clone()).await;
+            let mailbox = FakeMailboxFactory::new(candidate(), full_message());
+            Self {
+                root,
+                state_dir,
+                api_url,
+                api,
+                mailbox,
+            }
+        }
+
+        fn config(&self) -> WorkerConfig {
+            WorkerConfig {
+                home: self.root.path().join("home"),
+                state_dir: self.state_dir.clone(),
+                base_url: self.api_url.clone(),
+                channel_id: CHANNEL_ID.to_string(),
+                worker_id: "email:worker".to_string(),
+                once: true,
+                poll_interval: std::time::Duration::from_millis(10),
+                pull_limit: 10,
+                lease_ms: 60_000,
+                mailbox: MailboxConfig {
+                    mailbox_id: "assistant-example-com".to_string(),
+                    address: "assistant@example.com".to_string(),
+                    imap_host: "imap.example.com".to_string(),
+                    imap_port: 993,
+                    imap_tls: ImapTlsMode::Implicit,
+                    imap_username: "assistant@example.com".to_string(),
+                    imap_password: "secret".to_string(),
+                    imap_mailbox: "INBOX".to_string(),
+                    smtp_host: "smtp.example.com".to_string(),
+                    smtp_port: 587,
+                    smtp_implicit_tls: false,
+                    smtp_username: "assistant@example.com".to_string(),
+                    smtp_password: "secret".to_string(),
+                    from_name: Some("LionClaw".to_string()),
+                    fetch_limit: 25,
+                    mark_seen_after_admission: true,
+                },
+                digest: DigestConfig {
+                    interval: std::time::Duration::from_secs(3600),
+                    admin_to: None,
+                },
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ApiState {
+        authorized: AtomicBool,
+        authorize_requests: Mutex<Vec<Value>>,
+        inbound_requests: Mutex<Vec<Value>>,
+    }
+
+    impl ApiState {
+        fn set_authorized(&self, authorized: bool) {
+            self.authorized.store(authorized, Ordering::SeqCst);
+        }
+    }
+
+    async fn spawn_api(state: Arc<ApiState>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new()
+            .route("/v0/daemon/info", get(daemon_info))
+            .route("/v0/channels/health/report", post(ok))
+            .route("/v0/channels/authorize", post(authorize))
+            .route("/v0/channels/inbound", post(inbound))
+            .route("/v0/channels/outbox/pull", post(outbox_pull))
+            .route("/v0/channels/outbox/report", post(ok))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        format!("http://{addr}")
+    }
+
+    async fn daemon_info() -> Json<Value> {
+        Json(json!({
+            "daemon": "lionclawd",
+            "status": "ok",
+            "home_id": "home-test",
+            "bind_addr": "127.0.0.1:0"
+        }))
+    }
+
+    async fn ok() -> Json<Value> {
+        Json(json!({ "ok": true }))
+    }
+
+    async fn authorize(State(state): State<Arc<ApiState>>, Json(body): Json<Value>) -> Json<Value> {
+        state.authorize_requests.lock().unwrap().push(body);
+        let authorized = state.authorized.load(Ordering::SeqCst);
+        Json(json!({
+            "authorized": authorized,
+            "reason_code": if authorized { "approved" } else { "approval_required" },
+            "grant_id": if authorized { Some("grant-test") } else { None },
+        }))
+    }
+
+    async fn inbound(State(state): State<Arc<ApiState>>, Json(body): Json<Value>) -> Json<Value> {
+        state.inbound_requests.lock().unwrap().push(body);
+        Json(json!({ "outcome": "queued" }))
+    }
+
+    async fn outbox_pull() -> Json<Value> {
+        Json(json!({ "deliveries": [] }))
+    }
+
+    #[derive(Clone)]
+    struct FakeMailboxFactory {
+        state: Arc<FakeMailboxState>,
+    }
+
+    impl FakeMailboxFactory {
+        fn new(candidate: CandidateHeader, raw: Vec<u8>) -> Self {
+            Self {
+                state: Arc::new(FakeMailboxState {
+                    candidate,
+                    raw,
+                    full_fetches: AtomicUsize::new(0),
+                    seen: AtomicUsize::new(0),
+                    sent: Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        fn full_fetches(&self) -> usize {
+            self.state.full_fetches.load(Ordering::SeqCst)
+        }
+
+        fn seen(&self) -> usize {
+            self.state.seen.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FakeMailboxState {
+        candidate: CandidateHeader,
+        raw: Vec<u8>,
+        full_fetches: AtomicUsize,
+        seen: AtomicUsize,
+        sent: Mutex<Vec<OutboundEmail>>,
+    }
+
+    impl MailboxFactory for FakeMailboxFactory {
+        fn open(&self, _config: MailboxConfig) -> Box<dyn MailboxEngine> {
+            Box::new(FakeMailbox {
+                state: self.state.clone(),
+            })
+        }
+    }
+
+    struct FakeMailbox {
+        state: Arc<FakeMailboxState>,
+    }
+
+    #[async_trait]
+    impl MailboxEngine for FakeMailbox {
+        async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
+            Ok(vec![self.state.candidate.clone()])
+        }
+
+        async fn fetch_full_message_after_authorize(
+            &mut self,
+            _candidate: &CandidateHeader,
+        ) -> Result<FetchedMessage> {
+            self.state.full_fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(FetchedMessage {
+                raw: self.state.raw.clone(),
+            })
+        }
+
+        async fn record_seen_or_processed(&mut self, _candidate: &CandidateHeader) -> Result<()> {
+            self.state.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value> {
+            self.state.sent.lock().unwrap().push(email);
+            Ok(json!({
+                "provider": "smtp",
+                "message_id": "lc.test@example.com",
+                "recipient": "alice@example.com"
+            }))
+        }
+    }
+
+    fn candidate() -> CandidateHeader {
+        let facts = parse_headers_for_test(
+            "From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
+        );
+        CandidateHeader {
+            uid_validity: 7,
+            uid: 42,
+            event_id: "email:imap:assistant-example-com:7:42".to_string(),
+            sender_ref: sender_ref("alice@example.com"),
+            conversation_ref: conversation_ref("assistant-example-com"),
+            thread_ref: thread_ref("root@example.com"),
+            message_ref: message_ref("m1@example.com"),
+            attachment_count: 0,
+            facts,
+        }
+    }
+
+    fn full_message() -> Vec<u8> {
+        b"From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\nPlease check this.".to_vec()
+    }
+}
