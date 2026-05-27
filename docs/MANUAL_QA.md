@@ -210,9 +210,10 @@ Expected:
 - the reviewer runtime has `LIONCLAW_PROJECT_INSTANCE=reviewer` and can read a
   read-only `LIONCLAW_PROJECT_INSTANCES_FILE` JSON listing `main`, `reviewer`,
   `shared`, and `shared-two`
-- with a `channel-send` preset and a configured neighbor contact, the projection
-  uses schema version 2, leaves the selected instance entry identity-only, and
-  exposes route fields only for neighbors whose channel is active in the sender
+- fresh team-local setup creates a `team-local` preset with `channel-send`; with
+  that preset active and a configured neighbor contact, the projection uses
+  schema version 2, leaves the selected instance entry identity-only, and exposes
+  route fields only for neighbors whose channel is active in the sender
 
 ## Phase 4: Project Isolation
 

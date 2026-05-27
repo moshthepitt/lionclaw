@@ -13749,6 +13749,29 @@ impl Kernel {
                 )
                 .await;
         }
+        if let Some(project_context) = &self.project_instance_runtime {
+            let route_allowed = project_context
+                .channel_send_inventory
+                .contains_channel_send_route(
+                    &project_context.instance_name,
+                    channel_id,
+                    conversation_ref,
+                    thread_ref,
+                );
+            if !route_allowed {
+                return self
+                    .deny_runtime_channel_send(
+                        &context,
+                        channel_id,
+                        conversation_ref,
+                        RuntimeChannelSendProblem::new(
+                            "route_not_allowed",
+                            "channel.send route is not projected for this project instance",
+                        ),
+                    )
+                    .await;
+            }
+        }
 
         let content = normalize_runtime_channel_send_content(content);
         let fingerprint = runtime_channel_send_fingerprint(

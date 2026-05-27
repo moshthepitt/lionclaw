@@ -26,6 +26,10 @@ use lionclaw::{
         Kernel, KernelOptions,
     },
     operator::config::ChannelLaunchMode,
+    project_inventory::{
+        ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
+        ProjectInstanceRuntimeContext,
+    },
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -269,6 +273,101 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             & 0o777;
         assert_eq!(mode, 0o700, "channel.send socket directory is private");
     }
+}
+
+#[tokio::test]
+async fn project_instance_channel_send_allows_only_projected_routes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-projected").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            ProjectInstanceInventory::new_channel_send(
+                Some("main".to_string()),
+                vec![
+                    ProjectInstanceInventoryEntry::identity("main".to_string()),
+                    ProjectInstanceInventoryEntry::with_channel_send(
+                        "reviewer".to_string(),
+                        ProjectInstanceChannelSend::configured(
+                            "local-cli".to_string(),
+                            "member:reviewer".to_string(),
+                            Some("team-thread".to_string()),
+                        ),
+                    ),
+                ],
+            ),
+        ))
+        .await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let allowed = json!({
+        "idempotency_key": "allowed",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "thread_ref": "team-thread",
+        "content": { "text": "allowed", "format_hint": "markdown" }
+    });
+    let unprojected = json!({
+        "idempotency_key": "blocked",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:intruder",
+        "content": { "text": "blocked", "format_hint": "markdown" }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![allowed, unprojected],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-projected").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send projected and unprojected channel messages".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+    assert_eq!(responses[1]["ok"].as_bool(), Some(false));
+    assert_eq!(responses[1]["error"]["code"], "route_not_allowed");
+
+    let allowed_outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: Some("team-thread".to_string()),
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull allowed outbox");
+    assert_eq!(allowed_outbox.deliveries.len(), 1);
+
+    let blocked_outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:intruder".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull blocked outbox");
+    assert!(blocked_outbox.deliveries.is_empty());
 }
 
 #[tokio::test]
@@ -1580,6 +1679,24 @@ fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
         workspace_name: Some("main".to_string()),
         ..KernelOptions::default()
     }
+}
+
+fn channel_send_kernel_options_with_project_routes(
+    env: &TestHome,
+    channel_send_inventory: ProjectInstanceInventory,
+) -> KernelOptions {
+    let mut options = channel_send_kernel_options(env, true);
+    let project_root = env.temp_dir().to_path_buf();
+    let identity_inventory = ProjectInstanceInventory::new(
+        Some("main".to_string()),
+        vec!["main".to_string(), "reviewer".to_string()],
+    );
+    options.project_workspace_root = Some(project_root.clone());
+    options.project_instance_runtime = Some(
+        ProjectInstanceRuntimeContext::new(project_root, "main".to_string(), identity_inventory)
+            .with_channel_send_inventory(channel_send_inventory),
+    );
+    options
 }
 
 async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: &str) {

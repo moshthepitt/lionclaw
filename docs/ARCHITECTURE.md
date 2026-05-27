@@ -248,6 +248,11 @@ audited under `runtime.channel_send.bridge_error`. Request denials, including
 connection pressure over the bridge's concurrent connection cap, are audited as
 `runtime.channel_send.denied`.
 
+When project-instance runtime context is active, `channel.send` requests are
+also checked against the sender-relative `channel_send` projection for that
+selected instance. A project runtime can enqueue only routes that are present as
+configured neighbor routes in its generated inventory.
+
 Idempotency lives on the outbox row. Runtime channel sends use
 `source_kind = "runtime_channel_send"`, a source id scoped to
 `session_id`, `turn_id`, and the runtime idempotency key, plus a canonical
@@ -366,7 +371,10 @@ separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
 depend on the `lionclaw` crate.
 
 Project setup installs and configures `team-local` for project instances by
-default. Each instance publishes its own contact route as
+default. It also ensures a `team-local` execution preset with the existing
+`channel-send` escape class; that preset becomes the default only when the
+instance has no default preset yet. Each instance publishes its own contact
+route as
 `team-local:peer:<home-id>`. Setup also approves existing sibling instances with
 ordinary direct channel grants:
 

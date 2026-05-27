@@ -10,7 +10,7 @@ use crate::{
     applied::AppliedState,
     contracts::{ChannelGrantApproveRequest, ChannelRoutingProfile, TrustTier},
     home::LionClawHome,
-    kernel::{Kernel, KernelError, KernelOptions},
+    kernel::{runtime::EscapeClass, Kernel, KernelError, KernelOptions},
     operator::{
         channel_metadata::{bundled_channel_skill_dir, DEFAULT_CHANNEL_WORKER},
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub(crate) const CHANNEL_ID: &str = "team-local";
+const PRESET_ID: &str = "team-local";
 const WORKER_BIN_NAME: &str = "lionclaw-channel-team-local";
 const WORKER_BIN_REL_PATH: &str = "runtime/team-local/bin/lionclaw-channel-team-local";
 const CONTACT_REF_PREFIX: &str = "team-local:peer:";
@@ -132,6 +133,7 @@ async fn ensure_instance_team_local_channel(
     install_team_local_skill(home, worker_binary)?;
     let home_id = home.ensure_home_id().await?;
     let mut config = OperatorConfig::load(home).await?;
+    ensure_team_local_preset(&mut config);
     let existing_non_team_contact = config
         .channels
         .iter()
@@ -153,6 +155,12 @@ async fn ensure_instance_team_local_channel(
     });
     config.save(home).await?;
     Ok(home_id)
+}
+
+fn ensure_team_local_preset(config: &mut OperatorConfig) {
+    let mut preset = config.preset(PRESET_ID).cloned().unwrap_or_default();
+    preset.escape_classes.insert(EscapeClass::ChannelSend);
+    config.upsert_preset(PRESET_ID.to_string(), preset);
 }
 
 fn install_team_local_skill(home: &LionClawHome, worker_binary: &Path) -> Result<()> {
@@ -255,10 +263,12 @@ mod tests {
 
     use super::{
         ensure_project_team_local_with_worker, open_channel_admin_kernel, sender_ref, CHANNEL_ID,
+        PRESET_ID,
     };
     use crate::{
         contracts::ChannelPairingBlockRequest,
         home::LionClawHome,
+        kernel::runtime::{EscapeClass, ExecutionPreset},
         operator::{
             config::OperatorConfig,
             target::{create_project_instance, init_project},
@@ -284,6 +294,8 @@ mod tests {
         let reviewer_home = LionClawHome::new(temp_dir.path().join(".lionclaw/instances/reviewer"));
         assert_team_local_configured(&main_home).await;
         assert_team_local_configured(&reviewer_home).await;
+        assert_team_local_preset(&main_home).await;
+        assert_team_local_preset(&reviewer_home).await;
         assert_executable(
             &main_home
                 .skills_dir()
@@ -342,6 +354,50 @@ mod tests {
             .find(|channel| channel.id == "email")
             .expect("email channel");
         assert!(email.contact.is_some());
+    }
+
+    #[tokio::test]
+    async fn project_setup_preserves_existing_default_preset() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.upsert_preset("locked-down".to_string(), ExecutionPreset::default());
+        config.save(&home).await.expect("save config");
+        let worker = temp_dir.path().join("worker");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        make_executable(&worker);
+
+        ensure_project_team_local_with_worker(temp_dir.path(), &worker)
+            .await
+            .expect("team-local setup");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(config.defaults.preset.as_deref(), Some("locked-down"));
+        let preset = config.preset(PRESET_ID).expect("team-local preset");
+        assert!(preset.escape_classes.contains(&EscapeClass::ChannelSend));
+    }
+
+    #[tokio::test]
+    async fn project_setup_updates_existing_team_local_preset() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.upsert_preset(PRESET_ID.to_string(), ExecutionPreset::default());
+        config.save(&home).await.expect("save config");
+        let worker = temp_dir.path().join("worker");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        make_executable(&worker);
+
+        ensure_project_team_local_with_worker(temp_dir.path(), &worker)
+            .await
+            .expect("team-local setup");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let preset = config.preset(PRESET_ID).expect("team-local preset");
+        assert!(preset.escape_classes.contains(&EscapeClass::ChannelSend));
+        assert_eq!(config.defaults.preset.as_deref(), Some(PRESET_ID));
     }
 
     #[tokio::test]
@@ -423,6 +479,13 @@ mod tests {
             .expect("team-local channel");
         assert_eq!(channel.skill, CHANNEL_ID);
         assert!(channel.contact.is_some());
+    }
+
+    async fn assert_team_local_preset(home: &LionClawHome) {
+        let config = OperatorConfig::load(home).await.expect("load config");
+        let preset = config.preset(PRESET_ID).expect("team-local preset");
+        assert!(preset.escape_classes.contains(&EscapeClass::ChannelSend));
+        assert_eq!(config.defaults.preset.as_deref(), Some(PRESET_ID));
     }
 
     fn make_executable(path: &std::path::Path) {
