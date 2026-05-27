@@ -1,4 +1,5 @@
 pub mod attach;
+pub(crate) mod bundled_channels;
 pub mod channel_env;
 pub mod channel_metadata;
 pub mod cli;

@@ -18,6 +18,7 @@ use crate::{
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
+        bundled_channels::snapshot_overlays_for_source,
         channel_metadata::{
             load_channel_metadata, render_contact_template, resolve_channel_worker_entrypoint,
             ChannelMetadata, CHANNEL_METADATA_FILE,
@@ -42,7 +43,6 @@ use crate::{
             project_instance_runtime_context_for_home_in_project_with_contacts,
             project_instance_runtime_context_with_contacts,
         },
-        team_local::snapshot_overlays_for_source,
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
