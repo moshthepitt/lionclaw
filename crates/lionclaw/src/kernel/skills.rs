@@ -77,6 +77,48 @@ pub fn validate_skill_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_agent_skill_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if name != trimmed {
+        return Err(SkillAliasValidationError::new(format!(
+            "agent skill name '{name}' has surrounding whitespace"
+        ))
+        .into());
+    }
+    let name = trimmed;
+    if name.is_empty() {
+        return Err(SkillAliasValidationError::new("agent skill name is required").into());
+    }
+    if name.len() > 64 {
+        return Err(SkillAliasValidationError::new(format!(
+            "agent skill name '{name}' exceeds 64 characters"
+        ))
+        .into());
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(SkillAliasValidationError::new(format!(
+            "agent skill name '{name}' must not start or end with '-'"
+        ))
+        .into());
+    }
+    if name.contains("--") {
+        return Err(SkillAliasValidationError::new(format!(
+            "agent skill name '{name}' must not contain consecutive hyphens"
+        ))
+        .into());
+    }
+    if name
+        .chars()
+        .any(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'))
+    {
+        return Err(SkillAliasValidationError::new(format!(
+            "agent skill name '{name}' may only contain lowercase ASCII letters, numbers, and '-'"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 pub fn derive_skill_id(name: &str, hash: &str, install_id: Option<&str>) -> String {
     let short_hash = &hash[..12.min(hash.len())];
     match install_id.filter(|value| !value.trim().is_empty()) {

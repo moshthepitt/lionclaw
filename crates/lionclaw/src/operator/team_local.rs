@@ -21,7 +21,7 @@ use crate::{
 
 pub(crate) const CHANNEL_ID: &str = "team-local";
 const WORKER_BIN_NAME: &str = "lionclaw-channel-team-local";
-const WORKER_BIN_REL_PATH: &str = "runtime/bin/lionclaw-channel-team-local";
+const WORKER_BIN_REL_PATH: &str = "runtime/team-local/bin/lionclaw-channel-team-local";
 const CONTACT_REF_PREFIX: &str = "team-local:peer:";
 const SENDER_REF_PREFIX: &str = "team-local:instance:";
 
@@ -288,18 +288,18 @@ mod tests {
             &main_home
                 .skills_dir()
                 .join(CHANNEL_ID)
-                .join("runtime/bin/lionclaw-channel-team-local"),
+                .join("runtime/team-local/bin/lionclaw-channel-team-local"),
         );
         assert!(main_home
             .skills_dir()
             .join(CHANNEL_ID)
-            .join("runtime/SKILL.md")
+            .join("runtime/team-local/SKILL.md")
             .exists());
         assert_executable(
             &main_home
                 .skills_dir()
                 .join(CHANNEL_ID)
-                .join("runtime/scripts/send"),
+                .join("runtime/team-local/scripts/send"),
         );
     }
 

@@ -577,7 +577,7 @@ mod tests {
             "local",
             &[SnapshotOverlay::new(
                 worker_bin.clone(),
-                PathBuf::from("bin/lionclaw-channel-team-local"),
+                PathBuf::from("runtime/team-local/bin/lionclaw-channel-team-local"),
             )],
         )
         .expect("snapshot v1");
@@ -590,7 +590,7 @@ mod tests {
             "local",
             &[SnapshotOverlay::new(
                 worker_bin,
-                PathBuf::from("bin/lionclaw-channel-team-local"),
+                PathBuf::from("runtime/team-local/bin/lionclaw-channel-team-local"),
             )],
         )
         .expect("snapshot v2");
@@ -601,7 +601,7 @@ mod tests {
             fs::read_to_string(
                 second
                     .snapshot_abs_dir
-                    .join("bin/lionclaw-channel-team-local")
+                    .join("runtime/team-local/bin/lionclaw-channel-team-local")
             )
             .expect("installed worker"),
             "worker v2\n"

@@ -6311,7 +6311,7 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
@@ -6527,6 +6527,30 @@ mod tests {
         skill_dir
     }
 
+    async fn write_runtime_skill_facet(
+        skill_dir: &Path,
+        alias: &str,
+        description: &str,
+    ) -> PathBuf {
+        let runtime_skill_dir = skill_dir.join("runtime").join(alias);
+        tokio::fs::create_dir_all(runtime_skill_dir.join("scripts"))
+            .await
+            .expect("create runtime skill dir");
+        tokio::fs::write(
+            runtime_skill_dir.join("SKILL.md"),
+            format!("---\nname: {alias}\ndescription: {description}\n---\n"),
+        )
+        .await
+        .expect("write runtime skill md");
+        tokio::fs::write(
+            runtime_skill_dir.join("scripts/send"),
+            "#!/usr/bin/env bash\n",
+        )
+        .await
+        .expect("write runtime send helper");
+        runtime_skill_dir
+    }
+
     #[test]
     fn assistant_text_preserves_runtime_message_boundaries() {
         let literal_events = vec![
@@ -6701,6 +6725,55 @@ mod tests {
             .expect("list runtime-visible skills");
 
         assert!(runtime_skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_visible_skills_project_channel_runtime_facets_only() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let skill_dir = write_installed_skill(&home, "team-local", "team-local channel").await;
+        tokio::fs::write(
+            skill_dir.join("lionclaw.toml"),
+            "[channel]\nid = \"team-local\"\n",
+        )
+        .await
+        .expect("write channel metadata");
+        write_runtime_skill_facet(&skill_dir, "team-local", "team-local sender").await;
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
+            required_env: Vec::new(),
+            contact: None,
+        });
+        config.save(&home).await.expect("save config");
+        let kernel = kernel_with_home(&home).await;
+
+        let runtime_skills = kernel
+            .runtime_visible_skills()
+            .await
+            .expect("list runtime-visible skills");
+        let mounts = kernel
+            .resolve_runtime_skill_mounts(&runtime_skills)
+            .await
+            .expect("resolve skill mounts");
+
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].alias, "team-local");
+        assert_eq!(runtime_skills[0].name, "team-local");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/lionclaw/skills/team-local");
+        assert_eq!(mounts[0].access, MountAccess::ReadOnly);
+        assert!(mounts[0].source.ends_with("runtime/team-local"));
+        assert!(mounts[0].source.join("SKILL.md").exists());
+        assert!(mounts[0].source.join("scripts/send").exists());
+        assert!(!mounts[0].source.join("lionclaw.toml").exists());
+        assert!(!mounts[0].source.join("scripts/worker").exists());
     }
 
     #[tokio::test]

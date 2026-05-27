@@ -71,10 +71,10 @@ Configure project A:
 cd "$PROJ_A"
 "$LIONCLAW_BIN" project init
 "$LIONCLAW_BIN" instance create reviewer
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/bin/lionclaw-channel-team-local"
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/scripts/send"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/bin/lionclaw-channel-team-local"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/scripts/send"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/send"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
+test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/send"
 "$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" configure --runtime codex

@@ -350,10 +350,18 @@ template rendering or neighbor projection.
 
 `channel-team-local` is bundled as a first-party channel skill. Its installed
 snapshot is self-contained: `scripts/worker` execs
-`runtime/bin/lionclaw-channel-team-local` from the skill directory, and install
-plumbing copies the compiled worker binary into that snapshot before computing
-the installed skill hash. The same binary also backs the runtime-facing
-`runtime/scripts/send` helper for sender-side team messages. The worker is a
+`runtime/team-local/bin/lionclaw-channel-team-local` from the skill directory,
+and install plumbing copies the compiled worker binary into that snapshot
+before computing the installed skill hash. The same binary also backs the
+runtime-facing `runtime/team-local/scripts/send` helper for sender-side team
+messages.
+
+Channel-bound skill roots remain host-only by default. A channel skill can
+publish a runtime-facing Agent Skill only by including a complete embedded skill
+at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
+Only that embedded skill root is mounted read-only under
+`/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
+other host-side assets are not projected into the runtime. The worker is a
 separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
 depend on the `lionclaw` crate.
 

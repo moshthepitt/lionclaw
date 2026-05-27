@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-WORKER="$SKILL_ROOT/runtime/bin/lionclaw-channel-team-local"
+WORKER="$SKILL_ROOT/runtime/team-local/bin/lionclaw-channel-team-local"
 
 if [[ ! -x "$WORKER" ]]; then
   echo "missing team-local worker binary: $WORKER" >&2
