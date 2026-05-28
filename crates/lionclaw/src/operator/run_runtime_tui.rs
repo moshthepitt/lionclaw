@@ -14,7 +14,6 @@ use crate::{
         },
     },
     project_inventory::ProjectInstanceRuntimeContext,
-    runtime_timeouts::RuntimeTurnTimeouts,
 };
 
 pub(crate) struct RunRuntimeTuiInvocation<'a> {
@@ -50,7 +49,7 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         Some(runtime_id.clone()),
         work_root,
         project_instance_runtime,
-        Some(RuntimeTurnTimeouts::interactive()),
+        None,
     )
     .await?;
     let peer_id = local_peer_id_for_project(work_root);

@@ -512,7 +512,7 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
     }
 
     async fn execute(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionOutput> {
-        let hard_timeout = self.plan.hard_timeout;
+        let hard_timeout = self.hard_timeout();
         timeout(
             hard_timeout,
             execute_captured(ExecutionRequest {
