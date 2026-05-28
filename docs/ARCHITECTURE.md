@@ -240,6 +240,9 @@ no greater than the runtime plan's hard timeout, so a stuck runtime CLI cannot
 make native TUI exit handling unbounded. The attached native UI itself is not a
 LionClaw turn, so LionClaw turn timeout overrides do not wrap the runtime's own
 interactive session.
+Each native TUI launch also holds a LionClaw-owned file lock in the session's
+runtime state root, preventing separate operator processes from attaching two
+native UIs to the same LionClaw session state at once.
 
 Native TUI mode does not provide typed live answer/reasoning events to
 channels. The normal operator console, `run --plain`, channel turns, and

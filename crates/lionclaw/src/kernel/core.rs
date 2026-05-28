@@ -13,6 +13,10 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rustix::{
+    fs::{flock, FlockOperation},
+    io::Errno,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -495,7 +499,17 @@ pub struct AttachedRuntimeLaunchInput {
 
 const RUNTIME_TUI_STATE_RUNNING: &str = "running";
 const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
+const RUNTIME_TUI_LOCK_FILE: &str = ".lionclaw-runtime-tui.lock";
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct PreparedAttachedRuntimeLaunch {
+    request: ExecutionRequest,
+    _launch_lock: Option<AttachedRuntimeLaunchLock>,
+}
+
+struct AttachedRuntimeLaunchLock {
+    _file: std::fs::File,
+}
 
 struct AttachedRuntimeTranscriptProgramExecutor {
     plan: EffectiveExecutionPlan,
@@ -752,9 +766,9 @@ impl Kernel {
         let runtime_id = input.runtime_id.clone();
         let session_lock = self.session_lock(session_id).await;
         let _guard = session_lock.lock().await;
-        let request = self.prepare_attached_runtime_launch(input).await?;
-        let plan = request.plan.clone();
-        let output = match execute_attached(request).await {
+        let prepared = self.prepare_attached_runtime_launch(input).await?;
+        let plan = prepared.request.plan.clone();
+        let output = match execute_attached(prepared.request.clone()).await {
             Ok(output) => output,
             Err(err) => {
                 if let Err(finish_err) = self
@@ -782,7 +796,7 @@ impl Kernel {
     async fn prepare_attached_runtime_launch(
         &self,
         input: AttachedRuntimeLaunchInput,
-    ) -> Result<ExecutionRequest, KernelError> {
+    ) -> Result<PreparedAttachedRuntimeLaunch, KernelError> {
         let AttachedRuntimeLaunchInput {
             session_id,
             runtime_id,
@@ -814,6 +828,9 @@ impl Kernel {
                     timeout_ms: None,
                 },
             )
+            .await?;
+        let launch_lock = self
+            .acquire_attached_runtime_launch_lock(&execution_plan)
             .await?;
         let recover_before_launch = self
             .attached_runtime_needs_prelaunch_reconcile(&execution_plan)
@@ -857,11 +874,14 @@ impl Kernel {
         self.mark_attached_runtime_launch_started(&execution_plan)
             .await?;
 
-        Ok(ExecutionRequest {
-            plan: execution_plan,
-            program,
-            runtime_secrets_mount,
-            codex_home_override: self.codex_home_override.clone(),
+        Ok(PreparedAttachedRuntimeLaunch {
+            request: ExecutionRequest {
+                plan: execution_plan,
+                program,
+                runtime_secrets_mount,
+                codex_home_override: self.codex_home_override.clone(),
+            },
+            _launch_lock: launch_lock,
         })
     }
 
@@ -7448,7 +7468,7 @@ mod tests {
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.plan)
+        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
             .expect("runtime state root")
             .to_path_buf();
 
@@ -7459,7 +7479,7 @@ mod tests {
             .finish_attached_runtime_launch(
                 session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &first.plan,
+                &first.request.plan,
                 Some(0),
                 None,
             )
@@ -7471,6 +7491,7 @@ mod tests {
         assert!(runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
             .is_file());
+        drop(first);
 
         let second = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
@@ -7483,7 +7504,7 @@ mod tests {
             .join(RUNTIME_SESSION_READY_MARKER)
             .exists());
         assert_eq!(
-            Kernel::runtime_state_root(&second.plan),
+            Kernel::runtime_state_root(&second.request.plan),
             Some(runtime_state_root.as_path())
         );
     }
@@ -7498,12 +7519,13 @@ mod tests {
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.plan)
+        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
             .expect("runtime state root")
             .to_path_buf();
 
         assert_eq!(exports.load(Ordering::SeqCst), 0);
         assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
+        drop(first);
 
         let second = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
@@ -7513,7 +7535,7 @@ mod tests {
         assert_eq!(exports.load(Ordering::SeqCst), 1);
         assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
         assert_eq!(
-            Kernel::runtime_state_root(&second.plan),
+            Kernel::runtime_state_root(&second.request.plan),
             Some(runtime_state_root.as_path())
         );
     }
@@ -7564,11 +7586,13 @@ mod tests {
             .expect("prepare attached runtime launch");
 
         assert!(launch
+            .request
             .plan
             .environment
             .iter()
             .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
         assert!(launch
+            .request
             .plan
             .mounts
             .iter()
@@ -7611,6 +7635,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_runtime_launch_lock_is_shared_between_kernel_instances() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (first_kernel, _first_exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let session_id = open_test_session(&first_kernel).await;
+        let first_launch = first_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare first attached launch");
+        let (second_kernel, _second_exports) =
+            kernel_with_counting_terminal_runtime(&temp_dir).await;
+
+        let err = match second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+        {
+            Ok(_) => panic!("concurrent attached launch should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("already running")
+        ));
+
+        drop(first_launch);
+        let second_launch = second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare attached launch after lock release");
+        second_kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &second_launch.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish second launch");
+    }
+
+    #[tokio::test]
     async fn attached_runtime_exit_audit_records_signal_status() {
         let temp_dir = tempdir().expect("temp dir");
         let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
@@ -7620,7 +7686,7 @@ mod tests {
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare launch");
-        let runtime_state_root = Kernel::runtime_state_root(&launch.plan)
+        let runtime_state_root = Kernel::runtime_state_root(&launch.request.plan)
             .expect("runtime state root")
             .to_path_buf();
 
@@ -7628,7 +7694,7 @@ mod tests {
             .finish_attached_runtime_launch(
                 session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &launch.plan,
+                &launch.request.plan,
                 None,
                 Some(2),
             )
@@ -11675,6 +11741,55 @@ fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str)
     Uuid::new_v5(&Uuid::NAMESPACE_OID, material.as_bytes())
 }
 
+fn acquire_attached_runtime_launch_lock_blocking(
+    lock_path: &Path,
+) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(KernelError::Runtime(format!(
+                    "runtime TUI lock path '{}' is not a regular file",
+                    lock_path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat runtime TUI lock path '{}': {err}",
+                lock_path.display()
+            )));
+        }
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to open runtime TUI lock path '{}': {err}",
+                lock_path.display()
+            ))
+        })?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(AttachedRuntimeLaunchLock { _file: file }),
+        Err(err) if runtime_tui_lock_is_held(err) => Err(KernelError::Conflict(
+            "runtime TUI is already running for this LionClaw session".to_string(),
+        )),
+        Err(err) => Err(KernelError::Runtime(format!(
+            "failed to lock runtime TUI path '{}': {err}",
+            lock_path.display()
+        ))),
+    }
+}
+
+fn runtime_tui_lock_is_held(err: Errno) -> bool {
+    err == Errno::WOULDBLOCK || err == Errno::AGAIN
+}
+
 fn render_attached_runtime_context_file(runtime_id: &str, sections: &[String]) -> String {
     format!(
         "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n\n<!-- LIONCLAW:START -->\n{}\n<!-- LIONCLAW:END -->\n",
@@ -13997,6 +14112,25 @@ impl Kernel {
 
     fn runtime_tui_state_path(plan: &EffectiveExecutionPlan) -> Option<PathBuf> {
         Some(Self::runtime_state_root(plan)?.join(RUNTIME_TUI_STATE_MARKER))
+    }
+
+    async fn acquire_attached_runtime_launch_lock(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<Option<AttachedRuntimeLaunchLock>, KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
+            return Ok(None);
+        };
+        tokio::fs::create_dir_all(&runtime_state_root)
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let lock_path = runtime_state_root.join(RUNTIME_TUI_LOCK_FILE);
+        tokio::task::spawn_blocking(move || {
+            acquire_attached_runtime_launch_lock_blocking(&lock_path)
+        })
+        .await
+        .map_err(|err| internal(err.into()))?
+        .map(Some)
     }
 
     async fn attached_runtime_needs_prelaunch_reconcile(
