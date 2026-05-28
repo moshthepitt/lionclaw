@@ -2,7 +2,7 @@ use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::protocol::{mailbox_id_for, CHANNEL_ID};
+use crate::protocol::{mailbox_id_for, normalize_address, CHANNEL_ID};
 
 const DEFAULT_POLL_MS: u64 = 30_000;
 const DEFAULT_PULL_LIMIT: usize = 10;
@@ -92,6 +92,10 @@ impl WorkerCommand {
                 other => bail!("unknown argument '{other}'"),
             }
         }
+        let poll_ms = validate_positive_u64("EMAIL_POLL_MS", poll_ms)?;
+        let pull_limit = validate_positive_usize("EMAIL_OUTBOX_PULL_LIMIT", pull_limit)?;
+        let lease_ms = validate_positive_u64("EMAIL_OUTBOX_LEASE_MS", lease_ms)?;
+        let fetch_limit = validate_positive_usize("EMAIL_FETCH_LIMIT", fetch_limit)?;
 
         let home = required_env_path("LIONCLAW_HOME")?;
         let base_url = required_env("LIONCLAW_BASE_URL")?;
@@ -107,7 +111,7 @@ impl WorkerCommand {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| format!("{CHANNEL_ID}:worker"));
 
-        let address = required_env("EMAIL_ADDRESS")?;
+        let address = required_email_address_env("EMAIL_ADDRESS")?;
         let mailbox_id = env::var("EMAIL_MAILBOX_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -169,10 +173,11 @@ impl WorkerCommand {
                     .unwrap_or(true),
             },
             digest: DigestConfig {
-                interval: Duration::from_millis(
+                interval: Duration::from_millis(validate_positive_u64(
+                    "EMAIL_DIGEST_INTERVAL_MS",
                     env_u64("EMAIL_DIGEST_INTERVAL_MS")?.unwrap_or(DEFAULT_DIGEST_INTERVAL_MS),
-                ),
-                admin_to: optional_env("EMAIL_ADMIN_DIGEST_TO"),
+                )?),
+                admin_to: optional_email_address_env("EMAIL_ADMIN_DIGEST_TO")?,
             },
         })))
     }
@@ -191,6 +196,20 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn required_email_address_env(name: &str) -> Result<String> {
+    parse_email_address(name, &required_env(name)?)
+}
+
+fn optional_email_address_env(name: &str) -> Result<Option<String>> {
+    optional_env(name)
+        .map(|value| parse_email_address(name, &value))
+        .transpose()
+}
+
+fn parse_email_address(name: &str, raw: &str) -> Result<String> {
+    normalize_address(raw).ok_or_else(|| anyhow!("{name} must be a plain email address"))
 }
 
 fn required_env_path(name: &str) -> Result<PathBuf> {
@@ -238,8 +257,26 @@ fn env_usize(name: &str) -> Result<Option<usize>> {
         .transpose()
 }
 
+fn validate_positive_u64(name: &str, value: u64) -> Result<u64> {
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn validate_positive_usize(name: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
 fn parse_imap_tls(raw: Option<&str>, port: u16) -> Result<ImapTlsMode> {
-    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    match raw.as_deref() {
         Some("implicit") | Some("tls") => Ok(ImapTlsMode::Implicit),
         Some("starttls") => Ok(ImapTlsMode::StartTls),
         Some("insecure") | Some("none") => Ok(ImapTlsMode::Insecure),
@@ -277,4 +314,36 @@ fn print_help() {
     println!(
         "lionclaw-channel-email [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS] [--fetch-limit N]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_runtime_knob_validation_rejects_zero() {
+        let err = validate_positive_u64("EMAIL_POLL_MS", 0).expect_err("zero poll should fail");
+        assert!(err.to_string().contains("greater than zero"));
+
+        let err =
+            validate_positive_usize("EMAIL_FETCH_LIMIT", 0).expect_err("zero fetch should fail");
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn email_address_config_is_normalized_and_validated() {
+        assert_eq!(
+            parse_email_address("EMAIL_ADDRESS", " Assistant@Example.COM ").expect("address"),
+            "assistant@example.com"
+        );
+        assert!(parse_email_address("EMAIL_ADDRESS", "not an address").is_err());
+    }
+
+    #[test]
+    fn imap_tls_mode_is_case_insensitive() {
+        assert_eq!(
+            parse_imap_tls(Some("STARTTLS"), 993).expect("tls mode"),
+            ImapTlsMode::StartTls
+        );
+    }
 }
