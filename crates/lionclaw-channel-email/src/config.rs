@@ -112,10 +112,11 @@ impl WorkerCommand {
             .unwrap_or_else(|| format!("{CHANNEL_ID}:worker"));
 
         let address = required_email_address_env("EMAIL_ADDRESS")?;
-        let mailbox_id = env::var("EMAIL_MAILBOX_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        let mailbox_id = optional_env("EMAIL_MAILBOX_ID")
+            .map(|value| parse_mailbox_id("EMAIL_MAILBOX_ID", &value))
+            .transpose()?
             .unwrap_or_else(|| mailbox_id_for(&address));
+        validate_mailbox_id("EMAIL_MAILBOX_ID", &mailbox_id)?;
         let state_dir = env::var("EMAIL_STATE_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -210,6 +211,25 @@ fn optional_email_address_env(name: &str) -> Result<Option<String>> {
 
 fn parse_email_address(name: &str, raw: &str) -> Result<String> {
     normalize_address(raw).ok_or_else(|| anyhow!("{name} must be a plain email address"))
+}
+
+fn parse_mailbox_id(name: &str, raw: &str) -> Result<String> {
+    let value = mailbox_id_for(raw);
+    validate_mailbox_id(name, &value)?;
+    Ok(value)
+}
+
+fn validate_mailbox_id(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || matches!(value, "." | "..") {
+        bail!("{name} must resolve to a non-empty path-safe mailbox id");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("{name} must contain only ASCII letters, numbers, dash, underscore, or dot");
+    }
+    Ok(())
 }
 
 fn required_env_path(name: &str) -> Result<PathBuf> {
@@ -337,6 +357,17 @@ mod tests {
             "assistant@example.com"
         );
         assert!(parse_email_address("EMAIL_ADDRESS", "not an address").is_err());
+    }
+
+    #[test]
+    fn mailbox_id_config_is_normalized_and_path_safe() {
+        assert_eq!(
+            parse_mailbox_id("EMAIL_MAILBOX_ID", " Project/Inbox ").expect("mailbox id"),
+            "project-inbox"
+        );
+        assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", ".").is_err());
+        assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", "..").is_err());
+        assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", "///").is_err());
     }
 
     #[test]

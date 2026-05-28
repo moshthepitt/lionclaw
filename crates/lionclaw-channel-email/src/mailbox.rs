@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{error::Error, fmt, num::NonZeroU32};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -38,6 +38,30 @@ pub struct CandidateHeader {
     pub attachment_count: usize,
     pub rfc822_size: Option<u32>,
     pub facts: HeaderFacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleMailboxCandidate {
+    pub expected_uid_validity: u32,
+    pub actual_uid_validity: u32,
+}
+
+impl fmt::Display for StaleMailboxCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "IMAP UIDVALIDITY changed from {} to {}",
+            self.expected_uid_validity, self.actual_uid_validity
+        )
+    }
+}
+
+impl Error for StaleMailboxCandidate {}
+
+pub fn is_stale_mailbox_candidate(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StaleMailboxCandidate>().is_some())
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +189,22 @@ impl RealMailboxEngine {
             .map(NonZeroU32::get)
             .ok_or_else(|| anyhow!("IMAP server did not return UIDVALIDITY"))?;
         Ok((client, uid_validity))
+    }
+
+    async fn selected_candidate_imap(
+        &self,
+        read_only: bool,
+        candidate: &CandidateHeader,
+    ) -> Result<ImapClient> {
+        let (client, uid_validity) = self.selected_imap(read_only).await?;
+        if uid_validity != candidate.uid_validity {
+            return Err(StaleMailboxCandidate {
+                expected_uid_validity: candidate.uid_validity,
+                actual_uid_validity: uid_validity,
+            }
+            .into());
+        }
+        Ok(client)
     }
 
     fn header_fetch_items() -> MacroOrMessageDataItemNames<'static> {
@@ -371,7 +411,7 @@ impl MailboxEngine for RealMailboxEngine {
         &mut self,
         candidate: &CandidateHeader,
     ) -> Result<FetchedMessage> {
-        let (mut client, _) = self.selected_imap(true).await?;
+        let mut client = self.selected_candidate_imap(true, candidate).await?;
         let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
         let fetched = client
             .uid_fetch(
@@ -391,7 +431,7 @@ impl MailboxEngine for RealMailboxEngine {
         if !self.config.mark_seen_after_admission {
             return Ok(());
         }
-        let (mut client, _) = self.selected_imap(false).await?;
+        let mut client = self.selected_candidate_imap(false, candidate).await?;
         let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
         client
             .uid_silent_store(
@@ -602,6 +642,18 @@ mod tests {
         assert_ne!(first.message_ref, second.message_ref);
         assert!(first.facts.message_id.is_none());
         assert!(second.facts.message_id.is_none());
+    }
+
+    #[test]
+    fn stale_mailbox_candidate_error_is_detected_through_context() {
+        let error: anyhow::Error = StaleMailboxCandidate {
+            expected_uid_validity: 7,
+            actual_uid_validity: 8,
+        }
+        .into();
+        let error = error.context("failed to fetch authorized email body");
+
+        assert!(is_stale_mailbox_candidate(&error));
     }
 
     fn test_mailbox_config() -> MailboxConfig {
