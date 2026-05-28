@@ -204,16 +204,17 @@ impl RealMailboxEngine {
         let facts = parse_header_facts(raw_headers)?;
         let sender = sender_ref(&facts.sender.address);
         let conversation = conversation_ref(&self.config.mailbox_id);
-        let root = stable_message_root(
-            facts.message_id.as_deref(),
-            facts.in_reply_to.as_deref(),
-            &facts.references,
-        );
-        let thread = thread_ref(&root);
         let provider = facts
             .message_id
             .clone()
             .unwrap_or_else(|| format!("imap:{}:{}", uid_validity, uid));
+        let root = stable_message_root(
+            facts.message_id.as_deref(),
+            facts.in_reply_to.as_deref(),
+            &facts.references,
+            &provider,
+        );
+        let thread = thread_ref(&root);
         let message = message_ref(&provider);
         Ok(CandidateHeader {
             uid_validity,
@@ -552,6 +553,36 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].uid, 42);
         assert_eq!(candidates[0].sender_ref, "email:addr:alice@example.com");
+    }
+
+    #[test]
+    fn missing_message_ids_do_not_share_thread_identity() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let first = engine
+            .candidate_from_headers(
+                7,
+                NonZeroU32::new(41).expect("nonzero uid"),
+                b"From: Alice <alice@example.com>\r\nSubject: First\r\n\r\n",
+                0,
+                Some(128),
+            )
+            .expect("first candidate");
+        let second = engine
+            .candidate_from_headers(
+                7,
+                NonZeroU32::new(42).expect("nonzero uid"),
+                b"From: Alice <alice@example.com>\r\nSubject: Second\r\nMessage-ID: <>\r\n\r\n",
+                0,
+                Some(128),
+            )
+            .expect("second candidate");
+
+        assert_ne!(first.thread_ref, second.thread_ref);
+        assert_ne!(first.message_ref, second.message_ref);
+        assert!(first.facts.message_id.is_none());
+        assert!(second.facts.message_id.is_none());
     }
 
     fn test_mailbox_config() -> MailboxConfig {

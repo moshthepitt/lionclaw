@@ -72,13 +72,15 @@ pub fn stable_message_root(
     message_id: Option<&str>,
     in_reply_to: Option<&str>,
     references: &[String],
+    fallback: &str,
 ) -> String {
     references
-        .first()
+        .iter()
         .map(String::as_str)
-        .or(in_reply_to)
-        .or(message_id)
-        .unwrap_or("missing-message-id")
+        .find(|value| !value.trim().is_empty())
+        .or_else(|| in_reply_to.filter(|value| !value.trim().is_empty()))
+        .or_else(|| message_id.filter(|value| !value.trim().is_empty()))
+        .unwrap_or(fallback)
         .to_string()
 }
 
@@ -150,5 +152,17 @@ mod tests {
             "email:mailbox:assistant@example.com"
         );
         assert!(thread_ref("<root@example.com>").starts_with("email:thread:"));
+        assert_eq!(
+            stable_message_root(None, None, &[], "imap:7:42"),
+            "imap:7:42"
+        );
+        assert_eq!(
+            stable_message_root(Some("m1@example.com"), None, &[], "imap:7:42"),
+            "m1@example.com"
+        );
+        assert_eq!(
+            stable_message_root(None, Some("root@example.com"), &[], "imap:7:42"),
+            "root@example.com"
+        );
     }
 }
