@@ -199,9 +199,10 @@ impl SessionTurnStore {
         let started_at_ms = datetime_to_ms(turn.started_at);
         let finished_at_ms = turn.finished_at.map(datetime_to_ms);
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO session_turns \
+            "INSERT INTO session_turns \
              (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
-             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(turn_id) DO NOTHING",
         )
         .bind(turn.turn_id.to_string())
         .bind(turn.session_id.to_string())
