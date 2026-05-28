@@ -15,6 +15,7 @@ use imap_client::{
 };
 use mail_send::{mail_builder::MessageBuilder, SmtpClientBuilder};
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::{
     config::{ImapTlsMode, MailboxConfig},
@@ -222,12 +223,69 @@ impl RealMailboxEngine {
             facts,
         })
     }
+
+    fn push_candidate_from_headers(
+        &self,
+        candidates: &mut Vec<CandidateHeader>,
+        uid_validity: u32,
+        uid: NonZeroU32,
+        raw_headers: &[u8],
+        attachment_count: usize,
+    ) -> bool {
+        match self.candidate_from_headers(uid_validity, uid, raw_headers, attachment_count) {
+            Ok(candidate) => {
+                candidates.push(candidate);
+                true
+            }
+            Err(err) => {
+                warn!(
+                    uid_validity,
+                    uid = uid.get(),
+                    error = %err,
+                    "skipping email candidate with malformed headers"
+                );
+                false
+            }
+        }
+    }
+
+    async fn mark_malformed_candidates_processed(
+        &self,
+        client: &mut ImapClient,
+        uids: Vec<NonZeroU32>,
+    ) {
+        if uids.is_empty() || !self.config.mark_seen_after_admission {
+            return;
+        }
+        let count = uids.len();
+        match SequenceSet::try_from(uids) {
+            Ok(sequence_set) => {
+                if let Err(err) = client
+                    .uid_silent_store(sequence_set, StoreType::Add, [Flag::Seen])
+                    .await
+                {
+                    warn!(
+                        count,
+                        error = %err,
+                        "failed to mark malformed email candidates processed"
+                    );
+                }
+            }
+            Err(err) => warn!(
+                count,
+                error = %err,
+                "failed to build malformed email candidate UID set"
+            ),
+        }
+    }
 }
 
 #[async_trait]
 impl MailboxEngine for RealMailboxEngine {
     async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
-        let (mut client, uid_validity) = self.selected_imap(true).await?;
+        let (mut client, uid_validity) = self
+            .selected_imap(!self.config.mark_seen_after_admission)
+            .await?;
         let mut uids = client
             .uid_search([SearchKey::Unseen])
             .await
@@ -244,21 +302,34 @@ impl MailboxEngine for RealMailboxEngine {
             .await
             .context("failed to fetch IMAP message headers")?;
         let mut candidates = Vec::new();
+        let mut malformed_uids = Vec::new();
         for uid in uids {
             let Some(items) = fetched.get(&uid) else {
                 continue;
             };
             let Some(raw_headers) = body_data(items.as_ref()) else {
+                warn!(
+                    uid_validity,
+                    uid = uid.get(),
+                    "skipping email candidate with missing fetched headers"
+                );
+                malformed_uids.push(uid);
                 continue;
             };
             let attachment_count = bodystructure_attachment_count(items.as_ref());
-            candidates.push(self.candidate_from_headers(
+            let added = self.push_candidate_from_headers(
+                &mut candidates,
                 uid_validity,
                 uid,
                 &raw_headers,
                 attachment_count,
-            )?);
+            );
+            if !added {
+                malformed_uids.push(uid);
+            }
         }
+        self.mark_malformed_candidates_processed(&mut client, malformed_uids)
+            .await;
         Ok(candidates)
     }
 
@@ -421,4 +492,60 @@ fn i_string_eq(
     expected: &str,
 ) -> bool {
     value.as_ref().eq_ignore_ascii_case(expected.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ImapTlsMode;
+
+    #[test]
+    fn malformed_candidate_headers_do_not_discard_well_formed_candidates() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let mut candidates = Vec::new();
+
+        let malformed_added = engine.push_candidate_from_headers(
+            &mut candidates,
+            7,
+            NonZeroU32::new(41).expect("nonzero uid"),
+            b"Subject: Missing sender\r\n\r\n",
+            0,
+        );
+        let well_formed_added = engine.push_candidate_from_headers(
+            &mut candidates,
+            7,
+            NonZeroU32::new(42).expect("nonzero uid"),
+            b"From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+            0,
+        );
+
+        assert!(!malformed_added);
+        assert!(well_formed_added);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].uid, 42);
+        assert_eq!(candidates[0].sender_ref, "email:addr:alice@example.com");
+    }
+
+    fn test_mailbox_config() -> MailboxConfig {
+        MailboxConfig {
+            mailbox_id: "assistant-example-com".to_string(),
+            address: "assistant@example.com".to_string(),
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            imap_tls: ImapTlsMode::Implicit,
+            imap_username: "assistant@example.com".to_string(),
+            imap_password: "secret".to_string(),
+            imap_mailbox: "INBOX".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            smtp_implicit_tls: false,
+            smtp_username: "assistant@example.com".to_string(),
+            smtp_password: "secret".to_string(),
+            from_name: Some("LionClaw".to_string()),
+            fetch_limit: 25,
+            mark_seen_after_admission: true,
+        }
+    }
 }

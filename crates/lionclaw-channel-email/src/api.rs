@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use reqwest::multipart::{Form, Part};
+use reqwest::{
+    multipart::{Form, Part},
+    StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -305,16 +308,26 @@ impl LionClawApi {
         grant_id: &str,
         reason: &str,
     ) -> Result<()> {
-        let _: Value = self
-            .post_json(
-                "/v0/channels/grants/revoke",
-                &serde_json::json!({
-                    "channel_id": channel_id,
-                    "grant_id": grant_id,
-                    "reason": reason,
-                }),
-            )
-            .await?;
+        let response = self
+            .client
+            .post(self.url("/v0/channels/grants/revoke"))
+            .json(&serde_json::json!({
+                "channel_id": channel_id,
+                "grant_id": grant_id,
+                "reason": reason,
+            }))
+            .send()
+            .await
+            .context("POST /v0/channels/grants/revoke failed")?;
+        let (status, text) = response_text(response).await?;
+        if status == StatusCode::NOT_FOUND && text.contains("channel grant not found") {
+            return Ok(());
+        }
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status}: {text}");
+        }
+        let _: Value = serde_json::from_str(&text)
+            .with_context(|| format!("failed to decode response body: {text}"))?;
         Ok(())
     }
 
@@ -384,13 +397,18 @@ async fn response_json<T>(response: reqwest::Response) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
+    let (status, text) = response_text(response).await?;
+    if !status.is_success() {
+        anyhow::bail!("HTTP {status}: {text}");
+    }
+    serde_json::from_str(&text).with_context(|| format!("failed to decode response body: {text}"))
+}
+
+async fn response_text(response: reqwest::Response) -> Result<(StatusCode, String)> {
     let status = response.status();
     let text = response
         .text()
         .await
         .context("failed to read response body")?;
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status}: {text}");
-    }
-    serde_json::from_str(&text).with_context(|| format!("failed to decode response body: {text}"))
+    Ok((status, text))
 }

@@ -2235,6 +2235,7 @@ async fn channel_direct_grant_approval_admits_known_email_scope() {
         None,
     );
     route_req.reason = Some("operator_approved_known_identity".to_string());
+    route_req.label = Some("Project inbox".to_string());
     let route_grant = kernel
         .approve_channel_grant(route_req)
         .await
@@ -2265,6 +2266,11 @@ async fn channel_direct_grant_approval_admits_known_email_scope() {
     assert!(authorized.authorized);
     assert_eq!(authorized.reason_code, "authorized");
     assert_eq!(authorized.grant_id, Some(route_grant.grant_id));
+    assert_eq!(
+        authorized.grant_routing_profile,
+        Some(ChannelRoutingProfile::Conversation)
+    );
+    assert_eq!(authorized.grant_label.as_deref(), Some("Project inbox"));
     let expected_session_key = conversation_session_key("email", conversation_ref, sender_ref);
     assert_eq!(
         authorized.session_key.as_deref(),
