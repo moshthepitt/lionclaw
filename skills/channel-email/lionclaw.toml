@@ -30,4 +30,5 @@ optional_env = [
   "EMAIL_POLL_MS",
   "EMAIL_SMTP_IMPLICIT_TLS",
   "EMAIL_SMTP_PORT",
+  "EMAIL_SMTP_TLS",
 ]

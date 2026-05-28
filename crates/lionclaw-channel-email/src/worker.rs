@@ -1439,7 +1439,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            DigestConfig, ImapTlsMode, MailboxConfig, SenderAuthConfig, DEFAULT_MAX_MESSAGE_BYTES,
+            DigestConfig, ImapTlsMode, MailboxConfig, SenderAuthConfig, SmtpTlsMode,
+            DEFAULT_MAX_MESSAGE_BYTES,
         },
         mailbox::{CandidateHeaderBatch, FetchedMessage, MailboxFactory, StaleMailboxCandidate},
         mime::parse_headers_for_test,
@@ -2409,7 +2410,7 @@ mod tests {
                     imap_mailbox: "INBOX".to_string(),
                     smtp_host: "smtp.example.com".to_string(),
                     smtp_port: 587,
-                    smtp_implicit_tls: false,
+                    smtp_tls: SmtpTlsMode::StartTls,
                     smtp_username: "assistant@example.com".to_string(),
                     smtp_password: "secret".to_string(),
                     from_name: Some("LionClaw".to_string()),

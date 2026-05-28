@@ -43,7 +43,7 @@ pub struct MailboxConfig {
     pub imap_mailbox: String,
     pub smtp_host: String,
     pub smtp_port: u16,
-    pub smtp_implicit_tls: bool,
+    pub smtp_tls: SmtpTlsMode,
     pub smtp_username: String,
     pub smtp_password: String,
     pub from_name: Option<String>,
@@ -68,6 +68,13 @@ pub enum SenderAuthConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapTlsMode {
+    Implicit,
+    StartTls,
+    Insecure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpTlsMode {
     Implicit,
     StartTls,
     Insecure,
@@ -143,7 +150,14 @@ impl WorkerCommand {
         )?;
         let smtp_host = required_env("EMAIL_SMTP_HOST")?;
         let smtp_port = env_u16("EMAIL_SMTP_PORT")?.unwrap_or(587);
-        let smtp_implicit_tls = env_bool("EMAIL_SMTP_IMPLICIT_TLS")?.unwrap_or(smtp_port == 465);
+        let smtp_tls = parse_smtp_tls(
+            env::var("EMAIL_SMTP_TLS")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .as_deref(),
+            env_bool("EMAIL_SMTP_IMPLICIT_TLS")?,
+            smtp_port,
+        )?;
         let sender_auth = parse_sender_auth_config(required_env("EMAIL_AUTH_RESULTS_HOST")?)?;
 
         Ok(Self::Run(Box::new(WorkerConfig {
@@ -171,7 +185,7 @@ impl WorkerCommand {
                     .unwrap_or_else(|| "INBOX".to_string()),
                 smtp_host,
                 smtp_port,
-                smtp_implicit_tls,
+                smtp_tls,
                 smtp_username: required_env("EMAIL_SMTP_USERNAME")?,
                 smtp_password: required_env("EMAIL_SMTP_PASSWORD")?,
                 from_name: optional_env("EMAIL_FROM_NAME"),
@@ -333,6 +347,29 @@ fn parse_imap_tls(raw: Option<&str>, port: u16) -> Result<ImapTlsMode> {
     }
 }
 
+fn parse_smtp_tls(
+    raw: Option<&str>,
+    legacy_implicit_tls: Option<bool>,
+    port: u16,
+) -> Result<SmtpTlsMode> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    match raw.as_deref() {
+        Some("implicit") | Some("tls") => Ok(SmtpTlsMode::Implicit),
+        Some("starttls") => Ok(SmtpTlsMode::StartTls),
+        Some("insecure") | Some("none") => Ok(SmtpTlsMode::Insecure),
+        Some(other) => bail!("EMAIL_SMTP_TLS must be implicit, starttls, or insecure, got {other}"),
+        None => match legacy_implicit_tls {
+            Some(true) => Ok(SmtpTlsMode::Implicit),
+            Some(false) => Ok(SmtpTlsMode::StartTls),
+            None if port == 465 => Ok(SmtpTlsMode::Implicit),
+            None => Ok(SmtpTlsMode::StartTls),
+        },
+    }
+}
+
 pub(crate) fn validate_max_message_bytes(value: usize) -> Result<()> {
     if value == 0 {
         bail!("EMAIL_MAX_MESSAGE_BYTES must be greater than zero");
@@ -410,6 +447,26 @@ mod tests {
         assert_eq!(
             parse_imap_tls(Some("STARTTLS"), 993).expect("tls mode"),
             ImapTlsMode::StartTls
+        );
+    }
+
+    #[test]
+    fn smtp_tls_mode_is_explicit_with_legacy_bool_fallback() {
+        assert_eq!(
+            parse_smtp_tls(Some("STARTTLS"), None, 587).expect("tls mode"),
+            SmtpTlsMode::StartTls
+        );
+        assert_eq!(
+            parse_smtp_tls(Some("none"), None, 25).expect("tls mode"),
+            SmtpTlsMode::Insecure
+        );
+        assert_eq!(
+            parse_smtp_tls(None, Some(false), 587).expect("legacy tls mode"),
+            SmtpTlsMode::StartTls
+        );
+        assert_eq!(
+            parse_smtp_tls(None, None, 465).expect("default tls mode"),
+            SmtpTlsMode::Implicit
         );
     }
 
