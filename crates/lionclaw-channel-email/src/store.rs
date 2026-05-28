@@ -209,21 +209,23 @@ impl EmailStore {
         Ok(Some(parse_mail_status(&status, event_id)?))
     }
 
-    pub async fn mail_status_by_message_ref(
+    pub async fn mail_status_by_message_ref_for_sender(
         &self,
         message_ref: &str,
+        sender_ref: &str,
         except_event_id: &str,
     ) -> Result<Option<MailStatus>> {
         let Some(row) = sqlx::query(
             r#"
             SELECT event_id, status
             FROM mail_items
-            WHERE message_ref = ? AND event_id != ?
+            WHERE message_ref = ? AND sender_ref = ? AND event_id != ?
             ORDER BY created_at ASC, event_id ASC
             LIMIT 1
             "#,
         )
         .bind(message_ref)
+        .bind(sender_ref)
         .bind(except_event_id)
         .fetch_optional(&self.pool)
         .await?
@@ -1041,12 +1043,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_ref_status_lookup_finds_prior_provider_message() {
+    async fn message_ref_status_lookup_finds_prior_provider_message_from_same_sender() {
         let temp_dir = tempdir().expect("temp dir");
         let store = EmailStore::open(temp_dir.path()).await.expect("store");
         let original = candidate(1);
-        let mut copied = candidate(2);
-        copied.message_ref.clone_from(&original.message_ref);
+        let mut same_sender_copy = candidate(2);
+        same_sender_copy
+            .message_ref
+            .clone_from(&original.message_ref);
+        let mut different_sender_copy = candidate_from_sender(3, "bob@example.com");
+        different_sender_copy
+            .message_ref
+            .clone_from(&original.message_ref);
         store
             .record_admitted(&original, "downloaded")
             .await
@@ -1054,14 +1062,33 @@ mod tests {
 
         assert_eq!(
             store
-                .mail_status_by_message_ref(&copied.message_ref, &copied.event_id)
+                .mail_status_by_message_ref_for_sender(
+                    &same_sender_copy.message_ref,
+                    &same_sender_copy.sender_ref,
+                    &same_sender_copy.event_id,
+                )
                 .await
-                .expect("lookup copied"),
+                .expect("lookup same-sender copy"),
             Some(MailStatus::Admitted)
         );
         assert_eq!(
             store
-                .mail_status_by_message_ref(&original.message_ref, &original.event_id)
+                .mail_status_by_message_ref_for_sender(
+                    &different_sender_copy.message_ref,
+                    &different_sender_copy.sender_ref,
+                    &different_sender_copy.event_id,
+                )
+                .await
+                .expect("lookup different-sender copy"),
+            None
+        );
+        assert_eq!(
+            store
+                .mail_status_by_message_ref_for_sender(
+                    &original.message_ref,
+                    &original.sender_ref,
+                    &original.event_id,
+                )
                 .await
                 .expect("lookup self excluded"),
             None
@@ -1122,9 +1149,13 @@ mod tests {
     }
 
     fn candidate(index: u32) -> CandidateHeader {
+        candidate_from_sender(index, "alice@example.com")
+    }
+
+    fn candidate_from_sender(index: u32, sender: &str) -> CandidateHeader {
         let message_id = format!("m{index}@example.com");
         let headers = format!(
-            "From: Alice <alice@example.com>\r\nSubject: Held {index}\r\nMessage-ID: <{message_id}>\r\n\r\n"
+            "From: {sender}\r\nSubject: Held {index}\r\nMessage-ID: <{message_id}>\r\n\r\n"
         );
         let facts = parse_headers_for_test(&headers);
         CandidateHeader {
