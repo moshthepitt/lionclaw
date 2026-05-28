@@ -19,7 +19,7 @@ chrono = { workspace = true, features = ["serde", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 hex = "0.4"
-hyper = { version = "1.9", features = ["client", "http1"] }
+hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9.1"
