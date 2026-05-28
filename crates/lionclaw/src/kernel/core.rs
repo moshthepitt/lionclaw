@@ -491,7 +491,6 @@ impl Default for KernelOptions {
 pub struct AttachedRuntimeLaunchInput {
     pub session_id: Uuid,
     pub runtime_id: String,
-    pub timeout_ms: Option<u64>,
 }
 
 const RUNTIME_TUI_STATE_RUNNING: &str = "running";
@@ -752,7 +751,6 @@ impl Kernel {
         let AttachedRuntimeLaunchInput {
             session_id,
             runtime_id,
-            timeout_ms,
         } = input;
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
@@ -778,7 +776,7 @@ impl Kernel {
                     env_passthrough_keys: Vec::new(),
                     skill_mounts,
                     extra_mounts: Vec::new(),
-                    timeout_ms,
+                    timeout_ms: None,
                 },
             )
             .await?;
@@ -6892,7 +6890,6 @@ mod tests {
         AttachedRuntimeLaunchInput {
             session_id,
             runtime_id: TEST_TERMINAL_RUNTIME_ID.to_string(),
-            timeout_ms: None,
         }
     }
 

@@ -60,7 +60,6 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
             session_id: session.session_id,
             runtime_id: runtime_id.clone(),
-            timeout_ms: None,
         })
         .await
         .map_err(kernel_to_anyhow)?;
