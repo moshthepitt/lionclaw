@@ -207,7 +207,7 @@ transport without baking Telegram, Slack, or future integrations into the
 trusted kernel.
 
 Interactive channels run in the current terminal. Background channels are
-managed through the platform backend and store required channel env in the
+managed through the platform backend and store declared channel env in the
 selected instance home, not in accidental shell state.
 
 Use `lionclaw up` when you want LionClaw to stay reachable after the current

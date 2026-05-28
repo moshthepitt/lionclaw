@@ -59,39 +59,13 @@ pub fn merge_channel_env(
     Ok(existing)
 }
 
-pub fn validate_required_channel_env(
-    home: &LionClawHome,
-    channel_id: &str,
-    required_env: &[String],
-) -> Result<()> {
-    let stored = load_channel_env(home, channel_id)?;
-    for key in required_env {
-        validate_channel_env_name(key)?;
-        if required_value_is_missing(&stored, key) {
-            return Err(anyhow!(
-                "required environment value '{key}' is not configured for channel '{channel_id}'"
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn validate_channel_env_contract(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<()> {
-    let stored = load_channel_env(home, channel_id)?;
-    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)?;
-
-    for key in required_env {
-        validate_channel_env_name(key)?;
-        if required_value_is_missing(&stored, key) {
-            return Err(anyhow!(
-                "required environment value '{key}' is not configured for channel '{channel_id}'"
-            ));
-        }
-    }
+    load_declared_channel_env(home, channel_id, required_env, optional_env)?;
     Ok(())
 }
 
@@ -99,18 +73,21 @@ pub fn validate_no_undeclared_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<()> {
     let stored = load_channel_env(home, channel_id)?;
-    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)
+    validate_stored_channel_env_keys(home, channel_id, required_env, optional_env, &stored)
 }
 
-pub fn load_required_channel_env(
+pub fn load_declared_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<Vec<(String, String)>> {
     let stored = load_channel_env(home, channel_id)?;
-    let mut values = Vec::with_capacity(required_env.len());
+    validate_stored_channel_env_keys(home, channel_id, required_env, optional_env, &stored)?;
+    let mut values = Vec::with_capacity(required_env.len() + optional_env.len());
     for key in required_env {
         validate_channel_env_name(key)?;
         let Some(value) = stored.get(key).filter(|value| !value.is_empty()) else {
@@ -119,6 +96,12 @@ pub fn load_required_channel_env(
             ));
         };
         values.push((key.clone(), value.clone()));
+    }
+    for key in optional_env {
+        validate_channel_env_name(key)?;
+        if let Some(value) = stored.get(key).filter(|value| !value.is_empty()) {
+            values.push((key.clone(), value.clone()));
+        }
     }
     Ok(values)
 }
@@ -142,10 +125,15 @@ fn validate_stored_channel_env_keys(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
     stored: &ChannelEnv,
 ) -> Result<()> {
     let mut declared = BTreeSet::new();
     for key in required_env {
+        validate_channel_env_name(key)?;
+        declared.insert(key.as_str());
+    }
+    for key in optional_env {
         validate_channel_env_name(key)?;
         declared.insert(key.as_str());
     }
@@ -285,7 +273,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_channel_env, load_required_channel_env, missing_required_env, parse_env_file,
+        load_channel_env, load_declared_channel_env, missing_required_env, parse_env_file,
         save_channel_env, ChannelEnv,
     };
     use crate::home::LionClawHome;
@@ -396,16 +384,58 @@ mod tests {
     }
 
     #[test]
-    fn load_required_channel_env_rejects_empty_values() {
+    fn load_declared_channel_env_rejects_empty_required_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         let mut values = ChannelEnv::new();
         values.insert("TELEGRAM_BOT_TOKEN".to_string(), String::new());
         save_channel_env(&home, "telegram", &values).expect("save env");
 
-        let err = load_required_channel_env(&home, "telegram", &["TELEGRAM_BOT_TOKEN".to_string()])
-            .expect_err("empty required env should fail");
+        let err =
+            load_declared_channel_env(&home, "telegram", &["TELEGRAM_BOT_TOKEN".to_string()], &[])
+                .expect_err("empty required env should fail");
 
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn load_declared_channel_env_includes_present_optional_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        values.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
+        save_channel_env(&home, "telegram", &values).expect("save env");
+
+        let loaded = load_declared_channel_env(
+            &home,
+            "telegram",
+            &["TELEGRAM_BOT_TOKEN".to_string()],
+            &["TELEGRAM_POLL_MS".to_string(), "TELEGRAM_EMPTY".to_string()],
+        )
+        .expect("load declared env");
+
+        assert_eq!(
+            loaded,
+            vec![
+                ("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string()),
+                ("TELEGRAM_POLL_MS".to_string(), "1000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_declared_channel_env_rejects_stored_values_without_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("STALE_SECRET".to_string(), "secret".to_string());
+        save_channel_env(&home, "loopback", &values).expect("save env");
+
+        let err = load_declared_channel_env(&home, "loopback", &[], &[])
+            .expect_err("undeclared env should fail");
+
+        assert!(err.to_string().contains("STALE_SECRET"));
+        assert!(!err.to_string().contains("secret"));
     }
 }
