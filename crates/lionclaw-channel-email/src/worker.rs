@@ -540,7 +540,7 @@ where
         let held = store.held_since_last_digest(DEFAULT_DIGEST_LIMIT).await?;
         let suppressed_count = store.suppressed_count_since_last_digest().await?;
         if held.is_empty() && suppressed_count == 0 {
-            store.mark_digest_sent_now().await?;
+            store.mark_digest_sent(&held).await?;
             return Ok(());
         }
 
@@ -565,7 +565,7 @@ where
             })
             .await
             .context("failed to send held-mail digest")?;
-        store.mark_digest_sent_now().await?;
+        store.mark_digest_sent(&held).await?;
         Ok(())
     }
 

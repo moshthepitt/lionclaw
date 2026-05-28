@@ -11,6 +11,10 @@ use sqlx::{
 
 use crate::mailbox::CandidateHeader;
 
+const LAST_DIGEST_AT_KEY: &str = "last_digest_at";
+const LAST_DIGEST_ATTEMPT_AT_KEY: &str = "last_digest_sent_at";
+const LAST_HELD_DIGEST_ROWID_KEY: &str = "last_held_digest_rowid";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailStatus {
     Held,
@@ -30,6 +34,8 @@ impl MailStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeldItem {
+    #[serde(skip)]
+    pub(crate) digest_rowid: i64,
     pub held_id: String,
     pub event_id: String,
     pub sender_ref: String,
@@ -264,22 +270,24 @@ impl EmailStore {
     }
 
     pub async fn held_since_last_digest(&self, limit: i64) -> Result<Vec<HeldItem>> {
-        let since = self
-            .state_value("last_digest_at")
+        let after_rowid = self
+            .state_value(LAST_HELD_DIGEST_ROWID_KEY)
             .await?
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         let rows = sqlx::query(
             r#"
-            SELECT held_id, event_id, sender_ref, conversation_ref, thread_ref, message_ref,
+            SELECT rowid AS digest_rowid,
+                   held_id, event_id, sender_ref, conversation_ref, thread_ref, message_ref,
                    sender_address, sender_name, subject, snippet, received_at,
                    attachment_count, classification_reason
             FROM mail_items
-            WHERE status = 'held' AND created_at > ?
-            ORDER BY created_at ASC
+            WHERE status = 'held' AND rowid > ?
+            ORDER BY rowid ASC
             LIMIT ?
             "#,
         )
-        .bind(since)
+        .bind(after_rowid)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -287,6 +295,7 @@ impl EmailStore {
             .into_iter()
             .filter_map(|row| {
                 Some(HeldItem {
+                    digest_rowid: row.try_get("digest_rowid").ok()?,
                     held_id: row.try_get::<Option<String>, _>("held_id").ok()??,
                     event_id: row.try_get("event_id").ok()?,
                     sender_ref: row.try_get("sender_ref").ok()?,
@@ -307,7 +316,7 @@ impl EmailStore {
 
     pub async fn suppressed_count_since_last_digest(&self) -> Result<i64> {
         let since = self
-            .state_value("last_digest_at")
+            .state_value(LAST_DIGEST_AT_KEY)
             .await?
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         let row = sqlx::query(
@@ -319,13 +328,18 @@ impl EmailStore {
         Ok(row.try_get("count")?)
     }
 
-    pub async fn mark_digest_sent_now(&self) -> Result<()> {
-        self.set_state_value("last_digest_at", &Utc::now().to_rfc3339())
-            .await
+    pub async fn mark_digest_sent(&self, held: &[HeldItem]) -> Result<()> {
+        if let Some(item) = held.last() {
+            self.set_state_value(LAST_HELD_DIGEST_ROWID_KEY, &item.digest_rowid.to_string())
+                .await?;
+        }
+        self.set_state_value(LAST_DIGEST_AT_KEY, &Utc::now().to_rfc3339())
+            .await?;
+        Ok(())
     }
 
     pub async fn due_for_digest(&self, interval: std::time::Duration) -> Result<bool> {
-        let Some(last) = self.state_value("last_digest_sent_at").await? else {
+        let Some(last) = self.state_value(LAST_DIGEST_ATTEMPT_AT_KEY).await? else {
             return Ok(true);
         };
         let Ok(last) = DateTime::parse_from_rfc3339(&last) else {
@@ -336,7 +350,7 @@ impl EmailStore {
     }
 
     pub async fn mark_digest_attempt_now(&self) -> Result<()> {
-        self.set_state_value("last_digest_sent_at", &Utc::now().to_rfc3339())
+        self.set_state_value(LAST_DIGEST_ATTEMPT_AT_KEY, &Utc::now().to_rfc3339())
             .await
     }
 
@@ -517,4 +531,65 @@ impl EmailStore {
 
 pub fn held_id_for(event_id: &str) -> String {
     format!("hld_{}", crate::protocol::short_hash(event_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{
+        mailbox::CandidateHeader,
+        mime::parse_headers_for_test,
+        protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
+    };
+
+    #[tokio::test]
+    async fn held_digest_cursor_keeps_batches_after_the_limit() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        for index in 1..=25 {
+            let candidate = candidate(index);
+            store
+                .record_held(
+                    &candidate,
+                    &held_id_for(&candidate.event_id),
+                    "not downloaded",
+                    "approval_required",
+                )
+                .await
+                .expect("record held");
+        }
+
+        let first = store.held_since_last_digest(20).await.expect("first batch");
+        assert_eq!(first.len(), 20);
+        store.mark_digest_sent(&first).await.expect("mark first");
+
+        let second = store
+            .held_since_last_digest(20)
+            .await
+            .expect("second batch");
+        assert_eq!(second.len(), 5);
+        assert_eq!(second[0].event_id, "email:imap:assistant:7:21");
+    }
+
+    fn candidate(index: u32) -> CandidateHeader {
+        let message_id = format!("m{index}@example.com");
+        let headers = format!(
+            "From: Alice <alice@example.com>\r\nSubject: Held {index}\r\nMessage-ID: <{message_id}>\r\n\r\n"
+        );
+        let facts = parse_headers_for_test(&headers);
+        CandidateHeader {
+            uid_validity: 7,
+            uid: index,
+            event_id: format!("email:imap:assistant:7:{index}"),
+            sender_ref: sender_ref(&facts.sender.address),
+            conversation_ref: conversation_ref("assistant"),
+            thread_ref: thread_ref(&message_id),
+            message_ref: message_ref(&message_id),
+            attachment_count: 0,
+            rfc822_size: Some(headers.len() as u32),
+            facts,
+        }
+    }
 }
