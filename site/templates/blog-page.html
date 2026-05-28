@@ -16,7 +16,25 @@
       {% endif %}
     </div>
     <h1>{{ page.title }}</h1>
+    {% if page.extra.standfirst %}
+    <p class="article-standfirst">{{ page.extra.standfirst | safe }}</p>
+    {% endif %}
   </header>
+  {% if page.extra.hero_image %}
+  <figure class="article-media article-hero-media">
+    <a href="{{ page.extra.hero_image }}" target="_blank" rel="noopener noreferrer">
+      <img
+        src="{{ page.extra.hero_image }}"
+        alt="{% if page.extra.hero_alt %}{{ page.extra.hero_alt }}{% else %}{{ page.title }}{% endif %}"
+        {% if page.extra.hero_width %}width="{{ page.extra.hero_width }}"{% endif %}
+        {% if page.extra.hero_height %}height="{{ page.extra.hero_height }}"{% endif %}
+      >
+    </a>
+    {% if page.extra.hero_caption %}
+    <figcaption>{{ page.extra.hero_caption | safe }}</figcaption>
+    {% endif %}
+  </figure>
+  {% endif %}
   <div class="article-body">
     {{ page.content | safe }}
   </div>
