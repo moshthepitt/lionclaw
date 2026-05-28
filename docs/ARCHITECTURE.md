@@ -371,8 +371,8 @@ the owning channel skill directory.
 First-party channel snapshots can carry host-side worker assets and embedded
 runtime-facing facets, but those details remain skill-owned. The kernel contract
 is only that channel workers authenticate to LionClaw and use the channel
-authorize, inbound, attachment, outbox, health, and grant-revoke APIs without
-importing the `lionclaw` crate.
+authorize, inbound, attachment, outbox, health, and grant approve/revoke/consume
+APIs without importing the `lionclaw` crate.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
@@ -471,6 +471,7 @@ with the CLI.
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/approve`
 - `POST /v0/channels/grants/revoke`
+- `POST /v0/channels/grants/consume`
 - `POST /v0/channels/authorize`
 - `POST /v0/channels/inbound`
 - `POST /v0/channels/attachments/stage` (multipart worker upload)
@@ -594,16 +595,21 @@ workers must treat them as exact data, not executable instructions.
    oversized identities or timestamps more than two minutes in the future are
    rejected; stored far-future reports are excluded from latest-health selection.
 9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
-10. Direct grant approval, pairing invite/claim, pairing approve/block, and
-   grant revoke endpoints manage channel trust. Direct approval creates a
-   durable grant for already-known normalized channel refs without creating a
-   pairing row, and closes exact matching pending operator approvals in the
+10. Direct grant approval, pairing invite/claim, pairing approve/block, grant
+   revoke, and grant consume endpoints manage channel trust. Direct approval
+   creates a durable grant for already-known normalized channel refs without
+   creating a pairing row, and closes exact matching pending operator approvals in the
    same transaction. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
    pairing requests. Blocking a token invite by `pairing_id` marks that invite
    blocked without creating a sender grant. Blocks are enforced from the
    most-specific scope back to the direct sender.
+   Grant consume is worker-facing cleanup for approved labeled grants that have
+   already produced their intended terminal effect. It requires the exact
+   `grant_id` and expected label, deletes only that approved grant, audits
+   `channel.grant.consumed`, and does not leave a revoked scope. Operator
+   denial remains `revoke` or `block`.
 
 Attachment files are stored under LionClaw runtime state at
 `runtime/channels/sha256-<channel-id-digest>/attachments/sha256-<event-id-digest>/sha256-<attachment-id-digest>/`.

@@ -14,19 +14,19 @@ use lionclaw::{
         ChannelActorAuthorizeRequest, ChannelAttachmentDescriptor,
         ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
         ChannelAttachmentMissingReport, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
-        ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
-        ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
-        ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome,
-        ChannelInboundRequest, ChannelOperatorActor, ChannelOutboxDeliveryStatusDto,
-        ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-        ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
-        ChannelPairingStatus, ChannelRoutingProfile, ChannelSessionBinding,
-        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
-        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionRequest,
-        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
-        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
-        TrustTier,
+        ChannelGrantApproveRequest, ChannelGrantConsumeRequest, ChannelGrantConsumeResponse,
+        ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantView, ChannelHealthCheck,
+        ChannelHealthReportRequest, ChannelHealthReportResponse, ChannelHealthStatus,
+        ChannelInboundOutcome, ChannelInboundRequest, ChannelOperatorActor,
+        ChannelOutboxDeliveryStatusDto, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
+        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
+        ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
+        ChannelSessionBinding, ChannelStreamAckRequest, ChannelStreamEventView,
+        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse,
+        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -2420,6 +2420,104 @@ async fn channel_direct_grant_approval_refuses_blocked_and_revoked_exact_scopes(
 }
 
 #[tokio::test]
+async fn worker_can_consume_labeled_channel_grant_without_revoked_scope() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-consume-skill").await;
+    let kernel = env.kernel().await;
+
+    let mut release_req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some("email:addr:alice@example.com"),
+        None,
+        None,
+    );
+    release_req.label = Some("email-release:hld_123".to_string());
+    let release = kernel
+        .approve_channel_grant(release_req.clone())
+        .await
+        .expect("approve one-shot release grant")
+        .grant;
+
+    let consumed = kernel
+        .consume_channel_grant(ChannelGrantConsumeRequest {
+            channel_id: "email".to_string(),
+            grant_id: release.grant_id,
+            expected_label: "email-release:hld_123".to_string(),
+            reason: Some("email_one_shot_release_consumed".to_string()),
+        })
+        .await
+        .expect("consume release grant");
+    assert!(consumed.consumed);
+    assert_eq!(consumed.grant_id, release.grant_id);
+
+    let permanent = kernel
+        .approve_channel_grant(grant_approval_request(
+            "email",
+            ChannelRoutingProfile::Direct,
+            Some("email:addr:alice@example.com"),
+            None,
+            None,
+        ))
+        .await
+        .expect("same sender can be permanently approved after consumption")
+        .grant;
+    assert_ne!(permanent.grant_id, release.grant_id);
+    assert_eq!(permanent.status, "approved");
+
+    let release_grant_id = release.grant_id.to_string();
+    let audit = wait_for_audit_event_count(&kernel, "channel.grant.consumed", 1).await;
+    assert_eq!(
+        audit.events[0].details["grant_id"].as_str(),
+        Some(release_grant_id.as_str())
+    );
+    assert_eq!(
+        audit.events[0].details["label"].as_str(),
+        Some("email-release:hld_123")
+    );
+}
+
+#[tokio::test]
+async fn channel_grant_consume_requires_the_expected_label() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-consume-label-skill").await;
+    let kernel = env.kernel().await;
+
+    let mut release_req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some("email:addr:alice@example.com"),
+        None,
+        None,
+    );
+    release_req.label = Some("email-release:hld_123".to_string());
+    let release = kernel
+        .approve_channel_grant(release_req.clone())
+        .await
+        .expect("approve release grant")
+        .grant;
+
+    let err = kernel
+        .consume_channel_grant(ChannelGrantConsumeRequest {
+            channel_id: "email".to_string(),
+            grant_id: release.grant_id,
+            expected_label: "email-release:hld_other".to_string(),
+            reason: None,
+        })
+        .await
+        .expect_err("wrong label must not consume a grant");
+    assert!(matches!(err, KernelError::Conflict(message) if message == "grant_label_mismatch"));
+
+    let duplicate = kernel
+        .approve_channel_grant(release_req)
+        .await
+        .expect("grant still exists after failed consume")
+        .grant;
+    assert_eq!(duplicate.grant_id, release.grant_id);
+    assert_eq!(duplicate.label.as_deref(), Some("email-release:hld_123"));
+}
+
+#[tokio::test]
 async fn channel_direct_grant_approval_validates_scope_shapes() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "email", "direct-grant-validation-skill").await;
@@ -2561,6 +2659,60 @@ async fn worker_can_approve_channel_grant_over_http() {
     );
     assert_eq!(accepted.grant.status, "approved");
     assert_eq!(accepted.grant.label.as_deref(), Some("Alice"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn worker_can_consume_channel_grant_over_http() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "email", "direct-grant-consume-http-skill").await;
+    let kernel = env.kernel().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test api");
+    let bind_addr = listener.local_addr().expect("test api addr").to_string();
+    let app = build_router(
+        std::sync::Arc::new(kernel.clone()),
+        test_daemon_info(&env, bind_addr.clone()),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test api");
+    });
+
+    let mut req = grant_approval_request(
+        "email",
+        ChannelRoutingProfile::Direct,
+        Some("email:addr:alice@example.com"),
+        None,
+        None,
+    );
+    req.label = Some("email-release:hld_123".to_string());
+    let grant = kernel
+        .approve_channel_grant(req)
+        .await
+        .expect("approve grant before http consume")
+        .grant;
+
+    let consume = ChannelGrantConsumeRequest {
+        channel_id: "email".to_string(),
+        grant_id: grant.grant_id,
+        expected_label: "email-release:hld_123".to_string(),
+        reason: Some("email_one_shot_release_consumed".to_string()),
+    };
+    let response = reqwest::Client::new()
+        .post(format!("http://{bind_addr}/v0/channels/grants/consume"))
+        .json(&consume)
+        .send()
+        .await
+        .expect("consume grant over http");
+    let status = response.status();
+    let text = response.text().await.expect("read consume response");
+    assert!(status.is_success(), "{status}: {text}");
+    let consumed: ChannelGrantConsumeResponse =
+        serde_json::from_str(&text).expect("decode consume response");
+    assert_eq!(consumed.grant_id, grant.grant_id);
+    assert!(consumed.consumed);
 
     server.abort();
 }

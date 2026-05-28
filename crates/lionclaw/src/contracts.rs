@@ -1140,6 +1140,16 @@ pub struct ChannelGrantRevokeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelGrantConsumeRequest {
+    pub channel_id: String,
+    pub grant_id: Uuid,
+    pub expected_label: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelGrantView {
     pub grant_id: Uuid,
     pub channel_id: String,
@@ -1169,6 +1179,12 @@ pub struct ChannelGrantResponse {
 pub struct ChannelGrantRevokeResponse {
     pub grant_id: Uuid,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantConsumeResponse {
+    pub grant_id: Uuid,
+    pub consumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -67,7 +67,8 @@ Permanent approval is for an exact sender ref such as
 `email:addr:alice@example.com`; domain approval is not part of v1. One-shot
 release uses a direct sender grant labeled exactly `email-release:<held-id>`.
 The worker admits only the matching held item once, still requires the
-host-side sender-authentication policy to pass, and then revokes that grant.
+host-side sender-authentication policy to pass, and then consumes that exact
+labeled grant without leaving a revoked sender scope.
 The local operator creates permanent approval or one-shot release with
 `lionclaw channel pairing approve email --sender-ref ...`, optionally adding the
 one-shot label.

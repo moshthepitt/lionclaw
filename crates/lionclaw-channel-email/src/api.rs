@@ -298,32 +298,24 @@ impl LionClawApi {
         Ok(())
     }
 
-    pub async fn revoke_channel_grant(
+    pub async fn consume_channel_grant(
         &self,
         channel_id: &str,
         grant_id: &str,
+        expected_label: &str,
         reason: &str,
     ) -> Result<()> {
-        let response = self
-            .client
-            .post(self.url("/v0/channels/grants/revoke"))
-            .json(&serde_json::json!({
-                "channel_id": channel_id,
-                "grant_id": grant_id,
-                "reason": reason,
-            }))
-            .send()
-            .await
-            .context("POST /v0/channels/grants/revoke failed")?;
-        let (status, text) = response_text(response).await?;
-        if status == StatusCode::NOT_FOUND && text.contains("channel grant not found") {
-            return Ok(());
-        }
-        if !status.is_success() {
-            anyhow::bail!("HTTP {status}: {text}");
-        }
-        let _: Value = serde_json::from_str(&text)
-            .with_context(|| format!("failed to decode response body: {text}"))?;
+        let _: Value = self
+            .post_json(
+                "/v0/channels/grants/consume",
+                &serde_json::json!({
+                    "channel_id": channel_id,
+                    "grant_id": grant_id,
+                    "expected_label": expected_label,
+                    "reason": reason,
+                }),
+            )
+            .await?;
         Ok(())
     }
 

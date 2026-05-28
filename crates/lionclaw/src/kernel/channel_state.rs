@@ -1342,7 +1342,7 @@ impl ChannelStateStore {
         row.map(map_grant_row).transpose()
     }
 
-    async fn get_grant_in_tx(
+    pub(crate) async fn get_grant_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         grant_id: Uuid,
@@ -1357,6 +1357,23 @@ impl ChannelStateStore {
         .context("failed to query channel grant")?;
 
         row.map(map_grant_row).transpose()
+    }
+
+    pub(crate) async fn delete_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        grant_id: Uuid,
+    ) -> Result<bool> {
+        let changed =
+            sqlx::query("DELETE FROM channel_grants WHERE channel_id = ?1 AND grant_id = ?2")
+                .bind(channel_id)
+                .bind(grant_id.to_string())
+                .execute(&mut **tx)
+                .await
+                .context("failed to delete channel grant")?;
+
+        Ok(changed.rows_affected() > 0)
     }
 
     pub(crate) async fn get_grant_by_scope_in_tx(

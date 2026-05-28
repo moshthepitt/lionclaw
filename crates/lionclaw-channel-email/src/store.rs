@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
 };
 
 use crate::{
@@ -74,10 +74,20 @@ pub struct StoredReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingGrantRevocation {
+pub struct PendingGrantConsumption {
     pub grant_id: String,
     pub channel_id: String,
     pub held_id: String,
+    pub expected_label: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingGrantConsumptionInput<'a> {
+    pub grant_id: &'a str,
+    pub channel_id: &'a str,
+    pub held_id: &'a str,
+    pub expected_label: &'a str,
+    pub last_error: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -169,10 +179,11 @@ impl EmailStore {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS pending_grant_revocations (
+            CREATE TABLE IF NOT EXISTS pending_grant_consumptions (
                 grant_id TEXT PRIMARY KEY NOT NULL,
                 channel_id TEXT NOT NULL,
                 held_id TEXT NOT NULL,
+                expected_label TEXT NOT NULL,
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -311,13 +322,57 @@ impl EmailStore {
             MailStatus::Held,
             snippet,
             Some(reason),
+            None,
+        )
+        .await
+    }
+
+    pub async fn record_held_with_pending_grant_consumption(
+        &self,
+        candidate: &CandidateHeader,
+        held_id: &str,
+        snippet: &str,
+        reason: &str,
+        pending: Option<PendingGrantConsumptionInput<'_>>,
+    ) -> Result<()> {
+        self.upsert_mail(
+            candidate,
+            Some(held_id),
+            MailStatus::Held,
+            snippet,
+            Some(reason),
+            pending,
         )
         .await
     }
 
     pub async fn record_suppressed(&self, candidate: &CandidateHeader, reason: &str) -> Result<()> {
-        self.upsert_mail(candidate, None, MailStatus::Suppressed, "", Some(reason))
-            .await
+        self.upsert_mail(
+            candidate,
+            None,
+            MailStatus::Suppressed,
+            "",
+            Some(reason),
+            None,
+        )
+        .await
+    }
+
+    pub async fn record_suppressed_with_pending_grant_consumption(
+        &self,
+        candidate: &CandidateHeader,
+        reason: &str,
+        pending: Option<PendingGrantConsumptionInput<'_>>,
+    ) -> Result<()> {
+        self.upsert_mail(
+            candidate,
+            None,
+            MailStatus::Suppressed,
+            "",
+            Some(reason),
+            pending,
+        )
+        .await
     }
 
     pub async fn record_malformed_suppressed(
@@ -379,8 +434,25 @@ impl EmailStore {
     }
 
     pub async fn record_admitted(&self, candidate: &CandidateHeader, snippet: &str) -> Result<()> {
-        self.upsert_mail(candidate, None, MailStatus::Admitted, snippet, None)
+        self.upsert_mail(candidate, None, MailStatus::Admitted, snippet, None, None)
             .await
+    }
+
+    pub async fn record_admitted_with_pending_grant_consumption(
+        &self,
+        candidate: &CandidateHeader,
+        snippet: &str,
+        pending: Option<PendingGrantConsumptionInput<'_>>,
+    ) -> Result<()> {
+        self.upsert_mail(
+            candidate,
+            None,
+            MailStatus::Admitted,
+            snippet,
+            None,
+            pending,
+        )
+        .await
     }
 
     async fn upsert_mail(
@@ -390,10 +462,12 @@ impl EmailStore {
         status: MailStatus,
         snippet: &str,
         reason: Option<&str>,
+        pending: Option<PendingGrantConsumptionInput<'_>>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let received_at = candidate.facts.received_at.map(|value| value.to_rfc3339());
         let references_json = serde_json::to_string(&candidate.facts.references)?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             INSERT INTO mail_items (
@@ -444,8 +518,12 @@ impl EmailStore {
         .bind(references_json)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if let Some(pending) = pending {
+            insert_pending_grant_consumption(&mut tx, pending, &now).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -629,41 +707,37 @@ impl EmailStore {
         Ok(())
     }
 
-    pub async fn record_pending_grant_revocation(
+    pub async fn record_pending_grant_consumption(
         &self,
         grant_id: &str,
         channel_id: &str,
         held_id: &str,
+        expected_label: &str,
         last_error: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            INSERT INTO pending_grant_revocations (
-                grant_id, channel_id, held_id, last_error, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(grant_id) DO UPDATE SET
-                last_error=excluded.last_error,
-                updated_at=excluded.updated_at
-            "#,
+        let mut tx = self.pool.begin().await?;
+        insert_pending_grant_consumption(
+            &mut tx,
+            PendingGrantConsumptionInput {
+                grant_id,
+                channel_id,
+                held_id,
+                expected_label,
+                last_error,
+            },
+            &now,
         )
-        .bind(grant_id)
-        .bind(channel_id)
-        .bind(held_id)
-        .bind(last_error)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn pending_grant_revocations(&self) -> Result<Vec<PendingGrantRevocation>> {
+    pub async fn pending_grant_consumptions(&self) -> Result<Vec<PendingGrantConsumption>> {
         let rows = sqlx::query(
             r#"
-            SELECT grant_id, channel_id, held_id
-            FROM pending_grant_revocations
+            SELECT grant_id, channel_id, held_id, expected_label
+            FROM pending_grant_consumptions
             ORDER BY created_at ASC
             LIMIT 25
             "#,
@@ -673,17 +747,18 @@ impl EmailStore {
         Ok(rows
             .into_iter()
             .map(|row| {
-                Ok(PendingGrantRevocation {
+                Ok(PendingGrantConsumption {
                     grant_id: row.try_get("grant_id")?,
                     channel_id: row.try_get("channel_id")?,
                     held_id: row.try_get("held_id")?,
+                    expected_label: row.try_get("expected_label")?,
                 })
             })
             .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?)
     }
 
-    pub async fn clear_pending_grant_revocation(&self, grant_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM pending_grant_revocations WHERE grant_id = ?")
+    pub async fn clear_pending_grant_consumption(&self, grant_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_grant_consumptions WHERE grant_id = ?")
             .bind(grant_id)
             .execute(&self.pool)
             .await?;
@@ -715,6 +790,35 @@ impl EmailStore {
 
 pub fn held_id_for(event_id: &str) -> String {
     format!("hld_{}", crate::protocol::short_hash(event_id))
+}
+
+async fn insert_pending_grant_consumption(
+    tx: &mut Transaction<'_, Sqlite>,
+    pending: PendingGrantConsumptionInput<'_>,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO pending_grant_consumptions (
+            grant_id, channel_id, held_id, expected_label, last_error, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(grant_id) DO UPDATE SET
+            expected_label=excluded.expected_label,
+            last_error=excluded.last_error,
+            updated_at=excluded.updated_at
+        "#,
+    )
+    .bind(pending.grant_id)
+    .bind(pending.channel_id)
+    .bind(pending.held_id)
+    .bind(pending.expected_label)
+    .bind(pending.last_error)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn parse_mail_status(status: &str, event_id: &str) -> Result<MailStatus> {
