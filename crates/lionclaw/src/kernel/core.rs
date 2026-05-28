@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
@@ -6842,6 +6842,64 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_runtime_prelaunch_state_rejects_symlinked_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime-state");
+        let linked_root = temp_dir.path().join("linked-runtime-state");
+        fs::create_dir(&real_root).expect("real root");
+        fs::write(real_root.join(RUNTIME_TUI_STATE_MARKER), "clean\n").expect("write state");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![MountSpec {
+            source: linked_root,
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        assert!(
+            kernel
+                .attached_runtime_needs_prelaunch_reconcile(&plan)
+                .await,
+            "symlinked runtime roots should not be trusted as clean runtime TUI state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_runtime_prelaunch_state_rejects_symlinked_marker() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let outside_state = temp_dir.path().join("outside-state");
+        fs::create_dir(&runtime_state_root).expect("runtime root");
+        fs::write(&outside_state, "clean\n").expect("outside state");
+        std::os::unix::fs::symlink(
+            &outside_state,
+            runtime_state_root.join(RUNTIME_TUI_STATE_MARKER),
+        )
+        .expect("symlink state marker");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![MountSpec {
+            source: runtime_state_root,
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        assert!(
+            kernel
+                .attached_runtime_needs_prelaunch_reconcile(&plan)
+                .await,
+            "symlinked runtime TUI state markers should not be trusted as clean state"
+        );
+    }
+
     #[test]
     fn attached_runtime_transcript_export_timeout_is_capped() {
         let mut plan = test_execution_plan("codex");
@@ -7736,7 +7794,7 @@ mod tests {
         fs::write(&target_path, b"target").expect("write target");
         std::os::unix::fs::symlink(&target_path, &lock_path).expect("symlink lock path");
 
-        let err = match acquire_attached_runtime_launch_lock_blocking(&lock_path) {
+        let err = match acquire_attached_runtime_launch_lock_blocking(temp_dir.path()) {
             Ok(_) => panic!("symlinked lock path should be rejected"),
             Err(err) => err,
         };
@@ -7745,6 +7803,30 @@ mod tests {
             err,
             KernelError::Runtime(message) if message.contains("not a regular file")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_runtime_launch_lock_rejects_symlinked_runtime_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime-state");
+        let linked_root = temp_dir.path().join("linked-runtime-state");
+        fs::create_dir(&real_root).expect("real root");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+
+        let err = match acquire_attached_runtime_launch_lock_blocking(&linked_root) {
+            Ok(_) => panic!("symlinked runtime root should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Internal(message) if message.contains("failed to open runtime state root")
+        ));
+        assert!(
+            !real_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "runtime TUI lock must not be created through a symlinked runtime root"
+        );
     }
 
     #[tokio::test]
@@ -11816,29 +11898,10 @@ fn write_runtime_state_file_blocking(
     file_name: &str,
     contents: &[u8],
 ) -> Result<(), KernelError> {
-    use std::ffi::OsString;
-
-    use rustix::fs::{open, openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
 
     let target_name = runtime_state_file_name(file_name)?;
-    std::fs::create_dir_all(runtime_state_root).map_err(|err| {
-        internal(anyhow::anyhow!(
-            "failed to create runtime state root '{}': {err}",
-            runtime_state_root.display()
-        ))
-    })?;
-    let root = open(
-        runtime_state_root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|err| {
-        internal(anyhow::anyhow!(
-            "failed to open runtime state root '{}': {err}",
-            runtime_state_root.display()
-        ))
-    })?;
-    let root = std::fs::File::from(root);
+    let root = ensure_runtime_state_root_blocking(runtime_state_root)?;
 
     let temp_name = OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
     let temp = openat(
@@ -11899,6 +11962,107 @@ fn write_runtime_state_file_blocking(
     write_result
 }
 
+async fn read_runtime_state_file(
+    runtime_state_root: &Path,
+    file_name: &str,
+) -> Result<Option<String>, KernelError> {
+    let runtime_state_root = runtime_state_root.to_path_buf();
+    let file_name = file_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        read_runtime_state_file_blocking(&runtime_state_root, &file_name)
+    })
+    .await
+    .map_err(|err| internal(err.into()))?
+}
+
+fn read_runtime_state_file_blocking(
+    runtime_state_root: &Path,
+    file_name: &str,
+) -> Result<Option<String>, KernelError> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let target_name = runtime_state_file_name(file_name)?;
+    let Some(root) = open_existing_runtime_state_root_blocking(runtime_state_root)? else {
+        return Ok(None);
+    };
+    let file = match openat(
+        &root,
+        &target_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(err) => {
+            return Err(internal(anyhow::anyhow!(
+                "failed to open runtime state file '{}' in '{}': {err}",
+                file_name,
+                runtime_state_root.display()
+            )))
+        }
+    };
+    let mut file = std::fs::File::from(file);
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to read runtime state file '{}' in '{}': {err}",
+            file_name,
+            runtime_state_root.display()
+        ))
+    })?;
+    Ok(Some(contents))
+}
+
+fn ensure_runtime_state_root_blocking(
+    runtime_state_root: &Path,
+) -> Result<std::fs::File, KernelError> {
+    std::fs::create_dir_all(runtime_state_root).map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to create runtime state root '{}': {err}",
+            runtime_state_root.display()
+        ))
+    })?;
+    open_runtime_state_root_blocking(runtime_state_root)
+}
+
+fn open_runtime_state_root_blocking(
+    runtime_state_root: &Path,
+) -> Result<std::fs::File, KernelError> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let root = open(
+        runtime_state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to open runtime state root '{}': {err}",
+            runtime_state_root.display()
+        ))
+    })?;
+    Ok(std::fs::File::from(root))
+}
+
+fn open_existing_runtime_state_root_blocking(
+    runtime_state_root: &Path,
+) -> Result<Option<std::fs::File>, KernelError> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    match open(
+        runtime_state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(root) => Ok(Some(std::fs::File::from(root))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(err) => Err(internal(anyhow::anyhow!(
+            "failed to open runtime state root '{}': {err}",
+            runtime_state_root.display()
+        ))),
+    }
+}
+
 fn runtime_state_file_name(file_name: &str) -> Result<OsString, KernelError> {
     let path = Path::new(file_name);
     let mut components = path.components();
@@ -11931,39 +12095,33 @@ fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str)
 }
 
 fn acquire_attached_runtime_launch_lock_blocking(
-    lock_path: &Path,
+    runtime_state_root: &Path,
 ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
-    use rustix::fs::{open, Mode, OFlags};
+    use rustix::fs::{openat, Mode, OFlags};
 
-    match std::fs::symlink_metadata(lock_path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(KernelError::Runtime(format!(
-                    "runtime TUI lock path '{}' is not a regular file",
-                    lock_path.display()
-                )));
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(KernelError::Runtime(format!(
-                "failed to stat runtime TUI lock path '{}': {err}",
-                lock_path.display()
-            )));
-        }
-    }
-
-    let file = open(
-        lock_path,
+    let root = ensure_runtime_state_root_blocking(runtime_state_root)?;
+    let lock_name = runtime_state_file_name(RUNTIME_TUI_LOCK_FILE)?;
+    let lock_path = runtime_state_root.join(RUNTIME_TUI_LOCK_FILE);
+    let file = match openat(
+        &root,
+        &lock_name,
         OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
-    )
-    .map_err(|err| {
-        KernelError::Runtime(format!(
-            "failed to open runtime TUI lock path '{}': {err}",
-            lock_path.display()
-        ))
-    })?;
+    ) {
+        Ok(file) => file,
+        Err(Errno::LOOP) => {
+            return Err(KernelError::Runtime(format!(
+                "runtime TUI lock path '{}' is not a regular file",
+                lock_path.display()
+            )))
+        }
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to open runtime TUI lock path '{}': {err}",
+                lock_path.display()
+            )))
+        }
+    };
     let file = std::fs::File::from(file);
     let metadata = file.metadata().map_err(|err| {
         KernelError::Runtime(format!(
@@ -14312,10 +14470,6 @@ impl Kernel {
         }
     }
 
-    fn runtime_tui_state_path(plan: &EffectiveExecutionPlan) -> Option<PathBuf> {
-        Some(Self::runtime_state_root(plan)?.join(RUNTIME_TUI_STATE_MARKER))
-    }
-
     async fn acquire_attached_runtime_launch_lock(
         &self,
         plan: &EffectiveExecutionPlan,
@@ -14323,12 +14477,8 @@ impl Kernel {
         let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
             return Ok(None);
         };
-        tokio::fs::create_dir_all(&runtime_state_root)
-            .await
-            .map_err(|err| internal(err.into()))?;
-        let lock_path = runtime_state_root.join(RUNTIME_TUI_LOCK_FILE);
         tokio::task::spawn_blocking(move || {
-            acquire_attached_runtime_launch_lock_blocking(&lock_path)
+            acquire_attached_runtime_launch_lock_blocking(&runtime_state_root)
         })
         .await
         .map_err(|err| internal(err.into()))?
@@ -14339,27 +14489,27 @@ impl Kernel {
         &self,
         plan: &EffectiveExecutionPlan,
     ) -> bool {
-        let Some(path) = Self::runtime_tui_state_path(plan) else {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return false;
         };
-        match tokio::fs::read_to_string(&path).await {
-            Ok(contents) => match contents.trim() {
+        match read_runtime_state_file(runtime_state_root, RUNTIME_TUI_STATE_MARKER).await {
+            Ok(Some(contents)) => match contents.trim() {
                 RUNTIME_TUI_STATE_RUNNING => true,
                 RUNTIME_TUI_STATE_CLEAN => false,
                 other => {
                     warn!(
-                        path = %path.display(),
+                        path = %runtime_state_root.join(RUNTIME_TUI_STATE_MARKER).display(),
                         state = other,
                         "unknown runtime TUI state; reconciling before launch"
                     );
                     true
                 }
             },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Ok(None) => false,
             Err(err) => {
                 warn!(
                     ?err,
-                    path = %path.display(),
+                    path = %runtime_state_root.join(RUNTIME_TUI_STATE_MARKER).display(),
                     "failed to read runtime TUI state; reconciling before launch"
                 );
                 true
