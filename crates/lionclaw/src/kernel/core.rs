@@ -7676,6 +7676,26 @@ mod tests {
             .expect("finish second launch");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn attached_runtime_launch_lock_rejects_symlink_lock_path() {
+        let temp_dir = tempdir().expect("temp dir");
+        let lock_path = temp_dir.path().join(RUNTIME_TUI_LOCK_FILE);
+        let target_path = temp_dir.path().join("outside-lock-target");
+        fs::write(&target_path, b"target").expect("write target");
+        std::os::unix::fs::symlink(&target_path, &lock_path).expect("symlink lock path");
+
+        let err = match acquire_attached_runtime_launch_lock_blocking(&lock_path) {
+            Ok(_) => panic!("symlinked lock path should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Runtime(message) if message.contains("not a regular file")
+        ));
+    }
+
     #[tokio::test]
     async fn attached_runtime_exit_audit_records_signal_status() {
         let temp_dir = tempdir().expect("temp dir");
@@ -11744,6 +11764,8 @@ fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str)
 fn acquire_attached_runtime_launch_lock_blocking(
     lock_path: &Path,
 ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    use rustix::fs::{open, Mode, OFlags};
+
     match std::fs::symlink_metadata(lock_path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -11762,18 +11784,31 @@ fn acquire_attached_runtime_launch_lock_blocking(
         }
     }
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path)
-        .map_err(|err| {
-            KernelError::Runtime(format!(
-                "failed to open runtime TUI lock path '{}': {err}",
-                lock_path.display()
-            ))
-        })?;
+    let file = open(
+        lock_path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to open runtime TUI lock path '{}': {err}",
+            lock_path.display()
+        ))
+    })?;
+    let file = std::fs::File::from(file);
+    let metadata = file.metadata().map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to stat opened runtime TUI lock path '{}': {err}",
+            lock_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime TUI lock path '{}' is not a regular file",
+            lock_path.display()
+        )));
+    }
+
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(AttachedRuntimeLaunchLock { _file: file }),
         Err(err) if runtime_tui_lock_is_held(err) => Err(KernelError::Conflict(
