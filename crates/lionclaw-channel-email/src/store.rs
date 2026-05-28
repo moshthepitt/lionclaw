@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -84,10 +87,9 @@ pub struct EmailStore {
 
 impl EmailStore {
     pub async fn open(state_dir: &Path) -> Result<Self> {
-        tokio::fs::create_dir_all(state_dir)
-            .await
-            .with_context(|| format!("failed to create email state dir {}", state_dir.display()))?;
+        ensure_state_dir(state_dir)?;
         let db_path = state_dir.join("channel-email.sqlite3");
+        ensure_state_db_path(&db_path)?;
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
             .create_if_missing(true);
@@ -98,6 +100,8 @@ impl EmailStore {
             .with_context(|| format!("failed to open {}", db_path.display()))?;
         let store = Self { pool };
         store.migrate().await?;
+        ensure_state_db_path(&db_path)?;
+        set_private_file_permissions(&db_path)?;
         Ok(store)
     }
 
@@ -580,6 +584,95 @@ pub fn held_id_for(event_id: &str) -> String {
     format!("hld_{}", crate::protocol::short_hash(event_id))
 }
 
+fn ensure_state_dir(state_dir: &Path) -> Result<()> {
+    if state_dir.as_os_str().is_empty() {
+        bail!("email state dir is required");
+    }
+
+    let mut current = PathBuf::new();
+    for component in state_dir.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => bail!("email state dir must not contain '..'"),
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+            }
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!(
+                        "email state dir {} must not be a symlink",
+                        current.display()
+                    );
+                }
+                if !metadata.is_dir() {
+                    bail!("email state path {} is not a directory", current.display());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .with_context(|| format!("failed to create {}", current.display()))?;
+                set_private_dir_permissions(&current)?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", current.display()));
+            }
+        }
+    }
+    set_private_dir_permissions(state_dir)?;
+    Ok(())
+}
+
+fn ensure_state_db_path(db_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(db_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "email state database {} must not be a symlink",
+                    db_path.display()
+                );
+            }
+            if !metadata.is_file() {
+                bail!(
+                    "email state database {} is not a regular file",
+                    db_path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", db_path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHeader> {
     let event_id: String = row.try_get("event_id")?;
     let uid_validity = u32::try_from(row.try_get::<i64, _>("uid_validity")?)
@@ -632,6 +725,8 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -767,6 +862,44 @@ mod tests {
                 .map(|name| name == "rfc822_size")
                 .unwrap_or(false)
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_open_rejects_symlinked_state_dir_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let outside = temp_dir.path().join("outside-state");
+        fs::create_dir(&outside).expect("outside state");
+        let link = temp_dir.path().join("state-link");
+        symlink(&outside, &link).expect("state symlink");
+
+        let err = EmailStore::open(&link.join("email"))
+            .await
+            .expect_err("symlinked state ancestor should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(!outside.join("email/channel-email.sqlite3").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_open_rejects_symlinked_database_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let state_dir = temp_dir.path().join("state");
+        fs::create_dir(&state_dir).expect("state dir");
+        let outside_db = temp_dir.path().join("outside.sqlite3");
+        symlink(&outside_db, state_dir.join("channel-email.sqlite3")).expect("db symlink");
+
+        let err = EmailStore::open(&state_dir)
+            .await
+            .expect_err("symlinked state db should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(!outside_db.exists());
     }
 
     #[tokio::test]

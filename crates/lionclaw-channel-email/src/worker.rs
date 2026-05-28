@@ -1048,6 +1048,16 @@ async fn prepare_outbound_attachments(
                 anyhow!("failed to open attachment {}: {err}", path.display()),
             )
         })?;
+        let opened_metadata = file.metadata().await.map_err(|err| {
+            OutboundAttachmentError::new(
+                "attachment_unreadable",
+                anyhow!(
+                    "failed to inspect opened attachment {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        ensure_opened_same_regular_file(&path, &metadata, &opened_metadata)?;
         let mut content = Vec::new();
         file.take(remaining.saturating_add(1))
             .read_to_end(&mut content)
@@ -1084,6 +1094,33 @@ async fn prepare_outbound_attachments(
         });
     }
     Ok(prepared)
+}
+
+fn ensure_opened_same_regular_file(
+    path: &Path,
+    expected: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> std::result::Result<(), OutboundAttachmentError> {
+    if !opened.is_file() {
+        return Err(OutboundAttachmentError::new(
+            "attachment_unreadable",
+            anyhow!("attachment {} is not a regular file", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if expected.dev() != opened.dev() || expected.ino() != opened.ino() {
+            return Err(OutboundAttachmentError::new(
+                "attachment_unsafe_path",
+                anyhow!("attachment {} changed while being opened", path.display()),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn filename_from_path(path: &Path) -> Option<String> {
@@ -1313,6 +1350,48 @@ mod tests {
 
         assert_eq!(err.code, "message_too_large");
         assert!(err.source.to_string().contains("EMAIL_MAX_MESSAGE_BYTES"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_outbound_attachment_is_rejected_before_reading() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let target = temp_dir.path().join("target.bin");
+        std::fs::write(&target, "secret").expect("write target");
+        let link = temp_dir.path().join("link.bin");
+        symlink(&target, &link).expect("attachment symlink");
+
+        let attachments = vec![ChannelOutboxAttachment {
+            attachment_id: "att-1".to_string(),
+            path: link.display().to_string(),
+            filename: Some("link.bin".to_string()),
+            mime_type: Some("application/octet-stream".to_string()),
+        }];
+
+        let err = prepare_outbound_attachments(&attachments, DEFAULT_MAX_MESSAGE_BYTES, 0)
+            .await
+            .expect_err("symlinked attachment should fail before read");
+
+        assert_eq!(err.code, "attachment_unsafe_path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_outbound_attachment_path_is_rejected_after_opening() {
+        let temp_dir = tempdir().expect("temp dir");
+        let expected_path = temp_dir.path().join("expected.bin");
+        let opened_path = temp_dir.path().join("opened.bin");
+        std::fs::write(&expected_path, "expected").expect("write expected");
+        std::fs::write(&opened_path, "opened").expect("write opened");
+        let expected = std::fs::symlink_metadata(&expected_path).expect("expected metadata");
+        let opened = std::fs::metadata(&opened_path).expect("opened metadata");
+
+        let err = ensure_opened_same_regular_file(&expected_path, &expected, &opened)
+            .expect_err("changed attachment path should fail");
+
+        assert_eq!(err.code, "attachment_unsafe_path");
     }
 
     #[tokio::test]
