@@ -9,7 +9,10 @@ use sqlx::{
     Row, SqlitePool,
 };
 
-use crate::mailbox::CandidateHeader;
+use crate::{
+    mailbox::CandidateHeader,
+    mime::{EmailAddress, HeaderFacts},
+};
 
 const LAST_DIGEST_AT_KEY: &str = "last_digest_at";
 const LAST_DIGEST_ATTEMPT_AT_KEY: &str = "last_digest_sent_at";
@@ -186,6 +189,24 @@ impl EmailStore {
             "admitted" => Some(MailStatus::Admitted),
             other => bail!("unknown email mail status '{other}' for event {event_id}"),
         })
+    }
+
+    pub async fn held_candidates(&self, limit: i64) -> Result<Vec<CandidateHeader>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT event_id, uid_validity, uid, sender_ref, sender_address, sender_name,
+                   conversation_ref, thread_ref, message_ref, subject, received_at,
+                   attachment_count, provider_message_id, in_reply_to, references_json
+            FROM mail_items
+            WHERE status = 'held'
+            ORDER BY updated_at ASC, event_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(held_candidate_from_row).collect()
     }
 
     pub async fn record_held(
@@ -535,6 +556,50 @@ impl EmailStore {
 
 pub fn held_id_for(event_id: &str) -> String {
     format!("hld_{}", crate::protocol::short_hash(event_id))
+}
+
+fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHeader> {
+    let event_id: String = row.try_get("event_id")?;
+    let uid_validity = u32::try_from(row.try_get::<i64, _>("uid_validity")?)
+        .with_context(|| format!("held mail {event_id} has invalid uid_validity"))?;
+    let uid = u32::try_from(row.try_get::<i64, _>("uid")?)
+        .with_context(|| format!("held mail {event_id} has invalid uid"))?;
+    let received_at: Option<String> = row.try_get("received_at")?;
+    let received_at = received_at
+        .map(|value| -> Result<DateTime<Utc>> {
+            Ok(DateTime::parse_from_rfc3339(&value)
+                .with_context(|| format!("held mail {event_id} has invalid received_at"))?
+                .with_timezone(&Utc))
+        })
+        .transpose()?;
+    let references_json: String = row.try_get("references_json")?;
+    let references = serde_json::from_str(&references_json)
+        .with_context(|| format!("held mail {event_id} has invalid references"))?;
+    Ok(CandidateHeader {
+        uid_validity,
+        uid,
+        event_id,
+        sender_ref: row.try_get("sender_ref")?,
+        conversation_ref: row.try_get("conversation_ref")?,
+        thread_ref: row.try_get("thread_ref")?,
+        message_ref: row.try_get("message_ref")?,
+        attachment_count: usize::try_from(row.try_get::<i64, _>("attachment_count")?)
+            .context("held mail attachment_count is invalid")?,
+        rfc822_size: None,
+        facts: HeaderFacts {
+            sender: EmailAddress {
+                address: row.try_get("sender_address")?,
+                display_name: row.try_get("sender_name")?,
+            },
+            to: Vec::new(),
+            subject: row.try_get("subject")?,
+            message_id: row.try_get("provider_message_id")?,
+            in_reply_to: row.try_get("in_reply_to")?,
+            references,
+            received_at,
+            raw_headers: Vec::new(),
+        },
+    })
 }
 
 #[cfg(test)]
