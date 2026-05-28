@@ -28,7 +28,8 @@ use crate::{
     },
     protocol::{
         conversation_ref, generated_message_id, held_body_not_downloaded_text, message_ref,
-        non_empty_text, short_hash, CHANNEL_ID, INBOUND_SESSION_BINDING, INBOUND_TRIGGER,
+        non_empty_text, sanitize_header_text, short_hash, CHANNEL_ID, INBOUND_SESSION_BINDING,
+        INBOUND_TRIGGER,
     },
     store::{held_id_for, EmailStore, MailStatus, ThreadContext},
 };
@@ -869,8 +870,9 @@ async fn prepare_outbound_attachments(
         prepared.push(OutboundAttachment {
             filename: attachment
                 .filename
-                .clone()
-                .or_else(|| filename_from_path(&path))
+                .as_deref()
+                .and_then(sanitize_header_text)
+                .or_else(|| filename_from_path(&path).and_then(|name| sanitize_header_text(&name)))
                 .unwrap_or_else(|| attachment.attachment_id.clone()),
             mime_type: attachment
                 .mime_type
@@ -1046,6 +1048,26 @@ mod tests {
     fn reply_subject_keeps_existing_re_prefix() {
         assert_eq!(reply_subject("Build failed"), "Re: Build failed");
         assert_eq!(reply_subject("Re: Build failed"), "Re: Build failed");
+    }
+
+    #[tokio::test]
+    async fn outbound_attachment_filename_is_line_safe() {
+        let temp_dir = tempdir().expect("temp dir");
+        let path = temp_dir.path().join("artifact.txt");
+        std::fs::write(&path, "hello").expect("write attachment");
+
+        let attachments = vec![ChannelOutboxAttachment {
+            attachment_id: "att-1".to_string(),
+            path: path.display().to_string(),
+            filename: Some("report\r\nInjected: yes.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        }];
+
+        let prepared = prepare_outbound_attachments(&attachments)
+            .await
+            .expect("prepare attachments");
+
+        assert_eq!(prepared[0].filename, "report Injected: yes.txt");
     }
 
     #[test]

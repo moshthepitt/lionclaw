@@ -105,13 +105,14 @@ pub fn held_body_not_downloaded_text() -> &'static str {
     "Body not downloaded because the sender is not approved."
 }
 
+pub fn sanitize_header_text(raw: &str) -> Option<String> {
+    let value = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!value.is_empty()).then_some(value)
+}
+
 pub fn sanitize_subject(raw: Option<&str>) -> String {
-    let subject = raw.unwrap_or("(no subject)").trim();
-    if subject.is_empty() {
-        "(no subject)".to_string()
-    } else {
-        subject.replace(['\r', '\n'], " ")
-    }
+    raw.and_then(sanitize_header_text)
+        .unwrap_or_else(|| "(no subject)".to_string())
 }
 
 #[cfg(test)]
@@ -127,6 +128,15 @@ mod tests {
         assert!(normalize_address("no-at").is_none());
         assert!(normalize_address("Alice <alice@example.com>").is_none());
         assert!(normalize_address("alice@bad domain").is_none());
+    }
+
+    #[test]
+    fn sanitizes_header_text_to_one_line() {
+        assert_eq!(
+            sanitize_header_text(" Alice\r\n  Build\tfailed ").as_deref(),
+            Some("Alice Build failed")
+        );
+        assert_eq!(sanitize_subject(Some("\r\n\t")), "(no subject)");
     }
 
     #[test]
