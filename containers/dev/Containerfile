@@ -10,8 +10,9 @@ RUN rustup component add \
 
 FROM ${RUNTIME_IMAGE}
 
-# Dev inherits Codex from the runtime image; assert the expected runtime pin.
+# Dev inherits runtime CLIs from the runtime image; assert the expected pins.
 ARG CODEX_VERSION=0.134.0
+ARG OPENCODE_VERSION=1.4.6
 
 USER root
 
@@ -67,9 +68,11 @@ USER lionclaw
 WORKDIR /workspace
 
 RUN rustc --version \
-    && npm ls -g @openai/codex --depth=0 --json \
-        | jq -e --arg version "${CODEX_VERSION}" \
-            '.dependencies["@openai/codex"].version == $version' \
+    && npm ls -g @openai/codex opencode-ai --depth=0 --json \
+        | jq -e \
+            --arg codex_version "${CODEX_VERSION}" \
+            --arg opencode_version "${OPENCODE_VERSION}" \
+            '.dependencies["@openai/codex"].version == $codex_version and .dependencies["opencode-ai"].version == $opencode_version' \
             >/dev/null \
     && cargo --version \
     && cargo fmt --version \
