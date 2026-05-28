@@ -558,9 +558,12 @@ within the worker's configured message-size cap. Unknown senders are held with
 metadata only, automated/bulk/list mail is suppressed locally, oversized mail is
 suppressed without runtime work, and admitted messages are posted through the
 existing channel inbound and attachment endpoints with first-class `thread_ref`
-and `reply_to_ref` fields. The channel also publishes a runtime-facing Agent
-Skill at `runtime/email/`, so runtimes learn how to handle email turns without
-receiving the host-side channel package or mailbox credentials.
+and `reply_to_ref` fields. Held-message UID references are valid only while the
+mailbox `UIDVALIDITY` value is unchanged; stale held entries are suppressed
+instead of fetching or marking a different provider message. The channel also
+publishes a runtime-facing Agent Skill at `runtime/email/`, so runtimes learn
+how to handle email turns without receiving the host-side channel package or
+mailbox credentials.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill

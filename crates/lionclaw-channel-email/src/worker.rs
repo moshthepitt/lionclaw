@@ -19,8 +19,8 @@ use crate::{
     classifier::{classify_headers, MailClassification},
     config::{validate_max_message_bytes, WorkerConfig},
     mailbox::{
-        attachment_provider_ref, CandidateHeader, MailboxEngine, MailboxFactory,
-        OutboundAttachment, OutboundEmail,
+        attachment_provider_ref, is_stale_mailbox_candidate, CandidateHeader, MailboxEngine,
+        MailboxFactory, OutboundAttachment, OutboundEmail,
     },
     mime::{
         attachment_summary, parse_full_message, require_nonempty_body, ParsedAttachment,
@@ -36,6 +36,7 @@ use crate::{
 
 const ATTACHMENT_KIND: &str = "document";
 const DEFAULT_DIGEST_LIMIT: i64 = 20;
+const STALE_MAILBOX_UID_REASON: &str = "stale_mailbox_uid";
 
 #[derive(Debug)]
 pub struct EmailWorker<F>
@@ -238,14 +239,7 @@ where
                         authorization.reason_code.as_str(),
                     )
                     .await?;
-                if let Err(err) = mailbox.record_seen_or_processed(candidate).await {
-                    warn!(
-                        event_id = %candidate.event_id,
-                        sender_ref = %candidate.sender_ref,
-                        error = %err,
-                        "failed to mark held email candidate processed"
-                    );
-                }
+                mark_held_candidate_processed(store, mailbox, candidate).await?;
             }
             return Ok(());
         }
@@ -270,10 +264,22 @@ where
             .await?;
             return Ok(());
         }
-        let fetched = mailbox
-            .fetch_full_message_after_authorize(candidate)
-            .await
-            .context("failed to fetch authorized email body")?;
+        let fetched = match mailbox.fetch_full_message_after_authorize(candidate).await {
+            Ok(fetched) => fetched,
+            Err(err) if is_stale_mailbox_candidate(&err) => {
+                self.suppress_and_revoke_release_grant(
+                    store,
+                    mailbox,
+                    candidate,
+                    STALE_MAILBOX_UID_REASON,
+                    consumed_release_grant_id.as_deref(),
+                    held_id.as_str(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(err) => return Err(err.context("failed to fetch authorized email body")),
+        };
         if fetched.raw.len() > self.config.mailbox.max_message_bytes {
             self.suppress_and_revoke_release_grant(
                 store,
@@ -355,6 +361,7 @@ where
                 store
                     .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
                     .await?;
+                mark_held_candidate_processed(store, mailbox, candidate).await?;
                 self.revoke_consumed_one_shot_release_grant_if_needed(
                     store,
                     consumed_release_grant_id.as_deref(),
@@ -367,7 +374,18 @@ where
         }
 
         store.record_admitted(candidate, &parsed.snippet).await?;
-        mailbox.record_seen_or_processed(candidate).await?;
+        if let Err(err) = mailbox.record_seen_or_processed(candidate).await {
+            if is_stale_mailbox_candidate(&err) {
+                warn!(
+                    event_id = %candidate.event_id,
+                    sender_ref = %candidate.sender_ref,
+                    error = %err,
+                    "admitted email candidate became stale before it could be marked processed"
+                );
+            } else {
+                return Err(err);
+            }
+        }
         self.revoke_consumed_one_shot_release_grant_if_needed(
             store,
             consumed_release_grant_id.as_deref(),
@@ -839,7 +857,49 @@ async fn suppress_candidate(
     reason: &str,
 ) -> Result<()> {
     store.record_suppressed(candidate, reason).await?;
-    mailbox.record_seen_or_processed(candidate).await
+    match mailbox.record_seen_or_processed(candidate).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_stale_mailbox_candidate(&err) => {
+            warn!(
+                event_id = %candidate.event_id,
+                sender_ref = %candidate.sender_ref,
+                error = %err,
+                "suppressed email candidate became stale before it could be marked processed"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn mark_held_candidate_processed(
+    store: &EmailStore,
+    mailbox: &mut dyn MailboxEngine,
+    candidate: &CandidateHeader,
+) -> Result<()> {
+    match mailbox.record_seen_or_processed(candidate).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_stale_mailbox_candidate(&err) => {
+            warn!(
+                event_id = %candidate.event_id,
+                sender_ref = %candidate.sender_ref,
+                error = %err,
+                "held email candidate became stale; suppressing held record"
+            );
+            store
+                .record_suppressed(candidate, STALE_MAILBOX_UID_REASON)
+                .await
+        }
+        Err(err) => {
+            warn!(
+                event_id = %candidate.event_id,
+                sender_ref = %candidate.sender_ref,
+                error = %err,
+                "failed to mark held email candidate processed"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn candidate_message_size_exceeds_limit(
@@ -1115,7 +1175,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{DigestConfig, ImapTlsMode, MailboxConfig, DEFAULT_MAX_MESSAGE_BYTES},
-        mailbox::{FetchedMessage, MailboxFactory},
+        mailbox::{FetchedMessage, MailboxFactory, StaleMailboxCandidate},
         mime::parse_headers_for_test,
         protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
     };
@@ -1428,6 +1488,77 @@ mod tests {
                 .await
                 .expect("status"),
             Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_held_uidvalidity_is_suppressed_without_fetching_or_marking_seen() {
+        let fixture = EmailFixture::new(false).await;
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        let candidate = candidate();
+        store
+            .record_held(
+                &candidate,
+                &held_id_for(&candidate.event_id),
+                held_body_not_downloaded_text(),
+                "approval_required",
+            )
+            .await
+            .expect("record held");
+        fixture.mailbox.set_candidates(Vec::new());
+        fixture.mailbox.set_stale_uid_validity(true);
+
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 0);
+        assert_eq!(
+            store
+                .mail_status(&candidate.event_id)
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_released_uidvalidity_is_suppressed_and_revokes_release_grant() {
+        let fixture = EmailFixture::new(false).await;
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        let candidate = candidate();
+        let held_id = held_id_for(&candidate.event_id);
+        store
+            .record_held(
+                &candidate,
+                &held_id,
+                held_body_not_downloaded_text(),
+                "approval_required",
+            )
+            .await
+            .expect("record held");
+        fixture.mailbox.set_candidates(Vec::new());
+        fixture.mailbox.set_stale_uid_validity(true);
+        fixture.api.set_one_shot_release_authorized(&held_id);
+
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        assert_eq!(
+            store
+                .mail_status(&candidate.event_id)
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+        let revoked = fixture.api.revoked_grants.lock().unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(
+            revoked[0]["grant_id"],
+            "00000000-0000-0000-0000-000000000086"
         );
     }
 
@@ -1776,6 +1907,7 @@ mod tests {
                     candidate,
                     override_candidates: Mutex::new(None),
                     raw,
+                    stale_uid_validity: AtomicBool::new(false),
                     full_fetches: AtomicUsize::new(0),
                     seen: AtomicUsize::new(0),
                     sent: Mutex::new(Vec::new()),
@@ -1795,6 +1927,10 @@ mod tests {
             *self.state.override_candidates.lock().unwrap() = Some(candidates);
         }
 
+        fn set_stale_uid_validity(&self, stale: bool) {
+            self.state.stale_uid_validity.store(stale, Ordering::SeqCst);
+        }
+
         fn sent(&self) -> Vec<OutboundEmail> {
             self.state.sent.lock().unwrap().clone()
         }
@@ -1804,6 +1940,7 @@ mod tests {
         candidate: CandidateHeader,
         override_candidates: Mutex<Option<Vec<CandidateHeader>>>,
         raw: Vec<u8>,
+        stale_uid_validity: AtomicBool,
         full_fetches: AtomicUsize,
         seen: AtomicUsize,
         sent: Mutex<Vec<OutboundEmail>>,
@@ -1835,15 +1972,21 @@ mod tests {
 
         async fn fetch_full_message_after_authorize(
             &mut self,
-            _candidate: &CandidateHeader,
+            candidate: &CandidateHeader,
         ) -> Result<FetchedMessage> {
+            if self.state.stale_uid_validity.load(Ordering::SeqCst) {
+                return Err(stale_uid_validity_error(candidate));
+            }
             self.state.full_fetches.fetch_add(1, Ordering::SeqCst);
             Ok(FetchedMessage {
                 raw: self.state.raw.clone(),
             })
         }
 
-        async fn record_seen_or_processed(&mut self, _candidate: &CandidateHeader) -> Result<()> {
+        async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()> {
+            if self.state.stale_uid_validity.load(Ordering::SeqCst) {
+                return Err(stale_uid_validity_error(candidate));
+            }
             self.state.seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1892,6 +2035,14 @@ mod tests {
         let mut candidate = candidate();
         candidate.rfc822_size = rfc822_size;
         candidate
+    }
+
+    fn stale_uid_validity_error(candidate: &CandidateHeader) -> anyhow::Error {
+        StaleMailboxCandidate {
+            expected_uid_validity: candidate.uid_validity,
+            actual_uid_validity: candidate.uid_validity + 1,
+        }
+        .into()
     }
 
     fn full_message() -> Vec<u8> {
