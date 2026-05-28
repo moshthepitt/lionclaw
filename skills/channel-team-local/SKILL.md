@@ -11,3 +11,6 @@ same installed channel snapshot carries the worker and the runtime-facing
 `runtime/team-local/` skill. The worker polls outbox frequently for low-latency
 local delivery, but reports health at startup and then at most once per minute
 while running.
+
+Detailed architecture, setup, QA, and packaged asset notes for this channel live
+in `README.md` in this skill directory.

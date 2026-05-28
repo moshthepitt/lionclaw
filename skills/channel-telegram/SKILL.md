@@ -7,6 +7,9 @@ description: Run and operate a Telegram channel worker for LionClaw using the ke
 
 Use this skill when the user wants Telegram as a LionClaw channel.
 
+Manual QA and Telegram-specific acceptance notes live in `README.md` in this
+skill directory.
+
 What you run:
 
 1. start LionClaw for background work,

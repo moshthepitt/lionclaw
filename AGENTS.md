@@ -9,7 +9,6 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Project overview: `README.md`
 - architecture and contracts: `docs/ARCHITECTURE.md`
 - manual acceptance: `docs/MANUAL_QA.md`
-- release process: `docs/RELEASE.md`
 - developer/CI smoke helpers: `scripts/README.md`
 
 ## Working Rules

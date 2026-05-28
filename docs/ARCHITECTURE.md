@@ -10,7 +10,7 @@ runtime configuration, confinement, policy, and audit.
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
 path is designed for Linux/macOS-style Unix environments. When attached to a
 terminal, `run` opens the project operator console; `run --plain` and
-non-terminal use keep the command on the line-oriented interactive path;
+non-terminal invocations use the line-oriented interactive path;
 `run --runtime-tui` attaches the selected runtime's native terminal UI inside
 the same LionClaw boundary. Managed background paths, including
 `lionclaw up` and channel auto-start, currently use the systemd user manager;
@@ -76,8 +76,8 @@ Instead, LionClaw constrains the runtime launch:
 ### Skill-Owned Edges
 
 Skills are installable packages of instructions, channel workers, and
-integration logic. Channels are skills. Telegram and future transports stay
-outside the trusted Rust core and integrate through kernel APIs.
+integration logic. Channels are skills. Provider transports stay outside the
+trusted Rust core and integrate through kernel APIs.
 
 Skill text can influence prompt context. It cannot grant permissions.
 
@@ -484,8 +484,8 @@ through `LIONCLAW_PROJECT_INSTANCE`. Neighbor entries contain one of:
   "name": "reviewer",
   "channel_send": {
     "status": "configured",
-    "channel_id": "team-local",
-    "conversation_ref": "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f",
+    "channel_id": "example-channel",
+    "conversation_ref": "provider:conversation:123",
     "thread_ref": null
   }
 }
@@ -503,13 +503,13 @@ new contact marker clears any older preferred marker in the same instance:
 
 ```toml
 [[channels]]
-id = "team-local"
-skill = "team-local"
+id = "example-channel"
+skill = "example-skill"
 launch_mode = "background"
 worker = "scripts/worker"
 
 [channels.contact]
-conversation_ref = "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f"
+conversation_ref = "provider:conversation:123"
 # thread_ref is omitted when absent; TOML has no null value.
 ```
 
@@ -517,7 +517,7 @@ Channel metadata can provide a default contact template for `--contact`:
 
 ```toml
 [contact]
-conversation_ref_template = "member:{instance}"
+conversation_ref_template = "provider:member:{instance}"
 ```
 
 Only the `{instance}` variable is supported, and default templates must include
@@ -526,74 +526,22 @@ routes; `--thread-ref` stays optional. `--contact` requires a project instance
 target because direct homes do not have a stable project instance identity for
 template rendering or neighbor projection.
 
-## Bundled Channel Workers
-
-First-party channels are still skills. Their installed snapshots are
-self-contained: `scripts/worker` execs the compiled worker binary from inside
-the skill directory, and install plumbing copies that binary into the snapshot
-before computing the installed skill hash. The worker crates are separate Rust
-workspace members and do not depend on the `lionclaw` crate.
-
-Bundled channel worker binaries:
-
-- `channel-email` uses `bin/lionclaw-channel-email`.
-- `channel-team-local` uses `runtime/team-local/bin/lionclaw-channel-team-local`.
-
-The same bundled team-local binary also backs the runtime-facing
-`runtime/team-local/scripts/list`, `runtime/team-local/scripts/resolve`, and
-`runtime/team-local/scripts/send` helpers for sender-side team discovery and
-messages. The send helper resolves routes from the projected inventory and
-forwards provider-neutral text, format hints, reply refs, and `/runtime`
-attachments to the existing audited `channel.send` bridge. Its attachment
-option is intentionally path-only; the kernel derives the delivered filename
-and media type from the runtime file when it prepares the channel-send
-attachment.
-
-`channel-email` is a strict-whitelist work-inbox skill. Its channel-specific
-transport, held-mail, release, and runtime-facet architecture lives with the
-self-contained skill at `skills/channel-email/SKILL.md`; the central contract is
-that the worker integrates through the existing authorize, inbound, attachment,
-outbox, health, and grant-revoke channel APIs without importing the `lionclaw`
-crate.
+## Channel Skill Runtime Projection
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill
 at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
 Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
-other host-side assets are not projected into the runtime.
+other host-side assets are not projected into the runtime. Concrete worker
+binaries, contact templates, routing schemes, and provider behavior belong in
+the owning channel skill directory.
 
-## Team-Local Channel
-
-`channel-team-local` is a first-party local team channel skill. The same bundled
-worker binary also backs the runtime-facing `runtime/team-local/scripts/list`,
-`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages. The outer channel skill
-installs that binary at `runtime/team-local/bin/lionclaw-channel-team-local`;
-inside the projected runtime skill root, the helper scripts address the same
-file as `bin/lionclaw-channel-team-local`.
-
-Project setup installs and configures `team-local` for project instances by
-default. It also ensures a `team-local` execution preset with the existing
-`channel-send` escape class; that preset becomes the default only when the
-instance has no default preset yet. Each instance publishes its own contact
-route as
-`team-local:peer:<home-id>`. Setup also approves existing sibling instances with
-ordinary direct channel grants:
-
-```text
-channel_id = team-local
-sender_ref = team-local:instance:<sibling-home-id>
-routing_profile = direct
-trust_tier = main
-```
-
-The worker delivers only through existing channel APIs. It pulls local outbox
-deliveries, resolves the target route from project instance state, verifies the
-target daemon is `lionclawd` with the expected home id and canonical home path,
-preflights `/v0/channels/authorize`, then posts inbound events and attachments
-to the target daemon. Attachment bytes move through the existing attachment
-stage/finalize endpoints.
+First-party channel snapshots can carry host-side worker assets and embedded
+runtime-facing facets, but those details remain skill-owned. The kernel contract
+is only that channel workers authenticate to LionClaw and use the channel
+authorize, inbound, attachment, outbox, health, and grant-revoke APIs without
+importing the `lionclaw` crate.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
@@ -933,7 +881,7 @@ deterministic session keys from either the approved grant or the constrained
 channel contract; the kernel resolves runtime execution from the
 instance/default runtime configuration.
 Session-key components escape `:` and `%` so provider refs such as
-`telegram:chat:-123` remain unambiguous.
+`provider:conversation:123` remain unambiguous.
 Channel turn state is terminalized independently from the session turn state so
 queue workers can distinguish `completed`, `failed`, `timed_out`, `cancelled`,
 and `interrupted` without parsing runtime text. Cancelling a waiting or pending
