@@ -306,6 +306,7 @@ Each instance home contains:
 
 - [Architecture](docs/ARCHITECTURE.md) - trusted core, runtime boundary, channels, scheduler, audit, and API contracts
 - [Manual QA](docs/MANUAL_QA.md) - repeatable live acceptance checklist
+- [Release Process](docs/RELEASE.md) - release preparation and publishing
 - [Scripts](scripts/README.md) - developer and CI smoke helpers
 
 ## License
