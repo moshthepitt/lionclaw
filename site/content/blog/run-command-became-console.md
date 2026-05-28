@@ -1,131 +1,205 @@
 +++
-title = "The run command became the console"
+title = "The run command became a control room"
 date = 2026-05-25
-description = "Since v0.6, LionClaw's everyday command path has become a project operator console around real agent CLIs."
-draft = true
+description = "lionclaw run started as the obvious place to talk to an agent. It became the project operator console because LionClaw is a control plane around real agent harnesses, not another harness."
+
+[extra]
+standfirst = "At first, <code>lionclaw run</code> looked like it wanted to be a chat box. That was the wrong ceiling. LionClaw is the local control plane around real agent harnesses, so the everyday command has to feel more like a control room."
+hero_image = "/assets/lionclaw-run-console.png"
+hero_alt = "LionClaw run console showing project sessions, transcript, inspector, composer, and command help"
+hero_width = 1890
+hero_height = 969
+hero_caption = "<code>lionclaw run</code> keeps conversation, runtime state, project context, inspector panes, and changed files in one terminal."
 +++
 
-The most important product decision after v0.6 was not to add a new top-level
-workflow. It was to make the existing one obvious.
+At first `lionclaw run` looked like it wanted to become a chat box.
+
+That was not a bad place to start.
+
+When you use an agent, the first thing you need is conversation. You need
+somewhere to explain what you want. You need to go back and forth. You need to
+make a plan, change your mind, review work, and tell the agent that no, that is
+not quite what you meant.
+
+So yes, chat matters.
+
+But chat is not enough.
+
+If LionClaw was another agent harness, `run` would probably keep moving in that
+direction. Better prompt editing. Better transcript. Better planning. Better
+review. A more polished place to talk to your agent and watch it do things.
+
+That is a real product. It is just not this product.
+
+LionClaw is not trying to become Codex. It is not trying to become OpenCode. It
+should not become a thinner version of whatever agent UI happens to be popular
+this month.
+
+In the README I put the important thing plainly: Codex is still Codex. OpenCode
+is still OpenCode. LionClaw is the local control plane around them.
+
+That sentence decides what `run` has to become.
+
+## The wrong ceiling
+
+A chat box is a very small ceiling for something that can act inside a real
+project.
+
+An agent is doing more than answering questions. It is reading files, running
+tools, editing code, using runtime state, continuing sessions, producing drafts,
+and sometimes touching credentials. It may be Codex today, OpenCode tomorrow,
+Claude Code when that makes sense, or something better that does not exist yet.
+
+The harness can change. The project home should not.
+
+That is the whole point of LionClaw.
+
+The model may be commercial. Fine. The harness may be built by someone else.
+Also fine. Use the strongest tool available. But the boundary around the work
+should belong to you: the project it runs in, the state it sees, the sessions it
+continues, the skills and mounts it receives, the channels that can reach it,
+and the audit trail it leaves behind.
+
+So `lionclaw run` cannot just be a pleasant stream of text. It has to show the
+room.
+
+## What the room shows
+
+The everyday command is still simple:
 
 ```sh
 lionclaw run
 ```
 
-That command is the everyday path. It should be where the operator can start a
-turn, watch what is happening, interrupt when needed, and understand which
-project, instance, runtime, session, boundary, and audit context they are
-touching.
+In a terminal, that opens the project operator console.
 
-Before this work, `run` was still too close to a line prompt. That was useful
-for proving the runtime path, but it did not match the shape of real agent
-work. Real turns are long. They stream. They change files. They can need native
-runtime controls. They can be interrupted. They happen inside a project with
-state, not inside an isolated chat box.
+The conversation is still there. It has to be. But it is only one surface.
 
-So `lionclaw run` became the project operator console.
+When I am running an agent inside a project, I want to see:
 
-The Codex-assisted design thread behind this was not about making the terminal
-flashier. It kept coming back to a stricter product rule: LionClaw needs one
-obvious everyday command path, and that path should reveal the boundary instead
-of hiding it. Live Codex smoke work exposed the places where project roots,
-daemon reuse, session reuse, runtime controls, and interrupted turns could blur
-together. The console work is the product answer to that scar tissue.
+- which project instance I am touching
+- which runtime is doing the work
+- which session is being continued
+- whether the current turn is alive or stuck
+- what the runtime is doing right now
+- what files are changing
+- what boundary the runtime is inside
+- what controls are available without pretending every control belongs to LionClaw
 
-The console keeps the durable turn flow in one place: prompt input, transcript,
-live runtime status, file-change feedback, and the current answer stream. The
-surrounding panes show project objects and inspectable context without making
-the operator leave the turn surface. On wide terminals, the project list,
-inspector, and changed files can stay visible beside the active conversation.
-On narrower terminals, controls can take focus without moving the main Run
-surface out from under the operator.
+This is not about making the terminal look impressive.
 
-The point is not to imitate a web dashboard in the terminal. The point is to
-make the local boundary legible while the agent works.
+When an agent is acting, the local working context should be visible.
 
-## Run is for running
+The current console keeps the prompt and durable transcript together. Runtime
+status, reasoning, command activity, progress, and file changes are visible as
+live activity or control-pane detail instead of being dumped into the transcript
+as if they were part of the conversation.
 
-`run` is intentionally not a setup wizard.
+That distinction matters.
 
-If a project is missing setup, the console shows launch blockers. It does not
-create projects, configure runtimes, install skills, rewrite channel bindings,
-or run repair flows. That stays with `doctor`, explicit commands, and operator
-intent.
+I want to read the conversation later and understand what was said. I also want
+to know what the runtime was doing while the turn was active. Those are related
+things, but they are not the same thing.
 
-That split matters. LionClaw is a small trusted core around real runtimes. The
-command that runs a turn should not quietly mutate the world to make the turn
-possible. It should tell you what is missing, then wait for an explicit repair.
+## Control plane, not harness
 
-For scripts and non-terminal use, the line-oriented path still exists:
+This is the split I keep coming back to:
+
+The runtime does the agent work.
+
+LionClaw owns the boundary.
+
+That means LionClaw decides where the runtime runs, what work root it sees, what
+runtime state is mounted, what draft area exists, what secrets are staged, what
+session is durable, and what gets recorded.
+
+It also means LionClaw should not swallow every native runtime behaviour and
+pretend it invented it.
+
+If Codex has a control like `/compact`, that should remain a Codex control. If
+OpenCode has its own behaviour, that should remain OpenCode's behaviour.
+LionClaw can route and record the turn without turning itself into a bad clone
+of every harness.
+
+That is why this is not agent chat with extra panels.
+
+It is a control plane with a conversation surface.
+
+## Projects need operators
+
+A LionClaw project can have configured instances. Each instance has its own
+home, runtime config, sessions, logs, installed skills, runtime cache, and
+assistant-home continuity.
+
+That is where the control-room idea starts to matter.
+
+Today, the honest claim is narrower than the dream. `run` is a project operator
+console. It can render the configured project instances. It can switch to
+another configured instance when no turn is active. That switch reads the other
+instance's home, work root, runtime config, sessions, and audit scope. It does
+not secretly mutate the project to make things work.
+
+Good.
+
+I do not want magic here. I want to understand why I am looking at this agent,
+this runtime, this session, and this work root.
+
+Over time, this should become richer. I want audit panes that are actually
+useful. I want drafts produced by agents to be easy to inspect, promote, or
+discard. I want logs, jobs, channel traffic, and team state to have natural
+places to live. I want to see Codex doing one kind of work, OpenCode doing
+another, and some future harness doing whatever strange thing it is good at.
+
+But the rule should stay the same.
+
+The harnesses do the work. LionClaw gives the project a local home and an
+operator surface.
+
+## Run should not repair the world
+
+One thing I do not want is a `run` command that quietly rewrites everything
+before it starts.
+
+If setup is wrong, `doctor` should say so. If a runtime is missing, the operator
+should configure it explicitly. If a channel needs approval, that should be a
+deliberate act. If a mount is added, it should be remembered as runtime-profile
+state, not accidentally inherited from whatever shell happened to start the
+process.
+
+For scripts and non-terminal use, the plain path still exists:
 
 ```sh
 lionclaw run --plain
 ```
 
-When standard input is not a terminal, LionClaw stays on the plain path
-automatically.
+That is fine. Scripts need boring text.
 
-## Runtime controls stay native
+Humans doing serious agent work need more context.
 
-The console also forced a sharper distinction between LionClaw controls and
-runtime controls.
+## Why I care
 
-LionClaw reserves `/lionclaw ...` for LionClaw-owned actions such as continue,
-retry, reset, and exit. Other first-column slash commands are routed as native
-runtime controls. That lets a Codex control like `/compact` remain a Codex
-control instead of being stored as ordinary prompt text or reimplemented inside
-LionClaw.
+I am building LionClaw because I do not want the future of agents to become
+another rented platform.
 
-Those control turns are still recorded. They are not model-visible history
-unless the runtime chooses to make them so. The kernel audits routing, start,
-finish, and outcome so the operator can see what happened without LionClaw
-pretending to own every runtime command.
+We already did that with the web. The tools became convenient. Then the memory,
+logs, workflows, credentials, and distribution all moved somewhere else. After a
+while you are just renting your own life back through someone else's interface.
 
-Cancellation got the same treatment. Active turns can be interrupted through
-the runtime adapter. Queued channel turns can be terminalized before a worker
-claims them. The terminal events come from the owner of the state transition,
-not from whichever caller happened to ask first.
+Agents make that problem sharper.
 
-## The boundary became more inspectable
+If agents are going to do real work, then the home around that work matters.
+The transcript matters. The runtime state matters. The files matter. The audit
+trail matters. The ability to swap out the harness matters.
 
-The console work also made runtime boundaries more concrete.
+`lionclaw run` is where that idea becomes visible.
 
-Runtime profiles can now carry explicit persistent mounts:
+It did not become a bigger chat box.
 
-```sh
-lionclaw runtime mount add codex docs --source /absolute/docs
-lionclaw runtime mount list codex
-lionclaw runtime mount remove codex docs
-```
+It became the place where conversation, runtime state, project state, file
+changes, sessions, and boundary controls start to meet.
 
-Mounts default to read-only. LionClaw rejects project metadata, instance state,
-reserved runtime paths, invalid targets, and bind arguments that cannot be
-represented safely by the OCI backend. The operator gets a durable profile
-setting, not an accidental shell environment.
+That is the shape of LionClaw.
 
-The same period added a Rust-enabled development runtime image while keeping
-the default runtime image focused on everyday assistant work. That is the right
-shape: the default assistant boundary stays small, and the heavier development
-toolchain is opt-in.
+Not another harness.
 
-## Why this is the right surface
-
-Agents do not only answer. They inspect, edit, run tools, call native controls,
-touch files, and sometimes need to be stopped.
-
-If that work is going to happen beside a real project, the everyday surface has
-to show more than a prompt and a stream of text. It has to show the local
-context around the turn.
-
-That is what `lionclaw run` is becoming: one obvious command path, with the
-agent harness still doing the agent work and LionClaw keeping the project-side
-boundary visible.
-
-Build notes: this post is extracted from the v0.6 follow-up work in
-[#71](https://github.com/moshthepitt/lionclaw/pull/71),
-[#76](https://github.com/moshthepitt/lionclaw/pull/76),
-[#83](https://github.com/moshthepitt/lionclaw/pull/83),
-[#84](https://github.com/moshthepitt/lionclaw/pull/84),
-[#90](https://github.com/moshthepitt/lionclaw/pull/90),
-[#96](https://github.com/moshthepitt/lionclaw/pull/96), and
-[#97](https://github.com/moshthepitt/lionclaw/pull/97).
+A local control plane for real harnesses.
