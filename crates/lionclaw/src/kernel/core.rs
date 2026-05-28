@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fmt,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
@@ -913,9 +913,8 @@ impl Kernel {
 
         let rendered = render_attached_runtime_context_file(runtime_id, &sections);
         for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
-            tokio::fs::write(runtime_state_root.join(file_name), &rendered)
-                .await
-                .map_err(|err| internal(err.into()))?;
+            write_runtime_state_file(runtime_state_root, file_name, rendered.as_bytes().to_vec())
+                .await?;
         }
         Ok(())
     }
@@ -6791,6 +6790,58 @@ mod tests {
         assert!(rendered.ends_with("<!-- LIONCLAW:END -->\n"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_state_file_write_replaces_symlink_without_following() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        fs::create_dir(&runtime_state_root).expect("runtime state root");
+        let outside = temp_dir.path().join("outside.md");
+        fs::write(&outside, "outside\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside, runtime_state_root.join(AGENTS_FILE))
+            .expect("symlink runtime state file");
+
+        write_runtime_state_file(
+            &runtime_state_root,
+            AGENTS_FILE,
+            b"generated context\n".to_vec(),
+        )
+        .await
+        .expect("write runtime state file");
+
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside"),
+            "outside\n"
+        );
+        let metadata =
+            fs::symlink_metadata(runtime_state_root.join(AGENTS_FILE)).expect("stat generated");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(runtime_state_root.join(AGENTS_FILE)).expect("read generated"),
+            "generated context\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_state_file_write_rejects_symlinked_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime-state");
+        let linked_root = temp_dir.path().join("linked-runtime-state");
+        fs::create_dir(&real_root).expect("real root");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+
+        let err = write_runtime_state_file(&linked_root, AGENTS_FILE, b"context\n".to_vec())
+            .await
+            .expect_err("symlinked runtime root should fail");
+
+        assert!(matches!(
+            err,
+            KernelError::Internal(message) if message.contains("failed to open runtime state root")
+        ));
+    }
+
     #[test]
     fn attached_runtime_transcript_export_timeout_is_capped() {
         let mut plan = test_execution_plan("codex");
@@ -11746,6 +11797,124 @@ fn json_value_type(value: &serde_json::Value) -> &'static str {
     }
 }
 
+async fn write_runtime_state_file(
+    runtime_state_root: &Path,
+    file_name: &str,
+    contents: Vec<u8>,
+) -> Result<(), KernelError> {
+    let runtime_state_root = runtime_state_root.to_path_buf();
+    let file_name = file_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        write_runtime_state_file_blocking(&runtime_state_root, &file_name, &contents)
+    })
+    .await
+    .map_err(|err| internal(err.into()))?
+}
+
+fn write_runtime_state_file_blocking(
+    runtime_state_root: &Path,
+    file_name: &str,
+    contents: &[u8],
+) -> Result<(), KernelError> {
+    use std::ffi::OsString;
+
+    use rustix::fs::{open, openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+
+    let target_name = runtime_state_file_name(file_name)?;
+    std::fs::create_dir_all(runtime_state_root).map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to create runtime state root '{}': {err}",
+            runtime_state_root.display()
+        ))
+    })?;
+    let root = open(
+        runtime_state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to open runtime state root '{}': {err}",
+            runtime_state_root.display()
+        ))
+    })?;
+    let root = std::fs::File::from(root);
+
+    let temp_name = OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let temp = openat(
+        &root,
+        &temp_name,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::TRUNC
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to create runtime state temp file '{}' in '{}': {err}",
+            Path::new(&temp_name).display(),
+            runtime_state_root.display()
+        ))
+    })?;
+    let mut temp = std::fs::File::from(temp);
+
+    let write_result = (|| -> Result<(), KernelError> {
+        temp.write_all(contents).map_err(|err| {
+            internal(anyhow::anyhow!(
+                "failed to write runtime state file '{}' in '{}': {err}",
+                file_name,
+                runtime_state_root.display()
+            ))
+        })?;
+        temp.flush().map_err(|err| {
+            internal(anyhow::anyhow!(
+                "failed to flush runtime state file '{}' in '{}': {err}",
+                file_name,
+                runtime_state_root.display()
+            ))
+        })?;
+        renameat(&root, &temp_name, &root, &target_name).map_err(|err| {
+            internal(anyhow::anyhow!(
+                "failed to publish runtime state file '{}' in '{}': {err}",
+                file_name,
+                runtime_state_root.display()
+            ))
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        match unlinkat(&root, &temp_name, AtFlags::empty()) {
+            Ok(()) => {}
+            Err(err) => warn!(
+                ?err,
+                path = %runtime_state_root.join(Path::new(&temp_name)).display(),
+                "failed to remove temporary runtime state file"
+            ),
+        }
+    }
+    write_result
+}
+
+fn runtime_state_file_name(file_name: &str) -> Result<OsString, KernelError> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err(internal(anyhow::anyhow!(
+            "runtime state file name '{file_name}' is invalid"
+        )));
+    };
+    if components.next().is_some() {
+        return Err(internal(anyhow::anyhow!(
+            "runtime state file name '{file_name}' is invalid"
+        )));
+    }
+    Ok(OsString::from(name))
+}
+
 fn generate_pairing_code() -> String {
     let raw = Uuid::new_v4().simple().to_string();
     // Keep enough entropy that storing only a hash is meaningful if state leaks.
@@ -14121,12 +14290,10 @@ impl Kernel {
             return Ok(());
         }
 
-        tokio::fs::copy(
-            &generated_agents,
-            runtime_state_root.join(GENERATED_AGENTS_FILE),
-        )
-        .await
-        .map_err(|err| internal(err.into()))?;
+        let generated = tokio::fs::read(&generated_agents)
+            .await
+            .map_err(|err| internal(err.into()))?;
+        write_runtime_state_file(runtime_state_root, GENERATED_AGENTS_FILE, generated).await?;
         Ok(())
     }
 
@@ -14223,21 +14390,25 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
         state: &'static str,
     ) -> Result<(), KernelError> {
-        let Some(path) = Self::runtime_tui_state_path(plan) else {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return Ok(());
         };
-        tokio::fs::write(&path, format!("{state}\n"))
-            .await
-            .map_err(|err| internal(err.into()))
+        write_runtime_state_file(
+            runtime_state_root,
+            RUNTIME_TUI_STATE_MARKER,
+            format!("{state}\n").into_bytes(),
+        )
+        .await
     }
 
     async fn mark_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return;
         };
-        if let Err(err) = tokio::fs::write(
-            runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
-            b"ready\n",
+        if let Err(err) = write_runtime_state_file(
+            runtime_state_root,
+            RUNTIME_SESSION_READY_MARKER,
+            b"ready\n".to_vec(),
         )
         .await
         {

@@ -1,8 +1,5 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -12,12 +9,15 @@ use serde_json::Value;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnInput, RuntimeTurnMode,
+use crate::{
+    home::runtime_session_ready_marker_exists,
+    kernel::runtime::{
+        ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
+        RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnInput, RuntimeTurnMode,
+    },
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
@@ -79,7 +79,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         let resumes_existing_session = input
             .runtime_state_root
             .as_deref()
-            .map(runtime_session_is_ready)
+            .map(runtime_session_ready_marker_exists)
             .transpose()?
             .unwrap_or(false);
         self.sessions
@@ -578,12 +578,6 @@ fn get_runtime_session(
         .get(runtime_session_id)
         .copied()
         .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
-}
-
-fn runtime_session_is_ready(root: &Path) -> Result<bool> {
-    Ok(root
-        .join(crate::home::RUNTIME_SESSION_READY_MARKER)
-        .is_file())
 }
 
 #[cfg(test)]

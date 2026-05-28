@@ -12,14 +12,18 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::kernel::runtime::{
-    spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn,
-    RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
+use crate::{
+    home::runtime_session_ready_marker_exists,
+    kernel::runtime::{
+        spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
+        RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnMode, RuntimeTurnResult,
+    },
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
@@ -542,7 +546,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
         let thread_id = match input.runtime_state_root.as_deref() {
-            Some(root) if runtime_session_is_ready(root)? => load_saved_thread_id(root)?,
+            Some(root) if runtime_session_ready_marker_exists(root)? => load_saved_thread_id(root)?,
             Some(_) | None => None,
         };
         let resumes_existing_session = thread_id.is_some();
@@ -2335,12 +2339,6 @@ fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
     fs::write(&temp_path, format!("{thread_id}\n"))?;
     fs::rename(&temp_path, &path)?;
     Ok(())
-}
-
-fn runtime_session_is_ready(root: &Path) -> Result<bool> {
-    Ok(root
-        .join(crate::home::RUNTIME_SESSION_READY_MARKER)
-        .is_file())
 }
 
 impl CodexThreadState {
