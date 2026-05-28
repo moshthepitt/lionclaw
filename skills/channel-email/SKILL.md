@@ -11,9 +11,9 @@ runtime never receives mailbox credentials.
 
 The channel admits only exact approved senders through LionClaw channel grants.
 Unknown mail is held or suppressed by the worker and must not become runtime
-work unless the local operator explicitly approves or releases it. Full message
-bodies are fetched only after approval and are capped by
-`EMAIL_MAX_MESSAGE_BYTES` before any runtime work is queued.
+work unless the local operator explicitly approves the sender or releases an
+authenticated held item. Full message bodies are fetched only after approval
+and are capped by `EMAIL_MAX_MESSAGE_BYTES` before any runtime work is queued.
 
 This channel package also carries the runtime-facing `email` Agent Skill at
 `runtime/email/`. LionClaw projects that facet into runtimes when this skill is

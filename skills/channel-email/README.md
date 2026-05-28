@@ -35,8 +35,9 @@ no-reply mail is suppressed locally. Oversized mail is suppressed without
 runtime work, and known provider size metadata is retained with held rows so a
 later one-shot release still avoids downloading mail already known to exceed
 the configured cap. Mail that lacks trusted sender authentication is held with
-metadata only even when a permanent sender grant exists; an exact one-shot
-release can intentionally admit that held item.
+metadata only even when a permanent sender grant or one-shot release exists. A
+release approves a specific held message from an authenticated sender; it does
+not override failed provider sender authentication.
 
 Processed IMAP candidates are marked seen in the dedicated mailbox after they
 are held, suppressed, or admitted. This avoids reprocessing the same unread
@@ -66,10 +67,12 @@ Create that grant with the normal channel pairing operator surface:
 "$LIONCLAW_BIN" channel pairing approve email --sender-ref email:addr:alice@example.com --label email-release:<held-id>
 ```
 
-The worker admits only the held item whose id exactly matches that label. Other
-mail from the same sender remains held while the release grant exists. Once the
-matching held item is admitted or terminally suppressed, the worker revokes the
-grant through LionClaw's grant-revoke API. Failed revocations are retried from
+The worker admits only the held item whose id exactly matches that label and
+still requires the message to satisfy the configured sender-authentication
+policy. Other mail from the same sender remains held while the release grant
+exists. Once the matching held item is admitted, remains held for failed sender
+authentication, or is terminally suppressed, the worker revokes the grant
+through LionClaw's grant-revoke API. Failed revocations are retried from
 worker-local SQLite state.
 
 Permanent sender approval uses the same command without the one-shot release
@@ -128,12 +131,13 @@ Expected when credentials are available:
 - an exact approved sender queues one channel turn with a structured email
   envelope, not raw MIME
 - a forged or unauthenticated `From` stays held even if that sender has a
-  permanent grant, unless the operator uses an exact one-shot release
+  permanent grant or exact one-shot release
 - admitted email uses `thread_actor` session binding so separate threads from
   the same sender do not share runtime history
 - an unknown non-automated sender is held and does not queue runtime work
 - the held-mail digest includes held id, sender, subject, snippet, attachment
-  count, sender/conversation/thread refs, and release guidance
+  count, sender/conversation/thread refs, and hold-reason-specific approval or
+  release guidance
 - `channel pairing approve email --sender-ref ... --label email-release:<held-id>`
   releases only that held item once, leaves mismatched mail held, and is revoked
   after admission

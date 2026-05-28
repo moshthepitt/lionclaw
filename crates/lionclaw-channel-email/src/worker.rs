@@ -261,12 +261,6 @@ where
             .context("failed to authorize email sender")?;
         let sender_auth_decision =
             sender_authentication_decision(&self.config.sender_auth, candidate);
-        let exact_one_shot_release =
-            authorization
-                .one_shot_release_held_id()
-                .is_some_and(|released_held_id| {
-                    previously_held && released_held_id == held_id.as_str()
-                });
         let authenticated_candidate =
             candidate.with_sender_auth(sender_auth_decision.verdict.clone());
         let candidate = &authenticated_candidate;
@@ -307,16 +301,6 @@ where
             mark_held_candidate_processed(store, mailbox, candidate).await?;
             return Ok(());
         }
-        if let Some(reason) = sender_auth_decision
-            .failure_reason()
-            .filter(|_| !exact_one_shot_release)
-        {
-            store
-                .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
-                .await?;
-            mark_held_candidate_processed(store, mailbox, candidate).await?;
-            return Ok(());
-        }
 
         let consumed_release_grant_id = self
             .record_consumed_one_shot_release_grant_if_needed(
@@ -326,6 +310,20 @@ where
                 previously_held,
             )
             .await?;
+        if let Some(reason) = sender_auth_decision.failure_reason() {
+            store
+                .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
+                .await?;
+            mark_held_candidate_processed(store, mailbox, candidate).await?;
+            self.revoke_consumed_one_shot_release_grant_if_needed(
+                store,
+                consumed_release_grant_id.as_deref(),
+                held_id.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
+
         if candidate_message_size_exceeds_limit(candidate, self.config.mailbox.max_message_bytes) {
             self.suppress_and_revoke_release_grant(
                 store,
@@ -1322,7 +1320,7 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
     if !held.is_empty() {
         lines.push(String::new());
         lines.push(
-            "Held messages were not downloaded because the sender is not approved.".to_string(),
+            "Held messages were not downloaded because the sender is not approved or sender authentication did not pass.".to_string(),
         );
         for item in held {
             lines.push(String::new());
@@ -1342,16 +1340,25 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
                 lines.push(format!("Reason: {reason}"));
             }
             let sender_ref_arg = shell_quote(&item.sender_ref);
-            let release_label_arg = shell_quote(&format!("email-release:{}", item.held_id));
-            lines.push(format!(
-                "Approve: lionclaw channel pairing approve email --sender-ref {sender_ref_arg}"
-            ));
             lines.push(format!(
                 "Block: lionclaw channel pairing block email {sender_ref_arg}"
             ));
-            lines.push(format!(
-                "Release once: lionclaw channel pairing approve email --sender-ref {sender_ref_arg} --label {release_label_arg}"
-            ));
+            if item.classification_reason.as_deref() == Some("sender_authentication_required") {
+                lines.push(format!(
+                    "Approve future authenticated mail: lionclaw channel pairing approve email --sender-ref {sender_ref_arg}"
+                ));
+                lines.push(
+                    "Release once: unavailable because sender authentication failed.".to_string(),
+                );
+            } else {
+                let release_label_arg = shell_quote(&format!("email-release:{}", item.held_id));
+                lines.push(format!(
+                    "Approve: lionclaw channel pairing approve email --sender-ref {sender_ref_arg}"
+                ));
+                lines.push(format!(
+                    "Release once: lionclaw channel pairing approve email --sender-ref {sender_ref_arg} --label {release_label_arg}"
+                ));
+            }
         }
     }
     lines.join("\n")
@@ -1696,6 +1703,32 @@ mod tests {
             "--label {}",
             shell_quote("email-release:hld_unsafe'ish")
         )));
+    }
+
+    #[test]
+    fn held_digest_does_not_offer_release_for_sender_auth_failures() {
+        let held = vec![HeldItem {
+            digest_rowid: 1,
+            held_id: "hld_auth_failed".to_string(),
+            event_id: "email:imap:assistant-example-com:7:42".to_string(),
+            sender_ref: "email:addr:alice@example.com".to_string(),
+            conversation_ref: conversation_ref("assistant-example-com"),
+            thread_ref: thread_ref("root@example.com"),
+            message_ref: message_ref("m1@example.com"),
+            sender_address: "alice@example.com".to_string(),
+            sender_name: None,
+            subject: "Hello".to_string(),
+            snippet: held_body_not_downloaded_text().to_string(),
+            received_at: None,
+            attachment_count: 0,
+            classification_reason: Some("sender_authentication_required".to_string()),
+        }];
+
+        let text = digest_text("assistant@example.com", &held, 0);
+
+        assert!(text.contains("Approve future authenticated mail:"));
+        assert!(text.contains("Release once: unavailable because sender authentication failed."));
+        assert!(!text.contains("--label 'email-release:hld_auth_failed'"));
     }
 
     #[tokio::test]
@@ -2224,7 +2257,10 @@ mod tests {
 
     #[tokio::test]
     async fn one_shot_release_grant_is_revoked_after_admission() {
-        let fixture = EmailFixture::new(false).await;
+        let candidate = candidate_from_headers(
+            "Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\nFrom: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+        );
+        let fixture = EmailFixture::with_candidate(false, candidate, full_message()).await;
         let mut config = fixture.config();
         config.sender_auth = SenderAuthConfig::AuthenticationResults {
             authserv_id: "mx.example.com".to_string(),
@@ -2244,6 +2280,44 @@ mod tests {
             revoked[0]["grant_id"],
             "00000000-0000-0000-0000-000000000086"
         );
+        assert_eq!(revoked[0]["reason"], "email_one_shot_release_consumed");
+    }
+
+    #[tokio::test]
+    async fn one_shot_release_does_not_bypass_sender_authentication() {
+        let fixture = EmailFixture::new(false).await;
+        let mut config = fixture.config();
+        config.sender_auth = SenderAuthConfig::AuthenticationResults {
+            authserv_id: "mx.example.com".to_string(),
+        };
+
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+
+        let held_id = held_id_for("email:imap:assistant-example-com:7:42");
+        fixture.api.set_one_shot_release_authorized(&held_id);
+        worker.tick().await.expect("release tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Held)
+        );
+        let held = store
+            .held_since_last_digest(10)
+            .await
+            .expect("held digest rows");
+        assert_eq!(
+            held[0].classification_reason.as_deref(),
+            Some("sender_authentication_required")
+        );
+        let revoked = fixture.api.revoked_grants.lock().unwrap();
+        assert_eq!(revoked.len(), 1);
         assert_eq!(revoked[0]["reason"], "email_one_shot_release_consumed");
     }
 
@@ -2530,6 +2604,10 @@ mod tests {
         State(state): State<Arc<ApiState>>,
         Json(body): Json<Value>,
     ) -> impl IntoResponse {
+        let grant_id = body
+            .get("grant_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         state.revoked_grants.lock().unwrap().push(body);
         if state.missing_revoke.load(Ordering::SeqCst) {
             (
@@ -2542,6 +2620,14 @@ mod tests {
                 Json(json!({ "error": "revoke failed" })),
             )
         } else {
+            let mut grant = state.grant.lock().unwrap();
+            if grant
+                .as_ref()
+                .is_some_and(|current| Some(current.grant_id.as_str()) == grant_id.as_deref())
+            {
+                *grant = None;
+                state.authorized.store(false, Ordering::SeqCst);
+            }
             (StatusCode::OK, Json(json!({ "revoked": true })))
         }
     }
