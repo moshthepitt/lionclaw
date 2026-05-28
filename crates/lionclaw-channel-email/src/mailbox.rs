@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::{
-    config::{ImapTlsMode, MailboxConfig},
+    config::{ImapTlsMode, MailboxConfig, SmtpTlsMode},
     mime::{parse_header_facts, HeaderFacts},
     protocol::{
         conversation_ref, event_id, generated_message_id, message_ref, provider_file_ref,
@@ -552,21 +552,35 @@ impl MailboxEngine for RealMailboxEngine {
             );
         }
 
-        let mut client =
-            SmtpClientBuilder::new(self.config.smtp_host.as_str(), self.config.smtp_port)
-                .map_err(|err| anyhow!("failed to build SMTP client: {err}"))?
-                .implicit_tls(self.config.smtp_implicit_tls)
-                .credentials((
-                    self.config.smtp_username.as_str(),
-                    self.config.smtp_password.as_str(),
-                ))
-                .connect()
-                .await
-                .context("failed to connect to SMTP server")?;
-        client
-            .send(message)
-            .await
-            .map_err(|err| anyhow!("failed to send SMTP message: {err}"))?;
+        let builder = SmtpClientBuilder::new(self.config.smtp_host.as_str(), self.config.smtp_port)
+            .map_err(|err| anyhow!("failed to build SMTP client: {err}"))?
+            .credentials((
+                self.config.smtp_username.as_str(),
+                self.config.smtp_password.as_str(),
+            ));
+        match self.config.smtp_tls {
+            SmtpTlsMode::Implicit | SmtpTlsMode::StartTls => {
+                let mut client = builder
+                    .implicit_tls(matches!(self.config.smtp_tls, SmtpTlsMode::Implicit))
+                    .connect()
+                    .await
+                    .context("failed to connect to SMTP server")?;
+                client
+                    .send(message)
+                    .await
+                    .map_err(|err| anyhow!("failed to send SMTP message: {err}"))?;
+            }
+            SmtpTlsMode::Insecure => {
+                let mut client = builder
+                    .connect_plain()
+                    .await
+                    .context("failed to connect to SMTP server")?;
+                client
+                    .send(message)
+                    .await
+                    .map_err(|err| anyhow!("failed to send SMTP message: {err}"))?;
+            }
+        }
         Ok(json!({
             "provider": "smtp",
             "message_id": message_id,
@@ -677,7 +691,7 @@ fn i_string_eq(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ImapTlsMode;
+    use crate::config::{ImapTlsMode, SmtpTlsMode};
 
     #[test]
     fn malformed_candidate_headers_do_not_discard_well_formed_candidates() {
@@ -828,7 +842,7 @@ mod tests {
             imap_mailbox: "INBOX".to_string(),
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
-            smtp_implicit_tls: false,
+            smtp_tls: SmtpTlsMode::StartTls,
             smtp_username: "assistant@example.com".to_string(),
             smtp_password: "secret".to_string(),
             from_name: Some("LionClaw".to_string()),

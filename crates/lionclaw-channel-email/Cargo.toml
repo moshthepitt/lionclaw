@@ -14,7 +14,13 @@ chrono = { workspace = true, features = ["serde", "clock"] }
 hex.workspace = true
 imap-client = "0.3"
 mail-parser = "0.11"
-mail-send = "0.6"
+mail-send = { version = "0.6", default-features = false, features = [
+  "builder",
+  "cram-md5",
+  "digest-md5",
+  "ring",
+  "tls12",
+] }
 reqwest = { workspace = true, features = ["json", "multipart", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

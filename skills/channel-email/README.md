@@ -94,6 +94,7 @@ EMAIL_IMAP_PASSWORD=...
 EMAIL_SMTP_HOST=smtp.example.com
 EMAIL_SMTP_USERNAME=assistant@example.com
 EMAIL_SMTP_PASSWORD=...
+EMAIL_SMTP_TLS=starttls
 EMAIL_ADMIN_DIGEST_TO=operator@example.com
 # Optional: defaults to 50 MiB.
 EMAIL_MAX_MESSAGE_BYTES=52428800
@@ -108,6 +109,10 @@ deliveries. This is safe only when that provider strips attacker-supplied
 `Authentication-Results` headers for the same authserv-id or prepends its own
 authoritative result before any untrusted copy. Do not point this setting at an
 authserv-id that can be supplied by external senders.
+
+`EMAIL_SMTP_TLS` is `starttls` by default for port 587 and `implicit` by
+default for port 465. Use `insecure` only for loopback or private test relays;
+production mailbox providers should use `starttls` or `implicit`.
 
 `connect email` installs the bundled channel snapshot, stores declared channel
 env in the selected instance home, starts the background stack, and leaves
