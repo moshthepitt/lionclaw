@@ -549,26 +549,12 @@ option is intentionally path-only; the kernel derives the delivered filename
 and media type from the runtime file when it prepares the channel-send
 attachment.
 
-The Email channel is a strict-whitelist work-inbox skill. Its worker owns IMAP,
-SMTP, mailbox credentials, local held-mail state, and provider-specific email
-handling. It fetches only IMAP envelope/header facts, `BODYSTRUCTURE`, and
-`RFC822.SIZE` before calling `/v0/channels/authorize`; full MIME bodies and
-attachments are fetched only after the core grants the sender/thread and only
-within the worker's configured message-size cap. Unknown senders are held with
-metadata only, automated/bulk/list mail is suppressed locally, oversized mail is
-suppressed without runtime work, and known provider size metadata is retained
-with held rows so later one-shot releases still avoid downloading mail that was
-already known to exceed the configured cap. Admitted messages are posted through
-the existing channel inbound and attachment endpoints with first-class
-`thread_ref` and `reply_to_ref` fields. Worker-local SQLite state is derived
-from the selected LionClaw home and mailbox identity, so state placement follows
-the same instance boundary as the rest of the channel and is not controlled by
-undeclared process environment. Held-message UID references are valid only while the
-mailbox `UIDVALIDITY` value is unchanged; stale held entries are suppressed
-instead of fetching or marking a different provider message. The channel also
-publishes a runtime-facing Agent Skill at `runtime/email/`, so runtimes learn
-how to handle email turns without receiving the host-side channel package or
-mailbox credentials.
+`channel-email` is a strict-whitelist work-inbox skill. Its channel-specific
+transport, held-mail, release, and runtime-facet architecture lives with the
+self-contained skill at `skills/channel-email/SKILL.md`; the central contract is
+that the worker integrates through the existing authorize, inbound, attachment,
+outbox, health, and grant-revoke channel APIs without importing the `lionclaw`
+crate.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill
@@ -576,15 +562,6 @@ at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
 Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
 other host-side assets are not projected into the runtime.
-
-The runtime-visible email facet documents reply behavior and operator-driven
-email administration. Permanent sender approval uses the existing channel grant
-approval API for an exact `email:addr:<normalized-address>` sender ref. One-shot
-held-message release uses an existing thread-scoped grant labeled
-`email-release:<held-id>`; the email worker recognizes that label on the
-authorization response, admits the matching held item once, then revokes the
-grant through `/v0/channels/grants/revoke`. Failed revocations are retried from
-worker-local SQLite state.
 
 ## Team-Local Channel
 
