@@ -286,9 +286,10 @@ printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
 
 Expected when credentials are available:
 
-- the default runtime image reports `codex-cli 0.134.0` for
-  `codex --version`, `1.4.6` for `opencode --version`, and can run common
-  assistant probes such as `python3 --version`,
+- the default runtime image reports Codex and OpenCode versions matching the
+  `CODEX_VERSION` and `OPENCODE_VERSION` pins in
+  `containers/runtime/Containerfile`, and can run common assistant probes such
+  as `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - scoped grant approval is explicit
 - the channel response comes from the configured runtime
