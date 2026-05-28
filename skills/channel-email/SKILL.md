@@ -34,6 +34,11 @@ runtime work, and known provider size metadata is retained with held rows so
 later one-shot releases still avoid downloading mail already known to exceed
 the configured cap.
 
+Processed IMAP candidates are marked seen in the dedicated mailbox after they
+are held, suppressed, or admitted. This avoids reprocessing the same unread
+window forever under fixed-size polling and keeps the channel's local held-mail
+state as the operator-facing queue.
+
 Admitted messages are posted through LionClaw's existing channel inbound and
 attachment endpoints with first-class `thread_ref` and `reply_to_ref` fields.
 Worker-local SQLite state is derived from the selected LionClaw home and mailbox

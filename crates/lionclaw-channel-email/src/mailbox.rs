@@ -326,7 +326,7 @@ impl RealMailboxEngine {
         client: &mut ImapClient,
         uids: Vec<NonZeroU32>,
     ) {
-        if uids.is_empty() || !self.config.mark_seen_after_admission {
+        if uids.is_empty() {
             return;
         }
         let count = uids.len();
@@ -355,9 +355,7 @@ impl RealMailboxEngine {
 #[async_trait]
 impl MailboxEngine for RealMailboxEngine {
     async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
-        let (mut client, uid_validity) = self
-            .selected_imap(!self.config.mark_seen_after_admission)
-            .await?;
+        let (mut client, uid_validity) = self.selected_imap(false).await?;
         let mut uids = client
             .uid_search([SearchKey::Unseen])
             .await
@@ -428,9 +426,6 @@ impl MailboxEngine for RealMailboxEngine {
     }
 
     async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()> {
-        if !self.config.mark_seen_after_admission {
-            return Ok(());
-        }
         let mut client = self.selected_candidate_imap(false, candidate).await?;
         let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
         client
@@ -674,7 +669,6 @@ mod tests {
             from_name: Some("LionClaw".to_string()),
             fetch_limit: 25,
             max_message_bytes: crate::config::DEFAULT_MAX_MESSAGE_BYTES,
-            mark_seen_after_admission: true,
         }
     }
 }

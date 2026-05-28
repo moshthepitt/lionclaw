@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -52,6 +53,18 @@ where
 struct PreparedInboundAttachment {
     descriptor: ChannelAttachmentDescriptor,
     content: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct OutboundAttachmentError {
+    code: &'static str,
+    source: anyhow::Error,
+}
+
+impl OutboundAttachmentError {
+    fn new(code: &'static str, source: anyhow::Error) -> Self {
+        Self { code, source }
+    }
 }
 
 #[derive(Debug)]
@@ -540,9 +553,13 @@ where
                     anyhow!("no admitted email thread matches delivery"),
                 )
             })?;
-        let attachments = prepare_outbound_attachments(&delivery.content.attachments)
-            .await
-            .map_err(|err| terminal("attachment_unreadable", err))?;
+        let attachments = prepare_outbound_attachments(
+            &delivery.content.attachments,
+            self.config.mailbox.max_message_bytes,
+            delivery.content.text.len(),
+        )
+        .await
+        .map_err(|err| terminal(err.code, err.source))?;
         let references = reply_references(&context);
         let outbound = OutboundEmail {
             delivery_id: delivery.delivery_id.clone(),
@@ -966,21 +983,78 @@ fn prepare_inbound_attachment(
 
 async fn prepare_outbound_attachments(
     attachments: &[ChannelOutboxAttachment],
-) -> Result<Vec<OutboundAttachment>> {
+    max_message_bytes: usize,
+    initial_bytes: usize,
+) -> std::result::Result<Vec<OutboundAttachment>, OutboundAttachmentError> {
+    let max_message_bytes = u64::try_from(max_message_bytes).unwrap_or(u64::MAX);
+    let mut total_bytes = u64::try_from(initial_bytes).unwrap_or(u64::MAX);
+    if total_bytes > max_message_bytes {
+        return Err(OutboundAttachmentError::new(
+            "message_too_large",
+            anyhow!(
+                "email delivery body exceeds EMAIL_MAX_MESSAGE_BYTES ({max_message_bytes} bytes)"
+            ),
+        ));
+    }
     let mut prepared = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let path = PathBuf::from(&attachment.path);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to stat attachment {}", path.display()))?;
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
+            OutboundAttachmentError::new(
+                "attachment_unreadable",
+                anyhow!("failed to stat attachment {}: {err}", path.display()),
+            )
+        })?;
         if metadata.file_type().is_symlink() {
-            bail!("attachment {} must not be a symlink", path.display());
+            return Err(OutboundAttachmentError::new(
+                "attachment_unsafe_path",
+                anyhow!("attachment {} must not be a symlink", path.display()),
+            ));
         }
         if !metadata.is_file() {
-            bail!("attachment {} is not a regular file", path.display());
+            return Err(OutboundAttachmentError::new(
+                "attachment_unreadable",
+                anyhow!("attachment {} is not a regular file", path.display()),
+            ));
         }
-        let content = tokio::fs::read(&path)
+        let attachment_bytes = metadata.len();
+        let remaining = max_message_bytes.saturating_sub(total_bytes);
+        if attachment_bytes > remaining {
+            return Err(OutboundAttachmentError::new(
+                "message_too_large",
+                anyhow!(
+                    "attachment {} would exceed EMAIL_MAX_MESSAGE_BYTES ({max_message_bytes} bytes)",
+                    path.display()
+                ),
+            ));
+        }
+        let file = tokio::fs::File::open(&path).await.map_err(|err| {
+            OutboundAttachmentError::new(
+                "attachment_unreadable",
+                anyhow!("failed to open attachment {}: {err}", path.display()),
+            )
+        })?;
+        let mut content = Vec::new();
+        file.take(remaining.saturating_add(1))
+            .read_to_end(&mut content)
             .await
-            .with_context(|| format!("failed to read attachment {}", path.display()))?;
+            .map_err(|err| {
+                OutboundAttachmentError::new(
+                    "attachment_unreadable",
+                    anyhow!("failed to read attachment {}: {err}", path.display()),
+                )
+            })?;
+        let content_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        if content_len > remaining {
+            return Err(OutboundAttachmentError::new(
+                "message_too_large",
+                anyhow!(
+                    "attachment {} grew while reading and exceeded EMAIL_MAX_MESSAGE_BYTES ({max_message_bytes} bytes)",
+                    path.display()
+                ),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(content_len);
         prepared.push(OutboundAttachment {
             filename: attachment
                 .filename
@@ -1199,11 +1273,52 @@ mod tests {
             mime_type: Some("text/plain".to_string()),
         }];
 
-        let prepared = prepare_outbound_attachments(&attachments)
+        let prepared = prepare_outbound_attachments(&attachments, DEFAULT_MAX_MESSAGE_BYTES, 0)
             .await
             .expect("prepare attachments");
 
         assert_eq!(prepared[0].filename, "report Injected: yes.txt");
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_attachment_is_rejected_before_smtp() {
+        let temp_dir = tempdir().expect("temp dir");
+        let path = temp_dir.path().join("too-large.bin");
+        std::fs::write(&path, [0_u8; 17]).expect("write attachment");
+
+        let attachments = vec![ChannelOutboxAttachment {
+            attachment_id: "att-1".to_string(),
+            path: path.display().to_string(),
+            filename: Some("too-large.bin".to_string()),
+            mime_type: Some("application/octet-stream".to_string()),
+        }];
+
+        let err = prepare_outbound_attachments(&attachments, 16, 0)
+            .await
+            .expect_err("oversized attachment should fail before read");
+
+        assert_eq!(err.code, "message_too_large");
+        assert!(err.source.to_string().contains("EMAIL_MAX_MESSAGE_BYTES"));
+    }
+
+    #[tokio::test]
+    async fn outbound_text_and_attachments_share_message_size_budget() {
+        let temp_dir = tempdir().expect("temp dir");
+        let path = temp_dir.path().join("part.bin");
+        std::fs::write(&path, [0_u8; 8]).expect("write attachment");
+
+        let attachments = vec![ChannelOutboxAttachment {
+            attachment_id: "att-1".to_string(),
+            path: path.display().to_string(),
+            filename: Some("part.bin".to_string()),
+            mime_type: Some("application/octet-stream".to_string()),
+        }];
+
+        let err = prepare_outbound_attachments(&attachments, 16, 9)
+            .await
+            .expect_err("text and attachment total should be capped");
+
+        assert_eq!(err.code, "message_too_large");
     }
 
     #[test]
@@ -1760,7 +1875,6 @@ mod tests {
                     from_name: Some("LionClaw".to_string()),
                     fetch_limit: 25,
                     max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
-                    mark_seen_after_admission: true,
                 },
                 digest: DigestConfig {
                     interval: std::time::Duration::from_secs(3600),
