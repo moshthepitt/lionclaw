@@ -242,11 +242,11 @@ channels. The normal operator console, `run --plain`, channel turns, and
 scheduled jobs remain the paths that stream typed runtime events directly into
 LionClaw while a turn is active.
 
-Native TUI mode also does not intercept LionClaw slash controls. Once the TTY
-is attached, first-column commands belong to the selected runtime's own
-interface; operators exit through the runtime's normal exit gesture, such as
-Codex's Ctrl-D. This avoids terminal-editor proxying and keeps runtime command
-semantics out of the kernel.
+Native TUI mode has no LionClaw command layer inside the attached runtime UI.
+Once the TTY is attached, first-column commands belong to the selected
+runtime's own interface; operators exit through the runtime's normal exit
+gesture, such as Codex's Ctrl-D. This avoids terminal-editor proxying and keeps
+runtime command semantics out of the kernel.
 
 ## Runtime Control Commands
 

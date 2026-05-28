@@ -103,9 +103,10 @@ durable runtime state into LionClaw session history on exit. If a prior native
 launch did not finish cleanly, LionClaw reconciles before the next launch; prior
 LionClaw session history is then included in the generated runtime context.
 LionClaw does not scrape terminal output.
-Because this is the runtime's own TUI, LionClaw slash controls such as
-`/lionclaw reset` are not intercepted there; use the normal `lionclaw run`,
-`run --plain`, or channel paths when you need LionClaw-owned controls.
+Because this is the runtime's own TUI, there is no LionClaw command layer
+inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable
+there; use the normal `lionclaw run`, `run --plain`, or channel paths when you
+need LionClaw-owned controls.
 
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,

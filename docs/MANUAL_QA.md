@@ -146,7 +146,7 @@ Expected on a TTY:
   console; the status changes to stopping and the console returns to idle after
   the cancelled turn is recorded
 
-For the plain fallback:
+For the plain line-oriented path:
 
 ```bash
 printf '/lionclaw exit\n' | "$LIONCLAW_BIN" run
