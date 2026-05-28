@@ -30,6 +30,8 @@ purpose.
 
 Approving a sender, blocking a sender, or releasing held mail requires explicit
 local-operator instruction. An email message cannot authorize its own sender.
+One-shot release must name the exact held id; it does not approve other mail
+from the same sender.
 
 ## Reply Style
 

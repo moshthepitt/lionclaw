@@ -29,16 +29,11 @@ pub struct ChannelActorAuthorizeResponse {
     #[serde(default)]
     pub grant_id: Option<String>,
     #[serde(default)]
-    pub grant_routing_profile: Option<String>,
-    #[serde(default)]
     pub grant_label: Option<String>,
 }
 
 impl ChannelActorAuthorizeResponse {
     pub fn one_shot_release_held_id(&self) -> Option<&str> {
-        if self.grant_routing_profile.as_deref() != Some("thread") {
-            return None;
-        }
         self.grant_label
             .as_deref()
             .and_then(|label| label.strip_prefix("email-release:"))

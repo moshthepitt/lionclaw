@@ -270,8 +270,9 @@ Top-level QA checks only the kernel contract shared by channel skills.
 Transport-specific setup, commands, webhook behavior, attachment formats,
 reactions, and delivery rendering belong in the owning channel skill directory.
 Run the relevant owning skill checklist under `skills/` for channel-specific
-behavior. For example, email acceptance lives with `skills/channel-email/`, and
-Telegram acceptance lives with `skills/channel-telegram/`.
+behavior. For example, email acceptance lives in
+`skills/channel-email/README.md`, and Telegram acceptance lives in
+`skills/channel-telegram/README.md`.
 
 When a real credential-backed channel is available, configure it through its
 own skill docs, then record the generic kernel checks here:

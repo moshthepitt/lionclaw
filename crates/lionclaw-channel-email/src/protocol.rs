@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 
 pub const CHANNEL_ID: &str = "email";
-pub const INBOUND_TRIGGER: &str = "command";
+pub const INBOUND_TRIGGER: &str = "dm";
 pub const INBOUND_SESSION_BINDING: &str = "thread_actor";
 const MAX_HEADER_TEXT_CHARS: usize = 512;
 

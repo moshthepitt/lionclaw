@@ -13627,6 +13627,7 @@ fn approved_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
         } => {
             let mut lookups = Vec::new();
             if let Some(sender_ref) = sender_ref {
+                lookups.push(direct_session_grant_lookup(sender_ref));
                 lookups.push(ChannelSessionGrantLookup {
                     sender_ref: Some(sender_ref),
                     conversation_ref: Some(conversation_ref),
@@ -13649,6 +13650,7 @@ fn approved_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
         } => {
             let mut lookups = Vec::new();
             if let Some(sender_ref) = sender_ref {
+                lookups.push(direct_session_grant_lookup(sender_ref));
                 lookups.push(ChannelSessionGrantLookup {
                     sender_ref: Some(sender_ref),
                     conversation_ref: Some(conversation_ref),
