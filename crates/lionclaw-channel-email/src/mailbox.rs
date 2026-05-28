@@ -22,7 +22,7 @@ use crate::{
     mime::{parse_header_facts, HeaderFacts},
     protocol::{
         conversation_ref, event_id, generated_message_id, message_ref, provider_file_ref,
-        sender_ref, stable_message_root, thread_ref,
+        sender_ref, short_hash, stable_message_root, thread_ref,
     },
 };
 
@@ -40,6 +40,34 @@ pub struct CandidateHeader {
     pub attachment_count: usize,
     pub rfc822_size: Option<u32>,
     pub facts: HeaderFacts,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidateHeaderBatch {
+    pub candidates: Vec<CandidateHeader>,
+    pub malformed: Vec<MalformedCandidateHeader>,
+}
+
+impl CandidateHeaderBatch {
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty() && self.malformed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MalformedCandidateHeader {
+    pub uid_validity: u32,
+    pub uid: u32,
+    pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    pub thread_ref: String,
+    pub message_ref: String,
+    pub subject: String,
+    pub snippet: String,
+    pub attachment_count: usize,
+    pub rfc822_size: Option<u32>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,12 +119,16 @@ pub struct OutboundEmail {
 
 #[async_trait]
 pub trait MailboxEngine: Send {
-    async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>>;
+    async fn list_candidate_headers(&mut self) -> Result<CandidateHeaderBatch>;
     async fn fetch_full_message_after_authorize(
         &mut self,
         candidate: &CandidateHeader,
     ) -> Result<FetchedMessage>;
     async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()>;
+    async fn record_malformed_seen_or_processed(
+        &mut self,
+        candidate: &MalformedCandidateHeader,
+    ) -> Result<()>;
     async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value>;
 }
 
@@ -116,6 +148,15 @@ impl MailboxFactory for RealMailboxFactory {
 #[derive(Debug, Clone)]
 pub struct RealMailboxEngine {
     config: MailboxConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeaderCandidateInput<'a> {
+    uid_validity: u32,
+    uid: NonZeroU32,
+    raw_headers: &'a [u8],
+    attachment_count: usize,
+    rfc822_size: Option<u32>,
 }
 
 impl RealMailboxEngine {
@@ -254,27 +295,20 @@ impl RealMailboxEngine {
         }])
     }
 
-    fn candidate_from_headers(
-        &self,
-        uid_validity: u32,
-        uid: NonZeroU32,
-        raw_headers: &[u8],
-        attachment_count: usize,
-        rfc822_size: Option<u32>,
-    ) -> Result<CandidateHeader> {
-        if raw_headers.len() > MAX_CANDIDATE_HEADER_BYTES {
+    fn candidate_from_headers(&self, input: HeaderCandidateInput<'_>) -> Result<CandidateHeader> {
+        if input.raw_headers.len() > MAX_CANDIDATE_HEADER_BYTES {
             return Err(anyhow!(
                 "email candidate headers exceed {MAX_CANDIDATE_HEADER_BYTES} bytes"
             ));
         }
 
-        let facts = parse_header_facts(raw_headers)?;
+        let facts = parse_header_facts(input.raw_headers)?;
         let sender = sender_ref(&facts.sender.address);
         let conversation = conversation_ref(&self.config.mailbox_id);
         let provider = facts
             .message_id
             .clone()
-            .unwrap_or_else(|| format!("imap:{}:{}", uid_validity, uid));
+            .unwrap_or_else(|| format!("imap:{}:{}", input.uid_validity, input.uid));
         let root = stable_message_root(
             facts.message_id.as_deref(),
             facts.in_reply_to.as_deref(),
@@ -284,43 +318,39 @@ impl RealMailboxEngine {
         let thread = thread_ref(&root);
         let message = message_ref(&provider);
         Ok(CandidateHeader {
-            uid_validity,
-            uid: uid.get(),
-            event_id: event_id(&self.config.mailbox_id, uid_validity, uid.get()),
+            uid_validity: input.uid_validity,
+            uid: input.uid.get(),
+            event_id: event_id(&self.config.mailbox_id, input.uid_validity, input.uid.get()),
             sender_ref: sender,
             conversation_ref: conversation,
             thread_ref: thread,
             message_ref: message,
-            attachment_count,
-            rfc822_size,
+            attachment_count: input.attachment_count,
+            rfc822_size: input.rfc822_size,
             facts,
         })
     }
 
     fn push_candidate_from_headers(
         &self,
-        candidates: &mut Vec<CandidateHeader>,
-        uid_validity: u32,
-        uid: NonZeroU32,
-        raw_headers: &[u8],
-        attachment_count: usize,
-        rfc822_size: Option<u32>,
+        batch: &mut CandidateHeaderBatch,
+        input: HeaderCandidateInput<'_>,
     ) -> bool {
-        match self.candidate_from_headers(
-            uid_validity,
-            uid,
-            raw_headers,
-            attachment_count,
-            rfc822_size,
-        ) {
+        match self.candidate_from_headers(input) {
             Ok(candidate) => {
-                candidates.push(candidate);
+                batch.candidates.push(candidate);
                 true
             }
             Err(err) => {
+                batch.malformed.push(self.malformed_candidate_from_uid(
+                    input.uid_validity,
+                    input.uid,
+                    "malformed_headers",
+                    input.rfc822_size,
+                ));
                 warn!(
-                    uid_validity,
-                    uid = uid.get(),
+                    uid_validity = input.uid_validity,
+                    uid = input.uid.get(),
                     error = %err,
                     "skipping email candidate with malformed headers"
                 );
@@ -329,56 +359,59 @@ impl RealMailboxEngine {
         }
     }
 
-    async fn mark_malformed_candidates_processed(
+    fn malformed_candidate_from_uid(
         &self,
-        client: &mut ImapClient,
-        uids: Vec<NonZeroU32>,
-    ) {
-        if uids.is_empty() {
-            return;
-        }
-        let count = uids.len();
-        match SequenceSet::try_from(uids) {
-            Ok(sequence_set) => {
-                if let Err(err) = client
-                    .uid_silent_store(sequence_set, StoreType::Add, [Flag::Seen])
-                    .await
-                {
-                    warn!(
-                        count,
-                        error = %err,
-                        "failed to mark malformed email candidates processed"
-                    );
-                }
-            }
-            Err(err) => warn!(
-                count,
-                error = %err,
-                "failed to build malformed email candidate UID set"
+        uid_validity: u32,
+        uid: NonZeroU32,
+        reason: &str,
+        rfc822_size: Option<u32>,
+    ) -> MalformedCandidateHeader {
+        let event_id = event_id(&self.config.mailbox_id, uid_validity, uid.get());
+        let provider = format!("imap:{}:{}:malformed", uid_validity, uid);
+        let thread_root = format!("malformed:{event_id}");
+        MalformedCandidateHeader {
+            uid_validity,
+            uid: uid.get(),
+            event_id,
+            sender_ref: format!(
+                "email:malformed:{}",
+                short_hash(&format!(
+                    "{}:{}:{}",
+                    self.config.mailbox_id,
+                    uid_validity,
+                    uid.get()
+                ))
             ),
+            conversation_ref: conversation_ref(&self.config.mailbox_id),
+            thread_ref: thread_ref(&thread_root),
+            message_ref: message_ref(&provider),
+            subject: "(malformed headers)".to_string(),
+            snippet: "Header facts could not be parsed; body was not downloaded.".to_string(),
+            attachment_count: 0,
+            rfc822_size,
+            reason: reason.to_string(),
         }
     }
 }
 
 #[async_trait]
 impl MailboxEngine for RealMailboxEngine {
-    async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
-        let (mut client, uid_validity) = self.selected_imap(false).await?;
+    async fn list_candidate_headers(&mut self) -> Result<CandidateHeaderBatch> {
+        let (mut client, uid_validity) = self.selected_imap(true).await?;
         let mut uids = client
             .uid_search([SearchKey::Unseen])
             .await
             .context("failed to search IMAP mailbox")?;
         order_candidate_uids(&mut uids, self.config.fetch_limit);
         if uids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CandidateHeaderBatch::default());
         }
         let sequence_set = SequenceSet::try_from(uids.clone())?;
         let fetched = client
             .uid_fetch(sequence_set, Self::header_fetch_items())
             .await
             .context("failed to fetch IMAP message headers")?;
-        let mut candidates = Vec::new();
-        let mut malformed_uids = Vec::new();
+        let mut batch = CandidateHeaderBatch::default();
         for uid in uids {
             let Some(items) = fetched.get(&uid) else {
                 continue;
@@ -389,26 +422,28 @@ impl MailboxEngine for RealMailboxEngine {
                     uid = uid.get(),
                     "skipping email candidate with missing fetched headers"
                 );
-                malformed_uids.push(uid);
+                batch.malformed.push(self.malformed_candidate_from_uid(
+                    uid_validity,
+                    uid,
+                    "missing_headers",
+                    rfc822_size(items.as_ref()),
+                ));
                 continue;
             };
             let attachment_count = bodystructure_attachment_count(items.as_ref());
             let rfc822_size = rfc822_size(items.as_ref());
-            let added = self.push_candidate_from_headers(
-                &mut candidates,
-                uid_validity,
-                uid,
-                &raw_headers,
-                attachment_count,
-                rfc822_size,
+            self.push_candidate_from_headers(
+                &mut batch,
+                HeaderCandidateInput {
+                    uid_validity,
+                    uid,
+                    raw_headers: &raw_headers,
+                    attachment_count,
+                    rfc822_size,
+                },
             );
-            if !added {
-                malformed_uids.push(uid);
-            }
         }
-        self.mark_malformed_candidates_processed(&mut client, malformed_uids)
-            .await;
-        Ok(candidates)
+        Ok(batch)
     }
 
     async fn fetch_full_message_after_authorize(
@@ -442,6 +477,38 @@ impl MailboxEngine for RealMailboxEngine {
             )
             .await
             .context("failed to mark IMAP message seen")?;
+        Ok(())
+    }
+
+    async fn record_malformed_seen_or_processed(
+        &mut self,
+        candidate: &MalformedCandidateHeader,
+    ) -> Result<()> {
+        let mut client = self.imap().await?;
+        let selected = client
+            .select(self.config.imap_mailbox.as_str())
+            .await
+            .context("failed to select IMAP mailbox")?;
+        let uid_validity = selected
+            .uid_validity
+            .map(NonZeroU32::get)
+            .ok_or_else(|| anyhow!("IMAP server did not return UIDVALIDITY"))?;
+        if uid_validity != candidate.uid_validity {
+            return Err(StaleMailboxCandidate {
+                expected_uid_validity: candidate.uid_validity,
+                actual_uid_validity: uid_validity,
+            }
+            .into());
+        }
+        let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
+        client
+            .uid_silent_store(
+                SequenceSet::try_from(vec![uid])?,
+                StoreType::Add,
+                [Flag::Seen],
+            )
+            .await
+            .context("failed to mark malformed IMAP message seen")?;
         Ok(())
     }
 
@@ -600,30 +667,39 @@ mod tests {
         let engine = RealMailboxEngine {
             config: test_mailbox_config(),
         };
-        let mut candidates = Vec::new();
+        let mut batch = CandidateHeaderBatch::default();
 
         let malformed_added = engine.push_candidate_from_headers(
-            &mut candidates,
-            7,
-            NonZeroU32::new(41).expect("nonzero uid"),
-            b"Subject: Missing sender\r\n\r\n",
-            0,
-            Some(128),
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(41).expect("nonzero uid"),
+                raw_headers: b"Subject: Missing sender\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            },
         );
         let well_formed_added = engine.push_candidate_from_headers(
-            &mut candidates,
-            7,
-            NonZeroU32::new(42).expect("nonzero uid"),
-            b"From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
-            0,
-            Some(256),
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers: b"From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(256),
+            },
         );
 
         assert!(!malformed_added);
         assert!(well_formed_added);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].uid, 42);
-        assert_eq!(candidates[0].sender_ref, "email:addr:alice@example.com");
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.malformed.len(), 1);
+        assert_eq!(batch.malformed[0].reason, "malformed_headers");
+        assert_eq!(batch.candidates[0].uid, 42);
+        assert_eq!(
+            batch.candidates[0].sender_ref,
+            "email:addr:alice@example.com"
+        );
     }
 
     #[test]
@@ -634,19 +710,23 @@ mod tests {
         let mut raw_headers = b"From: Alice <alice@example.com>\r\nSubject: ".to_vec();
         raw_headers.extend(vec![b'x'; MAX_CANDIDATE_HEADER_BYTES]);
         raw_headers.extend_from_slice(b"\r\n\r\n");
-        let mut candidates = Vec::new();
+        let mut batch = CandidateHeaderBatch::default();
 
         let added = engine.push_candidate_from_headers(
-            &mut candidates,
-            7,
-            NonZeroU32::new(42).expect("nonzero uid"),
-            &raw_headers,
-            0,
-            Some(128),
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers: &raw_headers,
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            },
         );
 
         assert!(!added);
-        assert!(candidates.is_empty());
+        assert!(batch.candidates.is_empty());
+        assert_eq!(batch.malformed.len(), 1);
+        assert_eq!(batch.malformed[0].reason, "malformed_headers");
     }
 
     #[test]
@@ -682,22 +762,23 @@ mod tests {
             config: test_mailbox_config(),
         };
         let first = engine
-            .candidate_from_headers(
-                7,
-                NonZeroU32::new(41).expect("nonzero uid"),
-                b"From: Alice <alice@example.com>\r\nSubject: First\r\n\r\n",
-                0,
-                Some(128),
-            )
+            .candidate_from_headers(HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(41).expect("nonzero uid"),
+                raw_headers: b"From: Alice <alice@example.com>\r\nSubject: First\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            })
             .expect("first candidate");
         let second = engine
-            .candidate_from_headers(
-                7,
-                NonZeroU32::new(42).expect("nonzero uid"),
-                b"From: Alice <alice@example.com>\r\nSubject: Second\r\nMessage-ID: <>\r\n\r\n",
-                0,
-                Some(128),
-            )
+            .candidate_from_headers(HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers:
+                    b"From: Alice <alice@example.com>\r\nSubject: Second\r\nMessage-ID: <>\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            })
             .expect("second candidate");
 
         assert_ne!(first.thread_ref, second.thread_ref);

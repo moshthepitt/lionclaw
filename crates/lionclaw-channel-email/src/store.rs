@@ -13,7 +13,7 @@ use sqlx::{
 };
 
 use crate::{
-    mailbox::CandidateHeader,
+    mailbox::{CandidateHeader, MalformedCandidateHeader},
     mime::{EmailAddress, HeaderFacts},
 };
 
@@ -206,12 +206,33 @@ impl EmailStore {
             return Ok(None);
         };
         let status: String = row.try_get("status")?;
-        Ok(match status.as_str() {
-            "held" => Some(MailStatus::Held),
-            "suppressed" => Some(MailStatus::Suppressed),
-            "admitted" => Some(MailStatus::Admitted),
-            other => bail!("unknown email mail status '{other}' for event {event_id}"),
-        })
+        Ok(Some(parse_mail_status(&status, event_id)?))
+    }
+
+    pub async fn mail_status_by_message_ref(
+        &self,
+        message_ref: &str,
+        except_event_id: &str,
+    ) -> Result<Option<MailStatus>> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT event_id, status
+            FROM mail_items
+            WHERE message_ref = ? AND event_id != ?
+            ORDER BY created_at ASC, event_id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(message_ref)
+        .bind(except_event_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let event_id: String = row.try_get("event_id")?;
+        let status: String = row.try_get("status")?;
+        Ok(Some(parse_mail_status(&status, &event_id)?))
     }
 
     pub async fn held_candidates(&self, limit: i64) -> Result<Vec<CandidateHeader>> {
@@ -253,6 +274,61 @@ impl EmailStore {
     pub async fn record_suppressed(&self, candidate: &CandidateHeader, reason: &str) -> Result<()> {
         self.upsert_mail(candidate, None, MailStatus::Suppressed, "", Some(reason))
             .await
+    }
+
+    pub async fn record_malformed_suppressed(
+        &self,
+        candidate: &MalformedCandidateHeader,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO mail_items (
+                event_id, held_id, status, uid_validity, uid, sender_ref, sender_address,
+                sender_name, conversation_ref, thread_ref, message_ref, subject, snippet,
+                received_at, attachment_count, rfc822_size, classification_reason,
+                provider_message_id, in_reply_to, references_json, created_at, updated_at
+            )
+            VALUES (?, NULL, 'suppressed', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, '[]', ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                held_id=NULL,
+                status=excluded.status,
+                sender_ref=excluded.sender_ref,
+                sender_address=excluded.sender_address,
+                sender_name=NULL,
+                conversation_ref=excluded.conversation_ref,
+                thread_ref=excluded.thread_ref,
+                message_ref=excluded.message_ref,
+                subject=excluded.subject,
+                snippet=excluded.snippet,
+                received_at=NULL,
+                attachment_count=excluded.attachment_count,
+                rfc822_size=COALESCE(excluded.rfc822_size, mail_items.rfc822_size),
+                classification_reason=excluded.classification_reason,
+                provider_message_id=NULL,
+                in_reply_to=NULL,
+                references_json='[]',
+                updated_at=excluded.updated_at
+            "#,
+        )
+        .bind(&candidate.event_id)
+        .bind(i64::from(candidate.uid_validity))
+        .bind(i64::from(candidate.uid))
+        .bind(&candidate.sender_ref)
+        .bind("(unknown)")
+        .bind(&candidate.conversation_ref)
+        .bind(&candidate.thread_ref)
+        .bind(&candidate.message_ref)
+        .bind(&candidate.subject)
+        .bind(&candidate.snippet)
+        .bind(candidate.attachment_count as i64)
+        .bind(candidate.rfc822_size.map(i64::from))
+        .bind(&candidate.reason)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn record_admitted(&self, candidate: &CandidateHeader, snippet: &str) -> Result<()> {
@@ -584,6 +660,15 @@ pub fn held_id_for(event_id: &str) -> String {
     format!("hld_{}", crate::protocol::short_hash(event_id))
 }
 
+fn parse_mail_status(status: &str, event_id: &str) -> Result<MailStatus> {
+    match status {
+        "held" => Ok(MailStatus::Held),
+        "suppressed" => Ok(MailStatus::Suppressed),
+        "admitted" => Ok(MailStatus::Admitted),
+        other => bail!("unknown email mail status '{other}' for event {event_id}"),
+    }
+}
+
 fn ensure_state_dir(state_dir: &Path) -> Result<()> {
     if state_dir.as_os_str().is_empty() {
         bail!("email state dir is required");
@@ -731,7 +816,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        mailbox::CandidateHeader,
+        mailbox::{CandidateHeader, MalformedCandidateHeader},
         mime::parse_headers_for_test,
         protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
     };
@@ -955,6 +1040,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn message_ref_status_lookup_finds_prior_provider_message() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let original = candidate(1);
+        let mut copied = candidate(2);
+        copied.message_ref.clone_from(&original.message_ref);
+        store
+            .record_admitted(&original, "downloaded")
+            .await
+            .expect("record original");
+
+        assert_eq!(
+            store
+                .mail_status_by_message_ref(&copied.message_ref, &copied.event_id)
+                .await
+                .expect("lookup copied"),
+            Some(MailStatus::Admitted)
+        );
+        assert_eq!(
+            store
+                .mail_status_by_message_ref(&original.message_ref, &original.event_id)
+                .await
+                .expect("lookup self excluded"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_candidates_are_persisted_as_suppressed_mail() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let malformed = malformed_candidate(9);
+
+        store
+            .record_malformed_suppressed(&malformed)
+            .await
+            .expect("record malformed");
+
+        assert_eq!(
+            store
+                .mail_status(&malformed.event_id)
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+        let row = sqlx::query(
+            "SELECT sender_ref, sender_address, classification_reason FROM mail_items WHERE event_id = ?",
+        )
+        .bind(&malformed.event_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("mail item");
+        assert_eq!(
+            row.try_get::<String, _>("sender_ref").expect("sender_ref"),
+            malformed.sender_ref
+        );
+        assert_eq!(
+            row.try_get::<String, _>("sender_address")
+                .expect("sender_address"),
+            "(unknown)"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("classification_reason")
+                .expect("classification_reason"),
+            malformed.reason
+        );
+    }
+
     async fn record_held_for_digest(store: &EmailStore, candidate: &CandidateHeader) {
         store
             .record_held(
@@ -984,6 +1138,24 @@ mod tests {
             attachment_count: 0,
             rfc822_size: Some(headers.len() as u32),
             facts,
+        }
+    }
+
+    fn malformed_candidate(index: u32) -> MalformedCandidateHeader {
+        let event_id = format!("email:imap:assistant:7:{index}");
+        MalformedCandidateHeader {
+            uid_validity: 7,
+            uid: index,
+            event_id: event_id.clone(),
+            sender_ref: format!("email:malformed:{index}"),
+            conversation_ref: conversation_ref("assistant"),
+            thread_ref: thread_ref(&format!("malformed:{event_id}")),
+            message_ref: message_ref(&format!("imap:7:{index}:malformed")),
+            subject: "(malformed headers)".to_string(),
+            snippet: "Header facts could not be parsed; body was not downloaded.".to_string(),
+            attachment_count: 0,
+            rfc822_size: Some(128),
+            reason: "malformed_headers".to_string(),
         }
     }
 }

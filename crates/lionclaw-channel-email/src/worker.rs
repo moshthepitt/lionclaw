@@ -21,7 +21,7 @@ use crate::{
     config::{validate_max_message_bytes, WorkerConfig},
     mailbox::{
         attachment_provider_ref, is_stale_mailbox_candidate, CandidateHeader, MailboxEngine,
-        MailboxFactory, OutboundAttachment, OutboundEmail,
+        MailboxFactory, MalformedCandidateHeader, OutboundAttachment, OutboundEmail,
     },
     mime::{
         attachment_summary, parse_full_message, require_nonempty_body, ParsedAttachment,
@@ -126,17 +126,29 @@ where
         mailbox: &mut dyn MailboxEngine,
         worker_id: &str,
     ) -> Result<()> {
-        let candidates = mailbox.list_candidate_headers().await?;
-        if candidates.is_empty() {
+        let batch = mailbox.list_candidate_headers().await?;
+        if batch.is_empty() {
             debug!("email inbox has no unread candidate headers");
             return Ok(());
         }
 
         info!(
-            count = candidates.len(),
+            candidates = batch.candidates.len(),
+            malformed = batch.malformed.len(),
             "processing email candidate headers"
         );
-        for candidate in candidates {
+        for malformed in batch.malformed {
+            if let Err(err) = process_malformed_candidate(store, mailbox, &malformed).await {
+                warn!(
+                    event_id = %malformed.event_id,
+                    sender_ref = %malformed.sender_ref,
+                    error = %err,
+                    "failed to process malformed email candidate"
+                );
+            }
+        }
+
+        for candidate in batch.candidates {
             let status = store.mail_status(&candidate.event_id).await?;
             match status {
                 Some(MailStatus::Admitted | MailStatus::Suppressed) => {
@@ -151,6 +163,15 @@ where
                     continue;
                 }
                 Some(MailStatus::Held) | None => {}
+            }
+            if status.is_none()
+                && store
+                    .mail_status_by_message_ref(&candidate.message_ref, &candidate.event_id)
+                    .await?
+                    .is_some()
+            {
+                suppress_candidate(store, mailbox, &candidate, "duplicate_message_ref").await?;
+                continue;
             }
             if let Err(err) = self
                 .process_candidate(
@@ -903,6 +924,31 @@ async fn suppress_candidate(
     }
 }
 
+async fn process_malformed_candidate(
+    store: &EmailStore,
+    mailbox: &mut dyn MailboxEngine,
+    candidate: &MalformedCandidateHeader,
+) -> Result<()> {
+    match store.mail_status(&candidate.event_id).await? {
+        Some(MailStatus::Admitted | MailStatus::Suppressed) => {}
+        Some(MailStatus::Held) | None => store.record_malformed_suppressed(candidate).await?,
+    }
+
+    match mailbox.record_malformed_seen_or_processed(candidate).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_stale_mailbox_candidate(&err) => {
+            warn!(
+                event_id = %candidate.event_id,
+                sender_ref = %candidate.sender_ref,
+                error = %err,
+                "malformed email candidate became stale before it could be marked processed"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn mark_held_candidate_processed(
     store: &EmailStore,
     mailbox: &mut dyn MailboxEngine,
@@ -1300,7 +1346,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{DigestConfig, ImapTlsMode, MailboxConfig, DEFAULT_MAX_MESSAGE_BYTES},
-        mailbox::{FetchedMessage, MailboxFactory, StaleMailboxCandidate},
+        mailbox::{CandidateHeaderBatch, FetchedMessage, MailboxFactory, StaleMailboxCandidate},
         mime::parse_headers_for_test,
         protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
     };
@@ -1603,6 +1649,62 @@ mod tests {
         );
         let event_id = candidate.event_id.clone();
         let fixture = EmailFixture::with_candidate(false, candidate, full_message()).await;
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store.mail_status(&event_id).await.expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn copied_provider_message_is_suppressed_without_requeueing() {
+        let original = candidate();
+        let duplicate = candidate_with_uid(43);
+        let duplicate_event_id = duplicate.event_id.clone();
+        let fixture = EmailFixture::with_candidate(true, duplicate, full_message()).await;
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        store
+            .record_admitted(&original, "downloaded")
+            .await
+            .expect("record original");
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        assert_eq!(
+            store
+                .mail_status(&duplicate_event_id)
+                .await
+                .expect("duplicate status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_header_candidate_is_persisted_before_marking_seen() {
+        let malformed = malformed_candidate(44);
+        let event_id = malformed.event_id.clone();
+        let fixture = EmailFixture::new(true).await;
+        fixture.mailbox.set_candidates(Vec::new());
+        fixture.mailbox.set_malformed_candidates(vec![malformed]);
 
         EmailWorker::new(fixture.config(), fixture.mailbox.clone())
             .expect("worker")
@@ -2149,6 +2251,7 @@ mod tests {
                 state: Arc::new(FakeMailboxState {
                     candidate,
                     override_candidates: Mutex::new(None),
+                    override_malformed: Mutex::new(None),
                     raw,
                     stale_uid_validity: AtomicBool::new(false),
                     full_fetches: AtomicUsize::new(0),
@@ -2170,6 +2273,10 @@ mod tests {
             *self.state.override_candidates.lock().unwrap() = Some(candidates);
         }
 
+        fn set_malformed_candidates(&self, candidates: Vec<MalformedCandidateHeader>) {
+            *self.state.override_malformed.lock().unwrap() = Some(candidates);
+        }
+
         fn set_stale_uid_validity(&self, stale: bool) {
             self.state.stale_uid_validity.store(stale, Ordering::SeqCst);
         }
@@ -2182,6 +2289,7 @@ mod tests {
     struct FakeMailboxState {
         candidate: CandidateHeader,
         override_candidates: Mutex<Option<Vec<CandidateHeader>>>,
+        override_malformed: Mutex<Option<Vec<MalformedCandidateHeader>>>,
         raw: Vec<u8>,
         stale_uid_validity: AtomicBool,
         full_fetches: AtomicUsize,
@@ -2203,14 +2311,25 @@ mod tests {
 
     #[async_trait]
     impl MailboxEngine for FakeMailbox {
-        async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
-            Ok(self
+        async fn list_candidate_headers(&mut self) -> Result<CandidateHeaderBatch> {
+            let candidates = self
                 .state
                 .override_candidates
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| vec![self.state.candidate.clone()]))
+                .unwrap_or_else(|| vec![self.state.candidate.clone()]);
+            let malformed = self
+                .state
+                .override_malformed
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            Ok(CandidateHeaderBatch {
+                candidates,
+                malformed,
+            })
         }
 
         async fn fetch_full_message_after_authorize(
@@ -2218,7 +2337,7 @@ mod tests {
             candidate: &CandidateHeader,
         ) -> Result<FetchedMessage> {
             if self.state.stale_uid_validity.load(Ordering::SeqCst) {
-                return Err(stale_uid_validity_error(candidate));
+                return Err(stale_uid_validity_error(candidate.uid_validity));
             }
             self.state.full_fetches.fetch_add(1, Ordering::SeqCst);
             Ok(FetchedMessage {
@@ -2228,7 +2347,18 @@ mod tests {
 
         async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()> {
             if self.state.stale_uid_validity.load(Ordering::SeqCst) {
-                return Err(stale_uid_validity_error(candidate));
+                return Err(stale_uid_validity_error(candidate.uid_validity));
+            }
+            self.state.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn record_malformed_seen_or_processed(
+            &mut self,
+            candidate: &MalformedCandidateHeader,
+        ) -> Result<()> {
+            if self.state.stale_uid_validity.load(Ordering::SeqCst) {
+                return Err(stale_uid_validity_error(candidate.uid_validity));
             }
             self.state.seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -2248,6 +2378,13 @@ mod tests {
         candidate_from_headers(
             "From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
         )
+    }
+
+    fn candidate_with_uid(uid: u32) -> CandidateHeader {
+        let mut candidate = candidate();
+        candidate.uid = uid;
+        candidate.event_id = format!("email:imap:assistant-example-com:7:{uid}");
+        candidate
     }
 
     fn candidate_from_headers(raw_headers: &str) -> CandidateHeader {
@@ -2280,10 +2417,28 @@ mod tests {
         candidate
     }
 
-    fn stale_uid_validity_error(candidate: &CandidateHeader) -> anyhow::Error {
+    fn malformed_candidate(uid: u32) -> MalformedCandidateHeader {
+        let event_id = format!("email:imap:assistant-example-com:7:{uid}");
+        MalformedCandidateHeader {
+            uid_validity: 7,
+            uid,
+            event_id: event_id.clone(),
+            sender_ref: format!("email:malformed:{uid}"),
+            conversation_ref: conversation_ref("assistant-example-com"),
+            thread_ref: thread_ref(&format!("malformed:{event_id}")),
+            message_ref: message_ref(&format!("imap:7:{uid}:malformed")),
+            subject: "(malformed headers)".to_string(),
+            snippet: "Header facts could not be parsed; body was not downloaded.".to_string(),
+            attachment_count: 0,
+            rfc822_size: Some(128),
+            reason: "malformed_headers".to_string(),
+        }
+    }
+
+    fn stale_uid_validity_error(uid_validity: u32) -> anyhow::Error {
         StaleMailboxCandidate {
-            expected_uid_validity: candidate.uid_validity,
-            actual_uid_validity: candidate.uid_validity + 1,
+            expected_uid_validity: uid_validity,
+            actual_uid_validity: uid_validity + 1,
         }
         .into()
     }
