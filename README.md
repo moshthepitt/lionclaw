@@ -99,9 +99,12 @@ sandbox/approval layer; the runtime-private Codex config marks the container
 workspace as trusted so project-local Codex config and hooks behave like an
 approved native Codex launch without importing or mutating the host Codex
 config. Completed Codex and OpenCode native UI turns are reconciled from
-durable runtime state into LionClaw session history on exit. If a prior native
-launch did not finish cleanly, LionClaw reconciles before the next launch; prior
-LionClaw session history is then included in the generated runtime context.
+durable runtime state into LionClaw session history on exit. OpenCode receives
+its runtime config under `/runtime` and starts with its auto-update prompt
+disabled, so runtime updates stay under LionClaw's runtime image path. If a
+prior native launch did not finish cleanly, LionClaw reconciles before the next
+launch; prior LionClaw session history is then included in the generated
+runtime context.
 LionClaw does not scrape terminal output.
 Because this is the runtime's own TUI, there is no LionClaw command layer
 inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable

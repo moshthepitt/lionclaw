@@ -179,6 +179,7 @@ Expected:
 - Codex shows `/workspace` as the directory and no inner Codex sandbox or
   workspace-trust prompt
 - OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
+  without showing an auto-update prompt
 - the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events

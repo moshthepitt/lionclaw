@@ -217,10 +217,11 @@ LionClaw also materializes the runtime-private Codex config with
 own workspace prompt inside the container while keeping runtime updates under
 LionClaw's runtime image/update path. The host Codex home is not mutated.
 
-For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime`. OpenCode's
-native instruction loader then reads `/runtime/AGENTS.md` as global runtime
-instructions while project-level `.opencode` and `AGENTS.md` files remain
-project-owned.
+For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime` and sets
+`OPENCODE_DISABLE_AUTOUPDATE=1`. OpenCode's native instruction loader then
+reads `/runtime/AGENTS.md` as global runtime instructions while project-level
+`.opencode` and `AGENTS.md` files remain project-owned. Runtime updates stay
+under LionClaw's runtime image/update path.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex exports completed turns

@@ -279,10 +279,13 @@ fn build_opencode_export_program(
 }
 
 fn opencode_runtime_environment() -> Vec<(String, String)> {
-    vec![(
-        "OPENCODE_CONFIG_DIR".to_string(),
-        OPENCODE_RUNTIME_CONFIG_DIR.to_string(),
-    )]
+    vec![
+        (
+            "OPENCODE_CONFIG_DIR".to_string(),
+            OPENCODE_RUNTIME_CONFIG_DIR.to_string(),
+        ),
+        ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
+    ]
 }
 
 fn opencode_transcript_export_environment() -> Vec<(String, String)> {
@@ -905,7 +908,10 @@ mod tests {
         );
         assert_eq!(
             program.environment,
-            vec![("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string())]
+            vec![
+                ("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string()),
+                ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
+            ]
         );
         assert!(program.stdin.is_empty());
         assert!(program.auth.is_none());
@@ -1046,6 +1052,7 @@ mod tests {
             executor.programs[0].environment,
             vec![
                 ("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string()),
+                ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
                 ("OPENCODE_PURE".to_string(), "1".to_string()),
             ]
         );
@@ -1053,6 +1060,7 @@ mod tests {
             executor.programs[1].environment,
             vec![
                 ("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string()),
+                ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
                 ("OPENCODE_PURE".to_string(), "1".to_string()),
             ]
         );
