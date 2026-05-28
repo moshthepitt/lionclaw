@@ -298,6 +298,8 @@ EMAIL_SMTP_HOST=smtp.example.com
 EMAIL_SMTP_USERNAME=assistant@example.com
 EMAIL_SMTP_PASSWORD=...
 EMAIL_ADMIN_DIGEST_TO=operator@example.com
+# Optional: defaults to 50 MiB.
+EMAIL_MAX_MESSAGE_BYTES=52428800
 EOF
 "$LIONCLAW_BIN" connect email --env-file ./email.env
 "$LIONCLAW_BIN" doctor
@@ -316,6 +318,8 @@ Expected when credentials are available:
 - a thread-scoped grant labeled `email-release:<held-id>` releases that held
   item once and the worker revokes the grant after admission
 - automated/list/bounce/no-reply mail is suppressed without auto-reply
+- approved mail above `EMAIL_MAX_MESSAGE_BYTES` is suppressed without runtime
+  work
 - attachments are staged only after admission
 - repeated outbox delivery attempts do not send duplicate SMTP replies
 

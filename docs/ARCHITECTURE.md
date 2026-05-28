@@ -551,15 +551,16 @@ attachment.
 
 The Email channel is a strict-whitelist work-inbox skill. Its worker owns IMAP,
 SMTP, mailbox credentials, local held-mail state, and provider-specific email
-handling. It fetches only IMAP envelope/header facts and `BODYSTRUCTURE` before
-calling `/v0/channels/authorize`; full MIME bodies and attachments are fetched
-only after the core grants the sender/thread. Unknown senders are held with
-metadata only, automated/bulk/list mail is suppressed locally, and admitted
-messages are posted through the existing channel inbound and attachment
-endpoints with first-class `thread_ref` and `reply_to_ref` fields. The channel
-also publishes a runtime-facing Agent Skill at `runtime/email/`, so runtimes
-learn how to handle email turns without receiving the host-side channel package
-or mailbox credentials.
+handling. It fetches only IMAP envelope/header facts, `BODYSTRUCTURE`, and
+`RFC822.SIZE` before calling `/v0/channels/authorize`; full MIME bodies and
+attachments are fetched only after the core grants the sender/thread and only
+within the worker's configured message-size cap. Unknown senders are held with
+metadata only, automated/bulk/list mail is suppressed locally, oversized mail is
+suppressed without runtime work, and admitted messages are posted through the
+existing channel inbound and attachment endpoints with first-class `thread_ref`
+and `reply_to_ref` fields. The channel also publishes a runtime-facing Agent
+Skill at `runtime/email/`, so runtimes learn how to handle email turns without
+receiving the host-side channel package or mailbox credentials.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill

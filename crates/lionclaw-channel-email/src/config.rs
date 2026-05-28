@@ -8,6 +8,7 @@ const DEFAULT_POLL_MS: u64 = 30_000;
 const DEFAULT_PULL_LIMIT: usize = 10;
 const DEFAULT_LEASE_MS: u64 = 120_000;
 const DEFAULT_FETCH_LIMIT: usize = 25;
+pub(crate) const DEFAULT_MAX_MESSAGE_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_DIGEST_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub struct MailboxConfig {
     pub smtp_password: String,
     pub from_name: Option<String>,
     pub fetch_limit: usize,
+    pub max_message_bytes: usize,
     pub mark_seen_after_admission: bool,
 }
 
@@ -71,6 +73,9 @@ impl WorkerCommand {
         let mut pull_limit = env_usize("EMAIL_OUTBOX_PULL_LIMIT")?.unwrap_or(DEFAULT_PULL_LIMIT);
         let mut lease_ms = env_u64("EMAIL_OUTBOX_LEASE_MS")?.unwrap_or(DEFAULT_LEASE_MS);
         let mut fetch_limit = env_usize("EMAIL_FETCH_LIMIT")?.unwrap_or(DEFAULT_FETCH_LIMIT);
+        let max_message_bytes =
+            env_usize("EMAIL_MAX_MESSAGE_BYTES")?.unwrap_or(DEFAULT_MAX_MESSAGE_BYTES);
+        validate_max_message_bytes(max_message_bytes)?;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -159,6 +164,7 @@ impl WorkerCommand {
                 smtp_password: required_env("EMAIL_SMTP_PASSWORD")?,
                 from_name: optional_env("EMAIL_FROM_NAME"),
                 fetch_limit,
+                max_message_bytes,
                 mark_seen_after_admission: env_bool("EMAIL_MARK_SEEN_AFTER_ADMISSION")?
                     .unwrap_or(true),
             },
@@ -241,6 +247,16 @@ fn parse_imap_tls(raw: Option<&str>, port: u16) -> Result<ImapTlsMode> {
         None if port == 143 => Ok(ImapTlsMode::StartTls),
         None => Ok(ImapTlsMode::Implicit),
     }
+}
+
+pub(crate) fn validate_max_message_bytes(value: usize) -> Result<()> {
+    if value == 0 {
+        bail!("EMAIL_MAX_MESSAGE_BYTES must be greater than zero");
+    }
+    if value >= u32::MAX as usize {
+        bail!("EMAIL_MAX_MESSAGE_BYTES must be less than {}", u32::MAX);
+    }
+    Ok(())
 }
 
 fn parse_next_u64(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64> {
