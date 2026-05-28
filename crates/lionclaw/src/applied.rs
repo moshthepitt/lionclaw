@@ -87,6 +87,14 @@ impl AppliedState {
     }
 
     pub fn runtime_visible_skills(&self) -> Vec<AppliedSkill> {
+        self.runtime_visible_skills_for(RuntimeSkillSurface::ProgramBackedTurn)
+    }
+
+    pub(crate) fn attached_runtime_visible_skills(&self) -> Vec<AppliedSkill> {
+        self.runtime_visible_skills_for(RuntimeSkillSurface::AttachedNativeUi)
+    }
+
+    fn runtime_visible_skills_for(&self, surface: RuntimeSkillSurface) -> Vec<AppliedSkill> {
         let host_only_aliases = self
             .channels
             .iter()
@@ -96,7 +104,10 @@ impl AppliedState {
             .iter()
             .filter_map(|skill| {
                 if host_only_aliases.contains(skill.alias.as_str()) {
-                    skill.runtime_facet_projection()
+                    match surface {
+                        RuntimeSkillSurface::ProgramBackedTurn => skill.runtime_facet_projection(),
+                        RuntimeSkillSurface::AttachedNativeUi => None,
+                    }
                 } else {
                     Some(skill.clone())
                 }
@@ -133,6 +144,12 @@ impl AppliedState {
             channels_by_id,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeSkillSurface {
+    ProgramBackedTurn,
+    AttachedNativeUi,
 }
 
 struct AppliedStateInputs {

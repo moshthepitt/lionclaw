@@ -210,6 +210,8 @@ Expected:
 - LionClaw slash controls such as `/lionclaw retry`, `/lionclaw reset`, and
   `/lionclaw exit` are not available inside `run --runtime-tui`; exit through
   the runtime's native exit gesture
+- turn-scoped LionClaw bridges such as runtime `channel.send` are not exposed
+  inside `run --runtime-tui`
 
 ## Phase 3: Instances And Work Roots
 

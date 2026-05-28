@@ -106,7 +106,9 @@ LionClaw does not scrape terminal output.
 Because this is the runtime's own TUI, there is no LionClaw command layer
 inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable
 there; use the normal `lionclaw run`, `run --plain`, or channel paths when you
-need LionClaw-owned controls.
+need LionClaw-owned controls. Turn-scoped LionClaw features that require an
+active kernel-managed turn, such as the program-backed `channel.send` bridge,
+are not projected into native runtime TUI sessions.
 
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,

@@ -244,7 +244,9 @@ interactive session.
 Native TUI mode does not provide typed live answer/reasoning events to
 channels. The normal operator console, `run --plain`, channel turns, and
 scheduled jobs remain the paths that stream typed runtime events directly into
-LionClaw while a turn is active.
+LionClaw while a turn is active. Runtime skill facets that depend on an active
+LionClaw turn bridge, such as channel-bound `channel.send` facets, are not
+projected into native TUI sessions.
 
 Native TUI mode has no LionClaw command layer inside the attached runtime UI.
 Once the TTY is attached, first-column commands belong to the selected
@@ -303,8 +305,8 @@ kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
 at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
 environment variable and usable socket are absent. The bridge is valid only
 while the runtime turn is active; turn completion or timeout removes the socket
-and invalidates open connections. Native runtime controls do not receive this
-bridge.
+and invalidates open connections. Native runtime controls and native runtime
+TUI sessions do not receive this bridge.
 
 The host socket is created under the operator's short per-user runtime directory
 rather than under the instance home, so long project paths do not exceed Unix

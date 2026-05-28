@@ -764,9 +764,7 @@ impl Kernel {
         let RuntimeExecutionSkills {
             mounts: skill_mounts,
             ..
-        } = self
-            .resolve_runtime_execution_skills(RuntimeTurnMode::ProgramBacked)
-            .await?;
+        } = self.resolve_attached_runtime_execution_skills().await?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
                 session_id,
@@ -6689,7 +6687,7 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::Path,
         sync::{
@@ -7328,6 +7326,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_runtime_skills_exclude_channel_runtime_facets() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let skill_dir = write_installed_skill(&home, "team-local", "team-local channel").await;
+        write_runtime_skill_facet(&skill_dir, "team-local", "team-local sender").await;
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "team-local".to_string(),
+            skill: "team-local".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
+            required_env: Vec::new(),
+            contact: None,
+        });
+        config.save(&home).await.expect("save config");
+        let kernel = kernel_with_home(&home).await;
+
+        let turn_skills = kernel
+            .resolve_runtime_execution_skills(RuntimeTurnMode::ProgramBacked)
+            .await
+            .expect("resolve program-backed skills");
+        let attached_skills = kernel
+            .resolve_attached_runtime_execution_skills()
+            .await
+            .expect("resolve attached runtime skills");
+
+        assert!(turn_skills
+            .mounts
+            .iter()
+            .any(|mount| mount.target == "/lionclaw/skills/team-local"));
+        assert!(!attached_skills
+            .mounts
+            .iter()
+            .any(|mount| mount.target == "/lionclaw/skills/team-local"));
+        assert!(attached_skills.skill_ids.is_empty());
+    }
+
+    #[tokio::test]
     async fn materialize_runtime_plan_projects_skills_using_runtime_kind() {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
@@ -7445,6 +7484,63 @@ mod tests {
             Kernel::runtime_state_root(&second.plan),
             Some(runtime_state_root.as_path())
         );
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_launch_does_not_start_channel_send_bridge() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_root)
+            .await
+            .expect("workspace");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                default_preset_name: Some("channel-send".to_string()),
+                execution_presets: BTreeMap::from([(
+                    "channel-send".to_string(),
+                    crate::kernel::runtime::ExecutionPreset {
+                        workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
+                        network_mode: crate::kernel::runtime::NetworkMode::On,
+                        mount_runtime_secrets: false,
+                        escape_classes: BTreeSet::from([
+                            crate::kernel::runtime::EscapeClass::ChannelSend,
+                        ]),
+                    },
+                )]),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let exports = Arc::new(AtomicUsize::new(0));
+        kernel
+            .register_runtime_adapter(
+                TEST_TERMINAL_RUNTIME_ID,
+                Arc::new(CountingTerminalRuntimeAdapter { exports }),
+            )
+            .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let launch = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare attached runtime launch");
+
+        assert!(launch
+            .plan
+            .environment
+            .iter()
+            .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
+        assert!(launch
+            .plan
+            .mounts
+            .iter()
+            .all(|mount| mount.target != CHANNEL_SEND_SOCKET_CONTAINER_PATH));
     }
 
     #[tokio::test]
@@ -13663,12 +13759,31 @@ impl Kernel {
         turn_mode: RuntimeTurnMode,
     ) -> Result<RuntimeExecutionSkills, KernelError> {
         let runtime_skills = self.runtime_visible_skills().await?;
-        let (runtime_skills, mounts) = match turn_mode {
-            RuntimeTurnMode::Direct => (runtime_skills, Vec::new()),
-            RuntimeTurnMode::ProgramBacked => {
-                self.resolve_runtime_skill_mounts_and_skills(&runtime_skills)
-                    .await?
-            }
+        self.resolve_runtime_execution_skills_from(
+            runtime_skills,
+            turn_mode == RuntimeTurnMode::ProgramBacked,
+        )
+        .await
+    }
+
+    async fn resolve_attached_runtime_execution_skills(
+        &self,
+    ) -> Result<RuntimeExecutionSkills, KernelError> {
+        let runtime_skills = self.applied_state.attached_runtime_visible_skills();
+        self.resolve_runtime_execution_skills_from(runtime_skills, true)
+            .await
+    }
+
+    async fn resolve_runtime_execution_skills_from(
+        &self,
+        runtime_skills: Vec<AppliedSkill>,
+        mount_skills: bool,
+    ) -> Result<RuntimeExecutionSkills, KernelError> {
+        let (runtime_skills, mounts) = if mount_skills {
+            self.resolve_runtime_skill_mounts_and_skills(&runtime_skills)
+                .await?
+        } else {
+            (runtime_skills, Vec::new())
         };
         let skill_ids = runtime_skills
             .iter()
