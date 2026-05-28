@@ -48,7 +48,6 @@ pub struct MailboxConfig {
     pub from_name: Option<String>,
     pub fetch_limit: usize,
     pub max_message_bytes: usize,
-    pub mark_seen_after_admission: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -166,8 +165,6 @@ impl WorkerCommand {
                 from_name: optional_env("EMAIL_FROM_NAME"),
                 fetch_limit,
                 max_message_bytes,
-                mark_seen_after_admission: env_bool("EMAIL_MARK_SEEN_AFTER_ADMISSION")?
-                    .unwrap_or(true),
             },
             digest: DigestConfig {
                 interval: Duration::from_millis(validate_positive_u64(
