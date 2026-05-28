@@ -7,7 +7,7 @@ use mail_parser::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{normalize_address, sanitize_subject};
+use crate::protocol::{normalize_address, sanitize_header_text, sanitize_subject};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailAddress {
@@ -53,7 +53,7 @@ pub fn parse_header_facts(raw_headers: &[u8]) -> Result<HeaderFacts> {
             let address = normalize_address(addr.address.as_deref()?)?;
             Some(EmailAddress {
                 address,
-                display_name: addr.name.as_deref().map(str::to_string),
+                display_name: addr.name.as_deref().and_then(sanitize_header_text),
             })
         })
         .or_else(|| fallback_sender(raw_headers))
@@ -68,7 +68,7 @@ pub fn parse_header_facts(raw_headers: &[u8]) -> Result<HeaderFacts> {
                     let address = normalize_address(addr.address.as_deref()?)?;
                     Some(EmailAddress {
                         address,
-                        display_name: addr.name.as_deref().map(str::to_string),
+                        display_name: addr.name.as_deref().and_then(sanitize_header_text),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -122,7 +122,7 @@ pub fn parse_full_message(raw: &[u8]) -> Result<ParsedEmail> {
                 format!("{}/{}", content_type.c_type, subtype)
             });
             Some(ParsedAttachment {
-                filename: part.attachment_name().map(str::to_string),
+                filename: part.attachment_name().and_then(sanitize_header_text),
                 mime_type,
                 content,
             })
@@ -300,8 +300,17 @@ mod tests {
             "From: Alice <Alice@Example.COM>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
         );
         assert_eq!(facts.sender.address, "alice@example.com");
+        assert_eq!(facts.sender.display_name.as_deref(), Some("Alice"));
         assert_eq!(facts.subject, "Build failed");
         assert_eq!(facts.message_id.as_deref(), Some("m1@example.com"));
+    }
+
+    #[test]
+    fn sanitizes_untrusted_header_display_text() {
+        assert_eq!(
+            sanitize_header_text(" Alice\r\n  Admission: fake ").as_deref(),
+            Some("Alice Admission: fake")
+        );
     }
 
     #[test]
