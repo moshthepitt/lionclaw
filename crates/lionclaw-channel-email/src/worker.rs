@@ -32,7 +32,7 @@ use crate::{
         non_empty_text, sanitize_header_text, short_hash, CHANNEL_ID, INBOUND_SESSION_BINDING,
         INBOUND_TRIGGER,
     },
-    store::{held_id_for, EmailStore, MailStatus, ThreadContext},
+    store::{held_id_for, EmailStore, HeldItem, MailStatus, ThreadContext},
 };
 
 const ATTACHMENT_KIND: &str = "document";
@@ -673,14 +673,8 @@ where
         }
 
         let text = digest_text(&self.config.mailbox.address, &held, suppressed_count);
-        let delivery_id = format!(
-            "digest:{}",
-            short_hash(&format!(
-                "{}:{}",
-                self.config.mailbox.mailbox_id,
-                chrono::Utc::now()
-            ))
-        );
+        let delivery_id =
+            digest_delivery_id(&self.config.mailbox.mailbox_id, &held, suppressed_count);
         mailbox
             .send_threaded_reply(OutboundEmail {
                 delivery_id,
@@ -1241,11 +1235,7 @@ fn reply_references(context: &ThreadContext) -> Vec<String> {
     references
 }
 
-fn digest_text(
-    mailbox_address: &str,
-    held: &[crate::store::HeldItem],
-    suppressed_count: i64,
-) -> String {
+fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) -> String {
     let mut lines = vec![
         format!("LionClaw email digest for {mailbox_address}"),
         String::new(),
@@ -1281,6 +1271,17 @@ fn digest_text(
         }
     }
     lines.join("\n")
+}
+
+fn digest_delivery_id(mailbox_id: &str, held: &[HeldItem], suppressed_count: i64) -> String {
+    let mut raw = format!("{mailbox_id}:suppressed:{suppressed_count}");
+    for item in held {
+        raw.push(':');
+        raw.push_str(&item.digest_rowid.to_string());
+        raw.push('=');
+        raw.push_str(&item.held_id);
+    }
+    format!("digest:{}", short_hash(&raw))
 }
 
 fn validate_local_daemon(info: &DaemonInfoResponse, expected_home: &Path) -> Result<()> {
@@ -1522,6 +1523,55 @@ mod tests {
             .expect("held digest rows");
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].snippet, held_body_not_downloaded_text());
+    }
+
+    #[tokio::test]
+    async fn held_digest_delivery_id_is_stable_for_same_batch() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let first = candidate();
+        store
+            .record_held(
+                &first,
+                &held_id_for(&first.event_id),
+                held_body_not_downloaded_text(),
+                "approval_required",
+            )
+            .await
+            .expect("record first held");
+        let held = store
+            .held_since_last_digest(10)
+            .await
+            .expect("held digest rows");
+        let delivery_id = digest_delivery_id("assistant-example-com", &held, 0);
+
+        assert_eq!(
+            delivery_id,
+            digest_delivery_id("assistant-example-com", &held, 0)
+        );
+        assert_ne!(
+            delivery_id,
+            digest_delivery_id("assistant-example-com", &held, 1)
+        );
+
+        let second = candidate_with_uid(43);
+        store
+            .record_held(
+                &second,
+                &held_id_for(&second.event_id),
+                held_body_not_downloaded_text(),
+                "approval_required",
+            )
+            .await
+            .expect("record second held");
+        let expanded = store
+            .held_since_last_digest(10)
+            .await
+            .expect("expanded held digest rows");
+        assert_ne!(
+            delivery_id,
+            digest_delivery_id("assistant-example-com", &expanded, 0)
+        );
     }
 
     #[tokio::test]
