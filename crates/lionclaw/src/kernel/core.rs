@@ -819,7 +819,7 @@ impl Kernel {
                 ExecutionPlanRequest {
                     session_id: Some(session_id),
                     runtime_id: runtime_id.clone(),
-                    purpose: ExecutionPlanPurpose::Interactive,
+                    purpose: ExecutionPlanPurpose::AttachedRuntimeTui,
                     preset_name: None,
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
@@ -7781,6 +7781,7 @@ mod tests {
             .environment
             .iter()
             .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
+        assert!(launch.request.plan.escape_classes.is_empty());
         assert!(launch
             .request
             .plan

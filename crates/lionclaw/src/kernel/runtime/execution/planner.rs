@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -14,8 +19,8 @@ use super::{
         validate_configured_mounts, MountSourceProtection,
     },
     plan::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-        NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
+        ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionPreset, MountAccess,
+        MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
         SKILLS_MOUNT_TARGET_ROOT,
     },
 };
@@ -146,6 +151,7 @@ pub struct ExecutionPlanRequest {
 pub enum ExecutionPlanPurpose {
     #[default]
     Interactive,
+    AttachedRuntimeTui,
     HiddenCompaction,
 }
 
@@ -275,7 +281,7 @@ impl ExecutionPlanner {
             hard_timeout: execution_context.hard_timeout,
             mounts,
             mount_runtime_secrets: preset.mount_runtime_secrets,
-            escape_classes: preset.escape_classes,
+            escape_classes: escape_classes_for_purpose(request.purpose, preset.escape_classes),
             limits,
         })
     }
@@ -560,7 +566,7 @@ fn default_working_dir_for_purpose(
     purpose: ExecutionPlanPurpose,
     mounts: &[MountSpec],
 ) -> Option<String> {
-    if purpose != ExecutionPlanPurpose::Interactive {
+    if purpose == ExecutionPlanPurpose::HiddenCompaction {
         return None;
     }
 
@@ -568,6 +574,18 @@ fn default_working_dir_for_purpose(
         .iter()
         .find(|mount| mount.target == WORKSPACE_MOUNT_TARGET)
         .map(|mount| mount.source.to_string_lossy().to_string())
+}
+
+fn escape_classes_for_purpose(
+    purpose: ExecutionPlanPurpose,
+    escape_classes: BTreeSet<EscapeClass>,
+) -> BTreeSet<EscapeClass> {
+    match purpose {
+        ExecutionPlanPurpose::Interactive => escape_classes,
+        ExecutionPlanPurpose::AttachedRuntimeTui | ExecutionPlanPurpose::HiddenCompaction => {
+            BTreeSet::new()
+        }
+    }
 }
 
 fn build_runtime_environment(
@@ -626,7 +644,11 @@ fn build_runtime_environment(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        time::Duration,
+    };
 
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -637,7 +659,7 @@ mod tests {
     };
     use crate::home::{runtime_project_partition_key, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR};
     use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
+        ConfinementConfig, EscapeClass, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, WorkspaceAccess,
     };
     use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};
@@ -789,6 +811,60 @@ mod tests {
                 ("TMPDIR".to_string(), "/tmp".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn attached_runtime_tui_preserves_execution_shape_without_turn_scoped_escapes() {
+        let sandbox = tempdir().expect("temp dir");
+        let workspace_root = sandbox.path().join("project");
+        let runtime_root = sandbox.path().join("home/runtime");
+        let presets = [(
+            "team-local".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: true,
+                escape_classes: BTreeSet::from([EscapeClass::ChannelSend]),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: Some("team-local".to_string()),
+            presets,
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(workspace_root.clone()),
+            project_workspace_root: Some(workspace_root.clone()),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::AttachedRuntimeTui,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plan");
+
+        assert_eq!(plan.preset_name, "team-local");
+        assert_eq!(plan.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(plan.network_mode, NetworkMode::On);
+        assert!(plan.mount_runtime_secrets);
+        assert_eq!(
+            plan.working_dir.as_deref(),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert!(plan.escape_classes.is_empty());
     }
 
     #[test]

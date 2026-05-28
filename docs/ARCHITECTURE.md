@@ -249,7 +249,8 @@ channels. The normal operator console, `run --plain`, channel turns, and
 scheduled jobs remain the paths that stream typed runtime events directly into
 LionClaw while a turn is active. Runtime skill facets that depend on an active
 LionClaw turn bridge, such as channel-bound `channel.send` facets, are not
-projected into native TUI sessions.
+projected into native TUI sessions, even when the selected execution preset
+would enable those facets for normal kernel-managed turns.
 
 Native TUI mode has no LionClaw command layer inside the attached runtime UI.
 Once the TTY is attached, first-column commands belong to the selected
