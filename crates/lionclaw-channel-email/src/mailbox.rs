@@ -6,7 +6,7 @@ use imap_client::{
     client::tokio::Client as ImapClient,
     imap_next::imap_types::{
         body::{Body, BodyStructure, SinglePartExtensionData, SpecificFields},
-        core::{AString, Vec1},
+        core::{AString, IString, NString, Vec1},
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName, Section},
         flag::{Flag, StoreType},
         search::SearchKey,
@@ -125,7 +125,26 @@ impl RealMailboxEngine {
             )
             .await
             .context("failed to authenticate to IMAP server")?;
+        if let Err(err) = client.id(Some(Self::imap_id_params())).await {
+            warn!(error = %err, "IMAP ID command failed");
+        }
         Ok(client)
+    }
+
+    fn imap_id_params() -> Vec<(IString<'static>, NString<'static>)> {
+        [
+            ("name", "lionclaw-channel-email"),
+            ("version", env!("CARGO_PKG_VERSION")),
+            ("vendor", "LionClaw"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                IString::try_from(name).expect("valid IMAP ID field"),
+                NString::try_from(value).expect("valid IMAP ID value"),
+            )
+        })
+        .collect()
     }
 
     async fn selected_imap(&self, read_only: bool) -> Result<(ImapClient, u32)> {

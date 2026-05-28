@@ -95,6 +95,8 @@ where
 
         self.report_ready(&worker_id, &daemon).await;
         self.process_pending_release_revocations(&store).await?;
+        self.process_held_releases(&store, mailbox.as_mut(), &worker_id)
+            .await?;
         self.process_inbound(&store, mailbox.as_mut(), &worker_id)
             .await?;
         self.process_outbox(&store, mailbox.as_mut(), &worker_id)
@@ -158,6 +160,36 @@ where
         Ok(())
     }
 
+    async fn process_held_releases(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        worker_id: &str,
+    ) -> Result<()> {
+        let held_limit = i64::try_from(self.config.mailbox.fetch_limit).unwrap_or(i64::MAX);
+        let held = store.held_candidates(held_limit).await?;
+        if held.is_empty() {
+            return Ok(());
+        }
+
+        debug!(count = held.len(), "checking held email candidates");
+        for candidate in held {
+            if let Err(err) = self
+                .process_candidate(store, mailbox, &candidate, worker_id, true)
+                .await
+            {
+                warn!(
+                    event_id = %candidate.event_id,
+                    sender_ref = %candidate.sender_ref,
+                    error = %err,
+                    "failed to process held email candidate"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn process_candidate(
         &self,
         store: &EmailStore,
@@ -206,6 +238,14 @@ where
                         authorization.reason_code.as_str(),
                     )
                     .await?;
+                if let Err(err) = mailbox.record_seen_or_processed(candidate).await {
+                    warn!(
+                        event_id = %candidate.event_id,
+                        sender_ref = %candidate.sender_ref,
+                        error = %err,
+                        "failed to mark held email candidate processed"
+                    );
+                }
             }
             return Ok(());
         }
@@ -512,7 +552,7 @@ where
             .unwrap_or_else(|| {
                 generated_message_id(&delivery.delivery_id, &self.config.mailbox.address)
             });
-        store
+        if let Err(err) = store
             .record_receipt(
                 &delivery.delivery_id,
                 &message_id,
@@ -520,7 +560,21 @@ where
                 &receipt,
             )
             .await
-            .map_err(|err| retryable("receipt_record_failed", err))?;
+        {
+            warn!(
+                delivery_id = %delivery.delivery_id,
+                message_id = %message_id,
+                error = %err,
+                "failed to cache email delivery receipt after provider accepted message"
+            );
+            if let Some(object) = receipt.as_object_mut() {
+                object.insert("local_receipt_recorded".to_string(), json!(false));
+                object.insert(
+                    "local_receipt_record_error_code".to_string(),
+                    json!("receipt_record_failed"),
+                );
+            }
+        }
         Ok(receipt)
     }
 
@@ -1134,6 +1188,7 @@ mod tests {
             .expect("tick");
 
         assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
         assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(
@@ -1357,12 +1412,14 @@ mod tests {
         let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
         worker.tick().await.expect("first tick");
         assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
 
+        fixture.mailbox.set_candidates(Vec::new());
         fixture.api.set_authorized(true);
         worker.tick().await.expect("second tick");
 
         assert_eq!(fixture.mailbox.full_fetches(), 1);
-        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.mailbox.seen(), 2);
         assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(
@@ -1371,6 +1428,39 @@ mod tests {
                 .await
                 .expect("status"),
             Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_cache_failure_after_smtp_acceptance_does_not_retry_delivery() {
+        let fixture = EmailFixture::new(true).await;
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        let candidate = candidate();
+        store
+            .record_admitted(&candidate, "downloaded")
+            .await
+            .expect("record admitted context");
+        install_failing_receipt_insert_trigger(&fixture.state_dir).await;
+
+        let config = fixture.config();
+        let worker = EmailWorker::new(config.clone(), fixture.mailbox.clone()).expect("worker");
+        let mut mailbox = fixture.mailbox.open(config.mailbox.clone());
+        let result = worker
+            .deliver_outbox(
+                &store,
+                mailbox.as_mut(),
+                &outbox_delivery_for_thread(candidate.thread_ref.clone()),
+            )
+            .await;
+
+        let DeliveryResult::Delivered { receipt } = result else {
+            panic!("post-SMTP receipt cache failure must not request retry");
+        };
+        assert_eq!(fixture.mailbox.sent().len(), 1);
+        assert_eq!(receipt["local_receipt_recorded"], false);
+        assert_eq!(
+            receipt["local_receipt_record_error_code"],
+            "receipt_record_failed"
         );
     }
 
@@ -1442,7 +1532,7 @@ mod tests {
         let fixture = EmailFixture::with_candidate(
             false,
             candidate_with_rfc822_size(Some(1025)),
-            full_message(),
+            oversized_message(2048),
         )
         .await;
         let mut config = fixture.config();
@@ -1453,11 +1543,12 @@ mod tests {
         assert_eq!(fixture.mailbox.full_fetches(), 0);
 
         let held_id = held_id_for("email:imap:assistant-example-com:7:42");
+        fixture.mailbox.set_candidates(Vec::new());
         fixture.api.set_one_shot_release_authorized(&held_id);
         worker.tick().await.expect("release tick");
 
-        assert_eq!(fixture.mailbox.full_fetches(), 0);
-        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 2);
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(
             store
@@ -1683,6 +1774,7 @@ mod tests {
             Self {
                 state: Arc::new(FakeMailboxState {
                     candidate,
+                    override_candidates: Mutex::new(None),
                     raw,
                     full_fetches: AtomicUsize::new(0),
                     seen: AtomicUsize::new(0),
@@ -1698,10 +1790,19 @@ mod tests {
         fn seen(&self) -> usize {
             self.state.seen.load(Ordering::SeqCst)
         }
+
+        fn set_candidates(&self, candidates: Vec<CandidateHeader>) {
+            *self.state.override_candidates.lock().unwrap() = Some(candidates);
+        }
+
+        fn sent(&self) -> Vec<OutboundEmail> {
+            self.state.sent.lock().unwrap().clone()
+        }
     }
 
     struct FakeMailboxState {
         candidate: CandidateHeader,
+        override_candidates: Mutex<Option<Vec<CandidateHeader>>>,
         raw: Vec<u8>,
         full_fetches: AtomicUsize,
         seen: AtomicUsize,
@@ -1723,7 +1824,13 @@ mod tests {
     #[async_trait]
     impl MailboxEngine for FakeMailbox {
         async fn list_candidate_headers(&mut self) -> Result<Vec<CandidateHeader>> {
-            Ok(vec![self.state.candidate.clone()])
+            Ok(self
+                .state
+                .override_candidates
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| vec![self.state.candidate.clone()]))
         }
 
         async fn fetch_full_message_after_authorize(
@@ -1795,5 +1902,44 @@ mod tests {
         let mut message = full_message();
         message.resize(size, b'x');
         message
+    }
+
+    fn outbox_delivery_for_thread(thread_ref: String) -> ChannelOutboxDelivery {
+        ChannelOutboxDelivery {
+            delivery_id: "delivery-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            conversation_ref: conversation_ref("assistant-example-com"),
+            thread_ref: Some(thread_ref),
+            reply_to_ref: None,
+            session_id: Some("session-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            content: crate::api::ChannelOutboxContent {
+                text: "Accepted by SMTP".to_string(),
+                attachments: Vec::new(),
+            },
+        }
+    }
+
+    async fn install_failing_receipt_insert_trigger(state_dir: &Path) {
+        let db_path = state_dir.join("channel-email.sqlite3");
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(db_path);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open test db");
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_outbox_receipt_insert
+            BEFORE INSERT ON outbox_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'receipt write failed');
+            END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install failing receipt trigger");
+        pool.close().await;
     }
 }
