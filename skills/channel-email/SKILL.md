@@ -54,3 +54,47 @@ One-shot held-message release uses an existing thread-scoped grant labeled
 response, admits the matching held item once, then revokes the grant through
 `/v0/channels/grants/revoke`. Failed revocations are retried from worker-local
 SQLite state.
+
+## Manual QA
+
+Run this only with a dedicated mailbox, not a personal inbox.
+
+```bash
+export LIONCLAW_REPO=/path/to/lionclaw
+cd "$LIONCLAW_REPO"
+cargo build --workspace
+cd "$PROJ_A"
+"$LIONCLAW_BIN" skill add "$LIONCLAW_REPO/skills/channel-email" --alias email
+cat > email.env <<'EOF'
+EMAIL_ADDRESS=assistant@example.com
+EMAIL_IMAP_HOST=imap.example.com
+EMAIL_IMAP_USERNAME=assistant@example.com
+EMAIL_IMAP_PASSWORD=...
+EMAIL_SMTP_HOST=smtp.example.com
+EMAIL_SMTP_USERNAME=assistant@example.com
+EMAIL_SMTP_PASSWORD=...
+EMAIL_ADMIN_DIGEST_TO=operator@example.com
+# Optional: defaults to 50 MiB.
+EMAIL_MAX_MESSAGE_BYTES=52428800
+EOF
+"$LIONCLAW_BIN" connect email --env-file ./email.env
+"$LIONCLAW_BIN" doctor
+```
+
+Expected when credentials are available:
+
+- `doctor` shows email worker health without printing mailbox secrets
+- the channel-owned runtime skill facet is projected as the `email` skill for
+  runtimes; no separate email companion skill install is needed
+- an exact approved sender queues one channel turn with a structured email
+  envelope, not raw MIME
+- an unknown non-automated sender is held and does not queue runtime work
+- the held-mail digest includes held id, sender, subject, snippet, attachment
+  count, sender/conversation/thread refs, and release guidance
+- a thread-scoped grant labeled `email-release:<held-id>` releases that held
+  item once and the worker revokes the grant after admission
+- automated/list/bounce/no-reply mail is suppressed without auto-reply
+- mail above `EMAIL_MAX_MESSAGE_BYTES` is suppressed without runtime work,
+  including later one-shot release of held mail already known to exceed the cap
+- attachments are staged only after admission
+- repeated outbox delivery attempts do not send duplicate SMTP replies
