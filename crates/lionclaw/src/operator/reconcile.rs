@@ -189,9 +189,12 @@ pub async fn add_channel_with_contact(
         id,
         skill,
         launch_mode,
-        crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
-        required_env,
-        contact,
+        ChannelWorkerSetup {
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env,
+            optional_env: Vec::new(),
+            contact,
+        },
     )
     .await
 }
@@ -227,26 +230,33 @@ impl ChannelContactSetup {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelWorkerSetup {
+    pub worker: String,
+    pub required_env: Vec<String>,
+    pub optional_env: Vec<String>,
+    pub contact: Option<ChannelContactConfig>,
+}
+
 pub async fn add_channel_with_worker(
     home: &LionClawHome,
     id: String,
     skill: String,
     launch_mode: ChannelLaunchMode,
-    worker: String,
-    required_env: Vec<String>,
-    contact: Option<ChannelContactConfig>,
+    setup: ChannelWorkerSetup,
 ) -> Result<()> {
     validate_skill_alias(&skill)?;
     let skill_dir = resolve_installed_skill_dir(home, &skill)?;
-    resolve_channel_worker_entrypoint(&skill_dir, Some(&worker))?;
+    resolve_channel_worker_entrypoint(&skill_dir, Some(&setup.worker))?;
     let mut config = OperatorConfig::load(home).await?;
     config.upsert_channel(ManagedChannelConfig {
         id,
         skill,
         launch_mode,
-        worker,
-        required_env,
-        contact,
+        worker: setup.worker,
+        required_env: setup.required_env,
+        optional_env: setup.optional_env,
+        contact: setup.contact,
     });
     config.save(home).await
 }
@@ -705,10 +715,15 @@ pub(crate) fn build_managed_units(
                 home.runtime_channel_dir(&channel.id).display().to_string(),
             ),
         ];
-        let channel_env_path = if channel.required_env.is_empty() {
+        let channel_env_values = resolve_channel_env(
+            home,
+            &channel.id,
+            &channel.required_env,
+            &channel.optional_env,
+        )?;
+        let channel_env_path = if channel_env_values.is_empty() {
             None
         } else {
-            validate_required_channel_env(home, &channel.id, &channel.required_env)?;
             Some(home.channel_env_path(&channel.id))
         };
 
@@ -727,20 +742,18 @@ pub(crate) fn build_managed_units(
     Ok(units)
 }
 
-pub(crate) fn resolve_required_channel_env(
+pub(crate) fn resolve_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<Vec<(String, String)>> {
-    crate::operator::channel_env::load_required_channel_env(home, channel_id, required_env)
-}
-
-pub(crate) fn validate_required_channel_env(
-    home: &LionClawHome,
-    channel_id: &str,
-    required_env: &[String],
-) -> Result<()> {
-    crate::operator::channel_env::validate_channel_env_contract(home, channel_id, required_env)
+    crate::operator::channel_env::load_declared_channel_env(
+        home,
+        channel_id,
+        required_env,
+        optional_env,
+    )
 }
 
 #[cfg(test)]
@@ -1054,11 +1067,11 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_channel_with_contact, add_skill, down, ensure_managed_bind_configured,
-        logs, open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
-        render_runtime_cache_for_work_root, resolve_installed_skill_worker_entrypoint,
-        resolve_required_channel_env, resolve_worker_entrypoint, up_for_work_root,
-        ChannelContactSetup, StackBinaryPaths,
+        add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
+        ensure_managed_bind_configured, logs, open_kernel, open_kernel_with_project_root,
+        render_marker_file, render_runtime_cache, render_runtime_cache_for_work_root,
+        resolve_channel_env, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
+        up_for_work_root, ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1430,12 +1443,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_required_channel_env_rejects_invalid_env_keys_without_panicking() {
+    fn resolve_channel_env_rejects_invalid_env_keys_without_panicking() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         for key in ["", "BAD=KEY", "BAD\0KEY"] {
             let result = std::panic::catch_unwind(|| {
-                resolve_required_channel_env(&home, "loopback", &[key.to_string()])
+                resolve_channel_env(&home, "loopback", &[key.to_string()], &[])
             })
             .expect("invalid required_env key should not panic");
 
@@ -2136,17 +2149,23 @@ mod tests {
         )
         .await
         .expect("install skill");
-        add_channel(
+        add_channel_with_worker(
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
             ChannelLaunchMode::Background,
-            vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            ChannelWorkerSetup {
+                worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+                required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: vec!["TELEGRAM_POLL_MS".to_string()],
+                contact: None,
+            },
         )
         .await
         .expect("add channel");
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        env.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
 
         let manager = FakeUnitManager::default();
@@ -2170,7 +2189,9 @@ mod tests {
             .expect("telegram unit");
 
         assert!(!unit.env_content.contains("TELEGRAM_BOT_TOKEN"));
+        assert!(!unit.env_content.contains("TELEGRAM_POLL_MS"));
         assert!(!unit.env_content.contains("secret-token"));
+        assert!(!unit.env_content.contains("1000"));
         assert_eq!(
             unit.extra_env_files,
             vec![home.channel_env_path("telegram")]
@@ -2311,6 +2332,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");

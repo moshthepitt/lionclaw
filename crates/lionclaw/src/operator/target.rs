@@ -2077,6 +2077,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: contact.map(|(conversation_ref, thread_ref)| {
                 ChannelContactConfig::new(
                     conversation_ref.to_string(),

@@ -140,6 +140,7 @@ async fn ensure_instance_team_local_channel(
         launch_mode: ChannelLaunchMode::Background,
         worker: DEFAULT_CHANNEL_WORKER.to_string(),
         required_env: Vec::new(),
+        optional_env: Vec::new(),
         contact: should_publish_contact
             .then(|| ChannelContactConfig::new(peer_conversation_ref(&home_id), None)),
     });
@@ -293,6 +294,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(crate::operator::config::ChannelContactConfig::new(
                 "main@example.com".to_string(),
                 None,

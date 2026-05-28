@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -20,6 +21,7 @@ pub struct ChannelMetadata {
     pub launch: ChannelLaunchMode,
     pub worker: String,
     pub env: Vec<String>,
+    pub optional_env: Vec<String>,
     pub contact: Option<ChannelContactMetadata>,
 }
 
@@ -59,6 +61,8 @@ struct ChannelMetadataSection {
     worker: String,
     #[serde(default)]
     env: Vec<String>,
+    #[serde(default)]
+    optional_env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,17 +148,8 @@ pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
         .map_err(anyhow::Error::msg)?;
     let worker = parsed.channel.worker.trim().to_string();
     validate_channel_worker(&skill_dir, &worker)?;
-    let mut env = parsed
-        .channel
-        .env
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .collect::<Vec<_>>();
-    for key in &env {
-        validate_channel_env_name(key)?;
-    }
-    env.sort();
-    env.dedup();
+    let (env, optional_env) =
+        normalize_channel_env_metadata(parsed.channel.env, parsed.channel.optional_env)?;
     let contact = parsed
         .contact
         .map(|contact| -> Result<ChannelContactMetadata> {
@@ -171,8 +166,39 @@ pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
         launch,
         worker,
         env,
+        optional_env,
         contact,
     })
+}
+
+fn normalize_channel_env_metadata(
+    required: Vec<String>,
+    optional: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let required = normalize_env_names(required)?;
+    let optional = normalize_env_names(optional)?;
+    let required_set = required.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let duplicate_optional = optional
+        .iter()
+        .find(|key| required_set.contains(key.as_str()));
+    if let Some(key) = duplicate_optional {
+        bail!("channel optional_env duplicates required env key '{key}'");
+    }
+
+    Ok((required, optional))
+}
+
+fn normalize_env_names(raw: Vec<String>) -> Result<Vec<String>> {
+    let mut names = raw
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+    for key in &names {
+        validate_channel_env_name(key)?;
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 pub fn render_contact_template(template: &str, instance_name: &str) -> Result<String> {
@@ -535,6 +561,43 @@ mod tests {
         assert_eq!(metadata.id, "telegram");
         assert_eq!(metadata.worker, "scripts/worker");
         assert_eq!(metadata.env, vec!["TELEGRAM_BOT_TOKEN"]);
+        assert!(metadata.optional_env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_optional_channel_env_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"EMAIL_ADDRESS\"]\noptional_env = [\"EMAIL_ADMIN_DIGEST_TO\", \"EMAIL_MAX_MESSAGE_BYTES\"]\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+
+        assert_eq!(metadata.env, vec!["EMAIL_ADDRESS"]);
+        assert_eq!(
+            metadata.optional_env,
+            vec!["EMAIL_ADMIN_DIGEST_TO", "EMAIL_MAX_MESSAGE_BYTES"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_optional_env_that_duplicates_required_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"EMAIL_ADDRESS\"]\noptional_env = [\"EMAIL_ADDRESS\"]\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("duplicate env should fail");
+
+        assert!(err.to_string().contains("optional_env duplicates"));
     }
 
     #[cfg(unix)]

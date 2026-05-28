@@ -1033,16 +1033,18 @@ manually by the operator.
 ## Operator Launch Model
 
 - Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
-  worker entrypoint, and required env names. The v1 metadata contract is small
-  by design and does not claim permissions LionClaw does not enforce.
+  worker entrypoint, required env names, and optional env names that the
+  operator may persist and pass through when present. The v1 metadata contract
+  is small by design and does not claim permissions LionClaw does not enforce.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally
   started by `lionclaw connect <channel>` in the current terminal. The low-level
   attach path remains available for debugging.
-- Required channel env is selected-instance state under `config/channels/`.
-  Generated unit env may reference that private file, but generated unit env is
-  not the source of truth.
+- Channel env is selected-instance state under `config/channels/` and may
+  contain only names declared by the channel metadata. Generated unit env may
+  reference that private file, but generated unit env is not the source of
+  truth.
 
 Worker entrypoint resolution uses the metadata `worker` path and rejects
 symlink escapes outside the skill directory.

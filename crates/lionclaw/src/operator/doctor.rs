@@ -1270,7 +1270,12 @@ async fn inspect_channels(
             ),
         }
 
-        if let Err(err) = validate_channel_env_contract(home, &channel.id, &channel.required_env) {
+        if let Err(err) = validate_channel_env_contract(
+            home,
+            &channel.id,
+            &channel.required_env,
+            &channel.optional_env,
+        ) {
             findings.push(
                 DoctorFinding::error(
                     FindingKind::Channel,
@@ -1577,11 +1582,22 @@ fn inspect_channel_metadata_match(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let expected_optional_env = channel
+        .optional_env
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let actual_env = metadata.env.iter().cloned().collect::<BTreeSet<_>>();
+    let actual_optional_env = metadata
+        .optional_env
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if metadata.id != channel.id
         || metadata.launch != channel.launch_mode
         || metadata.worker != channel.worker
         || actual_env != expected_env
+        || actual_optional_env != expected_optional_env
     {
         findings.push(
             DoctorFinding::error(
@@ -1592,11 +1608,12 @@ fn inspect_channel_metadata_match(
                 ),
                 format!("channel {}", channel.id),
                 format!(
-                    "metadata declares id={} launch={} worker={} env={:?}",
+                    "metadata declares id={} launch={} worker={} env={:?} optional_env={:?}",
                     metadata.id,
                     metadata.launch.as_str(),
                     metadata.worker,
-                    metadata.env
+                    metadata.env,
+                    metadata.optional_env
                 ),
             )
             .with_inspect(commands.selected("channel list"))
@@ -2477,6 +2494,7 @@ mod tests {
             launch_mode,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         let db = crate::kernel::db::Db::connect_file(&home.db_path())
@@ -2615,6 +2633,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(crate::operator::config::ChannelContactConfig::new(
                 conversation_ref.to_string(),
                 None,
@@ -3691,6 +3710,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         let applied_state =
@@ -4290,6 +4310,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         let manager = FakeUnitManager::default();

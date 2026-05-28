@@ -221,6 +221,11 @@ impl OperatorConfig {
             }
             channel.required_env.sort();
             channel.required_env.dedup();
+            channel.optional_env.sort();
+            channel.optional_env.dedup();
+            channel
+                .optional_env
+                .retain(|key| channel.required_env.binary_search(key).is_err());
             if let Some(contact) = &mut channel.contact {
                 contact.conversation_ref = contact
                     .conversation_ref
@@ -318,6 +323,8 @@ pub struct ManagedChannelConfig {
     pub worker: String,
     #[serde(default)]
     pub required_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_env: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<ChannelContactConfig>,
 }
@@ -826,6 +833,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::default(),
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -849,6 +857,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Interactive,
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -872,6 +881,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(super::ChannelContactConfig::new(
                 "member:reviewer".to_string(),
                 None,
@@ -883,6 +893,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(super::ChannelContactConfig::new(
                 "reviewer@example.com".to_string(),
                 None,
@@ -924,6 +935,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(super::ChannelContactConfig::new(
                 "member:reviewer".to_string(),
                 None,

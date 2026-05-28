@@ -27,7 +27,8 @@ use crate::{
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_channel_contact_config,
-            resolve_stack_binaries, up_for_work_root, ChannelContactSetup, StackBinaryPaths,
+            resolve_stack_binaries, up_for_work_root, ChannelContactSetup, ChannelWorkerSetup,
+            StackBinaryPaths,
         },
         runtime::resolve_runtime_id,
     },
@@ -123,6 +124,7 @@ where
             home,
             channel_id: &channel_id,
             required_env: &discovered.metadata.env,
+            optional_env: &discovered.metadata.optional_env,
             env_inputs,
             interactive,
             hide_prompt_input,
@@ -141,9 +143,12 @@ where
         channel_id.clone(),
         skill_alias.clone(),
         discovered.metadata.launch,
-        discovered.metadata.worker.clone(),
-        discovered.metadata.env.clone(),
-        contact,
+        ChannelWorkerSetup {
+            worker: discovered.metadata.worker.clone(),
+            required_env: discovered.metadata.env.clone(),
+            optional_env: discovered.metadata.optional_env.clone(),
+            contact,
+        },
     )
     .await
     {
@@ -539,6 +544,7 @@ struct RequiredEnvRequest<'a> {
     home: &'a LionClawHome,
     channel_id: &'a str,
     required_env: &'a [String],
+    optional_env: &'a [String],
     env_inputs: ConnectEnvInputs,
     interactive: bool,
     hide_prompt_input: bool,
@@ -553,6 +559,7 @@ fn ensure_required_env<R: BufRead, W: Write>(
         home,
         channel_id,
         required_env,
+        optional_env,
         env_inputs,
         interactive,
         hide_prompt_input,
@@ -560,18 +567,29 @@ fn ensure_required_env<R: BufRead, W: Write>(
     let mut updates = ChannelEnv::new();
     if let Some(path) = env_inputs.env_file.as_deref() {
         let file_updates = parse_env_file(path)?;
-        validate_declared_env_updates(channel_id, required_env, &file_updates, "env file")?;
+        validate_declared_env_updates(
+            channel_id,
+            required_env,
+            optional_env,
+            &file_updates,
+            "env file",
+        )?;
         updates.extend(file_updates);
     }
-    validate_declared_env_input_names(channel_id, required_env, &env_inputs.from_env)?;
+    validate_declared_env_input_names(
+        channel_id,
+        required_env,
+        optional_env,
+        &env_inputs.from_env,
+    )?;
     updates.extend(collect_from_process_env(&env_inputs.from_env)?);
-    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
+    validate_no_undeclared_channel_env(home, channel_id, required_env, optional_env)?;
     if !updates.is_empty() {
         merge_channel_env_if_changed(home, channel_id, &updates)?;
     }
 
     let stored = load_channel_env(home, channel_id)?;
-    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
+    validate_no_undeclared_channel_env(home, channel_id, required_env, optional_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
         return Ok(());
@@ -588,7 +606,7 @@ fn ensure_required_env<R: BufRead, W: Write>(
     let prompted = prompt_required_env(channel_id, &missing, hide_prompt_input, input, output)?;
     merge_channel_env_if_changed(home, channel_id, &prompted)?;
     let stored = load_channel_env(home, channel_id)?;
-    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
+    validate_no_undeclared_channel_env(home, channel_id, required_env, optional_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
         Ok(())
@@ -644,10 +662,11 @@ fn prompt_required_env<R: BufRead, W: Write>(
 fn validate_declared_env_updates(
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
     updates: &ChannelEnv,
     source: &str,
 ) -> Result<()> {
-    let declared = declared_env_set(required_env)?;
+    let declared = declared_env_set(required_env, optional_env)?;
     let mut undeclared = Vec::new();
     for key in updates.keys() {
         if !declared.contains(key.as_str()) {
@@ -666,9 +685,10 @@ fn validate_declared_env_updates(
 fn validate_declared_env_input_names(
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
     input_names: &[String],
 ) -> Result<()> {
-    let declared = declared_env_set(required_env)?;
+    let declared = declared_env_set(required_env, optional_env)?;
     let mut undeclared = Vec::new();
     for key in input_names {
         validate_channel_env_name(key)?;
@@ -685,9 +705,16 @@ fn validate_declared_env_input_names(
     )
 }
 
-fn declared_env_set(required_env: &[String]) -> Result<BTreeSet<&str>> {
+fn declared_env_set<'a>(
+    required_env: &'a [String],
+    optional_env: &'a [String],
+) -> Result<BTreeSet<&'a str>> {
     let mut declared = BTreeSet::new();
     for key in required_env {
+        validate_channel_env_name(key)?;
+        declared.insert(key.as_str());
+    }
+    for key in optional_env {
         validate_channel_env_name(key)?;
         declared.insert(key.as_str());
     }
@@ -858,6 +885,7 @@ id = "{channel_id}"
 launch = "background"
 worker = "scripts/worker"
 env = ["TELEGRAM_BOT_TOKEN"]
+optional_env = ["TELEGRAM_POLL_MS"]
 "#,
             ),
         )
@@ -890,6 +918,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 home: &home,
                 channel_id: "telegram",
                 required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
                 env_inputs: ConnectEnvInputs::default(),
                 interactive: false,
                 hide_prompt_input: false,
@@ -925,6 +954,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 home: &home,
                 channel_id: "telegram",
                 required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
@@ -944,6 +974,52 @@ env = ["TELEGRAM_BOT_TOKEN"]
     }
 
     #[test]
+    fn env_file_accepts_declared_optional_values_without_requiring_them() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(
+            &env_file,
+            "TELEGRAM_BOT_TOKEN=secret-token\nTELEGRAM_POLL_MS=1000\n",
+        )
+        .expect("env file");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[
+                    "TELEGRAM_POLL_MS".to_string(),
+                    "TELEGRAM_TIMEOUT_MS".to_string(),
+                ],
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect("declared optional env should be accepted");
+
+        let stored = load_channel_env(&home, "telegram").expect("load env");
+        assert_eq!(
+            stored.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("secret-token")
+        );
+        assert_eq!(
+            stored.get("TELEGRAM_POLL_MS").map(String::as_str),
+            Some("1000")
+        );
+        assert!(!stored.contains_key("TELEGRAM_TIMEOUT_MS"));
+    }
+
+    #[test]
     fn from_env_rejects_undeclared_names_before_reading_process_env() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
@@ -955,6 +1031,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 home: &home,
                 channel_id: "telegram",
                 required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
                 env_inputs: ConnectEnvInputs {
                     env_file: None,
                     from_env: vec!["EXTRA_SECRET".to_string()],
@@ -987,6 +1064,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 home: &home,
                 channel_id: "telegram",
                 required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
                 env_inputs: ConnectEnvInputs::default(),
                 interactive: false,
                 hide_prompt_input: false,
@@ -1012,6 +1090,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 home: &home,
                 channel_id: "telegram",
                 required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
                 env_inputs: ConnectEnvInputs::default(),
                 interactive: true,
                 hide_prompt_input: false,
@@ -1238,6 +1317,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: Some(ChannelContactConfig::new(
                 "reviewer@example.com".to_string(),
                 Some("inbox".to_string()),
@@ -1685,6 +1765,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
 id = "test-channel"
 launch = "interactive"
 worker = "scripts/worker"
+optional_env = ["OPTIONAL_PATH"]
 "#,
         )
         .expect("channel metadata");
@@ -1728,6 +1809,7 @@ worker = "scripts/worker"
             channel.id == "test-channel"
                 && channel.skill == "test-channel"
                 && channel.launch_mode == ChannelLaunchMode::Interactive
+                && channel.optional_env == ["OPTIONAL_PATH"]
         }));
     }
 }

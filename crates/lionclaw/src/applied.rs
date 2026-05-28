@@ -294,6 +294,11 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
             hasher.update(key.as_bytes());
             hasher.update(b"\0");
         }
+        for key in &channel.optional_env {
+            hasher.update(b"optional_env\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"\0");
+        }
         if let Some(contact) = &channel.contact {
             hasher.update(b"contact\0");
             if let Some(conversation_ref) = &contact.conversation_ref {
@@ -806,6 +811,7 @@ pub struct AppliedChannel {
     pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
+    pub optional_env: Vec<String>,
     pub contact: Option<ChannelContactConfig>,
 }
 
@@ -817,6 +823,7 @@ impl AppliedChannel {
             worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
+            optional_env: config.optional_env.clone(),
             contact: config.contact.clone(),
         }
     }
@@ -970,6 +977,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -1012,6 +1020,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -1069,6 +1078,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save first config");
@@ -1081,6 +1091,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save second config");
@@ -1088,6 +1099,21 @@ mod tests {
         let second = AppliedState::load(&home).await.expect("load second state");
 
         assert_ne!(first.fingerprint(), second.fingerprint());
+
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "loopback".to_string(),
+            skill: "visible".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
+            required_env: vec!["SECOND_KEY".to_string()],
+            optional_env: vec!["OPTIONAL_KEY".to_string()],
+            contact: None,
+        });
+        config.save(&home).await.expect("save optional env config");
+
+        let third = AppliedState::load(&home).await.expect("load third state");
+
+        assert_ne!(second.fingerprint(), third.fingerprint());
     }
 
     #[tokio::test]
