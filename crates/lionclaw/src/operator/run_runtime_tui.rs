@@ -12,6 +12,7 @@ use crate::{
             kernel_to_anyhow, local_peer_id_for_project, resolve_repl_session,
             resolve_run_runtime_id,
         },
+        runtime::validate_runtime_launch_prerequisites_for_work_root,
     },
     project_inventory::ProjectInstanceRuntimeContext,
 };
@@ -40,6 +41,17 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         requested_runtime.as_deref(),
         instance_name.unwrap_or("selected home"),
     )?;
+    let project_root = project_instance_runtime
+        .as_ref()
+        .map(|context| context.project_root.as_path());
+    validate_runtime_launch_prerequisites_for_work_root(
+        home,
+        &config,
+        &runtime_id,
+        project_root,
+        Some(work_root),
+    )
+    .await?;
     print_runtime_tui_prepare_message(&runtime_id)?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
@@ -75,4 +87,60 @@ fn print_runtime_tui_prepare_message(runtime_id: &str) -> Result<()> {
     writeln!(stderr, "LionClaw: preparing {runtime_id} runtime UI...")?;
     stderr.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_runtime_tui, RunRuntimeTuiInvocation};
+    use crate::{
+        home::{LionClawHome, DEFAULT_WORKSPACE},
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+        operator::config::{OperatorConfig, RuntimeProfileConfig},
+        workspace::GENERATED_AGENTS_FILE,
+    };
+
+    #[tokio::test]
+    async fn runtime_tui_validates_profile_before_rendering_cache() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let work_root = temp_dir.path().join("workspace");
+        tokio::fs::create_dir(&work_root).await.expect("workspace");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: String::new(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: "podman".to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.save(&home).await.expect("save config");
+
+        let err = run_runtime_tui(RunRuntimeTuiInvocation {
+            home: &home,
+            work_root: &work_root,
+            instance_name: Some("main"),
+            project_instance_runtime: None,
+            requested_runtime: None,
+            continue_last_session: false,
+        })
+        .await
+        .expect_err("invalid runtime profile should fail before launch");
+
+        assert!(err
+            .to_string()
+            .contains("configured runtime profile 'codex' is invalid"));
+        assert!(
+            !home
+                .runtime_project_dir("codex", DEFAULT_WORKSPACE, &work_root)
+                .join(GENERATED_AGENTS_FILE)
+                .exists(),
+            "invalid runtime TUI launch must not render runtime cache"
+        );
+    }
 }
