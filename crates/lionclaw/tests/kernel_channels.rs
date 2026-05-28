@@ -3989,6 +3989,125 @@ async fn channel_session_binding_derives_requested_keys_after_authorization() {
 }
 
 #[tokio::test]
+async fn channel_session_binding_allows_direct_grants_to_derive_actor_scoped_route_keys() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "binding-direct-scoped", "binding-direct-scoped-skill").await;
+    let kernel = env.kernel().await;
+
+    let sender_ref = "email:addr:alice@example.com";
+    let conversation_ref = "email:mailbox:assistant";
+    let thread_ref = "email:thread:build";
+
+    create_pending_pairing(
+        &kernel,
+        "binding-direct-scoped",
+        sender_ref,
+        "binding-direct-scoped-direct-pending",
+    )
+    .await;
+    approve_pairing(&kernel, "binding-direct-scoped", sender_ref).await;
+
+    let conversation_actor = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            sender_ref: sender_ref.to_string(),
+            conversation_ref: conversation_ref.to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::ConversationActor,
+        })
+        .await
+        .expect("direct actor grant should cover narrower conversation_actor binding");
+    assert!(conversation_actor.authorized);
+    let conversation_actor_key = conversation_actor_binding_session_key(
+        "binding-direct-scoped",
+        conversation_ref,
+        sender_ref,
+    );
+    assert_eq!(
+        conversation_actor.session_key.as_deref(),
+        Some(conversation_actor_key.as_str())
+    );
+
+    let thread_actor = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            sender_ref: sender_ref.to_string(),
+            conversation_ref: conversation_ref.to_string(),
+            thread_ref: Some(thread_ref.to_string()),
+            trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::ThreadActor,
+        })
+        .await
+        .expect("direct actor grant should cover narrower thread_actor binding");
+    assert!(thread_actor.authorized);
+    let thread_actor_key = thread_actor_binding_session_key(
+        "binding-direct-scoped",
+        conversation_ref,
+        thread_ref,
+        sender_ref,
+    );
+    assert_eq!(
+        thread_actor.session_key.as_deref(),
+        Some(thread_actor_key.as_str())
+    );
+
+    let opened_conversation_actor = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            peer_id: conversation_actor_key,
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("direct grant should permit reopening derived conversation_actor session");
+    assert_eq!(opened_conversation_actor.trust_tier.as_str(), "main");
+
+    let opened_thread_actor = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            peer_id: thread_actor_key,
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("direct grant should permit reopening derived thread_actor session");
+    assert_eq!(opened_thread_actor.trust_tier.as_str(), "main");
+
+    let actorless_conversation = kernel
+        .authorize_channel_actor(ChannelActorAuthorizeRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            sender_ref: sender_ref.to_string(),
+            conversation_ref: conversation_ref.to_string(),
+            thread_ref: None,
+            trigger: ChannelTrigger::Dm,
+            session_binding: ChannelSessionBinding::Conversation,
+        })
+        .await
+        .expect_err("direct actor grant must not cover actorless conversation binding");
+    assert!(
+        matches!(actorless_conversation, KernelError::BadRequest(message) if message.contains("not covered by an approved grant"))
+    );
+
+    let actorless_thread_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "binding-direct-scoped".to_string(),
+            peer_id: thread_binding_session_key(
+                "binding-direct-scoped",
+                conversation_ref,
+                thread_ref,
+            ),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect_err("direct actor grant must not open actorless thread session");
+    assert!(
+        matches!(actorless_thread_session, KernelError::BadRequest(message) if message.contains("channel grant is not approved"))
+    );
+}
+
+#[tokio::test]
 async fn channel_session_binding_accepts_only_canonical_session_keys() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "binding-canonical", "binding-canonical-skill").await;

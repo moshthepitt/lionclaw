@@ -257,6 +257,22 @@ where
             return Ok(());
         }
 
+        if authorization
+            .one_shot_release_held_id()
+            .is_some_and(|released_held_id| !previously_held || released_held_id != held_id)
+        {
+            store
+                .record_held(
+                    candidate,
+                    &held_id,
+                    held_body_not_downloaded_text(),
+                    "release_grant_mismatch",
+                )
+                .await?;
+            mark_held_candidate_processed(store, mailbox, candidate).await?;
+            return Ok(());
+        }
+
         let consumed_release_grant_id = self
             .record_consumed_one_shot_release_grant_if_needed(
                 store,
@@ -1172,7 +1188,7 @@ fn digest_text(
                 lines.push(format!("Reason: {reason}"));
             }
             lines.push(format!(
-                "Actions: allow {}, block {}, or release {} once with a thread-scoped grant labeled email-release:{}.",
+                "Actions: allow {}, block {}, or release {} once with a direct sender grant labeled email-release:{}.",
                 item.sender_address, item.sender_address, item.held_id, item.held_id
             ));
         }
@@ -1424,6 +1440,7 @@ mod tests {
                 authorize[0]["session_binding"],
                 crate::protocol::INBOUND_SESSION_BINDING
             );
+            assert_eq!(authorize[0]["trigger"], crate::protocol::INBOUND_TRIGGER);
         }
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(
@@ -1741,6 +1758,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mismatched_one_shot_release_grant_does_not_admit_other_held_mail() {
+        let fixture = EmailFixture::new(false).await;
+
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+
+        fixture.api.set_one_shot_release_authorized("hld_different");
+        worker.tick().await.expect("mismatched release tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        assert!(fixture.api.revoked_grants.lock().unwrap().is_empty());
+
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Held)
+        );
+    }
+
+    #[tokio::test]
     async fn one_shot_release_revocation_survives_failed_release_processing() {
         let fixture = EmailFixture::with_candidate(
             false,
@@ -1937,7 +1978,7 @@ mod tests {
             self.authorized.store(true, Ordering::SeqCst);
             *self.grant.lock().unwrap() = Some(AuthGrant {
                 grant_id: "00000000-0000-0000-0000-000000000086".to_string(),
-                routing_profile: "thread".to_string(),
+                routing_profile: "direct".to_string(),
                 label: format!("email-release:{held_id}"),
             });
         }

@@ -44,40 +44,30 @@ Under the hood, the worker:
 
 ## Prerequisites
 
-- `python3`
-- `uv`
+- a configured LionClaw project instance
 - Telegram bot token with DM access
-- LionClaw running (default `http://127.0.0.1:8979`)
+- `python3` and `uv` for source/development worker runs
 
 ## Setup
 
-1. Register the skill and channel:
+Use the product path first:
 
 ```bash
-lionclaw skill add skills/channel-telegram --alias telegram
-lionclaw channel add telegram --required-env TELEGRAM_BOT_TOKEN
+printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
+lionclaw connect telegram --env-file ./telegram.env
+lionclaw doctor
 ```
 
-2. Start LionClaw for background channels:
+`connect telegram` installs or refreshes the channel skill, stores declared
+channel env in the selected instance home, and starts the background stack.
+
+Direct worker invocation is for development and tests when you intentionally
+provide the LionClaw worker environment. Polling is the default. For webhook
+deployments, expose the worker's local receiver through HTTPS, set Telegram's
+webhook URL with the same `secret_token`, and run the worker with its normal
+LionClaw/Telegram env plus:
 
 ```bash
-lionclaw up
-```
-
-3. Run the worker script:
-
-```bash
-TELEGRAM_BOT_TOKEN=... \
-LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
-./skills/channel-telegram/scripts/worker
-```
-
-Polling is the default. For webhook deployments, expose the worker's local
-receiver through HTTPS, set Telegram's webhook URL with the same
-`secret_token`, and run with:
-
-```bash
-TELEGRAM_BOT_TOKEN=... \
 TELEGRAM_UPDATE_MODE=webhook \
 TELEGRAM_WEBHOOK_SECRET_TOKEN=... \
 TELEGRAM_WEBHOOK_HOST=127.0.0.1 \
@@ -88,7 +78,8 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
 
 ## Notes
 
-- LionClaw enforces scoped pairing (`pending_approval` -> approved grant through `lionclaw channel pairing approve ...` or `/v0/channels/pairing/approve`).
+- LionClaw enforces scoped pairing (`pending_approval` -> approved grant
+  through `lionclaw channel pairing approve ...`).
 - The worker accepts Telegram `message`, `edited_message`, `channel_post`, and
   `edited_channel_post` updates when they contain usable text, captions, or
   supported media. Inline `callback_query` updates are accepted only for

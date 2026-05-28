@@ -65,9 +65,8 @@ attachment count, held id, and the exact refs shown in the digest.
 
 Permanent approval is for an exact sender ref such as
 `email:addr:alice@example.com`; domain approval is not part of v1. One-shot
-release uses a thread-scoped grant labeled exactly
-`email-release:<held-id>`. The worker admits the matching held item once and
-then revokes that grant.
+release uses a direct sender grant labeled exactly `email-release:<held-id>`.
+The worker admits only the matching held item once and then revokes that grant.
 
 Only perform approval, block, or release steps when the local operator
 explicitly requests that administrative action and the required LionClaw admin

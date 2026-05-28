@@ -539,6 +539,11 @@ does not broaden the approved grant scope, then derives the session key itself.
 Workers never supply raw session keys, templates, or metadata-derived session
 identity.
 
+Actor-qualified conversation/thread bindings may be covered by an approved
+direct actor grant because they narrow that actor into a more specific history
+key. Actorless conversation/thread bindings require an approved route grant and
+cannot be opened from a direct actor grant alone.
+
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
    a deterministic `(channel_id, session_key)`.
 2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
