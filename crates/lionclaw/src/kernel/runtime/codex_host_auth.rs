@@ -312,13 +312,17 @@ fn trust_runtime_workspace(document: &mut DocumentMut) -> Result<()> {
     let projects_table = document["projects"]
         .as_table_mut()
         .ok_or_else(|| anyhow!("projects table missing after initialization"))?;
-    let needs_workspace_table = !projects_table.contains_key(CODEX_RUNTIME_WORKSPACE_PATH)
-        || projects_table
+    if projects_table
+        .get(CODEX_RUNTIME_WORKSPACE_PATH)
+        .and_then(Item::as_table)
+        .is_none()
+    {
+        let workspace_table = projects_table
             .get(CODEX_RUNTIME_WORKSPACE_PATH)
-            .and_then(Item::as_table)
-            .is_none();
-    if needs_workspace_table {
-        projects_table.insert(CODEX_RUNTIME_WORKSPACE_PATH, toml_edit::table());
+            .and_then(Item::as_inline_table)
+            .map(|project| project.clone().into_table())
+            .unwrap_or_default();
+        projects_table.insert(CODEX_RUNTIME_WORKSPACE_PATH, Item::Table(workspace_table));
     }
 
     let workspace_table = projects_table
@@ -1144,5 +1148,23 @@ projects = { "/host/repo" = { trust_level = "trusted", marker = "keep" } }
         assert!(config.contains("marker = \"keep\""));
         assert!(config.contains("[projects.\"/workspace\"]"));
         assert!(config.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn runtime_codex_config_preserves_existing_workspace_project_fields() {
+        let config = runtime_codex_config_contents(Some(
+            br#"
+[projects]
+"/workspace" = { trust_level = "untrusted", marker = "keep" }
+"#
+            .to_vec(),
+        ))
+        .expect("runtime config");
+        let config = String::from_utf8(config).expect("config utf8");
+
+        assert!(config.contains("[projects.\"/workspace\"]"));
+        assert!(config.contains("trust_level = \"trusted\""));
+        assert!(config.contains("marker = \"keep\""));
+        assert!(!config.contains("trust_level = \"untrusted\""));
     }
 }
