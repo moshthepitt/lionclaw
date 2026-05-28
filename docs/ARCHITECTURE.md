@@ -192,13 +192,13 @@ Flow:
 
 1. The operator CLI resolves the normal LionClaw project, runtime, and durable
    interactive session.
-2. The kernel renders the same runtime cache and generated context used by
-   program-backed turns, then writes it into runtime-private state as both
-   `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
+2. The kernel materializes the confined runtime layout, runtime-visible skills,
+   and a fresh attached-session context directly into runtime-private state as
+   both `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
 3. The runtime adapter supplies a terminal program through
    `build_terminal_program()`.
-4. The execution planner compiles and materializes the same confined runtime
-   layout, staged auth, mounts, network mode, and secret policy.
+4. The execution planner compiles the same mounted workspace, staged auth,
+   network mode, and secret policy used by the selected runtime preset.
 5. The OCI backend attaches the operator's terminal to the runtime process with
    a TTY.
 6. On launch and exit, the kernel writes `runtime.tui.launch`,
