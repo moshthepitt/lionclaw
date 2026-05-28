@@ -34,6 +34,18 @@ For multiline messages, pipe the body on stdin:
 printf '%s\n' "Please inspect the current workspace and reply." | scripts/send reviewer
 ```
 
+Use `--format plain|markdown|html` when the message is not markdown. Use
+`--attachment /runtime/path` for files the current turn has written under
+`/runtime`; repeat it for multiple attachments. Attachments are intentionally
+path-only here: LionClaw derives the filename and media type from the runtime
+file, so write or rename the file under `/runtime` before sending when the name
+matters. Use `--reply-to-ref <ref>` only when continuing a known provider
+message thread.
+
+```bash
+scripts/send reviewer --format plain --attachment /runtime/results/report.txt -- "Report attached."
+```
+
 If a task will take a while, send a short acknowledgment first, then send the
 result when done. Incoming team-local messages arrive as normal LionClaw channel
 turns. Reply normally; LionClaw routes the response back through the same

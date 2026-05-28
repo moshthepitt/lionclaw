@@ -27,7 +27,25 @@ pub struct SendConfig {
     pub channel_send_socket: PathBuf,
     pub recipients: Vec<String>,
     pub message: Option<String>,
+    pub format_hint: String,
+    pub attachments: Vec<SendAttachmentConfig>,
+    pub reply_to_ref: Option<String>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendAttachmentConfig {
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSendArgs {
+    recipients: Vec<String>,
+    message: Option<String>,
+    format_hint: String,
+    attachments: Vec<SendAttachmentConfig>,
+    reply_to_ref: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,40 +186,19 @@ impl Command {
     }
 
     fn send_from_args(args: Vec<String>) -> Result<Self> {
-        let mut recipients = Vec::new();
-        let mut message_parts = None;
-        let mut idempotency_key = None;
-
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--" => {
-                    message_parts = Some(args.collect::<Vec<_>>());
-                    break;
-                }
-                "--idempotency-key" => {
-                    idempotency_key = Some(parse_next_string(&mut args, "--idempotency-key")?);
-                }
-                "-h" | "--help" => {
-                    print_send_help();
-                    return Ok(Self::Help);
-                }
-                other if other.starts_with('-') => bail!("unknown argument '{other}'"),
-                recipient => recipients.push(recipient.to_string()),
-            }
-        }
-
-        if recipients.is_empty() {
-            bail!("team-local send requires at least one recipient");
-        }
-        let message = message_parts.map(|parts| parts.join(" "));
+        let Some(parsed) = parse_send_args(args)? else {
+            return Ok(Self::Help);
+        };
         Ok(Self::Send(SendConfig {
             self_instance: required_env("LIONCLAW_PROJECT_INSTANCE")?,
             instances_file: required_env_path("LIONCLAW_PROJECT_INSTANCES_FILE")?,
             channel_send_socket: required_env_path("LIONCLAW_CHANNEL_SEND_SOCKET")?,
-            recipients,
-            message,
-            idempotency_key,
+            recipients: parsed.recipients,
+            message: parsed.message,
+            format_hint: parsed.format_hint,
+            attachments: parsed.attachments,
+            reply_to_ref: parsed.reply_to_ref,
+            idempotency_key: parsed.idempotency_key,
         }))
     }
 }
@@ -219,6 +216,58 @@ fn inventory_config_from_env() -> Result<InventoryConfig> {
         self_instance: required_env("LIONCLAW_PROJECT_INSTANCE")?,
         instances_file: required_env_path("LIONCLAW_PROJECT_INSTANCES_FILE")?,
     })
+}
+
+fn parse_send_args(args: Vec<String>) -> Result<Option<ParsedSendArgs>> {
+    let mut recipients = Vec::new();
+    let mut message_parts = None;
+    let mut format_hint = "markdown".to_string();
+    let mut attachments = Vec::new();
+    let mut reply_to_ref = None;
+    let mut idempotency_key = None;
+
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => {
+                message_parts = Some(args.collect::<Vec<_>>());
+                break;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(parse_next_string(&mut args, "--idempotency-key")?);
+            }
+            "--format" => {
+                format_hint = parse_format_hint(&mut args)?;
+            }
+            "--attachment" => {
+                attachments.push(SendAttachmentConfig {
+                    path: parse_next_string(&mut args, "--attachment")?,
+                });
+            }
+            "--reply-to-ref" => {
+                reply_to_ref = Some(parse_next_string(&mut args, "--reply-to-ref")?);
+            }
+            "-h" | "--help" => {
+                print_send_help();
+                return Ok(None);
+            }
+            other if other.starts_with('-') => bail!("unknown argument '{other}'"),
+            recipient => recipients.push(recipient.to_string()),
+        }
+    }
+
+    if recipients.is_empty() {
+        bail!("team-local send requires at least one recipient");
+    }
+
+    Ok(Some(ParsedSendArgs {
+        recipients,
+        message: message_parts.map(|parts| parts.join(" ")),
+        format_hint,
+        attachments,
+        reply_to_ref,
+        idempotency_key,
+    }))
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -258,12 +307,21 @@ fn parse_next_string(args: &mut impl Iterator<Item = String>, flag: &str) -> Res
         .ok_or_else(|| anyhow!("{flag} requires a non-empty value"))
 }
 
+fn parse_format_hint(args: &mut impl Iterator<Item = String>) -> Result<String> {
+    let value = parse_next_string(args, "--format")?;
+    if matches!(value.as_str(), "plain" | "markdown" | "html") {
+        Ok(value)
+    } else {
+        bail!("--format must be plain, markdown, or html")
+    }
+}
+
 fn print_help() {
     println!(
         "lionclaw-channel-team-local worker [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS]\n\
          lionclaw-channel-team-local list\n\
          lionclaw-channel-team-local resolve <recipient>\n\
-         lionclaw-channel-team-local send [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+         lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }
 
@@ -283,6 +341,73 @@ fn print_resolve_help() {
 
 fn print_send_help() {
     println!(
-        "lionclaw-channel-team-local send [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+        "lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_send_args;
+
+    #[test]
+    fn parses_send_content_flags_and_repeated_attachments() {
+        let parsed = parse_send_args(vec![
+            "--format".to_string(),
+            "html".to_string(),
+            "--attachment".to_string(),
+            "/runtime/results/report.html".to_string(),
+            "--attachment".to_string(),
+            "/runtime/results/data.json".to_string(),
+            "--reply-to-ref".to_string(),
+            "source-message".to_string(),
+            "--idempotency-key".to_string(),
+            "turn-1".to_string(),
+            "reviewer".to_string(),
+            "qa".to_string(),
+            "--".to_string(),
+            "Report".to_string(),
+            "attached.".to_string(),
+        ])
+        .expect("parse send args")
+        .expect("send args");
+
+        assert_eq!(parsed.recipients, ["reviewer", "qa"]);
+        assert_eq!(parsed.message.as_deref(), Some("Report attached."));
+        assert_eq!(parsed.format_hint, "html");
+        assert_eq!(parsed.attachments.len(), 2);
+        assert_eq!(parsed.attachments[0].path, "/runtime/results/report.html");
+        assert_eq!(parsed.attachments[1].path, "/runtime/results/data.json");
+        assert_eq!(parsed.reply_to_ref.as_deref(), Some("source-message"));
+        assert_eq!(parsed.idempotency_key.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn parses_send_defaults_for_simple_message() {
+        let parsed = parse_send_args(vec![
+            "reviewer".to_string(),
+            "--".to_string(),
+            "Please check this.".to_string(),
+        ])
+        .expect("parse send args")
+        .expect("send args");
+
+        assert_eq!(parsed.recipients, ["reviewer"]);
+        assert_eq!(parsed.message.as_deref(), Some("Please check this."));
+        assert_eq!(parsed.format_hint, "markdown");
+        assert!(parsed.attachments.is_empty());
+        assert!(parsed.reply_to_ref.is_none());
+        assert!(parsed.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_send_format() {
+        let err = parse_send_args(vec![
+            "--format".to_string(),
+            "rtf".to_string(),
+            "reviewer".to_string(),
+        ])
+        .expect_err("invalid format");
+
+        assert!(err.to_string().contains("--format must be"));
+    }
 }
