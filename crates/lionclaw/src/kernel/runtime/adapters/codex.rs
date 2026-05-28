@@ -831,11 +831,7 @@ fn codex_app_server_user_input_text(input: &Value) -> Option<String> {
 fn codex_app_server_turn_status(
     turn: &Value,
 ) -> (RuntimeTerminalTurnStatus, Option<String>, Option<String>) {
-    let status = match turn.get("status").and_then(Value::as_str) {
-        Some("failed") => RuntimeTerminalTurnStatus::Failed,
-        Some("interrupted") => RuntimeTerminalTurnStatus::Interrupted,
-        _ => RuntimeTerminalTurnStatus::Completed,
-    };
+    let status = codex_app_server_terminal_turn_status(turn.get("status").and_then(Value::as_str));
     let error_text = turn
         .get("error")
         .and_then(|error| error.get("message"))
@@ -845,6 +841,19 @@ fn codex_app_server_turn_status(
         .as_ref()
         .map(|_| "runtime.codex.turn_failed".to_string());
     (status, error_code, error_text)
+}
+
+fn codex_app_server_terminal_turn_status(status: Option<&str>) -> RuntimeTerminalTurnStatus {
+    let Some(status) = status.map(str::trim).filter(|status| !status.is_empty()) else {
+        return RuntimeTerminalTurnStatus::Completed;
+    };
+    if status.eq_ignore_ascii_case("completed") {
+        RuntimeTerminalTurnStatus::Completed
+    } else if status.eq_ignore_ascii_case("failed") {
+        RuntimeTerminalTurnStatus::Failed
+    } else {
+        RuntimeTerminalTurnStatus::Interrupted
+    }
 }
 
 fn codex_app_server_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
@@ -2758,6 +2767,38 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn codex_app_server_turn_status_preserves_terminal_state() {
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "completed"
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Completed);
+        assert_eq!(error_code, None);
+        assert_eq!(error_text, None);
+
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "failed",
+            "error": {"message": "quota exceeded"}
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Failed);
+        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
+        assert_eq!(error_text, Some("quota exceeded".to_string()));
+
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "interrupted"
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
+        assert_eq!(error_code, None);
+        assert_eq!(error_text, None);
+
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "inProgress"
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
+        assert_eq!(error_code, None);
+        assert_eq!(error_text, None);
     }
 
     #[test]
