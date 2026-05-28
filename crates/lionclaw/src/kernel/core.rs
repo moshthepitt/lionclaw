@@ -7713,9 +7713,11 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(
-            matches!(err, KernelError::Runtime(message) if message.contains("runtime TUI requires a runtime state mount"))
-        );
+        let message = match err {
+            KernelError::BadRequest(message) | KernelError::Runtime(message) => message,
+            other => panic!("unexpected error: {other}"),
+        };
+        assert!(message.contains("runtime TUI requires a runtime state mount"));
     }
 
     #[tokio::test]

@@ -247,23 +247,24 @@ impl ExecutionPlanner {
             extra_mounts: &request.extra_mounts,
             purpose: request.purpose,
         })?;
+        let has_workspace_mount = has_mount_target(&mounts, WORKSPACE_MOUNT_TARGET);
+        let has_runtime_mount = has_mount_target(&mounts, RUNTIME_MOUNT_TARGET);
+        let has_drafts_mount = has_mount_target(&mounts, DRAFTS_MOUNT_TARGET);
+        let has_skills_mount = mounts
+            .iter()
+            .any(|mount| is_skills_mount_target(&mount.target));
+        if request.purpose == ExecutionPlanPurpose::AttachedRuntimeTui && !has_runtime_mount {
+            return Err("runtime TUI requires a runtime state mount at /runtime".to_string());
+        }
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
         let environment = build_runtime_environment(
             execution_context.environment,
-            mounts
-                .iter()
-                .any(|mount| mount.target == WORKSPACE_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| mount.target == RUNTIME_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| is_skills_mount_target(&mount.target)),
+            has_workspace_mount,
+            has_runtime_mount,
+            has_drafts_mount,
+            has_skills_mount,
         );
         let working_dir = execution_context
             .working_dir
@@ -451,6 +452,10 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
         WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
     }
+}
+
+fn has_mount_target(mounts: &[MountSpec], target: &str) -> bool {
+    mounts.iter().any(|mount| mount.target == target)
 }
 
 fn is_skills_mount_target(target: &str) -> bool {
@@ -865,6 +870,43 @@ mod tests {
             Some(workspace_root.to_string_lossy().as_ref())
         );
         assert!(plan.escape_classes.is_empty());
+    }
+
+    #[test]
+    fn attached_runtime_tui_requires_runtime_state_mount() {
+        let sandbox = tempdir().expect("temp dir");
+        let workspace_root = sandbox.path().join("project");
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(workspace_root),
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::AttachedRuntimeTui,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("attached runtime TUI should require runtime state");
+
+        assert!(
+            err.contains("runtime TUI requires a runtime state mount at /runtime"),
+            "unexpected planner error: {err}"
+        );
     }
 
     #[test]
