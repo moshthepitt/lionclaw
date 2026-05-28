@@ -84,7 +84,7 @@ pub fn parse_header_facts(raw_headers: &[u8]) -> Result<HeaderFacts> {
         sender,
         to,
         subject: sanitize_subject(headers.subject()),
-        message_id: headers.message_id().map(clean_message_id),
+        message_id: headers.message_id().and_then(clean_message_id),
         in_reply_to: first_id_header(Some(headers.in_reply_to())),
         references: id_header_values(Some(headers.references())),
         received_at,
@@ -204,19 +204,22 @@ fn first_id_header(value: Option<&HeaderValue<'_>>) -> Option<String> {
 
 fn id_header_values(value: Option<&HeaderValue<'_>>) -> Vec<String> {
     match value {
-        Some(HeaderValue::Text(text)) => vec![clean_message_id(text)],
-        Some(HeaderValue::TextList(values)) => {
-            values.iter().map(|value| clean_message_id(value)).collect()
-        }
+        Some(HeaderValue::Text(text)) => clean_message_id(text).into_iter().collect(),
+        Some(HeaderValue::TextList(values)) => values
+            .iter()
+            .filter_map(|value| clean_message_id(value))
+            .collect(),
         _ => Vec::new(),
     }
 }
 
-fn clean_message_id(raw: &str) -> String {
-    raw.trim()
+fn clean_message_id(raw: &str) -> Option<String> {
+    let value = raw
+        .trim()
         .trim_matches('<')
         .trim_matches('>')
-        .replace(['\r', '\n'], "")
+        .replace(['\r', '\n'], "");
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn fallback_sender(raw_headers: &[u8]) -> Option<EmailAddress> {
