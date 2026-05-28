@@ -255,9 +255,9 @@ pub async fn validate_oci_private_network_prerequisites(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         bail!(
-            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with code {:?} while starting a private network on this host",
+            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with {} while starting a private network on this host",
             confinement.engine,
-            output.exit_code
+            output.status_description()
         );
     }
 
@@ -291,9 +291,9 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
             bail!(
-                "failed to resolve OCI image identity for '{}'; OCI engine exited with code {:?}",
+                "failed to resolve OCI image identity for '{}'; OCI engine exited with {}",
                 image,
-                output.exit_code
+                output.status_description()
             );
         }
         bail!("failed to resolve OCI image identity for '{image}': {stderr}");
@@ -458,9 +458,9 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 bail!(
-                    "failed to inspect OCI image '{}'; OCI engine exited with code {:?}",
+                    "failed to inspect OCI image '{}'; OCI engine exited with {}",
                     image,
-                    output.exit_code
+                    output.status_description()
                 );
             }
             bail!("failed to inspect OCI image '{image}': {stderr}");
@@ -610,8 +610,8 @@ async fn ensure_runtime_secrets_registered(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         bail!(
-            "failed to register OCI runtime secrets; podman secret create exited with code {:?}",
-            output.exit_code
+            "failed to register OCI runtime secrets; podman secret create exited with {}",
+            output.status_description()
         );
     }
 
@@ -663,9 +663,9 @@ impl OciRuntimeSecretsCleanup {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
             bail!(
-                "failed to remove OCI runtime secret '{}'; OCI engine exited with code {:?}",
+                "failed to remove OCI runtime secret '{}'; OCI engine exited with {}",
                 self.secret_name,
-                output.exit_code
+                output.status_description()
             );
         }
 

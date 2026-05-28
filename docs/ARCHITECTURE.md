@@ -235,7 +235,8 @@ shows the prior attached launch did not complete its after-exit pass; that keeps
 normal startup fast while still recovering completed runtime turns already
 written by the harness after an unclean LionClaw exit. Reconciliation errors are
 audited and logged but do not prevent the operator from leaving the native TUI
-cleanly.
+cleanly. Transcript export passes are bounded by the runtime plan's hard
+timeout so a stuck runtime CLI cannot make native TUI exit handling unbounded.
 
 Native TUI mode does not provide typed live answer/reasoning events to
 channels. The normal operator console, `run --plain`, channel turns, and

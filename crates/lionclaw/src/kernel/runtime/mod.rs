@@ -436,15 +436,23 @@ pub trait RuntimeAdapter: Send + Sync {
         output: &ExecutionOutput,
         observed_error_text: Option<&str>,
     ) -> String {
-        let code = output.exit_code.unwrap_or(1);
         if let Some(text) = observed_error_text.filter(|text| !text.trim().is_empty()) {
-            format!("runtime process exited with code {code}: {text}")
+            format!(
+                "runtime process exited with {}: {text}",
+                output.status_description()
+            )
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                format!("runtime process exited with code {code}")
+                format!(
+                    "runtime process exited with {}",
+                    output.status_description()
+                )
             } else {
-                format!("runtime process exited with code {code}: {stderr}")
+                format!(
+                    "runtime process exited with {}: {stderr}",
+                    output.status_description()
+                )
             }
         }
     }

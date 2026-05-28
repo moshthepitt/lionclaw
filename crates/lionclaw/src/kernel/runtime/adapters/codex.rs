@@ -1618,12 +1618,17 @@ fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {
     if output.success() {
         return Ok(());
     }
-    let code = output.exit_code.unwrap_or(1);
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
-        bail!("codex app-server exited with code {code}");
+        bail!(
+            "codex app-server exited with {}",
+            output.status_description()
+        );
     }
-    bail!("codex app-server exited with code {code}: {stderr}");
+    bail!(
+        "codex app-server exited with {}: {stderr}",
+        output.status_description()
+    );
 }
 
 async fn finish_app_server_session<T, R>(

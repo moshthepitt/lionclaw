@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
@@ -126,7 +127,18 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         _input: RuntimeTerminalTranscriptInput,
         executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
     ) -> Result<Vec<RuntimeTerminalTurn>> {
-        export_opencode_terminal_transcript_with_cli(&self.config, executor).await
+        let hard_timeout = executor.hard_timeout();
+        timeout(
+            hard_timeout,
+            export_opencode_terminal_transcript_with_cli(&self.config, executor),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s while exporting OpenCode native TUI transcript through the OpenCode CLI",
+                hard_timeout.as_secs_f32()
+            )
+        })?
     }
 
     fn format_program_exit_error(
@@ -134,7 +146,6 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         output: &ExecutionOutput,
         observed_error_text: Option<&str>,
     ) -> String {
-        let code = output.exit_code.unwrap_or(1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let observed_detail = observed_error_text
             .map(str::trim)
@@ -150,9 +161,12 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             .or(stderr_detail);
 
         if let Some(detail) = detail {
-            format!("opencode run exited with code {code}: {detail}")
+            format!(
+                "opencode run exited with {}: {detail}",
+                output.status_description()
+            )
         } else {
-            format!("opencode run exited with code {code}")
+            format!("opencode run exited with {}", output.status_description())
         }
     }
 
@@ -319,13 +333,13 @@ fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Err
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         anyhow!(
-            "OpenCode CLI {action} exited with code {:?}",
-            output.exit_code
+            "OpenCode CLI {action} exited with {}",
+            output.status_description()
         )
     } else {
         anyhow!(
-            "OpenCode CLI {action} exited with code {:?}: {stderr}",
-            output.exit_code
+            "OpenCode CLI {action} exited with {}: {stderr}",
+            output.status_description()
         )
     }
 }
@@ -778,7 +792,7 @@ fn collect_texts(value: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, future::pending, time::Duration};
 
     use crate::kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
@@ -806,6 +820,24 @@ mod tests {
             self.outputs
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("missing fake OpenCode output"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingTranscriptExecutor;
+
+    #[async_trait::async_trait]
+    impl RuntimeTerminalTranscriptProgramExecutor for HangingTranscriptExecutor {
+        fn hard_timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+
+        async fn execute(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> anyhow::Result<ExecutionOutput> {
+            pending::<()>().await;
+            unreachable!("pending transcript executor returned")
         }
     }
 
@@ -1029,6 +1061,35 @@ mod tests {
                 ("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string()),
                 ("OPENCODE_PURE".to_string(), "1".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_export_is_bounded_as_a_whole_pass() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let mut executor = HangingTranscriptExecutor;
+
+        let err = adapter
+            .export_terminal_transcript(
+                RuntimeTerminalTranscriptInput {
+                    session_id: Uuid::new_v4(),
+                    runtime_state_root,
+                },
+                &mut executor,
+            )
+            .await
+            .expect_err("expected export timeout");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out after"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            message.contains("OpenCode native TUI transcript through the OpenCode CLI"),
+            "unexpected error: {err}"
         );
     }
 
