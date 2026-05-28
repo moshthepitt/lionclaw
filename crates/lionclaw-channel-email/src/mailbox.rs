@@ -39,7 +39,22 @@ pub struct CandidateHeader {
     pub message_ref: String,
     pub attachment_count: usize,
     pub rfc822_size: Option<u32>,
+    pub sender_auth: Option<SenderAuthVerdict>,
     pub facts: HeaderFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderAuthVerdict {
+    pub policy: String,
+    pub authenticated: bool,
+}
+
+impl CandidateHeader {
+    pub fn with_sender_auth(&self, sender_auth: SenderAuthVerdict) -> Self {
+        let mut candidate = self.clone();
+        candidate.sender_auth = Some(sender_auth);
+        candidate
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,6 +343,7 @@ impl RealMailboxEngine {
             message_ref: message,
             attachment_count: input.attachment_count,
             rfc822_size: input.rfc822_size,
+            sender_auth: None,
             facts,
         })
     }

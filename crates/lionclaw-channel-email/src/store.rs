@@ -13,7 +13,7 @@ use sqlx::{
 };
 
 use crate::{
-    mailbox::{CandidateHeader, MalformedCandidateHeader},
+    mailbox::{CandidateHeader, MalformedCandidateHeader, SenderAuthVerdict},
     mime::{EmailAddress, HeaderFacts},
 };
 
@@ -126,6 +126,8 @@ impl EmailStore {
                 attachment_count INTEGER NOT NULL DEFAULT 0,
                 rfc822_size INTEGER,
                 classification_reason TEXT,
+                sender_auth_policy TEXT,
+                sender_auth_authenticated INTEGER,
                 provider_message_id TEXT,
                 in_reply_to TEXT,
                 references_json TEXT NOT NULL DEFAULT '[]',
@@ -137,6 +139,7 @@ impl EmailStore {
         .execute(&self.pool)
         .await?;
         self.ensure_mail_items_rfc822_size_column().await?;
+        self.ensure_mail_items_sender_auth_columns().await?;
         self.ensure_mail_items_indexes().await?;
 
         sqlx::query(
@@ -210,6 +213,32 @@ impl EmailStore {
         Ok(())
     }
 
+    async fn ensure_mail_items_sender_auth_columns(&self) -> Result<()> {
+        self.ensure_column("mail_items", "sender_auth_policy", "TEXT")
+            .await?;
+        self.ensure_column("mail_items", "sender_auth_authenticated", "INTEGER")
+            .await
+    }
+
+    async fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&self.pool)
+            .await?;
+        let has_column = rows.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == column)
+                .unwrap_or(false)
+        });
+        if !has_column {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn mail_status(&self, event_id: &str) -> Result<Option<MailStatus>> {
         let Some(row) = sqlx::query("SELECT status FROM mail_items WHERE event_id = ?")
             .bind(event_id)
@@ -256,7 +285,7 @@ impl EmailStore {
             SELECT event_id, uid_validity, uid, sender_ref, sender_address, sender_name,
                    conversation_ref, thread_ref, message_ref, subject, received_at,
                    attachment_count, rfc822_size, provider_message_id, in_reply_to,
-                   references_json
+                   references_json, sender_auth_policy, sender_auth_authenticated
             FROM mail_items
             WHERE status = 'held'
             ORDER BY updated_at ASC, event_id ASC
@@ -302,9 +331,10 @@ impl EmailStore {
                 event_id, held_id, status, uid_validity, uid, sender_ref, sender_address,
                 sender_name, conversation_ref, thread_ref, message_ref, subject, snippet,
                 received_at, attachment_count, rfc822_size, classification_reason,
-                provider_message_id, in_reply_to, references_json, created_at, updated_at
+                sender_auth_policy, sender_auth_authenticated, provider_message_id,
+                in_reply_to, references_json, created_at, updated_at
             )
-            VALUES (?, NULL, 'suppressed', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, '[]', ?, ?)
+            VALUES (?, NULL, 'suppressed', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, '[]', ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 held_id=NULL,
                 status=excluded.status,
@@ -320,6 +350,8 @@ impl EmailStore {
                 attachment_count=excluded.attachment_count,
                 rfc822_size=COALESCE(excluded.rfc822_size, mail_items.rfc822_size),
                 classification_reason=excluded.classification_reason,
+                sender_auth_policy=NULL,
+                sender_auth_authenticated=NULL,
                 provider_message_id=NULL,
                 in_reply_to=NULL,
                 references_json='[]',
@@ -368,15 +400,18 @@ impl EmailStore {
                 event_id, held_id, status, uid_validity, uid, sender_ref, sender_address,
                 sender_name, conversation_ref, thread_ref, message_ref, subject, snippet,
                 received_at, attachment_count, rfc822_size, classification_reason,
-                provider_message_id, in_reply_to, references_json, created_at, updated_at
+                sender_auth_policy, sender_auth_authenticated, provider_message_id,
+                in_reply_to, references_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 held_id=excluded.held_id,
                 status=excluded.status,
                 snippet=excluded.snippet,
                 rfc822_size=COALESCE(excluded.rfc822_size, mail_items.rfc822_size),
                 classification_reason=excluded.classification_reason,
+                sender_auth_policy=COALESCE(excluded.sender_auth_policy, mail_items.sender_auth_policy),
+                sender_auth_authenticated=COALESCE(excluded.sender_auth_authenticated, mail_items.sender_auth_authenticated),
                 updated_at=excluded.updated_at
             "#,
         )
@@ -397,6 +432,13 @@ impl EmailStore {
         .bind(candidate.attachment_count as i64)
         .bind(candidate.rfc822_size.map(i64::from))
         .bind(reason)
+        .bind(candidate.sender_auth.as_ref().map(|value| value.policy.as_str()))
+        .bind(
+            candidate
+                .sender_auth
+                .as_ref()
+                .map(|value| if value.authenticated { 1_i64 } else { 0_i64 }),
+        )
         .bind(&candidate.facts.message_id)
         .bind(&candidate.facts.in_reply_to)
         .bind(references_json)
@@ -796,6 +838,7 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
             u32::try_from(value).with_context(|| format!("held mail {event_id} has invalid size"))
         })
         .transpose()?;
+    let sender_auth = sender_auth_from_row(&row, &event_id)?;
     Ok(CandidateHeader {
         uid_validity,
         uid,
@@ -807,6 +850,7 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
         attachment_count: usize::try_from(row.try_get::<i64, _>("attachment_count")?)
             .context("held mail attachment_count is invalid")?,
         rfc822_size,
+        sender_auth,
         facts: HeaderFacts {
             sender: EmailAddress {
                 address: row.try_get("sender_address")?,
@@ -821,6 +865,26 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
             raw_headers: Vec::new(),
         },
     })
+}
+
+fn sender_auth_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    event_id: &str,
+) -> Result<Option<SenderAuthVerdict>> {
+    let policy: Option<String> = row.try_get("sender_auth_policy")?;
+    let authenticated: Option<i64> = row.try_get("sender_auth_authenticated")?;
+    match (policy, authenticated) {
+        (Some(policy), Some(0)) => Ok(Some(SenderAuthVerdict {
+            policy,
+            authenticated: false,
+        })),
+        (Some(policy), Some(1)) => Ok(Some(SenderAuthVerdict {
+            policy,
+            authenticated: true,
+        })),
+        (None, None) => Ok(None),
+        _ => bail!("held mail {event_id} has invalid sender auth verdict"),
+    }
 }
 
 #[cfg(test)]
@@ -978,6 +1042,35 @@ mod tests {
                 .map(|name| name == "mail_items_message_ref_sender_ref_idx")
                 .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn held_candidates_preserve_sender_auth_verdict() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let candidate = candidate(1).with_sender_auth(SenderAuthVerdict {
+            policy: "auth-results:mx.example.com".to_string(),
+            authenticated: true,
+        });
+        store
+            .record_held(
+                &candidate,
+                &held_id_for(&candidate.event_id),
+                "not downloaded",
+                "approval_required",
+            )
+            .await
+            .expect("record held");
+
+        let held = store.held_candidates(10).await.expect("held candidates");
+
+        assert_eq!(
+            held[0].sender_auth,
+            Some(SenderAuthVerdict {
+                policy: "auth-results:mx.example.com".to_string(),
+                authenticated: true,
+            })
+        );
     }
 
     #[cfg(unix)]
@@ -1197,6 +1290,7 @@ mod tests {
             message_ref: message_ref(&message_id),
             attachment_count: 0,
             rfc822_size: Some(headers.len() as u32),
+            sender_auth: None,
             facts,
         }
     }
