@@ -7595,6 +7595,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_rejects_symlinked_generated_context_cache() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let project_root = temp_dir.path().join("project");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        fs::create_dir(&project_root).expect("project root");
+        fs::create_dir(&runtime_state_root).expect("runtime state root");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(project_root.clone()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![MountSpec {
+            source: runtime_state_root.clone(),
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        let generated_agents = runtime_project_generated_agents_path_from_parts(
+            &runtime_root,
+            "codex",
+            "main",
+            Some(&project_root),
+        );
+        let outside = temp_dir.path().join("outside-generated.md");
+        fs::create_dir_all(generated_agents.parent().expect("generated parent"))
+            .expect("generated parent");
+        fs::write(&outside, "outside context\n").expect("outside context");
+        std::os::unix::fs::symlink(&outside, &generated_agents).expect("generated context symlink");
+
+        let err = kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect_err("symlinked generated runtime context should fail");
+
+        assert!(
+            matches!(err, KernelError::Runtime(message) if message.contains("generated runtime context"))
+        );
+        assert!(
+            !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
+            "materialization must not import generated context through a symlink"
+        );
+    }
+
     #[tokio::test]
     async fn attached_runtime_skips_prelaunch_reconcile_for_clean_state() {
         let temp_dir = tempdir().expect("temp dir");
@@ -9561,7 +9614,24 @@ fn open_runtime_artifact_source(
     artifact: &RuntimeArtifact,
 ) -> Result<std::fs::File, KernelError> {
     let relative = runtime_artifact_relative_path(artifact_root, artifact)?;
-    open_regular_file_beneath_root(artifact_root, &relative, &artifact.path)
+    open_regular_file_beneath_root(artifact_root, &relative, &artifact.path, "runtime artifact")
+}
+
+fn read_regular_file_beneath_root(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+    label: &str,
+) -> Result<Vec<u8>, KernelError> {
+    let mut file = open_regular_file_beneath_root(root, relative, display_path, label)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(|err| {
+        KernelError::Runtime(format!(
+            "{label} '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    Ok(contents)
 }
 
 #[cfg(unix)]
@@ -9569,6 +9639,7 @@ fn open_regular_file_beneath_root(
     root: &Path,
     relative: &Path,
     display_path: &Path,
+    label: &str,
 ) -> Result<std::fs::File, KernelError> {
     use rustix::fs::{open, openat, Mode, OFlags};
 
@@ -9579,7 +9650,7 @@ fn open_regular_file_beneath_root(
     )
     .map_err(|err| {
         KernelError::Runtime(format!(
-            "runtime artifact root '{}' is not readable: {err}",
+            "{label} root '{}' is not readable: {err}",
             root.display()
         ))
     })?;
@@ -9588,7 +9659,7 @@ fn open_regular_file_beneath_root(
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is outside the runtime root",
+                "{label} '{}' is outside the runtime root",
                 display_path.display()
             )));
         };
@@ -9602,7 +9673,7 @@ fn open_regular_file_beneath_root(
             )
             .map_err(|err| {
                 KernelError::Runtime(format!(
-                    "runtime artifact '{}' is not readable: {err}",
+                    "{label} '{}' is not readable: {err}",
                     display_path.display()
                 ))
             })?;
@@ -9618,20 +9689,20 @@ fn open_regular_file_beneath_root(
         )
         .map_err(|err| {
             KernelError::Runtime(format!(
-                "runtime artifact '{}' is not readable: {err}",
+                "{label} '{}' is not readable: {err}",
                 display_path.display()
             ))
         })?;
         let file = std::fs::File::from(file);
         let metadata = file.metadata().map_err(|err| {
             KernelError::Runtime(format!(
-                "runtime artifact '{}' is not readable: {err}",
+                "{label} '{}' is not readable: {err}",
                 display_path.display()
             ))
         })?;
         if !metadata.is_file() {
             return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is not a regular file",
+                "{label} '{}' is not a regular file",
                 display_path.display()
             )));
         }
@@ -9639,7 +9710,7 @@ fn open_regular_file_beneath_root(
     }
 
     Err(KernelError::Runtime(format!(
-        "runtime artifact '{}' is not a regular file",
+        "{label} '{}' is not a regular file",
         display_path.display()
     )))
 }
@@ -9649,35 +9720,36 @@ fn open_regular_file_beneath_root(
     root: &Path,
     relative: &Path,
     display_path: &Path,
+    label: &str,
 ) -> Result<std::fs::File, KernelError> {
     let path = root.join(relative);
     let file = std::fs::File::open(&path).map_err(|err| {
         KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
+            "{label} '{}' is not readable: {err}",
             display_path.display()
         ))
     })?;
     let metadata = file.metadata().map_err(|err| {
         KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
+            "{label} '{}' is not readable: {err}",
             display_path.display()
         ))
     })?;
     if !metadata.is_file() {
         return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is not a regular file",
+            "{label} '{}' is not a regular file",
             display_path.display()
         )));
     }
     let canonical = std::fs::canonicalize(&path).map_err(|err| {
         KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
+            "{label} '{}' is not readable: {err}",
             display_path.display()
         ))
     })?;
     if !canonical.starts_with(root) {
         return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is outside the runtime root",
+            "{label} '{}' is outside the runtime root",
             display_path.display()
         )));
     }
@@ -14502,16 +14574,36 @@ impl Kernel {
             workspace_name,
             self.project_workspace_root.as_deref(),
         );
-        if !tokio::fs::try_exists(&generated_agents)
-            .await
-            .map_err(|err| internal(err.into()))?
-        {
-            return Ok(());
+        let metadata = match tokio::fs::symlink_metadata(&generated_agents).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(internal(err.into())),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(KernelError::Runtime(format!(
+                "generated runtime context '{}' must not be a symlink",
+                generated_agents.display()
+            )));
         }
-
-        let generated = tokio::fs::read(&generated_agents)
-            .await
-            .map_err(|err| internal(err.into()))?;
+        if !metadata.is_file() {
+            return Err(KernelError::Runtime(format!(
+                "generated runtime context '{}' is not a regular file",
+                generated_agents.display()
+            )));
+        }
+        let generated_relative = generated_agents.strip_prefix(runtime_root).map_err(|err| {
+            KernelError::Runtime(format!(
+                "generated runtime context '{}' is outside the runtime root '{}': {err}",
+                generated_agents.display(),
+                runtime_root.display()
+            ))
+        })?;
+        let generated = read_regular_file_beneath_root(
+            runtime_root,
+            generated_relative,
+            &generated_agents,
+            "generated runtime context",
+        )?;
         write_runtime_state_file(runtime_state_root, GENERATED_AGENTS_FILE, generated).await?;
         Ok(())
     }

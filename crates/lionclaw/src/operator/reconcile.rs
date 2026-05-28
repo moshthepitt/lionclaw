@@ -32,6 +32,7 @@ use crate::{
             unit_status_is_active, ChannelUnitSpec, DaemonProjectInstanceSpec, DaemonUnitSpec,
             ManagedUnit, UnitIdentity, UnitManager,
         },
+        private_paths::{create_private_dir_all, write_private_file},
         redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
@@ -765,9 +766,7 @@ pub(crate) async fn render_runtime_cache_for_work_root(
         target_dir.clone(),
         home.runtime_project_drafts_dir(runtime_id, workspace, project_workspace_root),
     ] {
-        tokio::fs::create_dir_all(&path)
-            .await
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        create_private_dir_all(home, &path, "runtime cache directory")?;
     }
     let target_path = target_dir.join(GENERATED_AGENTS_FILE);
 
@@ -791,9 +790,12 @@ pub(crate) async fn render_runtime_cache_for_work_root(
         &sections.join("\n\n"),
     );
 
-    tokio::fs::write(&target_path, rendered)
-        .await
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
+    write_private_file(
+        home,
+        &target_path,
+        rendered.as_bytes(),
+        "generated runtime context file",
+    )?;
     Ok(())
 }
 
@@ -1054,8 +1056,9 @@ mod tests {
     use super::{
         add_channel, add_channel_with_contact, add_skill, down, ensure_managed_bind_configured,
         logs, open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
-        resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
-        resolve_worker_entrypoint, up_for_work_root, ChannelContactSetup, StackBinaryPaths,
+        render_runtime_cache_for_work_root, resolve_installed_skill_worker_entrypoint,
+        resolve_required_channel_env, resolve_worker_entrypoint, up_for_work_root,
+        ChannelContactSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1336,6 +1339,64 @@ mod tests {
         assert!(rendered.contains("/run/secrets"));
         assert!(rendered.contains("lionclaw-runtime-secrets-"));
         assert!(rendered.contains("do not print its contents"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn render_runtime_cache_rejects_symlinked_project_cache_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let config = load_test_config(&home).await;
+        let project_workspace_root = temp_dir.path().join("work");
+        fs::create_dir(&project_workspace_root).expect("work root");
+        let target_dir =
+            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
+        let outside = temp_dir.path().join("outside-cache");
+        fs::create_dir_all(target_dir.parent().expect("target parent")).expect("target parent");
+        fs::create_dir(&outside).expect("outside cache");
+        symlink(&outside, &target_dir).expect("runtime cache dir symlink");
+
+        let err =
+            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
+                .await
+                .expect_err("symlinked runtime cache dir should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(
+            !outside.join(GENERATED_AGENTS_FILE).exists(),
+            "runtime cache rendering must not write through a symlinked project cache dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn render_runtime_cache_rejects_symlinked_generated_context_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let config = load_test_config(&home).await;
+        let project_workspace_root = temp_dir.path().join("work");
+        fs::create_dir(&project_workspace_root).expect("work root");
+        let target_dir =
+            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
+        let outside = temp_dir.path().join("outside-generated.md");
+        fs::create_dir_all(&target_dir).expect("target dir");
+        fs::write(&outside, "outside\n").expect("outside generated");
+        symlink(&outside, target_dir.join(GENERATED_AGENTS_FILE)).expect("generated symlink");
+
+        let err =
+            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
+                .await
+                .expect_err("symlinked generated context should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside contents"),
+            "outside\n"
+        );
     }
 
     #[tokio::test]

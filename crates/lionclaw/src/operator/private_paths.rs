@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Component, Path},
 };
 
@@ -57,6 +58,17 @@ pub(crate) fn ensure_private_file_write_target(
     })?;
     create_private_dir_all(home, parent, &format!("{label} directory"))?;
     ensure_file_target_not_symlink(path, label)
+}
+
+pub(crate) fn write_private_file(
+    home: &LionClawHome,
+    path: &Path,
+    contents: &[u8],
+    label: &str,
+) -> Result<()> {
+    ensure_private_file_write_target(home, path, label)?;
+    write_private_file_no_follow(path, contents, label)?;
+    set_private_file_permissions(path)
 }
 
 pub(crate) fn read_private_file_to_string(
@@ -341,4 +353,26 @@ fn ensure_file_target_not_symlink(path: &Path, label: &str) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
+}
+
+#[cfg(unix)]
+fn write_private_file_no_follow(path: &Path, contents: &[u8], label: &str) -> Result<()> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let file = open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let mut file = fs::File::from(file);
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_private_file_no_follow(path: &Path, contents: &[u8], _label: &str) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
 }
