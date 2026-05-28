@@ -2,7 +2,9 @@
 use anyhow::Context;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use mail_parser::{HeaderValue, MessageParser, MimeHeaders, PartType};
+use mail_parser::{
+    decoders::html::html_to_text, HeaderValue, Message, MessageParser, MimeHeaders, PartType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::{normalize_address, sanitize_subject};
@@ -95,7 +97,7 @@ pub fn parse_full_message(raw: &[u8]) -> Result<ParsedEmail> {
         .parse(raw)
         .ok_or_else(|| anyhow!("email MIME could not be parsed"))?;
     let facts = parse_header_facts(raw)?;
-    let body = message.body_text(0).unwrap_or_default().into_owned();
+    let body = message_body_text(&message);
     let stripped = strip_quoted_history(&body);
     let text = if stripped.trim().is_empty() {
         body
@@ -133,6 +135,18 @@ pub fn parse_full_message(raw: &[u8]) -> Result<ParsedEmail> {
         snippet,
         attachments,
     })
+}
+
+fn message_body_text(message: &Message<'_>) -> String {
+    let plain = message.body_text(0).unwrap_or_default().into_owned();
+    if !plain.trim().is_empty() {
+        return plain;
+    }
+
+    message
+        .body_html(0)
+        .map(|html| html_to_text(html.as_ref()))
+        .unwrap_or(plain)
 }
 
 pub fn header_value<'a>(facts: &'a HeaderFacts, name: &str) -> Option<&'a str> {
@@ -296,5 +310,17 @@ mod tests {
             strip_quoted_history("Please fix this.\n\n> old text\n> older"),
             "Please fix this."
         );
+    }
+
+    #[test]
+    fn parses_html_only_body_as_text() {
+        let parsed = parse_full_message(
+            b"From: Alice <alice@example.com>\r\nSubject: Hello\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hello<br>world &amp; team</p>",
+        )
+        .expect("parse html email");
+
+        assert!(parsed.text.contains("Hello"));
+        assert!(parsed.text.contains("world & team"));
+        require_nonempty_body(&parsed).expect("html body should count as usable body");
     }
 }

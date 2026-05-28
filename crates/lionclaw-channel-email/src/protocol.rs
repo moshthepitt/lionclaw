@@ -9,7 +9,15 @@ pub fn normalize_address(raw: &str) -> Option<String> {
     let (local, domain) = addr.split_once('@')?;
     let local = local.trim();
     let domain = domain.trim().to_ascii_lowercase();
-    if local.is_empty() || domain.is_empty() || domain.contains(' ') {
+    if local.is_empty()
+        || domain.is_empty()
+        || local
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '@'))
+        || domain
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '@'))
+    {
         return None;
     }
     Some(format!("{}@{}", local.to_ascii_lowercase(), domain))
@@ -117,6 +125,8 @@ mod tests {
             Some("alice@example.com")
         );
         assert!(normalize_address("no-at").is_none());
+        assert!(normalize_address("Alice <alice@example.com>").is_none());
+        assert!(normalize_address("alice@bad domain").is_none());
     }
 
     #[test]
