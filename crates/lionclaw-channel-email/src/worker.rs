@@ -1659,7 +1659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_release_grant_is_revoked_when_message_is_too_large() {
+    async fn known_oversized_held_release_is_suppressed_without_fetching() {
         let fixture = EmailFixture::with_candidate(
             false,
             candidate_with_rfc822_size(Some(1025)),
@@ -1678,7 +1678,7 @@ mod tests {
         fixture.api.set_one_shot_release_authorized(&held_id);
         worker.tick().await.expect("release tick");
 
-        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
         assert_eq!(fixture.mailbox.seen(), 2);
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(

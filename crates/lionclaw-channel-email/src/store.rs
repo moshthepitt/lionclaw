@@ -120,6 +120,7 @@ impl EmailStore {
                 snippet TEXT NOT NULL,
                 received_at TEXT,
                 attachment_count INTEGER NOT NULL DEFAULT 0,
+                rfc822_size INTEGER,
                 classification_reason TEXT,
                 provider_message_id TEXT,
                 in_reply_to TEXT,
@@ -131,6 +132,7 @@ impl EmailStore {
         )
         .execute(&self.pool)
         .await?;
+        self.ensure_mail_items_rfc822_size_column().await?;
 
         sqlx::query(
             r#"
@@ -174,6 +176,23 @@ impl EmailStore {
         Ok(())
     }
 
+    async fn ensure_mail_items_rfc822_size_column(&self) -> Result<()> {
+        let rows = sqlx::query("PRAGMA table_info(mail_items)")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_column = rows.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "rfc822_size")
+                .unwrap_or(false)
+        });
+        if !has_column {
+            sqlx::query("ALTER TABLE mail_items ADD COLUMN rfc822_size INTEGER")
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn mail_status(&self, event_id: &str) -> Result<Option<MailStatus>> {
         let Some(row) = sqlx::query("SELECT status FROM mail_items WHERE event_id = ?")
             .bind(event_id)
@@ -196,7 +215,8 @@ impl EmailStore {
             r#"
             SELECT event_id, uid_validity, uid, sender_ref, sender_address, sender_name,
                    conversation_ref, thread_ref, message_ref, subject, received_at,
-                   attachment_count, provider_message_id, in_reply_to, references_json
+                   attachment_count, rfc822_size, provider_message_id, in_reply_to,
+                   references_json
             FROM mail_items
             WHERE status = 'held'
             ORDER BY updated_at ASC, event_id ASC
@@ -252,14 +272,15 @@ impl EmailStore {
             INSERT INTO mail_items (
                 event_id, held_id, status, uid_validity, uid, sender_ref, sender_address,
                 sender_name, conversation_ref, thread_ref, message_ref, subject, snippet,
-                received_at, attachment_count, classification_reason, provider_message_id,
-                in_reply_to, references_json, created_at, updated_at
+                received_at, attachment_count, rfc822_size, classification_reason,
+                provider_message_id, in_reply_to, references_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 held_id=excluded.held_id,
                 status=excluded.status,
                 snippet=excluded.snippet,
+                rfc822_size=COALESCE(excluded.rfc822_size, mail_items.rfc822_size),
                 classification_reason=excluded.classification_reason,
                 updated_at=excluded.updated_at
             "#,
@@ -279,6 +300,7 @@ impl EmailStore {
         .bind(snippet)
         .bind(received_at)
         .bind(candidate.attachment_count as i64)
+        .bind(candidate.rfc822_size.map(i64::from))
         .bind(reason)
         .bind(&candidate.facts.message_id)
         .bind(&candidate.facts.in_reply_to)
@@ -575,6 +597,12 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
     let references_json: String = row.try_get("references_json")?;
     let references = serde_json::from_str(&references_json)
         .with_context(|| format!("held mail {event_id} has invalid references"))?;
+    let rfc822_size = row
+        .try_get::<Option<i64>, _>("rfc822_size")?
+        .map(|value| {
+            u32::try_from(value).with_context(|| format!("held mail {event_id} has invalid size"))
+        })
+        .transpose()?;
     Ok(CandidateHeader {
         uid_validity,
         uid,
@@ -585,7 +613,7 @@ fn held_candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CandidateHead
         message_ref: row.try_get("message_ref")?,
         attachment_count: usize::try_from(row.try_get::<i64, _>("attachment_count")?)
             .context("held mail attachment_count is invalid")?,
-        rfc822_size: None,
+        rfc822_size,
         facts: HeaderFacts {
             sender: EmailAddress {
                 address: row.try_get("sender_address")?,
@@ -660,6 +688,85 @@ mod tests {
             store.state_value(LAST_HELD_DIGEST_ROWID_KEY).await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn held_candidates_preserve_rfc822_size_fact() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let mut candidate = candidate(1);
+        candidate.rfc822_size = Some(1025);
+        store
+            .record_held(
+                &candidate,
+                &held_id_for(&candidate.event_id),
+                "not downloaded",
+                "approval_required",
+            )
+            .await
+            .expect("record held");
+
+        let held = store.held_candidates(10).await.expect("held candidates");
+
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].rfc822_size, Some(1025));
+    }
+
+    #[tokio::test]
+    async fn store_open_adds_rfc822_size_to_existing_mail_items_table() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("channel-email.sqlite3");
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("legacy store");
+        sqlx::query(
+            r#"
+            CREATE TABLE mail_items (
+                event_id TEXT PRIMARY KEY NOT NULL,
+                held_id TEXT UNIQUE,
+                status TEXT NOT NULL,
+                uid_validity INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                sender_ref TEXT NOT NULL,
+                sender_address TEXT NOT NULL,
+                sender_name TEXT,
+                conversation_ref TEXT NOT NULL,
+                thread_ref TEXT NOT NULL,
+                message_ref TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                snippet TEXT NOT NULL,
+                received_at TEXT,
+                attachment_count INTEGER NOT NULL DEFAULT 0,
+                classification_reason TEXT,
+                provider_message_id TEXT,
+                in_reply_to TEXT,
+                references_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy mail_items");
+        pool.close().await;
+
+        let store = EmailStore::open(temp_dir.path()).await.expect("open store");
+        let columns = sqlx::query("PRAGMA table_info(mail_items)")
+            .fetch_all(&store.pool)
+            .await
+            .expect("columns");
+
+        assert!(columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "rfc822_size")
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]
