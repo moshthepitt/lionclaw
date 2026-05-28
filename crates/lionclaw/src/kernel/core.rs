@@ -120,7 +120,7 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
+        append_streamed_text_boundary, append_streamed_text_delta, execute_captured,
         project_runtime_skills, register_builtin_runtime_adapters,
         resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
         EffectiveExecutionPlan, EscapeClass, ExecutionOutput, ExecutionPlanPurpose,
@@ -512,7 +512,7 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
         let hard_timeout = self.plan.hard_timeout;
         timeout(
             hard_timeout,
-            execute_attached(ExecutionRequest {
+            execute_captured(ExecutionRequest {
                 plan: self.plan.clone(),
                 program,
                 runtime_secrets_mount: None,
@@ -522,7 +522,7 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "timed out after {}s while exporting attached runtime transcript",
+                "timed out after {}s while exporting native runtime transcript",
                 hard_timeout.as_secs_f32()
             )
         })?

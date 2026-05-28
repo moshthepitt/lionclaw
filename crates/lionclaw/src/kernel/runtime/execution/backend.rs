@@ -99,6 +99,8 @@ pub trait ExecutionBackend: Send + Sync {
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput>;
 
+    async fn execute_captured(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
+
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession>;
 
     async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
@@ -110,6 +112,12 @@ pub async fn execute_streaming(
 ) -> Result<ExecutionOutput> {
     match request.plan.confinement.backend() {
         ConfinementBackend::Oci => OciExecutionBackend.execute_streaming(request, stdout).await,
+    }
+}
+
+pub async fn execute_captured(request: ExecutionRequest) -> Result<ExecutionOutput> {
+    match request.plan.confinement.backend() {
+        ConfinementBackend::Oci => OciExecutionBackend.execute_captured(request).await,
     }
 }
 

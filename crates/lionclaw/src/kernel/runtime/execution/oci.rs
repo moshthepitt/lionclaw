@@ -107,36 +107,19 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
-        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-        let prepared = prepare_oci_process_launch(
-            &request,
-            runtime_secrets
-                .as_ref()
-                .map(|secrets| secrets.secret_name.as_str()),
-        )?;
-        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
-        let result = run_process_streaming(&invocation, move |line| {
-            drop(stdout.send(line.to_string()));
-            Ok(())
-        })
-        .await;
-        let runtime_secrets_cleanup_result = match runtime_secrets {
-            Some(cleanup) => cleanup.shutdown().await,
-            None => Ok(()),
-        };
+        execute_oci_process(
+            request,
+            move |line| {
+                drop(stdout.send(line.to_string()));
+                Ok(())
+            },
+            "streaming OCI runtime turn",
+        )
+        .await
+    }
 
-        match (result, runtime_secrets_cleanup_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(output), Err(err)) => {
-                warn!(
-                    error = %err,
-                    "runtime secret cleanup failed after successful OCI runtime turn"
-                );
-                Ok(output)
-            }
-            (Err(err), _) => Err(err),
-        }
+    async fn execute_captured(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        execute_oci_process(request, |_| Ok(()), "captured OCI runtime command").await
     }
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
@@ -183,6 +166,43 @@ impl ExecutionBackend for OciExecutionBackend {
             }
             (Err(err), _) => Err(err),
         }
+    }
+}
+
+async fn execute_oci_process<F>(
+    request: ExecutionRequest,
+    on_stdout_line: F,
+    cleanup_context: &'static str,
+) -> Result<ExecutionOutput>
+where
+    F: FnMut(&str) -> Result<()> + Send,
+{
+    let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+    let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+    let prepared = prepare_oci_process_launch(
+        &request,
+        runtime_secrets
+            .as_ref()
+            .map(|secrets| secrets.secret_name.as_str()),
+    )?;
+    let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+    let result = run_process_streaming(&invocation, on_stdout_line).await;
+    let runtime_secrets_cleanup_result = match runtime_secrets {
+        Some(cleanup) => cleanup.shutdown().await,
+        None => Ok(()),
+    };
+
+    match (result, runtime_secrets_cleanup_result) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(output), Err(err)) => {
+            warn!(
+                error = %err,
+                context = cleanup_context,
+                "runtime secret cleanup failed after successful OCI runtime"
+            );
+            Ok(output)
+        }
+        (Err(err), _) => Err(err),
     }
 }
 
@@ -859,8 +879,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        build_oci_process_invocation, prepare_oci_process_launch,
-        private_network_probe_reached_process_exec, OciExecutionBackend,
+        build_oci_attached_process_invocation, build_oci_process_invocation,
+        prepare_oci_process_launch, private_network_probe_reached_process_exec,
+        OciExecutionBackend,
     };
     use crate::kernel::runtime::execution::backend::{
         ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
@@ -1047,6 +1068,18 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn oci_backend_adds_tty_only_for_attached_invocation() {
+        let request = sample_execution_request();
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        let captured = build_oci_process_invocation(prepared.clone(), &[]);
+        let attached = build_oci_attached_process_invocation(prepared, &[]);
+
+        assert!(!captured.args.iter().any(|arg| arg == "--tty"));
+        assert!(attached.args.iter().any(|arg| arg == "--tty"));
     }
 
     #[test]
