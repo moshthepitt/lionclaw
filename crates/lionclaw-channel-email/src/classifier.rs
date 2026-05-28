@@ -13,28 +13,26 @@ pub fn classify_headers(facts: &HeaderFacts, own_address: &str) -> MailClassific
         return suppressed("self_sender");
     }
 
-    if local_part(&facts.sender.address).is_some_and(|local| {
-        matches!(
-            local,
-            "noreply" | "no-reply" | "mailer-daemon" | "postmaster"
-        )
-    }) {
+    if local_part(&facts.sender.address).is_some_and(is_automated_local_part) {
         return suppressed("automated_sender");
     }
 
-    if let Some(value) = header_value(facts, "Auto-Submitted") {
-        if !value.eq_ignore_ascii_case("no") {
-            return suppressed("auto_submitted");
-        }
+    let auto_submitted = header_values(facts, "Auto-Submitted");
+    if !auto_submitted.is_empty()
+        && auto_submitted
+            .iter()
+            .any(|value| !value.eq_ignore_ascii_case("no"))
+    {
+        return suppressed("auto_submitted");
     }
 
-    if let Some(value) = header_value(facts, "Precedence") {
-        if matches!(
-            value.to_ascii_lowercase().as_str(),
+    if header_values(facts, "Precedence").iter().any(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
             "bulk" | "list" | "junk"
-        ) {
-            return suppressed("precedence_bulk");
-        }
+        )
+    }) {
+        return suppressed("precedence_bulk");
     }
 
     if header_value(facts, "List-Id").is_some()
@@ -68,6 +66,17 @@ fn local_part(address: &str) -> Option<&str> {
     address.split_once('@').map(|(local, _)| local)
 }
 
+fn is_automated_local_part(local: &str) -> bool {
+    let compact = local
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | '.'))
+        .collect::<String>();
+    matches!(
+        compact.as_str(),
+        "noreply" | "donotreply" | "mailerdaemon" | "postmaster"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +91,57 @@ mod tests {
             classify_headers(&facts, "assistant@example.com"),
             MailClassification::Suppressed {
                 reason: "auto_submitted".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn suppresses_common_no_reply_sender_variants() {
+        for sender in [
+            "noreply@example.com",
+            "no-reply@example.com",
+            "no_reply@example.com",
+            "do-not-reply@example.com",
+            "mailer.daemon@example.com",
+            "postmaster@example.com",
+        ] {
+            let facts =
+                parse_headers_for_test(&format!("From: {sender}\r\nSubject: Automated\r\n\r\n"));
+
+            assert_eq!(
+                classify_headers(&facts, "assistant@example.com"),
+                MailClassification::Suppressed {
+                    reason: "automated_sender".to_string()
+                },
+                "{sender} should be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn suppresses_if_any_duplicate_auto_submitted_header_is_automated() {
+        let facts = parse_headers_for_test(
+            "From: Robot <robot@example.com>\r\nAuto-Submitted: auto-replied\r\nAuto-Submitted: no\r\nSubject: Re\r\n\r\n",
+        );
+
+        assert_eq!(
+            classify_headers(&facts, "assistant@example.com"),
+            MailClassification::Suppressed {
+                reason: "auto_submitted".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn suppresses_if_any_duplicate_precedence_header_is_bulk() {
+        let facts = parse_headers_for_test(
+            "From: List <list@example.com>\r\nPrecedence: normal\r\nPrecedence: bulk\r\nSubject: News\r\n\r\n",
+        );
+
+        assert_eq!(
+            classify_headers(&facts, "assistant@example.com"),
+            MailClassification::Suppressed {
+                reason: "precedence_bulk".to_string()
             }
         );
     }

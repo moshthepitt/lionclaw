@@ -224,12 +224,16 @@ fn bounded_reference_ids(value: Option<&HeaderValue<'_>>) -> Vec<String> {
 }
 
 fn clean_message_id(raw: &str) -> Option<String> {
-    let value = raw
-        .trim()
-        .trim_matches('<')
-        .trim_matches('>')
-        .replace(['\r', '\n'], "");
-    (!value.trim().is_empty() && value.chars().count() <= MAX_MESSAGE_ID_CHARS).then_some(value)
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    let value = raw.trim().trim_matches('<').trim_matches('>').to_string();
+    let valid = !value.trim().is_empty()
+        && value.chars().count() <= MAX_MESSAGE_ID_CHARS
+        && value
+            .chars()
+            .all(|ch| !ch.is_whitespace() && !ch.is_control() && !matches!(ch, '<' | '>'));
+    valid.then_some(value)
 }
 
 fn fallback_sender(raw_headers: &[u8]) -> Option<EmailAddress> {
@@ -399,5 +403,16 @@ mod tests {
             facts.references[MAX_REFERENCE_IDS - 1],
             format!("m{}@example.com", MAX_REFERENCE_IDS - 1)
         );
+    }
+
+    #[test]
+    fn ignores_malformed_message_ids_with_spaces_or_controls() {
+        let facts = parse_header_facts(
+            b"From: Alice <alice@example.com>\r\nMessage-ID: <bad id@example.com>\r\nIn-Reply-To: <root\x1b@example.com>\r\n\r\n",
+        )
+        .expect("parse headers");
+
+        assert!(facts.message_id.is_none());
+        assert!(facts.in_reply_to.is_none());
     }
 }

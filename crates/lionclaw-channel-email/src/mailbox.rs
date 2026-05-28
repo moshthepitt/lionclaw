@@ -368,9 +368,7 @@ impl MailboxEngine for RealMailboxEngine {
             .uid_search([SearchKey::Unseen])
             .await
             .context("failed to search IMAP mailbox")?;
-        uids.sort();
-        uids.reverse();
-        uids.truncate(self.config.fetch_limit);
+        order_candidate_uids(&mut uids, self.config.fetch_limit);
         if uids.is_empty() {
             return Ok(Vec::new());
         }
@@ -515,6 +513,11 @@ fn candidate_header_fetch_limit() -> NonZeroU32 {
     NonZeroU32::new(limit).expect("candidate header fetch limit is nonzero")
 }
 
+fn order_candidate_uids(uids: &mut Vec<NonZeroU32>, fetch_limit: usize) {
+    uids.sort();
+    uids.truncate(fetch_limit);
+}
+
 fn bodystructure_attachment_count(items: &[MessageDataItem<'_>]) -> usize {
     items
         .iter()
@@ -651,6 +654,25 @@ mod tests {
         assert_eq!(
             candidate_header_fetch_limit().get() as usize,
             MAX_CANDIDATE_HEADER_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn candidate_uids_are_processed_oldest_first_with_fetch_limit() {
+        let mut uids = vec![
+            NonZeroU32::new(42).expect("uid"),
+            NonZeroU32::new(7).expect("uid"),
+            NonZeroU32::new(13).expect("uid"),
+        ];
+
+        order_candidate_uids(&mut uids, 2);
+
+        assert_eq!(
+            uids,
+            vec![
+                NonZeroU32::new(7).expect("uid"),
+                NonZeroU32::new(13).expect("uid")
+            ]
         );
     }
 

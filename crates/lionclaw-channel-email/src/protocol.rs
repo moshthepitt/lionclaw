@@ -121,6 +121,9 @@ pub fn sanitize_header_text(raw: &str) -> Option<String> {
             }
             continue;
         }
+        if ch.is_control() {
+            continue;
+        }
 
         if pending_space && !value.is_empty() {
             if kept_chars + 1 >= MAX_HEADER_TEXT_CHARS {
@@ -173,6 +176,14 @@ mod tests {
             Some("Alice Build failed")
         );
         assert_eq!(sanitize_subject(Some("\r\n\t")), "(no subject)");
+    }
+
+    #[test]
+    fn sanitizes_non_whitespace_control_characters() {
+        assert_eq!(
+            sanitize_header_text("Alice\u{1b}[31m red").as_deref(),
+            Some("Alice[31m red")
+        );
     }
 
     #[test]
