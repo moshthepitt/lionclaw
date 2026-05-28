@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
-    fs::Metadata,
-    io::ErrorKind,
+    ffi::OsString,
+    fs::{File, Metadata},
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     time::Duration as StdDuration,
 };
@@ -171,16 +172,17 @@ pub async fn sync_codex_home_into_runtime(
     codex_home_override: Option<&Path>,
 ) -> Result<()> {
     let ready = load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await?;
-    let runtime_codex_home = runtime_state_root.join("home").join(".codex");
-    ensure_runtime_codex_directory(&runtime_codex_home).await?;
+    ensure_runtime_codex_directory(runtime_state_root).await?;
     write_runtime_codex_file(
-        &runtime_codex_home.join(CODEX_AUTH_FILE_NAME),
+        runtime_state_root,
+        CODEX_AUTH_FILE_NAME,
         serde_json::to_vec_pretty(&ready.auth).context("failed to encode synced Codex auth")?,
         private_file_permissions(),
     )
     .await?;
     write_runtime_codex_file(
-        &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
+        runtime_state_root,
+        CODEX_CONFIG_FILE_NAME,
         runtime_codex_config_contents(),
         runtime_config_file_permissions(),
     )
@@ -407,8 +409,6 @@ fn write_private_temp_file_blocking(
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    use std::io::Write;
-
     let mut file = open_private_file(path, false)
         .with_context(|| format!("failed to open {}", path.display()))?;
     file.write_all(&contents)
@@ -474,54 +474,246 @@ async fn harden_private_file_permissions(
     Ok(())
 }
 
-async fn ensure_runtime_codex_directory(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        ensure_runtime_directory_component(parent).await?;
-    }
+#[cfg(unix)]
+async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()> {
+    let runtime_state_root = runtime_state_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        ensure_runtime_codex_directory_blocking(&runtime_state_root)
+    })
+    .await
+    .context("failed to join runtime Codex directory task")?
+}
 
-    tokio::fs::create_dir_all(path)
+#[cfg(unix)]
+fn ensure_runtime_codex_directory_blocking(runtime_state_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(runtime_state_root)
+        .with_context(|| format!("failed to create {}", runtime_state_root.display()))?;
+    let root = open_runtime_state_root(runtime_state_root)?;
+    let home_path = runtime_state_root.join("home");
+    let home = ensure_runtime_codex_child_dir(&root, "home", &home_path)?;
+    let codex_home_path = runtime_codex_home_path(runtime_state_root);
+    let _codex_home = ensure_runtime_codex_child_dir(&home, ".codex", &codex_home_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_runtime_codex_child_dir(parent: &File, name: &str, display_path: &Path) -> Result<File> {
+    use rustix::{
+        fs::{mkdirat, openat, Mode, OFlags},
+        io::Errno,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    match mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to create {}", display_path.display()))
+        }
+    }
+    let dir = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| format!("failed to open {}", display_path.display()))?;
+    let dir = File::from(dir);
+    dir.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to chmod {}", display_path.display()))?;
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn open_runtime_state_root(runtime_state_root: &Path) -> Result<File> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let root = open(
+        runtime_state_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| format!("failed to open {}", runtime_state_root.display()))?;
+    Ok(File::from(root))
+}
+
+#[cfg(unix)]
+fn open_runtime_codex_home(runtime_state_root: &Path) -> Result<File> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let root = open_runtime_state_root(runtime_state_root)?;
+    let home = openat(
+        &root,
+        "home",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to open {}",
+            runtime_state_root.join("home").display()
+        )
+    })?;
+    let home = File::from(home);
+    let codex_home = openat(
+        &home,
+        ".codex",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "failed to open {}",
+            runtime_codex_home_path(runtime_state_root).display()
+        )
+    })?;
+    Ok(File::from(codex_home))
+}
+
+#[cfg(not(unix))]
+async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()> {
+    let path = runtime_codex_home_path(runtime_state_root);
+    tokio::fs::create_dir_all(&path)
         .await
         .with_context(|| format!("failed to create {}", path.display()))?;
-    ensure_runtime_directory_component(path).await
+    Ok(())
 }
 
-async fn ensure_runtime_directory_component(path: &Path) -> Result<()> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "runtime Codex home path '{}' must not be a symlink",
-            path.display()
-        );
-    }
-    if !metadata.is_dir() {
-        bail!(
-            "runtime Codex home path '{}' must be a directory",
-            path.display()
-        );
-    }
-    set_runtime_codex_dir_permissions(path).await
-}
-
+#[cfg(unix)]
 async fn write_runtime_codex_file(
-    path: &Path,
+    runtime_state_root: &Path,
+    file_name: &str,
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    let temp_path = path.with_file_name(format!(
+    let runtime_state_root = runtime_state_root.to_path_buf();
+    let file_name = file_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        write_runtime_codex_file_blocking(&runtime_state_root, &file_name, contents, permissions)
+    })
+    .await
+    .context("failed to join runtime Codex file write task")?
+}
+
+#[cfg(unix)]
+fn write_runtime_codex_file_blocking(
+    runtime_state_root: &Path,
+    file_name: &str,
+    contents: Vec<u8>,
+    permissions: std::fs::Permissions,
+) -> Result<()> {
+    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+
+    let target_name = runtime_codex_file_name(file_name)?;
+    let runtime_codex_home = open_runtime_codex_home(runtime_state_root)?;
+    let runtime_codex_home_path = runtime_codex_home_path(runtime_state_root);
+    let temp_name = OsString::from(format!(
+        ".lionclaw-runtime-codex-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    let temp = openat(
+        &runtime_codex_home,
+        &temp_name,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::TRUNC
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .with_context(|| {
+        format!(
+            "failed to create runtime Codex temp file '{}' in {}",
+            Path::new(&temp_name).display(),
+            runtime_codex_home_path.display()
+        )
+    })?;
+    let mut temp = File::from(temp);
+
+    let write_result = (|| -> Result<()> {
+        temp.write_all(&contents).with_context(|| {
+            format!(
+                "failed to write runtime Codex file '{}' in {}",
+                file_name,
+                runtime_codex_home_path.display()
+            )
+        })?;
+        temp.set_permissions(permissions).with_context(|| {
+            format!(
+                "failed to chmod runtime Codex file '{}' in {}",
+                file_name,
+                runtime_codex_home_path.display()
+            )
+        })?;
+        temp.sync_all().with_context(|| {
+            format!(
+                "failed to sync runtime Codex file '{}' in {}",
+                file_name,
+                runtime_codex_home_path.display()
+            )
+        })?;
+        renameat(
+            &runtime_codex_home,
+            &temp_name,
+            &runtime_codex_home,
+            &target_name,
+        )
+        .with_context(|| {
+            format!(
+                "failed to replace runtime Codex file '{}' in {}",
+                file_name,
+                runtime_codex_home_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        match unlinkat(&runtime_codex_home, &temp_name, AtFlags::empty()) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+    write_result
+}
+
+#[cfg(unix)]
+fn runtime_codex_file_name(file_name: &str) -> Result<OsString> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        bail!("runtime Codex file name '{file_name}' is invalid");
+    };
+    if components.next().is_some() {
+        bail!("runtime Codex file name '{file_name}' is invalid");
+    }
+    Ok(OsString::from(name))
+}
+
+#[cfg(not(unix))]
+async fn write_runtime_codex_file(
+    runtime_state_root: &Path,
+    file_name: &str,
+    contents: Vec<u8>,
+    permissions: std::fs::Permissions,
+) -> Result<()> {
+    let runtime_codex_home = runtime_codex_home_path(runtime_state_root);
+    let path = runtime_codex_home.join(file_name);
+    let temp_path = runtime_codex_home.join(format!(
         ".lionclaw-runtime-codex-{}.tmp",
         Uuid::new_v4().simple()
     ));
     write_private_temp_file(&temp_path, contents, private_file_permissions()).await?;
-    if let Err(err) = tokio::fs::rename(&temp_path, path).await {
+    if let Err(err) = tokio::fs::rename(&temp_path, &path).await {
         drop(tokio::fs::remove_file(&temp_path).await);
         return Err(err).with_context(|| format!("failed to replace {}", path.display()));
     }
-    set_runtime_codex_file_permissions(path, permissions).await
+    tokio::fs::set_permissions(&path, permissions)
+        .await
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+fn runtime_codex_home_path(runtime_state_root: &Path) -> PathBuf {
+    runtime_state_root.join("home").join(".codex")
 }
 
 #[cfg(unix)]
@@ -548,38 +740,6 @@ fn runtime_config_file_permissions() -> std::fs::Permissions {
 #[cfg(not(unix))]
 fn runtime_config_file_permissions() -> std::fs::Permissions {
     private_file_permissions()
-}
-
-#[cfg(unix)]
-async fn set_runtime_codex_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .await
-        .with_context(|| format!("failed to chmod {}", path.display()))
-}
-
-#[cfg(not(unix))]
-async fn set_runtime_codex_dir_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn set_runtime_codex_file_permissions(
-    path: &Path,
-    permissions: std::fs::Permissions,
-) -> Result<()> {
-    tokio::fs::set_permissions(path, permissions)
-        .await
-        .with_context(|| format!("failed to chmod {}", path.display()))
-}
-
-#[cfg(not(unix))]
-async fn set_runtime_codex_file_permissions(
-    _path: &Path,
-    _permissions: std::fs::Permissions,
-) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1060,6 +1220,81 @@ command = "/host/tool"
         assert!(!regenerated_config.contains("stale = true"));
         assert!(regenerated_config.contains("[projects.\"/workspace\"]"));
         assert!(regenerated_config.contains("trust_level = \"trusted\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_codex_sync_rejects_symlinked_runtime_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        let outside_runtime = temp_dir.path().join("outside-runtime");
+        let runtime_root = temp_dir.path().join("runtime");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        std::fs::create_dir(&outside_runtime).expect("outside runtime");
+        symlink(&outside_runtime, &runtime_root).expect("runtime root symlink");
+
+        let err = sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+            .await
+            .expect_err("symlinked runtime root should fail");
+
+        assert!(err.to_string().contains("failed to open"));
+        assert!(
+            !outside_runtime.join("home").exists(),
+            "runtime sync must not create files through a symlinked runtime root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_codex_sync_replaces_symlinked_config_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        let runtime_root = temp_dir.path().join("runtime");
+        let outside_config = temp_dir.path().join("outside-config.toml");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        std::fs::create_dir_all(runtime_root.join("home/.codex")).expect("runtime codex home");
+        std::fs::write(&outside_config, "outside = true\n").expect("outside config");
+        symlink(
+            &outside_config,
+            runtime_root
+                .join("home/.codex")
+                .join(CODEX_CONFIG_FILE_NAME),
+        )
+        .expect("runtime config symlink");
+
+        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+            .await
+            .expect("sync runtime home");
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_config).expect("outside config"),
+            "outside = true\n"
+        );
+        let runtime_config = runtime_root
+            .join("home/.codex")
+            .join(CODEX_CONFIG_FILE_NAME);
+        let metadata = std::fs::symlink_metadata(&runtime_config).expect("runtime config metadata");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert!(std::fs::read_to_string(&runtime_config)
+            .expect("runtime config")
+            .contains("trust_level = \"trusted\""));
     }
 
     #[test]
