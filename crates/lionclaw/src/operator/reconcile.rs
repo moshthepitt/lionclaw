@@ -10,10 +10,10 @@ use uuid::Uuid;
 use crate::{
     applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     contracts::{
-        ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-        ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
+        ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
+        ChannelGrantRevokeResponse, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingInviteRequest, ChannelPairingInviteResponse,
+        ChannelPairingListResponse, ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
     },
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
@@ -583,6 +583,30 @@ pub async fn pairing_approve(
         .map_err(to_anyhow)
 }
 
+pub async fn pairing_approve_sender(
+    home: &LionClawHome,
+    channel_id: String,
+    sender_ref: String,
+    trust_tier: TrustTier,
+    label: Option<String>,
+) -> Result<ChannelGrantResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel
+        .approve_channel_grant(ChannelGrantApproveRequest {
+            channel_id,
+            sender_ref: non_empty_trimmed(Some(sender_ref)),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+            trust_tier: Some(trust_tier),
+            label,
+            reason: Some("operator_direct_sender_approval".to_string()),
+        })
+        .await
+        .map_err(to_anyhow)
+}
+
 pub async fn pairing_invite(
     home: &LionClawHome,
     req: ChannelPairingInviteRequest,
@@ -1067,14 +1091,14 @@ mod tests {
     use super::{
         add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
         ensure_managed_bind_configured, logs, open_kernel, open_kernel_with_project_root,
-        render_marker_file, render_runtime_cache, resolve_channel_env,
-        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, up_for_work_root,
-        ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
+        pairing_approve_sender, pairing_list, render_marker_file, render_runtime_cache,
+        resolve_channel_env, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
+        up_for_work_root, ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
         config::resolve_project_workspace_root,
-        contracts::DaemonInfoResponse,
+        contracts::{ChannelRoutingProfile, DaemonInfoResponse, TrustTier},
         home::{runtime_project_partition_key, LionClawHome},
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
@@ -1564,6 +1588,61 @@ mod tests {
             .await
             .expect_err("channel-bound alias should fail");
         assert!(err.to_string().contains("remove the channel first"));
+    }
+
+    #[tokio::test]
+    async fn pairing_approve_sender_creates_direct_channel_grant() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source = write_skill_source(temp_dir.path(), "channel-email", "email", true);
+        add_skill(
+            &home,
+            "email".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "email".to_string(),
+            "email".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        let approved = pairing_approve_sender(
+            &home,
+            "email".to_string(),
+            "email:addr:alice@example.com".to_string(),
+            TrustTier::Main,
+            Some("email-release:held-1".to_string()),
+        )
+        .await
+        .expect("approve sender");
+
+        assert_eq!(approved.grant.channel_id, "email");
+        assert_eq!(
+            approved.grant.sender_ref.as_deref(),
+            Some("email:addr:alice@example.com")
+        );
+        assert_eq!(
+            approved.grant.routing_profile,
+            ChannelRoutingProfile::Direct
+        );
+        assert_eq!(
+            approved.grant.label.as_deref(),
+            Some("email-release:held-1")
+        );
+
+        let listed = pairing_list(&home, Some("email".to_string()), None)
+            .await
+            .expect("list pairing state");
+        assert!(listed.pairings.is_empty());
+        assert_eq!(listed.grants.len(), 1);
+        assert_eq!(listed.grants[0].grant_id, approved.grant.grant_id);
     }
 
     #[tokio::test]

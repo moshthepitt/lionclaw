@@ -1265,8 +1265,8 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
                 lines.push(format!("Reason: {reason}"));
             }
             lines.push(format!(
-                "Actions: allow {}, block {}, or release {} once with a direct sender grant labeled email-release:{}.",
-                item.sender_address, item.sender_address, item.held_id, item.held_id
+                "Actions: approve with `lionclaw channel pairing approve email --sender-ref {}`, block with `lionclaw channel pairing block email {}`, or release once with `lionclaw channel pairing approve email --sender-ref {} --label email-release:{}`.",
+                item.sender_ref, item.sender_ref, item.sender_ref, item.held_id
             ));
         }
     }

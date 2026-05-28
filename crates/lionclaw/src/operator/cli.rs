@@ -43,9 +43,9 @@ use crate::{
         },
         reconcile::{
             add_channel_with_contact, add_skill, open_kernel, open_runtime_kernel_for_work_root,
-            pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
-            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
-            ChannelContactSetup,
+            pairing_approve, pairing_approve_sender, pairing_block, pairing_invite, pairing_list,
+            pairing_revoke, remove_channel, remove_skill,
+            resolve_installed_skill_worker_entrypoint, ChannelContactSetup,
         },
         run::{run_local, RunLocalInvocation},
         run_tui::{
@@ -521,9 +521,17 @@ struct PairingListArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("approve_target")
+        .required(true)
+        .args(["pairing", "sender_ref"])
+))]
 struct PairingApproveArgs {
     channel_id: String,
-    pairing: String,
+    #[arg(value_name = "PAIRING")]
+    pairing: Option<String>,
+    #[arg(long = "sender-ref", value_name = "SENDER_REF")]
+    sender_ref: Option<String>,
     #[arg(long)]
     label: Option<String>,
     #[arg(long = "routing-profile")]
@@ -1255,15 +1263,37 @@ pub async fn run() -> Result<ExitCode> {
                         .map(ChannelRoutingProfile::from_str)
                         .transpose()
                         .map_err(anyhow::Error::msg)?;
-                    let grant = pairing_approve(
-                        &home,
-                        args.channel_id,
-                        args.pairing,
-                        routing_profile,
-                        trust_tier,
-                        args.label,
-                    )
-                    .await?;
+                    let grant = match (args.pairing, args.sender_ref) {
+                        (Some(pairing), None) => {
+                            pairing_approve(
+                                &home,
+                                args.channel_id,
+                                pairing,
+                                routing_profile,
+                                trust_tier,
+                                args.label,
+                            )
+                            .await?
+                        }
+                        (None, Some(sender_ref)) => {
+                            let routing_profile =
+                                routing_profile.unwrap_or(ChannelRoutingProfile::Direct);
+                            if routing_profile != ChannelRoutingProfile::Direct {
+                                bail!(
+                                    "--sender-ref approval creates direct sender grants; use a pending pairing for scoped route approval"
+                                );
+                            }
+                            pairing_approve_sender(
+                                &home,
+                                args.channel_id,
+                                sender_ref,
+                                trust_tier,
+                                args.label,
+                            )
+                            .await?
+                        }
+                        _ => bail!("channel pairing approve requires a pairing or --sender-ref"),
+                    };
                     println!(
                         "approved channel={} grant={} profile={} trust={}",
                         grant.grant.channel_id,
@@ -3066,6 +3096,87 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn channel_pairing_approve_accepts_pairing_target() {
+        let pairing_id = Uuid::new_v4().to_string();
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "telegram",
+            pairing_id.as_str(),
+            "--label",
+            "alice",
+        ])
+        .expect("parse pairing approve");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Approve(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "telegram");
+                assert_eq!(args.pairing.as_deref(), Some(pairing_id.as_str()));
+                assert!(args.sender_ref.is_none());
+                assert_eq!(args.label.as_deref(), Some("alice"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_approve_accepts_known_sender_ref() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "email",
+            "--sender-ref",
+            "email:addr:alice@example.com",
+            "--label",
+            "email-release:held-1",
+        ])
+        .expect("parse direct sender approve");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Approve(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "email");
+                assert!(args.pairing.is_none());
+                assert_eq!(
+                    args.sender_ref.as_deref(),
+                    Some("email:addr:alice@example.com")
+                );
+                assert_eq!(args.label.as_deref(), Some("email-release:held-1"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_approve_rejects_ambiguous_targets() {
+        let err = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "email",
+            "pairing-1",
+            "--sender-ref",
+            "email:addr:alice@example.com",
+        ])
+        .expect_err("approve target must be unambiguous");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

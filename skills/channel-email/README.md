@@ -56,11 +56,24 @@ One-shot held-message release uses a temporary direct sender grant labeled:
 email-release:<held-id>
 ```
 
+Create that grant with the normal channel pairing operator surface:
+
+```bash
+"$LIONCLAW_BIN" channel pairing approve email --sender-ref email:addr:alice@example.com --label email-release:<held-id>
+```
+
 The worker admits only the held item whose id exactly matches that label. Other
 mail from the same sender remains held while the release grant exists. Once the
 matching held item is admitted or terminally suppressed, the worker revokes the
 grant through `/v0/channels/grants/revoke`. Failed revocations are retried from
 worker-local SQLite state.
+
+Permanent sender approval uses the same command without the one-shot release
+label:
+
+```bash
+"$LIONCLAW_BIN" channel pairing approve email --sender-ref email:addr:alice@example.com
+```
 
 ## Setup
 
@@ -102,8 +115,9 @@ Expected when credentials are available:
 - an unknown non-automated sender is held and does not queue runtime work
 - the held-mail digest includes held id, sender, subject, snippet, attachment
   count, sender/conversation/thread refs, and release guidance
-- a direct sender grant labeled `email-release:<held-id>` releases only that
-  held item once, leaves mismatched mail held, and is revoked after admission
+- `channel pairing approve email --sender-ref ... --label email-release:<held-id>`
+  releases only that held item once, leaves mismatched mail held, and is revoked
+  after admission
 - automated/list/bounce/no-reply mail is suppressed without auto-reply
 - mail above `EMAIL_MAX_MESSAGE_BYTES` is suppressed without runtime work,
   including later one-shot release of held mail already known to exceed the cap
