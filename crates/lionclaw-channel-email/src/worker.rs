@@ -88,7 +88,7 @@ where
 
     async fn tick(&self) -> Result<()> {
         let daemon = self.api.daemon_info().await?;
-        validate_local_daemon(&daemon)?;
+        validate_local_daemon(&daemon, &self.config.home)?;
         let worker_id = self.worker_id(&daemon);
         let store = EmailStore::open(&self.config.state_dir).await?;
         let mut mailbox = self.mailbox_factory.open(self.config.mailbox.clone());
@@ -994,12 +994,34 @@ fn digest_text(
     lines.join("\n")
 }
 
-fn validate_local_daemon(info: &DaemonInfoResponse) -> Result<()> {
+fn validate_local_daemon(info: &DaemonInfoResponse, expected_home: &Path) -> Result<()> {
     if info.daemon != "lionclawd" {
         bail!("local endpoint is not lionclawd: {}", info.daemon);
     }
     if info.status != "ok" {
         bail!("local daemon is not ok: {}", info.status);
+    }
+    if info.home_root.trim().is_empty() {
+        bail!("local daemon did not report home root");
+    }
+    let expected_home = fs::canonicalize(expected_home).with_context(|| {
+        format!(
+            "failed to resolve configured LionClaw home {}",
+            expected_home.display()
+        )
+    })?;
+    let reported_home = fs::canonicalize(&info.home_root).with_context(|| {
+        format!(
+            "failed to resolve reported LionClaw home {}",
+            info.home_root
+        )
+    })?;
+    if reported_home != expected_home {
+        bail!(
+            "local daemon home root mismatch: expected {}, got {}",
+            expected_home.display(),
+            reported_home.display()
+        );
     }
     Ok(())
 }
@@ -1279,6 +1301,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_daemon_home_mismatch_fails_before_mailbox_access() {
+        let fixture = EmailFixture::new(true).await;
+        let foreign_home = fixture.root.path().join("foreign-home");
+        std::fs::create_dir_all(&foreign_home).expect("foreign home");
+        fixture.api.set_home_root(&foreign_home);
+
+        let err = EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect_err("foreign daemon home should fail");
+
+        assert!(
+            err.to_string().contains("home root mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn malformed_authorized_mail_is_suppressed_and_marked_processed() {
         let fixture = EmailFixture::with_candidate(
             true,
@@ -1449,8 +1493,11 @@ mod tests {
             raw: Vec<u8>,
         ) -> Self {
             let root = tempdir().expect("temp dir");
+            let home = root.path().join("home");
+            std::fs::create_dir_all(&home).expect("home dir");
             let state_dir = root.path().join("state");
             let api = Arc::new(ApiState::default());
+            api.set_home_root(&home);
             api.set_authorized(authorized);
             let api_url = spawn_api(api.clone()).await;
             let mailbox = FakeMailboxFactory::new(candidate, raw);
@@ -1503,6 +1550,7 @@ mod tests {
 
     #[derive(Default)]
     struct ApiState {
+        home_root: Mutex<String>,
         authorized: AtomicBool,
         fail_revoke: AtomicBool,
         missing_revoke: AtomicBool,
@@ -1520,6 +1568,11 @@ mod tests {
     }
 
     impl ApiState {
+        fn set_home_root(&self, home: &Path) {
+            let home = home.canonicalize().expect("canonical home");
+            *self.home_root.lock().unwrap() = home.display().to_string();
+        }
+
         fn set_authorized(&self, authorized: bool) {
             self.authorized.store(authorized, Ordering::SeqCst);
             if !authorized {
@@ -1563,11 +1616,13 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn daemon_info() -> Json<Value> {
+    async fn daemon_info(State(state): State<Arc<ApiState>>) -> Json<Value> {
+        let home_root = state.home_root.lock().unwrap().clone();
         Json(json!({
             "daemon": "lionclawd",
             "status": "ok",
             "home_id": "home-test",
+            "home_root": home_root,
             "bind_addr": "127.0.0.1:0"
         }))
     }

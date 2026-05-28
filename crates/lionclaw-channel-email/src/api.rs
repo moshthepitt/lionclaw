@@ -18,6 +18,7 @@ pub struct DaemonInfoResponse {
     pub daemon: String,
     pub status: String,
     pub home_id: String,
+    pub home_root: String,
     pub bind_addr: String,
 }
 
