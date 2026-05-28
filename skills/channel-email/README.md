@@ -24,15 +24,19 @@ threads from sharing runtime history without requiring route grants for every
 thread.
 
 Before authorization, the worker fetches only bounded IMAP header facts,
-`BODYSTRUCTURE`, and `RFC822.SIZE`. Full MIME bodies and attachments are fetched
-only after LionClaw authorizes the sender, and only within
-`EMAIL_MAX_MESSAGE_BYTES`.
+`BODYSTRUCTURE`, and `RFC822.SIZE`. It also requires a trusted provider
+`Authentication-Results` header proving the `From` domain passed aligned sender
+authentication before a permanent sender grant can admit mail. Full MIME bodies
+and attachments are fetched only after LionClaw authorizes the sender and the
+sender-auth check passes, and only within `EMAIL_MAX_MESSAGE_BYTES`.
 
 Unknown senders are held with metadata only. Automated, bulk, list, bounce, and
 no-reply mail is suppressed locally. Oversized mail is suppressed without
 runtime work, and known provider size metadata is retained with held rows so a
 later one-shot release still avoids downloading mail already known to exceed
-the configured cap.
+the configured cap. Mail that lacks trusted sender authentication is held with
+metadata only even when a permanent sender grant exists; an exact one-shot
+release can intentionally admit that held item.
 
 Processed IMAP candidates are marked seen in the dedicated mailbox after they
 are held, suppressed, or admitted. This avoids reprocessing the same unread
@@ -83,6 +87,7 @@ Run this only with a dedicated mailbox, not a personal inbox.
 cd "$PROJ_A"
 cat > email.env <<'EOF'
 EMAIL_ADDRESS=assistant@example.com
+EMAIL_AUTH_RESULTS_HOST=mx.example.com
 EMAIL_IMAP_HOST=imap.example.com
 EMAIL_IMAP_USERNAME=assistant@example.com
 EMAIL_IMAP_PASSWORD=...
@@ -97,6 +102,13 @@ EOF
 "$LIONCLAW_BIN" doctor
 ```
 
+`EMAIL_AUTH_RESULTS_HOST` must match the mailbox provider's trusted
+`Authentication-Results` authserv-id, such as `mx.google.com` for many Gmail
+deliveries. If a deployment has an upstream mailbox rule that already enforces
+sender authentication before delivery, it may set `EMAIL_TRUST_FROM_HEADER=true`
+instead, but then grants trust that upstream filter rather than the message
+header itself.
+
 `connect email` installs the bundled channel snapshot, stores declared channel
 env in the selected instance home, starts the background stack, and leaves
 mailbox secrets out of runtime skill projection.
@@ -110,6 +122,8 @@ Expected when credentials are available:
   runtimes; no separate email companion skill install is needed
 - an exact approved sender queues one channel turn with a structured email
   envelope, not raw MIME
+- a forged or unauthenticated `From` stays held even if that sender has a
+  permanent grant, unless the operator uses an exact one-shot release
 - admitted email uses `thread_actor` session binding so separate threads from
   the same sender do not share runtime history
 - an unknown non-automated sender is held and does not queue runtime work

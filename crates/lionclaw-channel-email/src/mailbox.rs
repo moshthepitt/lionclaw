@@ -259,6 +259,7 @@ impl RealMailboxEngine {
             "Message-ID",
             "In-Reply-To",
             "References",
+            "Authentication-Results",
             "Auto-Submitted",
             "Precedence",
             "List-Id",

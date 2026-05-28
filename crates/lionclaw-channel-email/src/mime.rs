@@ -170,6 +170,19 @@ pub fn header_values<'a>(facts: &'a HeaderFacts, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+pub fn authentication_results_authenticates_sender(
+    facts: &HeaderFacts,
+    trusted_authserv_id: &str,
+) -> bool {
+    let Some(from_domain) = address_domain(&facts.sender.address) else {
+        return false;
+    };
+    header_values(facts, "Authentication-Results")
+        .into_iter()
+        .find(|value| authserv_id_matches(value, trusted_authserv_id))
+        .is_some_and(|value| authentication_results_aligns_from_domain(value, &from_domain))
+}
+
 pub fn snippet(raw: &str, max_chars: usize) -> String {
     let collapsed = raw
         .split_whitespace()
@@ -251,6 +264,80 @@ fn fallback_sender(raw_headers: &[u8]) -> Option<EmailAddress> {
         address,
         display_name: None,
     })
+}
+
+fn authserv_id_matches(value: &str, expected: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().next())
+        .is_some_and(|authserv_id| authserv_id.eq_ignore_ascii_case(expected))
+}
+
+fn authentication_results_aligns_from_domain(value: &str, from_domain: &str) -> bool {
+    value
+        .split(';')
+        .skip(1)
+        .any(|part| auth_result_part_aligns_from_domain(part, from_domain))
+}
+
+fn auth_result_part_aligns_from_domain(part: &str, from_domain: &str) -> bool {
+    if auth_result_is_pass(part, "dmarc") {
+        return auth_result_domain_property_matches(part, "header.from", from_domain);
+    }
+    if auth_result_is_pass(part, "dkim") {
+        return auth_result_domain_property_matches(part, "header.d", from_domain)
+            || auth_result_domain_property_matches(part, "header.i", from_domain);
+    }
+    if auth_result_is_pass(part, "spf") {
+        return auth_result_domain_property_matches(part, "smtp.mailfrom", from_domain);
+    }
+    false
+}
+
+fn auth_result_is_pass(part: &str, method: &str) -> bool {
+    part.split_whitespace()
+        .next()
+        .and_then(|token| token.split_once('='))
+        .is_some_and(|(candidate, result)| {
+            candidate.eq_ignore_ascii_case(method) && result.eq_ignore_ascii_case("pass")
+        })
+}
+
+fn auth_result_domain_property_matches(part: &str, property: &str, from_domain: &str) -> bool {
+    part.split_whitespace().any(|token| {
+        token
+            .trim_matches(|ch| matches!(ch, ',' | ';'))
+            .split_once('=')
+            .and_then(|(name, value)| {
+                name.eq_ignore_ascii_case(property)
+                    .then(|| normalize_auth_result_domain(value))
+            })
+            .flatten()
+            .is_some_and(|domain| domain == from_domain)
+    })
+}
+
+fn address_domain(address: &str) -> Option<String> {
+    address
+        .split_once('@')
+        .map(|(_, domain)| normalize_domain(domain))
+        .filter(|domain| !domain.is_empty())
+}
+
+fn normalize_auth_result_domain(value: &str) -> Option<String> {
+    let value =
+        value.trim_matches(|ch| matches!(ch, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']'));
+    let domain = value
+        .split_once('@')
+        .map(|(_, domain)| domain)
+        .unwrap_or(value);
+    let domain = normalize_domain(domain);
+    (!domain.is_empty()).then_some(domain)
+}
+
+fn normalize_domain(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 pub fn parse_raw_headers(raw: &[u8]) -> Vec<(String, String)> {
@@ -403,6 +490,61 @@ mod tests {
             facts.references[MAX_REFERENCE_IDS - 1],
             format!("m{}@example.com", MAX_REFERENCE_IDS - 1)
         );
+    }
+
+    #[test]
+    fn authentication_results_requires_trusted_aligned_sender_domain() {
+        let facts = parse_headers_for_test(
+            "Authentication-Results: mx.example.com; dmarc=pass header.from=example.com; dkim=pass header.d=example.com\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\n",
+        );
+
+        assert!(authentication_results_authenticates_sender(
+            &facts,
+            "mx.example.com"
+        ));
+        assert!(!authentication_results_authenticates_sender(
+            &facts,
+            "other.example.com"
+        ));
+
+        let spoof = parse_headers_for_test(
+            "Authentication-Results: mx.example.com; dmarc=pass header.from=evil.example\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\n",
+        );
+        assert!(!authentication_results_authenticates_sender(
+            &spoof,
+            "mx.example.com"
+        ));
+    }
+
+    #[test]
+    fn authentication_results_uses_first_trusted_provider_result_only() {
+        let facts = parse_headers_for_test(
+            "Authentication-Results: mx.example.com; dmarc=fail header.from=example.com\r\nAuthentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\n",
+        );
+
+        assert!(!authentication_results_authenticates_sender(
+            &facts,
+            "mx.example.com"
+        ));
+    }
+
+    #[test]
+    fn authentication_results_accepts_aligned_dkim_or_spf_fallbacks() {
+        let dkim = parse_headers_for_test(
+            "Authentication-Results: mx.example.com; dkim=pass header.i=@example.com\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\n",
+        );
+        let spf = parse_headers_for_test(
+            "Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=alice@example.com\r\nFrom: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\n",
+        );
+
+        assert!(authentication_results_authenticates_sender(
+            &dkim,
+            "mx.example.com"
+        ));
+        assert!(authentication_results_authenticates_sender(
+            &spf,
+            "mx.example.com"
+        ));
     }
 
     #[test]
