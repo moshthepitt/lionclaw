@@ -6900,6 +6900,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_session_ready_clear_rejects_symlinked_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime-state");
+        let linked_root = temp_dir.path().join("linked-runtime-state");
+        fs::create_dir(&real_root).expect("real root");
+        fs::write(real_root.join(RUNTIME_SESSION_READY_MARKER), "ready\n")
+            .expect("write ready marker");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![MountSpec {
+            source: linked_root,
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        kernel.clear_runtime_session_ready(&plan).await;
+
+        assert!(
+            real_root.join(RUNTIME_SESSION_READY_MARKER).exists(),
+            "clearing runtime session readiness must not remove files through a symlinked runtime root"
+        );
+    }
+
     #[test]
     fn attached_runtime_transcript_export_timeout_is_capped() {
         let mut plan = test_execution_plan("codex");
@@ -12013,6 +12041,39 @@ fn read_runtime_state_file_blocking(
     Ok(Some(contents))
 }
 
+async fn remove_runtime_state_file(
+    runtime_state_root: &Path,
+    file_name: &str,
+) -> Result<(), KernelError> {
+    let runtime_state_root = runtime_state_root.to_path_buf();
+    let file_name = file_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        remove_runtime_state_file_blocking(&runtime_state_root, &file_name)
+    })
+    .await
+    .map_err(|err| internal(err.into()))?
+}
+
+fn remove_runtime_state_file_blocking(
+    runtime_state_root: &Path,
+    file_name: &str,
+) -> Result<(), KernelError> {
+    use rustix::fs::{unlinkat, AtFlags};
+
+    let target_name = runtime_state_file_name(file_name)?;
+    let Some(root) = open_existing_runtime_state_root_blocking(runtime_state_root)? else {
+        return Ok(());
+    };
+    match unlinkat(&root, &target_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(internal(anyhow::anyhow!(
+            "failed to remove runtime state file '{}' in '{}': {err}",
+            file_name,
+            runtime_state_root.display()
+        ))),
+    }
+}
+
 fn ensure_runtime_state_root_blocking(
     runtime_state_root: &Path,
 ) -> Result<std::fs::File, KernelError> {
@@ -14570,12 +14631,10 @@ impl Kernel {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return;
         };
-        let path = runtime_state_root.join(RUNTIME_SESSION_READY_MARKER);
-        match tokio::fs::remove_file(&path).await {
+        match remove_runtime_state_file(runtime_state_root, RUNTIME_SESSION_READY_MARKER).await {
             Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                warn!(?err, path = %path.display(), "failed to clear runtime session ready marker");
+                warn!(?err, path = %runtime_state_root.join(RUNTIME_SESSION_READY_MARKER).display(), "failed to clear runtime session ready marker");
             }
         }
     }
