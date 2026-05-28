@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 pub const CHANNEL_ID: &str = "email";
 pub const INBOUND_TRIGGER: &str = "command";
 pub const INBOUND_SESSION_BINDING: &str = "thread_actor";
+const MAX_HEADER_TEXT_CHARS: usize = 512;
 
 pub fn normalize_address(raw: &str) -> Option<String> {
     let addr = raw.trim().trim_matches('<').trim_matches('>').trim();
@@ -108,7 +109,40 @@ pub fn held_body_not_downloaded_text() -> &'static str {
 }
 
 pub fn sanitize_header_text(raw: &str) -> Option<String> {
-    let value = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut value = String::new();
+    let mut kept_chars = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !value.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+
+        if pending_space && !value.is_empty() {
+            if kept_chars + 1 >= MAX_HEADER_TEXT_CHARS {
+                truncated = true;
+                break;
+            }
+            value.push(' ');
+            kept_chars += 1;
+            pending_space = false;
+        }
+
+        if kept_chars == MAX_HEADER_TEXT_CHARS {
+            truncated = true;
+            break;
+        }
+        value.push(ch);
+        kept_chars += 1;
+    }
+
+    if truncated {
+        value.push_str("...");
+    }
     (!value.is_empty()).then_some(value)
 }
 
@@ -139,6 +173,19 @@ mod tests {
             Some("Alice Build failed")
         );
         assert_eq!(sanitize_subject(Some("\r\n\t")), "(no subject)");
+    }
+
+    #[test]
+    fn sanitizes_header_text_to_bounded_display_text() {
+        let raw = "x".repeat(MAX_HEADER_TEXT_CHARS + 1);
+
+        assert_eq!(
+            sanitize_header_text(&raw)
+                .expect("sanitized")
+                .chars()
+                .count(),
+            MAX_HEADER_TEXT_CHARS + 3
+        );
     }
 
     #[test]

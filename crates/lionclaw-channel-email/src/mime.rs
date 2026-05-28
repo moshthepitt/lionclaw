@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::{normalize_address, sanitize_header_text, sanitize_subject};
 
+const MAX_MESSAGE_ID_CHARS: usize = 256;
+const MAX_REFERENCE_IDS: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailAddress {
     pub address: String,
@@ -86,7 +89,7 @@ pub fn parse_header_facts(raw_headers: &[u8]) -> Result<HeaderFacts> {
         subject: sanitize_subject(headers.subject()),
         message_id: headers.message_id().and_then(clean_message_id),
         in_reply_to: first_id_header(Some(headers.in_reply_to())),
-        references: id_header_values(Some(headers.references())),
+        references: bounded_reference_ids(Some(headers.references())),
         received_at,
         raw_headers: parse_raw_headers(raw_headers),
     })
@@ -213,13 +216,20 @@ fn id_header_values(value: Option<&HeaderValue<'_>>) -> Vec<String> {
     }
 }
 
+fn bounded_reference_ids(value: Option<&HeaderValue<'_>>) -> Vec<String> {
+    id_header_values(value)
+        .into_iter()
+        .take(MAX_REFERENCE_IDS)
+        .collect()
+}
+
 fn clean_message_id(raw: &str) -> Option<String> {
     let value = raw
         .trim()
         .trim_matches('<')
         .trim_matches('>')
         .replace(['\r', '\n'], "");
-    (!value.trim().is_empty()).then_some(value)
+    (!value.trim().is_empty() && value.chars().count() <= MAX_MESSAGE_ID_CHARS).then_some(value)
 }
 
 fn fallback_sender(raw_headers: &[u8]) -> Option<EmailAddress> {
@@ -364,6 +374,30 @@ mod tests {
         assert!(
             err.to_string().contains("sender address"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn bounds_message_ids_and_references_from_untrusted_headers() {
+        let long_id = format!("{}@example.com", "x".repeat(MAX_MESSAGE_ID_CHARS + 1));
+        let references = (0..(MAX_REFERENCE_IDS + 4))
+            .map(|index| format!("<m{index}@example.com>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let facts = parse_header_facts(
+            format!(
+                "From: Alice <alice@example.com>\r\nMessage-ID: <{long_id}>\r\nReferences: {references}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("parse headers");
+
+        assert!(facts.message_id.is_none());
+        assert_eq!(facts.references.len(), MAX_REFERENCE_IDS);
+        assert_eq!(facts.references[0], "m0@example.com");
+        assert_eq!(
+            facts.references[MAX_REFERENCE_IDS - 1],
+            format!("m{}@example.com", MAX_REFERENCE_IDS - 1)
         );
     }
 }
