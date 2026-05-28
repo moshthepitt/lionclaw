@@ -558,7 +558,10 @@ within the worker's configured message-size cap. Unknown senders are held with
 metadata only, automated/bulk/list mail is suppressed locally, oversized mail is
 suppressed without runtime work, and admitted messages are posted through the
 existing channel inbound and attachment endpoints with first-class `thread_ref`
-and `reply_to_ref` fields. Held-message UID references are valid only while the
+and `reply_to_ref` fields. Worker-local SQLite state is derived from the
+selected LionClaw home and mailbox identity, so state placement follows the same
+instance boundary as the rest of the channel and is not controlled by undeclared
+process environment. Held-message UID references are valid only while the
 mailbox `UIDVALIDITY` value is unchanged; stale held entries are suppressed
 instead of fetching or marking a different provider message. The channel also
 publishes a runtime-facing Agent Skill at `runtime/email/`, so runtimes learn

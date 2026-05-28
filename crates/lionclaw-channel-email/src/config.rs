@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -117,15 +121,7 @@ impl WorkerCommand {
             .transpose()?
             .unwrap_or_else(|| mailbox_id_for(&address));
         validate_mailbox_id("EMAIL_MAILBOX_ID", &mailbox_id)?;
-        let state_dir = env::var("EMAIL_STATE_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                home.join("channel-state")
-                    .join(CHANNEL_ID)
-                    .join(&mailbox_id)
-            });
+        let state_dir = state_dir_for(&home, &mailbox_id);
 
         let imap_host = required_env("EMAIL_IMAP_HOST")?;
         let imap_port = env_u16("EMAIL_IMAP_PORT")?.unwrap_or(993);
@@ -234,6 +230,10 @@ fn validate_mailbox_id(name: &str, value: &str) -> Result<()> {
 
 fn required_env_path(name: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(required_env(name)?))
+}
+
+fn state_dir_for(home: &Path, mailbox_id: &str) -> PathBuf {
+    home.join("channel-state").join(CHANNEL_ID).join(mailbox_id)
 }
 
 fn normalize_base_url(raw: &str) -> String {
@@ -368,6 +368,14 @@ mod tests {
         assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", ".").is_err());
         assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", "..").is_err());
         assert!(parse_mailbox_id("EMAIL_MAILBOX_ID", "///").is_err());
+    }
+
+    #[test]
+    fn state_dir_is_derived_from_lionclaw_home_and_mailbox_id() {
+        assert_eq!(
+            state_dir_for(Path::new("/tmp/lionclaw-home"), "assistant-example-com"),
+            PathBuf::from("/tmp/lionclaw-home/channel-state/email/assistant-example-com")
+        );
     }
 
     #[test]
