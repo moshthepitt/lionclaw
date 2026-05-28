@@ -240,6 +240,9 @@ pub fn parse_raw_headers(raw: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(raw);
     let mut out: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
+        if line.trim_end_matches('\r').is_empty() {
+            break;
+        }
         if line.starts_with(' ') || line.starts_with('\t') {
             if let Some((_, value)) = out.last_mut() {
                 value.push(' ');
@@ -331,5 +334,33 @@ mod tests {
         assert!(parsed.text.contains("Hello"));
         assert!(parsed.text.contains("world & team"));
         require_nonempty_body(&parsed).expect("html body should count as usable body");
+    }
+
+    #[test]
+    fn raw_header_parser_stops_at_message_body() {
+        let headers = parse_raw_headers(
+            b"From: Alice <alice@example.com>\r\nSubject: Hello\r\n\r\nFrom: Mallory <mallory@example.com>\r\n Auto-Submitted: auto-replied\r\n",
+        );
+
+        assert_eq!(
+            headers,
+            vec![
+                ("From".to_string(), "Alice <alice@example.com>".to_string()),
+                ("Subject".to_string(), "Hello".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_sender_does_not_trust_body_from_lines() {
+        let err = parse_header_facts(
+            b"Subject: Missing sender\r\n\r\nFrom: Mallory <mallory@example.com>\r\n",
+        )
+        .expect_err("body From line must not become sender identity");
+
+        assert!(
+            err.to_string().contains("sender address"),
+            "unexpected error: {err:#}"
+        );
     }
 }

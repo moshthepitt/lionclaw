@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,7 +184,7 @@ impl EmailStore {
             "held" => Some(MailStatus::Held),
             "suppressed" => Some(MailStatus::Suppressed),
             "admitted" => Some(MailStatus::Admitted),
-            _ => None,
+            other => bail!("unknown email mail status '{other}' for event {event_id}"),
         })
     }
 
@@ -620,6 +620,32 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("failed to decode admitted email references"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_status_fails_closed_on_unknown_status() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let candidate = candidate(1);
+        store
+            .record_admitted(&candidate, "downloaded")
+            .await
+            .expect("record admitted");
+        sqlx::query("UPDATE mail_items SET status = ? WHERE event_id = ?")
+            .bind("mystery")
+            .bind(&candidate.event_id)
+            .execute(&store.pool)
+            .await
+            .expect("malform status");
+
+        let err = store
+            .mail_status(&candidate.event_id)
+            .await
+            .expect_err("unknown status must fail closed");
+        assert!(
+            err.to_string().contains("unknown email mail status"),
             "unexpected error: {err:#}"
         );
     }
