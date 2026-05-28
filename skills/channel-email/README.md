@@ -104,10 +104,10 @@ EOF
 
 `EMAIL_AUTH_RESULTS_HOST` must match the mailbox provider's trusted
 `Authentication-Results` authserv-id, such as `mx.google.com` for many Gmail
-deliveries. If a deployment has an upstream mailbox rule that already enforces
-sender authentication before delivery, it may set `EMAIL_TRUST_FROM_HEADER=true`
-instead, but then grants trust that upstream filter rather than the message
-header itself.
+deliveries. This is safe only when that provider strips attacker-supplied
+`Authentication-Results` headers for the same authserv-id or prepends its own
+authoritative result before any untrusted copy. Do not point this setting at an
+authserv-id that can be supplied by external senders.
 
 `connect email` installs the bundled channel snapshot, stores declared channel
 env in the selected instance home, starts the background stack, and leaves

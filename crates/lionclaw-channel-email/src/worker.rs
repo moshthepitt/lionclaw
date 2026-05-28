@@ -22,6 +22,7 @@ use crate::{
     mailbox::{
         attachment_provider_ref, is_stale_mailbox_candidate, CandidateHeader, MailboxEngine,
         MailboxFactory, MalformedCandidateHeader, OutboundAttachment, OutboundEmail,
+        SenderAuthVerdict,
     },
     mime::{
         attachment_summary, authentication_results_authenticates_sender, parse_full_message,
@@ -258,14 +259,17 @@ where
             )
             .await
             .context("failed to authorize email sender")?;
-        let sender_auth_failure =
-            sender_authentication_failure_reason(&self.config.sender_auth, candidate);
+        let sender_auth_decision =
+            sender_authentication_decision(&self.config.sender_auth, candidate);
         let exact_one_shot_release =
             authorization
                 .one_shot_release_held_id()
                 .is_some_and(|released_held_id| {
                     previously_held && released_held_id == held_id.as_str()
                 });
+        let authenticated_candidate =
+            candidate.with_sender_auth(sender_auth_decision.verdict.clone());
+        let candidate = &authenticated_candidate;
 
         if !authorization.authorized {
             if authorization.reason_code == "blocked_grant" {
@@ -277,7 +281,9 @@ where
                 )
                 .await?;
             } else {
-                let reason = sender_auth_failure.unwrap_or(authorization.reason_code.as_str());
+                let reason = sender_auth_decision
+                    .failure_reason()
+                    .unwrap_or(authorization.reason_code.as_str());
                 store
                     .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
                     .await?;
@@ -301,7 +307,10 @@ where
             mark_held_candidate_processed(store, mailbox, candidate).await?;
             return Ok(());
         }
-        if let Some(reason) = sender_auth_failure.filter(|_| !exact_one_shot_release) {
+        if let Some(reason) = sender_auth_decision
+            .failure_reason()
+            .filter(|_| !exact_one_shot_release)
+        {
             store
                 .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
                 .await?;
@@ -1008,15 +1017,59 @@ fn one_shot_release_grant_id<'a>(
     authorization.grant_id.as_deref()
 }
 
-fn sender_authentication_failure_reason<'a>(
-    sender_auth: &'a SenderAuthConfig,
+#[derive(Debug, Clone)]
+struct SenderAuthDecision {
+    verdict: SenderAuthVerdict,
+}
+
+impl SenderAuthDecision {
+    fn failure_reason(&self) -> Option<&'static str> {
+        (!self.verdict.authenticated).then_some("sender_authentication_required")
+    }
+}
+
+fn sender_authentication_decision(
+    sender_auth: &SenderAuthConfig,
     candidate: &CandidateHeader,
-) -> Option<&'a str> {
+) -> SenderAuthDecision {
     match sender_auth {
-        SenderAuthConfig::TrustFromHeader => None,
+        #[cfg(test)]
+        SenderAuthConfig::TrustFromHeader => SenderAuthDecision {
+            verdict: SenderAuthVerdict {
+                policy: sender_auth_policy_key(sender_auth),
+                authenticated: true,
+            },
+        },
         SenderAuthConfig::AuthenticationResults { authserv_id } => {
-            (!authentication_results_authenticates_sender(&candidate.facts, authserv_id))
-                .then_some("sender_authentication_required")
+            let policy = sender_auth_policy_key(sender_auth);
+            if let Some(verdict) = candidate
+                .sender_auth
+                .as_ref()
+                .filter(|verdict| verdict.policy == policy)
+            {
+                return SenderAuthDecision {
+                    verdict: verdict.clone(),
+                };
+            }
+            SenderAuthDecision {
+                verdict: SenderAuthVerdict {
+                    policy,
+                    authenticated: authentication_results_authenticates_sender(
+                        &candidate.facts,
+                        authserv_id,
+                    ),
+                },
+            }
+        }
+    }
+}
+
+fn sender_auth_policy_key(sender_auth: &SenderAuthConfig) -> String {
+    match sender_auth {
+        #[cfg(test)]
+        SenderAuthConfig::TrustFromHeader => "trust-from-header".to_string(),
+        SenderAuthConfig::AuthenticationResults { authserv_id } => {
+            format!("auth-results:{}", authserv_id.to_ascii_lowercase())
         }
     }
 }
@@ -1288,22 +1341,24 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
             if let Some(reason) = &item.classification_reason {
                 lines.push(format!("Reason: {reason}"));
             }
-            lines.push(
-                "Action templates: replace SENDER_REF and HELD_ID with the values above."
-                    .to_string(),
-            );
-            lines.push(
-                "Approve: lionclaw channel pairing approve email --sender-ref SENDER_REF"
-                    .to_string(),
-            );
-            lines.push("Block: lionclaw channel pairing block email SENDER_REF".to_string());
-            lines.push(
-                "Release once: lionclaw channel pairing approve email --sender-ref SENDER_REF --label email-release:HELD_ID"
-                    .to_string(),
-            );
+            let sender_ref_arg = shell_quote(&item.sender_ref);
+            let release_label_arg = shell_quote(&format!("email-release:{}", item.held_id));
+            lines.push(format!(
+                "Approve: lionclaw channel pairing approve email --sender-ref {sender_ref_arg}"
+            ));
+            lines.push(format!(
+                "Block: lionclaw channel pairing block email {sender_ref_arg}"
+            ));
+            lines.push(format!(
+                "Release once: lionclaw channel pairing approve email --sender-ref {sender_ref_arg} --label {release_label_arg}"
+            ));
         }
     }
     lines.join("\n")
+}
+
+fn shell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 fn digest_delivery_id(mailbox_id: &str, held: &[HeldItem], suppressed_count: i64) -> String {
@@ -1515,6 +1570,7 @@ mod tests {
             message_ref: "email:message:m1".to_string(),
             attachment_count: 0,
             rfc822_size: Some(128),
+            sender_auth: None,
             facts: facts.clone(),
         };
         let parsed = ParsedEmail {
@@ -1610,12 +1666,12 @@ mod tests {
     }
 
     #[test]
-    fn held_digest_renders_action_templates_without_untrusted_shell_args() {
+    fn held_digest_renders_shell_quoted_action_commands() {
         let held = vec![HeldItem {
             digest_rowid: 1,
-            held_id: "hld_safe".to_string(),
+            held_id: "hld_unsafe'ish".to_string(),
             event_id: "email:imap:assistant-example-com:7:42".to_string(),
-            sender_ref: "email:addr:bad;$(touch /tmp/pwn)@example.com".to_string(),
+            sender_ref: "email:addr:bad;'$(touch /tmp/pwn)'@example.com".to_string(),
             conversation_ref: conversation_ref("assistant-example-com"),
             thread_ref: thread_ref("root@example.com"),
             message_ref: message_ref("m1@example.com"),
@@ -1630,10 +1686,15 @@ mod tests {
 
         let text = digest_text("assistant@example.com", &held, 0);
 
-        assert!(text.contains("Sender ref: email:addr:bad;$(touch /tmp/pwn)@example.com"));
-        assert!(!text.contains("--sender-ref email:addr:bad;$(touch /tmp/pwn)@example.com"));
-        assert!(text.contains("--sender-ref SENDER_REF"));
-        assert!(text.contains("--label email-release:HELD_ID"));
+        assert!(text.contains("Sender ref: email:addr:bad;'$(touch /tmp/pwn)'@example.com"));
+        assert!(text.contains(&format!(
+            "--sender-ref {}",
+            shell_quote("email:addr:bad;'$(touch /tmp/pwn)'@example.com")
+        )));
+        assert!(text.contains(&format!(
+            "--label {}",
+            shell_quote("email-release:hld_unsafe'ish")
+        )));
     }
 
     #[tokio::test]
@@ -2002,6 +2063,39 @@ mod tests {
         let fixture = EmailFixture::new(false).await;
 
         let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+
+        fixture.mailbox.set_candidates(Vec::new());
+        fixture.api.set_authorized(true);
+        worker.tick().await.expect("second tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 2);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn held_authenticated_sender_is_fetched_after_later_permanent_authorization() {
+        let candidate = candidate_from_headers(
+            "Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\nFrom: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
+        );
+        let fixture = EmailFixture::with_candidate(false, candidate, full_message()).await;
+        let mut config = fixture.config();
+        config.sender_auth = SenderAuthConfig::AuthenticationResults {
+            authserv_id: "mx.example.com".to_string(),
+        };
+
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
         worker.tick().await.expect("first tick");
         assert_eq!(fixture.mailbox.full_fetches(), 0);
         assert_eq!(fixture.mailbox.seen(), 1);
@@ -2626,6 +2720,7 @@ mod tests {
             message_ref: message_ref(provider_message_id),
             attachment_count: 0,
             rfc822_size: Some(raw_headers.len() as u32),
+            sender_auth: None,
             facts,
         }
     }

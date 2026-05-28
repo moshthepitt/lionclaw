@@ -59,7 +59,10 @@ pub struct DigestConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SenderAuthConfig {
-    AuthenticationResults { authserv_id: String },
+    AuthenticationResults {
+        authserv_id: String,
+    },
+    #[cfg(test)]
     TrustFromHeader,
 }
 
@@ -141,10 +144,7 @@ impl WorkerCommand {
         let smtp_host = required_env("EMAIL_SMTP_HOST")?;
         let smtp_port = env_u16("EMAIL_SMTP_PORT")?.unwrap_or(587);
         let smtp_implicit_tls = env_bool("EMAIL_SMTP_IMPLICIT_TLS")?.unwrap_or(smtp_port == 465);
-        let sender_auth = parse_sender_auth_config(
-            optional_env("EMAIL_AUTH_RESULTS_HOST"),
-            env_bool("EMAIL_TRUST_FROM_HEADER")?.unwrap_or(false),
-        )?;
+        let sender_auth = parse_sender_auth_config(required_env("EMAIL_AUTH_RESULTS_HOST")?)?;
 
         Ok(Self::Run(Box::new(WorkerConfig {
             home,
@@ -237,23 +237,9 @@ fn validate_mailbox_id(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_sender_auth_config(
-    authserv_id: Option<String>,
-    trust_from_header: bool,
-) -> Result<SenderAuthConfig> {
-    match (authserv_id, trust_from_header) {
-        (Some(_), true) => bail!(
-            "set either EMAIL_AUTH_RESULTS_HOST or EMAIL_TRUST_FROM_HEADER=true, not both"
-        ),
-        (Some(authserv_id), false) => {
-            validate_authserv_id("EMAIL_AUTH_RESULTS_HOST", &authserv_id)?;
-            Ok(SenderAuthConfig::AuthenticationResults { authserv_id })
-        }
-        (None, true) => Ok(SenderAuthConfig::TrustFromHeader),
-        (None, false) => bail!(
-            "EMAIL_AUTH_RESULTS_HOST is required unless EMAIL_TRUST_FROM_HEADER=true is explicitly set"
-        ),
-    }
+fn parse_sender_auth_config(authserv_id: String) -> Result<SenderAuthConfig> {
+    validate_authserv_id("EMAIL_AUTH_RESULTS_HOST", &authserv_id)?;
+    Ok(SenderAuthConfig::AuthenticationResults { authserv_id })
 }
 
 fn validate_authserv_id(name: &str, value: &str) -> Result<()> {
@@ -428,20 +414,13 @@ mod tests {
     }
 
     #[test]
-    fn sender_auth_requires_provider_auth_or_explicit_unsafe_mode() {
+    fn sender_auth_requires_provider_auth() {
         assert_eq!(
-            parse_sender_auth_config(Some("mx.example.com".to_string()), false)
-                .expect("auth results"),
+            parse_sender_auth_config("mx.example.com".to_string()).expect("auth results"),
             SenderAuthConfig::AuthenticationResults {
                 authserv_id: "mx.example.com".to_string()
             }
         );
-        assert_eq!(
-            parse_sender_auth_config(None, true).expect("explicit trust"),
-            SenderAuthConfig::TrustFromHeader
-        );
-        assert!(parse_sender_auth_config(None, false).is_err());
-        assert!(parse_sender_auth_config(Some("mx.example.com".to_string()), true).is_err());
-        assert!(parse_sender_auth_config(Some("mx example".to_string()), false).is_err());
+        assert!(parse_sender_auth_config("mx example".to_string()).is_err());
     }
 }

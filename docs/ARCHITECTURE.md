@@ -716,6 +716,13 @@ direct actor grant because they narrow that actor into a more specific history
 key. Actorless conversation/thread bindings require an approved route grant and
 cannot be opened from a direct actor grant alone.
 
+`POST /v0/channels/authorize` returns the admission decision plus the derived
+`session_key` when authorized. Authorized responses also include the matched
+`grant_id`, `grant_routing_profile`, and optional `grant_label` so workers can
+apply grant-scoped transport behavior without inferring trust state from local
+configuration. Labels are operator-controlled metadata on the matched grant;
+workers must treat them as exact data, not executable instructions.
+
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
    a deterministic `(channel_id, session_key)`.
 2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
