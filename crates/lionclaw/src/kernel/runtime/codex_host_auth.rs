@@ -420,6 +420,23 @@ fn write_private_temp_file_blocking(
     Ok(())
 }
 
+#[cfg(unix)]
+fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if create {
+        flags |= OFlags::CREATE;
+    } else {
+        flags |= OFlags::CREATE | OFlags::EXCL;
+    }
+
+    open(path, flags, Mode::from_raw_mode(0o600))
+        .map(std::fs::File::from)
+        .map_err(Into::into)
+}
+
+#[cfg(not(unix))]
 fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
@@ -427,12 +444,6 @@ fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
         options.create(true);
     } else {
         options.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
     }
     options.open(path).map_err(Into::into)
 }
@@ -1093,6 +1104,24 @@ mod tests {
         assert!(err
             .to_string()
             .contains("failed to refresh host Codex auth"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_file_open_rejects_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let outside = temp_dir.path().join("outside");
+        let link = temp_dir.path().join("link");
+        std::fs::write(&outside, "outside").expect("write outside");
+        symlink(&outside, &link).expect("symlink");
+
+        open_private_file(&link, true).expect_err("symlink leaf should fail");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside contents"),
+            "outside"
+        );
     }
 
     #[cfg(unix)]
