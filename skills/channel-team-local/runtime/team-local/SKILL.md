@@ -36,8 +36,11 @@ printf '%s\n' "Please inspect the current workspace and reply." | scripts/send r
 
 Use `--format plain|markdown|html` when the message is not markdown. Use
 `--attachment /runtime/path` for files the current turn has written under
-`/runtime`; repeat it for multiple attachments. Use `--reply-to-ref <ref>` only
-when continuing a known provider message thread.
+`/runtime`; repeat it for multiple attachments. Attachments are intentionally
+path-only here: LionClaw derives the filename and media type from the runtime
+file, so write or rename the file under `/runtime` before sending when the name
+matters. Use `--reply-to-ref <ref>` only when continuing a known provider
+message thread.
 
 ```bash
 scripts/send reviewer --format plain --attachment /runtime/results/report.txt -- "Report attached."
