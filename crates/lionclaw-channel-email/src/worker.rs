@@ -463,7 +463,6 @@ where
                 "references": parsed.facts.references,
                 "rfc822_size": candidate.rfc822_size,
                 "authorization_reason_code": authorization.reason_code,
-                "grant_id": authorization.grant_id,
             }),
         }
     }
@@ -1406,6 +1405,16 @@ mod tests {
                 .as_str()
                 .expect("inbound text")
                 .contains("Please check this."));
+            let metadata = inbound[0]["provider_metadata"]
+                .as_object()
+                .expect("provider metadata");
+            assert_eq!(
+                metadata
+                    .get("authorization_reason_code")
+                    .and_then(|value| value.as_str()),
+                Some("approved")
+            );
+            assert!(!metadata.contains_key("grant_id"));
         }
         {
             let authorize = fixture.api.authorize_requests.lock().unwrap();
