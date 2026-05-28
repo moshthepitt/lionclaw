@@ -33,7 +33,9 @@ use crate::{
         non_empty_text, sanitize_header_text, short_hash, CHANNEL_ID, INBOUND_SESSION_BINDING,
         INBOUND_TRIGGER,
     },
-    store::{held_id_for, EmailStore, HeldItem, MailStatus, ThreadContext},
+    store::{
+        held_id_for, EmailStore, HeldItem, MailStatus, PendingGrantConsumptionInput, ThreadContext,
+    },
 };
 
 const ATTACHMENT_KIND: &str = "document";
@@ -54,6 +56,29 @@ where
 struct PreparedInboundAttachment {
     descriptor: ChannelAttachmentDescriptor,
     content: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct OneShotReleaseGrant {
+    grant_id: String,
+    label: String,
+}
+
+impl OneShotReleaseGrant {
+    fn pending_input<'a>(
+        &'a self,
+        channel_id: &'a str,
+        held_id: &'a str,
+        last_error: &'a str,
+    ) -> PendingGrantConsumptionInput<'a> {
+        PendingGrantConsumptionInput {
+            grant_id: &self.grant_id,
+            channel_id,
+            held_id,
+            expected_label: &self.label,
+            last_error,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -109,7 +134,7 @@ where
         let mut mailbox = self.mailbox_factory.open(self.config.mailbox.clone());
 
         self.report_ready(&worker_id, &daemon).await;
-        self.process_pending_release_revocations(&store).await?;
+        self.process_pending_release_consumptions(&store).await?;
         self.process_held_releases(&store, mailbox.as_mut(), &worker_id)
             .await?;
         self.process_inbound(&store, mailbox.as_mut(), &worker_id)
@@ -302,22 +327,29 @@ where
             return Ok(());
         }
 
-        let consumed_release_grant_id = self
-            .record_consumed_one_shot_release_grant_if_needed(
-                store,
-                &authorization,
-                held_id.as_str(),
-                previously_held,
-            )
-            .await?;
+        let release_grant =
+            one_shot_release_grant(&authorization, held_id.as_str(), previously_held);
         if let Some(reason) = sender_auth_decision.failure_reason() {
+            let pending = release_grant.as_ref().map(|grant| {
+                grant.pending_input(
+                    &self.config.channel_id,
+                    held_id.as_str(),
+                    "terminal_outcome_recorded",
+                )
+            });
             store
-                .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
+                .record_held_with_pending_grant_consumption(
+                    candidate,
+                    &held_id,
+                    held_body_not_downloaded_text(),
+                    reason,
+                    pending,
+                )
                 .await?;
             mark_held_candidate_processed(store, mailbox, candidate).await?;
-            self.revoke_consumed_one_shot_release_grant_if_needed(
+            self.consume_one_shot_release_grant_if_needed(
                 store,
-                consumed_release_grant_id.as_deref(),
+                release_grant.as_ref(),
                 held_id.as_str(),
             )
             .await?;
@@ -325,12 +357,12 @@ where
         }
 
         if candidate_message_size_exceeds_limit(candidate, self.config.mailbox.max_message_bytes) {
-            self.suppress_and_revoke_release_grant(
+            self.suppress_and_consume_release_grant(
                 store,
                 mailbox,
                 candidate,
                 "message_too_large",
-                consumed_release_grant_id.as_deref(),
+                release_grant.as_ref(),
                 held_id.as_str(),
             )
             .await?;
@@ -339,12 +371,12 @@ where
         let fetched = match mailbox.fetch_full_message_after_authorize(candidate).await {
             Ok(fetched) => fetched,
             Err(err) if is_stale_mailbox_candidate(&err) => {
-                self.suppress_and_revoke_release_grant(
+                self.suppress_and_consume_release_grant(
                     store,
                     mailbox,
                     candidate,
                     STALE_MAILBOX_UID_REASON,
-                    consumed_release_grant_id.as_deref(),
+                    release_grant.as_ref(),
                     held_id.as_str(),
                 )
                 .await?;
@@ -353,12 +385,12 @@ where
             Err(err) => return Err(err.context("failed to fetch authorized email body")),
         };
         if fetched.raw.len() > self.config.mailbox.max_message_bytes {
-            self.suppress_and_revoke_release_grant(
+            self.suppress_and_consume_release_grant(
                 store,
                 mailbox,
                 candidate,
                 "message_too_large",
-                consumed_release_grant_id.as_deref(),
+                release_grant.as_ref(),
                 held_id.as_str(),
             )
             .await?;
@@ -367,12 +399,12 @@ where
         let parsed = match parse_full_message(&fetched.raw) {
             Ok(parsed) => parsed,
             Err(err) => {
-                self.suppress_and_revoke_release_grant(
+                self.suppress_and_consume_release_grant(
                     store,
                     mailbox,
                     candidate,
                     "malformed_message",
-                    consumed_release_grant_id.as_deref(),
+                    release_grant.as_ref(),
                     held_id.as_str(),
                 )
                 .await?;
@@ -380,12 +412,12 @@ where
             }
         };
         if let Err(err) = require_nonempty_body(&parsed) {
-            self.suppress_and_revoke_release_grant(
+            self.suppress_and_consume_release_grant(
                 store,
                 mailbox,
                 candidate,
                 "empty_message",
-                consumed_release_grant_id.as_deref(),
+                release_grant.as_ref(),
                 held_id.as_str(),
             )
             .await?;
@@ -414,12 +446,12 @@ where
                 .await?;
             }
             "blocked" => {
-                self.suppress_and_revoke_release_grant(
+                self.suppress_and_consume_release_grant(
                     store,
                     mailbox,
                     candidate,
                     "blocked",
-                    consumed_release_grant_id.as_deref(),
+                    release_grant.as_ref(),
                     held_id.as_str(),
                 )
                 .await?;
@@ -430,13 +462,26 @@ where
                     .reason_code
                     .as_deref()
                     .unwrap_or(response.outcome.as_str());
+                let pending = release_grant.as_ref().map(|grant| {
+                    grant.pending_input(
+                        &self.config.channel_id,
+                        held_id.as_str(),
+                        "terminal_outcome_recorded",
+                    )
+                });
                 store
-                    .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
+                    .record_held_with_pending_grant_consumption(
+                        candidate,
+                        &held_id,
+                        held_body_not_downloaded_text(),
+                        reason,
+                        pending,
+                    )
                     .await?;
                 mark_held_candidate_processed(store, mailbox, candidate).await?;
-                self.revoke_consumed_one_shot_release_grant_if_needed(
+                self.consume_one_shot_release_grant_if_needed(
                     store,
-                    consumed_release_grant_id.as_deref(),
+                    release_grant.as_ref(),
                     held_id.as_str(),
                 )
                 .await?;
@@ -445,7 +490,21 @@ where
             other => bail!("unexpected inbound outcome '{other}'"),
         }
 
-        store.record_admitted(candidate, &parsed.snippet).await?;
+        if let Some(grant) = release_grant.as_ref() {
+            store
+                .record_admitted_with_pending_grant_consumption(
+                    candidate,
+                    &parsed.snippet,
+                    Some(grant.pending_input(
+                        &self.config.channel_id,
+                        held_id.as_str(),
+                        "terminal_outcome_recorded",
+                    )),
+                )
+                .await?;
+        } else {
+            store.record_admitted(candidate, &parsed.snippet).await?;
+        }
         if let Err(err) = mailbox.record_seen_or_processed(candidate).await {
             if is_stale_mailbox_candidate(&err) {
                 warn!(
@@ -458,26 +517,39 @@ where
                 return Err(err);
             }
         }
-        self.revoke_consumed_one_shot_release_grant_if_needed(
+        self.consume_one_shot_release_grant_if_needed(
             store,
-            consumed_release_grant_id.as_deref(),
+            release_grant.as_ref(),
             held_id.as_str(),
         )
         .await?;
         Ok(())
     }
 
-    async fn suppress_and_revoke_release_grant(
+    async fn suppress_and_consume_release_grant(
         &self,
         store: &EmailStore,
         mailbox: &mut dyn MailboxEngine,
         candidate: &CandidateHeader,
         reason: &str,
-        grant_id: Option<&str>,
+        grant: Option<&OneShotReleaseGrant>,
         held_id: &str,
     ) -> Result<()> {
-        suppress_candidate(store, mailbox, candidate, reason).await?;
-        self.revoke_consumed_one_shot_release_grant_if_needed(store, grant_id, held_id)
+        suppress_candidate_with_pending_grant_consumption(
+            store,
+            mailbox,
+            candidate,
+            reason,
+            grant.map(|grant| {
+                grant.pending_input(
+                    &self.config.channel_id,
+                    held_id,
+                    "terminal_outcome_recorded",
+                )
+            }),
+        )
+        .await?;
+        self.consume_one_shot_release_grant_if_needed(store, grant, held_id)
             .await
     }
 
@@ -709,79 +781,71 @@ where
         Ok(())
     }
 
-    async fn process_pending_release_revocations(&self, store: &EmailStore) -> Result<()> {
-        for pending in store.pending_grant_revocations().await? {
-            self.revoke_one_shot_release_grant(
+    async fn process_pending_release_consumptions(&self, store: &EmailStore) -> Result<()> {
+        for pending in store.pending_grant_consumptions().await? {
+            self.consume_one_shot_release_grant(
                 store,
                 &pending.channel_id,
                 &pending.grant_id,
                 &pending.held_id,
+                &pending.expected_label,
             )
             .await?;
         }
         Ok(())
     }
 
-    async fn record_consumed_one_shot_release_grant_if_needed(
+    async fn consume_one_shot_release_grant_if_needed(
         &self,
         store: &EmailStore,
-        authorization: &crate::api::ChannelActorAuthorizeResponse,
-        held_id: &str,
-        previously_held: bool,
-    ) -> Result<Option<String>> {
-        let Some(grant_id) = one_shot_release_grant_id(authorization, held_id, previously_held)
-        else {
-            return Ok(None);
-        };
-        store
-            .record_pending_grant_revocation(
-                grant_id,
-                &self.config.channel_id,
-                held_id,
-                "release_attempt_started",
-            )
-            .await?;
-        Ok(Some(grant_id.to_string()))
-    }
-
-    async fn revoke_consumed_one_shot_release_grant_if_needed(
-        &self,
-        store: &EmailStore,
-        grant_id: Option<&str>,
+        grant: Option<&OneShotReleaseGrant>,
         held_id: &str,
     ) -> Result<()> {
-        let Some(grant_id) = grant_id else {
+        let Some(grant) = grant else {
             return Ok(());
         };
-        self.revoke_one_shot_release_grant(store, &self.config.channel_id, grant_id, held_id)
-            .await
+        self.consume_one_shot_release_grant(
+            store,
+            &self.config.channel_id,
+            &grant.grant_id,
+            held_id,
+            &grant.label,
+        )
+        .await
     }
 
-    async fn revoke_one_shot_release_grant(
+    async fn consume_one_shot_release_grant(
         &self,
         store: &EmailStore,
         channel_id: &str,
         grant_id: &str,
         held_id: &str,
+        expected_label: &str,
     ) -> Result<()> {
         match self
             .api
-            .revoke_channel_grant(channel_id, grant_id, "email_one_shot_release_consumed")
+            .consume_channel_grant(
+                channel_id,
+                grant_id,
+                expected_label,
+                "email_one_shot_release_consumed",
+            )
             .await
         {
-            Ok(()) => store.clear_pending_grant_revocation(grant_id).await?,
+            Ok(()) => store.clear_pending_grant_consumption(grant_id).await?,
             Err(err) => {
                 warn!(
                     grant_id,
                     held_id,
                     error = %err,
-                    "failed to revoke consumed one-shot email release grant"
+                    "failed to consume one-shot email release grant"
                 );
                 store
-                    .record_pending_grant_revocation(
+                    .record_pending_grant_consumption(
                         grant_id,
                         channel_id,
                         held_id,
+                        expected_label,
                         &err.to_string(),
                     )
                     .await?;
@@ -925,6 +989,26 @@ async fn suppress_candidate(
     reason: &str,
 ) -> Result<()> {
     store.record_suppressed(candidate, reason).await?;
+    mark_suppressed_candidate_processed(mailbox, candidate).await
+}
+
+async fn suppress_candidate_with_pending_grant_consumption(
+    store: &EmailStore,
+    mailbox: &mut dyn MailboxEngine,
+    candidate: &CandidateHeader,
+    reason: &str,
+    pending: Option<PendingGrantConsumptionInput<'_>>,
+) -> Result<()> {
+    store
+        .record_suppressed_with_pending_grant_consumption(candidate, reason, pending)
+        .await?;
+    mark_suppressed_candidate_processed(mailbox, candidate).await
+}
+
+async fn mark_suppressed_candidate_processed(
+    mailbox: &mut dyn MailboxEngine,
+    candidate: &CandidateHeader,
+) -> Result<()> {
     match mailbox.record_seen_or_processed(candidate).await {
         Ok(()) => Ok(()),
         Err(err) if is_stale_mailbox_candidate(&err) => {
@@ -1004,15 +1088,18 @@ fn candidate_message_size_exceeds_limit(
         .is_some_and(|size| u64::from(size) > max_message_bytes as u64)
 }
 
-fn one_shot_release_grant_id<'a>(
-    authorization: &'a crate::api::ChannelActorAuthorizeResponse,
+fn one_shot_release_grant(
+    authorization: &crate::api::ChannelActorAuthorizeResponse,
     held_id: &str,
     previously_held: bool,
-) -> Option<&'a str> {
+) -> Option<OneShotReleaseGrant> {
     if !previously_held || authorization.one_shot_release_held_id() != Some(held_id) {
         return None;
     }
-    authorization.grant_id.as_deref()
+    Some(OneShotReleaseGrant {
+        grant_id: authorization.grant_id.clone()?,
+        label: authorization.grant_label.clone()?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2183,7 +2270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_released_uidvalidity_is_suppressed_and_revokes_release_grant() {
+    async fn stale_released_uidvalidity_is_suppressed_and_consumes_release_grant() {
         let fixture = EmailFixture::new(false).await;
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         let candidate = candidate();
@@ -2214,10 +2301,10 @@ mod tests {
                 .expect("status"),
             Some(MailStatus::Suppressed)
         );
-        let revoked = fixture.api.revoked_grants.lock().unwrap();
-        assert_eq!(revoked.len(), 1);
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 1);
         assert_eq!(
-            revoked[0]["grant_id"],
+            consumed[0]["grant_id"],
             "00000000-0000-0000-0000-000000000086"
         );
     }
@@ -2256,7 +2343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_release_grant_is_revoked_after_admission() {
+    async fn one_shot_release_grant_is_consumed_after_admission() {
         let candidate = candidate_from_headers(
             "Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\nFrom: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
         );
@@ -2274,13 +2361,17 @@ mod tests {
         worker.tick().await.expect("release tick");
 
         assert_eq!(fixture.mailbox.full_fetches(), 1);
-        let revoked = fixture.api.revoked_grants.lock().unwrap();
-        assert_eq!(revoked.len(), 1);
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 1);
         assert_eq!(
-            revoked[0]["grant_id"],
+            consumed[0]["grant_id"],
             "00000000-0000-0000-0000-000000000086"
         );
-        assert_eq!(revoked[0]["reason"], "email_one_shot_release_consumed");
+        assert_eq!(consumed[0]["reason"], "email_one_shot_release_consumed");
+        assert_eq!(
+            consumed[0]["expected_label"],
+            format!("email-release:{held_id}")
+        );
     }
 
     #[tokio::test]
@@ -2316,9 +2407,9 @@ mod tests {
             held[0].classification_reason.as_deref(),
             Some("sender_authentication_required")
         );
-        let revoked = fixture.api.revoked_grants.lock().unwrap();
-        assert_eq!(revoked.len(), 1);
-        assert_eq!(revoked[0]["reason"], "email_one_shot_release_consumed");
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0]["reason"], "email_one_shot_release_consumed");
     }
 
     #[tokio::test]
@@ -2333,7 +2424,7 @@ mod tests {
 
         assert_eq!(fixture.mailbox.full_fetches(), 0);
         assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
-        assert!(fixture.api.revoked_grants.lock().unwrap().is_empty());
+        assert!(fixture.api.consumed_grants.lock().unwrap().is_empty());
 
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         assert_eq!(
@@ -2346,7 +2437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_release_revocation_survives_failed_release_processing() {
+    async fn one_shot_release_consumption_survives_failed_release_processing() {
         let fixture = EmailFixture::with_candidate(
             false,
             candidate(),
@@ -2359,30 +2450,65 @@ mod tests {
 
         let held_id = held_id_for("email:imap:assistant-example-com:7:42");
         fixture.api.set_one_shot_release_authorized(&held_id);
-        fixture.api.set_revoke_fails(true);
+        fixture.api.set_consume_fails(true);
         worker.tick().await.expect("failed release tick");
 
         let store = EmailStore::open(&fixture.state_dir).await.expect("store");
         let pending = store
-            .pending_grant_revocations()
+            .pending_grant_consumptions()
             .await
-            .expect("pending revocations");
+            .expect("pending consumptions");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].grant_id, "00000000-0000-0000-0000-000000000086");
+        assert_eq!(
+            pending[0].expected_label,
+            format!("email-release:{held_id}")
+        );
 
-        fixture.api.set_revoke_fails(false);
-        fixture.api.set_revoke_missing(true);
-        worker.tick().await.expect("retry absent revocation tick");
+        fixture.api.set_consume_fails(false);
+        fixture.api.set_consume_missing(true);
+        worker.tick().await.expect("retry absent consumption tick");
 
         assert!(store
-            .pending_grant_revocations()
+            .pending_grant_consumptions()
             .await
-            .expect("pending revocations")
+            .expect("pending consumptions")
             .is_empty());
-        let revoked = fixture.api.revoked_grants.lock().unwrap();
-        assert_eq!(revoked.len(), 2);
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 2);
         assert_eq!(
-            revoked[1]["grant_id"],
+            consumed[1]["grant_id"],
+            "00000000-0000-0000-0000-000000000086"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_release_is_not_consumed_after_transient_fetch_failure() {
+        let fixture = EmailFixture::new(false).await;
+        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+
+        let held_id = held_id_for("email:imap:assistant-example-com:7:42");
+        fixture.api.set_one_shot_release_authorized(&held_id);
+        fixture.mailbox.set_full_fetch_fails(true);
+        worker.tick().await.expect("transient release tick");
+
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert!(store
+            .pending_grant_consumptions()
+            .await
+            .expect("pending consumptions")
+            .is_empty());
+        assert!(fixture.api.consumed_grants.lock().unwrap().is_empty());
+
+        fixture.mailbox.set_full_fetch_fails(false);
+        worker.tick().await.expect("successful release retry");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(
+            consumed[0]["grant_id"],
             "00000000-0000-0000-0000-000000000086"
         );
     }
@@ -2417,10 +2543,10 @@ mod tests {
                 .expect("status"),
             Some(MailStatus::Suppressed)
         );
-        let revoked = fixture.api.revoked_grants.lock().unwrap();
-        assert_eq!(revoked.len(), 1);
+        let consumed = fixture.api.consumed_grants.lock().unwrap();
+        assert_eq!(consumed.len(), 1);
         assert_eq!(
-            revoked[0]["grant_id"],
+            consumed[0]["grant_id"],
             "00000000-0000-0000-0000-000000000086"
         );
     }
@@ -2503,12 +2629,12 @@ mod tests {
     struct ApiState {
         home_root: Mutex<String>,
         authorized: AtomicBool,
-        fail_revoke: AtomicBool,
-        missing_revoke: AtomicBool,
+        fail_consume: AtomicBool,
+        missing_consume: AtomicBool,
         grant: Mutex<Option<AuthGrant>>,
         authorize_requests: Mutex<Vec<Value>>,
         inbound_requests: Mutex<Vec<Value>>,
-        revoked_grants: Mutex<Vec<Value>>,
+        consumed_grants: Mutex<Vec<Value>>,
     }
 
     #[derive(Clone)]
@@ -2531,12 +2657,12 @@ mod tests {
             }
         }
 
-        fn set_revoke_fails(&self, fail: bool) {
-            self.fail_revoke.store(fail, Ordering::SeqCst);
+        fn set_consume_fails(&self, fail: bool) {
+            self.fail_consume.store(fail, Ordering::SeqCst);
         }
 
-        fn set_revoke_missing(&self, missing: bool) {
-            self.missing_revoke.store(missing, Ordering::SeqCst);
+        fn set_consume_missing(&self, missing: bool) {
+            self.missing_consume.store(missing, Ordering::SeqCst);
         }
 
         fn set_one_shot_release_authorized(&self, held_id: &str) {
@@ -2557,7 +2683,7 @@ mod tests {
             .route("/v0/channels/health/report", post(ok))
             .route("/v0/channels/authorize", post(authorize))
             .route("/v0/channels/inbound", post(inbound))
-            .route("/v0/channels/grants/revoke", post(revoke_grant))
+            .route("/v0/channels/grants/consume", post(consume_grant))
             .route("/v0/channels/outbox/pull", post(outbox_pull))
             .route("/v0/channels/outbox/report", post(ok))
             .with_state(state);
@@ -2600,7 +2726,7 @@ mod tests {
         Json(json!({ "outcome": "queued" }))
     }
 
-    async fn revoke_grant(
+    async fn consume_grant(
         State(state): State<Arc<ApiState>>,
         Json(body): Json<Value>,
     ) -> impl IntoResponse {
@@ -2608,27 +2734,28 @@ mod tests {
             .get("grant_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        state.revoked_grants.lock().unwrap().push(body);
-        if state.missing_revoke.load(Ordering::SeqCst) {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "channel grant not found" })),
-            )
-        } else if state.fail_revoke.load(Ordering::SeqCst) {
+        let expected_label = body
+            .get("expected_label")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        state.consumed_grants.lock().unwrap().push(body);
+        if state.fail_consume.load(Ordering::SeqCst) {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "revoke failed" })),
+                Json(json!({ "error": "consume failed" })),
             )
+        } else if state.missing_consume.load(Ordering::SeqCst) {
+            (StatusCode::OK, Json(json!({ "consumed": false })))
         } else {
             let mut grant = state.grant.lock().unwrap();
-            if grant
-                .as_ref()
-                .is_some_and(|current| Some(current.grant_id.as_str()) == grant_id.as_deref())
-            {
+            if grant.as_ref().is_some_and(|current| {
+                Some(current.grant_id.as_str()) == grant_id.as_deref()
+                    && Some(current.label.as_str()) == expected_label.as_deref()
+            }) {
                 *grant = None;
                 state.authorized.store(false, Ordering::SeqCst);
             }
-            (StatusCode::OK, Json(json!({ "revoked": true })))
+            (StatusCode::OK, Json(json!({ "consumed": true })))
         }
     }
 
@@ -2650,6 +2777,7 @@ mod tests {
                     override_malformed: Mutex::new(None),
                     raw,
                     stale_uid_validity: AtomicBool::new(false),
+                    fail_full_fetch: AtomicBool::new(false),
                     full_fetches: AtomicUsize::new(0),
                     seen: AtomicUsize::new(0),
                     sent: Mutex::new(Vec::new()),
@@ -2677,6 +2805,10 @@ mod tests {
             self.state.stale_uid_validity.store(stale, Ordering::SeqCst);
         }
 
+        fn set_full_fetch_fails(&self, fail: bool) {
+            self.state.fail_full_fetch.store(fail, Ordering::SeqCst);
+        }
+
         fn sent(&self) -> Vec<OutboundEmail> {
             self.state.sent.lock().unwrap().clone()
         }
@@ -2688,6 +2820,7 @@ mod tests {
         override_malformed: Mutex<Option<Vec<MalformedCandidateHeader>>>,
         raw: Vec<u8>,
         stale_uid_validity: AtomicBool,
+        fail_full_fetch: AtomicBool,
         full_fetches: AtomicUsize,
         seen: AtomicUsize,
         sent: Mutex<Vec<OutboundEmail>>,
@@ -2734,6 +2867,9 @@ mod tests {
         ) -> Result<FetchedMessage> {
             if self.state.stale_uid_validity.load(Ordering::SeqCst) {
                 return Err(stale_uid_validity_error(candidate.uid_validity));
+            }
+            if self.state.fail_full_fetch.load(Ordering::SeqCst) {
+                bail!("temporary full fetch failure");
             }
             self.state.full_fetches.fetch_add(1, Ordering::SeqCst);
             Ok(FetchedMessage {

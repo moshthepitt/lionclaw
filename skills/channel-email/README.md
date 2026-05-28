@@ -71,9 +71,10 @@ The worker admits only the held item whose id exactly matches that label and
 still requires the message to satisfy the configured sender-authentication
 policy. Other mail from the same sender remains held while the release grant
 exists. Once the matching held item is admitted, remains held for failed sender
-authentication, or is terminally suppressed, the worker revokes the grant
-through LionClaw's grant-revoke API. Failed revocations are retried from
-worker-local SQLite state.
+authentication, or is terminally suppressed, the worker consumes that exact
+labeled grant through LionClaw's grant-consume API. Consumption removes the
+temporary release grant without leaving a revoked sender scope; failed
+consumptions are retried from worker-local SQLite state.
 
 Permanent sender approval uses the same command without the one-shot release
 label:
@@ -139,8 +140,8 @@ Expected when credentials are available:
   count, sender/conversation/thread refs, and hold-reason-specific approval or
   release guidance
 - `channel pairing approve email --sender-ref ... --label email-release:<held-id>`
-  releases only that held item once, leaves mismatched mail held, and is revoked
-  after admission
+  releases only that held item once, leaves mismatched mail held, and is
+  consumed after a terminal local outcome
 - automated/list/bounce/no-reply mail is suppressed without auto-reply
 - mail above `EMAIL_MAX_MESSAGE_BYTES` is suppressed without runtime work,
   including later one-shot release of held mail already known to exceed the cap

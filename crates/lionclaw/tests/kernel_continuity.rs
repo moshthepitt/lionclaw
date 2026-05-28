@@ -13,11 +13,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelGrantApproveRequest, ChannelGrantRevokeRequest, ChannelInboundRequest,
-        ChannelPairingApproveRequest, ChannelPairingStatus, ChannelRoutingProfile,
-        ChannelSessionBinding, ChannelTrigger, ContinuityPathRequest, ContinuitySearchRequest,
-        JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest,
-        SessionTurnRequest, TrustTier,
+        ChannelGrantApproveRequest, ChannelGrantConsumeRequest, ChannelGrantRevokeRequest,
+        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelPairingStatus,
+        ChannelRoutingProfile, ChannelSessionBinding, ChannelTrigger, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
+        SessionOpenRequest, SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -742,6 +742,64 @@ async fn revoke_channel_grant_rolls_back_when_audit_append_fails() {
         })
         .await
         .expect_err("revoke should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM channel_grants WHERE grant_id = ?1")
+            .bind(grant.grant_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("query grant status after rollback");
+    assert_eq!(status, "approved");
+}
+
+#[tokio::test]
+async fn consume_channel_grant_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    install_and_bind_channel(&env, "loopback").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let grant = kernel
+        .approve_channel_grant(ChannelGrantApproveRequest {
+            channel_id: "loopback".to_string(),
+            sender_ref: Some("alice".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+            trust_tier: Some(TrustTier::Main),
+            label: Some("email-release:hld_123".to_string()),
+            reason: None,
+        })
+        .await
+        .expect("approve grant before consume rollback")
+        .grant;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .consume_channel_grant(ChannelGrantConsumeRequest {
+            channel_id: "loopback".to_string(),
+            grant_id: grant.grant_id,
+            expected_label: "email-release:hld_123".to_string(),
+            reason: None,
+        })
+        .await
+        .expect_err("consume should fail when audit append fails");
     assert!(err.to_string().contains("failed to append audit event"));
 
     let status: String =
