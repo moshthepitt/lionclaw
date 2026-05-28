@@ -167,6 +167,7 @@ struct RunArgs {
     continue_last_session: bool,
     #[arg(
         long,
+        conflicts_with = "runtime_tui",
         value_parser = parse_runtime_timeout,
         help = "Runtime turn limit, such as 30m, 2h, or 7200s"
     )]
@@ -844,7 +845,6 @@ pub async fn run() -> Result<ExitCode> {
                     project_instance_runtime: target.project_instance_runtime_context()?,
                     requested_runtime: args.runtime,
                     continue_last_session: args.continue_last_session,
-                    timeout_override,
                 })
                 .await?;
             } else if should_use_run_tui(
@@ -2996,6 +2996,9 @@ mod tests {
     fn run_runtime_tui_parse_conflicts_with_plain_mode() {
         assert!(Cli::try_parse_from(["lionclaw", "run", "--runtime-tui"]).is_ok());
         assert!(Cli::try_parse_from(["lionclaw", "run", "--plain", "--runtime-tui"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lionclaw", "run", "--runtime-tui", "--timeout", "30s"]).is_err()
+        );
     }
 
     #[test]

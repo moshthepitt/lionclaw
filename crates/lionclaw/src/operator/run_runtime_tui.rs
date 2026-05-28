@@ -24,7 +24,6 @@ pub(crate) struct RunRuntimeTuiInvocation<'a> {
     pub(crate) project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub(crate) requested_runtime: Option<String>,
     pub(crate) continue_last_session: bool,
-    pub(crate) timeout_override: Option<RuntimeTurnTimeouts>,
 }
 
 pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> Result<()> {
@@ -35,7 +34,6 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         project_instance_runtime,
         requested_runtime,
         continue_last_session,
-        timeout_override,
     } = invocation;
     let config = OperatorConfig::load(home).await?;
     let runtime_id = resolve_run_runtime_id(
@@ -46,14 +44,13 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
     print_runtime_tui_prepare_message(&runtime_id)?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
-    let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = open_runtime_kernel_for_work_root(
         home,
         &config,
         Some(runtime_id.clone()),
         work_root,
         project_instance_runtime,
-        Some(effective_timeouts),
+        Some(RuntimeTurnTimeouts::interactive()),
     )
     .await?;
     let peer_id = local_peer_id_for_project(work_root);
@@ -64,7 +61,7 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
             session_id: session.session_id,
             runtime_id: runtime_id.clone(),
-            timeout_ms: timeout_override.map(|timeouts| timeouts.idle.as_millis() as u64),
+            timeout_ms: None,
         })
         .await
         .map_err(kernel_to_anyhow)?;

@@ -496,6 +496,7 @@ pub struct AttachedRuntimeLaunchInput {
 
 const RUNTIME_TUI_STATE_RUNNING: &str = "running";
 const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
+const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct AttachedRuntimeTranscriptProgramExecutor {
     plan: EffectiveExecutionPlan,
@@ -505,7 +506,9 @@ struct AttachedRuntimeTranscriptProgramExecutor {
 #[async_trait::async_trait]
 impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgramExecutor {
     fn hard_timeout(&self) -> std::time::Duration {
-        self.plan.hard_timeout
+        self.plan
+            .hard_timeout
+            .min(ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT)
     }
 
     async fn execute(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionOutput> {
@@ -6735,6 +6738,28 @@ mod tests {
         assert!(rendered.contains("## MEMORY.md\n\nremember this"));
         assert!(rendered.contains("## Prior Turn 1\n\n### User\n\nhello"));
         assert!(rendered.ends_with("<!-- LIONCLAW:END -->\n"));
+    }
+
+    #[test]
+    fn attached_runtime_transcript_export_timeout_is_capped() {
+        let mut plan = test_execution_plan("codex");
+        plan.hard_timeout = ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT * 10;
+        let executor = AttachedRuntimeTranscriptProgramExecutor {
+            plan,
+            codex_home_override: None,
+        };
+        assert_eq!(
+            executor.hard_timeout(),
+            ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT
+        );
+
+        let mut plan = test_execution_plan("codex");
+        plan.hard_timeout = Duration::from_secs(5);
+        let executor = AttachedRuntimeTranscriptProgramExecutor {
+            plan,
+            codex_home_override: None,
+        };
+        assert_eq!(executor.hard_timeout(), Duration::from_secs(5));
     }
 
     fn test_execution_plan(runtime_id: &str) -> EffectiveExecutionPlan {
