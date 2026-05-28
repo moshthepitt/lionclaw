@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -291,27 +291,30 @@ impl EmailStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                Some(HeldItem {
-                    digest_rowid: row.try_get("digest_rowid").ok()?,
-                    held_id: row.try_get::<Option<String>, _>("held_id").ok()??,
-                    event_id: row.try_get("event_id").ok()?,
-                    sender_ref: row.try_get("sender_ref").ok()?,
-                    conversation_ref: row.try_get("conversation_ref").ok()?,
-                    thread_ref: row.try_get("thread_ref").ok()?,
-                    message_ref: row.try_get("message_ref").ok()?,
-                    sender_address: row.try_get("sender_address").ok()?,
-                    sender_name: row.try_get("sender_name").ok()?,
-                    subject: row.try_get("subject").ok()?,
-                    snippet: row.try_get("snippet").ok()?,
-                    received_at: row.try_get("received_at").ok()?,
-                    attachment_count: row.try_get("attachment_count").ok()?,
-                    classification_reason: row.try_get("classification_reason").ok()?,
+        rows.into_iter()
+            .map(|row| -> Result<HeldItem> {
+                let digest_rowid: i64 = row.try_get("digest_rowid")?;
+                let held_id: Option<String> = row.try_get("held_id")?;
+                let held_id = held_id
+                    .ok_or_else(|| anyhow!("held mail row {digest_rowid} is missing held_id"))?;
+                Ok(HeldItem {
+                    digest_rowid,
+                    held_id,
+                    event_id: row.try_get("event_id")?,
+                    sender_ref: row.try_get("sender_ref")?,
+                    conversation_ref: row.try_get("conversation_ref")?,
+                    thread_ref: row.try_get("thread_ref")?,
+                    message_ref: row.try_get("message_ref")?,
+                    sender_address: row.try_get("sender_address")?,
+                    sender_name: row.try_get("sender_name")?,
+                    subject: row.try_get("subject")?,
+                    snippet: row.try_get("snippet")?,
+                    received_at: row.try_get("received_at")?,
+                    attachment_count: row.try_get("attachment_count")?,
+                    classification_reason: row.try_get("classification_reason")?,
                 })
             })
-            .collect())
+            .collect()
     }
 
     pub async fn suppressed_count_since_last_digest(&self) -> Result<i64> {
@@ -393,7 +396,8 @@ impl EmailStore {
             return Ok(None);
         };
         let references_json: String = row.try_get("references_json")?;
-        let references = serde_json::from_str(&references_json).unwrap_or_default();
+        let references = serde_json::from_str(&references_json)
+            .context("failed to decode admitted email references")?;
         Ok(Some(ThreadContext {
             sender_address: row.try_get("sender_address")?,
             subject: row.try_get("subject")?,
@@ -550,15 +554,7 @@ mod tests {
         let store = EmailStore::open(temp_dir.path()).await.expect("store");
         for index in 1..=25 {
             let candidate = candidate(index);
-            store
-                .record_held(
-                    &candidate,
-                    &held_id_for(&candidate.event_id),
-                    "not downloaded",
-                    "approval_required",
-                )
-                .await
-                .expect("record held");
+            record_held_for_digest(&store, &candidate).await;
         }
 
         let first = store.held_since_last_digest(20).await.expect("first batch");
@@ -571,6 +567,73 @@ mod tests {
             .expect("second batch");
         assert_eq!(second.len(), 5);
         assert_eq!(second[0].event_id, "email:imap:assistant:7:21");
+    }
+
+    #[tokio::test]
+    async fn held_digest_fails_closed_on_malformed_held_rows() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let malformed = candidate(1);
+        let valid = candidate(2);
+        record_held_for_digest(&store, &malformed).await;
+        sqlx::query("UPDATE mail_items SET held_id = NULL WHERE event_id = ?")
+            .bind(&malformed.event_id)
+            .execute(&store.pool)
+            .await
+            .expect("malform held row");
+        record_held_for_digest(&store, &valid).await;
+
+        let err = store
+            .held_since_last_digest(20)
+            .await
+            .expect_err("malformed held rows fail digest decoding");
+        assert!(
+            err.to_string().contains("missing held_id"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            store.state_value(LAST_HELD_DIGEST_ROWID_KEY).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_context_fails_closed_on_malformed_references() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let candidate = candidate(1);
+        store
+            .record_admitted(&candidate, "downloaded")
+            .await
+            .expect("record admitted");
+        sqlx::query("UPDATE mail_items SET references_json = ? WHERE event_id = ?")
+            .bind("{not json")
+            .bind(&candidate.event_id)
+            .execute(&store.pool)
+            .await
+            .expect("malform references");
+
+        let err = store
+            .thread_context(None, Some(&candidate.thread_ref))
+            .await
+            .expect_err("malformed references fail thread lookup");
+        assert!(
+            err.to_string()
+                .contains("failed to decode admitted email references"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    async fn record_held_for_digest(store: &EmailStore, candidate: &CandidateHeader) {
+        store
+            .record_held(
+                candidate,
+                &held_id_for(&candidate.event_id),
+                "not downloaded",
+                "approval_required",
+            )
+            .await
+            .expect("record held");
     }
 
     fn candidate(index: u32) -> CandidateHeader {
