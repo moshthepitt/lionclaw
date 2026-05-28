@@ -43,6 +43,7 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         requested_runtime.as_deref(),
         instance_name.unwrap_or("selected home"),
     )?;
+    print_runtime_tui_prepare_message(&runtime_id)?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
@@ -68,7 +69,6 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         .await
         .map_err(kernel_to_anyhow)?;
     let plan = request.plan.clone();
-    print_runtime_tui_launch_message(&runtime_id)?;
     let output = match execute_attached(request).await {
         Ok(output) => output,
         Err(err) => {
@@ -94,9 +94,9 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
     }
 }
 
-fn print_runtime_tui_launch_message(runtime_id: &str) -> Result<()> {
+fn print_runtime_tui_prepare_message(runtime_id: &str) -> Result<()> {
     let mut stderr = std::io::stderr().lock();
-    writeln!(stderr, "LionClaw: launching {runtime_id} runtime UI...")?;
+    writeln!(stderr, "LionClaw: preparing {runtime_id} runtime UI...")?;
     stderr.flush()?;
     Ok(())
 }
