@@ -794,6 +794,7 @@ impl Kernel {
                 &runtime_id,
                 &execution_plan,
                 None,
+                None,
                 "before_launch",
             )
             .await;
@@ -871,6 +872,7 @@ impl Kernel {
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
+        exit_signal: Option<i32>,
     ) -> Result<(), KernelError> {
         let reconciled = self
             .reconcile_attached_runtime_transcript_best_effort(
@@ -878,13 +880,14 @@ impl Kernel {
                 runtime_id,
                 plan,
                 exit_code,
+                exit_signal,
                 "after_exit",
             )
             .await;
         if reconciled {
             self.mark_attached_runtime_launch_clean(plan).await;
         }
-        if exit_code == Some(0) && reconciled {
+        if exit_code == Some(0) && exit_signal.is_none() && reconciled {
             self.mark_runtime_session_ready(plan).await;
         } else {
             self.clear_runtime_session_ready(plan).await;
@@ -897,7 +900,8 @@ impl Kernel {
                 json!({
                     "runtime_id": runtime_id,
                     "exit_code": exit_code,
-                    "success": exit_code == Some(0),
+                    "exit_signal": exit_signal,
+                    "success": exit_code == Some(0) && exit_signal.is_none(),
                 }),
             )
             .await
@@ -911,6 +915,7 @@ impl Kernel {
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
+        exit_signal: Option<i32>,
         phase: &'static str,
     ) -> bool {
         match self
@@ -926,6 +931,7 @@ impl Kernel {
                         "runtime_id": runtime_id,
                         "phase": phase,
                         "exit_code": exit_code,
+                        "exit_signal": exit_signal,
                         "imported_turn_count": imported_count,
                     }),
                 )
@@ -948,6 +954,7 @@ impl Kernel {
                         "runtime_id": runtime_id,
                         "phase": phase,
                         "exit_code": exit_code,
+                        "exit_signal": exit_signal,
                         "error": err.to_string(),
                     }),
                 )
@@ -7358,6 +7365,7 @@ mod tests {
                 TEST_TERMINAL_RUNTIME_ID,
                 &first.plan,
                 Some(0),
+                None,
             )
             .await
             .expect("finish first launch");
@@ -7412,6 +7420,50 @@ mod tests {
             Kernel::runtime_state_root(&second.plan),
             Some(runtime_state_root.as_path())
         );
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_exit_audit_records_signal_status() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let session_id = open_test_session(&kernel).await;
+
+        let launch = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare launch");
+        let runtime_state_root = Kernel::runtime_state_root(&launch.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &launch.plan,
+                None,
+                Some(2),
+            )
+            .await
+            .expect("finish signal launch");
+
+        let events = kernel
+            .query_audit(
+                Some(session_id),
+                Some("runtime.tui.exit".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .expect("query exit audit")
+            .events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["exit_code"], serde_json::Value::Null);
+        assert_eq!(events[0].details["exit_signal"], 2);
+        assert_eq!(events[0].details["success"], false);
+        assert!(!runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .exists());
     }
 
     #[tokio::test]

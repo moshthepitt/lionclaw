@@ -1469,6 +1469,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nix",
  "ratatui",
  "ratatui-textarea",
  "reqwest",

@@ -73,7 +73,7 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         Ok(output) => output,
         Err(err) => {
             if let Err(finish_err) = kernel
-                .finish_attached_runtime_launch(session.session_id, &runtime_id, &plan, None)
+                .finish_attached_runtime_launch(session.session_id, &runtime_id, &plan, None, None)
                 .await
             {
                 return Err(kernel_to_anyhow(finish_err)).context(format!(
@@ -84,13 +84,19 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         }
     };
     kernel
-        .finish_attached_runtime_launch(session.session_id, &runtime_id, &plan, output.exit_code)
+        .finish_attached_runtime_launch(
+            session.session_id,
+            &runtime_id,
+            &plan,
+            output.exit_code,
+            output.exit_signal,
+        )
         .await
         .map_err(kernel_to_anyhow)?;
     if output.success() {
         Ok(())
     } else {
-        bail!("runtime TUI exited with code {:?}", output.exit_code)
+        bail!("runtime TUI exited with {}", output.status_description())
     }
 }
 

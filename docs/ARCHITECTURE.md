@@ -247,6 +247,9 @@ Once the TTY is attached, first-column commands belong to the selected
 runtime's own interface; operators exit through the runtime's normal exit
 gesture, such as Codex's Ctrl-D. This avoids terminal-editor proxying and keeps
 runtime command semantics out of the kernel.
+Terminal-generated interrupts and quits remain runtime-owned; LionClaw keeps
+the parent process alive so it can reconcile durable runtime state after the
+native UI exits.
 
 ## Runtime Control Commands
 

@@ -6,6 +6,12 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
+#[cfg(unix)]
+use nix::sys::signal::{self, SigHandler, Signal};
+
 #[derive(Clone)]
 pub struct ProcessInvocation {
     pub executable: String,
@@ -32,11 +38,22 @@ pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
 }
 
 impl ProcessOutput {
     pub fn success(&self) -> bool {
-        self.exit_code == Some(0)
+        self.exit_code == Some(0) && self.exit_signal.is_none()
+    }
+
+    pub fn status_description(&self) -> String {
+        if let Some(code) = self.exit_code {
+            return format!("code {code}");
+        }
+        if let Some(signal) = self.exit_signal {
+            return format!("signal {signal}");
+        }
+        "unknown status".to_string()
     }
 }
 
@@ -127,6 +144,7 @@ where
         stdout: captured_stdout,
         stderr: captured_stderr,
         exit_code: status.code(),
+        exit_signal: exit_signal(&status),
     })
 }
 
@@ -152,15 +170,13 @@ pub async fn run_process_attached(invocation: &ProcessInvocation) -> Result<Proc
         .stderr(Stdio::inherit());
 
     let mut child = spawn_with_retry(&mut command, &invocation.executable).await?;
-    let status = child
-        .wait()
-        .await
-        .context("failed to wait for subprocess")?;
+    let status = wait_for_attached_child(&mut child).await?;
 
     Ok(ProcessOutput {
         stdout: Vec::new(),
         stderr: Vec::new(),
         exit_code: status.code(),
+        exit_signal: exit_signal(&status),
     })
 }
 
@@ -238,8 +254,76 @@ impl ProcessSession {
             stdout: self.captured_stdout,
             stderr: captured_stderr,
             exit_code: status.code(),
+            exit_signal: exit_signal(&status),
         })
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_attached_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    // The child remains in the foreground process group, so terminal-generated
+    // interrupts already reach it. Consume the parent's copy so LionClaw can
+    // run exit reconciliation after the native UI finishes.
+    let _guard = AttachedSignalGuard::install()?;
+    child.wait().await.context("failed to wait for subprocess")
+}
+
+#[cfg(not(unix))]
+async fn wait_for_attached_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    child.wait().await.context("failed to wait for subprocess")
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+struct AttachedSignalGuard {
+    previous: Vec<(Signal, SigHandler)>,
+}
+
+#[cfg(unix)]
+impl AttachedSignalGuard {
+    fn install() -> Result<Self> {
+        let mut guard = Self {
+            previous: Vec::new(),
+        };
+        guard.ignore(Signal::SIGINT)?;
+        guard.ignore(Signal::SIGQUIT)?;
+        Ok(guard)
+    }
+
+    fn ignore(&mut self, signal: Signal) -> Result<()> {
+        let previous = set_signal_handler(signal, SigHandler::SigIgn)?;
+        self.previous.push((signal, previous));
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AttachedSignalGuard {
+    fn drop(&mut self) {
+        for (signal, handler) in self.previous.drain(..).rev() {
+            drop(set_signal_handler(signal, handler));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    unsafe_code,
+    reason = "scoped terminal signal disposition requires sigaction through nix"
+)]
+fn set_signal_handler(signal: Signal, handler: SigHandler) -> Result<SigHandler> {
+    // SAFETY: This sets a process-level disposition to SIG_IGN or restores a
+    // previously returned disposition for terminal-generated signals.
+    unsafe { signal::signal(signal, handler) }.context("failed to update signal handler")
 }
 
 pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<ProcessSession> {
@@ -341,7 +425,7 @@ async fn spawn_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::{spawn_process_session, ProcessInvocation};
+    use super::{run_process_attached, spawn_process_session, ProcessInvocation};
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -383,5 +467,23 @@ mod tests {
             String::from_utf8(output.stdout).expect("stdout"),
             "tail-after-close\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_process_records_signal_exit_status() {
+        let output = run_process_attached(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "kill -TERM $$".to_string()],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("run attached");
+
+        assert_eq!(output.exit_code, None);
+        assert_eq!(output.exit_signal, Some(15));
+        assert_eq!(output.status_description(), "signal 15");
     }
 }

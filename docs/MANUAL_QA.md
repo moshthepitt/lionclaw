@@ -204,6 +204,7 @@ Expected:
 
 - the first answer is `RUN_OK_A_1`
 - `/rename` and `/compact` are handled by the native runtime UI
+- native interrupt keys such as Codex's Ctrl+C remain handled by the runtime UI
 - the marker read returns `project-a`
 - generated drafts stay outside the project checkout
 - LionClaw slash controls such as `/lionclaw retry`, `/lionclaw reset`, and
