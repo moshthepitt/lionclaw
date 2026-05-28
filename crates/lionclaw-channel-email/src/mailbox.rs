@@ -36,6 +36,7 @@ pub struct CandidateHeader {
     pub thread_ref: String,
     pub message_ref: String,
     pub attachment_count: usize,
+    pub rfc822_size: Option<u32>,
     pub facts: HeaderFacts,
 }
 
@@ -182,10 +183,12 @@ impl RealMailboxEngine {
         ])
     }
 
-    fn full_fetch_items() -> MacroOrMessageDataItemNames<'static> {
+    fn full_fetch_items(max_message_bytes: usize) -> MacroOrMessageDataItemNames<'static> {
+        let fetch_limit = u32::try_from(max_message_bytes.saturating_add(1)).unwrap_or(u32::MAX);
+        let fetch_limit = NonZeroU32::new(fetch_limit).unwrap_or(NonZeroU32::MIN);
         MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::BodyExt {
             section: None,
-            partial: None,
+            partial: Some((0, fetch_limit)),
             peek: true,
         }])
     }
@@ -196,6 +199,7 @@ impl RealMailboxEngine {
         uid: NonZeroU32,
         raw_headers: &[u8],
         attachment_count: usize,
+        rfc822_size: Option<u32>,
     ) -> Result<CandidateHeader> {
         let facts = parse_header_facts(raw_headers)?;
         let sender = sender_ref(&facts.sender.address);
@@ -220,6 +224,7 @@ impl RealMailboxEngine {
             thread_ref: thread,
             message_ref: message,
             attachment_count,
+            rfc822_size,
             facts,
         })
     }
@@ -231,8 +236,15 @@ impl RealMailboxEngine {
         uid: NonZeroU32,
         raw_headers: &[u8],
         attachment_count: usize,
+        rfc822_size: Option<u32>,
     ) -> bool {
-        match self.candidate_from_headers(uid_validity, uid, raw_headers, attachment_count) {
+        match self.candidate_from_headers(
+            uid_validity,
+            uid,
+            raw_headers,
+            attachment_count,
+            rfc822_size,
+        ) {
             Ok(candidate) => {
                 candidates.push(candidate);
                 true
@@ -317,12 +329,14 @@ impl MailboxEngine for RealMailboxEngine {
                 continue;
             };
             let attachment_count = bodystructure_attachment_count(items.as_ref());
+            let rfc822_size = rfc822_size(items.as_ref());
             let added = self.push_candidate_from_headers(
                 &mut candidates,
                 uid_validity,
                 uid,
                 &raw_headers,
                 attachment_count,
+                rfc822_size,
             );
             if !added {
                 malformed_uids.push(uid);
@@ -340,7 +354,10 @@ impl MailboxEngine for RealMailboxEngine {
         let (mut client, _) = self.selected_imap(true).await?;
         let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
         let fetched = client
-            .uid_fetch(SequenceSet::try_from(vec![uid])?, Self::full_fetch_items())
+            .uid_fetch(
+                SequenceSet::try_from(vec![uid])?,
+                Self::full_fetch_items(self.config.max_message_bytes),
+            )
             .await
             .context("failed to fetch full IMAP message")?;
         let raw = fetched
@@ -439,6 +456,13 @@ fn bodystructure_attachment_count(items: &[MessageDataItem<'_>]) -> usize {
         .unwrap_or(0)
 }
 
+fn rfc822_size(items: &[MessageDataItem<'_>]) -> Option<u32> {
+    items.iter().find_map(|item| match item {
+        MessageDataItem::Rfc822Size(size) => Some(*size),
+        _ => None,
+    })
+}
+
 fn count_attachments(body: &BodyStructure<'_>) -> usize {
     match body {
         BodyStructure::Single {
@@ -512,6 +536,7 @@ mod tests {
             NonZeroU32::new(41).expect("nonzero uid"),
             b"Subject: Missing sender\r\n\r\n",
             0,
+            Some(128),
         );
         let well_formed_added = engine.push_candidate_from_headers(
             &mut candidates,
@@ -519,6 +544,7 @@ mod tests {
             NonZeroU32::new(42).expect("nonzero uid"),
             b"From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
             0,
+            Some(256),
         );
 
         assert!(!malformed_added);
@@ -545,6 +571,7 @@ mod tests {
             smtp_password: "secret".to_string(),
             from_name: Some("LionClaw".to_string()),
             fetch_limit: 25,
+            max_message_bytes: crate::config::DEFAULT_MAX_MESSAGE_BYTES,
             mark_seen_after_admission: true,
         }
     }

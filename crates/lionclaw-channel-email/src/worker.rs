@@ -17,7 +17,7 @@ use crate::{
         DaemonInfoResponse, LionClawApi,
     },
     classifier::{classify_headers, MailClassification},
-    config::WorkerConfig,
+    config::{validate_max_message_bytes, WorkerConfig},
     mailbox::{
         attachment_provider_ref, CandidateHeader, MailboxEngine, MailboxFactory,
         OutboundAttachment, OutboundEmail,
@@ -64,6 +64,7 @@ where
     F: MailboxFactory,
 {
     pub fn new(config: WorkerConfig, mailbox_factory: F) -> Result<Self> {
+        validate_max_message_bytes(config.mailbox.max_message_bytes)?;
         let api = LionClawApi::new(config.base_url.clone())?;
         Ok(Self {
             config,
@@ -216,16 +217,42 @@ where
                 previously_held,
             )
             .await?;
+        if candidate_message_size_exceeds_limit(candidate, self.config.mailbox.max_message_bytes) {
+            self.suppress_and_revoke_release_grant(
+                store,
+                mailbox,
+                candidate,
+                "message_too_large",
+                consumed_release_grant_id.as_deref(),
+                held_id.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
         let fetched = mailbox
             .fetch_full_message_after_authorize(candidate)
             .await
             .context("failed to fetch authorized email body")?;
+        if fetched.raw.len() > self.config.mailbox.max_message_bytes {
+            self.suppress_and_revoke_release_grant(
+                store,
+                mailbox,
+                candidate,
+                "message_too_large",
+                consumed_release_grant_id.as_deref(),
+                held_id.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
         let parsed = match parse_full_message(&fetched.raw) {
             Ok(parsed) => parsed,
             Err(err) => {
-                suppress_candidate(store, mailbox, candidate, "malformed_message").await?;
-                self.revoke_consumed_one_shot_release_grant_if_needed(
+                self.suppress_and_revoke_release_grant(
                     store,
+                    mailbox,
+                    candidate,
+                    "malformed_message",
                     consumed_release_grant_id.as_deref(),
                     held_id.as_str(),
                 )
@@ -234,9 +261,11 @@ where
             }
         };
         if let Err(err) = require_nonempty_body(&parsed) {
-            suppress_candidate(store, mailbox, candidate, "empty_message").await?;
-            self.revoke_consumed_one_shot_release_grant_if_needed(
+            self.suppress_and_revoke_release_grant(
                 store,
+                mailbox,
+                candidate,
+                "empty_message",
                 consumed_release_grant_id.as_deref(),
                 held_id.as_str(),
             )
@@ -266,9 +295,11 @@ where
                 .await?;
             }
             "blocked" => {
-                suppress_candidate(store, mailbox, candidate, "blocked").await?;
-                self.revoke_consumed_one_shot_release_grant_if_needed(
+                self.suppress_and_revoke_release_grant(
                     store,
+                    mailbox,
+                    candidate,
+                    "blocked",
                     consumed_release_grant_id.as_deref(),
                     held_id.as_str(),
                 )
@@ -303,6 +334,20 @@ where
         )
         .await?;
         Ok(())
+    }
+
+    async fn suppress_and_revoke_release_grant(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        candidate: &CandidateHeader,
+        reason: &str,
+        grant_id: Option<&str>,
+        held_id: &str,
+    ) -> Result<()> {
+        suppress_candidate(store, mailbox, candidate, reason).await?;
+        self.revoke_consumed_one_shot_release_grant_if_needed(store, grant_id, held_id)
+            .await
     }
 
     fn build_inbound(
@@ -344,6 +389,7 @@ where
                 "message_id": parsed.facts.message_id,
                 "in_reply_to": parsed.facts.in_reply_to,
                 "references": parsed.facts.references,
+                "rfc822_size": candidate.rfc822_size,
                 "authorization_reason_code": authorization.reason_code,
                 "grant_id": authorization.grant_id,
             }),
@@ -741,6 +787,15 @@ async fn suppress_candidate(
     mailbox.record_seen_or_processed(candidate).await
 }
 
+fn candidate_message_size_exceeds_limit(
+    candidate: &CandidateHeader,
+    max_message_bytes: usize,
+) -> bool {
+    candidate
+        .rfc822_size
+        .is_some_and(|size| u64::from(size) > max_message_bytes as u64)
+}
+
 fn one_shot_release_grant_id<'a>(
     authorization: &'a crate::api::ChannelActorAuthorizeResponse,
     held_id: &str,
@@ -981,7 +1036,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{DigestConfig, ImapTlsMode, MailboxConfig},
+        config::{DigestConfig, ImapTlsMode, MailboxConfig, DEFAULT_MAX_MESSAGE_BYTES},
         mailbox::{FetchedMessage, MailboxFactory},
         mime::parse_headers_for_test,
         protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
@@ -1007,6 +1062,7 @@ mod tests {
             thread_ref: "email:thread:root".to_string(),
             message_ref: "email:message:m1".to_string(),
             attachment_count: 0,
+            rfc822_size: Some(128),
             facts: facts.clone(),
         };
         let parsed = ParsedEmail {
@@ -1093,6 +1149,66 @@ mod tests {
                 .await
                 .expect("status"),
             Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_oversized_message_is_suppressed_without_full_fetch() {
+        let fixture = EmailFixture::with_candidate(
+            true,
+            candidate_with_rfc822_size(Some(1025)),
+            full_message(),
+        )
+        .await;
+        let mut config = fixture.config();
+        config.mailbox.max_message_bytes = 1024;
+
+        EmailWorker::new(config, fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_unknown_size_message_is_suppressed_after_bounded_fetch() {
+        let fixture = EmailFixture::with_candidate(
+            true,
+            candidate_with_rfc822_size(None),
+            oversized_message(2048),
+        )
+        .await;
+        let mut config = fixture.config();
+        config.mailbox.max_message_bytes = 1024;
+
+        EmailWorker::new(config, fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
         );
     }
 
@@ -1255,6 +1371,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn one_shot_release_grant_is_revoked_when_message_is_too_large() {
+        let fixture = EmailFixture::with_candidate(
+            false,
+            candidate_with_rfc822_size(Some(1025)),
+            full_message(),
+        )
+        .await;
+        let mut config = fixture.config();
+        config.mailbox.max_message_bytes = 1024;
+
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
+        worker.tick().await.expect("first tick");
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+
+        let held_id = held_id_for("email:imap:assistant-example-com:7:42");
+        fixture.api.set_one_shot_release_authorized(&held_id);
+        worker.tick().await.expect("release tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Suppressed)
+        );
+        let revoked = fixture.api.revoked_grants.lock().unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(
+            revoked[0]["grant_id"],
+            "00000000-0000-0000-0000-000000000086"
+        );
+    }
+
     struct EmailFixture {
         root: tempfile::TempDir,
         state_dir: PathBuf,
@@ -1315,6 +1468,7 @@ mod tests {
                     smtp_password: "secret".to_string(),
                     from_name: Some("LionClaw".to_string()),
                     fetch_limit: 25,
+                    max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
                     mark_seen_after_admission: true,
                 },
                 digest: DigestConfig {
@@ -1545,11 +1699,24 @@ mod tests {
             thread_ref: thread_ref(root_message_id),
             message_ref: message_ref(provider_message_id),
             attachment_count: 0,
+            rfc822_size: Some(raw_headers.len() as u32),
             facts,
         }
     }
 
+    fn candidate_with_rfc822_size(rfc822_size: Option<u32>) -> CandidateHeader {
+        let mut candidate = candidate();
+        candidate.rfc822_size = rfc822_size;
+        candidate
+    }
+
     fn full_message() -> Vec<u8> {
         b"From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\nPlease check this.".to_vec()
+    }
+
+    fn oversized_message(size: usize) -> Vec<u8> {
+        let mut message = full_message();
+        message.resize(size, b'x');
+        message
     }
 }
