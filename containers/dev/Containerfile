@@ -12,7 +12,7 @@ FROM ${RUNTIME_IMAGE}
 
 # Dev inherits runtime CLIs from the runtime image; assert the expected pins.
 ARG CODEX_VERSION=0.134.0
-ARG OPENCODE_VERSION=1.4.6
+ARG OPENCODE_VERSION=1.15.11
 
 USER root
 
