@@ -166,7 +166,11 @@ where
             }
             if status.is_none()
                 && store
-                    .mail_status_by_message_ref(&candidate.message_ref, &candidate.event_id)
+                    .mail_status_by_message_ref_for_sender(
+                        &candidate.message_ref,
+                        &candidate.sender_ref,
+                        &candidate.event_id,
+                    )
                     .await?
                     .is_some()
             {
@@ -1699,6 +1703,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copied_provider_message_from_different_sender_is_not_suppressed() {
+        let original = candidate();
+        let duplicate = candidate_from_headers_with_uid(
+            "From: Bob <bob@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+            43,
+        );
+        let duplicate_event_id = duplicate.event_id.clone();
+        let fixture = EmailFixture::with_candidate(
+            true,
+            duplicate,
+            b"From: Bob <bob@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\nPlease check this.".to_vec(),
+        )
+        .await;
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        store
+            .record_admitted(&original, "downloaded")
+            .await
+            .expect("record original");
+
+        EmailWorker::new(fixture.config(), fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.mailbox.seen(), 1);
+        assert_eq!(fixture.api.authorize_requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .mail_status(&duplicate_event_id)
+                .await
+                .expect("duplicate status"),
+            Some(MailStatus::Admitted)
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_header_candidate_is_persisted_before_marking_seen() {
         let malformed = malformed_candidate(44);
         let event_id = malformed.event_id.clone();
@@ -2381,13 +2424,17 @@ mod tests {
     }
 
     fn candidate_with_uid(uid: u32) -> CandidateHeader {
-        let mut candidate = candidate();
-        candidate.uid = uid;
-        candidate.event_id = format!("email:imap:assistant-example-com:7:{uid}");
-        candidate
+        candidate_from_headers_with_uid(
+            "From: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
+            uid,
+        )
     }
 
     fn candidate_from_headers(raw_headers: &str) -> CandidateHeader {
+        candidate_from_headers_with_uid(raw_headers, 42)
+    }
+
+    fn candidate_from_headers_with_uid(raw_headers: &str, uid: u32) -> CandidateHeader {
         let facts = parse_headers_for_test(raw_headers);
         let provider_message_id = facts.message_id.as_deref().unwrap_or("missing-message-id");
         let root_message_id = facts
@@ -2399,8 +2446,8 @@ mod tests {
             .unwrap_or(provider_message_id);
         CandidateHeader {
             uid_validity: 7,
-            uid: 42,
-            event_id: "email:imap:assistant-example-com:7:42".to_string(),
+            uid,
+            event_id: format!("email:imap:assistant-example-com:7:{uid}"),
             sender_ref: sender_ref(&facts.sender.address),
             conversation_ref: conversation_ref("assistant-example-com"),
             thread_ref: thread_ref(root_message_id),
