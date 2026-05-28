@@ -7,7 +7,7 @@ use crate::{
     kernel::AttachedRuntimeLaunchInput,
     operator::{
         config::OperatorConfig,
-        reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
+        reconcile::open_runtime_kernel_for_work_root,
         run::{
             kernel_to_anyhow, local_peer_id_for_project, resolve_repl_session,
             resolve_run_runtime_id,
@@ -53,8 +53,6 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
     )
     .await?;
     print_runtime_tui_prepare_message(&runtime_id)?;
-    render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
-
     let kernel = open_runtime_kernel_for_work_root(
         home,
         &config,
@@ -100,7 +98,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn runtime_tui_validates_profile_before_rendering_cache() {
+    async fn runtime_tui_validates_profile_before_opening_kernel() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let work_root = temp_dir.path().join("workspace");
@@ -140,7 +138,7 @@ mod tests {
                 .runtime_project_dir("codex", DEFAULT_WORKSPACE, &work_root)
                 .join(GENERATED_AGENTS_FILE)
                 .exists(),
-            "invalid runtime TUI launch must not render runtime cache"
+            "invalid runtime TUI launch must not prepare runtime state"
         );
     }
 }

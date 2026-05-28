@@ -837,7 +837,7 @@ impl Kernel {
             .await;
         self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
-        self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
+        self.materialize_attached_runtime_plan(&runtime_kind, &execution_plan)
             .await?;
         if recover_before_launch {
             self.reconcile_attached_runtime_transcript_best_effort(
@@ -7646,6 +7646,41 @@ mod tests {
             !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
             "materialization must not import generated context through a symlink"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_runtime_launch_generates_context_without_project_cache() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let runtime_root = temp_dir.path().join("runtime");
+        let generated_agents = runtime_project_generated_agents_path_from_parts(
+            &runtime_root,
+            TEST_TERMINAL_RUNTIME_ID,
+            "main",
+            None,
+        );
+        let outside = temp_dir.path().join("outside-generated.md");
+        fs::create_dir_all(generated_agents.parent().expect("generated parent"))
+            .expect("generated parent");
+        fs::write(&outside, "outside context\n").expect("outside context");
+        std::os::unix::fs::symlink(&outside, &generated_agents).expect("generated context symlink");
+        let session_id = open_test_session(&kernel).await;
+
+        let launch = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("attached runtime launch should generate its own context");
+
+        let runtime_state_root = Kernel::runtime_state_root(&launch.request.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+        let generated = tokio::fs::read_to_string(runtime_state_root.join(GENERATED_AGENTS_FILE))
+            .await
+            .expect("read generated attached context");
+
+        assert!(generated.contains("## Native Runtime TUI Session"));
+        assert!(!generated.contains("outside context"));
     }
 
     #[tokio::test]
@@ -14548,6 +14583,26 @@ impl Kernel {
         runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
+        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
+            .await?;
+        self.materialize_cached_runtime_context(runtime_id, plan)
+            .await
+    }
+
+    async fn materialize_attached_runtime_plan(
+        &self,
+        runtime_kind: &str,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
+            .await
+    }
+
+    async fn materialize_runtime_mounts_and_skills(
+        &self,
+        runtime_kind: &str,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
             if matches!(mount.target.as_str(), "/runtime" | "/drafts") {
                 tokio::fs::create_dir_all(&mount.source)
@@ -14561,7 +14616,17 @@ impl Kernel {
         };
         project_runtime_skills(runtime_kind, runtime_state_root, &plan.mounts)
             .await
-            .map_err(internal)?;
+            .map_err(internal)
+    }
+
+    async fn materialize_cached_runtime_context(
+        &self,
+        runtime_id: &str,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(());
+        };
         let Some(runtime_root) = self.runtime_root.as_deref() else {
             return Ok(());
         };
