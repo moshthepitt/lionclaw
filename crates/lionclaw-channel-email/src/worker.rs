@@ -18,14 +18,14 @@ use crate::{
         DaemonInfoResponse, LionClawApi,
     },
     classifier::{classify_headers, MailClassification},
-    config::{validate_max_message_bytes, WorkerConfig},
+    config::{validate_max_message_bytes, SenderAuthConfig, WorkerConfig},
     mailbox::{
         attachment_provider_ref, is_stale_mailbox_candidate, CandidateHeader, MailboxEngine,
         MailboxFactory, MalformedCandidateHeader, OutboundAttachment, OutboundEmail,
     },
     mime::{
-        attachment_summary, parse_full_message, require_nonempty_body, ParsedAttachment,
-        ParsedEmail,
+        attachment_summary, authentication_results_authenticates_sender, parse_full_message,
+        require_nonempty_body, ParsedAttachment, ParsedEmail,
     },
     protocol::{
         conversation_ref, generated_message_id, held_body_not_downloaded_text, message_ref,
@@ -258,6 +258,14 @@ where
             )
             .await
             .context("failed to authorize email sender")?;
+        let sender_auth_failure =
+            sender_authentication_failure_reason(&self.config.sender_auth, candidate);
+        let exact_one_shot_release =
+            authorization
+                .one_shot_release_held_id()
+                .is_some_and(|released_held_id| {
+                    previously_held && released_held_id == held_id.as_str()
+                });
 
         if !authorization.authorized {
             if authorization.reason_code == "blocked_grant" {
@@ -269,13 +277,9 @@ where
                 )
                 .await?;
             } else {
+                let reason = sender_auth_failure.unwrap_or(authorization.reason_code.as_str());
                 store
-                    .record_held(
-                        candidate,
-                        &held_id,
-                        held_body_not_downloaded_text(),
-                        authorization.reason_code.as_str(),
-                    )
+                    .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
                     .await?;
                 mark_held_candidate_processed(store, mailbox, candidate).await?;
             }
@@ -293,6 +297,13 @@ where
                     held_body_not_downloaded_text(),
                     "release_grant_mismatch",
                 )
+                .await?;
+            mark_held_candidate_processed(store, mailbox, candidate).await?;
+            return Ok(());
+        }
+        if let Some(reason) = sender_auth_failure.filter(|_| !exact_one_shot_release) {
+            store
+                .record_held(candidate, &held_id, held_body_not_downloaded_text(), reason)
                 .await?;
             mark_held_candidate_processed(store, mailbox, candidate).await?;
             return Ok(());
@@ -997,6 +1008,19 @@ fn one_shot_release_grant_id<'a>(
     authorization.grant_id.as_deref()
 }
 
+fn sender_authentication_failure_reason<'a>(
+    sender_auth: &'a SenderAuthConfig,
+    candidate: &CandidateHeader,
+) -> Option<&'a str> {
+    match sender_auth {
+        SenderAuthConfig::TrustFromHeader => None,
+        SenderAuthConfig::AuthenticationResults { authserv_id } => {
+            (!authentication_results_authenticates_sender(&candidate.facts, authserv_id))
+                .then_some("sender_authentication_required")
+        }
+    }
+}
+
 fn prepare_inbound_attachments(
     mailbox_id: &str,
     candidate: &CandidateHeader,
@@ -1264,10 +1288,19 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
             if let Some(reason) = &item.classification_reason {
                 lines.push(format!("Reason: {reason}"));
             }
-            lines.push(format!(
-                "Actions: approve with `lionclaw channel pairing approve email --sender-ref {}`, block with `lionclaw channel pairing block email {}`, or release once with `lionclaw channel pairing approve email --sender-ref {} --label email-release:{}`.",
-                item.sender_ref, item.sender_ref, item.sender_ref, item.held_id
-            ));
+            lines.push(
+                "Action templates: replace SENDER_REF and HELD_ID with the values above."
+                    .to_string(),
+            );
+            lines.push(
+                "Approve: lionclaw channel pairing approve email --sender-ref SENDER_REF"
+                    .to_string(),
+            );
+            lines.push("Block: lionclaw channel pairing block email SENDER_REF".to_string());
+            lines.push(
+                "Release once: lionclaw channel pairing approve email --sender-ref SENDER_REF --label email-release:HELD_ID"
+                    .to_string(),
+            );
         }
     }
     lines.join("\n")
@@ -1350,7 +1383,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{DigestConfig, ImapTlsMode, MailboxConfig, DEFAULT_MAX_MESSAGE_BYTES},
+        config::{
+            DigestConfig, ImapTlsMode, MailboxConfig, SenderAuthConfig, DEFAULT_MAX_MESSAGE_BYTES,
+        },
         mailbox::{CandidateHeaderBatch, FetchedMessage, MailboxFactory, StaleMailboxCandidate},
         mime::parse_headers_for_test,
         protocol::{conversation_ref, message_ref, sender_ref, thread_ref},
@@ -1574,6 +1609,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn held_digest_renders_action_templates_without_untrusted_shell_args() {
+        let held = vec![HeldItem {
+            digest_rowid: 1,
+            held_id: "hld_safe".to_string(),
+            event_id: "email:imap:assistant-example-com:7:42".to_string(),
+            sender_ref: "email:addr:bad;$(touch /tmp/pwn)@example.com".to_string(),
+            conversation_ref: conversation_ref("assistant-example-com"),
+            thread_ref: thread_ref("root@example.com"),
+            message_ref: message_ref("m1@example.com"),
+            sender_address: "bad;$(touch /tmp/pwn)@example.com".to_string(),
+            sender_name: None,
+            subject: "Hello".to_string(),
+            snippet: held_body_not_downloaded_text().to_string(),
+            received_at: None,
+            attachment_count: 0,
+            classification_reason: Some("approval_required".to_string()),
+        }];
+
+        let text = digest_text("assistant@example.com", &held, 0);
+
+        assert!(text.contains("Sender ref: email:addr:bad;$(touch /tmp/pwn)@example.com"));
+        assert!(!text.contains("--sender-ref email:addr:bad;$(touch /tmp/pwn)@example.com"));
+        assert!(text.contains("--sender-ref SENDER_REF"));
+        assert!(text.contains("--label email-release:HELD_ID"));
+    }
+
     #[tokio::test]
     async fn authorized_sender_is_fetched_and_queued() {
         let fixture = EmailFixture::new(true).await;
@@ -1719,6 +1781,61 @@ mod tests {
             store.mail_status(&event_id).await.expect("status"),
             Some(MailStatus::Suppressed)
         );
+    }
+
+    #[tokio::test]
+    async fn authorized_sender_without_trusted_authentication_results_is_held() {
+        let fixture = EmailFixture::new(true).await;
+        let mut config = fixture.config();
+        config.sender_auth = SenderAuthConfig::AuthenticationResults {
+            authserv_id: "mx.example.com".to_string(),
+        };
+
+        EmailWorker::new(config, fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 0);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 0);
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        assert_eq!(
+            store
+                .mail_status("email:imap:assistant-example-com:7:42")
+                .await
+                .expect("status"),
+            Some(MailStatus::Held)
+        );
+        let held = store
+            .held_since_last_digest(10)
+            .await
+            .expect("held digest rows");
+        assert_eq!(
+            held[0].classification_reason.as_deref(),
+            Some("sender_authentication_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_sender_with_trusted_authentication_results_is_admitted() {
+        let candidate = candidate_from_headers(
+            "Authentication-Results: mx.example.com; dmarc=pass header.from=example.com\r\nFrom: Alice <alice@example.com>\r\nTo: Assistant <assistant@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\nIn-Reply-To: <root@example.com>\r\nReferences: <root@example.com>\r\n\r\n",
+        );
+        let fixture = EmailFixture::with_candidate(true, candidate, full_message()).await;
+        let mut config = fixture.config();
+        config.sender_auth = SenderAuthConfig::AuthenticationResults {
+            authserv_id: "mx.example.com".to_string(),
+        };
+
+        EmailWorker::new(config, fixture.mailbox.clone())
+            .expect("worker")
+            .tick()
+            .await
+            .expect("tick");
+
+        assert_eq!(fixture.mailbox.full_fetches(), 1);
+        assert_eq!(fixture.api.inbound_requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2013,8 +2130,12 @@ mod tests {
     #[tokio::test]
     async fn one_shot_release_grant_is_revoked_after_admission() {
         let fixture = EmailFixture::new(false).await;
+        let mut config = fixture.config();
+        config.sender_auth = SenderAuthConfig::AuthenticationResults {
+            authserv_id: "mx.example.com".to_string(),
+        };
 
-        let worker = EmailWorker::new(fixture.config(), fixture.mailbox.clone()).expect("worker");
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
         worker.tick().await.expect("first tick");
 
         let held_id = held_id_for("email:imap:assistant-example-com:7:42");
@@ -2178,6 +2299,7 @@ mod tests {
                 base_url: self.api_url.clone(),
                 channel_id: CHANNEL_ID.to_string(),
                 worker_id: "email:worker".to_string(),
+                sender_auth: SenderAuthConfig::TrustFromHeader,
                 once: true,
                 poll_interval: std::time::Duration::from_millis(10),
                 pull_limit: 10,

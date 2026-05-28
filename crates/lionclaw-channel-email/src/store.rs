@@ -137,6 +137,7 @@ impl EmailStore {
         .execute(&self.pool)
         .await?;
         self.ensure_mail_items_rfc822_size_column().await?;
+        self.ensure_mail_items_indexes().await?;
 
         sqlx::query(
             r#"
@@ -173,6 +174,18 @@ impl EmailStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_mail_items_indexes(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS mail_items_message_ref_sender_ref_idx
+            ON mail_items (message_ref, sender_ref, event_id)
             "#,
         )
         .execute(&self.pool)
@@ -947,6 +960,22 @@ mod tests {
         assert!(columns.iter().any(|row| {
             row.try_get::<String, _>("name")
                 .map(|name| name == "rfc822_size")
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn store_open_adds_message_ref_sender_lookup_index() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        let indexes = sqlx::query("PRAGMA index_list(mail_items)")
+            .fetch_all(&store.pool)
+            .await
+            .expect("indexes");
+
+        assert!(indexes.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .map(|name| name == "mail_items_message_ref_sender_ref_idx")
                 .unwrap_or(false)
         }));
     }
