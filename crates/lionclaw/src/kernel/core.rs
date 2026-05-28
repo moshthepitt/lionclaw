@@ -120,8 +120,8 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        append_streamed_text_boundary, append_streamed_text_delta, execute_captured,
-        project_runtime_skills, register_builtin_runtime_adapters,
+        append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
+        execute_captured, project_runtime_skills, register_builtin_runtime_adapters,
         resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
         EffectiveExecutionPlan, EscapeClass, ExecutionOutput, ExecutionPlanPurpose,
         ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
@@ -744,7 +744,42 @@ impl Kernel {
         Ok(kernel)
     }
 
-    pub async fn prepare_attached_runtime_launch(
+    pub async fn execute_attached_runtime_launch(
+        &self,
+        input: AttachedRuntimeLaunchInput,
+    ) -> Result<ExecutionOutput, KernelError> {
+        let session_id = input.session_id;
+        let runtime_id = input.runtime_id.clone();
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
+        let request = self.prepare_attached_runtime_launch(input).await?;
+        let plan = request.plan.clone();
+        let output = match execute_attached(request).await {
+            Ok(output) => output,
+            Err(err) => {
+                if let Err(finish_err) = self
+                    .finish_attached_runtime_launch(session_id, &runtime_id, &plan, None, None)
+                    .await
+                {
+                    return Err(KernelError::Runtime(format!(
+                        "runtime TUI launch failed before exit handling: {err}; exit handling also failed: {finish_err}"
+                    )));
+                }
+                return Err(KernelError::Runtime(err.to_string()));
+            }
+        };
+        self.finish_attached_runtime_launch(
+            session_id,
+            &runtime_id,
+            &plan,
+            output.exit_code,
+            output.exit_signal,
+        )
+        .await?;
+        Ok(output)
+    }
+
+    async fn prepare_attached_runtime_launch(
         &self,
         input: AttachedRuntimeLaunchInput,
     ) -> Result<ExecutionRequest, KernelError> {
@@ -865,7 +900,7 @@ impl Kernel {
         Ok(())
     }
 
-    pub async fn finish_attached_runtime_launch(
+    async fn finish_attached_runtime_launch(
         &self,
         session_id: Uuid,
         runtime_id: &str,
@@ -7538,6 +7573,41 @@ mod tests {
             .mounts
             .iter()
             .all(|mount| mount.target != CHANNEL_SEND_SOCKET_CONTAINER_PATH));
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_launch_waits_for_session_lock() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let session_id = open_test_session(&kernel).await;
+        let session_lock = kernel.session_lock(session_id).await;
+        let guard = Arc::clone(&session_lock).lock_owned().await;
+        let task_kernel = kernel.clone();
+        let mut task = tokio::spawn(async move {
+            task_kernel
+                .execute_attached_runtime_launch(AttachedRuntimeLaunchInput {
+                    session_id,
+                    runtime_id: "missing-runtime".to_string(),
+                })
+                .await
+        });
+
+        tokio::select! {
+            result = &mut task => panic!("attached runtime launch should wait for the session lock: {result:?}"),
+            _ = sleep(Duration::from_millis(25)) => {}
+        }
+
+        drop(guard);
+        let err = task
+            .await
+            .expect("join launch task")
+            .expect_err("missing runtime after lock release");
+        assert!(matches!(
+            err,
+            KernelError::NotFound(message) if message.contains("missing-runtime")
+        ));
     }
 
     #[tokio::test]

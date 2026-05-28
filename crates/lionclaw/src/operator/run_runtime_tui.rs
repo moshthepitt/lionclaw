@@ -1,10 +1,10 @@
 use std::{io::Write, path::Path};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::{
     home::LionClawHome,
-    kernel::{runtime::execute_attached, AttachedRuntimeLaunchInput},
+    kernel::AttachedRuntimeLaunchInput,
     operator::{
         config::OperatorConfig,
         reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
@@ -56,36 +56,11 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
     let session = resolve_repl_session(&kernel, &peer_id, continue_last_session)
         .await
         .map_err(kernel_to_anyhow)?;
-    let request = kernel
-        .prepare_attached_runtime_launch(AttachedRuntimeLaunchInput {
+    let output = kernel
+        .execute_attached_runtime_launch(AttachedRuntimeLaunchInput {
             session_id: session.session_id,
             runtime_id: runtime_id.clone(),
         })
-        .await
-        .map_err(kernel_to_anyhow)?;
-    let plan = request.plan.clone();
-    let output = match execute_attached(request).await {
-        Ok(output) => output,
-        Err(err) => {
-            if let Err(finish_err) = kernel
-                .finish_attached_runtime_launch(session.session_id, &runtime_id, &plan, None, None)
-                .await
-            {
-                return Err(kernel_to_anyhow(finish_err)).context(format!(
-                    "runtime TUI launch failed before exit handling: {err}"
-                ));
-            }
-            return Err(err);
-        }
-    };
-    kernel
-        .finish_attached_runtime_launch(
-            session.session_id,
-            &runtime_id,
-            &plan,
-            output.exit_code,
-            output.exit_signal,
-        )
         .await
         .map_err(kernel_to_anyhow)?;
     if output.success() {
