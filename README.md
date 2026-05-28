@@ -97,11 +97,14 @@ runtime-standard `AGENTS.md`. For Codex, LionClaw uses the outer container as
 the sandbox boundary and starts the inner Codex UI without Codex's own
 sandbox/approval layer; the runtime-private Codex config marks the container
 workspace as trusted so project-local Codex config and hooks behave like an
-approved native Codex launch without mutating the host Codex home. Completed
-Codex and OpenCode native UI turns are
+approved native Codex launch without importing or mutating the host Codex
+config. Completed Codex and OpenCode native UI turns are
 reconciled from durable runtime state into LionClaw session history on exit and
 before the next native launch; prior LionClaw session history is then included
 in the generated runtime context. LionClaw does not scrape terminal output.
+Because this is the runtime's own TUI, LionClaw slash controls such as
+`/lionclaw reset` are not intercepted there; use the normal `lionclaw run`,
+`run --plain`, or channel paths when you need LionClaw-owned controls.
 
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,

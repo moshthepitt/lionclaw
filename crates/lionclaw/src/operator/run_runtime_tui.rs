@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{io::Write, path::Path};
 
 use anyhow::{bail, Context, Result};
 
@@ -68,6 +68,7 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
         .await
         .map_err(kernel_to_anyhow)?;
     let plan = request.plan.clone();
+    print_runtime_tui_launch_message(&runtime_id)?;
     let output = match execute_attached(request).await {
         Ok(output) => output,
         Err(err) => {
@@ -91,4 +92,11 @@ pub(crate) async fn run_runtime_tui(invocation: RunRuntimeTuiInvocation<'_>) -> 
     } else {
         bail!("runtime TUI exited with code {:?}", output.exit_code)
     }
+}
+
+fn print_runtime_tui_launch_message(runtime_id: &str) -> Result<()> {
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "LionClaw: launching {runtime_id} runtime UI...")?;
+    stderr.flush()?;
+    Ok(())
 }

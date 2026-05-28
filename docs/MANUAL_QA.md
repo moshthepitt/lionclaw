@@ -198,21 +198,17 @@ Reply with exactly RUN_OK_A_1 and nothing else.
 Read project-marker.txt from the current workspace and reply with exactly its contents.
 Write a draft file named keep.txt under LIONCLAW_DRAFTS_DIR containing exactly KEEP_OK, and reply only with keep.txt. Do not explain.
 /compact
-/lionclaw retry
-/lionclaw reset
-Reply with exactly RESET_OK and nothing else.
-/lionclaw exit
 ```
 
 Expected:
 
 - the first answer is `RUN_OK_A_1`
-- `/rename` and `/compact` are handled as native runtime controls,
-  not sent as ordinary prompt text
+- `/rename` and `/compact` are handled by the native runtime UI
 - the marker read returns `project-a`
-- `/lionclaw retry` reruns the previous prompt through LionClaw history
-- `/lionclaw reset` starts a fresh interactive session
 - generated drafts stay outside the project checkout
+- LionClaw slash controls such as `/lionclaw retry`, `/lionclaw reset`, and
+  `/lionclaw exit` are not available inside `run --runtime-tui`; exit through
+  the runtime's native exit gesture
 
 ## Phase 3: Instances And Work Roots
 

@@ -242,13 +242,20 @@ channels. The normal operator console, `run --plain`, channel turns, and
 scheduled jobs remain the paths that stream typed runtime events directly into
 LionClaw while a turn is active.
 
+Native TUI mode also does not intercept LionClaw slash controls. Once the TTY
+is attached, first-column commands belong to the selected runtime's own
+interface; operators exit through the runtime's normal exit gesture, such as
+Codex's Ctrl-D. This avoids terminal-editor proxying and keeps runtime command
+semantics out of the kernel.
+
 ## Runtime Control Commands
 
-The first column is command space. `lionclaw run` and channel inbound routing
-reserve `/lionclaw ...` for LionClaw-owned controls such as
-`/lionclaw retry`, `/lionclaw reset`, and `/lionclaw exit`. Local-only controls
-such as `/lionclaw exit` are acknowledged by channel routing but do not exit a
-channel worker.
+The first column is command space on LionClaw-owned interactive surfaces.
+`lionclaw run`, `run --plain`, and channel inbound routing reserve
+`/lionclaw ...` for LionClaw-owned controls such as `/lionclaw retry`,
+`/lionclaw reset`, and `/lionclaw exit`. Local-only controls such as
+`/lionclaw exit` are acknowledged by channel routing but do not exit a channel
+worker.
 
 Other first-column slash commands are classified as runtime controls and are
 persisted as `runtime_control` turns. The kernel records
@@ -257,9 +264,10 @@ persisted as `runtime_control` turns. The kernel records
 decide whether a control is handled, unsupported, interactive-only, or failed.
 
 This keeps native runtime commands such as `/compact` and `/rename` native to
-the selected runtime without teaching the kernel runtime-specific command
-semantics. Leading-space slash input and path-like slash input remain ordinary
-prompts.
+the selected runtime on LionClaw-owned turn paths without teaching the kernel
+runtime-specific command semantics. In native TUI mode those commands are
+handled directly by the runtime UI. Leading-space slash input and path-like
+slash input remain ordinary prompts.
 
 ## Direct Runtime And Brokered Capability Flow
 
@@ -535,11 +543,11 @@ and the runtime secret file to `0600` on Unix before loading it.
 Host-only runtime auth comes from the host runtime itself. Before a confined
 Codex turn, LionClaw reads the host Codex auth store, normally
 `~/.codex/auth.json`, refreshes that host auth when needed, then stages
-session-local copies of `auth.json` and `config.toml` under
-`/runtime/home/.codex` before launch. The runtime copy of `config.toml` is a
-Codex-compatible merge of the host config plus LionClaw's trusted `/workspace`
-project entry. The real host Codex home is never mounted into the runtime
-container.
+session-local `auth.json` under `/runtime/home/.codex` before launch. LionClaw
+also writes a small runtime-owned Codex `config.toml` there with the trusted
+`/workspace` project entry and update checks disabled. Host Codex config,
+plugins, apps, MCP servers, and paths are not imported into the confined
+runtime. The real host Codex home is never mounted into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
 `lionclaw up` persists that same override into the managed daemon environment
