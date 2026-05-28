@@ -23,10 +23,11 @@ mail transport credentials out of the runtime.
 ## Architecture
 
 The worker owns IMAP, SMTP, mailbox credentials, local held-mail state, and
-provider-specific email handling. It fetches only IMAP envelope/header facts,
-`BODYSTRUCTURE`, and `RFC822.SIZE` before calling `/v0/channels/authorize`.
-Full MIME bodies and attachments are fetched only after LionClaw grants the
-sender/thread and only within the configured `EMAIL_MAX_MESSAGE_BYTES` cap.
+provider-specific email handling. It fetches only a bounded IMAP
+envelope/header-fact window, `BODYSTRUCTURE`, and `RFC822.SIZE` before calling
+`/v0/channels/authorize`. Full MIME bodies and attachments are fetched only
+after LionClaw grants the sender/thread and only within the configured
+`EMAIL_MAX_MESSAGE_BYTES` cap.
 
 Unknown senders are held with metadata only. Automated, bulk, list, bounce, and
 no-reply mail is suppressed locally. Oversized mail is suppressed without

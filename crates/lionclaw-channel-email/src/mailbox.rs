@@ -26,6 +26,8 @@ use crate::{
     },
 };
 
+const MAX_CANDIDATE_HEADER_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CandidateHeader {
     pub uid_validity: u32,
@@ -234,7 +236,7 @@ impl RealMailboxEngine {
                     None,
                     Vec1::try_from(fields).expect("nonempty header list"),
                 )),
-                partial: None,
+                partial: Some((0, candidate_header_fetch_limit())),
                 peek: true,
             },
             MessageDataItemName::BodyStructure,
@@ -260,6 +262,12 @@ impl RealMailboxEngine {
         attachment_count: usize,
         rfc822_size: Option<u32>,
     ) -> Result<CandidateHeader> {
+        if raw_headers.len() > MAX_CANDIDATE_HEADER_BYTES {
+            return Err(anyhow!(
+                "email candidate headers exceed {MAX_CANDIDATE_HEADER_BYTES} bytes"
+            ));
+        }
+
         let facts = parse_header_facts(raw_headers)?;
         let sender = sender_ref(&facts.sender.address);
         let conversation = conversation_ref(&self.config.mailbox_id);
@@ -501,6 +509,12 @@ fn body_data(items: &[MessageDataItem<'_>]) -> Option<Vec<u8>> {
     })
 }
 
+fn candidate_header_fetch_limit() -> NonZeroU32 {
+    let limit = u32::try_from(MAX_CANDIDATE_HEADER_BYTES.saturating_add(1))
+        .expect("candidate header fetch limit fits u32");
+    NonZeroU32::new(limit).expect("candidate header fetch limit is nonzero")
+}
+
 fn bodystructure_attachment_count(items: &[MessageDataItem<'_>]) -> usize {
     items
         .iter()
@@ -607,6 +621,37 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].uid, 42);
         assert_eq!(candidates[0].sender_ref, "email:addr:alice@example.com");
+    }
+
+    #[test]
+    fn oversized_candidate_headers_are_rejected_before_admission() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let mut raw_headers = b"From: Alice <alice@example.com>\r\nSubject: ".to_vec();
+        raw_headers.extend(vec![b'x'; MAX_CANDIDATE_HEADER_BYTES]);
+        raw_headers.extend_from_slice(b"\r\n\r\n");
+        let mut candidates = Vec::new();
+
+        let added = engine.push_candidate_from_headers(
+            &mut candidates,
+            7,
+            NonZeroU32::new(42).expect("nonzero uid"),
+            &raw_headers,
+            0,
+            Some(128),
+        );
+
+        assert!(!added);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn candidate_header_fetch_window_keeps_one_extra_byte_for_overflow_detection() {
+        assert_eq!(
+            candidate_header_fetch_limit().get() as usize,
+            MAX_CANDIDATE_HEADER_BYTES + 1
+        );
     }
 
     #[test]
