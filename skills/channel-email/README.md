@@ -65,7 +65,7 @@ Create that grant with the normal channel pairing operator surface:
 The worker admits only the held item whose id exactly matches that label. Other
 mail from the same sender remains held while the release grant exists. Once the
 matching held item is admitted or terminally suppressed, the worker revokes the
-grant through `/v0/channels/grants/revoke`. Failed revocations are retried from
+grant through LionClaw's grant-revoke API. Failed revocations are retried from
 worker-local SQLite state.
 
 Permanent sender approval uses the same command without the one-shot release
