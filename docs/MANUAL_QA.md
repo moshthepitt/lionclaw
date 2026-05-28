@@ -5,9 +5,9 @@ uses product commands first and keeps platform commands only for environment
 evidence.
 
 The local runtime, project, instance, job, background-daemon, and doctor phases
-are runnable without a configured external channel. Provider-channel acceptance
-requires real provider credentials and a real provider conversation; record
-those checks as skipped when credentials are unavailable.
+are runnable without a configured credential-backed channel. Credential-backed
+channel acceptance requires real transport credentials and a real conversation;
+record those checks as skipped when credentials are unavailable.
 
 Record each phase as:
 
@@ -71,16 +71,6 @@ Configure project A:
 cd "$PROJ_A"
 "$LIONCLAW_BIN" project init
 "$LIONCLAW_BIN" instance create reviewer
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/list"
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/resolve"
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/send"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/list"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/resolve"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/send"
-"$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
-"$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" configure --runtime codex
 "$LIONCLAW_BIN" status
 "$LIONCLAW_BIN" doctor
@@ -89,9 +79,7 @@ test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-loc
 Expected:
 
 - project metadata exists under `.lionclaw/`
-- `main` and `reviewer` have the bundled `team-local` channel installed with
-  an embedded Rust worker/sender binary, runtime list/resolve/send helpers, and
-  approved direct sibling grants
+- `main` and `reviewer` instance homes exist and can be targeted independently
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 
@@ -214,10 +202,8 @@ Expected:
 - the reviewer runtime has `LIONCLAW_PROJECT_INSTANCE=reviewer` and can read a
   read-only `LIONCLAW_PROJECT_INSTANCES_FILE` JSON listing `main`, `reviewer`,
   `shared`, and `shared-two`
-- fresh team-local setup creates a `team-local` preset with `channel-send`; with
-  that preset active and a configured neighbor contact, the projection uses
-  schema version 2, leaves the selected instance entry identity-only, and exposes
-  route fields only for neighbors whose channel is active in the sender
+- channel-specific neighbor contacts and runtime helpers are covered by the
+  relevant owning skill docs under `skills/`
 
 ## Phase 4: Project Isolation
 
@@ -241,20 +227,23 @@ Expected:
 - the answer is `project-b`
 - project B does not reuse project A work-root state
 
-## Phase 5: Provider Channels
+## Phase 5: Channel Skill Acceptance
 
-Email is credential-gated manual QA. Run it only with a dedicated mailbox, not a
-personal inbox. The channel-specific setup and expected behavior live with the
-self-contained channel skill at `skills/channel-email/SKILL.md`.
+Top-level QA checks only the kernel contract shared by channel skills.
+Transport-specific setup, commands, webhook behavior, attachment formats,
+reactions, and delivery rendering belong in the owning channel skill directory.
+Run the relevant owning skill checklist under `skills/` for channel-specific
+behavior. For example, email acceptance lives with `skills/channel-email/`, and
+Telegram acceptance lives with `skills/channel-telegram/`.
 
-Telegram is credential-gated manual QA. Run it only when a real bot token and
-chat flow are available; do not fake Telegram with local shims in this
-checklist.
+When a real credential-backed channel is available, configure it through its
+own skill docs, then record the generic kernel checks here:
 
 ```bash
 cd "$PROJ_A"
-printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
-"$LIONCLAW_BIN" connect telegram --env-file ./telegram.env
+export QA_CHANNEL_ID=your-channel-id
+export QA_CHANNEL_ENV_FILE=/path/to/channel.env
+"$LIONCLAW_BIN" connect "$QA_CHANNEL_ID" --env-file "$QA_CHANNEL_ENV_FILE"
 ```
 
 Expected when credentials are available:
@@ -263,73 +252,19 @@ Expected when credentials are available:
   `codex --version`, `opencode --version`, `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - scoped grant approval is explicit
-- the channel response comes from the configured runtime
+- accepted channel turns run through the configured runtime
 - `lionclaw logs -f` can inspect the selected instance without raw HTTP
 - `doctor` surfaces channel pairing/outbox state and worker health without
-  contacting provider APIs
-- the token is stored in selected-instance private channel env
-- `doctor` does not print the token and shows the latest Telegram worker health
+  contacting transport APIs
+- required channel env is stored in selected-instance private channel env
+- `doctor` does not print secret values and shows the latest worker health
   report after the worker has submitted one
-- `connect telegram` prints a one-use direct connection link when the worker
-  reports the bot identity, so the first host can click instead of typing
-  `/start`
-- a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
-  claims through the kernel and does not start an agent turn
-- a group invite shaped like
-  `https://t.me/<bot_username>?startgroup=lc_<token>` claims where Telegram
-  exposes the payload to the bot
-- in DM, `/settings` is account/channel focused, while `/connections` shows a
-  `Connect group` button that creates a short-lived one-use `startgroup` link;
-  the link can be opened by the host or shared with a trusted group admin
-- in connected groups, chat-scoped menu commands are installed so `/ask message`
-  strips the Telegram envelope and submits only `message` to the runtime; empty
-  `/ask` opens a Telegram reply prompt
-- in connected groups, only Telegram accounts that are also connected as
-  approved direct hosts can run `/ask`, runtime slash commands, or LionClaw
-  group controls
-- unknown targeted Telegram groups receive a clean "not connected" setup hint
-  without exposing `pc_...` approval codes, and no provider files are downloaded
-  before approval
-- Telegram delivery works through the configured runtime after scoped grant
-  approval
-- `/help`, `/status`, `/stop`, `/settings`, and `/connections` behave as
-  documented: Telegram-local commands stay local, `/lionclaw reset` and
-  `/lionclaw retry` enter LionClaw as canonical controls, and `/compact` reaches
-  the runtime
-- inline buttons for status and stop acknowledge clicks without leaking
-  controls across users, chats, or forum topics
-- a forum topic with a thread grant keeps replies in the same Telegram topic
-- a conversation grant used inside a topic follows the channel scoped-grant
-  behavior from Channels v2
-- a photo, document, voice, or video attachment reaches the runtime under
-  `/attachments/...`
-- a rapid burst of short text messages from the same chat is received as one
-  coherent turn when Telegram delivers the updates together
-- a Telegram album is received as one turn with all album attachments, and a
-  runtime-generated two-photo/two-video batch is returned as a native Telegram
-  media group
-- a Telegram location and venue reach the runtime as readable text with
-  structured provider metadata
-- unsupported Telegram content such as a contact or poll gets a clear local
-  reply in DMs and addressed groups, and stays silent in unaddressed groups
-- a runtime-generated image is returned to Telegram as a native media
-  attachment, even when the runtime final text is empty
-- Markdown in runtime answers renders as Telegram formatting, and local
-  workspace links are shown as labels rather than broken Telegram links
-- a long-running turn first shows typing, then one provisional message that is
-  edited in place, then deletes that provisional message when the durable final
-  answer arrives
-- the original inbound Telegram message receives best-effort reactions for
-  accepted, completed, stopped, or failed lifecycle states when reactions are
-  available in that chat
-- webhook mode rejects requests without
-  `X-Telegram-Bot-Api-Secret-Token: <TELEGRAM_WEBHOOK_SECRET_TOKEN>` and accepts
-  the same update when the configured secret is present
-- a retryable Telegram delivery failure survives worker restart and is retried
-  through the outbox lease/report flow
+- transport files are not downloaded before kernel admission approves them
+- retryable delivery failure survives worker restart and is retried through the
+  outbox lease/report flow
 
-If credentials are not available, record this subphase as skipped with
-`missing Telegram bot token`.
+If credentials are not available, record this subphase as skipped with the
+concrete missing transport credential or conversation.
 
 ## Phase 6: Background Operation
 
@@ -348,11 +283,11 @@ cd "$PROJ_A"
 Expected:
 
 - the managed daemon is active
-- configured background workers are active when a background provider channel
-  was configured
+- configured background workers are active when a credential-backed background
+  channel was configured
 - `doctor` reports stable `[LC-D...]` findings when there is drift
-- `doctor` warns when a configured background provider channel has no worker
-  health report or its latest report is more than ten minutes old
+- `doctor` warns when a configured credential-backed background channel has no
+  worker health report or its latest report is more than ten minutes old
 - `doctor` does not repair, start, stop, allocate, or rewrite state
 - `down` stops only units owned by the selected instance
 
@@ -383,9 +318,9 @@ Expected:
 
 - manual job run succeeds
 - job history is visible through the CLI
-- if a provider channel was configured in Phase 5, a separate delivery job can
-  target that approved conversation and should reach the provider through the
-  outbox lease/report flow
+- if a credential-backed channel was configured in Phase 5, a separate delivery
+  job can target that approved conversation and should reach the transport
+  through the outbox lease/report flow
 
 ## Phase 8: Doctor Diagnostics
 
@@ -413,22 +348,23 @@ Expected:
 
 ### Missing Channel Env
 
-Only run this after configuring a channel with required env, such as Telegram:
+Only run this after configuring a channel with required env:
 
 ```bash
 cd "$PROJ_A"
-mv .lionclaw/instances/main/config/channels/telegram.env \
-  .lionclaw/instances/main/config/channels/telegram.env.qa-bak
+export QA_CHANNEL_ID=your-channel-id
+mv ".lionclaw/instances/main/config/channels/$QA_CHANNEL_ID.env" \
+  ".lionclaw/instances/main/config/channels/$QA_CHANNEL_ID.env.qa-bak"
 "$LIONCLAW_BIN" doctor
-mv .lionclaw/instances/main/config/channels/telegram.env.qa-bak \
-  .lionclaw/instances/main/config/channels/telegram.env
+mv ".lionclaw/instances/main/config/channels/$QA_CHANNEL_ID.env.qa-bak" \
+  ".lionclaw/instances/main/config/channels/$QA_CHANNEL_ID.env"
 ```
 
 Expected:
 
 - `doctor` exits 1
 - the finding names the channel env problem without printing secret values
-- `inspect` is read-only and `repair` points at `lionclaw connect telegram`
+- `inspect` is read-only and `repair` points at `lionclaw connect <channel>`
 
 Skip with `no credential-backed background channel configured` when this
 precondition is not available.
@@ -499,7 +435,7 @@ Expected:
 
 - every finding has `[LC-D...]`, severity, target, expected, and observed
 - every finding has a read-only `inspect` command
-- channel observations may include latest worker health checks, but provider
+- channel observations may include latest worker health checks, but transport
   diagnostics remain worker-reported rather than doctor-performed
 - optional `repair` commands are explicit LionClaw or platform commands
 - info and warnings exit 0

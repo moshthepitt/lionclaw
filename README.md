@@ -189,11 +189,9 @@ When the active preset allows program-backed `channel.send`, the same projection
 can include restart-bound neighbor contact status; only configured neighbor
 routes expose channel and provider refs.
 
-Project setup installs the bundled `team-local` channel for project instances by
-default, so sibling instances have a local preferred contact without extra
-operator steps. `connect --contact` can still use a channel skill's `{instance}`
-contact template for other channels; pass `--conversation-ref` when you want to
-set a provider route explicitly.
+Project instances can expose preferred contacts through channel skill config.
+Channel-specific setup, routing behavior, and transport notes live with the
+owning skill under `skills/`.
 
 Without `--home` or `--project`, LionClaw discovers only the current directory
 and its immediate parent. Use `--home PATH` when you need to target one exact
@@ -203,8 +201,7 @@ the current instance commands.
 ## Channels And Background Work
 
 Channels are skills that run outside the Rust core. They connect LionClaw to a
-transport without baking Telegram, Slack, or future integrations into the
-trusted kernel.
+transport without baking provider-specific behavior into the trusted kernel.
 
 Interactive channels run in the current terminal. Background channels are
 managed through the platform backend and store declared channel env in the
@@ -212,6 +209,8 @@ selected instance home, not in accidental shell state.
 
 Use `lionclaw up` when you want LionClaw to stay reachable after the current
 terminal is gone. Use command help for current channel and background syntax.
+Use the owning skill docs under `skills/` for channel-specific setup and
+operations.
 
 ## Jobs
 
@@ -275,7 +274,6 @@ Each instance home contains:
 
 - [Architecture](docs/ARCHITECTURE.md) - trusted core, runtime boundary, channels, scheduler, audit, and API contracts
 - [Manual QA](docs/MANUAL_QA.md) - repeatable live acceptance checklist
-- [Release Process](docs/RELEASE.md) - release preparation and publishing
 - [Scripts](scripts/README.md) - developer and CI smoke helpers
 
 ## License
