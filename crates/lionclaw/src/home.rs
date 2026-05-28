@@ -4,6 +4,11 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(unix)]
+use rustix::{
+    fs::{open, openat, Mode, OFlags},
+    io::Errno,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -14,6 +19,51 @@ pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
 pub const RUNTIME_TUI_STATE_MARKER: &str = ".lionclaw-runtime-tui-state";
 
+#[cfg(unix)]
+pub fn runtime_session_ready_marker_exists(root: &Path) -> Result<bool> {
+    let marker_path = root.join(RUNTIME_SESSION_READY_MARKER);
+    let root_dir = match open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(root_dir) => std::fs::File::from(root_dir),
+        Err(Errno::NOENT) => return Ok(false),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(anyhow!(
+                "runtime session marker root '{}' must be a directory and cannot be a symlink",
+                root.display()
+            ))
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to open {}", root.display()));
+        }
+    };
+    let marker = match openat(
+        &root_dir,
+        RUNTIME_SESSION_READY_MARKER,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(marker) => std::fs::File::from(marker),
+        Err(Errno::NOENT) => return Ok(false),
+        Err(Errno::LOOP) => {
+            return Err(anyhow!(
+                "runtime session marker '{}' cannot be a symlink",
+                marker_path.display()
+            ))
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to open {}", marker_path.display()));
+        }
+    };
+    let metadata = marker
+        .metadata()
+        .with_context(|| format!("failed to stat {}", marker_path.display()))?;
+    Ok(metadata.is_file())
+}
+
+#[cfg(not(unix))]
 pub fn runtime_session_ready_marker_exists(root: &Path) -> Result<bool> {
     let path = root.join(RUNTIME_SESSION_READY_MARKER);
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -581,6 +631,24 @@ mod tests {
 
         let err =
             runtime_session_ready_marker_exists(&root).expect_err("symlink marker should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_session_ready_marker_rejects_symlinked_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime");
+        let linked_root = temp_dir.path().join("linked-runtime");
+        std::fs::create_dir(&real_root).expect("real root");
+        std::fs::write(real_root.join(RUNTIME_SESSION_READY_MARKER), "ready\n")
+            .expect("write marker");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+
+        let err = runtime_session_ready_marker_exists(&linked_root)
+            .expect_err("symlinked marker root should fail");
+
+        assert!(err.to_string().contains("root"));
         assert!(err.to_string().contains("cannot be a symlink"));
     }
 }
