@@ -504,7 +504,7 @@ const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
-    _launch_lock: Option<AttachedRuntimeLaunchLock>,
+    _launch_lock: AttachedRuntimeLaunchLock,
 }
 
 struct AttachedRuntimeLaunchLock {
@@ -891,9 +891,7 @@ impl Kernel {
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
-            return Ok(());
-        };
+        let runtime_state_root = Self::require_runtime_tui_state_root(plan)?;
         let session = self.get_scoped_session(session_id).await?;
         let mut sections = self.build_prompt_sections().await?;
         sections.push(String::from(
@@ -1023,9 +1021,7 @@ impl Kernel {
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<usize, KernelError> {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
-            return Ok(0);
-        };
+        let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
         let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
@@ -7684,6 +7680,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_runtime_launch_requires_runtime_state_mount() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_root)
+            .await
+            .expect("workspace");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let exports = Arc::new(AtomicUsize::new(0));
+        kernel
+            .register_runtime_adapter(
+                TEST_TERMINAL_RUNTIME_ID,
+                Arc::new(CountingTerminalRuntimeAdapter { exports }),
+            )
+            .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let err = match kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+        {
+            Ok(_) => panic!("attached runtime launch should require runtime state mount"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, KernelError::Runtime(message) if message.contains("runtime TUI requires a runtime state mount"))
+        );
+    }
+
+    #[tokio::test]
     async fn attached_runtime_skips_prelaunch_reconcile_for_clean_state() {
         let temp_dir = tempdir().expect("temp dir");
         let (kernel, exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
@@ -14286,6 +14321,14 @@ impl Kernel {
             .map(|mount| mount.source.as_path())
     }
 
+    fn require_runtime_tui_state_root(plan: &EffectiveExecutionPlan) -> Result<&Path, KernelError> {
+        Self::runtime_state_root(plan).ok_or_else(|| {
+            KernelError::Runtime(
+                "runtime TUI requires a runtime state mount at /runtime".to_string(),
+            )
+        })
+    }
+
     async fn maybe_mount_project_instance_inventory(
         &self,
         session_id: Uuid,
@@ -14692,16 +14735,13 @@ impl Kernel {
     async fn acquire_attached_runtime_launch_lock(
         &self,
         plan: &EffectiveExecutionPlan,
-    ) -> Result<Option<AttachedRuntimeLaunchLock>, KernelError> {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
-            return Ok(None);
-        };
+    ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+        let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
         tokio::task::spawn_blocking(move || {
             acquire_attached_runtime_launch_lock_blocking(&runtime_state_root)
         })
         .await
         .map_err(|err| internal(err.into()))?
-        .map(Some)
     }
 
     async fn attached_runtime_needs_prelaunch_reconcile(
