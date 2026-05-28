@@ -460,7 +460,6 @@ where
                 "subject": parsed.facts.subject,
                 "message_id": parsed.facts.message_id,
                 "in_reply_to": parsed.facts.in_reply_to,
-                "references": parsed.facts.references,
                 "rfc822_size": candidate.rfc822_size,
                 "authorization_reason_code": authorization.reason_code,
             }),
@@ -1415,6 +1414,7 @@ mod tests {
                 Some("approved")
             );
             assert!(!metadata.contains_key("grant_id"));
+            assert!(!metadata.contains_key("references"));
         }
         {
             let authorize = fixture.api.authorize_requests.lock().unwrap();
