@@ -366,7 +366,10 @@ and install plumbing copies the compiled worker binary into that snapshot
 before computing the installed skill hash. The same binary also backs the
 runtime-facing `runtime/team-local/scripts/list`,
 `runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages.
+helpers for sender-side team discovery and messages. The send helper resolves
+routes from the projected inventory and forwards provider-neutral text,
+format hints, reply refs, and `/runtime` attachments to the existing audited
+`channel.send` bridge.
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill

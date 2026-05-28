@@ -27,7 +27,15 @@ pub struct SendConfig {
     pub channel_send_socket: PathBuf,
     pub recipients: Vec<String>,
     pub message: Option<String>,
+    pub format_hint: String,
+    pub attachments: Vec<SendAttachmentConfig>,
+    pub reply_to_ref: Option<String>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendAttachmentConfig {
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +178,9 @@ impl Command {
     fn send_from_args(args: Vec<String>) -> Result<Self> {
         let mut recipients = Vec::new();
         let mut message_parts = None;
+        let mut format_hint = "markdown".to_string();
+        let mut attachments = Vec::new();
+        let mut reply_to_ref = None;
         let mut idempotency_key = None;
 
         let mut args = args.into_iter();
@@ -181,6 +192,17 @@ impl Command {
                 }
                 "--idempotency-key" => {
                     idempotency_key = Some(parse_next_string(&mut args, "--idempotency-key")?);
+                }
+                "--format" => {
+                    format_hint = parse_format_hint(&mut args)?;
+                }
+                "--attachment" => {
+                    attachments.push(SendAttachmentConfig {
+                        path: parse_next_string(&mut args, "--attachment")?,
+                    });
+                }
+                "--reply-to-ref" => {
+                    reply_to_ref = Some(parse_next_string(&mut args, "--reply-to-ref")?);
                 }
                 "-h" | "--help" => {
                     print_send_help();
@@ -201,6 +223,9 @@ impl Command {
             channel_send_socket: required_env_path("LIONCLAW_CHANNEL_SEND_SOCKET")?,
             recipients,
             message,
+            format_hint,
+            attachments,
+            reply_to_ref,
             idempotency_key,
         }))
     }
@@ -258,12 +283,21 @@ fn parse_next_string(args: &mut impl Iterator<Item = String>, flag: &str) -> Res
         .ok_or_else(|| anyhow!("{flag} requires a non-empty value"))
 }
 
+fn parse_format_hint(args: &mut impl Iterator<Item = String>) -> Result<String> {
+    let value = parse_next_string(args, "--format")?;
+    if matches!(value.as_str(), "plain" | "markdown" | "html") {
+        Ok(value)
+    } else {
+        bail!("--format must be plain, markdown, or html")
+    }
+}
+
 fn print_help() {
     println!(
         "lionclaw-channel-team-local worker [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS]\n\
          lionclaw-channel-team-local list\n\
          lionclaw-channel-team-local resolve <recipient>\n\
-         lionclaw-channel-team-local send [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+         lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }
 
@@ -283,6 +317,6 @@ fn print_resolve_help() {
 
 fn print_send_help() {
     println!(
-        "lionclaw-channel-team-local send [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+        "lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }

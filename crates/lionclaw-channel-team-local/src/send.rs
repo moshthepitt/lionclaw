@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     os::unix::net::UnixStream,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::{
-    config::SendConfig,
+    config::{SendAttachmentConfig, SendConfig},
     inventory::{ProjectInventory, RecipientRoute, RouteError},
 };
 
@@ -42,27 +42,41 @@ pub struct SendError {
 
 #[derive(Debug, Serialize)]
 struct ChannelSendRequest<'a> {
-    idempotency_key: String,
+    idempotency_key: &'a str,
     channel_id: &'a str,
     conversation_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     thread_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to_ref: Option<&'a str>,
     content: ChannelSendContent<'a>,
 }
 
 #[derive(Debug, Serialize)]
 struct ChannelSendContent<'a> {
     text: &'a str,
-    format_hint: &'static str,
-    attachments: Vec<ChannelSendAttachment>,
+    format_hint: &'a str,
+    attachments: Vec<ChannelSendAttachment<'a>>,
 }
 
-#[derive(Debug, Serialize)]
-struct ChannelSendAttachment {}
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ChannelSendAttachment<'a> {
+    path: &'a str,
+}
+
+struct SendRequestInput<'a> {
+    route: &'a RecipientRoute,
+    message: &'a str,
+    format_hint: &'a str,
+    attachments: &'a [ChannelSendAttachment<'a>],
+    reply_to_ref: Option<&'a str>,
+    idempotency_key: String,
+}
 
 pub fn run(mut config: SendConfig) -> Result<SendSummary> {
     let message = match config.message.take() {
         Some(message) => message,
+        None if !config.attachments.is_empty() && std::io::stdin().is_terminal() => String::new(),
         None => {
             let mut message = String::new();
             std::io::stdin()
@@ -75,11 +89,12 @@ pub fn run(mut config: SendConfig) -> Result<SendSummary> {
 }
 
 fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
-    if message.trim().is_empty() {
-        bail!("team-local send message cannot be empty");
+    if message.trim().is_empty() && config.attachments.is_empty() {
+        bail!("team-local send message or attachment is required");
     }
 
     let recipients = unique_recipients(&config.recipients)?;
+    let attachments = validate_attachments(&config.attachments)?;
     let inventory = ProjectInventory::load(&config.instances_file)?;
     let idempotency_base = match config.idempotency_key {
         Some(key) => key,
@@ -102,9 +117,18 @@ fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
             send_to_route(
                 &config.channel_send_socket,
                 &item.recipient,
-                &item.route,
-                message.as_str(),
-                idempotency_key_for(&idempotency_base, &item.recipient, recipient_count),
+                SendRequestInput {
+                    route: &item.route,
+                    message: message.as_str(),
+                    format_hint: config.format_hint.as_str(),
+                    attachments: attachments.as_slice(),
+                    reply_to_ref: config.reply_to_ref.as_deref(),
+                    idempotency_key: idempotency_key_for(
+                        &idempotency_base,
+                        &item.recipient,
+                        recipient_count,
+                    ),
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -129,6 +153,21 @@ fn unique_recipients(recipients: &[String]) -> Result<Vec<String>> {
         unique.push(recipient.to_string());
     }
     Ok(unique)
+}
+
+fn validate_attachments(
+    attachments: &[SendAttachmentConfig],
+) -> Result<Vec<ChannelSendAttachment<'_>>> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let path = attachment.path.trim();
+            if path.is_empty() {
+                bail!("team-local attachment path cannot be empty");
+            }
+            Ok(ChannelSendAttachment { path })
+        })
+        .collect()
 }
 
 fn idempotency_key_for(base: &str, recipient: &str, recipient_count: usize) -> String {
@@ -169,14 +208,8 @@ fn generated_idempotency_key() -> Result<String> {
     ))
 }
 
-fn send_to_route(
-    socket: &Path,
-    recipient: &str,
-    route: &RecipientRoute,
-    message: &str,
-    idempotency_key: String,
-) -> SendDelivery {
-    match send_request(socket, route, message, idempotency_key) {
+fn send_to_route(socket: &Path, recipient: &str, request: SendRequestInput<'_>) -> SendDelivery {
+    match send_request(socket, request) {
         Ok(response) => response.into_delivery(recipient.to_string()),
         Err(err) => SendDelivery::failed(
             recipient.to_string(),
@@ -188,12 +221,7 @@ fn send_to_route(
     }
 }
 
-fn send_request(
-    socket: &Path,
-    route: &RecipientRoute,
-    message: &str,
-    idempotency_key: String,
-) -> Result<ChannelSendResponse> {
+fn send_request(socket: &Path, request: SendRequestInput<'_>) -> Result<ChannelSendResponse> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("failed to connect to {}", socket.display()))?;
     stream
@@ -203,18 +231,19 @@ fn send_request(
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .context("failed to set channel-send write timeout")?;
 
-    let request = ChannelSendRequest {
-        idempotency_key,
-        channel_id: &route.channel_id,
-        conversation_ref: &route.conversation_ref,
-        thread_ref: route.thread_ref.as_deref(),
+    let wire_request = ChannelSendRequest {
+        idempotency_key: request.idempotency_key.as_str(),
+        channel_id: &request.route.channel_id,
+        conversation_ref: &request.route.conversation_ref,
+        thread_ref: request.route.thread_ref.as_deref(),
+        reply_to_ref: request.reply_to_ref,
         content: ChannelSendContent {
-            text: message,
-            format_hint: "markdown",
-            attachments: Vec::new(),
+            text: request.message,
+            format_hint: request.format_hint,
+            attachments: request.attachments.to_vec(),
         },
     };
-    serde_json::to_writer(&mut stream, &request)
+    serde_json::to_writer(&mut stream, &wire_request)
         .context("failed to encode channel-send request")?;
     stream
         .write_all(b"\n")
@@ -326,7 +355,9 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{send_message, SendConfig};
+    use crate::config::{SendAttachmentConfig, SendConfig};
+
+    use super::send_message;
 
     #[test]
     fn sends_same_message_to_multiple_recipients() {
@@ -395,6 +426,9 @@ mod tests {
                 channel_send_socket: socket,
                 recipients: vec!["reviewer".to_string(), "qa".to_string()],
                 message: None,
+                format_hint: "markdown".to_string(),
+                attachments: Vec::new(),
+                reply_to_ref: None,
                 idempotency_key: Some("turn-1".to_string()),
             },
             " Please check this.\n".to_string(),
@@ -413,6 +447,82 @@ mod tests {
         assert_eq!(requests[0]["content"]["text"], " Please check this.\n");
         assert_eq!(requests[1]["idempotency_key"], "turn-1:qa");
         assert_eq!(requests[1]["conversation_ref"], "team-local:peer:home-qa");
+    }
+
+    #[test]
+    fn sends_format_reply_ref_and_runtime_attachments() {
+        let temp_dir = tempdir().expect("temp dir");
+        let socket = temp_dir.path().join("channel-send.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("json");
+            let mut stream = reader.into_inner();
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "ok": true,
+                    "delivery_id": "delivery-1",
+                    "status": "queued"
+                })
+            )
+            .expect("response");
+            request
+        });
+
+        let inventory = temp_dir.path().join("instances.json");
+        std::fs::write(
+            &inventory,
+            json!({
+                "schema_version": 2,
+                "default_instance": "main",
+                "instances": [
+                    { "name": "main" },
+                    {
+                        "name": "reviewer",
+                        "channel_send": {
+                            "status": "configured",
+                            "channel_id": "team-local",
+                            "conversation_ref": "team-local:peer:home-reviewer"
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("inventory");
+
+        let summary = send_message(
+            SendConfig {
+                self_instance: "main".to_string(),
+                instances_file: inventory,
+                channel_send_socket: socket,
+                recipients: vec!["reviewer".to_string()],
+                message: None,
+                format_hint: "html".to_string(),
+                attachments: vec![SendAttachmentConfig {
+                    path: "/runtime/output/report.html".to_string(),
+                }],
+                reply_to_ref: Some("source-message".to_string()),
+                idempotency_key: Some("turn-1".to_string()),
+            },
+            String::new(),
+        )
+        .expect("send");
+
+        assert!(summary.ok);
+        let request = server.join().expect("server");
+        assert_eq!(request["reply_to_ref"], "source-message");
+        assert_eq!(request["content"]["text"], "");
+        assert_eq!(request["content"]["format_hint"], "html");
+        assert_eq!(
+            request["content"]["attachments"][0]["path"],
+            "/runtime/output/report.html"
+        );
     }
 
     #[test]
@@ -456,6 +566,9 @@ mod tests {
                     "missing".to_string(),
                 ],
                 message: None,
+                format_hint: "markdown".to_string(),
+                attachments: Vec::new(),
+                reply_to_ref: None,
                 idempotency_key: Some("turn-1".to_string()),
             },
             "Please check this.".to_string(),
