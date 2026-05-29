@@ -936,7 +936,7 @@ struct CodexThreadTerminalTranscript {
 #[derive(Debug, Clone)]
 struct CodexTerminalTurnPage {
     turns: Vec<RuntimeTerminalTurn>,
-    newest_turn_completed: Option<bool>,
+    newest_turn_resumable: Option<bool>,
 }
 
 fn codex_app_server_threads(response: &Value) -> Vec<CodexListedThread> {
@@ -972,7 +972,7 @@ where
     let mut cursor = None;
     let mut seen_cursors = HashSet::new();
     let mut turns = Vec::new();
-    let mut newest_turn_completed = None;
+    let mut newest_turn_resumable = None;
 
     loop {
         let Some(response) = codex_app_server_request_until(
@@ -993,13 +993,13 @@ where
         else {
             return Ok(CodexThreadTerminalTranscript {
                 turns,
-                resumable: newest_turn_completed.unwrap_or(false),
+                resumable: newest_turn_resumable.unwrap_or(false),
                 deadline_reached: true,
             });
         };
         let page = codex_app_server_terminal_turn_page(thread, &response)?;
-        if newest_turn_completed.is_none() {
-            newest_turn_completed = page.newest_turn_completed;
+        if newest_turn_resumable.is_none() {
+            newest_turn_resumable = page.newest_turn_resumable;
         }
         turns.extend(page.turns);
 
@@ -1021,7 +1021,7 @@ where
 
     Ok(CodexThreadTerminalTranscript {
         turns,
-        resumable: newest_turn_completed.unwrap_or(false),
+        resumable: newest_turn_resumable.unwrap_or(false),
         deadline_reached: false,
     })
 }
@@ -1073,61 +1073,52 @@ fn codex_app_server_terminal_turn_page(
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("codex thread/turns/list response missing data"))?;
+    let mut turns = Vec::new();
+    let mut newest_turn_resumable = None;
+    for (index, turn) in page.iter().enumerate() {
+        let terminal_turn =
+            codex_app_server_terminal_turn(&thread.id, thread.started_at, thread.finished_at, turn);
+        if index == 0 {
+            newest_turn_resumable = Some(
+                terminal_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed),
+            );
+        }
+        if let Some(turn) = terminal_turn {
+            turns.push(turn);
+        }
+    }
     Ok(CodexTerminalTurnPage {
-        turns: codex_app_server_terminal_turns(
-            &thread.id,
-            thread.started_at,
-            thread.finished_at,
-            page,
-        ),
-        newest_turn_completed: page.first().map(codex_app_server_raw_turn_completed),
+        turns,
+        newest_turn_resumable,
     })
 }
 
-fn codex_app_server_raw_turn_completed(turn: &Value) -> bool {
-    codex_app_server_terminal_turn_status(turn.get("status").and_then(Value::as_str))
-        == RuntimeTerminalTurnStatus::Completed
-}
-
-fn codex_app_server_terminal_turns<'a>(
+fn codex_app_server_terminal_turn(
     thread_id: &str,
     thread_started_at: Option<DateTime<Utc>>,
     thread_finished_at: Option<DateTime<Utc>>,
-    turns: impl IntoIterator<Item = &'a Value>,
-) -> Vec<RuntimeTerminalTurn> {
-    let mut terminal_turns = Vec::new();
+    turn: &Value,
+) -> Option<RuntimeTerminalTurn> {
+    let turn_id = turn.get("id").and_then(Value::as_str).and_then(non_empty)?;
+    let user_text = codex_app_server_turn_user_text(turn)?;
+    let assistant_text = codex_app_server_turn_assistant_text(turn)?;
+    let (started_at, finished_at) =
+        codex_app_server_turn_times(turn, thread_started_at, thread_finished_at)?;
+    let (status, error_code, error_text) = codex_app_server_turn_status(turn);
 
-    for turn in turns {
-        let Some(turn_id) = turn.get("id").and_then(Value::as_str).and_then(non_empty) else {
-            continue;
-        };
-        let Some(user_text) = codex_app_server_turn_user_text(turn) else {
-            continue;
-        };
-        let Some(assistant_text) = codex_app_server_turn_assistant_text(turn) else {
-            continue;
-        };
-        let Some((started_at, finished_at)) =
-            codex_app_server_turn_times(turn, thread_started_at, thread_finished_at)
-        else {
-            continue;
-        };
-        let (status, error_code, error_text) = codex_app_server_turn_status(turn);
-
-        terminal_turns.push(RuntimeTerminalTurn {
-            source_id: format!("codex-app-server:{thread_id}:{turn_id}"),
-            display_user_text: user_text.clone(),
-            prompt_user_text: user_text,
-            assistant_text,
-            status,
-            error_code,
-            error_text,
-            started_at,
-            finished_at,
-        });
-    }
-
-    terminal_turns
+    Some(RuntimeTerminalTurn {
+        source_id: format!("codex-app-server:{thread_id}:{turn_id}"),
+        display_user_text: user_text.clone(),
+        prompt_user_text: user_text,
+        assistant_text,
+        status,
+        error_code,
+        error_text,
+        started_at,
+        finished_at,
+    })
 }
 
 fn codex_app_server_turn_times(
@@ -3848,6 +3839,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_terminal_transcript_resumability_requires_importable_latest_turn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        let mut latest = codex_completed_app_server_turn(
+            "turn_missing_time",
+            "new prompt",
+            "new answer",
+            1780000010,
+            1780000017,
+        );
+        latest["startedAt"] = Value::Null;
+        latest["completedAt"] = Value::Null;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{"id": "thr_cli"}],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [
+                        latest,
+                        codex_completed_app_server_turn(
+                            "turn_done",
+                            "hello",
+                            "answer",
+                            1780000001,
+                            1780000007,
+                        )
+                    ],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_cli"),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "codex-app-server:thr_cli:turn_done"
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
     async fn codex_terminal_transcript_timeout_returns_partial_transcript() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
@@ -3922,16 +3988,16 @@ mod tests {
         turn["startedAt"] = Value::Null;
         turn["completedAt"] = Value::Null;
 
-        let turns = super::codex_app_server_terminal_turns(
+        let turn = super::codex_app_server_terminal_turn(
             "thr_cli",
             Some(codex_test_timestamp(1780000010)),
             Some(codex_test_timestamp(1780000020)),
-            std::iter::once(&turn),
-        );
+            &turn,
+        )
+        .expect("turn");
 
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].started_at, codex_test_timestamp(1780000010));
-        assert_eq!(turns[0].finished_at, codex_test_timestamp(1780000020));
+        assert_eq!(turn.started_at, codex_test_timestamp(1780000010));
+        assert_eq!(turn.finished_at, codex_test_timestamp(1780000020));
     }
 
     #[test]
@@ -3940,10 +4006,7 @@ mod tests {
         turn["startedAt"] = Value::Null;
         turn["completedAt"] = Value::Null;
 
-        let turns =
-            super::codex_app_server_terminal_turns("thr_cli", None, None, std::iter::once(&turn));
-
-        assert!(turns.is_empty());
+        assert!(super::codex_app_server_terminal_turn("thr_cli", None, None, &turn).is_none());
     }
 
     #[test]

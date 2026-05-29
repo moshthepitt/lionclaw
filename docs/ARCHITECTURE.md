@@ -272,12 +272,13 @@ adapter proves its chosen continuation source was reconciled; partial exports of
 that continuation source keep the marker dirty so the next native launch retries
 before rendering context.
 It marks the runtime session resumable only when that reconciled continuation
-target is valid from raw runtime state, not merely from turns imported into
-LionClaw. For Codex, the saved continuation thread must export cleanly far enough
-to prove its newest raw turn completed. For OpenCode, the linked continuation
-session must export cleanly and its raw message state must have a completed
-assistant answering the latest user message; older good sessions do not make the
-next `opencode run --session` safe.
+target is valid from runtime-owned state and the latest continuation turn can be
+represented in LionClaw's canonical transcript. For Codex, the saved
+continuation thread must export cleanly far enough to prove its newest turn is
+completed and importable. For OpenCode, the linked continuation session must
+export cleanly and its raw message state must have a completed assistant
+answering the latest user message; older good sessions do not make the next
+`opencode run --session` safe.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
