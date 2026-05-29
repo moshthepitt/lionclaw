@@ -47,7 +47,11 @@ pub fn merge_channel_env(
     let mut existing = load_channel_env(home, channel_id)?;
     for (key, value) in updates {
         validate_channel_env_name(key)?;
-        existing.insert(key.clone(), value.clone());
+        if value.is_empty() {
+            existing.remove(key);
+        } else {
+            existing.insert(key.clone(), value.clone());
+        }
     }
     save_channel_env(home, channel_id, &existing)?;
     Ok(existing)
@@ -299,6 +303,33 @@ mod tests {
 
         assert!(err.to_string().contains("reserved LionClaw namespace"));
         assert!(!home.channel_env_path("telegram").exists());
+    }
+
+    #[test]
+    fn channel_env_merge_removes_empty_updates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret".to_string());
+        values.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
+        save_channel_env(&home, "telegram", &values).expect("save env");
+
+        let mut updates = ChannelEnv::new();
+        updates.insert("TELEGRAM_POLL_MS".to_string(), String::new());
+        updates.insert("TELEGRAM_TIMEOUT_MS".to_string(), "5000".to_string());
+        let merged = super::merge_channel_env(&home, "telegram", &updates).expect("merge env");
+
+        assert_eq!(
+            merged.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert!(!merged.contains_key("TELEGRAM_POLL_MS"));
+        assert_eq!(
+            merged.get("TELEGRAM_TIMEOUT_MS").map(String::as_str),
+            Some("5000")
+        );
+        let stored = load_channel_env(&home, "telegram").expect("load env");
+        assert!(!stored.contains_key("TELEGRAM_POLL_MS"));
     }
 
     #[cfg(unix)]

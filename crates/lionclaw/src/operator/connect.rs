@@ -980,9 +980,13 @@ fn merge_channel_env_if_changed(
     updates: &ChannelEnv,
 ) -> Result<()> {
     let existing = load_channel_env(home, channel_id)?;
-    let changed = updates
-        .iter()
-        .any(|(key, value)| existing.get(key) != Some(value));
+    let changed = updates.iter().any(|(key, value)| {
+        if value.is_empty() {
+            existing.contains_key(key)
+        } else {
+            existing.get(key) != Some(value)
+        }
+    });
     if changed {
         merge_channel_env(home, channel_id, updates)?;
     }
@@ -1575,6 +1579,50 @@ exit 17
             Some("1000")
         );
         assert!(!stored.contains_key("TELEGRAM_TIMEOUT_MS"));
+    }
+
+    #[test]
+    fn env_file_empty_optional_value_clears_stored_channel_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut existing = ChannelEnv::new();
+        existing.insert("TELEGRAM_BOT_TOKEN".to_string(), "old-token".to_string());
+        existing.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
+        save_channel_env(&home, "telegram", &existing).expect("save env");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(
+            &env_file,
+            "TELEGRAM_BOT_TOKEN=new-token\nTELEGRAM_POLL_MS=\n",
+        )
+        .expect("env file");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &["TELEGRAM_POLL_MS".to_string()],
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect("env update should be accepted");
+
+        let stored = load_channel_env(&home, "telegram").expect("load env");
+        assert_eq!(
+            stored.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("new-token")
+        );
+        assert!(!stored.contains_key("TELEGRAM_POLL_MS"));
     }
 
     #[test]

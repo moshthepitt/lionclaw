@@ -1488,10 +1488,12 @@ fn build_email_env_content(setup: &ResolvedSetup, executable: &Path) -> String {
     values.insert("EMAIL_AUTH_MODE", "xoauth2".to_string());
     values.insert("EMAIL_XOAUTH2_TOKEN_CMD", token_command);
     values.insert("EMAIL_IMAP_HOST", setup.imap_host.clone());
+    values.insert("EMAIL_IMAP_PASSWORD", String::new());
     values.insert("EMAIL_IMAP_PORT", setup.imap_port.to_string());
     values.insert("EMAIL_IMAP_USERNAME", setup.account.clone());
     values.insert("EMAIL_IMAP_TLS", setup.imap_tls.clone());
     values.insert("EMAIL_SMTP_HOST", setup.smtp_host.clone());
+    values.insert("EMAIL_SMTP_PASSWORD", String::new());
     values.insert("EMAIL_SMTP_PORT", setup.smtp_port.to_string());
     values.insert("EMAIL_SMTP_USERNAME", setup.account.clone());
     values.insert("EMAIL_SMTP_TLS", setup.smtp_tls.clone());
@@ -1577,6 +1579,8 @@ mod tests {
             build_email_env_content(&setup, Path::new("/usr/local/bin/lionclaw-channel-email"));
         assert!(env_content.contains("EMAIL_AUTH_MODE=xoauth2\n"));
         assert!(env_content.contains("EMAIL_IMAP_HOST=imap.gmail.com\n"));
+        assert!(env_content.contains("EMAIL_IMAP_PASSWORD=\n"));
+        assert!(env_content.contains("EMAIL_SMTP_PASSWORD=\n"));
         assert!(env_content.contains("EMAIL_XOAUTH2_TOKEN_CMD=\"/usr/local/bin/lionclaw-channel-email oauth2 token --state-file /tmp/oauth-state.json\"\n"));
     }
 

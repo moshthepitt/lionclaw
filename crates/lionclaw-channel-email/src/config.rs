@@ -286,23 +286,15 @@ fn parse_mailbox_auth_config(
     smtp_tls: SmtpTlsMode,
 ) -> Result<MailboxAuthConfig> {
     match mode.trim().to_ascii_lowercase().as_str() {
-        "basic" => {
-            if token_command.is_some() {
-                bail!("EMAIL_XOAUTH2_TOKEN_CMD requires EMAIL_AUTH_MODE=xoauth2");
-            }
-            Ok(MailboxAuthConfig::Basic {
-                imap_password: imap_password.ok_or_else(|| {
-                    anyhow!("EMAIL_IMAP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
-                })?,
-                smtp_password: smtp_password.ok_or_else(|| {
-                    anyhow!("EMAIL_SMTP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
-                })?,
-            })
-        }
+        "basic" => Ok(MailboxAuthConfig::Basic {
+            imap_password: imap_password.ok_or_else(|| {
+                anyhow!("EMAIL_IMAP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
+            })?,
+            smtp_password: smtp_password.ok_or_else(|| {
+                anyhow!("EMAIL_SMTP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
+            })?,
+        }),
         "xoauth2" => {
-            if imap_password.is_some() || smtp_password.is_some() {
-                bail!("EMAIL_IMAP_PASSWORD and EMAIL_SMTP_PASSWORD require EMAIL_AUTH_MODE=basic");
-            }
             if matches!(imap_tls, ImapTlsMode::Insecure)
                 || matches!(smtp_tls, SmtpTlsMode::Insecure)
             {
@@ -584,16 +576,30 @@ mod tests {
         )
         .expect_err("insecure IMAP should fail");
         assert!(err.to_string().contains("requires TLS"));
+    }
 
-        let err = parse_mailbox_auth_config(
+    #[test]
+    fn mailbox_auth_mode_ignores_inactive_credential_family() {
+        let auth = parse_mailbox_auth_config(
             "xoauth2".to_string(),
             Some("imap-secret".to_string()),
-            None,
+            Some("smtp-secret".to_string()),
             Some("/usr/local/bin/token".to_string()),
             ImapTlsMode::Implicit,
             SmtpTlsMode::StartTls,
         )
-        .expect_err("passwords should not be accepted in xoauth2 mode");
-        assert!(err.to_string().contains("EMAIL_AUTH_MODE=basic"));
+        .expect("xoauth2 auth should ignore stale basic passwords");
+        assert_eq!(auth.mode_name(), "xoauth2");
+
+        let auth = parse_mailbox_auth_config(
+            "basic".to_string(),
+            Some("imap-secret".to_string()),
+            Some("smtp-secret".to_string()),
+            Some("relative-token-helper".to_string()),
+            ImapTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+        )
+        .expect("basic auth should ignore stale token helper");
+        assert_eq!(auth.mode_name(), "basic");
     }
 }
