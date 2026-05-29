@@ -8402,6 +8402,38 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn attached_runtime_launch_rejects_symlinked_runtime_private_intermediate() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_id_root = runtime_root.join(TEST_TERMINAL_RUNTIME_ID);
+        let outside_root = temp_dir.path().join("outside-runtime-parent");
+        fs::create_dir_all(&runtime_id_root).expect("runtime id root");
+        fs::create_dir_all(&outside_root).expect("outside root");
+        std::os::unix::fs::symlink(&outside_root, runtime_id_root.join("main"))
+            .expect("symlink runtime workspace parent");
+        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let session_id = open_test_session(&kernel).await;
+
+        let err = match kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+        {
+            Ok(_) => panic!("symlinked runtime-private intermediate should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("not a regular directory")
+        ));
+        assert!(
+            !outside_root.join("projects").exists(),
+            "runtime launch must not create directories through a symlinked runtime-private intermediate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn runtime_plan_reset_rejects_symlinked_runtime_private_parent() {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_root = temp_dir.path().join("runtime");
@@ -11336,70 +11368,28 @@ async fn create_owner_private_directory_all(
     root: Option<&Path>,
     path: &Path,
 ) -> Result<(), KernelError> {
-    let Some(root) = root.filter(|root| path.starts_with(root)) else {
-        tokio::fs::create_dir_all(path).await.map_err(|err| {
-            KernelError::Internal(format!(
-                "failed to create private runtime directory '{}': {err}",
-                path.display()
-            ))
-        })?;
-        return ensure_owner_private_directory(path).await;
-    };
-
-    create_owner_private_root_directory(root).await?;
-    let mut current = root.to_path_buf();
-    for component in private_runtime_relative_components(root, path)? {
-        current.push(component);
-        create_owner_private_directory(&current).await?;
-    }
-    Ok(())
+    create_owner_private_directory_all_impl(root, path).await
 }
 
-async fn remove_owner_private_directory_all(
+#[cfg(unix)]
+async fn create_owner_private_directory_all_impl(
     root: Option<&Path>,
     path: &Path,
 ) -> Result<(), KernelError> {
-    let Some(root) = root.filter(|root| path.starts_with(root)) else {
-        return remove_safe_directory_tree(path).await;
-    };
-
-    if !owner_private_directory_exists(root).await? {
-        return Ok(());
-    }
-    let mut current = root.to_path_buf();
-    for component in private_runtime_relative_components(root, path)? {
-        current.push(component);
-        if !owner_private_directory_exists(&current).await? {
-            return Ok(());
-        }
-    }
-    remove_safe_directory_tree(path).await
+    let root = root.map(Path::to_path_buf);
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        create_owner_private_directory_all_blocking(root.as_deref(), &path)
+    })
+    .await
+    .map_err(|err| internal(err.into()))?
 }
 
-fn private_runtime_relative_components(
-    root: &Path,
+#[cfg(not(unix))]
+async fn create_owner_private_directory_all_impl(
+    _root: Option<&Path>,
     path: &Path,
-) -> Result<Vec<OsString>, KernelError> {
-    let relative = path.strip_prefix(root).map_err(|err| {
-        KernelError::Internal(format!(
-            "private runtime directory '{}' is not under '{}': {err}",
-            path.display(),
-            root.display()
-        ))
-    })?;
-    relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => Ok(OsString::from(name)),
-            _ => Err(KernelError::Internal(format!(
-                "private runtime directory '{}' contains an unsupported path component",
-                path.display()
-            ))),
-        })
-        .collect()
-}
-
-async fn create_owner_private_root_directory(path: &Path) -> Result<(), KernelError> {
+) -> Result<(), KernelError> {
     tokio::fs::create_dir_all(path).await.map_err(|err| {
         KernelError::Internal(format!(
             "failed to create private runtime directory '{}': {err}",
@@ -11409,40 +11399,48 @@ async fn create_owner_private_root_directory(path: &Path) -> Result<(), KernelEr
     ensure_owner_private_directory(path).await
 }
 
-async fn create_owner_private_directory(path: &Path) -> Result<(), KernelError> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(_) => ensure_owner_private_directory(path).await,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            tokio::fs::create_dir(path).await.map_err(|err| {
-                KernelError::Internal(format!(
-                    "failed to create private runtime directory '{}': {err}",
-                    path.display()
-                ))
-            })?;
-            ensure_owner_private_directory(path).await
+#[cfg(unix)]
+fn create_owner_private_directory_all_blocking(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<(), KernelError> {
+    let path_components = runtime_directory_components(path)?;
+    let private_from = match root.filter(|root| path.starts_with(root)) {
+        Some(root) => {
+            let root_components = runtime_directory_components(root)?;
+            if root_components.is_empty() {
+                return Err(KernelError::Conflict(format!(
+                    "runtime storage root '{}' must not be the filesystem root",
+                    root.display()
+                )));
+            }
+            root_components.len() - 1
         }
-        Err(err) => Err(KernelError::Internal(format!(
-            "failed to inspect private runtime directory '{}': {err}",
-            path.display()
-        ))),
-    }
+        None => path_components.len().checked_sub(1).ok_or_else(|| {
+            KernelError::Conflict(format!(
+                "runtime storage path '{}' is not a regular directory",
+                path.display()
+            ))
+        })?,
+    };
+    open_runtime_directory_path_blocking(path, path_components, true, Some(private_from))
+        .map(|_| ())
 }
 
-async fn owner_private_directory_exists(path: &Path) -> Result<bool, KernelError> {
-    match tokio::fs::symlink_metadata(path).await {
-        Ok(_) => {
-            ensure_owner_private_directory(path).await?;
-            Ok(true)
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(KernelError::Internal(format!(
-            "failed to inspect private runtime directory '{}': {err}",
-            path.display()
-        ))),
-    }
+async fn remove_owner_private_directory_all(path: &Path) -> Result<(), KernelError> {
+    remove_owner_private_directory_all_impl(path).await
 }
 
-async fn remove_safe_directory_tree(path: &Path) -> Result<(), KernelError> {
+#[cfg(unix)]
+async fn remove_owner_private_directory_all_impl(path: &Path) -> Result<(), KernelError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_owner_private_directory_all_blocking(&path))
+        .await
+        .map_err(|err| internal(err.into()))?
+}
+
+#[cfg(not(unix))]
+async fn remove_owner_private_directory_all_impl(path: &Path) -> Result<(), KernelError> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -11466,24 +11464,304 @@ async fn remove_safe_directory_tree(path: &Path) -> Result<(), KernelError> {
 }
 
 #[cfg(unix)]
-async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
-    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+fn remove_owner_private_directory_all_blocking(path: &Path) -> Result<(), KernelError> {
+    use rustix::fs::{openat, Mode, OFlags};
 
-    ensure_existing_directory_is_safe(path).await?;
-    tokio::fs::set_permissions(path, Permissions::from_mode(RUNTIME_STATE_DIR_MODE))
-        .await
-        .map_err(|err| {
+    let mut components = runtime_directory_components(path)?.into_iter().peekable();
+    if components.peek().is_none() {
+        return Err(KernelError::Conflict(format!(
+            "runtime storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    };
+    let mut parent = open_runtime_directory_walk_start(path)?;
+    let mut current_path = runtime_directory_walk_start_path(path);
+
+    while let Some(component) = components.next() {
+        current_path.push(&component);
+        if components.peek().is_none() {
+            return remove_runtime_directory_at(&parent, component.as_os_str(), &current_path);
+        }
+        let next = match openat(
+            &parent,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(next) => next,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(runtime_directory_not_regular(&current_path))
+            }
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to open runtime storage directory '{}': {err}",
+                    current_path.display()
+                )))
+            }
+        };
+        parent = std::fs::File::from(next);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_runtime_directory_at(
+    parent: &std::fs::File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), KernelError> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let dir = match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(dir) => std::fs::File::from(dir),
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => return Err(runtime_directory_not_regular(path)),
+        Err(err) => {
+            return Err(KernelError::Internal(format!(
+                "failed to open runtime storage directory '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+    remove_open_runtime_directory(parent, name, path, &dir)
+}
+
+#[cfg(unix)]
+fn remove_runtime_directory_contents(dir: &std::fs::File, path: &Path) -> Result<(), KernelError> {
+    use rustix::fs::Dir;
+    use std::os::unix::ffi::OsStrExt;
+
+    let entries = Dir::read_from(dir).map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to read runtime storage directory '{}': {err}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
             KernelError::Internal(format!(
-                "failed to make runtime storage directory '{}' private: {err}",
+                "failed to read runtime storage directory '{}': {err}",
                 path.display()
             ))
         })?;
-    ensure_existing_directory_is_safe(path).await
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(name.to_bytes());
+        let child_path = path.join(name);
+        remove_runtime_directory_child(dir, name, &child_path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_runtime_directory_child(
+    parent: &std::fs::File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(), KernelError> {
+    use rustix::fs::{openat, unlinkat, AtFlags, Mode, OFlags};
+
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(dir) => {
+            let dir = std::fs::File::from(dir);
+            remove_open_runtime_directory(parent, name, path, &dir)
+        }
+        Err(Errno::NOENT) => Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => match unlinkat(parent, name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(err) => Err(KernelError::Internal(format!(
+                "failed to remove runtime storage path '{}': {err}",
+                path.display()
+            ))),
+        },
+        Err(err) => Err(KernelError::Internal(format!(
+            "failed to open runtime storage path '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn remove_open_runtime_directory(
+    parent: &std::fs::File,
+    name: &OsStr,
+    path: &Path,
+    dir: &std::fs::File,
+) -> Result<(), KernelError> {
+    use rustix::fs::{unlinkat, AtFlags};
+
+    remove_runtime_directory_contents(dir, path)?;
+    match unlinkat(parent, name, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(KernelError::Internal(format!(
+            "failed to remove runtime storage directory '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let components = runtime_directory_components(&path)?;
+        let private_from = components.len().checked_sub(1).ok_or_else(|| {
+            KernelError::Conflict(format!(
+                "runtime storage path '{}' is not a regular directory",
+                path.display()
+            ))
+        })?;
+        open_runtime_directory_path_blocking(&path, components, false, Some(private_from))
+            .map(|_| ())
+    })
+    .await
+    .map_err(|err| internal(err.into()))?
 }
 
 #[cfg(not(unix))]
 async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
     ensure_existing_directory_is_safe(path).await
+}
+
+#[cfg(unix)]
+fn runtime_directory_components(path: &Path) -> Result<Vec<OsString>, KernelError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => components.push(OsString::from(name)),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(KernelError::Internal(format!(
+                    "runtime storage path '{}' contains an unsupported path component",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn open_runtime_directory_path_blocking(
+    path: &Path,
+    components: Vec<OsString>,
+    create: bool,
+    private_from: Option<usize>,
+) -> Result<std::fs::File, KernelError> {
+    use rustix::fs::{mkdirat, openat, Mode, OFlags};
+
+    let mut current = open_runtime_directory_walk_start(path)?;
+    let mut current_path = runtime_directory_walk_start_path(path);
+    if components.is_empty() {
+        return Err(runtime_directory_not_regular(path));
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        current_path.push(component);
+        if create {
+            match mkdirat(
+                &current,
+                component.as_os_str(),
+                Mode::from_raw_mode(RUNTIME_STATE_DIR_MODE),
+            ) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(err) => {
+                    return Err(KernelError::Internal(format!(
+                        "failed to create private runtime directory '{}': {err}",
+                        current_path.display()
+                    )))
+                }
+            }
+        }
+        let next = match openat(
+            &current,
+            component.as_os_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(next) => next,
+            Err(Errno::NOENT) if !create => {
+                return Err(KernelError::Internal(format!(
+                    "failed to open runtime storage directory '{}': no such directory",
+                    current_path.display()
+                )))
+            }
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(runtime_directory_not_regular(&current_path))
+            }
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to open runtime storage directory '{}': {err}",
+                    current_path.display()
+                )))
+            }
+        };
+        current = std::fs::File::from(next);
+        if private_from.is_some_and(|first_private| index >= first_private) {
+            harden_owner_private_directory_fd(&current, &current_path)?;
+        }
+    }
+
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn open_runtime_directory_walk_start(path: &Path) -> Result<std::fs::File, KernelError> {
+    let start = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    std::fs::File::open(start).map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to open runtime storage walk root '{}': {err}",
+            start.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn runtime_directory_walk_start_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    }
+}
+
+#[cfg(unix)]
+fn harden_owner_private_directory_fd(dir: &std::fs::File, path: &Path) -> Result<(), KernelError> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    dir.set_permissions(Permissions::from_mode(RUNTIME_STATE_DIR_MODE))
+        .map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to make runtime storage directory '{}' private: {err}",
+                path.display()
+            ))
+        })
+}
+
+#[cfg(unix)]
+fn runtime_directory_not_regular(path: &Path) -> KernelError {
+    KernelError::Conflict(format!(
+        "runtime storage path '{}' is not a regular directory",
+        path.display()
+    ))
 }
 
 async fn remove_file_best_effort(path: &Path) {
@@ -15303,7 +15581,7 @@ impl Kernel {
             return Ok(());
         };
 
-        remove_owner_private_directory_all(self.runtime_root.as_deref(), runtime_state_root).await
+        remove_owner_private_directory_all(runtime_state_root).await
     }
 
     async fn acquire_attached_runtime_launch_lock(
