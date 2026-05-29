@@ -262,20 +262,22 @@ one stale runtime thread cannot block valid completed turns from import.
 Enumeration failures are audited as source warnings when a previously linked
 continuation target can still be exported; otherwise they are audited as
 `runtime.tui.reconcile_error`.
-A clean native TUI exit marks the runtime session resumable only when the
-adapter verifies that its own continuation target is valid from raw runtime
-state, not merely from turns imported into LionClaw. For Codex, the saved
-continuation thread must export cleanly far enough to prove its newest raw turn
-completed. For OpenCode, the linked continuation session must export cleanly and
-its raw message state must have a completed assistant answering the latest user
-message; older good sessions do not make the next `opencode run --session`
-safe.
+A clean native TUI exit clears LionClaw's dirty launch marker only when the
+adapter proves its chosen continuation source was reconciled; partial exports
+keep the marker dirty so the next native launch retries before rendering context.
+It marks the runtime session resumable only when that reconciled continuation
+target is valid from raw runtime state, not merely from turns imported into
+LionClaw. For Codex, the saved continuation thread must export cleanly far enough
+to prove its newest raw turn completed. For OpenCode, the linked continuation
+session must export cleanly and its raw message state must have a completed
+assistant answering the latest user message; older good sessions do not make the
+next `opencode run --session` safe.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
-warnings when the deadline is reached; resumability remains adapter-owned and may
-still be true when the latest raw continuation state was proven before older
-backfill stopped. The attached native UI itself is not a LionClaw turn, so
+warnings when the deadline is reached; resumability remains adapter-owned but is
+not accepted until the adapter has reconciled the continuation source. The
+attached native UI itself is not a LionClaw turn, so
 LionClaw turn timeout overrides do not wrap the runtime's own interactive
 session.
 Each native TUI launch also holds a LionClaw-owned file lock in the session's

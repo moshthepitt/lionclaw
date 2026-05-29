@@ -27,14 +27,18 @@ impl TerminalTranscriptTarget {
         true
     }
 
-    fn record_export(&mut self, id: &str, resumable: bool) {
+    fn record_export(&mut self, id: &str, resumable: bool, reconciled: bool) {
         if self.id.as_deref() == Some(id) {
-            self.exported = true;
-            self.resumable = resumable;
+            self.exported = reconciled;
+            self.resumable = reconciled && resumable;
         }
     }
 
     fn resumable(&self) -> bool {
         self.exported && self.resumable
+    }
+
+    fn reconciled(&self) -> bool {
+        self.id.is_none() || self.exported
     }
 }

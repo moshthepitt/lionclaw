@@ -196,6 +196,7 @@ struct AttachedRuntimeReconciliation {
     exported_turn_count: usize,
     imported_turn_count: usize,
     warning_count: usize,
+    reconciled: bool,
     resumable: bool,
 }
 
@@ -949,14 +950,17 @@ impl Kernel {
                 "after_exit",
             )
             .await;
-        if reconciliation.is_some() {
+        if reconciliation
+            .as_ref()
+            .is_some_and(|summary| summary.reconciled)
+        {
             self.mark_attached_runtime_launch_clean(plan).await;
         }
         if exit_code == Some(0)
             && exit_signal.is_none()
             && reconciliation
                 .as_ref()
-                .is_some_and(|summary| summary.resumable)
+                .is_some_and(|summary| summary.reconciled && summary.resumable)
         {
             self.mark_runtime_session_ready(plan).await;
         } else {
@@ -1005,6 +1009,7 @@ impl Kernel {
                         "exported_turn_count": summary.exported_turn_count,
                         "imported_turn_count": summary.imported_turn_count,
                         "source_warning_count": summary.warning_count,
+                        "reconciled": summary.reconciled,
                         "resumable": summary.resumable,
                     }),
                 )
@@ -1058,7 +1063,7 @@ impl Kernel {
         let RuntimeTerminalTranscript {
             mut turns,
             warnings,
-            resumable,
+            state,
         } = adapter
             .export_terminal_transcript(transcript_input, &mut executor)
             .await
@@ -1108,7 +1113,8 @@ impl Kernel {
             exported_turn_count,
             imported_turn_count: imported_count,
             warning_count,
-            resumable,
+            reconciled: state.reconciled,
+            resumable: state.resumable,
         })
     }
 
@@ -6795,7 +6801,9 @@ mod tests {
 
     use super::*;
     use crate::kernel::continuity::title_file_name;
-    use crate::kernel::runtime::{RuntimeAdapterInfo, RuntimeEventSender};
+    use crate::kernel::runtime::{
+        RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+    };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::project_inventory::{
         ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
@@ -7018,6 +7026,7 @@ mod tests {
         exports: Arc<AtomicUsize>,
         turns: Vec<RuntimeTerminalTurn>,
         resumable: bool,
+        reconciled: bool,
     }
 
     #[async_trait::async_trait]
@@ -7059,7 +7068,10 @@ mod tests {
             Ok(RuntimeTerminalTranscript::new(
                 self.turns.clone(),
                 Vec::new(),
-                self.resumable,
+                RuntimeTerminalTranscriptState {
+                    reconciled: self.reconciled,
+                    resumable: self.resumable,
+                },
             ))
         }
 
@@ -7111,6 +7123,15 @@ mod tests {
         turns: Vec<RuntimeTerminalTurn>,
         resumable: bool,
     ) -> (Kernel, Arc<AtomicUsize>) {
+        kernel_with_counting_terminal_runtime_and_state(temp_dir, turns, resumable, true).await
+    }
+
+    async fn kernel_with_counting_terminal_runtime_and_state(
+        temp_dir: &tempfile::TempDir,
+        turns: Vec<RuntimeTerminalTurn>,
+        resumable: bool,
+        reconciled: bool,
+    ) -> (Kernel, Arc<AtomicUsize>) {
         let runtime_root = temp_dir.path().join("runtime");
         let workspace_root = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_root)
@@ -7135,6 +7156,7 @@ mod tests {
                     exports: Arc::clone(&exports),
                     turns,
                     resumable,
+                    reconciled,
                 }),
             )
             .await;
@@ -7789,6 +7811,7 @@ mod tests {
                     exports,
                     turns: Vec::new(),
                     resumable: false,
+                    reconciled: true,
                 }),
             )
             .await;
@@ -7893,6 +7916,57 @@ mod tests {
         assert!(!runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
             .exists());
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_keeps_dirty_state_until_target_reconciles() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, exports) = kernel_with_counting_terminal_runtime_and_state(
+            &temp_dir,
+            vec![test_terminal_turn("native-source-1")],
+            true,
+            false,
+        )
+        .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let first = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare first launch");
+        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &first.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish first launch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 1);
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
+        assert!(!runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .exists());
+        drop(first);
+
+        let second = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare recovery launch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 2);
+        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
+        assert_eq!(
+            Kernel::runtime_state_root(&second.request.plan),
+            Some(runtime_state_root.as_path())
+        );
     }
 
     #[tokio::test]
@@ -8052,6 +8126,7 @@ mod tests {
                     exports,
                     turns: Vec::new(),
                     resumable: false,
+                    reconciled: true,
                 }),
             )
             .await;

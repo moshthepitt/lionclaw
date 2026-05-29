@@ -197,6 +197,13 @@ impl RuntimeTerminalTranscriptWarning {
 pub struct RuntimeTerminalTranscript {
     pub turns: Vec<RuntimeTerminalTurn>,
     pub warnings: Vec<RuntimeTerminalTranscriptWarning>,
+    pub state: RuntimeTerminalTranscriptState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeTerminalTranscriptState {
+    /// True only when the adapter has reconciled its chosen continuation source.
+    pub reconciled: bool,
     /// True only when the adapter has verified its own continuation target is valid.
     pub resumable: bool,
 }
@@ -205,12 +212,12 @@ impl RuntimeTerminalTranscript {
     pub fn new(
         turns: Vec<RuntimeTerminalTurn>,
         warnings: Vec<RuntimeTerminalTranscriptWarning>,
-        resumable: bool,
+        state: RuntimeTerminalTranscriptState,
     ) -> Self {
         Self {
             turns,
             warnings,
-            resumable,
+            state,
         }
     }
 }
