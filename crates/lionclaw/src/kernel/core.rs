@@ -512,6 +512,8 @@ const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
 const RUNTIME_TUI_LOCK_FILE: &str = ".lionclaw-runtime-tui.lock";
 const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-at";
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
+const RUNTIME_STATE_DIR_MODE: u32 = 0o700;
+const RUNTIME_STATE_FILE_MODE: u32 = 0o600;
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
@@ -6845,6 +6847,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runtime_state_file_write_replaces_symlink_without_following() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp_dir = tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         fs::create_dir(&runtime_state_root).expect("runtime state root");
@@ -6872,6 +6876,18 @@ mod tests {
         assert_eq!(
             fs::read_to_string(runtime_state_root.join(AGENTS_FILE)).expect("read generated"),
             "generated context\n"
+        );
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            RUNTIME_STATE_FILE_MODE
+        );
+        assert_eq!(
+            fs::metadata(&runtime_state_root)
+                .expect("stat runtime state root")
+                .permissions()
+                .mode()
+                & 0o777,
+            RUNTIME_STATE_DIR_MODE
         );
     }
 
@@ -7763,6 +7779,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn attached_runtime_launch_generates_context_without_project_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp_dir = tempdir().expect("temp dir");
         let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let runtime_root = temp_dir.path().join("runtime");
@@ -7787,12 +7805,55 @@ mod tests {
         let runtime_state_root = Kernel::runtime_state_root(&launch.request.plan)
             .expect("runtime state root")
             .to_path_buf();
+        let drafts_root = launch
+            .request
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/drafts")
+            .expect("drafts root")
+            .source
+            .clone();
         let generated = tokio::fs::read_to_string(runtime_state_root.join(GENERATED_AGENTS_FILE))
             .await
             .expect("read generated attached context");
 
         assert!(generated.contains("## Native Runtime TUI Session"));
         assert!(!generated.contains("outside context"));
+        for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
+            assert_eq!(
+                fs::metadata(runtime_state_root.join(file_name))
+                    .expect("stat attached runtime context")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                RUNTIME_STATE_FILE_MODE
+            );
+        }
+        assert_eq!(
+            fs::metadata(&runtime_state_root)
+                .expect("stat runtime state root")
+                .permissions()
+                .mode()
+                & 0o777,
+            RUNTIME_STATE_DIR_MODE
+        );
+        assert_eq!(
+            fs::metadata(&runtime_root)
+                .expect("stat runtime root")
+                .permissions()
+                .mode()
+                & 0o777,
+            RUNTIME_STATE_DIR_MODE
+        );
+        assert_eq!(
+            fs::metadata(&drafts_root)
+                .expect("stat drafts root")
+                .permissions()
+                .mode()
+                & 0o777,
+            RUNTIME_STATE_DIR_MODE
+        );
     }
 
     #[tokio::test]
@@ -11167,12 +11228,47 @@ async fn ensure_staged_attachment_file_is_safe(path: &Path) -> Result<(), Kernel
     Ok(())
 }
 
+async fn create_owner_private_directory_all(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<(), KernelError> {
+    tokio::fs::create_dir_all(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to create private runtime directory '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let Some(root) = root.filter(|root| path.starts_with(root)) else {
+        return ensure_owner_private_directory(path).await;
+    };
+
+    let mut current = path;
+    let mut directories = Vec::new();
+    loop {
+        directories.push(current.to_path_buf());
+        if current == root {
+            break;
+        }
+        current = current.parent().ok_or_else(|| {
+            KernelError::Internal(format!(
+                "private runtime directory '{}' is not under '{}'",
+                path.display(),
+                root.display()
+            ))
+        })?;
+    }
+    for directory in directories.into_iter().rev() {
+        ensure_owner_private_directory(&directory).await?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
     ensure_existing_directory_is_safe(path).await?;
-    tokio::fs::set_permissions(path, Permissions::from_mode(0o700))
+    tokio::fs::set_permissions(path, Permissions::from_mode(RUNTIME_STATE_DIR_MODE))
         .await
         .map_err(|err| {
             KernelError::Internal(format!(
@@ -12379,7 +12475,7 @@ fn write_runtime_state_file_blocking(
         runtime_state_root,
         &target_name,
         contents,
-        0o644,
+        RUNTIME_STATE_FILE_MODE,
         None,
         "runtime state file",
     )
@@ -12489,7 +12585,9 @@ fn ensure_runtime_state_root_blocking(
             runtime_state_root.display()
         ))
     })?;
-    open_runtime_state_root_blocking(runtime_state_root)
+    let root = open_runtime_state_root_blocking(runtime_state_root)?;
+    harden_runtime_state_root_blocking(&root, runtime_state_root)?;
+    Ok(root)
 }
 
 fn open_runtime_state_root_blocking(
@@ -12511,6 +12609,30 @@ fn open_runtime_state_root_blocking(
     Ok(std::fs::File::from(root))
 }
 
+#[cfg(unix)]
+fn harden_runtime_state_root_blocking(
+    root: &std::fs::File,
+    runtime_state_root: &Path,
+) -> Result<(), KernelError> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    root.set_permissions(Permissions::from_mode(RUNTIME_STATE_DIR_MODE))
+        .map_err(|err| {
+            internal(anyhow::anyhow!(
+                "failed to make runtime state root '{}' private: {err}",
+                runtime_state_root.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn harden_runtime_state_root_blocking(
+    _root: &std::fs::File,
+    _runtime_state_root: &Path,
+) -> Result<(), KernelError> {
+    Ok(())
+}
+
 fn open_existing_runtime_state_root_blocking(
     runtime_state_root: &Path,
 ) -> Result<Option<std::fs::File>, KernelError> {
@@ -12521,7 +12643,11 @@ fn open_existing_runtime_state_root_blocking(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     ) {
-        Ok(root) => Ok(Some(std::fs::File::from(root))),
+        Ok(root) => {
+            let root = std::fs::File::from(root);
+            harden_runtime_state_root_blocking(&root, runtime_state_root)?;
+            Ok(Some(root))
+        }
         Err(Errno::NOENT) => Ok(None),
         Err(err) => Err(internal(anyhow::anyhow!(
             "failed to open runtime state root '{}': {err}",
@@ -12573,7 +12699,7 @@ fn acquire_attached_runtime_launch_lock_blocking(
         &root,
         &lock_name,
         OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(0o600),
+        Mode::from_raw_mode(RUNTIME_STATE_FILE_MODE),
     ) {
         Ok(file) => file,
         Err(Errno::LOOP) => {
@@ -14911,9 +15037,8 @@ impl Kernel {
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
             if matches!(mount.target.as_str(), "/runtime" | "/drafts") {
-                tokio::fs::create_dir_all(&mount.source)
-                    .await
-                    .map_err(|err| internal(err.into()))?;
+                create_owner_private_directory_all(self.runtime_root.as_deref(), &mount.source)
+                    .await?;
             }
         }
 
