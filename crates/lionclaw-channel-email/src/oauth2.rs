@@ -825,6 +825,7 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         .state_file
         .unwrap_or_else(|| default_state_file(args.provider, &account));
     let env_file = args.env_file.unwrap_or_else(default_env_file);
+    validate_setup_file_paths(args.client_secret_json.as_deref(), &state_file, &env_file)?;
     for param in &args.auth_params {
         validate_custom_authorization_param_name(&param.key)?;
     }
@@ -862,6 +863,47 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
 
 fn first_present<T>(preferred: Option<T>, fallback: Option<T>) -> Option<T> {
     preferred.or(fallback)
+}
+
+fn validate_setup_file_paths(
+    client_secret_json: Option<&Path>,
+    state_file: &Path,
+    env_file: &Path,
+) -> Result<()> {
+    let state_file = normalize_output_path("--state-file", state_file)?;
+    let env_file = normalize_output_path("--env-file", env_file)?;
+    if state_file == env_file {
+        bail!("--state-file and --env-file must be different paths");
+    }
+    if let Some(client_secret_json) = client_secret_json {
+        let client_secret_json = fs::canonicalize(client_secret_json)
+            .with_context(|| format!("failed to resolve {}", client_secret_json.display()))?;
+        if state_file == client_secret_json || env_file == client_secret_json {
+            bail!("OAuth client JSON must be different from --state-file and --env-file");
+        }
+    }
+    Ok(())
+}
+
+fn normalize_output_path(name: &str, path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("{name} must not be empty");
+    }
+    let mut normalized = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        env::current_dir().context("failed to resolve current directory for OAuth2 output path")?
+    };
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => bail!("{name} must not contain '..'"),
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
 }
 
 fn read_oauth_client_file(path: &Path) -> Result<OAuthClientFile> {
@@ -1932,6 +1974,48 @@ mod tests {
             false,
         )
         .expect("direct helper mode keeps explicit paths");
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_overlapping_output_paths() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.env_file = Some(PathBuf::from("./oauth-output"));
+        args.state_file = Some(
+            env::current_dir()
+                .expect("current dir")
+                .join("oauth-output"),
+        );
+
+        let err = resolve_setup(args).expect_err("env and state outputs must not overlap");
+
+        assert!(err.to_string().contains("must be different paths"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_output_paths_that_overwrite_client_json() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let client_json = temp_dir.path().join("client.json");
+        fs::write(
+            &client_json,
+            r#"{
+              "installed": {
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "auth_uri": "https://accounts.example/authorize",
+                "token_uri": "https://accounts.example/token"
+              }
+            }"#,
+        )
+        .expect("write client");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.client_id = None;
+        args.client_secret_json = Some(client_json.clone());
+        args.env_file = Some(client_json);
+        args.force = true;
+
+        let err = resolve_setup(args).expect_err("setup outputs must not overwrite client JSON");
+
+        assert!(err.to_string().contains("OAuth client JSON"));
     }
 
     #[test]
