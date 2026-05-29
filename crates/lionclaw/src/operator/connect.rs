@@ -1503,6 +1503,34 @@ exit 17
     }
 
     #[cfg(unix)]
+    fn write_channel_skill_with_symlinked_setup_outputs(root: &Path) {
+        write_channel_skill_with_setup_script(
+            root,
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+outside_env="${1:?}"
+outside_state="${2:?}"
+rm -f "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+ln -s "$outside_env" "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+rm -rf "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
+ln -s "$outside_state" "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
+exit 17
+"#,
+        );
+    }
+
+    #[cfg(unix)]
     fn write_normal_skill(root: &Path, skill_name: &str, token: &str) {
         fs::create_dir_all(root).expect("skill dir");
         fs::write(
@@ -1971,6 +1999,60 @@ exit 17
         assert!(!channel_setup_env_file(&home, "telegram").exists());
         assert!(!channel_setup_state_dir(&home, "telegram").exists());
         assert!(!home.channel_env_path("telegram").exists());
+        assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_setup_hook_unlinks_symlinked_generated_outputs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let outside_env = temp_dir.path().join("outside.env");
+        let outside_state = temp_dir.path().join("outside-state");
+        fs::write(&outside_env, "outside\n").expect("outside env");
+        fs::create_dir_all(&outside_state).expect("outside state");
+        fs::write(outside_state.join("token.json"), "outside\n").expect("outside token");
+        let skill_source = temp_dir.path().join("telegram-symlinked-setup-outputs");
+        write_channel_skill_with_symlinked_setup_outputs(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_args: vec![
+                        outside_env.display().to_string(),
+                        outside_state.display().to_string(),
+                    ],
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("failing setup hook should fail connect");
+
+        assert!(err.to_string().contains("exited with"));
+        assert!(fs::symlink_metadata(channel_setup_env_file(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(channel_setup_state_dir(&home, "telegram")).is_err());
+        assert_eq!(
+            fs::read_to_string(&outside_env).expect("outside env"),
+            "outside\n"
+        );
+        assert_eq!(
+            fs::read_to_string(outside_state.join("token.json")).expect("outside token"),
+            "outside\n"
+        );
         assert!(!home.skills_dir().join("telegram").exists());
     }
 

@@ -119,6 +119,10 @@ pub(crate) fn remove_private_file_if_exists(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()));
+    }
     ensure_private_file_metadata(path, label, metadata)?;
     remove_private_file_after_validation(home, path, label)
 }
@@ -128,11 +132,18 @@ pub(crate) fn remove_private_dir_all_if_exists(
     path: &Path,
     label: &str,
 ) -> Result<()> {
-    if !private_dir_exists(home, path, label)? {
+    if !private_parent_chain_exists(home, path, label)? {
         return Ok(());
     }
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()));
+    }
     ensure_private_dir_metadata(path, label, metadata)?;
     fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
 }
@@ -370,7 +381,6 @@ fn ensure_file_target_regular_or_absent(path: &Path, label: &str) -> Result<()> 
         Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
 }
-
 #[cfg(unix)]
 fn write_private_file_contents(
     home: &LionClawHome,
@@ -511,4 +521,66 @@ fn open_private_dir_relative(
     }
 
     Ok(Some(current))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::home::LionClawHome;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_cleanup_unlinks_target_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let path = home.config_dir().join("channel-setup/email/generated.env");
+        create_private_dir_all(
+            &home,
+            path.parent().expect("setup env parent"),
+            "setup env dir",
+        )
+        .expect("setup env parent");
+        let outside = temp_dir.path().join("outside.env");
+        fs::write(&outside, "outside\n").expect("outside");
+        symlink(&outside, &path).expect("target symlink");
+
+        remove_private_file_if_exists(&home, &path, "channel setup env file")
+            .expect("remove target symlink");
+
+        assert!(fs::symlink_metadata(&path).is_err());
+        assert_eq!(fs::read_to_string(&outside).expect("outside"), "outside\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_cleanup_unlinks_target_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let path = home.config_dir().join("channel-setup/email/state");
+        create_private_dir_all(
+            &home,
+            path.parent().expect("setup state parent"),
+            "setup state dir",
+        )
+        .expect("setup state parent");
+        let outside = temp_dir.path().join("outside-state");
+        fs::create_dir_all(&outside).expect("outside state");
+        fs::write(outside.join("token.json"), "outside\n").expect("outside token");
+        symlink(&outside, &path).expect("target symlink");
+
+        remove_private_dir_all_if_exists(&home, &path, "channel setup state directory")
+            .expect("remove target symlink");
+
+        assert!(fs::symlink_metadata(&path).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("token.json")).expect("outside token"),
+            "outside\n"
+        );
+    }
 }
