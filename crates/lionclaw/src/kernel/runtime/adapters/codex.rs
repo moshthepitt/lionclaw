@@ -1094,8 +1094,10 @@ fn codex_app_server_terminal_turn_page(
         let terminal_turn =
             codex_app_server_terminal_turn(&thread.id, thread.started_at, thread.finished_at, turn);
         if index == 0 {
-            newest_turn_resumable =
-                Some(terminal_turn.is_some() && codex_app_server_turn_has_completed_status(turn));
+            newest_turn_resumable = Some(codex_app_server_turn_is_successful_for_resume(
+                turn,
+                terminal_turn.as_ref(),
+            ));
         }
         if let Some(turn) = terminal_turn {
             turns.push(turn);
@@ -1206,15 +1208,25 @@ fn codex_app_server_turn_status(
     turn: &Value,
 ) -> (RuntimeTerminalTurnStatus, Option<String>, Option<String>) {
     let status = codex_app_server_terminal_turn_status(turn.get("status").and_then(Value::as_str));
-    let error_text = turn
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .and_then(non_empty);
+    let error_text = codex_app_server_turn_error_text(turn);
+    let status = if status == RuntimeTerminalTurnStatus::Completed && error_text.is_some() {
+        RuntimeTerminalTurnStatus::Failed
+    } else {
+        status
+    };
     let error_code = error_text
         .as_ref()
         .map(|_| "runtime.codex.turn_failed".to_string());
     (status, error_code, error_text)
+}
+
+fn codex_app_server_turn_is_successful_for_resume(
+    raw_turn: &Value,
+    imported_turn: Option<&RuntimeTerminalTurn>,
+) -> bool {
+    codex_app_server_turn_has_completed_status(raw_turn)
+        && codex_app_server_turn_error_text(raw_turn).is_none()
+        && imported_turn.is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
 }
 
 fn codex_app_server_turn_has_completed_status(turn: &Value) -> bool {
@@ -1223,6 +1235,12 @@ fn codex_app_server_turn_has_completed_status(turn: &Value) -> bool {
         .map(str::trim)
         .filter(|status| !status.is_empty())
         .is_some_and(|status| status.eq_ignore_ascii_case("completed"))
+}
+
+fn codex_app_server_turn_error_text(turn: &Value) -> Option<String> {
+    turn.get("error")
+        .filter(|error| !error.is_null())
+        .map(app_server_error_text)
 }
 
 fn codex_app_server_terminal_turn_status(status: Option<&str>) -> RuntimeTerminalTurnStatus {
@@ -4078,6 +4096,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_terminal_transcript_resumability_rejects_completed_turn_with_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        let mut latest = codex_completed_app_server_turn(
+            "turn_error",
+            "new prompt",
+            "new answer",
+            1780000010,
+            1780000017,
+        );
+        latest["error"] = json!({"message": "boom"});
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{"id": "thr_cli"}],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [
+                        latest,
+                        codex_completed_app_server_turn(
+                            "turn_done",
+                            "hello",
+                            "answer",
+                            1780000001,
+                            1780000007,
+                        )
+                    ],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_cli"),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert_eq!(transcript.turns.len(), 2);
+        let latest = transcript
+            .turns
+            .iter()
+            .find(|turn| turn.source_id == "codex-app-server:thr_cli:turn_error")
+            .expect("latest turn imported");
+        assert_eq!(latest.status, RuntimeTerminalTurnStatus::Failed);
+        assert_eq!(
+            latest.error_code,
+            Some("runtime.codex.turn_failed".to_string())
+        );
+        assert_eq!(latest.error_text, Some("boom".to_string()));
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
     async fn codex_terminal_transcript_timeout_returns_partial_transcript() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
@@ -4183,6 +4282,14 @@ mod tests {
         assert_eq!(error_text, None);
 
         let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "completed",
+            "error": {"message": "quota exceeded"}
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Failed);
+        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
+        assert_eq!(error_text, Some("quota exceeded".to_string()));
+
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
             "status": "failed",
             "error": {"message": "quota exceeded"}
         }));
@@ -4196,6 +4303,14 @@ mod tests {
         assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
         assert_eq!(error_code, None);
         assert_eq!(error_text, None);
+
+        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
+            "status": "interrupted",
+            "error": {"message": "cancelled"}
+        }));
+        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
+        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
+        assert_eq!(error_text, Some("cancelled".to_string()));
 
         let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
             "status": "inProgress"
