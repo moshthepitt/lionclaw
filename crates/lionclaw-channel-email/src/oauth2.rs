@@ -352,6 +352,7 @@ struct StoredOAuth2State {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: Option<String>,
+    token_type: Option<String>,
     refresh_token: Option<String>,
     expires_in: Option<i64>,
     error: Option<String>,
@@ -1525,10 +1526,23 @@ async fn post_token_form(
         let description = parsed.error_description.as_deref().unwrap_or("");
         bail!("OAuth2 token endpoint returned {status}: {error} {description}");
     }
-    if let Some(access_token) = parsed.access_token.as_deref() {
+    validate_successful_token_response(&parsed)?;
+    Ok(parsed)
+}
+
+fn validate_successful_token_response(response: &TokenResponse) -> Result<()> {
+    if let Some(access_token) = response.access_token.as_deref() {
         validate_access_token("OAuth2 token endpoint", access_token)?;
     }
-    Ok(parsed)
+    if let Some(token_type) = response.token_type.as_deref() {
+        if !token_type.eq_ignore_ascii_case("bearer") {
+            bail!(
+                "OAuth2 token endpoint returned token_type {:?}; email XOAUTH2 requires Bearer access tokens",
+                truncate_for_error(token_type)
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn read_token_response_text(mut response: reqwest::Response) -> Result<String> {
@@ -2726,7 +2740,8 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..bytes]);
             assert!(request.contains("grant_type=refresh_token"));
             assert!(request.contains("refresh_token=refresh-token"));
-            let body = r#"{"access_token":"new-access-token","expires_in":3600}"#;
+            let body =
+                r#"{"access_token":"new-access-token","token_type":"Bearer","expires_in":3600}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -2742,6 +2757,7 @@ mod tests {
         let response = refresh_access_token(&state).await.expect("refresh");
 
         assert_eq!(response.access_token.as_deref(), Some("new-access-token"));
+        assert_eq!(response.token_type.as_deref(), Some("Bearer"));
         server.await.expect("server task");
     }
 
@@ -2799,20 +2815,9 @@ mod tests {
 
     #[tokio::test]
     async fn token_response_body_is_bounded() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = vec![0; 1024];
-            let _ = stream.read(&mut request).await.expect("read request");
-            let body = "x".repeat(TOKEN_RESPONSE_MAX_BYTES + 1);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
-        let state = test_token_state(format!("http://127.0.0.1:{port}/token"));
+        let (endpoint, server) =
+            token_endpoint_with_body("x".repeat(TOKEN_RESPONSE_MAX_BYTES + 1)).await;
+        let state = test_token_state(endpoint);
 
         let err = refresh_access_token(&state)
             .await
@@ -2824,13 +2829,45 @@ mod tests {
 
     #[tokio::test]
     async fn token_response_rejects_invalid_access_token_text() {
+        let (endpoint, server) =
+            token_endpoint_with_body(r#"{"access_token":"bad token","expires_in":3600}"#).await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("invalid access token should fail");
+
+        assert!(err.to_string().contains("whitespace"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn token_response_rejects_unsupported_token_type() {
+        let (endpoint, server) = token_endpoint_with_body(
+            r#"{"access_token":"new-access-token","token_type":"mac","expires_in":3600}"#,
+        )
+        .await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("unsupported token type should fail");
+
+        assert!(err.to_string().contains("token_type"));
+        assert!(err.to_string().contains("Bearer"));
+        server.await.expect("server task");
+    }
+
+    async fn token_endpoint_with_body(
+        body: impl Into<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
         let port = listener.local_addr().expect("addr").port();
+        let body = body.into();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = vec![0; 1024];
             let _ = stream.read(&mut request).await.expect("read request");
-            let body = r#"{"access_token":"bad token","expires_in":3600}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -2840,14 +2877,7 @@ mod tests {
                 .await
                 .expect("write response");
         });
-        let state = test_token_state(format!("http://127.0.0.1:{port}/token"));
-
-        let err = refresh_access_token(&state)
-            .await
-            .expect_err("invalid access token should fail");
-
-        assert!(err.to_string().contains("whitespace"));
-        server.await.expect("server task");
+        (format!("http://127.0.0.1:{port}/token"), server)
     }
 
     #[cfg(unix)]
