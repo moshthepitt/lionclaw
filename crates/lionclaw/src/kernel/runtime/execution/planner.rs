@@ -594,57 +594,82 @@ fn escape_classes_for_purpose(
 }
 
 fn build_runtime_environment(
-    mut passthrough_environment: Vec<(String, String)>,
+    mut environment: Vec<(String, String)>,
     has_workspace_mount: bool,
     has_runtime_mount: bool,
     has_drafts_mount: bool,
     has_skills_mount: bool,
 ) -> Vec<(String, String)> {
     if has_workspace_mount {
-        passthrough_environment.push((
-            "LIONCLAW_WORKSPACE_DIR".to_string(),
-            WORKSPACE_MOUNT_TARGET.to_string(),
-        ));
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_WORKSPACE_DIR",
+            WORKSPACE_MOUNT_TARGET,
+        );
     }
 
     if has_runtime_mount {
-        passthrough_environment.extend([
-            ("HOME".to_string(), format!("{RUNTIME_MOUNT_TARGET}/home")),
-            (
-                "XDG_CONFIG_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.config"),
-            ),
-            (
-                "XDG_CACHE_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.cache"),
-            ),
-            (
-                "XDG_STATE_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.local/state"),
-            ),
-            (
-                "LIONCLAW_RUNTIME_DIR".to_string(),
-                RUNTIME_MOUNT_TARGET.to_string(),
-            ),
-        ]);
+        let runtime_home = format!("{RUNTIME_MOUNT_TARGET}/home");
+        set_environment_value(&mut environment, "HOME", runtime_home.clone());
+        set_environment_value(
+            &mut environment,
+            "XDG_CONFIG_HOME",
+            format!("{runtime_home}/.config"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_CACHE_HOME",
+            format!("{runtime_home}/.cache"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_DATA_HOME",
+            format!("{runtime_home}/.local/share"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_STATE_HOME",
+            format!("{runtime_home}/.local/state"),
+        );
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_RUNTIME_DIR",
+            RUNTIME_MOUNT_TARGET,
+        );
     }
 
     if has_drafts_mount {
-        passthrough_environment.push((
-            "LIONCLAW_DRAFTS_DIR".to_string(),
-            DRAFTS_MOUNT_TARGET.to_string(),
-        ));
+        set_environment_value(&mut environment, "LIONCLAW_DRAFTS_DIR", DRAFTS_MOUNT_TARGET);
     }
 
     if has_skills_mount {
-        passthrough_environment.push((
-            "LIONCLAW_SKILLS_DIR".to_string(),
-            SKILLS_MOUNT_TARGET_ROOT.to_string(),
-        ));
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_SKILLS_DIR",
+            SKILLS_MOUNT_TARGET_ROOT,
+        );
     }
 
-    passthrough_environment.push(("TMPDIR".to_string(), "/tmp".to_string()));
-    passthrough_environment
+    set_environment_value(&mut environment, "TMPDIR", "/tmp");
+    environment
+}
+
+fn set_environment_value(
+    environment: &mut Vec<(String, String)>,
+    key: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let key = key.into();
+    let value = value.into();
+
+    if let Some((_, existing_value)) = environment
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing_value = value;
+    } else {
+        environment.push((key, value));
+    }
 }
 
 #[cfg(test)]
@@ -808,6 +833,10 @@ mod tests {
                     "/runtime/home/.cache".to_string()
                 ),
                 (
+                    "XDG_DATA_HOME".to_string(),
+                    "/runtime/home/.local/share".to_string()
+                ),
+                (
                     "XDG_STATE_HOME".to_string(),
                     "/runtime/home/.local/state".to_string()
                 ),
@@ -815,6 +844,36 @@ mod tests {
                 ("LIONCLAW_DRAFTS_DIR".to_string(), "/drafts".to_string()),
                 ("TMPDIR".to_string(), "/tmp".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_environment_defaults_replace_passthrough_paths() {
+        let environment = super::build_runtime_environment(
+            vec![
+                ("XDG_CONFIG_HOME".to_string(), "/host/config".to_string()),
+                ("XDG_DATA_HOME".to_string(), "/host/share".to_string()),
+                ("TMPDIR".to_string(), "/host/tmp".to_string()),
+                ("USER_DEFINED".to_string(), "kept".to_string()),
+            ],
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            single_environment_value(&environment, "XDG_CONFIG_HOME"),
+            "/runtime/home/.config"
+        );
+        assert_eq!(
+            single_environment_value(&environment, "XDG_DATA_HOME"),
+            "/runtime/home/.local/share"
+        );
+        assert_eq!(single_environment_value(&environment, "TMPDIR"), "/tmp");
+        assert_eq!(
+            single_environment_value(&environment, "USER_DEFINED"),
+            "kept"
         );
     }
 
@@ -1657,5 +1716,15 @@ mod tests {
 
         let debug = format!("{planner:?}");
         assert!(!debug.contains("ghp_secret"));
+    }
+
+    fn single_environment_value<'a>(environment: &'a [(String, String)], key: &str) -> &'a str {
+        let values: Vec<&str> = environment
+            .iter()
+            .filter(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values.len(), 1, "{key} should appear exactly once");
+        values[0]
     }
 }

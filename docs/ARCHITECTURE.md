@@ -551,9 +551,10 @@ are summarized as live activity for the active turn and exposed through control
 panes instead of being appended as transcript lines.
 
 The planner injects runtime-private environment defaults such as
-`HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
-`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted
-assets, so engine-specific caches and config stay out of assistant continuity.
+`HOME=/runtime/home`, XDG config/cache/data/state roots under `/runtime/home`,
+`LIONCLAW_DRAFTS_DIR=/drafts`, and `LIONCLAW_SKILLS_DIR=/lionclaw/skills`
+when runtime-visible skills have mounted assets, so engine-specific caches,
+data, and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
 request, but the mounted `/runtime` state root is scoped to the LionClaw
