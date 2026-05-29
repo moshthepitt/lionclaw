@@ -642,6 +642,7 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
     }
     process.args(setup_args);
     process
+        .current_dir(skill_dir)
         .env_clear()
         .envs(channel_setup_ambient_env())
         .env("LIONCLAW_HOME", home.root())
@@ -1396,6 +1397,8 @@ test "${1:-}" = "bootstrap"
 test "${2:-}" = "testprofile"
 test "${3:-}" = "--flag"
 test "${4:-}" = "value"
+expected_setup_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+test "$(pwd -P)" = "$expected_setup_root"
 test "${LIONCLAW_CHANNEL_ID:-}" = "telegram"
 test -n "${LIONCLAW_HOME:-}"
 test -n "${LIONCLAW_CHANNEL_SETUP_STATE_DIR:-}"

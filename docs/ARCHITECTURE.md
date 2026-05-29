@@ -997,8 +997,9 @@ manually by the operator.
   Helpers launched by `connect` receive LionClaw-managed setup env and state
   paths plus a small ambient allowlist for browser, proxy, locale, certificate,
   terminal, and temp-dir behavior; they do not inherit arbitrary shell secrets
-  from the operator process and should not move generated credentials outside
-  the managed paths.
+  from the operator process, run with the installed channel skill directory as
+  their working directory, and should not move generated credentials outside the
+  managed paths.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally
