@@ -1304,6 +1304,7 @@ fn cached_access_token(state: &StoredOAuth2State) -> Option<String> {
 fn read_oauth2_state(path: &Path) -> Result<StoredOAuth2State> {
     ensure_parent_dirs_without_symlinks(path, "OAuth2 state file")?;
     ensure_existing_regular_file(path, "OAuth2 state file")?;
+    set_private_file_permissions(path)?;
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let state: StoredOAuth2State = serde_json::from_str(&content)
@@ -2045,6 +2046,40 @@ mod tests {
         let err = read_oauth2_state(&link).expect_err("symlink state should fail");
 
         assert!(err.to_string().contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oauth_state_file_read_hardens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "provider": "gmail",
+              "account": "assistant@gmail.com",
+              "token_endpoint": "https://oauth2.googleapis.com/token",
+              "client_id": "client-id",
+              "client_secret": null,
+              "refresh_token": "refresh",
+              "access_token": null,
+              "expires_at": null,
+              "scope": ["https://mail.google.com/"]
+            }"#,
+        )
+        .expect("write state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("public state");
+
+        read_oauth2_state(&path).expect("read state");
+
+        let mode = fs::metadata(&path)
+            .expect("state metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[cfg(unix)]
