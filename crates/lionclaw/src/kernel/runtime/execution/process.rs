@@ -86,15 +86,8 @@ where
 
     let mut child = spawn_with_retry(&mut command, &invocation.executable).await?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(invocation.input.as_bytes())
-            .await
-            .context("failed to write input to subprocess stdin")?;
-        stdin
-            .shutdown()
-            .await
-            .context("failed to close subprocess stdin")?;
+    if let Some(stdin) = child.stdin.take() {
+        write_input_and_close_stdin(stdin, invocation.input.as_bytes()).await?;
     }
 
     let stdout = child
@@ -224,14 +217,10 @@ impl ProcessSession {
     }
 
     pub async fn close_stdin(&mut self) -> Result<()> {
-        let Some(mut stdin) = self.stdin.take() else {
+        let Some(stdin) = self.stdin.take() else {
             return Ok(());
         };
-        stdin
-            .shutdown()
-            .await
-            .context("failed to close subprocess stdin")?;
-        Ok(())
+        shutdown_child_stdin(stdin).await
     }
 
     pub async fn wait(mut self) -> Result<ProcessOutput> {
@@ -391,6 +380,26 @@ fn spawn_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHandle<Resul
     })
 }
 
+async fn write_input_and_close_stdin(mut stdin: ChildStdin, input: &[u8]) -> Result<()> {
+    if let Err(err) = stdin.write_all(input).await {
+        if err.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(err).context("failed to write input to subprocess stdin");
+    }
+    shutdown_child_stdin(stdin).await
+}
+
+async fn shutdown_child_stdin(mut stdin: ChildStdin) -> Result<()> {
+    if let Err(err) = stdin.shutdown().await {
+        if err.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(err).context("failed to close subprocess stdin");
+    }
+    Ok(())
+}
+
 async fn spawn_with_retry(
     command: &mut Command,
     executable: &str,
@@ -425,7 +434,9 @@ async fn spawn_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_process_attached, spawn_process_session, ProcessInvocation};
+    use super::{
+        run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
+    };
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -466,6 +477,65 @@ mod tests {
         assert_eq!(
             String::from_utf8(output.stdout).expect("stdout"),
             "tail-after-close\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_session_wait_collects_status_after_child_closes_stdin() {
+        let session = spawn_process_session(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "exec 0<&-; printf 'closed-session-stdin\\n'; printf 'session-details\\n' >&2; exit 7"
+                    .to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("spawn session");
+
+        let output = session.wait().await.expect("wait");
+
+        assert_eq!(output.exit_code, Some(7));
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout"),
+            "closed-session-stdin\n"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr"),
+            "session-details\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_process_collects_status_after_child_closes_stdin() {
+        let output = run_process_streaming(
+            &ProcessInvocation {
+                executable: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "exec 0<&-; printf 'closed-stdin\\n'; printf 'details\\n' >&2; exit 7"
+                        .to_string(),
+                ],
+                working_dir: None,
+                environment: Vec::new(),
+                input: "ignored\n".repeat(1024 * 1024),
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("run process");
+
+        assert_eq!(output.exit_code, Some(7));
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout"),
+            "closed-stdin\n"
+        );
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("stderr"),
+            "details\n"
         );
     }
 
