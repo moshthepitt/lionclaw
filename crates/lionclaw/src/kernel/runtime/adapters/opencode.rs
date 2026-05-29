@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::{
-    choose_terminal_transcript_target,
+    choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
     state_file::{load_state_value, save_state_value},
-    TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
@@ -395,7 +395,10 @@ async fn export_opencode_terminal_transcript_with_cli(
     let target_session_id = choose_terminal_transcript_target(
         saved_session_id.as_deref(),
         listed_sessions.latest.as_ref(),
-        input.launch_started_at,
+        normalize_terminal_transcript_launch_started_at(
+            input.launch_started_at,
+            TerminalTranscriptTimestampPrecision::Milliseconds,
+        ),
     );
     let mut target = TerminalTranscriptTarget::default();
     if let Some(session_id) = target_session_id.as_deref() {
@@ -1207,6 +1210,10 @@ mod tests {
             .expect("valid test timestamp")
     }
 
+    fn opencode_test_precise_timestamp(seconds: i64, nanos: u32) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(seconds, nanos).expect("valid test timestamp")
+    }
+
     fn opencode_transcript_input(runtime_state_root: PathBuf) -> RuntimeTerminalTranscriptInput {
         opencode_transcript_input_after(runtime_state_root, None)
     }
@@ -1793,6 +1800,52 @@ mod tests {
             std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
                 .expect("saved session id"),
             "ses_saved\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_accepts_latest_in_launch_millisecond() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output_with_times(&[("ses_latest", 1_500)]),
+                opencode_completed_export_output("ses_latest", "hello", "answer"),
+                opencode_completed_export_output("ses_saved", "before", "saved answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input_after(
+                    runtime_state_root.clone(),
+                    Some(opencode_test_precise_timestamp(1, 500_999_000)),
+                ),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 2);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+        assert_eq!(
+            executor.programs[1].args,
+            vec!["export".to_string(), "ses_latest".to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
+                .expect("saved session id"),
+            "ses_latest\n"
         );
     }
 

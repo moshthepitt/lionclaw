@@ -3,7 +3,7 @@ mod mock;
 mod opencode;
 mod state_file;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 
 pub use codex::{CodexRuntimeAdapter, CodexRuntimeConfig};
 pub use mock::MockRuntimeAdapter;
@@ -13,6 +13,12 @@ pub use opencode::{OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
 struct TerminalTranscriptCandidate {
     id: String,
     updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TerminalTranscriptTimestampPrecision {
+    Seconds,
+    Milliseconds,
 }
 
 impl TerminalTranscriptCandidate {
@@ -98,4 +104,19 @@ fn choose_terminal_transcript_target(
     }
 
     latest.map(|candidate| candidate.id.clone())
+}
+
+fn normalize_terminal_transcript_launch_started_at(
+    launch_started_at: Option<DateTime<Utc>>,
+    precision: TerminalTranscriptTimestampPrecision,
+) -> Option<DateTime<Utc>> {
+    let started_at = launch_started_at?;
+    match precision {
+        TerminalTranscriptTimestampPrecision::Seconds => {
+            DateTime::<Utc>::from_timestamp(started_at.timestamp(), 0)
+        }
+        TerminalTranscriptTimestampPrecision::Milliseconds => Utc
+            .timestamp_millis_opt(started_at.timestamp_millis())
+            .single(),
+    }
 }

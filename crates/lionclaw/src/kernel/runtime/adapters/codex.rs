@@ -30,9 +30,9 @@ use crate::{
 };
 
 use super::{
-    choose_terminal_transcript_target,
+    choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
     state_file::{load_state_value, save_state_value},
-    TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
@@ -531,7 +531,10 @@ impl CodexRuntimeAdapter {
                     if let Some(thread_id) = choose_terminal_transcript_target(
                         request.resume_thread_id,
                         latest.as_ref(),
-                        codex_thread_list_launch_started_at(request.launch_started_at),
+                        normalize_terminal_transcript_launch_started_at(
+                            request.launch_started_at,
+                            TerminalTranscriptTimestampPrecision::Seconds,
+                        ),
                     ) {
                         if target.choose_if_empty(&thread_id) {
                             save_thread_id(request.runtime_state_root, &thread_id)?;
@@ -921,13 +924,6 @@ fn codex_listed_thread_updated_at(thread: &CodexListedThread) -> Option<DateTime
         .as_ref()
         .or(thread.started_at.as_ref())
         .cloned()
-}
-
-fn codex_thread_list_launch_started_at(
-    launch_started_at: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    launch_started_at
-        .and_then(|started_at| DateTime::<Utc>::from_timestamp(started_at.timestamp(), 0))
 }
 
 #[derive(Debug, Clone)]
