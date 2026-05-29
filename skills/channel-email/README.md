@@ -118,7 +118,9 @@ EOF
 
 ### OAuth2 / XOAUTH2
 
-For providers that require OAuth, use the provider profile on `connect`.
+For providers that require OAuth, use the provider profile on `connect`
+(`connect email gmail`) or pass the helper's provider flag
+(`connect email --provider gmail`).
 LionClaw installs the bundled email channel snapshot, runs the channel's setup
 helper from that snapshot, stores the generated channel env in the selected
 instance home, and starts the background worker. The generated env points

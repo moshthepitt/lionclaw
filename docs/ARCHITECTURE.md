@@ -989,10 +989,11 @@ manually by the operator.
   metadata contract is small by design and does not claim permissions LionClaw
   does not enforce.
 - Setup hooks are channel-owned commands declared under `[channel.setup]`.
-  `lionclaw connect <channel> <profile> ...` passes the profile and trailing
-  args to that command after installing/selecting the channel snapshot, and
-  validates the generated env through the same declared-env contract as
-  `--env-file`. Core does not contain provider-specific channel setup logic.
+  `lionclaw connect <channel> <profile> ...` and helper-style flags such as
+  `lionclaw connect <channel> --provider gmail ...` pass setup arguments to
+  that command after installing/selecting the channel snapshot, and validate the
+  generated env through the same declared-env contract as `--env-file`. Core
+  does not contain provider-specific channel setup logic.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally

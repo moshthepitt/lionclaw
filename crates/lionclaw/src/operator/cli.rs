@@ -216,6 +216,7 @@ struct ConnectArgs {
     thread_ref: Option<String>,
     #[arg(
         value_name = "SETUP",
+        allow_hyphen_values = true,
         help = "Optional channel setup profile passed to the channel helper, such as gmail"
     )]
     setup_profile: Option<String>,
@@ -2748,6 +2749,40 @@ mod tests {
                 assert_eq!(args.env_file, Some(PathBuf::from("./email.env")));
                 assert!(args.setup_profile.is_none());
                 assert!(args.setup_args.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_passes_unknown_helper_flags_to_channel_setup() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "connect",
+            "email",
+            "--provider",
+            "gmail",
+            "--account",
+            "assistant@gmail.com",
+            "--client-secret-json",
+            "/tmp/client.json",
+        ])
+        .expect("parse connect setup helper flags");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.setup_profile.as_deref(), Some("--provider"));
+                assert_eq!(
+                    args.setup_args,
+                    vec![
+                        "gmail".to_string(),
+                        "--account".to_string(),
+                        "assistant@gmail.com".to_string(),
+                        "--client-secret-json".to_string(),
+                        "/tmp/client.json".to_string()
+                    ]
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
