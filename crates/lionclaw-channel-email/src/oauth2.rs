@@ -17,7 +17,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -1160,45 +1160,64 @@ async fn handle_callback_connection(
     stream: &mut TcpStream,
     expected_state: &str,
 ) -> Result<Option<String>> {
-    let Some(first_line) = read_callback_request_line(stream).await? else {
-        write_callback_response(stream, 400, "Bad request").await?;
+    let Some(first_line) = read_callback_request_line_best_effort(stream).await else {
+        write_callback_response_best_effort(stream, 400, "Bad request").await;
         return Ok(None);
     };
     let Some(target) = parse_http_get_target(&first_line) else {
-        write_callback_response(stream, 404, "Waiting for OAuth2 callback").await?;
+        write_callback_response_best_effort(stream, 404, "Waiting for OAuth2 callback").await;
         return Ok(None);
     };
     let parsed = parse_callback_target(target);
     if parsed.path != CALLBACK_PATH {
-        write_callback_response(stream, 404, "Waiting for OAuth2 callback").await?;
+        write_callback_response_best_effort(stream, 404, "Waiting for OAuth2 callback").await;
         return Ok(None);
     }
-    if let Some(error) = parsed.query.get("error") {
-        write_callback_response(stream, 400, "OAuth2 authorization was not completed").await?;
-        bail!("OAuth2 provider returned error: {error}");
-    }
     let Some(state) = parsed.query.get("state") else {
-        write_callback_response(stream, 400, "OAuth2 callback did not include state").await?;
+        write_callback_response_best_effort(stream, 400, "OAuth2 callback did not include state")
+            .await;
         return Ok(None);
     };
     if state != expected_state {
-        write_callback_response(stream, 400, "OAuth2 state did not match").await?;
+        write_callback_response_best_effort(stream, 400, "OAuth2 state did not match").await;
         return Ok(None);
     }
+    if let Some(error) = parsed.query.get("error") {
+        write_callback_response_best_effort(stream, 400, "OAuth2 authorization was not completed")
+            .await;
+        bail!("OAuth2 provider returned error: {error}");
+    }
     let Some(code) = parsed.query.get("code").cloned() else {
-        write_callback_response(stream, 400, "OAuth2 callback did not include code").await?;
+        write_callback_response_best_effort(stream, 400, "OAuth2 callback did not include code")
+            .await;
         return Ok(None);
     };
-    write_callback_response(
+    write_callback_response_best_effort(
         stream,
         200,
         "OAuth2 setup complete. You can close this tab.",
     )
-    .await?;
+    .await;
     Ok(Some(code))
 }
 
-async fn read_callback_request_line(stream: &mut TcpStream) -> Result<Option<String>> {
+async fn read_callback_request_line_best_effort<R>(stream: &mut R) -> Option<String>
+where
+    R: AsyncRead + Unpin,
+{
+    match read_callback_request_line(stream).await {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to read OAuth2 callback request");
+            None
+        }
+    }
+}
+
+async fn read_callback_request_line<R>(stream: &mut R) -> Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
     match timeout(
         CALLBACK_REQUEST_LINE_WAIT,
         read_callback_request_line_inner(stream),
@@ -1210,7 +1229,10 @@ async fn read_callback_request_line(stream: &mut TcpStream) -> Result<Option<Str
     }
 }
 
-async fn read_callback_request_line_inner(stream: &mut TcpStream) -> Result<Option<String>> {
+async fn read_callback_request_line_inner<R>(stream: &mut R) -> Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut request = Vec::new();
     let mut chunk = [0_u8; 512];
 
@@ -1313,7 +1335,19 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-async fn write_callback_response(stream: &mut TcpStream, status: u16, text: &str) -> Result<()> {
+async fn write_callback_response_best_effort<W>(stream: &mut W, status: u16, text: &str)
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(err) = write_callback_response(stream, status, text).await {
+        tracing::debug!(error = %err, "failed to write OAuth2 callback response");
+    }
+}
+
+async fn write_callback_response<W>(stream: &mut W, status: u16, text: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1770,6 +1804,13 @@ fn shell_quote_arg(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use super::*;
 
     fn test_setup_args(provider: Oauth2Provider) -> SetupArgs {
@@ -2208,6 +2249,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_request_read_is_best_effort() {
+        let mut reader = FailingReader;
+
+        assert!(read_callback_request_line_best_effort(&mut reader)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_response_write_is_best_effort() {
+        let mut writer = FailingWriter;
+
+        write_callback_response_best_effort(&mut writer, 400, "Bad request").await;
+    }
+
+    #[tokio::test]
     async fn callback_wait_continues_after_state_mismatch() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2230,6 +2287,58 @@ mod tests {
             .expect("join callback wait")
             .expect("callback code");
         assert_eq!(code, "good/code");
+    }
+
+    #[tokio::test]
+    async fn callback_wait_continues_after_error_without_matching_state() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let missing_state_response =
+            send_callback_request(port, "/oauth2/callback?error=access_denied").await;
+        assert!(missing_state_response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(missing_state_response.contains("OAuth2 callback did not include state"));
+
+        let wrong_state_response =
+            send_callback_request(port, "/oauth2/callback?error=access_denied&state=wrong").await;
+        assert!(wrong_state_response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(wrong_state_response.contains("OAuth2 state did not match"));
+
+        let good_response =
+            send_callback_request(port, "/oauth2/callback?code=good%2Fcode&state=expected").await;
+        assert!(good_response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "good/code");
+    }
+
+    #[tokio::test]
+    async fn callback_provider_error_with_matching_state_aborts_wait() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let response =
+            send_callback_request(port, "/oauth2/callback?error=access_denied&state=expected")
+                .await;
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("OAuth2 authorization was not completed"));
+
+        let err = wait
+            .await
+            .expect("join callback wait")
+            .expect_err("matching provider error should fail setup");
+        assert!(err.to_string().contains("access_denied"));
     }
 
     #[tokio::test]
@@ -2288,6 +2397,48 @@ mod tests {
             .await
             .expect("read callback response");
         response
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let _ = self;
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::ConnectionReset,
+                "reset callback stream",
+            )))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let _ = self;
+            Poll::Ready(Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "closed callback stream",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let _ = self;
+            Poll::Ready(Ok(()))
+        }
     }
 
     #[test]
