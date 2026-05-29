@@ -209,18 +209,6 @@ impl RuntimeTerminalTranscript {
     }
 }
 
-pub fn latest_terminal_turn_is_completed(turns: &[RuntimeTerminalTurn]) -> bool {
-    turns
-        .iter()
-        .max_by(|left, right| {
-            left.finished_at
-                .cmp(&right.finished_at)
-                .then_with(|| left.started_at.cmp(&right.started_at))
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        })
-        .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
-}
-
 #[derive(Debug, Clone)]
 pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
