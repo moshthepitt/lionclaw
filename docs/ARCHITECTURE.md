@@ -230,7 +230,8 @@ Native TUI launches resume with `codex resume <threadID>` when that link exists.
 After native TUI exit, Codex exports completed turns through Codex's app-server
 `thread/list` and paged `thread/turns/list` protocol inside the same runtime
 boundary, enumerating newest history first, learning the current newest CLI
-thread when no link exists, and sorting before canonical import. OpenCode
+thread as the continuation link, falling back to the saved link when listing
+cannot produce a current thread, and sorting before canonical import. OpenCode
 continuity is a LionClaw-owned link to one
 OpenCode root session id stored in runtime-private state. Program-backed
 OpenCode turns learn that id from OpenCode's machine-readable `sessionID`

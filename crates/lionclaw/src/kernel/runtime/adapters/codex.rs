@@ -476,12 +476,11 @@ impl CodexRuntimeAdapter {
         let mut seen_cursors = HashSet::new();
         let mut turns = Vec::new();
         let mut warnings = Vec::new();
-        let mut resumable = false;
-        let mut target_thread_id = request.resume_thread_id.map(str::to_string);
-        let mut target_exported = false;
+        let mut target = CodexTerminalTranscriptTarget::default();
+        let mut seen_thread_ids = HashSet::new();
 
         loop {
-            let response = match codex_app_server_request_until(
+            let response_result = codex_app_server_request_until(
                 client,
                 "thread/list",
                 codex_thread_list_params(cursor.as_deref()),
@@ -489,22 +488,33 @@ impl CodexRuntimeAdapter {
                 request.thread_state,
                 request.deadline,
             )
-            .await?
-            {
-                Some(response) => response,
-                None => {
+            .await;
+            let response = match response_result {
+                Ok(Some(response)) => response,
+                Ok(None) => {
                     warnings.push(RuntimeTerminalTranscriptWarning::new(
                         "codex-app-server",
                         codex_app_server_deadline_warning(request.hard_timeout, "listing threads"),
                     ));
                     break;
                 }
+                Err(err) if request.resume_thread_id.is_some() => {
+                    warnings.push(RuntimeTerminalTranscriptWarning::new(
+                        "codex-app-server",
+                        format!("{err:#}"),
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    return Err(err).context("failed to list Codex app-server threads");
+                }
             };
             let mut deadline_reached = false;
             for thread in codex_app_server_threads(&response) {
-                if target_thread_id.is_none() {
-                    target_thread_id = Some(thread.id.clone());
+                if !seen_thread_ids.insert(thread.id.clone()) {
+                    continue;
                 }
+                target.choose_if_empty(&thread.id);
                 match codex_app_server_thread_terminal_transcript(
                     client,
                     request.events,
@@ -515,12 +525,13 @@ impl CodexRuntimeAdapter {
                 .await
                 {
                     Ok(thread_transcript) => {
-                        if target_thread_id.as_deref() == Some(thread.id.as_str()) {
-                            target_exported = true;
-                            resumable = thread_transcript.resumable;
-                            save_thread_id(request.runtime_state_root, &thread.id)?;
-                        }
-                        if thread_transcript.deadline_reached {
+                        if codex_record_app_server_thread_transcript(
+                            request.runtime_state_root,
+                            &mut target,
+                            &thread,
+                            thread_transcript,
+                            &mut turns,
+                        )? {
                             warnings.push(RuntimeTerminalTranscriptWarning::new(
                                 format!("codex-app-server:{}", thread.id),
                                 codex_app_server_deadline_warning(
@@ -530,7 +541,6 @@ impl CodexRuntimeAdapter {
                             ));
                             deadline_reached = true;
                         }
-                        turns.extend(thread_transcript.turns);
                         if deadline_reached {
                             break;
                         }
@@ -561,13 +571,58 @@ impl CodexRuntimeAdapter {
             cursor = Some(next_cursor);
         }
 
+        if target.is_empty() {
+            if let Some(resume_thread_id) = request.resume_thread_id {
+                let thread = CodexListedThread {
+                    id: resume_thread_id.to_string(),
+                    started_at: None,
+                    finished_at: None,
+                };
+                target.choose_if_empty(&thread.id);
+                match codex_app_server_thread_terminal_transcript(
+                    client,
+                    request.events,
+                    request.thread_state,
+                    &thread,
+                    request.deadline,
+                )
+                .await
+                {
+                    Ok(thread_transcript) => {
+                        if codex_record_app_server_thread_transcript(
+                            request.runtime_state_root,
+                            &mut target,
+                            &thread,
+                            thread_transcript,
+                            &mut turns,
+                        )? {
+                            warnings.push(RuntimeTerminalTranscriptWarning::new(
+                                format!("codex-app-server:{}", thread.id),
+                                codex_app_server_deadline_warning(
+                                    request.hard_timeout,
+                                    "listing thread turns",
+                                ),
+                            ));
+                        }
+                    }
+                    Err(err) => warnings.push(RuntimeTerminalTranscriptWarning::new(
+                        format!("codex-app-server:{}", thread.id),
+                        format!("{err:#}"),
+                    )),
+                }
+            }
+        }
+
         turns.sort_by(|left, right| {
             left.started_at
                 .cmp(&right.started_at)
                 .then_with(|| left.source_id.cmp(&right.source_id))
         });
-        let resumable = target_exported && resumable;
-        Ok(RuntimeTerminalTranscript::new(turns, warnings, resumable))
+        Ok(RuntimeTerminalTranscript::new(
+            turns,
+            warnings,
+            target.resumable(),
+        ))
     }
 
     fn transcript_session_guard(
@@ -745,6 +800,56 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             .remove(&handle.runtime_session_id);
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+struct CodexTerminalTranscriptTarget {
+    thread_id: Option<String>,
+    exported: bool,
+    resumable: bool,
+}
+
+impl CodexTerminalTranscriptTarget {
+    fn is_empty(&self) -> bool {
+        self.thread_id.is_none()
+    }
+
+    fn choose_if_empty(&mut self, thread_id: &str) {
+        if self.thread_id.is_none() {
+            self.thread_id = Some(thread_id.to_string());
+        }
+    }
+
+    fn record_export(
+        &mut self,
+        runtime_state_root: &Path,
+        thread: &CodexListedThread,
+        resumable: bool,
+    ) -> Result<()> {
+        if self.thread_id.as_deref() == Some(thread.id.as_str()) {
+            self.exported = true;
+            self.resumable = resumable;
+            save_thread_id(runtime_state_root, &thread.id)?;
+        }
+        Ok(())
+    }
+
+    fn resumable(&self) -> bool {
+        self.exported && self.resumable
+    }
+}
+
+fn codex_record_app_server_thread_transcript(
+    runtime_state_root: &Path,
+    target: &mut CodexTerminalTranscriptTarget,
+    thread: &CodexListedThread,
+    transcript: CodexThreadTerminalTranscript,
+    turns: &mut Vec<RuntimeTerminalTurn>,
+) -> Result<bool> {
+    target.record_export(runtime_state_root, thread, transcript.resumable)?;
+    let deadline_reached = transcript.deadline_reached;
+    turns.extend(transcript.turns);
+    Ok(deadline_reached)
 }
 
 fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
@@ -3192,7 +3297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_terminal_transcript_keeps_saved_thread_as_resume_target() {
+    async fn codex_terminal_transcript_follows_newest_cli_thread() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
             start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
@@ -3210,10 +3315,12 @@ mod tests {
             json!({
                 "id": 3,
                 "result": {
-                    "data": [codex_interrupted_app_server_turn(
+                    "data": [codex_completed_app_server_turn(
                         "turn_other",
-                        "unfinished",
+                        "newer",
+                        "newer answer",
                         1780000010,
+                        1780000017,
                     )],
                     "nextCursor": null,
                     "backwardsCursor": null
@@ -3260,12 +3367,16 @@ mod tests {
         assert!(transcript.resumable);
         assert_eq!(
             load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_saved".to_string())
+            Some("thr_other".to_string())
         );
-        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.turns.len(), 2);
         assert_eq!(
             transcript.turns[0].source_id,
             "codex-app-server:thr_saved:turn_saved"
+        );
+        assert_eq!(
+            transcript.turns[1].source_id,
+            "codex-app-server:thr_other:turn_other"
         );
     }
 
@@ -3274,6 +3385,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
             start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        save_thread_id(temp_dir.path(), "thr_good").expect("save thread");
         let transport = FakeAppServerTransport::new(vec![
             json!({"id": 1, "result": {}}),
             json!({
@@ -3335,6 +3447,10 @@ mod tests {
             transcript.turns[0].source_id,
             "codex-app-server:thr_good:turn_good"
         );
+        assert_eq!(
+            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
+            Some("thr_good".to_string())
+        );
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "codex-app-server:thr_bad");
         assert!(
@@ -3344,6 +3460,154 @@ mod tests {
             "unexpected warning: {}",
             transcript.warnings[0].error
         );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_transcript_falls_back_to_saved_thread_when_listing_fails() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "error": {
+                    "code": -32000,
+                    "message": "thread list unavailable"
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [codex_completed_app_server_turn(
+                        "turn_saved",
+                        "hello",
+                        "answer",
+                        1780000001,
+                        1780000007,
+                    )],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_saved"),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert!(transcript.resumable);
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "codex-app-server:thr_saved:turn_saved"
+        );
+        assert_eq!(
+            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
+            Some("thr_saved".to_string())
+        );
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(transcript.warnings[0].source_id, "codex-app-server");
+        assert!(
+            transcript.warnings[0]
+                .error
+                .contains("thread list unavailable"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_transcript_deduplicates_overlapping_thread_pages() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{"id": "thr_cli"}],
+                    "nextCursor": "threads-page-2",
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [codex_completed_app_server_turn(
+                        "turn_done",
+                        "hello",
+                        "answer",
+                        1780000001,
+                        1780000007,
+                    )],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 4,
+                "result": {
+                    "data": [{"id": "thr_cli"}],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    None,
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert!(transcript.resumable);
+        assert_eq!(transcript.turns.len(), 1);
+        let sent = sent.lock().expect("sent lock");
+        let turn_list_requests = sent
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str) == Some("thread/turns/list")
+            })
+            .count();
+        assert_eq!(turn_list_requests, 1);
     }
 
     #[tokio::test]
