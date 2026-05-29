@@ -229,9 +229,11 @@ LionClaw-owned link to one Codex CLI thread id stored in runtime-private state.
 Native TUI launches resume with `codex resume <threadID>` when that link exists.
 After native TUI exit, Codex exports completed turns through Codex's app-server
 `thread/list` and paged `thread/turns/list` protocol inside the same runtime
-boundary, enumerating newest history first, learning the current newest CLI
-thread as the continuation link, falling back to the saved link when listing
-cannot produce a current thread, and sorting before canonical import. OpenCode
+boundary, enumerating newest history first, recording the current newest CLI
+thread as the native UI continuation link, proving program-backed resumability
+separately from that thread's exported turn state, falling back to the saved
+link when listing cannot produce a current thread, and sorting before canonical
+import. OpenCode
 continuity is a LionClaw-owned link to one
 OpenCode root session id stored in runtime-private state. Program-backed
 OpenCode turns learn that id from OpenCode's machine-readable `sessionID`
@@ -239,10 +241,12 @@ events and then resume with `opencode run --session <sessionID>`. Native TUI
 launches resume with `opencode --session <sessionID>` when that link exists.
 After native TUI exit, LionClaw uses OpenCode's `session list --format json`
 only to identify the current newest root session in the same runtime boundary,
-then imports through `export <sessionID>` for that current linked session and,
-when different, the previously linked session. LionClaw does not depend on a
-private OpenCode SQLite schema and does not try to backfill an arbitrary
-session-list window.
+records it as the native UI continuation link, then imports through
+`export <sessionID>` for that current linked session and, when different, the
+previously linked session. Program-backed OpenCode resumability is proved
+separately from the current linked session's exported message state. LionClaw
+does not depend on a private OpenCode SQLite schema and does not try to backfill
+an arbitrary session-list window.
 The kernel imports those turns into canonical `session_turns` with deterministic
 source-derived ids, so reconciliation is idempotent. Reconciliation runs after
 process exit. Before launch, it runs only when LionClaw-owned runtime TUI state

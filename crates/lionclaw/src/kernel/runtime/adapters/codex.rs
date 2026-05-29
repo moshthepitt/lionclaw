@@ -29,7 +29,10 @@ use crate::{
     },
 };
 
-use super::state_file::{load_state_value, save_state_value};
+use super::{
+    state_file::{load_state_value, save_state_value},
+    TerminalTranscriptTarget,
+};
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
@@ -476,7 +479,7 @@ impl CodexRuntimeAdapter {
         let mut seen_cursors = HashSet::new();
         let mut turns = Vec::new();
         let mut warnings = Vec::new();
-        let mut target = CodexTerminalTranscriptTarget::default();
+        let mut target = TerminalTranscriptTarget::default();
         let mut seen_thread_ids = HashSet::new();
 
         loop {
@@ -514,7 +517,9 @@ impl CodexRuntimeAdapter {
                 if !seen_thread_ids.insert(thread.id.clone()) {
                     continue;
                 }
-                target.choose_if_empty(&thread.id);
+                if target.choose_if_empty(&thread.id) {
+                    save_thread_id(request.runtime_state_root, &thread.id)?;
+                }
                 match codex_app_server_thread_terminal_transcript(
                     client,
                     request.events,
@@ -526,12 +531,11 @@ impl CodexRuntimeAdapter {
                 {
                     Ok(thread_transcript) => {
                         if codex_record_app_server_thread_transcript(
-                            request.runtime_state_root,
                             &mut target,
                             &thread,
                             thread_transcript,
                             &mut turns,
-                        )? {
+                        ) {
                             warnings.push(RuntimeTerminalTranscriptWarning::new(
                                 format!("codex-app-server:{}", thread.id),
                                 codex_app_server_deadline_warning(
@@ -578,7 +582,9 @@ impl CodexRuntimeAdapter {
                     started_at: None,
                     finished_at: None,
                 };
-                target.choose_if_empty(&thread.id);
+                if target.choose_if_empty(&thread.id) {
+                    save_thread_id(request.runtime_state_root, &thread.id)?;
+                }
                 match codex_app_server_thread_terminal_transcript(
                     client,
                     request.events,
@@ -590,12 +596,11 @@ impl CodexRuntimeAdapter {
                 {
                     Ok(thread_transcript) => {
                         if codex_record_app_server_thread_transcript(
-                            request.runtime_state_root,
                             &mut target,
                             &thread,
                             thread_transcript,
                             &mut turns,
-                        )? {
+                        ) {
                             warnings.push(RuntimeTerminalTranscriptWarning::new(
                                 format!("codex-app-server:{}", thread.id),
                                 codex_app_server_deadline_warning(
@@ -802,54 +807,16 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-#[derive(Debug, Default)]
-struct CodexTerminalTranscriptTarget {
-    thread_id: Option<String>,
-    exported: bool,
-    resumable: bool,
-}
-
-impl CodexTerminalTranscriptTarget {
-    fn is_empty(&self) -> bool {
-        self.thread_id.is_none()
-    }
-
-    fn choose_if_empty(&mut self, thread_id: &str) {
-        if self.thread_id.is_none() {
-            self.thread_id = Some(thread_id.to_string());
-        }
-    }
-
-    fn record_export(
-        &mut self,
-        runtime_state_root: &Path,
-        thread: &CodexListedThread,
-        resumable: bool,
-    ) -> Result<()> {
-        if self.thread_id.as_deref() == Some(thread.id.as_str()) {
-            self.exported = true;
-            self.resumable = resumable;
-            save_thread_id(runtime_state_root, &thread.id)?;
-        }
-        Ok(())
-    }
-
-    fn resumable(&self) -> bool {
-        self.exported && self.resumable
-    }
-}
-
 fn codex_record_app_server_thread_transcript(
-    runtime_state_root: &Path,
-    target: &mut CodexTerminalTranscriptTarget,
+    target: &mut TerminalTranscriptTarget,
     thread: &CodexListedThread,
     transcript: CodexThreadTerminalTranscript,
     turns: &mut Vec<RuntimeTerminalTurn>,
-) -> Result<bool> {
-    target.record_export(runtime_state_root, thread, transcript.resumable)?;
+) -> bool {
+    target.record_export(&thread.id, transcript.resumable);
     let deadline_reached = transcript.deadline_reached;
     turns.extend(transcript.turns);
-    Ok(deadline_reached)
+    deadline_reached
 }
 
 fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
@@ -3381,7 +3348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_terminal_transcript_skips_failed_thread_turn_exports() {
+    async fn codex_terminal_transcript_tracks_failed_current_thread_without_resumability() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
             start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
@@ -3449,7 +3416,7 @@ mod tests {
         );
         assert_eq!(
             load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_good".to_string())
+            Some("thr_bad".to_string())
         );
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "codex-app-server:thr_bad");

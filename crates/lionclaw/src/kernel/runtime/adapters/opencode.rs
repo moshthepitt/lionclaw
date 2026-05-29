@@ -23,7 +23,10 @@ use crate::{
     },
 };
 
-use super::state_file::{load_state_value, save_state_value};
+use super::{
+    state_file::{load_state_value, save_state_value},
+    TerminalTranscriptTarget,
+};
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
 const OPENCODE_SESSION_ID_STATE_FILE: &str = ".lionclaw-opencode-session-id";
@@ -391,8 +394,12 @@ async fn export_opencode_terminal_transcript_with_cli(
         .latest_id
         .clone()
         .or_else(|| saved_session_id.clone());
-    let mut resumable = false;
-    let mut target_exported = false;
+    let mut target = TerminalTranscriptTarget::default();
+    if let Some(session_id) = target_session_id.as_deref() {
+        if target.choose_if_empty(session_id) {
+            save_opencode_session_id(&input.runtime_state_root, session_id)?;
+        }
+    }
 
     for session_id in
         opencode_reconcile_session_ids(target_session_id.as_deref(), saved_session_id.as_deref())
@@ -439,11 +446,7 @@ async fn export_opencode_terminal_transcript_with_cli(
         }
         match parse_opencode_export(&session_id, &export_output.stdout) {
             Ok(session_transcript) => {
-                if target_session_id.as_deref() == Some(session_id.as_str()) {
-                    target_exported = true;
-                    resumable = session_transcript.resumable;
-                    save_opencode_session_id(&input.runtime_state_root, &session_id)?;
-                }
+                target.record_export(&session_id, session_transcript.resumable);
                 turns.extend(session_transcript.turns);
             }
             Err(err) => warnings.push(RuntimeTerminalTranscriptWarning::new(
@@ -452,14 +455,17 @@ async fn export_opencode_terminal_transcript_with_cli(
             )),
         }
     }
-    resumable = target_exported && resumable;
 
     turns.sort_by(|left, right| {
         left.started_at
             .cmp(&right.started_at)
             .then_with(|| left.source_id.cmp(&right.source_id))
     });
-    Ok(RuntimeTerminalTranscript::new(turns, warnings, resumable))
+    Ok(RuntimeTerminalTranscript::new(
+        turns,
+        warnings,
+        target.resumable(),
+    ))
 }
 
 fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Error {
@@ -1691,7 +1697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_terminal_transcript_latest_failed_session_is_not_resumable() {
+    async fn opencode_terminal_transcript_tracks_failed_current_session_without_resumability() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -1727,7 +1733,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
                 .expect("saved session id"),
-            "ses_good\n"
+            "ses_bad\n"
         );
     }
 
