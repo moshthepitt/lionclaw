@@ -506,20 +506,21 @@ fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> 
         return Ok(OpenCodeListedSessions::default());
     }
 
-    let sessions = serde_json::from_slice::<Vec<OpenCodeSessionListItem>>(stdout)
+    let latest = serde_json::from_slice::<Vec<OpenCodeSessionListItem>>(stdout)
         .context("failed to parse OpenCode session list JSON")?;
-    for session in sessions {
-        if let Some(id) = normalize_opencode_session_id(&session.id) {
-            return Ok(OpenCodeListedSessions {
-                latest: TerminalTranscriptCandidate::new(
-                    id,
-                    opencode_session_list_updated_at(&session),
-                ),
-            });
-        }
-    }
+    let latest = latest
+        .into_iter()
+        .filter_map(|session| {
+            let id = normalize_opencode_session_id(&session.id)?;
+            TerminalTranscriptCandidate::new(id, opencode_session_list_updated_at(&session))
+        })
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
 
-    Ok(OpenCodeListedSessions::default())
+    Ok(OpenCodeListedSessions { latest })
 }
 
 fn opencode_session_list_updated_at(session: &OpenCodeSessionListItem) -> Option<DateTime<Utc>> {
@@ -1119,8 +1120,8 @@ mod tests {
     };
 
     use super::{
-        opencode_runtime_environment, parse_opencode_stdout, OpenCodeRuntimeAdapter,
-        OpenCodeRuntimeConfig, OPENCODE_SESSION_ID_STATE_FILE,
+        opencode_runtime_environment, parse_opencode_session_list, parse_opencode_stdout,
+        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, OPENCODE_SESSION_ID_STATE_FILE,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
@@ -1597,6 +1598,24 @@ mod tests {
         assert!(
             err.to_string().contains("cannot be a symlink"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn opencode_session_list_chooses_newest_timestamp_independent_of_order() {
+        let output = opencode_session_list_output_with_times(&[
+            ("ses_old", 1_000),
+            ("ses_new", 3_000),
+            ("ses_mid", 2_000),
+        ]);
+
+        let listed = parse_opencode_session_list(&output.stdout).expect("session list");
+
+        let latest = listed.latest.expect("latest session");
+        assert_eq!(latest.id, "ses_new");
+        assert_eq!(
+            latest.updated_at.expect("updated").timestamp_millis(),
+            3_000
         );
     }
 

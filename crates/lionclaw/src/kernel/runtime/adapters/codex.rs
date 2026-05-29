@@ -1079,11 +1079,8 @@ fn codex_app_server_terminal_turn_page(
         let terminal_turn =
             codex_app_server_terminal_turn(&thread.id, thread.started_at, thread.finished_at, turn);
         if index == 0 {
-            newest_turn_resumable = Some(
-                terminal_turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed),
-            );
+            newest_turn_resumable =
+                Some(terminal_turn.is_some() && codex_app_server_turn_has_completed_status(turn));
         }
         if let Some(turn) = terminal_turn {
             turns.push(turn);
@@ -1203,6 +1200,14 @@ fn codex_app_server_turn_status(
         .as_ref()
         .map(|_| "runtime.codex.turn_failed".to_string());
     (status, error_code, error_text)
+}
+
+fn codex_app_server_turn_has_completed_status(turn: &Value) -> bool {
+    turn.get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .is_some_and(|status| status.eq_ignore_ascii_case("completed"))
 }
 
 fn codex_app_server_terminal_turn_status(status: Option<&str>) -> RuntimeTerminalTurnStatus {
@@ -3907,6 +3912,87 @@ mod tests {
         assert_eq!(
             transcript.turns[0].source_id,
             "codex-app-server:thr_cli:turn_done"
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_transcript_resumability_requires_explicit_completed_status() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        let mut latest = codex_completed_app_server_turn(
+            "turn_missing_status",
+            "new prompt",
+            "new answer",
+            1780000010,
+            1780000017,
+        );
+        latest
+            .as_object_mut()
+            .expect("turn object")
+            .remove("status");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{"id": "thr_cli"}],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [
+                        latest,
+                        codex_completed_app_server_turn(
+                            "turn_done",
+                            "hello",
+                            "answer",
+                            1780000001,
+                            1780000007,
+                        )
+                    ],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_cli"),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert_eq!(transcript.turns.len(), 2);
+        assert_eq!(
+            transcript.turns[1].source_id,
+            "codex-app-server:thr_cli:turn_missing_status"
+        );
+        assert_eq!(
+            transcript.turns[1].status,
+            RuntimeTerminalTurnStatus::Completed
         );
         assert!(transcript.state.is_reconciled());
         assert!(!transcript.state.is_resumable());

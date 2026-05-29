@@ -250,12 +250,13 @@ events and then resume with `opencode run --session <sessionID>`. Native TUI
 launches resume with `opencode --session <sessionID>` when that link exists.
 After native TUI exit, LionClaw uses OpenCode's `session list --format json`
 only to identify whether the runtime moved to a newer root session during the
-launch, records the chosen root session as the native UI continuation link, then
+launch, choosing by exported update timestamp instead of relying on list order.
+It records the chosen root session as the native UI continuation link, then
 imports through `export <sessionID>` for that current linked session and, when
-different, the previously linked session. Program-backed OpenCode resumability is proved
-separately from the current linked session's exported message state. LionClaw
-does not depend on a private OpenCode SQLite schema and does not try to backfill
-an arbitrary session-list window.
+different, the previously linked session. Program-backed OpenCode resumability
+is proved separately from the current linked session's exported message state.
+LionClaw does not depend on a private OpenCode SQLite schema and does not try to
+backfill an arbitrary session-list window.
 The kernel imports those turns into canonical `session_turns` with deterministic
 source-derived ids, so reconciliation is idempotent. Reconciliation runs after
 process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
@@ -275,10 +276,10 @@ It marks the runtime session resumable only when that reconciled continuation
 target is valid from runtime-owned state and the latest continuation turn can be
 represented in LionClaw's canonical transcript. For Codex, the saved
 continuation thread must export cleanly far enough to prove its newest turn is
-completed and importable. For OpenCode, the linked continuation session must
-export cleanly and its raw message state must have a completed assistant
-answering the latest user message; older good sessions do not make the next
-`opencode run --session` safe.
+explicitly completed and importable. For OpenCode, the linked continuation
+session must export cleanly and its raw message state must have a completed
+assistant answering the latest user message; older good sessions do not make the
+next `opencode run --session` safe.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
