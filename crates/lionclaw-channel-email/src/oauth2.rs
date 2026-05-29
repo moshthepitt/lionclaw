@@ -825,7 +825,8 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         .state_file
         .unwrap_or_else(|| default_state_file(args.provider, &account));
     let env_file = args.env_file.unwrap_or_else(default_env_file);
-    validate_setup_file_paths(args.client_secret_json.as_deref(), &state_file, &env_file)?;
+    let (state_file, env_file) =
+        validate_setup_file_paths(args.client_secret_json.as_deref(), &state_file, &env_file)?;
     for param in &args.auth_params {
         validate_custom_authorization_param_name(&param.key)?;
     }
@@ -869,7 +870,7 @@ fn validate_setup_file_paths(
     client_secret_json: Option<&Path>,
     state_file: &Path,
     env_file: &Path,
-) -> Result<()> {
+) -> Result<(PathBuf, PathBuf)> {
     let state_file = normalize_output_path("--state-file", state_file)?;
     let env_file = normalize_output_path("--env-file", env_file)?;
     if state_file == env_file {
@@ -882,7 +883,7 @@ fn validate_setup_file_paths(
             bail!("OAuth client JSON must be different from --state-file and --env-file");
         }
     }
-    Ok(())
+    Ok((state_file, env_file))
 }
 
 fn normalize_output_path(name: &str, path: &Path) -> Result<PathBuf> {
@@ -1957,6 +1958,25 @@ mod tests {
             build_email_env_content(&setup, Path::new("/usr/local/bin/lionclaw-channel-email"));
 
         assert!(env_content.contains("EMAIL_ADMIN_DIGEST_TO=\n"));
+    }
+
+    #[test]
+    fn oauth2_setup_resolves_output_paths_before_rendering_token_command() {
+        let current_dir = env::current_dir().expect("current dir");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.state_file = Some(PathBuf::from("./oauth/state.json"));
+        args.env_file = Some(PathBuf::from("./email.env"));
+
+        let setup = resolve_setup(args).expect("setup");
+
+        assert_eq!(setup.state_file, current_dir.join("oauth/state.json"));
+        assert_eq!(setup.env_file, current_dir.join("email.env"));
+        let env_content =
+            build_email_env_content(&setup, Path::new("/usr/local/bin/lionclaw-channel-email"));
+        assert!(env_content.contains(&format!(
+            "--state-file {}",
+            shell_quote_arg(&current_dir.join("oauth/state.json").display().to_string())
+        )));
     }
 
     #[test]
