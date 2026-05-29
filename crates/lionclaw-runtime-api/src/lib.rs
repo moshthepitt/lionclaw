@@ -839,6 +839,12 @@ impl RuntimeExecutionContext {
             if component_count < best_component_count {
                 continue;
             }
+            if component_count == best_component_count
+                && matches!(&best_match, Some(RuntimePathProjectionResolution::Blocked))
+                && matches!(&resolution, RuntimePathProjectionResolution::Resolved(_))
+            {
+                continue;
+            }
             best_match = Some(resolution);
             best_component_count = component_count;
         }
@@ -1707,6 +1713,24 @@ mod tests {
         );
         assert_eq!(
             context.host_path_for_runtime_path("/runtime/lionclaw/channel-send.sock/../outside"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_execution_context_keeps_equal_depth_blocks_order_independent() {
+        let context = RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: None,
+            runtime_path_projections: vec![
+                RuntimePathProjection::exact("/runtime/channel.sock", "/tmp/channel.sock"),
+                RuntimePathProjection::directory("/runtime/channel.sock", "/tmp/channel-tree"),
+            ],
+        };
+
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/channel.sock/file"),
             None
         );
     }
