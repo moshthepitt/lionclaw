@@ -6,7 +6,11 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::protocol::{mailbox_id_for, normalize_address, CHANNEL_ID};
+use crate::{
+    auth::{MailboxAuthConfig, TokenCommand},
+    oauth2::{parse_command_from_args, parse_setup_command_from_args, Oauth2Command},
+    protocol::{mailbox_id_for, normalize_address, CHANNEL_ID},
+};
 
 const DEFAULT_POLL_MS: u64 = 30_000;
 const DEFAULT_PULL_LIMIT: usize = 10;
@@ -39,13 +43,12 @@ pub struct MailboxConfig {
     pub imap_port: u16,
     pub imap_tls: ImapTlsMode,
     pub imap_username: String,
-    pub imap_password: String,
     pub imap_mailbox: String,
     pub smtp_host: String,
     pub smtp_port: u16,
     pub smtp_tls: SmtpTlsMode,
     pub smtp_username: String,
-    pub smtp_password: String,
+    pub auth: MailboxAuthConfig,
     pub from_name: Option<String>,
     pub fetch_limit: usize,
     pub max_message_bytes: usize,
@@ -83,11 +86,22 @@ pub enum SmtpTlsMode {
 #[derive(Debug, Clone)]
 pub enum WorkerCommand {
     Run(Box<WorkerConfig>),
+    Oauth2(Oauth2Command),
     Help,
 }
 
 impl WorkerCommand {
     pub fn from_env_and_args() -> Result<Self> {
+        let args = env::args().skip(1).collect::<Vec<_>>();
+        if args.first().map(String::as_str) == Some("oauth2") {
+            return parse_command_from_args(args.into_iter().skip(1).collect())
+                .map(|command| command.map_or(Self::Help, Self::Oauth2));
+        }
+        if args.first().map(String::as_str) == Some("setup") {
+            return parse_setup_command_from_args(args.into_iter().skip(1).collect())
+                .map(|command| command.map_or(Self::Help, Self::Oauth2));
+        }
+
         let mut once = false;
         let mut poll_ms = env_u64("EMAIL_POLL_MS")?.unwrap_or(DEFAULT_POLL_MS);
         let mut pull_limit = env_usize("EMAIL_OUTBOX_PULL_LIMIT")?.unwrap_or(DEFAULT_PULL_LIMIT);
@@ -97,7 +111,7 @@ impl WorkerCommand {
             env_usize("EMAIL_MAX_MESSAGE_BYTES")?.unwrap_or(DEFAULT_MAX_MESSAGE_BYTES);
         validate_max_message_bytes(max_message_bytes)?;
 
-        let mut args = env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--once" => once = true,
@@ -159,6 +173,14 @@ impl WorkerCommand {
             smtp_port,
         )?;
         let sender_auth = parse_sender_auth_config(required_env("EMAIL_AUTH_RESULTS_HOST")?)?;
+        let auth = parse_mailbox_auth_config(
+            required_env("EMAIL_AUTH_MODE")?,
+            optional_env("EMAIL_IMAP_PASSWORD"),
+            optional_env("EMAIL_SMTP_PASSWORD"),
+            optional_env("EMAIL_XOAUTH2_TOKEN_CMD"),
+            imap_tls,
+            smtp_tls,
+        )?;
 
         Ok(Self::Run(Box::new(WorkerConfig {
             home,
@@ -178,7 +200,6 @@ impl WorkerCommand {
                 imap_port,
                 imap_tls,
                 imap_username: required_env("EMAIL_IMAP_USERNAME")?,
-                imap_password: required_env("EMAIL_IMAP_PASSWORD")?,
                 imap_mailbox: env::var("EMAIL_IMAP_MAILBOX")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
@@ -187,7 +208,7 @@ impl WorkerCommand {
                 smtp_port,
                 smtp_tls,
                 smtp_username: required_env("EMAIL_SMTP_USERNAME")?,
-                smtp_password: required_env("EMAIL_SMTP_PASSWORD")?,
+                auth,
                 from_name: optional_env("EMAIL_FROM_NAME"),
                 fetch_limit,
                 max_message_bytes,
@@ -254,6 +275,48 @@ fn validate_mailbox_id(name: &str, value: &str) -> Result<()> {
 fn parse_sender_auth_config(authserv_id: String) -> Result<SenderAuthConfig> {
     validate_authserv_id("EMAIL_AUTH_RESULTS_HOST", &authserv_id)?;
     Ok(SenderAuthConfig::AuthenticationResults { authserv_id })
+}
+
+fn parse_mailbox_auth_config(
+    mode: String,
+    imap_password: Option<String>,
+    smtp_password: Option<String>,
+    token_command: Option<String>,
+    imap_tls: ImapTlsMode,
+    smtp_tls: SmtpTlsMode,
+) -> Result<MailboxAuthConfig> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "basic" => {
+            if token_command.is_some() {
+                bail!("EMAIL_XOAUTH2_TOKEN_CMD requires EMAIL_AUTH_MODE=xoauth2");
+            }
+            Ok(MailboxAuthConfig::Basic {
+                imap_password: imap_password.ok_or_else(|| {
+                    anyhow!("EMAIL_IMAP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
+                })?,
+                smtp_password: smtp_password.ok_or_else(|| {
+                    anyhow!("EMAIL_SMTP_PASSWORD is required when EMAIL_AUTH_MODE=basic")
+                })?,
+            })
+        }
+        "xoauth2" => {
+            if imap_password.is_some() || smtp_password.is_some() {
+                bail!("EMAIL_IMAP_PASSWORD and EMAIL_SMTP_PASSWORD require EMAIL_AUTH_MODE=basic");
+            }
+            if matches!(imap_tls, ImapTlsMode::Insecure)
+                || matches!(smtp_tls, SmtpTlsMode::Insecure)
+            {
+                bail!("EMAIL_AUTH_MODE=xoauth2 requires TLS for both IMAP and SMTP");
+            }
+            let raw = token_command.ok_or_else(|| {
+                anyhow!("EMAIL_XOAUTH2_TOKEN_CMD is required when EMAIL_AUTH_MODE=xoauth2")
+            })?;
+            Ok(MailboxAuthConfig::Xoauth2TokenCommand {
+                token_command: TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &raw)?,
+            })
+        }
+        other => bail!("EMAIL_AUTH_MODE must be basic or xoauth2, got {other}"),
+    }
 }
 
 fn validate_authserv_id(name: &str, value: &str) -> Result<()> {
@@ -396,7 +459,9 @@ fn parse_next_usize(args: &mut impl Iterator<Item = String>, flag: &str) -> Resu
 
 fn print_help() {
     println!(
-        "lionclaw-channel-email [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS] [--fetch-limit N]"
+        "lionclaw-channel-email [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS] [--fetch-limit N]\n\
+         lionclaw-channel-email oauth2 setup --provider gmail --account EMAIL --client-secret-json PATH --env-file email.env\n\
+         lionclaw-channel-email oauth2 token --state-file PATH"
     );
 }
 
@@ -479,5 +544,56 @@ mod tests {
             }
         );
         assert!(parse_sender_auth_config("mx example".to_string()).is_err());
+    }
+
+    #[test]
+    fn mailbox_auth_basic_requires_passwords() {
+        let err = parse_mailbox_auth_config(
+            "basic".to_string(),
+            Some("imap-secret".to_string()),
+            None,
+            None,
+            ImapTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+        )
+        .expect_err("missing SMTP password should fail");
+
+        assert!(err.to_string().contains("EMAIL_SMTP_PASSWORD"));
+    }
+
+    #[test]
+    fn mailbox_auth_xoauth2_requires_token_command_and_tls() {
+        let err = parse_mailbox_auth_config(
+            "xoauth2".to_string(),
+            None,
+            None,
+            None,
+            ImapTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+        )
+        .expect_err("missing token command should fail");
+        assert!(err.to_string().contains("EMAIL_XOAUTH2_TOKEN_CMD"));
+
+        let err = parse_mailbox_auth_config(
+            "xoauth2".to_string(),
+            None,
+            None,
+            Some("/usr/local/bin/token".to_string()),
+            ImapTlsMode::Insecure,
+            SmtpTlsMode::StartTls,
+        )
+        .expect_err("insecure IMAP should fail");
+        assert!(err.to_string().contains("requires TLS"));
+
+        let err = parse_mailbox_auth_config(
+            "xoauth2".to_string(),
+            Some("imap-secret".to_string()),
+            None,
+            Some("/usr/local/bin/token".to_string()),
+            ImapTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+        )
+        .expect_err("passwords should not be accepted in xoauth2 mode");
+        assert!(err.to_string().contains("EMAIL_AUTH_MODE=basic"));
     }
 }

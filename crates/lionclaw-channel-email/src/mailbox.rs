@@ -13,11 +13,12 @@ use imap_client::{
         sequence::SequenceSet,
     },
 };
-use mail_send::{mail_builder::MessageBuilder, SmtpClientBuilder};
+use mail_send::{mail_builder::MessageBuilder, Credentials, SmtpClientBuilder};
 use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::{
+    auth::MailboxAuthConfig,
     config::{ImapTlsMode, MailboxConfig, SmtpTlsMode},
     mime::{parse_header_facts, HeaderFacts},
     protocol::{
@@ -200,17 +201,49 @@ impl RealMailboxEngine {
             }
         }
         .context("failed to connect to IMAP server")?;
-        client
-            .authenticate_plain(
-                self.config.imap_username.clone(),
-                self.config.imap_password.clone(),
-            )
-            .await
-            .context("failed to authenticate to IMAP server")?;
+        self.authenticate_imap(&mut client).await?;
         if let Err(err) = client.id(Some(Self::imap_id_params())).await {
             warn!(error = %err, "IMAP ID command failed");
         }
         Ok(client)
+    }
+
+    async fn authenticate_imap(&self, client: &mut ImapClient) -> Result<()> {
+        match &self.config.auth {
+            MailboxAuthConfig::Basic { imap_password, .. } => client
+                .authenticate_plain(self.config.imap_username.clone(), imap_password.clone())
+                .await
+                .context("failed to authenticate to IMAP server with basic auth"),
+            MailboxAuthConfig::Xoauth2TokenCommand { token_command } => {
+                let token = token_command
+                    .access_token()
+                    .await
+                    .context("failed to obtain XOAUTH2 access token for IMAP")?;
+                client
+                    .authenticate_xoauth2(self.config.imap_username.clone(), token)
+                    .await
+                    .context("failed to authenticate to IMAP server with XOAUTH2")
+            }
+        }
+    }
+
+    async fn smtp_credentials(&self) -> Result<Credentials<String>> {
+        match &self.config.auth {
+            MailboxAuthConfig::Basic { smtp_password, .. } => Ok(Credentials::new(
+                self.config.smtp_username.clone(),
+                smtp_password.clone(),
+            )),
+            MailboxAuthConfig::Xoauth2TokenCommand { token_command } => {
+                let token = token_command
+                    .access_token()
+                    .await
+                    .context("failed to obtain XOAUTH2 access token for SMTP")?;
+                Ok(Credentials::new_xoauth2(
+                    self.config.smtp_username.clone(),
+                    token,
+                ))
+            }
+        }
     }
 
     fn imap_id_params() -> Vec<(IString<'static>, NString<'static>)> {
@@ -552,12 +585,10 @@ impl MailboxEngine for RealMailboxEngine {
             );
         }
 
-        let builder = SmtpClientBuilder::new(self.config.smtp_host.as_str(), self.config.smtp_port)
+        let credentials = self.smtp_credentials().await?;
+        let builder = SmtpClientBuilder::new(self.config.smtp_host.clone(), self.config.smtp_port)
             .map_err(|err| anyhow!("failed to build SMTP client: {err}"))?
-            .credentials((
-                self.config.smtp_username.as_str(),
-                self.config.smtp_password.as_str(),
-            ));
+            .credentials(credentials);
         match self.config.smtp_tls {
             SmtpTlsMode::Implicit | SmtpTlsMode::StartTls => {
                 let mut client = builder
@@ -838,13 +869,15 @@ mod tests {
             imap_port: 993,
             imap_tls: ImapTlsMode::Implicit,
             imap_username: "assistant@example.com".to_string(),
-            imap_password: "secret".to_string(),
             imap_mailbox: "INBOX".to_string(),
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             smtp_tls: SmtpTlsMode::StartTls,
             smtp_username: "assistant@example.com".to_string(),
-            smtp_password: "secret".to_string(),
+            auth: MailboxAuthConfig::Basic {
+                imap_password: "secret".to_string(),
+                smtp_password: "secret".to_string(),
+            },
             from_name: Some("LionClaw".to_string()),
             fetch_limit: 25,
             max_message_bytes: crate::config::DEFAULT_MAX_MESSAGE_BYTES,

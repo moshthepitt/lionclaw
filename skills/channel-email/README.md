@@ -39,6 +39,12 @@ metadata only even when a permanent sender grant or one-shot release exists. A
 release approves a specific held message from an authenticated sender; it does
 not override failed provider sender authentication.
 
+Held-mail operator digests are sent directly by the channel worker through the
+same mailbox transport, not through LionClaw's user-facing outbox. Each delivery
+attempt is recorded in worker-local SQLite and reported through normal channel
+health so `doctor` can show digest delivery failures without contacting the
+mailbox provider.
+
 Processed IMAP candidates are marked seen in the dedicated mailbox after they
 are held, suppressed, or admitted. This avoids reprocessing the same unread
 window forever under fixed-size polling and keeps the channel's local held-mail
@@ -87,11 +93,14 @@ label:
 
 Run this only with a dedicated mailbox, not a personal inbox.
 
+### Basic Auth
+
 ```bash
 cd "$PROJ_A"
 cat > email.env <<'EOF'
 EMAIL_ADDRESS=assistant@example.com
 EMAIL_AUTH_RESULTS_HOST=mx.example.com
+EMAIL_AUTH_MODE=basic
 EMAIL_IMAP_HOST=imap.example.com
 EMAIL_IMAP_USERNAME=assistant@example.com
 EMAIL_IMAP_PASSWORD=...
@@ -106,6 +115,105 @@ EOF
 "$LIONCLAW_BIN" connect email --env-file ./email.env
 "$LIONCLAW_BIN" doctor
 ```
+
+### OAuth2 / XOAUTH2
+
+For providers that require OAuth, use the provider profile on `connect`.
+LionClaw installs the bundled email channel snapshot, runs the channel's setup
+helper from that snapshot, stores the generated channel env in the selected
+instance home, and starts the background worker. The generated env points
+`EMAIL_XOAUTH2_TOKEN_CMD` back to `lionclaw-channel-email oauth2 token`, so the
+worker refreshes access tokens through the same packaged channel binary.
+On a TTY, `"$LIONCLAW_BIN" connect email` starts the same setup helper as a
+guided prompt.
+
+Gmail:
+
+```bash
+cd "$PROJ_A"
+"$LIONCLAW_BIN" connect email gmail \
+  --account assistant@gmail.com \
+  --client-secret-json "$HOME/Downloads/client_secret_desktop.json" \
+  --admin-to operator@example.com
+"$LIONCLAW_BIN" doctor
+```
+
+The Google OAuth desktop client JSON is the credentials file downloaded from a
+Google Cloud OAuth client whose application type is `Desktop app`. It contains
+the OAuth `client_id` and client metadata for your own Google Cloud project; it
+is not the mailbox password. Add the mailbox account as a test user if the
+consent screen is still in testing. The Gmail preset uses `imap.gmail.com:993`,
+`smtp.gmail.com:587`, `mx.google.com`, and the `https://mail.google.com/`
+scope. Google device-code OAuth is not suitable for Gmail IMAP/SMTP because
+Google's limited-input device flow does not include the Gmail mail scope. Use
+the default loopback browser flow; on a remote shell, run with a fixed `--port`
+and forward that port to `127.0.0.1`.
+See Google's [Gmail IMAP/SMTP documentation][gmail-imap-smtp],
+[XOAUTH2 mechanism documentation][gmail-xoauth2], and
+[limited-input device flow documentation][google-device-flow].
+
+Microsoft 365 and Outlook.com:
+
+```bash
+cd "$PROJ_A"
+"$LIONCLAW_BIN" connect email microsoft365 \
+  --tenant common \
+  --account assistant@example.com \
+  --client-id 00000000-0000-0000-0000-000000000000 \
+  --auth-results-host mx.example.com \
+  --admin-to operator@example.com
+"$LIONCLAW_BIN" doctor
+```
+
+Register the Microsoft app as a public/native client, add
+`http://localhost/oauth2/callback` as a redirect URI, and grant delegated
+permissions for IMAP and SMTP. Microsoft ignores the ephemeral port for
+matching localhost redirect URIs. The Microsoft preset uses
+`outlook.office365.com:993`, `smtp.office365.com:587`, and the documented
+delegated scopes `offline_access`,
+`https://outlook.office.com/IMAP.AccessAsUser.All`, and
+`https://outlook.office.com/SMTP.Send`. Microsoft mailbox
+`Authentication-Results` authserv-ids vary by tenant and routing path, so set
+`--auth-results-host` from trusted provider headers for the dedicated mailbox.
+See Microsoft's [IMAP/SMTP OAuth documentation][ms-imap-smtp-oauth] and
+[redirect URI documentation][ms-redirect-uri].
+
+Other OAuth2 IMAP/SMTP providers use the same connect form with explicit
+provider facts:
+
+```bash
+"$LIONCLAW_BIN" connect email generic \
+  --account assistant@example.com \
+  --client-id client-id \
+  --auth-url https://accounts.example.com/oauth2/authorize \
+  --token-url https://accounts.example.com/oauth2/token \
+  --scope imap.send \
+  --scope smtp.send \
+  --auth-results-host mx.example.com \
+  --imap-host imap.example.com \
+  --smtp-host smtp.example.com
+```
+
+To replace existing OAuth state for the same provider/account, pass `--force`
+after the provider profile. For direct helper use outside `connect`, the same
+implementation remains available:
+
+```bash
+EMAIL_CHANNEL_BIN="${EMAIL_CHANNEL_BIN:-$(command -v lionclaw-channel-email)}"
+"$EMAIL_CHANNEL_BIN" oauth2 setup \
+  --provider gmail \
+  --account assistant@gmail.com \
+  --client-secret-json "$HOME/Downloads/client_secret_desktop.json" \
+  --env-file ./email.env
+"$LIONCLAW_BIN" connect email --env-file ./email.env
+```
+
+The generated `EMAIL_XOAUTH2_TOKEN_CMD` starts with the absolute installed
+channel helper path. The worker parses arguments, executes the helper without a
+shell, closes stdin, drops stderr, reads one UTF-8 access token from stdout,
+enforces a 10 second timeout and a 16 KiB stdout cap, and never logs the token.
+OAuth refresh state is stored in a private local state file; LionClaw consumes
+only the short-lived access token and never projects it to runtimes.
 
 `EMAIL_AUTH_RESULTS_HOST` must match the mailbox provider's trusted
 `Authentication-Results` authserv-id, such as `mx.google.com` for many Gmail
@@ -136,9 +244,12 @@ Expected when credentials are available:
 - admitted email uses `thread_actor` session binding so separate threads from
   the same sender do not share runtime history
 - an unknown non-automated sender is held and does not queue runtime work
-- the held-mail digest includes held id, sender, subject, snippet, attachment
-  count, sender/conversation/thread refs, and hold-reason-specific approval or
-  release guidance
+- the held-mail digest includes held id, sender, subject, date, size,
+  attachment count, sender-auth verdict, sender/conversation/thread/message
+  refs, held reason, and hold-reason-specific approval, block, or release
+  guidance without downloading provider body previews
+- failed held-mail digest sends are recorded in worker-local audit state and
+  appear in `doctor` through the `email.digest` worker health check
 - `channel pairing approve email --sender-ref ... --label email-release:<held-id>`
   releases only that held item once, leaves mismatched mail held, and is
   consumed after a terminal local outcome
@@ -147,6 +258,10 @@ Expected when credentials are available:
   including later one-shot release of held mail already known to exceed the cap
 - attachments are staged only after admission
 - repeated outbox delivery attempts do not send duplicate SMTP replies
+- public OAuth smoke starts with Microsoft OAuth + IMAP TLS + held unknown
+  sender + approval + post-admission body fetch + SMTP reply; run Gmail OAuth
+  as a separate smoke with loopback, SSH-forwarded loopback, or pre-provisioned
+  helper state; keep generic IMAP/SMTP smoke coverage for non-OAuth providers
 
 ## Packaged Assets
 
@@ -154,3 +269,9 @@ Packaged builds that include this channel must keep these assets together:
 
 - `lionclaw-channel-email`
 - `skills/channel-email/`
+
+[gmail-imap-smtp]: https://developers.google.com/gmail/imap/imap-smtp
+[gmail-xoauth2]: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
+[google-device-flow]: https://developers.google.com/identity/protocols/oauth2/limited-input-device
+[ms-imap-smtp-oauth]: https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
+[ms-redirect-uri]: https://learn.microsoft.com/en-us/entra/identity-platform/reply-url

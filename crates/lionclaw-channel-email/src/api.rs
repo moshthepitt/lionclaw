@@ -125,6 +125,14 @@ pub struct ChannelAttachmentDescriptor {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ChannelHealthCheckReport {
+    pub code: String,
+    pub status: String,
+    pub message: String,
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChannelInboundRequest {
     pub channel_id: String,
     pub event_id: String,
@@ -324,9 +332,7 @@ impl LionClawApi {
         channel_id: &str,
         worker_id: &str,
         status: &str,
-        code: &str,
-        message: &str,
-        details: Value,
+        checks: Vec<ChannelHealthCheckReport>,
     ) -> Result<()> {
         let _: Value = self
             .post_json(
@@ -335,12 +341,7 @@ impl LionClawApi {
                     "channel_id": channel_id,
                     "reporter_id": worker_id,
                     "status": status,
-                    "checks": [{
-                        "code": code,
-                        "status": status,
-                        "message": message,
-                        "details": details,
-                    }],
+                    "checks": checks,
                     "observed_at": Utc::now(),
                 }),
             )

@@ -1,8 +1,10 @@
 mod api;
+mod auth;
 mod classifier;
 mod config;
 mod mailbox;
 mod mime;
+mod oauth2;
 mod protocol;
 mod store;
 mod worker;
@@ -25,6 +27,7 @@ async fn main() -> Result<()> {
 
     match WorkerCommand::from_env_and_args()? {
         WorkerCommand::Run(config) => EmailWorker::new(*config, RealMailboxFactory)?.run().await?,
+        WorkerCommand::Oauth2(command) => oauth2::run(command).await?,
         WorkerCommand::Help => {}
     }
 

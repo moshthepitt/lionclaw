@@ -54,6 +54,9 @@ pub struct HeldItem {
     pub snippet: String,
     pub received_at: Option<String>,
     pub attachment_count: i64,
+    pub rfc822_size: Option<i64>,
+    pub sender_auth_policy: Option<String>,
+    pub sender_auth_authenticated: Option<bool>,
     pub classification_reason: Option<String>,
 }
 
@@ -88,6 +91,45 @@ pub struct PendingGrantConsumptionInput<'a> {
     pub held_id: &'a str,
     pub expected_label: &'a str,
     pub last_error: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldDigestAttemptStatus {
+    Delivered,
+    Failed,
+}
+
+impl HeldDigestAttemptStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeldDigestAttemptInput<'a> {
+    pub delivery_id: &'a str,
+    pub status: HeldDigestAttemptStatus,
+    pub held_count: i64,
+    pub suppressed_count: i64,
+    pub last_held_digest_rowid: Option<i64>,
+    pub error_code: Option<&'a str>,
+    pub error_text: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldDigestAttempt {
+    pub attempt_id: String,
+    pub delivery_id: String,
+    pub status: HeldDigestAttemptStatus,
+    pub held_count: i64,
+    pub suppressed_count: i64,
+    pub last_held_digest_rowid: Option<i64>,
+    pub error_code: Option<String>,
+    pub error_text: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +227,25 @@ impl EmailStore {
                 held_id TEXT NOT NULL,
                 expected_label TEXT NOT NULL,
                 last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS held_digest_attempts (
+                attempt_id TEXT PRIMARY KEY NOT NULL,
+                delivery_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                held_count INTEGER NOT NULL,
+                suppressed_count INTEGER NOT NULL,
+                last_held_digest_rowid INTEGER,
+                error_code TEXT,
+                error_text TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -538,7 +599,8 @@ impl EmailStore {
             SELECT rowid AS digest_rowid,
                    held_id, event_id, sender_ref, conversation_ref, thread_ref, message_ref,
                    sender_address, sender_name, subject, snippet, received_at,
-                   attachment_count, classification_reason
+                   attachment_count, rfc822_size, sender_auth_policy,
+                   sender_auth_authenticated, classification_reason
             FROM mail_items
             WHERE status = 'held' AND rowid > ?
             ORDER BY rowid ASC
@@ -569,6 +631,11 @@ impl EmailStore {
                     snippet: row.try_get("snippet")?,
                     received_at: row.try_get("received_at")?,
                     attachment_count: row.try_get("attachment_count")?,
+                    rfc822_size: row.try_get("rfc822_size")?,
+                    sender_auth_policy: row.try_get("sender_auth_policy")?,
+                    sender_auth_authenticated: row
+                        .try_get::<Option<i64>, _>("sender_auth_authenticated")?
+                        .map(|value| value != 0),
                     classification_reason: row.try_get("classification_reason")?,
                 })
             })
@@ -613,6 +680,71 @@ impl EmailStore {
     pub async fn mark_digest_attempt_now(&self) -> Result<()> {
         self.set_state_value(LAST_DIGEST_ATTEMPT_AT_KEY, &Utc::now().to_rfc3339())
             .await
+    }
+
+    pub async fn record_held_digest_attempt(
+        &self,
+        attempt: HeldDigestAttemptInput<'_>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO held_digest_attempts (
+                attempt_id, delivery_id, status, held_count, suppressed_count,
+                last_held_digest_rowid, error_code, error_text, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::protocol::short_hash(&format!(
+            "{}:{}:{}:{}",
+            attempt.delivery_id,
+            attempt.status.as_str(),
+            attempt.held_count,
+            now
+        )))
+        .bind(attempt.delivery_id)
+        .bind(attempt.status.as_str())
+        .bind(attempt.held_count)
+        .bind(attempt.suppressed_count)
+        .bind(attempt.last_held_digest_rowid)
+        .bind(attempt.error_code)
+        .bind(attempt.error_text)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_held_digest_attempt(&self) -> Result<Option<HeldDigestAttempt>> {
+        let Some(row) = sqlx::query(
+            r#"
+            SELECT attempt_id, delivery_id, status, held_count, suppressed_count,
+                   last_held_digest_rowid, error_code, error_text, updated_at
+            FROM held_digest_attempts
+            ORDER BY created_at DESC, attempt_id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let attempt_id: String = row.try_get("attempt_id")?;
+        let status: String = row.try_get("status")?;
+        Ok(Some(HeldDigestAttempt {
+            attempt_id: attempt_id.clone(),
+            delivery_id: row.try_get("delivery_id")?,
+            status: parse_digest_attempt_status(&status, &attempt_id)?,
+            held_count: row.try_get("held_count")?,
+            suppressed_count: row.try_get("suppressed_count")?,
+            last_held_digest_rowid: row.try_get("last_held_digest_rowid")?,
+            error_code: row.try_get("error_code")?,
+            error_text: row.try_get("error_text")?,
+            updated_at: row.try_get("updated_at")?,
+        }))
     }
 
     pub async fn thread_context(
@@ -827,6 +959,14 @@ fn parse_mail_status(status: &str, event_id: &str) -> Result<MailStatus> {
         "suppressed" => Ok(MailStatus::Suppressed),
         "admitted" => Ok(MailStatus::Admitted),
         other => bail!("unknown email mail status '{other}' for event {event_id}"),
+    }
+}
+
+fn parse_digest_attempt_status(status: &str, attempt_id: &str) -> Result<HeldDigestAttemptStatus> {
+    match status {
+        "delivered" => Ok(HeldDigestAttemptStatus::Delivered),
+        "failed" => Ok(HeldDigestAttemptStatus::Failed),
+        other => bail!("unknown held digest attempt status '{other}' for attempt {attempt_id}"),
     }
 }
 

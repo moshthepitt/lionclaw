@@ -271,8 +271,10 @@ Transport-specific setup, commands, webhook behavior, attachment formats,
 reactions, and delivery rendering belong in the owning channel skill directory.
 Run the relevant owning skill checklist under `skills/` for channel-specific
 behavior. For example, email acceptance lives in
-`skills/channel-email/README.md`, and Telegram acceptance lives in
-`skills/channel-telegram/README.md`.
+`skills/channel-email/README.md`, including the basic auth, OAuth2/XOAUTH2
+`lionclaw connect email <provider>` setup flow, held-mail digest, and provider
+smoke checks. Telegram
+acceptance lives in `skills/channel-telegram/README.md`.
 
 When a real credential-backed channel is available, configure it through its
 own skill docs, then record the generic kernel checks here:

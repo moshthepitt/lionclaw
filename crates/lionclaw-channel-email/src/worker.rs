@@ -13,9 +13,9 @@ pub use crate::mailbox::RealMailboxFactory;
 
 use crate::{
     api::{
-        ChannelAttachmentDescriptor, ChannelAttachmentMissingReport, ChannelInboundRequest,
-        ChannelOutboxAttachment, ChannelOutboxDelivery, ChannelOutboxReportInput,
-        DaemonInfoResponse, LionClawApi,
+        ChannelAttachmentDescriptor, ChannelAttachmentMissingReport, ChannelHealthCheckReport,
+        ChannelInboundRequest, ChannelOutboxAttachment, ChannelOutboxDelivery,
+        ChannelOutboxReportInput, DaemonInfoResponse, LionClawApi,
     },
     classifier::{classify_headers, MailClassification},
     config::{validate_max_message_bytes, SenderAuthConfig, WorkerConfig},
@@ -34,7 +34,8 @@ use crate::{
         INBOUND_TRIGGER,
     },
     store::{
-        held_id_for, EmailStore, HeldItem, MailStatus, PendingGrantConsumptionInput, ThreadContext,
+        held_id_for, EmailStore, HeldDigestAttemptInput, HeldDigestAttemptStatus, HeldItem,
+        MailStatus, PendingGrantConsumptionInput, ThreadContext,
     },
 };
 
@@ -133,15 +134,26 @@ where
         let store = EmailStore::open(&self.config.state_dir).await?;
         let mut mailbox = self.mailbox_factory.open(self.config.mailbox.clone());
 
-        self.report_ready(&worker_id, &daemon).await;
-        self.process_pending_release_consumptions(&store).await?;
-        self.process_held_releases(&store, mailbox.as_mut(), &worker_id)
+        let result = self
+            .process_tick(&store, mailbox.as_mut(), &worker_id)
+            .await;
+        self.report_health(&worker_id, &daemon, &store, result.as_ref().err())
+            .await;
+        result
+    }
+
+    async fn process_tick(
+        &self,
+        store: &EmailStore,
+        mailbox: &mut dyn MailboxEngine,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.process_pending_release_consumptions(store).await?;
+        self.process_held_releases(store, mailbox, worker_id)
             .await?;
-        self.process_inbound(&store, mailbox.as_mut(), &worker_id)
-            .await?;
-        self.process_outbox(&store, mailbox.as_mut(), &worker_id)
-            .await?;
-        self.process_digest(&store, mailbox.as_mut()).await?;
+        self.process_inbound(store, mailbox, worker_id).await?;
+        self.process_outbox(store, mailbox, worker_id).await?;
+        self.process_digest(store, mailbox).await?;
 
         Ok(())
     }
@@ -765,9 +777,9 @@ where
         let text = digest_text(&self.config.mailbox.address, &held, suppressed_count);
         let delivery_id =
             digest_delivery_id(&self.config.mailbox.mailbox_id, &held, suppressed_count);
-        mailbox
+        let send_result = mailbox
             .send_threaded_reply(OutboundEmail {
-                delivery_id,
+                delivery_id: delivery_id.clone(),
                 to: admin_to.to_string(),
                 subject: format!("LionClaw email digest for {}", self.config.mailbox.address),
                 text,
@@ -775,8 +787,37 @@ where
                 references: Vec::new(),
                 attachments: Vec::new(),
             })
-            .await
-            .context("failed to send held-mail digest")?;
+            .await;
+        match send_result {
+            Ok(_) => {
+                store
+                    .record_held_digest_attempt(HeldDigestAttemptInput {
+                        delivery_id: &delivery_id,
+                        status: HeldDigestAttemptStatus::Delivered,
+                        held_count: i64::try_from(held.len()).unwrap_or(i64::MAX),
+                        suppressed_count,
+                        last_held_digest_rowid: held.last().map(|item| item.digest_rowid),
+                        error_code: None,
+                        error_text: None,
+                    })
+                    .await?;
+            }
+            Err(err) => {
+                let error_text = redact_error_text(&err.to_string());
+                store
+                    .record_held_digest_attempt(HeldDigestAttemptInput {
+                        delivery_id: &delivery_id,
+                        status: HeldDigestAttemptStatus::Failed,
+                        held_count: i64::try_from(held.len()).unwrap_or(i64::MAX),
+                        suppressed_count,
+                        last_held_digest_rowid: held.last().map(|item| item.digest_rowid),
+                        error_code: Some("digest_send_failed"),
+                        error_text: Some(&error_text),
+                    })
+                    .await?;
+                return Err(err).context("failed to send held-mail digest");
+            }
+        }
         store.mark_digest_sent(&held).await?;
         Ok(())
     }
@@ -905,14 +946,17 @@ where
         }
     }
 
-    async fn report_ready(&self, worker_id: &str, daemon: &DaemonInfoResponse) {
-        let _ = self
-            .api
-            .report_health(
-                &self.config.channel_id,
-                worker_id,
-                "ok",
+    async fn report_health(
+        &self,
+        worker_id: &str,
+        daemon: &DaemonInfoResponse,
+        store: &EmailStore,
+        tick_error: Option<&anyhow::Error>,
+    ) {
+        let mut checks = vec![
+            health_check(
                 "email.ready",
+                "ok",
                 "email worker is running",
                 json!({
                     "mailbox_id": self.config.mailbox.mailbox_id,
@@ -920,9 +964,101 @@ where
                     "home": self.config.home.display().to_string(),
                     "daemon_bind_addr": daemon.bind_addr,
                 }),
-            )
+            ),
+            health_check(
+                "email.auth",
+                "ok",
+                format!(
+                    "mailbox auth mode is {}",
+                    self.config.mailbox.auth.mode_name()
+                ),
+                json!({
+                    "mode": self.config.mailbox.auth.mode_name(),
+                }),
+            ),
+        ];
+
+        checks.push(self.digest_health_check(store).await);
+        if let Some(err) = tick_error {
+            checks.push(health_check(
+                "email.tick",
+                "error",
+                format!(
+                    "email worker tick failed: {}",
+                    redact_error_text(&err.to_string())
+                ),
+                json!({}),
+            ));
+        }
+        let status = aggregate_health_status(&checks);
+        let _ = self
+            .api
+            .report_health(&self.config.channel_id, worker_id, status, checks)
             .await
             .inspect_err(|err| warn!(error = %err, "failed to report email health"));
+    }
+
+    async fn digest_health_check(&self, store: &EmailStore) -> ChannelHealthCheckReport {
+        if self.config.digest.admin_to.is_none() {
+            return health_check(
+                "email.digest",
+                "ok",
+                "held-mail digest delivery is disabled",
+                json!({ "enabled": false }),
+            );
+        }
+
+        match store.latest_held_digest_attempt().await {
+            Ok(Some(attempt)) if attempt.status == HeldDigestAttemptStatus::Failed => health_check(
+                "email.digest",
+                "warning",
+                format!(
+                    "last held-mail digest delivery failed; retry pending: {}",
+                    attempt
+                        .error_text
+                        .as_deref()
+                        .or(attempt.error_code.as_deref())
+                        .unwrap_or("unknown error")
+                ),
+                json!({
+                    "enabled": true,
+                    "latest_status": "failed",
+                    "delivery_id": attempt.delivery_id,
+                    "held_count": attempt.held_count,
+                    "suppressed_count": attempt.suppressed_count,
+                    "error_code": attempt.error_code,
+                    "updated_at": attempt.updated_at,
+                }),
+            ),
+            Ok(Some(attempt)) => health_check(
+                "email.digest",
+                "ok",
+                "last held-mail digest delivery succeeded",
+                json!({
+                    "enabled": true,
+                    "latest_status": "delivered",
+                    "delivery_id": attempt.delivery_id,
+                    "held_count": attempt.held_count,
+                    "suppressed_count": attempt.suppressed_count,
+                    "updated_at": attempt.updated_at,
+                }),
+            ),
+            Ok(None) => health_check(
+                "email.digest",
+                "ok",
+                "held-mail digest delivery has not run yet",
+                json!({ "enabled": true }),
+            ),
+            Err(err) => health_check(
+                "email.digest",
+                "warning",
+                format!(
+                    "held-mail digest audit is unavailable: {}",
+                    redact_error_text(&err.to_string())
+                ),
+                json!({ "enabled": true }),
+            ),
+        }
     }
 
     fn worker_id(&self, daemon: &DaemonInfoResponse) -> String {
@@ -1414,11 +1550,20 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
             lines.push(format!("Held ID: {}", item.held_id));
             lines.push(format!("From: {}", item.sender_address));
             lines.push(format!("Subject: {}", item.subject));
-            if let Some(received_at) = &item.received_at {
-                lines.push(format!("Received: {received_at}"));
-            }
+            lines.push(format!(
+                "Received: {}",
+                item.received_at.as_deref().unwrap_or("unknown")
+            ));
+            lines.push(format!("Size: {}", message_size_text(item.rfc822_size)));
             lines.push(format!("Snippet: {}", item.snippet));
             lines.push(format!("Attachments: {}", item.attachment_count));
+            lines.push(format!(
+                "Sender auth: {}",
+                sender_auth_text(
+                    item.sender_auth_policy.as_deref(),
+                    item.sender_auth_authenticated
+                )
+            ));
             lines.push(format!("Sender ref: {}", item.sender_ref));
             lines.push(format!("Conversation ref: {}", item.conversation_ref));
             lines.push(format!("Thread ref: {}", item.thread_ref));
@@ -1449,6 +1594,22 @@ fn digest_text(mailbox_address: &str, held: &[HeldItem], suppressed_count: i64) 
         }
     }
     lines.join("\n")
+}
+
+fn message_size_text(size: Option<i64>) -> String {
+    size.map(|value| format!("{value} bytes"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn sender_auth_text(policy: Option<&str>, authenticated: Option<bool>) -> String {
+    match (policy, authenticated) {
+        (Some(policy), Some(true)) => format!("{policy}: pass"),
+        (Some(policy), Some(false)) => format!("{policy}: fail"),
+        (Some(policy), None) => policy.to_string(),
+        (None, Some(true)) => "pass".to_string(),
+        (None, Some(false)) => "fail".to_string(),
+        (None, None) => "not evaluated".to_string(),
+    }
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -1498,6 +1659,51 @@ fn validate_local_daemon(info: &DaemonInfoResponse, expected_home: &Path) -> Res
     Ok(())
 }
 
+fn health_check(
+    code: impl Into<String>,
+    status: impl Into<String>,
+    message: impl Into<String>,
+    details: Value,
+) -> ChannelHealthCheckReport {
+    ChannelHealthCheckReport {
+        code: code.into(),
+        status: status.into(),
+        message: message.into(),
+        details,
+    }
+}
+
+fn aggregate_health_status(checks: &[ChannelHealthCheckReport]) -> &'static str {
+    if checks.iter().any(|check| check.status == "error") {
+        "error"
+    } else if checks.iter().any(|check| check.status == "warning") {
+        "warning"
+    } else {
+        "ok"
+    }
+}
+
+fn redact_error_text(raw: &str) -> String {
+    let one_line = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == '\r' || ch == '\n' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let trimmed = one_line.trim();
+    let mut chars = trimmed.chars();
+    let preview = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 fn retryable(code: &'static str, err: anyhow::Error) -> DeliveryResult {
     DeliveryResult::RetryableFailed {
         code,
@@ -1532,6 +1738,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        auth::MailboxAuthConfig,
         config::{
             DigestConfig, ImapTlsMode, MailboxConfig, SenderAuthConfig, SmtpTlsMode,
             DEFAULT_MAX_MESSAGE_BYTES,
@@ -1776,12 +1983,18 @@ mod tests {
             snippet: held_body_not_downloaded_text().to_string(),
             received_at: None,
             attachment_count: 0,
+            rfc822_size: Some(128),
+            sender_auth_policy: None,
+            sender_auth_authenticated: None,
             classification_reason: Some("approval_required".to_string()),
         }];
 
         let text = digest_text("assistant@example.com", &held, 0);
 
         assert!(text.contains("Sender ref: email:addr:bad;'$(touch /tmp/pwn)'@example.com"));
+        assert!(text.contains("Received: unknown"));
+        assert!(text.contains("Size: 128 bytes"));
+        assert!(text.contains("Sender auth: not evaluated"));
         assert!(text.contains(&format!(
             "--sender-ref {}",
             shell_quote("email:addr:bad;'$(touch /tmp/pwn)'@example.com")
@@ -1808,12 +2021,16 @@ mod tests {
             snippet: held_body_not_downloaded_text().to_string(),
             received_at: None,
             attachment_count: 0,
+            rfc822_size: Some(128),
+            sender_auth_policy: Some("mx.example.com".to_string()),
+            sender_auth_authenticated: Some(false),
             classification_reason: Some("sender_authentication_required".to_string()),
         }];
 
         let text = digest_text("assistant@example.com", &held, 0);
 
         assert!(text.contains("Approve future authenticated mail:"));
+        assert!(text.contains("Sender auth: mx.example.com: fail"));
         assert!(text.contains("Release once: unavailable because sender authentication failed."));
         assert!(!text.contains("--label 'email-release:hld_auth_failed'"));
     }
@@ -2551,6 +2768,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn held_digest_delivery_is_audited_and_reported_in_health() {
+        let fixture = EmailFixture::new(false).await;
+        let mut config = fixture.config();
+        config.digest.admin_to = Some("operator@example.com".to_string());
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
+
+        worker.tick().await.expect("digest tick");
+
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        let attempt = store
+            .latest_held_digest_attempt()
+            .await
+            .expect("latest digest attempt")
+            .expect("digest attempt");
+        assert_eq!(attempt.status, HeldDigestAttemptStatus::Delivered);
+        assert_eq!(attempt.held_count, 1);
+        assert_eq!(attempt.suppressed_count, 0);
+        assert!(attempt.error_code.is_none());
+
+        let sent = fixture.mailbox.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].to, "operator@example.com");
+        assert!(sent[0]
+            .text
+            .contains("Sender auth: trust-from-header: pass"));
+        assert!(sent[0].text.contains("Size: "));
+
+        let health = fixture.latest_health_report();
+        assert_eq!(health["status"], "ok");
+        let digest = health_check_by_code(&health, "email.digest");
+        assert_eq!(digest["status"], "ok");
+        assert_eq!(digest["details"]["latest_status"], "delivered");
+    }
+
+    #[tokio::test]
+    async fn held_digest_failure_is_audited_and_reported_in_health() {
+        let fixture = EmailFixture::new(false).await;
+        let mut config = fixture.config();
+        config.digest.admin_to = Some("operator@example.com".to_string());
+        fixture.mailbox.set_send_fails(true);
+        let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
+
+        let err = worker.tick().await.expect_err("digest send should fail");
+        assert!(err.to_string().contains("failed to send held-mail digest"));
+
+        let store = EmailStore::open(&fixture.state_dir).await.expect("store");
+        let attempt = store
+            .latest_held_digest_attempt()
+            .await
+            .expect("latest digest attempt")
+            .expect("digest attempt");
+        assert_eq!(attempt.status, HeldDigestAttemptStatus::Failed);
+        assert_eq!(attempt.held_count, 1);
+        assert_eq!(attempt.error_code.as_deref(), Some("digest_send_failed"));
+        assert!(attempt
+            .error_text
+            .as_deref()
+            .is_some_and(|text| text.contains("temporary SMTP send failure")));
+        assert!(fixture.mailbox.sent().is_empty());
+
+        let health = fixture.latest_health_report();
+        assert_eq!(health["status"], "error");
+        let digest = health_check_by_code(&health, "email.digest");
+        assert_eq!(digest["status"], "warning");
+        assert_eq!(digest["details"]["latest_status"], "failed");
+        let tick = health_check_by_code(&health, "email.tick");
+        assert_eq!(tick["status"], "error");
+    }
+
     struct EmailFixture {
         root: tempfile::TempDir,
         state_dir: PathBuf,
@@ -2587,6 +2874,16 @@ mod tests {
             }
         }
 
+        fn latest_health_report(&self) -> Value {
+            self.api
+                .health_reports
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("health report")
+        }
+
         fn config(&self) -> WorkerConfig {
             WorkerConfig {
                 home: self.root.path().join("home"),
@@ -2606,13 +2903,15 @@ mod tests {
                     imap_port: 993,
                     imap_tls: ImapTlsMode::Implicit,
                     imap_username: "assistant@example.com".to_string(),
-                    imap_password: "secret".to_string(),
                     imap_mailbox: "INBOX".to_string(),
                     smtp_host: "smtp.example.com".to_string(),
                     smtp_port: 587,
                     smtp_tls: SmtpTlsMode::StartTls,
                     smtp_username: "assistant@example.com".to_string(),
-                    smtp_password: "secret".to_string(),
+                    auth: MailboxAuthConfig::Basic {
+                        imap_password: "secret".to_string(),
+                        smtp_password: "secret".to_string(),
+                    },
                     from_name: Some("LionClaw".to_string()),
                     fetch_limit: 25,
                     max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
@@ -2635,6 +2934,7 @@ mod tests {
         authorize_requests: Mutex<Vec<Value>>,
         inbound_requests: Mutex<Vec<Value>>,
         consumed_grants: Mutex<Vec<Value>>,
+        health_reports: Mutex<Vec<Value>>,
     }
 
     #[derive(Clone)]
@@ -2680,7 +2980,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let app = Router::new()
             .route("/v0/daemon/info", get(daemon_info))
-            .route("/v0/channels/health/report", post(ok))
+            .route("/v0/channels/health/report", post(health_report))
             .route("/v0/channels/authorize", post(authorize))
             .route("/v0/channels/inbound", post(inbound))
             .route("/v0/channels/grants/consume", post(consume_grant))
@@ -2705,6 +3005,14 @@ mod tests {
     }
 
     async fn ok() -> Json<Value> {
+        Json(json!({ "ok": true }))
+    }
+
+    async fn health_report(
+        State(state): State<Arc<ApiState>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.health_reports.lock().unwrap().push(body);
         Json(json!({ "ok": true }))
     }
 
@@ -2778,6 +3086,7 @@ mod tests {
                     raw,
                     stale_uid_validity: AtomicBool::new(false),
                     fail_full_fetch: AtomicBool::new(false),
+                    fail_send: AtomicBool::new(false),
                     full_fetches: AtomicUsize::new(0),
                     seen: AtomicUsize::new(0),
                     sent: Mutex::new(Vec::new()),
@@ -2809,6 +3118,10 @@ mod tests {
             self.state.fail_full_fetch.store(fail, Ordering::SeqCst);
         }
 
+        fn set_send_fails(&self, fail: bool) {
+            self.state.fail_send.store(fail, Ordering::SeqCst);
+        }
+
         fn sent(&self) -> Vec<OutboundEmail> {
             self.state.sent.lock().unwrap().clone()
         }
@@ -2821,6 +3134,7 @@ mod tests {
         raw: Vec<u8>,
         stale_uid_validity: AtomicBool,
         fail_full_fetch: AtomicBool,
+        fail_send: AtomicBool,
         full_fetches: AtomicUsize,
         seen: AtomicUsize,
         sent: Mutex<Vec<OutboundEmail>>,
@@ -2897,6 +3211,9 @@ mod tests {
         }
 
         async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value> {
+            if self.state.fail_send.load(Ordering::SeqCst) {
+                bail!("temporary SMTP send failure");
+            }
             self.state.sent.lock().unwrap().push(email);
             Ok(json!({
                 "provider": "smtp",
@@ -3004,6 +3321,15 @@ mod tests {
                 attachments: Vec::new(),
             },
         }
+    }
+
+    fn health_check_by_code<'a>(report: &'a Value, code: &str) -> &'a Value {
+        report["checks"]
+            .as_array()
+            .expect("health checks")
+            .iter()
+            .find(|check| check["code"] == code)
+            .unwrap_or_else(|| panic!("missing health check {code}"))
     }
 
     async fn install_failing_receipt_insert_trigger(state_dir: &Path) {

@@ -5,12 +5,11 @@ id = "email"
 launch = "background"
 worker = "scripts/worker"
 env = [
+  "EMAIL_AUTH_MODE",
   "EMAIL_IMAP_HOST",
   "EMAIL_IMAP_USERNAME",
-  "EMAIL_IMAP_PASSWORD",
   "EMAIL_SMTP_HOST",
   "EMAIL_SMTP_USERNAME",
-  "EMAIL_SMTP_PASSWORD",
   "EMAIL_ADDRESS",
   "EMAIL_AUTH_RESULTS_HOST",
 ]
@@ -20,6 +19,7 @@ optional_env = [
   "EMAIL_DIGEST_INTERVAL_MS",
   "EMAIL_FETCH_LIMIT",
   "EMAIL_FROM_NAME",
+  "EMAIL_IMAP_PASSWORD",
   "EMAIL_IMAP_MAILBOX",
   "EMAIL_IMAP_PORT",
   "EMAIL_IMAP_TLS",
@@ -28,7 +28,13 @@ optional_env = [
   "EMAIL_OUTBOX_LEASE_MS",
   "EMAIL_OUTBOX_PULL_LIMIT",
   "EMAIL_POLL_MS",
+  "EMAIL_SMTP_PASSWORD",
   "EMAIL_SMTP_IMPLICIT_TLS",
   "EMAIL_SMTP_PORT",
   "EMAIL_SMTP_TLS",
+  "EMAIL_XOAUTH2_TOKEN_CMD",
 ]
+
+[channel.setup]
+command = "bin/lionclaw-channel-email"
+args = ["setup"]
