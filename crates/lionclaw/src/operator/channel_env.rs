@@ -27,7 +27,6 @@ pub fn load_channel_env(home: &LionClawHome, channel_id: &str) -> Result<Channel
 
 pub fn save_channel_env(home: &LionClawHome, channel_id: &str, values: &ChannelEnv) -> Result<()> {
     let path = home.channel_env_path(channel_id);
-
     let mut content = String::new();
     for (key, value) in values {
         validate_channel_env_name(key)?;
@@ -302,6 +301,7 @@ mod tests {
         let err = save_channel_env(&home, "telegram", &values).expect_err("reserved env");
 
         assert!(err.to_string().contains("reserved LionClaw namespace"));
+        assert!(!home.config_dir().exists());
         assert!(!home.channel_env_path("telegram").exists());
     }
 
