@@ -561,7 +561,8 @@ fn parse_opencode_export(
     let export = serde_json::from_slice::<OpenCodeExport>(stdout).with_context(|| {
         format!("failed to parse OpenCode export JSON for session {requested_session_id}")
     })?;
-    let resumable = opencode_export_is_resumable(&export.messages);
+    let resumable_pair = opencode_resumable_message_pair(&export.messages)
+        .map(|(user, assistant)| (user.info.id.as_str(), assistant.info.id.as_str()));
     let exported_session_id = export
         .info
         .id
@@ -574,6 +575,7 @@ fn parse_opencode_export(
         .map(|message| (message.info.id.as_str(), message))
         .collect::<HashMap<_, _>>();
     let mut turns = Vec::new();
+    let mut resumable = false;
 
     for assistant in export
         .messages
@@ -595,34 +597,15 @@ fn parse_opencode_export(
             continue;
         }
 
-        let display_user_text = opencode_message_export_text(user);
-        let assistant_text = opencode_message_export_text(assistant);
-        if display_user_text.trim().is_empty() || assistant_text.trim().is_empty() {
+        let Some(turn) = opencode_export_turn(exported_session_id, user, assistant)? else {
             continue;
+        };
+        if resumable_pair.is_some_and(|(user_id, assistant_id)| {
+            user.info.id.as_str() == user_id && assistant.info.id.as_str() == assistant_id
+        }) {
+            resumable = true;
         }
-
-        let session_id = assistant
-            .info
-            .session_id
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or(exported_session_id);
-        let (error_code, error_text) = opencode_assistant_error(&assistant.info);
-
-        turns.push(RuntimeTerminalTurn {
-            source_id: format!(
-                "opencode-export:{}:{}:{}",
-                session_id, user.info.id, assistant.info.id
-            ),
-            prompt_user_text: display_user_text.clone(),
-            display_user_text,
-            assistant_text,
-            status: opencode_assistant_status(&assistant.info),
-            error_code,
-            error_text,
-            started_at: opencode_message_time(user, false)?,
-            finished_at: opencode_message_time(assistant, true)?,
-        });
+        turns.push(turn);
     }
 
     Ok(OpenCodeTerminalTranscript { turns, resumable })
@@ -678,6 +661,41 @@ struct OpenCodeExportPart {
     text: Option<String>,
 }
 
+fn opencode_export_turn(
+    exported_session_id: &str,
+    user: &OpenCodeExportMessage,
+    assistant: &OpenCodeExportMessage,
+) -> Result<Option<RuntimeTerminalTurn>> {
+    let display_user_text = opencode_message_export_text(user);
+    let assistant_text = opencode_message_export_text(assistant);
+    if display_user_text.trim().is_empty() || assistant_text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let session_id = assistant
+        .info
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(exported_session_id);
+    let (error_code, error_text) = opencode_assistant_error(&assistant.info);
+
+    Ok(Some(RuntimeTerminalTurn {
+        source_id: format!(
+            "opencode-export:{}:{}:{}",
+            session_id, user.info.id, assistant.info.id
+        ),
+        prompt_user_text: display_user_text.clone(),
+        display_user_text,
+        assistant_text,
+        status: opencode_assistant_status(&assistant.info),
+        error_code,
+        error_text,
+        started_at: opencode_message_time(user, false)?,
+        finished_at: opencode_message_time(assistant, true)?,
+    }))
+}
+
 fn opencode_message_export_text(message: &OpenCodeExportMessage) -> String {
     message
         .parts
@@ -712,14 +730,16 @@ fn opencode_assistant_status(info: &OpenCodeExportMessageInfo) -> RuntimeTermina
     }
 }
 
-fn opencode_export_is_resumable(messages: &[OpenCodeExportMessage]) -> bool {
+fn opencode_resumable_message_pair(
+    messages: &[OpenCodeExportMessage],
+) -> Option<(&OpenCodeExportMessage, &OpenCodeExportMessage)> {
     let latest_user = opencode_latest_raw_message(messages, "user");
     let latest_assistant = opencode_latest_raw_message(messages, "assistant");
     let (Some(latest_user), Some(latest_assistant)) = (latest_user, latest_assistant) else {
-        return false;
+        return None;
     };
 
-    opencode_raw_message_order(&latest_user.info)
+    (opencode_raw_message_order(&latest_user.info)
         < opencode_raw_message_order(&latest_assistant.info)
         && latest_assistant.info.parent_id.as_deref() == Some(latest_user.info.id.as_str())
         && latest_assistant.info.error.is_none()
@@ -730,7 +750,8 @@ fn opencode_export_is_resumable(messages: &[OpenCodeExportMessage]) -> bool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|finish| !finish.is_empty())
-            .is_some_and(|finish| finish != "tool-calls")
+            .is_some_and(|finish| finish != "tool-calls"))
+    .then_some((latest_user, latest_assistant))
 }
 
 fn opencode_latest_raw_message<'a>(
@@ -2015,6 +2036,63 @@ mod tests {
         assert_eq!(
             transcript.turns[0].source_id,
             "opencode-export:ses_good:msg_user_1:msg_assistant_old"
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_resumability_requires_imported_latest_pair() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut latest_user = opencode_user_message("ses_good", "msg_user_2", "ignored", 4_000);
+        latest_user["parts"][0]["ignored"] = json!(true);
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good"]),
+                opencode_export_output(
+                    "ses_good",
+                    vec![
+                        opencode_user_message("ses_good", "msg_user_1", "hello", 1_000),
+                        opencode_assistant_message(
+                            "ses_good",
+                            "msg_assistant_1",
+                            "msg_user_1",
+                            Some("answer"),
+                            2_000,
+                            Some(3_000),
+                            Some("stop"),
+                        ),
+                        latest_user,
+                        opencode_assistant_message(
+                            "ses_good",
+                            "msg_assistant_2",
+                            "msg_user_2",
+                            Some("latest answer"),
+                            5_000,
+                            Some(6_000),
+                            Some("stop"),
+                        ),
+                    ],
+                ),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "opencode-export:ses_good:msg_user_1:msg_assistant_1"
         );
         assert!(transcript.state.is_reconciled());
         assert!(!transcript.state.is_resumable());
