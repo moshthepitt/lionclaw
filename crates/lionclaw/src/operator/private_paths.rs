@@ -123,6 +123,20 @@ pub(crate) fn remove_private_file_if_exists(
     remove_private_file_after_validation(home, path, label)
 }
 
+pub(crate) fn remove_private_dir_all_if_exists(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    if !private_dir_exists(home, path, label)? {
+        return Ok(());
+    }
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    ensure_private_dir_metadata(path, label, metadata)?;
+    fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
 pub(crate) fn read_private_dir_file_paths(
     home: &LionClawHome,
     path: &Path,
@@ -299,7 +313,7 @@ fn harden_private_file(path: &Path, label: &str) -> Result<()> {
     set_private_file_permissions(path)
 }
 
-fn private_dir_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<bool> {
+pub(crate) fn private_dir_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<bool> {
     let root = home.root();
     ensure_path_under_home(&root, path, label)?;
     let relative = path.strip_prefix(&root).with_context(|| {

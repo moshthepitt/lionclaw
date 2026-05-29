@@ -984,9 +984,15 @@ manually by the operator.
 ## Operator Launch Model
 
 - Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
-  worker entrypoint, required env names, and optional env names that the
-  operator may persist and pass through when present. The v1 metadata contract
-  is small by design and does not claim permissions LionClaw does not enforce.
+  worker entrypoint, required env names, optional env names that the operator
+  may persist and pass through when present, and an optional setup hook. The v1
+  metadata contract is small by design and does not claim permissions LionClaw
+  does not enforce.
+- Setup hooks are channel-owned commands declared under `[channel.setup]`.
+  `lionclaw connect <channel> <profile> ...` passes the profile and trailing
+  args to that command after installing/selecting the channel snapshot, and
+  validates the generated env through the same declared-env contract as
+  `--env-file`. Core does not contain provider-specific channel setup logic.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally

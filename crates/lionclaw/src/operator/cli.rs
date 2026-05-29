@@ -182,18 +182,50 @@ struct ConfigureArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  lionclaw connect email gmail --account assistant@gmail.com --client-secret-json ~/Downloads/client_secret_desktop.json\n  lionclaw connect email --env-file ./email.env"
+)]
 struct ConnectArgs {
+    #[arg(help = "Channel id, installed channel id, bundled channel id, or channel skill path")]
     channel_or_path: String,
-    #[arg(long = "env-file", value_name = "PATH")]
+    #[arg(
+        long = "env-file",
+        value_name = "PATH",
+        help = "Read declared channel environment values from an env file"
+    )]
     env_file: Option<PathBuf>,
-    #[arg(long = "from-env", value_name = "NAME")]
+    #[arg(
+        long = "from-env",
+        value_name = "NAME",
+        help = "Copy a declared channel environment value from the current process"
+    )]
     from_env: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Configure this channel as a preferred project contact")]
     contact: bool,
-    #[arg(long = "conversation-ref", value_name = "REF")]
+    #[arg(
+        long = "conversation-ref",
+        value_name = "REF",
+        help = "Preferred contact conversation route"
+    )]
     conversation_ref: Option<String>,
-    #[arg(long = "thread-ref", value_name = "REF")]
+    #[arg(
+        long = "thread-ref",
+        value_name = "REF",
+        help = "Preferred contact thread route"
+    )]
     thread_ref: Option<String>,
+    #[arg(
+        value_name = "SETUP",
+        help = "Optional channel setup profile passed to the channel helper, such as gmail"
+    )]
+    setup_profile: Option<String>,
+    #[arg(
+        value_name = "SETUP_ARG",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Arguments passed through to the selected channel setup helper"
+    )]
+    setup_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -821,6 +853,8 @@ pub async fn run() -> Result<ExitCode> {
                     env_inputs: ConnectEnvInputs {
                         env_file: args.env_file,
                         from_env: args.from_env,
+                        setup_profile: args.setup_profile,
+                        setup_args: args.setup_args,
                     },
                     contact: ChannelContactSetup {
                         enabled: args.contact,
@@ -2668,6 +2702,55 @@ mod tests {
         assert!(Cli::try_parse_from(["lionclaw", "project", "init"]).is_ok());
         assert!(Cli::try_parse_from(["lionclaw", "project", "status"]).is_err());
         assert!(Cli::try_parse_from(["lionclaw", "project", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn connect_parses_channel_setup_profile_and_passthrough_args() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "connect",
+            "email",
+            "gmail",
+            "--account",
+            "assistant@gmail.com",
+            "--client-secret-json",
+            "/tmp/client.json",
+        ])
+        .expect("parse connect setup");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.setup_profile.as_deref(), Some("gmail"));
+                assert_eq!(
+                    args.setup_args,
+                    vec![
+                        "--account".to_string(),
+                        "assistant@gmail.com".to_string(),
+                        "--client-secret-json".to_string(),
+                        "/tmp/client.json".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_keeps_env_file_as_core_option_without_setup_profile() {
+        let cli =
+            Cli::try_parse_from(["lionclaw", "connect", "email", "--env-file", "./email.env"])
+                .expect("parse connect env file");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.env_file, Some(PathBuf::from("./email.env")));
+                assert!(args.setup_profile.is_none());
+                assert!(args.setup_args.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

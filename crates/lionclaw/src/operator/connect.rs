@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, ErrorKind, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,13 +19,18 @@ use crate::{
             validate_no_undeclared_channel_env, ChannelEnv,
         },
         channel_metadata::{
-            discover_channel_skill, validate_channel_env_name, ChannelSkillSource,
+            discover_channel_skill, resolve_channel_setup_command_entrypoint,
+            validate_channel_env_name, ChannelSetupMetadata, ChannelSkillSource,
             DiscoveredChannelSkill,
         },
         command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         managed_units::UnitManager,
-        private_paths::{private_file_exists, remove_private_file_if_exists},
+        private_paths::{
+            create_private_dir_all, ensure_private_file_readable, ensure_private_file_write_target,
+            private_dir_exists, private_file_exists, remove_private_dir_all_if_exists,
+            remove_private_file_if_exists,
+        },
         reconcile::{
             add_channel_with_worker, add_skill, resolve_channel_contact_config,
             resolve_stack_binaries, up_for_work_root, ChannelContactSetup, ChannelWorkerSetup,
@@ -38,6 +44,8 @@ use crate::{
 pub struct ConnectEnvInputs {
     pub env_file: Option<PathBuf>,
     pub from_env: Vec<String>,
+    pub setup_profile: Option<String>,
+    pub setup_args: Vec<String>,
 }
 
 pub struct ConnectChannelRequest<'a, M> {
@@ -119,25 +127,47 @@ where
     let contact = resolve_channel_contact_config(contact, Some(&discovered.metadata), &channel_id)?;
     let rollback =
         ConnectRollback::capture(home, &channel_id, config.channels.clone(), &discovered)?;
+    let skill_alias = match install_or_select_skill(home, &discovered, &config).await {
+        Ok(skill_alias) => skill_alias,
+        Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
+    };
+    let installed_skill_dir = match installed_channel_skill_dir(home, &skill_alias) {
+        Ok(skill_dir) => skill_dir,
+        Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
+    };
+    let mut prepared_env = match prepare_connect_env_inputs(PrepareConnectEnvRequest {
+        home,
+        channel_id: &channel_id,
+        required_env: &discovered.metadata.env,
+        optional_env: &discovered.metadata.optional_env,
+        env_inputs,
+        interactive,
+        installed_skill_dir: &installed_skill_dir,
+        discovered: &discovered,
+    }) {
+        Ok(prepared) => prepared,
+        Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
+    };
     if let Err(err) = ensure_required_env(
         RequiredEnvRequest {
             home,
             channel_id: &channel_id,
             required_env: &discovered.metadata.env,
             optional_env: &discovered.metadata.optional_env,
-            env_inputs,
+            env_inputs: prepared_env.inputs.clone(),
             interactive,
             hide_prompt_input,
         },
         input,
         output,
     ) {
-        return Err(rollback.restore_channel_env_only(home, &channel_id, err));
+        let err = prepared_env.rollback(home, err);
+        return rollback_all_and_return(home, &channel_id, rollback, err).await;
     }
-    let skill_alias = match install_or_select_skill(home, &discovered, &config).await {
-        Ok(skill_alias) => skill_alias,
-        Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
-    };
+    if let Err(err) = prepared_env.cleanup_generated_env(home) {
+        let err = prepared_env.rollback(home, err);
+        return rollback_all_and_return(home, &channel_id, rollback, err).await;
+    }
     if let Err(err) = add_channel_with_worker(
         home,
         channel_id.clone(),
@@ -152,11 +182,16 @@ where
     )
     .await
     {
+        let err = prepared_env.rollback(home, err);
         return rollback_all_and_return(home, &channel_id, rollback, err).await;
     }
 
     let action = match discovered.metadata.launch {
         ChannelLaunchMode::Interactive => {
+            if let Err(err) = prepared_env.commit(home) {
+                let err = prepared_env.rollback(home, err);
+                return rollback_all_and_return(home, &channel_id, rollback, err).await;
+            }
             rollback.commit()?;
             attach_channel_with_binaries(
                 ChannelAttachContext {
@@ -186,12 +221,18 @@ where
             )
             .await
             {
+                let err = prepared_env.rollback(home, err);
                 return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
             if channel_was_active {
                 if let Err(err) = restart_background_channel(home, manager, &channel_id).await {
+                    let err = prepared_env.rollback(home, err);
                     return rollback_all_and_return(home, &channel_id, rollback, err).await;
                 }
+            }
+            if let Err(err) = prepared_env.commit(home) {
+                let err = prepared_env.rollback(home, err);
+                return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
             rollback.commit()?;
             ConnectAction::BackgroundStarted
@@ -269,6 +310,327 @@ fn validate_channel_skill_alias_install_target(
     }
 }
 
+struct PrepareConnectEnvRequest<'a> {
+    home: &'a LionClawHome,
+    channel_id: &'a str,
+    required_env: &'a [String],
+    optional_env: &'a [String],
+    env_inputs: ConnectEnvInputs,
+    interactive: bool,
+    installed_skill_dir: &'a Path,
+    discovered: &'a DiscoveredChannelSkill,
+}
+
+struct PreparedConnectEnvInputs {
+    inputs: ConnectEnvInputs,
+    generated_env_file: Option<PathBuf>,
+    setup_state: Option<SetupStateRollback>,
+}
+
+impl PreparedConnectEnvInputs {
+    fn cleanup_generated_env(&mut self, home: &LionClawHome) -> Result<()> {
+        if let Some(path) = self.generated_env_file.take() {
+            remove_private_file_if_exists(home, &path, "channel setup env file")?;
+        }
+        Ok(())
+    }
+
+    fn rollback(mut self, home: &LionClawHome, err: anyhow::Error) -> anyhow::Error {
+        let err = self.cleanup_generated_env_lossy(home, err);
+        let Some(setup_state) = self.setup_state.take() else {
+            return err;
+        };
+        if let Err(rollback_err) = setup_state.restore(home) {
+            return anyhow!(
+                "{err}; additionally failed to roll back channel setup state: {rollback_err}"
+            );
+        }
+        err
+    }
+
+    fn commit(&mut self, home: &LionClawHome) -> Result<()> {
+        if let Some(setup_state) = self.setup_state.as_mut() {
+            setup_state.discard(home)?;
+        }
+        self.setup_state = None;
+        Ok(())
+    }
+
+    fn cleanup_generated_env_lossy(
+        &mut self,
+        home: &LionClawHome,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        let Some(path) = self.generated_env_file.take() else {
+            return err;
+        };
+        cleanup_generated_setup_env(home, &path, err)
+    }
+}
+
+fn prepare_connect_env_inputs(
+    request: PrepareConnectEnvRequest<'_>,
+) -> Result<PreparedConnectEnvInputs> {
+    let PrepareConnectEnvRequest {
+        home,
+        channel_id,
+        required_env,
+        optional_env,
+        env_inputs,
+        interactive,
+        installed_skill_dir,
+        discovered,
+    } = request;
+    reject_conflicting_setup_inputs(&env_inputs)?;
+    if env_inputs.env_file.is_some() || !env_inputs.from_env.is_empty() {
+        return Ok(PreparedConnectEnvInputs {
+            inputs: env_inputs,
+            generated_env_file: None,
+            setup_state: None,
+        });
+    }
+
+    validate_no_undeclared_channel_env(home, channel_id, required_env, optional_env)?;
+    let stored = load_channel_env(home, channel_id)?;
+    let missing = missing_required_env(&stored, required_env)?;
+    let setup_requested = setup_inputs_requested(&env_inputs);
+    if missing.is_empty() && !setup_requested {
+        return Ok(PreparedConnectEnvInputs {
+            inputs: env_inputs,
+            generated_env_file: None,
+            setup_state: None,
+        });
+    }
+    let setup = discovered.metadata.setup.as_ref();
+    if !setup_requested && (!interactive || setup.is_none()) {
+        return Ok(PreparedConnectEnvInputs {
+            inputs: env_inputs,
+            generated_env_file: None,
+            setup_state: None,
+        });
+    }
+
+    let setup =
+        setup.ok_or_else(|| anyhow!("channel '{channel_id}' does not declare a setup command"))?;
+    let env_file = channel_setup_env_file(home, channel_id);
+    let state_dir = channel_setup_state_dir(home, channel_id);
+    let setup_state = SetupStateRollback::capture(home, channel_id)?;
+    if let Err(err) = create_private_dir_all(home, &state_dir, "channel setup state directory") {
+        return Err(rollback_setup_state(home, setup_state, err));
+    }
+    if let Err(err) = remove_private_file_if_exists(home, &env_file, "channel setup env file") {
+        return Err(rollback_setup_state(home, setup_state, err));
+    }
+    if let Err(err) = ensure_private_file_write_target(home, &env_file, "channel setup env file") {
+        return Err(rollback_setup_state(home, setup_state, err));
+    }
+    if let Err(err) = run_channel_setup_command(ChannelSetupRunRequest {
+        skill_dir: installed_skill_dir,
+        setup,
+        home,
+        channel_id,
+        setup_profile: env_inputs.setup_profile.as_deref(),
+        setup_args: &env_inputs.setup_args,
+        env_file: &env_file,
+        state_dir: &state_dir,
+    }) {
+        return Err(PreparedConnectEnvInputs {
+            inputs: ConnectEnvInputs::default(),
+            generated_env_file: Some(env_file),
+            setup_state: Some(setup_state),
+        }
+        .rollback(home, err));
+    }
+    if let Err(err) = ensure_private_file_readable(home, &env_file, "channel setup env file") {
+        return Err(PreparedConnectEnvInputs {
+            inputs: ConnectEnvInputs::default(),
+            generated_env_file: Some(env_file),
+            setup_state: Some(setup_state),
+        }
+        .rollback(home, err));
+    }
+
+    Ok(PreparedConnectEnvInputs {
+        inputs: ConnectEnvInputs {
+            env_file: Some(env_file.clone()),
+            from_env: Vec::new(),
+            setup_profile: None,
+            setup_args: Vec::new(),
+        },
+        generated_env_file: Some(env_file),
+        setup_state: Some(setup_state),
+    })
+}
+
+fn cleanup_generated_setup_env(
+    home: &LionClawHome,
+    env_file: &Path,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if let Err(cleanup_err) =
+        remove_private_file_if_exists(home, env_file, "channel setup env file")
+    {
+        return anyhow!(
+            "{err}; additionally failed to clean up channel setup env file: {cleanup_err}"
+        );
+    }
+    err
+}
+
+fn rollback_setup_state(
+    home: &LionClawHome,
+    setup_state: SetupStateRollback,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    PreparedConnectEnvInputs {
+        inputs: ConnectEnvInputs::default(),
+        generated_env_file: None,
+        setup_state: Some(setup_state),
+    }
+    .rollback(home, err)
+}
+
+fn reject_conflicting_setup_inputs(env_inputs: &ConnectEnvInputs) -> Result<()> {
+    if setup_inputs_requested(env_inputs)
+        && (env_inputs.env_file.is_some() || !env_inputs.from_env.is_empty())
+    {
+        bail!("channel setup arguments cannot be combined with --env-file or --from-env");
+    }
+    Ok(())
+}
+
+fn setup_inputs_requested(env_inputs: &ConnectEnvInputs) -> bool {
+    env_inputs.setup_profile.is_some() || !env_inputs.setup_args.is_empty()
+}
+
+struct SetupStateRollback {
+    state_dir: PathBuf,
+    backup_dir: Option<PathBuf>,
+}
+
+impl SetupStateRollback {
+    fn capture(home: &LionClawHome, channel_id: &str) -> Result<Self> {
+        let state_dir = channel_setup_state_dir(home, channel_id);
+        let backup_dir = if private_dir_exists(home, &state_dir, "channel setup state directory")? {
+            let backup_dir = channel_setup_dir(home, channel_id)
+                .join(format!(".state.rollback-{}", Uuid::new_v4()));
+            copy_regular_tree_for_rollback(
+                &state_dir,
+                &backup_dir,
+                "channel setup state directory",
+            )?;
+            Some(backup_dir)
+        } else {
+            None
+        };
+        Ok(Self {
+            state_dir,
+            backup_dir,
+        })
+    }
+
+    fn restore(self, home: &LionClawHome) -> Result<()> {
+        remove_private_dir_all_if_exists(home, &self.state_dir, "channel setup state directory")?;
+        if let Some(backup_dir) = self.backup_dir {
+            fs::rename(&backup_dir, &self.state_dir).with_context(|| {
+                format!(
+                    "failed to restore '{}' from '{}'",
+                    self.state_dir.display(),
+                    backup_dir.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self, home: &LionClawHome) -> Result<()> {
+        let Some(backup_dir) = self.backup_dir.take() else {
+            return Ok(());
+        };
+        if let Err(err) = remove_private_dir_all_if_exists(
+            home,
+            &backup_dir,
+            "channel setup state rollback directory",
+        ) {
+            self.backup_dir = Some(backup_dir);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+struct ChannelSetupRunRequest<'a> {
+    skill_dir: &'a Path,
+    setup: &'a ChannelSetupMetadata,
+    home: &'a LionClawHome,
+    channel_id: &'a str,
+    setup_profile: Option<&'a str>,
+    setup_args: &'a [String],
+    env_file: &'a Path,
+    state_dir: &'a Path,
+}
+
+fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> {
+    let ChannelSetupRunRequest {
+        skill_dir,
+        setup,
+        home,
+        channel_id,
+        setup_profile,
+        setup_args,
+        env_file,
+        state_dir,
+    } = request;
+    let command = resolve_channel_setup_command_entrypoint(skill_dir, setup)?;
+    let mut process = Command::new(&command);
+    process.args(&setup.args);
+    if let Some(profile) = setup_profile {
+        process.arg(profile);
+    }
+    process.args(setup_args);
+    process
+        .env("LIONCLAW_HOME", home.root())
+        .env("LIONCLAW_CHANNEL_ID", channel_id)
+        .env("LIONCLAW_CHANNEL_SETUP_ENV_FILE", env_file)
+        .env("LIONCLAW_CHANNEL_SETUP_STATE_DIR", state_dir)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = process.status().with_context(|| {
+        format!(
+            "failed to start channel setup command {}",
+            command.display()
+        )
+    })?;
+    if !status.success() {
+        bail!(
+            "channel setup command {} exited with {status}",
+            command.display()
+        );
+    }
+    Ok(())
+}
+
+fn installed_channel_skill_dir(home: &LionClawHome, alias: &str) -> Result<PathBuf> {
+    let path = home.skills_dir().join(alias);
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    ensure_skill_snapshot_dir(&path, &metadata)?;
+    fs::canonicalize(&path).with_context(|| format!("failed to resolve {}", path.display()))
+}
+
+fn channel_setup_env_file(home: &LionClawHome, channel_id: &str) -> PathBuf {
+    channel_setup_dir(home, channel_id).join("generated.env")
+}
+
+fn channel_setup_state_dir(home: &LionClawHome, channel_id: &str) -> PathBuf {
+    channel_setup_dir(home, channel_id).join("state")
+}
+
+fn channel_setup_dir(home: &LionClawHome, channel_id: &str) -> PathBuf {
+    home.config_dir().join("channel-setup").join(channel_id)
+}
+
 struct ConnectRollback {
     previous_channels: Vec<ManagedChannelConfig>,
     previous_env: ChannelEnvSnapshot,
@@ -287,24 +649,6 @@ impl ConnectRollback {
             previous_env: ChannelEnvSnapshot::capture(home, channel_id)?,
             skill: SkillRollback::capture(home, discovered)?,
         })
-    }
-
-    fn restore_channel_env_only(
-        self,
-        home: &LionClawHome,
-        channel_id: &str,
-        err: anyhow::Error,
-    ) -> anyhow::Error {
-        if let Err(rollback_err) = self
-            .previous_env
-            .restore(home, channel_id)
-            .and_then(|()| self.skill.discard())
-        {
-            return anyhow!(
-                "{err}; additionally failed to roll back partial channel env state: {rollback_err}"
-            );
-        }
-        err
     }
 
     async fn rollback_all(self, home: &LionClawHome, channel_id: &str) -> Result<()> {
@@ -460,8 +804,22 @@ fn ensure_skill_snapshot_dir(path: &Path, metadata: &fs::Metadata) -> Result<()>
 }
 
 fn copy_skill_snapshot_for_rollback(source: &Path, destination: &Path) -> Result<()> {
+    copy_regular_tree_for_rollback(source, destination, "skill snapshot")
+}
+
+fn copy_regular_tree_for_rollback(source: &Path, destination: &Path, label: &str) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to stat {}", source.display()))?;
+    if source_metadata.file_type().is_symlink() {
+        bail!("{label} {} must not be a symlink", source.display());
+    }
+    if !source_metadata.is_dir() {
+        bail!("{label} {} is not a directory", source.display());
+    }
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
+    fs::set_permissions(destination, source_metadata.permissions())
+        .with_context(|| format!("failed to chmod {}", destination.display()))?;
     let mut entries = fs::read_dir(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -474,13 +832,10 @@ fn copy_skill_snapshot_for_rollback(source: &Path, destination: &Path) -> Result
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to stat {}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            bail!(
-                "skill snapshot entry {} must not be a symlink",
-                path.display()
-            );
+            bail!("{label} entry {} must not be a symlink", path.display());
         }
         if metadata.is_dir() {
-            copy_skill_snapshot_for_rollback(&path, &target)?;
+            copy_regular_tree_for_rollback(&path, &target, label)?;
         } else if metadata.is_file() {
             fs::copy(&path, &target).with_context(|| {
                 format!(
@@ -493,7 +848,7 @@ fn copy_skill_snapshot_for_rollback(source: &Path, destination: &Path) -> Result
                 .with_context(|| format!("failed to chmod {}", target.display()))?;
         } else {
             bail!(
-                "skill snapshot entry {} is not a regular file or directory",
+                "{label} entry {} is not a regular file or directory",
                 path.display()
             );
         }
@@ -779,14 +1134,16 @@ mod tests {
     use std::{fs, io::Cursor, net::TcpListener, path::Path};
 
     use super::{
-        connect_channel_with_binaries, ensure_required_env, ConnectAction, ConnectChannelRequest,
-        ConnectEnvInputs, RequiredEnvRequest,
+        channel_setup_env_file, channel_setup_state_dir, connect_channel_with_binaries,
+        ensure_required_env, prepare_connect_env_inputs, ConnectAction, ConnectChannelRequest,
+        ConnectEnvInputs, PrepareConnectEnvRequest, RequiredEnvRequest,
     };
     use crate::{
         home::LionClawHome,
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
+            channel_metadata::discover_channel_skill,
             config::{
                 ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
                 RuntimeProfileConfig,
@@ -897,6 +1254,205 @@ optional_env = ["TELEGRAM_POLL_MS"]
     }
 
     #[cfg(unix)]
+    fn write_channel_skill_with_setup(root: &Path) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+optional_env = ["TELEGRAM_POLL_MS"]
+
+[channel.setup]
+command = "scripts/setup"
+args = ["bootstrap"]
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(
+            root.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test "${1:-}" = "bootstrap"
+test "${2:-}" = "testprofile"
+test "${3:-}" = "--flag"
+test "${4:-}" = "value"
+test "${LIONCLAW_CHANNEL_ID:-}" = "telegram"
+test -n "${LIONCLAW_HOME:-}"
+test -n "${LIONCLAW_CHANNEL_SETUP_STATE_DIR:-}"
+mkdir -p "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/check"
+printf 'TELEGRAM_BOT_TOKEN=setup-token\nTELEGRAM_POLL_MS=250\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_interactive_setup(root: &Path) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+args = ["bootstrap"]
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(
+            root.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test "${1:-}" = "bootstrap"
+test "${2:-}" = ""
+printf 'TELEGRAM_BOT_TOKEN=interactive-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_public_setup_env(root: &Path) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(
+            root.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+chmod 0644 "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_setup_state(root: &Path) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(
+            root.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail"
+printf 'new-state\n' > "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail/new.json"
+printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_failing_setup_state(root: &Path) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(
+            root.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail"
+printf 'failed-state\n' > "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail/state.json"
+printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+exit 17
+"#,
+        );
+    }
+
+    #[cfg(unix)]
     fn write_normal_skill(root: &Path, skill_name: &str, token: &str) {
         fs::create_dir_all(root).expect("skill dir");
         fs::write(
@@ -958,6 +1514,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 interactive: false,
                 hide_prompt_input: false,
@@ -998,6 +1555,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 interactive: false,
                 hide_prompt_input: false,
@@ -1035,6 +1593,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: None,
                     from_env: vec!["EXTRA_SECRET".to_string()],
+                    ..ConnectEnvInputs::default()
                 },
                 interactive: false,
                 hide_prompt_input: false,
@@ -1132,6 +1691,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1161,6 +1721,281 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 && channel.launch_mode == ChannelLaunchMode::Background
                 && channel.required_env == ["TELEGRAM_BOT_TOKEN"]
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_generated_env_file_is_hardened_before_ingest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("create base dirs");
+        let skill_source = temp_dir.path().join("telegram-public-setup-env");
+        write_channel_skill_with_public_setup_env(&skill_source);
+        let discovered =
+            discover_channel_skill(&home, skill_source.to_str().expect("utf8 skill source"))
+                .expect("discover skill");
+
+        let mut prepared = prepare_connect_env_inputs(PrepareConnectEnvRequest {
+            home: &home,
+            channel_id: "telegram",
+            required_env: &discovered.metadata.env,
+            optional_env: &discovered.metadata.optional_env,
+            env_inputs: ConnectEnvInputs {
+                setup_profile: Some("setup".to_string()),
+                ..ConnectEnvInputs::default()
+            },
+            interactive: false,
+            installed_skill_dir: &skill_source,
+            discovered: &discovered,
+        })
+        .expect("prepare setup env");
+
+        let mode = fs::metadata(channel_setup_env_file(&home, "telegram"))
+            .expect("setup env metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        prepared
+            .cleanup_generated_env(&home)
+            .expect("cleanup setup env");
+        prepared.commit(&home).expect("commit setup state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_setup_hook_removes_generated_env_and_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("telegram-failing-setup-state");
+        write_channel_skill_with_failing_setup_state(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("failing setup hook should fail connect");
+
+        assert!(err.to_string().contains("exited with"));
+        assert!(!channel_setup_env_file(&home, "telegram").exists());
+        assert!(!channel_setup_state_dir(&home, "telegram").exists());
+        assert!(!home.channel_env_path("telegram").exists());
+        assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_connect_after_setup_restores_previous_setup_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let state_file = channel_setup_state_dir(&home, "telegram").join("gmail/old.json");
+        fs::create_dir_all(state_file.parent().expect("state parent")).expect("state dir");
+        fs::write(&state_file, "old-state\n").expect("old state");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.daemon.bind = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("listener addr").port()
+        );
+        config.daemon.bind_configured = true;
+        config.save(&home).await.expect("save config");
+        let skill_source = temp_dir.path().join("telegram-setup-state");
+        write_channel_skill_with_setup_state(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("reserved non-LionClaw listener should block background startup");
+
+        assert!(err.to_string().contains("non-LionClaw listener"));
+        assert_eq!(
+            fs::read_to_string(&state_file).expect("restored state"),
+            "old-state\n"
+        );
+        assert!(
+            !channel_setup_state_dir(&home, "telegram")
+                .join("gmail/new.json")
+                .exists(),
+            "failed connect must not leave setup-created OAuth state"
+        );
+        assert!(!channel_setup_env_file(&home, "telegram").exists());
+        assert!(!home.channel_env_path("telegram").exists());
+        assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_runs_declared_setup_hook_when_env_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("telegram-setup");
+        write_channel_skill_with_setup(&skill_source);
+        let manager = FakeUnitManager::default();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let outcome = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    setup_args: vec!["--flag".to_string(), "value".to_string()],
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("connect with setup hook");
+
+        assert_eq!(outcome.channel_id, "telegram");
+        let stored = load_channel_env(&home, "telegram").expect("channel env");
+        assert_eq!(
+            stored.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("setup-token")
+        );
+        assert_eq!(
+            stored.get("TELEGRAM_POLL_MS").map(String::as_str),
+            Some("250")
+        );
+        assert!(
+            !channel_setup_env_file(&home, "telegram").exists(),
+            "generated setup env should be transient after validation"
+        );
+        assert!(channel_setup_state_dir(&home, "telegram")
+            .join("check")
+            .is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_connect_runs_declared_setup_hook_without_profile() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("telegram-interactive-setup");
+        write_channel_skill_with_interactive_setup(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs::default(),
+                contact: ChannelContactSetup::default(),
+                interactive: true,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("interactive connect with setup hook");
+
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("channel env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("interactive-token")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_connect_without_setup_hook_prompts_for_missing_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("telegram-prompt-setup");
+        write_channel_skill(&skill_source, "Telegram", "prompt");
+        let manager = FakeUnitManager::default();
+        let mut input = Cursor::new(b"prompt-token\n".to_vec());
+        let mut output = Vec::new();
+
+        let outcome = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs::default(),
+                contact: ChannelContactSetup::default(),
+                interactive: true,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("interactive connect with env prompt");
+
+        assert_eq!(outcome.channel_id, "telegram");
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("channel env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("prompt-token")
+        );
+        let rendered = String::from_utf8(output).expect("utf8");
+        assert!(rendered.contains("TELEGRAM_BOT_TOKEN"));
+        assert!(!rendered.contains("prompt-token"));
     }
 
     #[cfg(unix)]
@@ -1266,6 +2101,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup {
                     enabled: true,
@@ -1344,6 +2180,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup {
                     enabled: true,
@@ -1399,6 +2236,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1454,6 +2292,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1508,6 +2347,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1562,6 +2402,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1642,6 +2483,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1691,6 +2533,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(first_env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
@@ -1719,6 +2562,7 @@ optional_env = ["TELEGRAM_POLL_MS"]
                 env_inputs: ConnectEnvInputs {
                     env_file: Some(second_env_file),
                     from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
                 },
                 contact: ChannelContactSetup::default(),
                 interactive: false,
