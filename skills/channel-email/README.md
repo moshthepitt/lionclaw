@@ -210,6 +210,10 @@ provider facts:
 owns the core OAuth fields, including `client_id`, `redirect_uri`, `scope`,
 `state`, and PKCE parameters, and rejects attempts to pass them through
 `--auth-param` or pre-seed them in the authorization URL query.
+Setup also validates required provider facts before opening the browser:
+client ids and IMAP/SMTP hosts must be non-empty plain values, and
+`--auth-results-host` must be an Authentication-Results authserv-id rather than
+a full header value.
 
 To replace existing OAuth state for the same provider/account, pass `--force`
 after the provider profile. For direct helper use outside `connect`, the same

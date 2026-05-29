@@ -23,7 +23,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::protocol::{mailbox_id_for, normalize_address};
+use crate::{
+    config::validate_authserv_id,
+    protocol::{mailbox_id_for, normalize_address},
+};
 
 const CALLBACK_PATH: &str = "/oauth2/callback";
 const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
@@ -751,6 +754,7 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
     .ok_or_else(|| {
         anyhow!("OAuth2 setup requires --client-id or --client-secret-json with client_id")
     })?;
+    let client_id = normalize_plain_setup_value("--client-id", client_id)?;
     let client_secret = first_present(
         args.client_secret,
         client_file
@@ -789,14 +793,22 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         bail!("OAuth2 setup requires at least one --scope");
     }
 
-    let auth_results_host =
+    let auth_results_host = normalize_authserv_setup_value(
+        "--auth-results-host",
         first_present(args.auth_results_host, defaults.auth_results_host.clone()).ok_or_else(
             || anyhow!("OAuth2 setup requires --auth-results-host for this provider"),
-        )?;
-    let imap_host = first_present(args.imap_host, defaults.imap_host.clone())
-        .ok_or_else(|| anyhow!("OAuth2 setup requires --imap-host for this provider"))?;
-    let smtp_host = first_present(args.smtp_host, defaults.smtp_host.clone())
-        .ok_or_else(|| anyhow!("OAuth2 setup requires --smtp-host for this provider"))?;
+        )?,
+    )?;
+    let imap_host = normalize_plain_setup_value(
+        "--imap-host",
+        first_present(args.imap_host, defaults.imap_host.clone())
+            .ok_or_else(|| anyhow!("OAuth2 setup requires --imap-host for this provider"))?,
+    )?;
+    let smtp_host = normalize_plain_setup_value(
+        "--smtp-host",
+        first_present(args.smtp_host, defaults.smtp_host.clone())
+            .ok_or_else(|| anyhow!("OAuth2 setup requires --smtp-host for this provider"))?,
+    )?;
     let imap_tls = normalize_secure_tls_mode(
         "--imap-tls",
         &first_present(args.imap_tls, defaults.imap_tls.clone())
@@ -883,6 +895,26 @@ fn normalize_scopes(values: Vec<String>) -> Vec<String> {
         })
         .filter(|scope| !scope.is_empty())
         .collect()
+}
+
+fn normalize_plain_setup_value(name: &str, raw: String) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("{name} must not be empty");
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        bail!("{name} must not contain whitespace or control characters");
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_authserv_setup_value(name: &str, raw: String) -> Result<String> {
+    let value = raw.trim().to_string();
+    validate_authserv_id(name, &value)?;
+    Ok(value)
 }
 
 fn normalize_microsoft_tenant(raw: &str) -> Result<String> {
@@ -1891,6 +1923,24 @@ mod tests {
         let err = resolve_setup(args).expect_err("reserved auth parameter should fail");
 
         assert!(err.to_string().contains("--auth-param"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_invalid_required_text_values() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.client_id = Some(" ".to_string());
+        let err = resolve_setup(args).expect_err("blank client id should fail");
+        assert!(err.to_string().contains("--client-id"));
+
+        let mut args = test_setup_args(Oauth2Provider::Generic);
+        args.auth_results_host = Some("mx.example.com:spoof".to_string());
+        let err = resolve_setup(args).expect_err("invalid authserv-id should fail");
+        assert!(err.to_string().contains("--auth-results-host"));
+
+        let mut args = test_setup_args(Oauth2Provider::Generic);
+        args.imap_host = Some("imap example.com".to_string());
+        let err = resolve_setup(args).expect_err("invalid IMAP host should fail");
+        assert!(err.to_string().contains("--imap-host"));
     }
 
     #[test]

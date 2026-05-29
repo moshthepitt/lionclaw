@@ -311,7 +311,7 @@ fn parse_mailbox_auth_config(
     }
 }
 
-fn validate_authserv_id(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_authserv_id(name: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         bail!("{name} must not be empty");
     }
