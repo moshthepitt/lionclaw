@@ -268,8 +268,9 @@ Enumeration failures are audited as source warnings when a previously linked
 continuation target can still be exported; otherwise they are audited as
 `runtime.tui.reconcile_error`.
 A clean native TUI exit clears LionClaw's dirty launch marker only when the
-adapter proves its chosen continuation source was reconciled; partial exports
-keep the marker dirty so the next native launch retries before rendering context.
+adapter proves its chosen continuation source was reconciled; partial exports of
+that continuation source keep the marker dirty so the next native launch retries
+before rendering context.
 It marks the runtime session resumable only when that reconciled continuation
 target is valid from raw runtime state, not merely from turns imported into
 LionClaw. For Codex, the saved continuation thread must export cleanly far enough

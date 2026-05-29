@@ -121,7 +121,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
                 &input.prompt,
                 session.session_id.as_deref(),
             ),
-            environment: Vec::new(),
+            environment: opencode_runtime_environment(),
             stdin: String::new(),
             auth: None,
         })
@@ -1119,8 +1119,8 @@ mod tests {
     };
 
     use super::{
-        parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        OPENCODE_SESSION_ID_STATE_FILE,
+        opencode_runtime_environment, parse_opencode_stdout, OpenCodeRuntimeAdapter,
+        OpenCodeRuntimeConfig, OPENCODE_SESSION_ID_STATE_FILE,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
@@ -1407,7 +1407,7 @@ mod tests {
                 "hello".to_string(),
             ]
         );
-        assert!(program.environment.is_empty());
+        assert_eq!(program.environment, opencode_runtime_environment());
         assert!(program.stdin.is_empty());
     }
 
@@ -1460,6 +1460,7 @@ mod tests {
                 "next".to_string(),
             ]
         );
+        assert_eq!(program.environment, opencode_runtime_environment());
     }
 
     #[tokio::test]
@@ -1511,6 +1512,7 @@ mod tests {
                 "hello".to_string(),
             ]
         );
+        assert_eq!(program.environment, opencode_runtime_environment());
     }
 
     #[test]
@@ -1540,13 +1542,7 @@ mod tests {
                 "builder".to_string(),
             ]
         );
-        assert_eq!(
-            program.environment,
-            vec![
-                ("OPENCODE_CONFIG_DIR".to_string(), "/runtime".to_string()),
-                ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
-            ]
-        );
+        assert_eq!(program.environment, opencode_runtime_environment());
         assert!(program.stdin.is_empty());
         assert!(program.auth.is_none());
     }
