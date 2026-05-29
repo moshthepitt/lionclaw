@@ -186,6 +186,8 @@ Expected:
 - completed Codex and OpenCode native UI turns are present in LionClaw session
   history and are available to later `lionclaw run`, `run --plain`, and
   channel context
+- opening and exiting the native UI without completing a turn leaves the launch
+  clean but does not prime a later program-backed continuation
 - after a clean exit, relaunching the native UI starts without a prelaunch
   transcript-export pass
 - after an unclean LionClaw exit, relaunching the native UI reconciles durable

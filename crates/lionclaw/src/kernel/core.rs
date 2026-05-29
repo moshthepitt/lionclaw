@@ -135,9 +135,9 @@ use super::{
         RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
         RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
         RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -189,6 +189,14 @@ const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
+
+#[derive(Debug, Clone, Copy)]
+struct AttachedRuntimeReconciliation {
+    exported_turn_count: usize,
+    imported_turn_count: usize,
+    warning_count: usize,
+    resumable: bool,
+}
 
 #[derive(Debug, Clone)]
 struct RuntimeChannelSendContext {
@@ -925,7 +933,7 @@ impl Kernel {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> Result<(), KernelError> {
-        let reconciled = self
+        let reconciliation = self
             .reconcile_attached_runtime_transcript_best_effort(
                 session_id,
                 runtime_id,
@@ -935,10 +943,15 @@ impl Kernel {
                 "after_exit",
             )
             .await;
-        if reconciled {
+        if reconciliation.is_some() {
             self.mark_attached_runtime_launch_clean(plan).await;
         }
-        if exit_code == Some(0) && exit_signal.is_none() && reconciled {
+        if exit_code == Some(0)
+            && exit_signal.is_none()
+            && reconciliation
+                .as_ref()
+                .is_some_and(|summary| summary.resumable)
+        {
             self.mark_runtime_session_ready(plan).await;
         } else {
             self.clear_runtime_session_ready(plan).await;
@@ -968,12 +981,12 @@ impl Kernel {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
         phase: &'static str,
-    ) -> bool {
+    ) -> Option<AttachedRuntimeReconciliation> {
         match self
             .reconcile_attached_runtime_transcript(session_id, runtime_id, plan)
             .await
         {
-            Ok(imported_count) => {
+            Ok(summary) => {
                 self.append_audit_event_best_effort(
                     "runtime.tui.reconcile",
                     Some(session_id),
@@ -983,11 +996,14 @@ impl Kernel {
                         "phase": phase,
                         "exit_code": exit_code,
                         "exit_signal": exit_signal,
-                        "imported_turn_count": imported_count,
+                        "exported_turn_count": summary.exported_turn_count,
+                        "imported_turn_count": summary.imported_turn_count,
+                        "source_warning_count": summary.warning_count,
+                        "resumable": summary.resumable,
                     }),
                 )
                 .await;
-                true
+                Some(summary)
             }
             Err(err) => {
                 warn!(
@@ -1010,7 +1026,7 @@ impl Kernel {
                     }),
                 )
                 .await;
-                false
+                None
             }
         }
     }
@@ -1020,7 +1036,7 @@ impl Kernel {
         session_id: Uuid,
         runtime_id: &str,
         plan: &EffectiveExecutionPlan,
-    ) -> Result<usize, KernelError> {
+    ) -> Result<AttachedRuntimeReconciliation, KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
         let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
@@ -1033,10 +1049,29 @@ impl Kernel {
             plan: plan.clone(),
             codex_home_override: self.codex_home_override.clone(),
         };
-        let mut turns = adapter
+        let RuntimeTerminalTranscript {
+            mut turns,
+            warnings,
+            resumable,
+        } = adapter
             .export_terminal_transcript(transcript_input, &mut executor)
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let warning_count = warnings.len();
+        for warning in warnings {
+            self.append_audit_event_best_effort(
+                "runtime.tui.reconcile_source_warning",
+                Some(session_id),
+                "kernel",
+                json!({
+                    "runtime_id": runtime_id,
+                    "source_id": warning.source_id,
+                    "error": warning.error,
+                }),
+            )
+            .await;
+        }
+        let exported_turn_count = turns.len();
         turns.sort_by(|left, right| {
             left.started_at
                 .cmp(&right.started_at)
@@ -1063,7 +1098,12 @@ impl Kernel {
                 .await;
         }
 
-        Ok(imported_count)
+        Ok(AttachedRuntimeReconciliation {
+            exported_turn_count,
+            imported_turn_count: imported_count,
+            warning_count,
+            resumable,
+        })
     }
 
     async fn insert_attached_runtime_turn(
@@ -6970,6 +7010,8 @@ mod tests {
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
+        turns: Vec<RuntimeTerminalTurn>,
+        resumable: bool,
     }
 
     #[async_trait::async_trait]
@@ -7003,9 +7045,13 @@ mod tests {
             &self,
             _input: RuntimeTerminalTranscriptInput,
             _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-        ) -> anyhow::Result<Vec<RuntimeTerminalTurn>> {
+        ) -> anyhow::Result<RuntimeTerminalTranscript> {
             self.exports.fetch_add(1, Ordering::SeqCst);
-            Ok(Vec::new())
+            Ok(RuntimeTerminalTranscript::new(
+                self.turns.clone(),
+                Vec::new(),
+                self.resumable,
+            ))
         }
 
         async fn resolve_capability_requests(
@@ -7046,6 +7092,16 @@ mod tests {
     async fn kernel_with_counting_terminal_runtime(
         temp_dir: &tempfile::TempDir,
     ) -> (Kernel, Arc<AtomicUsize>) {
+        let (kernel, exports) =
+            kernel_with_counting_terminal_runtime_and_transcript(temp_dir, Vec::new(), false).await;
+        (kernel, exports)
+    }
+
+    async fn kernel_with_counting_terminal_runtime_and_transcript(
+        temp_dir: &tempfile::TempDir,
+        turns: Vec<RuntimeTerminalTurn>,
+        resumable: bool,
+    ) -> (Kernel, Arc<AtomicUsize>) {
         let runtime_root = temp_dir.path().join("runtime");
         let workspace_root = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_root)
@@ -7068,10 +7124,30 @@ mod tests {
                 TEST_TERMINAL_RUNTIME_ID,
                 Arc::new(CountingTerminalRuntimeAdapter {
                     exports: Arc::clone(&exports),
+                    turns,
+                    resumable,
                 }),
             )
             .await;
         (kernel, exports)
+    }
+
+    fn test_terminal_turn(source_id: &str) -> RuntimeTerminalTurn {
+        RuntimeTerminalTurn {
+            source_id: source_id.to_string(),
+            display_user_text: "hello native tui".to_string(),
+            prompt_user_text: "hello native tui".to_string(),
+            assistant_text: "hello from native tui".to_string(),
+            status: RuntimeTerminalTurnStatus::Completed,
+            error_code: None,
+            error_text: None,
+            started_at: DateTime::<Utc>::from(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            ),
+            finished_at: DateTime::<Utc>::from(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(2),
+            ),
+        }
     }
 
     fn test_attached_runtime_launch_input(session_id: Uuid) -> AttachedRuntimeLaunchInput {
@@ -7700,7 +7776,11 @@ mod tests {
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter { exports }),
+                Arc::new(CountingTerminalRuntimeAdapter {
+                    exports,
+                    turns: Vec::new(),
+                    resumable: false,
+                }),
             )
             .await;
         let session_id = open_test_session(&kernel).await;
@@ -7750,9 +7830,9 @@ mod tests {
 
         assert_eq!(exports.load(Ordering::SeqCst), 1);
         assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_CLEAN).await;
-        assert!(runtime_state_root
+        assert!(!runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
-            .is_file());
+            .exists());
         drop(first);
 
         let second = kernel
@@ -7769,6 +7849,128 @@ mod tests {
             Kernel::runtime_state_root(&second.request.plan),
             Some(runtime_state_root.as_path())
         );
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_does_not_mark_ready_without_adapter_resume_proof() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, _exports) = kernel_with_counting_terminal_runtime_and_transcript(
+            &temp_dir,
+            vec![test_terminal_turn("native-source-1")],
+            false,
+        )
+        .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let launch = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare launch");
+        let runtime_state_root = Kernel::runtime_state_root(&launch.request.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &launch.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish launch");
+
+        assert!(!runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_marks_ready_with_adapter_resume_proof() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, exports) = kernel_with_counting_terminal_runtime_and_transcript(
+            &temp_dir,
+            vec![test_terminal_turn("native-source-1")],
+            true,
+        )
+        .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let first = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare first launch");
+        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
+            .expect("runtime state root")
+            .to_path_buf();
+
+        kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &first.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish first launch");
+
+        assert_eq!(exports.load(Ordering::SeqCst), 1);
+        assert!(runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file());
+        drop(first);
+
+        let second = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+            .expect("prepare second launch");
+
+        kernel
+            .finish_attached_runtime_launch(
+                session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &second.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish second launch");
+
+        assert_eq!(
+            exports.load(Ordering::SeqCst),
+            2,
+            "second clean exit should export again"
+        );
+        assert!(runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file());
+
+        let events = kernel
+            .query_audit(
+                Some(session_id),
+                Some("runtime.tui.reconcile".to_string()),
+                None,
+                Some(2),
+            )
+            .await
+            .expect("query reconcile audit")
+            .events;
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.details["exported_turn_count"] == 1));
+        let mut imported_counts = events
+            .iter()
+            .map(|event| {
+                event.details["imported_turn_count"]
+                    .as_u64()
+                    .expect("imported count")
+            })
+            .collect::<Vec<_>>();
+        imported_counts.sort_unstable();
+        assert_eq!(imported_counts, vec![0, 1]);
     }
 
     #[tokio::test]
@@ -7837,7 +8039,11 @@ mod tests {
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter { exports }),
+                Arc::new(CountingTerminalRuntimeAdapter {
+                    exports,
+                    turns: Vec::new(),
+                    resumable: false,
+                }),
             )
             .await;
         let session_id = open_test_session(&kernel).await;

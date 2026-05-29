@@ -172,6 +172,55 @@ pub struct RuntimeTerminalTurn {
     pub finished_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTerminalTranscriptWarning {
+    pub source_id: String,
+    pub error: String,
+}
+
+impl RuntimeTerminalTranscriptWarning {
+    pub fn new(source_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            source_id: source_id.into(),
+            error: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeTerminalTranscript {
+    pub turns: Vec<RuntimeTerminalTurn>,
+    pub warnings: Vec<RuntimeTerminalTranscriptWarning>,
+    /// True only when the adapter has verified its own continuation target is valid.
+    pub resumable: bool,
+}
+
+impl RuntimeTerminalTranscript {
+    pub fn new(
+        turns: Vec<RuntimeTerminalTurn>,
+        warnings: Vec<RuntimeTerminalTranscriptWarning>,
+        resumable: bool,
+    ) -> Self {
+        Self {
+            turns,
+            warnings,
+            resumable,
+        }
+    }
+}
+
+pub fn latest_terminal_turn_is_completed(turns: &[RuntimeTerminalTurn]) -> bool {
+    turns
+        .iter()
+        .max_by(|left, right| {
+            left.finished_at
+                .cmp(&right.finished_at)
+                .then_with(|| left.started_at.cmp(&right.started_at))
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        })
+        .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
@@ -417,7 +466,7 @@ pub trait RuntimeAdapter: Send + Sync {
         &self,
         _input: RuntimeTerminalTranscriptInput,
         _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<Vec<RuntimeTerminalTurn>> {
+    ) -> Result<RuntimeTerminalTranscript> {
         Err(anyhow!(
             "runtime does not support native terminal transcript export"
         ))

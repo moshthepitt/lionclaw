@@ -234,13 +234,20 @@ source-derived ids, so reconciliation is idempotent. Reconciliation runs after
 process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
 shows the prior attached launch did not complete its after-exit pass; that keeps
 normal startup fast while still recovering completed runtime turns already
-written by the harness after an unclean LionClaw exit. Reconciliation errors are
-audited and logged but do not prevent the operator from leaving the native TUI
-cleanly. Transcript export passes are bounded by a kernel native-export timeout
-no greater than the runtime plan's hard timeout, so a stuck runtime CLI cannot
-make native TUI exit handling unbounded. The attached native UI itself is not a
-LionClaw turn, so LionClaw turn timeout overrides do not wrap the runtime's own
-interactive session.
+written by the harness after an unclean LionClaw exit. Per-source export/read
+failures are audited as `runtime.tui.reconcile_source_warning` and skipped, so
+one stale runtime thread cannot block valid completed turns from import.
+Pass-level enumeration failures are audited as `runtime.tui.reconcile_error`.
+A clean native TUI exit marks the runtime session resumable only when the
+adapter verifies that its own continuation target is valid. For OpenCode, that
+means the newest root session exported cleanly and its latest imported turn is
+completed; older good sessions do not make the next `opencode run --continue`
+safe. Transcript export passes are bounded by a kernel native-export timeout no
+greater than the runtime plan's hard timeout, so a stuck runtime CLI cannot make
+native TUI exit handling unbounded. Adapters may return partial transcripts with
+source warnings when the deadline is reached. The attached native UI itself is
+not a LionClaw turn, so LionClaw turn timeout overrides do not wrap the
+runtime's own interactive session.
 Each native TUI launch also holds a LionClaw-owned file lock in the session's
 runtime state root, preventing separate operator processes from attaching two
 native UIs to the same LionClaw session state at once.

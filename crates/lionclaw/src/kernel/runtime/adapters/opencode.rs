@@ -6,22 +6,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
 use crate::{
     home::runtime_session_ready_marker_exists,
     kernel::runtime::{
-        ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode,
+        latest_terminal_turn_is_completed, ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
+        RuntimeProgramSpec, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
     },
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
-const OPENCODE_TRANSCRIPT_SESSION_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -126,19 +126,11 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         &self,
         _input: RuntimeTerminalTranscriptInput,
         executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<Vec<RuntimeTerminalTurn>> {
+    ) -> Result<RuntimeTerminalTranscript> {
         let hard_timeout = executor.hard_timeout();
-        timeout(
-            hard_timeout,
-            export_opencode_terminal_transcript_with_cli(&self.config, executor),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "timed out after {}s while exporting OpenCode native TUI transcript through the OpenCode CLI",
-                hard_timeout.as_secs_f32()
-            )
-        })?
+        let deadline = Instant::now() + hard_timeout;
+        export_opencode_terminal_transcript_with_cli(&self.config, executor, deadline, hard_timeout)
+            .await
     }
 
     fn format_program_exit_error(
@@ -256,8 +248,6 @@ fn build_opencode_session_list_program(config: &OpenCodeRuntimeConfig) -> Runtim
             "list".to_string(),
             "--format".to_string(),
             "json".to_string(),
-            "--max-count".to_string(),
-            OPENCODE_TRANSCRIPT_SESSION_LIMIT.to_string(),
         ],
         environment: opencode_transcript_export_environment(),
         stdin: String::new(),
@@ -297,31 +287,82 @@ fn opencode_transcript_export_environment() -> Vec<(String, String)> {
 async fn export_opencode_terminal_transcript_with_cli(
     config: &OpenCodeRuntimeConfig,
     executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-) -> Result<Vec<RuntimeTerminalTurn>> {
-    let list_output = executor
-        .execute(build_opencode_session_list_program(config))
-        .await
-        .context("failed to list OpenCode sessions through the OpenCode CLI")?;
+    deadline: Instant,
+    hard_timeout: std::time::Duration,
+) -> Result<RuntimeTerminalTranscript> {
+    let list_output = timeout_at(
+        deadline,
+        executor.execute(build_opencode_session_list_program(config)),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "timed out after {}s while listing OpenCode sessions through the OpenCode CLI",
+            hard_timeout.as_secs_f32()
+        )
+    })?
+    .context("failed to list OpenCode sessions through the OpenCode CLI")?;
     if !list_output.success() {
         return Err(opencode_program_error("session list", &list_output));
     }
 
-    let session_ids = parse_opencode_session_list(&list_output.stdout)?;
+    let listed_sessions = parse_opencode_session_list(&list_output.stdout)?;
     let mut turns = Vec::new();
-    for session_id in session_ids {
-        let export_output = executor
-            .execute(build_opencode_export_program(config, &session_id))
-            .await
-            .with_context(|| {
-                format!("failed to export OpenCode session {session_id} through the OpenCode CLI")
-            })?;
-        if !export_output.success() {
-            return Err(opencode_program_error(
-                &format!("export {session_id}"),
-                &export_output,
+    let mut warnings = Vec::new();
+    let mut resumable = false;
+    for session_id in listed_sessions.ids {
+        if Instant::now() >= deadline {
+            warnings.push(RuntimeTerminalTranscriptWarning::new(
+                "opencode-session-list",
+                "OpenCode transcript export deadline reached; returning partial transcript",
             ));
+            break;
         }
-        turns.extend(parse_opencode_export(&session_id, &export_output.stdout)?);
+
+        let export_output = match timeout_at(
+            deadline,
+            executor.execute(build_opencode_export_program(config, &session_id)),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                warnings.push(RuntimeTerminalTranscriptWarning::new(
+                    format!("opencode-session:{session_id}"),
+                    format!("failed to export OpenCode session through the OpenCode CLI: {err}"),
+                ));
+                continue;
+            }
+            Err(_) => {
+                warnings.push(RuntimeTerminalTranscriptWarning::new(
+                    format!("opencode-session:{session_id}"),
+                    format!(
+                        "timed out after {}s while exporting OpenCode session; returning partial transcript",
+                        hard_timeout.as_secs_f32()
+                    ),
+                ));
+                break;
+            }
+        };
+        if !export_output.success() {
+            warnings.push(RuntimeTerminalTranscriptWarning::new(
+                format!("opencode-session:{session_id}"),
+                opencode_program_error(&format!("export {session_id}"), &export_output).to_string(),
+            ));
+            continue;
+        }
+        match parse_opencode_export(&session_id, &export_output.stdout) {
+            Ok(session_turns) => {
+                if listed_sessions.latest_id.as_deref() == Some(session_id.as_str()) {
+                    resumable = latest_terminal_turn_is_completed(&session_turns);
+                }
+                turns.extend(session_turns);
+            }
+            Err(err) => warnings.push(RuntimeTerminalTranscriptWarning::new(
+                format!("opencode-session:{session_id}"),
+                err.to_string(),
+            )),
+        }
     }
 
     turns.sort_by(|left, right| {
@@ -329,7 +370,7 @@ async fn export_opencode_terminal_transcript_with_cli(
             .cmp(&right.started_at)
             .then_with(|| left.source_id.cmp(&right.source_id))
     });
-    Ok(turns)
+    Ok(RuntimeTerminalTranscript::new(turns, warnings, resumable))
 }
 
 fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Error {
@@ -347,26 +388,39 @@ fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Err
     }
 }
 
-fn parse_opencode_session_list(stdout: &[u8]) -> Result<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenCodeListedSessions {
+    ids: Vec<String>,
+    latest_id: Option<String>,
+}
+
+fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> {
     let raw = String::from_utf8_lossy(stdout);
     if raw.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(OpenCodeListedSessions {
+            ids: Vec::new(),
+            latest_id: None,
+        });
     }
 
     let sessions = serde_json::from_slice::<Vec<OpenCodeSessionListItem>>(stdout)
         .context("failed to parse OpenCode session list JSON")?;
     let mut seen = HashSet::new();
-    let mut ids = sessions
-        .into_iter()
-        .filter(|session| !session.id.trim().is_empty())
-        .filter_map(|session| {
-            seen.insert(session.id.clone())
-                .then_some((session.updated, session.id))
-        })
-        .collect::<Vec<_>>();
-    ids.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut ids = Vec::new();
+    let mut latest_id = None;
+    for session in sessions {
+        let id = session.id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let id = id.to_string();
+        if latest_id.is_none() {
+            latest_id = Some(id.clone());
+        }
+        ids.push(id);
+    }
 
-    Ok(ids.into_iter().map(|(_, id)| id).collect())
+    Ok(OpenCodeListedSessions { ids, latest_id })
 }
 
 fn parse_opencode_export(
@@ -445,8 +499,6 @@ fn parse_opencode_export(
 #[derive(Debug, Deserialize)]
 struct OpenCodeSessionListItem {
     id: String,
-    #[serde(default)]
-    updated: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,6 +890,127 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HangingAfterOutputsTranscriptExecutor {
+        outputs: VecDeque<ExecutionOutput>,
+        programs: Vec<RuntimeProgramSpec>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeTerminalTranscriptProgramExecutor for HangingAfterOutputsTranscriptExecutor {
+        fn hard_timeout(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+
+        async fn execute(
+            &mut self,
+            program: RuntimeProgramSpec,
+        ) -> anyhow::Result<ExecutionOutput> {
+            self.programs.push(program);
+            if let Some(output) = self.outputs.pop_front() {
+                return Ok(output);
+            }
+            pending::<()>().await;
+            unreachable!("pending transcript executor returned")
+        }
+    }
+
+    fn json_output(value: serde_json::Value) -> ExecutionOutput {
+        ExecutionOutput {
+            stdout: value.to_string().into_bytes(),
+            exit_code: Some(0),
+            ..ExecutionOutput::default()
+        }
+    }
+
+    fn bytes_output(bytes: impl Into<Vec<u8>>) -> ExecutionOutput {
+        ExecutionOutput {
+            stdout: bytes.into(),
+            exit_code: Some(0),
+            ..ExecutionOutput::default()
+        }
+    }
+
+    fn opencode_session_list_output(session_ids: &[&str]) -> ExecutionOutput {
+        json_output(json!(session_ids
+            .iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                json!({
+                    "id": session_id,
+                    "title": session_id,
+                    "updated": 10_000 - index as i64,
+                    "created": 1_000 + index as i64,
+                    "projectId": "proj",
+                    "directory": "/workspace"
+                })
+            })
+            .collect::<Vec<_>>()))
+    }
+
+    fn opencode_completed_export_output(
+        session_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+    ) -> ExecutionOutput {
+        json_output(json!({
+            "info": {
+                "id": session_id,
+                "title": "native test",
+                "time": { "created": 1000, "updated": 3000 },
+                "directory": "/workspace"
+            },
+            "messages": [
+                {
+                    "info": {
+                        "id": "msg_user",
+                        "sessionID": session_id,
+                        "role": "user",
+                        "time": { "created": 1000 },
+                        "agent": "build",
+                        "model": { "providerID": "openai", "modelID": "gpt-5" }
+                    },
+                    "parts": [{
+                        "id": "part_user",
+                        "messageID": "msg_user",
+                        "sessionID": session_id,
+                        "type": "text",
+                        "text": user_text
+                    }]
+                },
+                {
+                    "info": {
+                        "id": "msg_assistant",
+                        "sessionID": session_id,
+                        "role": "assistant",
+                        "time": { "created": 2000, "completed": 3000 },
+                        "parentID": "msg_user",
+                        "modelID": "gpt-5",
+                        "providerID": "openai",
+                        "mode": "build",
+                        "agent": "build",
+                        "path": { "cwd": "/workspace", "root": "/workspace" },
+                        "cost": 0,
+                        "tokens": {
+                            "input": 0,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": { "read": 0, "write": 0 }
+                        },
+                        "finish": "stop"
+                    },
+                    "parts": [{
+                        "id": "part_assistant",
+                        "messageID": "msg_assistant",
+                        "sessionID": session_id,
+                        "type": "text",
+                        "text": assistant_text
+                    }]
+                }
+            ]
+        }))
+    }
+
     #[tokio::test]
     async fn opencode_adapter_builds_program_spec_for_registered_session() {
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
@@ -923,94 +1096,18 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let mut executor = FakeTranscriptExecutor {
             outputs: VecDeque::from([
-                ExecutionOutput {
-                    stdout: json!([
-                        {
-                            "id": "ses_opencode_session",
-                            "title": "native test",
-                            "updated": 3000,
-                            "created": 1000,
-                            "projectId": "proj",
-                            "directory": "/workspace"
-                        }
-                    ])
-                    .to_string()
-                    .into_bytes(),
-                    exit_code: Some(0),
-                    ..ExecutionOutput::default()
-                },
-                ExecutionOutput {
-                    stdout: json!({
-                        "info": {
-                            "id": "ses_opencode_session",
-                            "title": "native test",
-                            "time": { "created": 1000, "updated": 3000 },
-                            "directory": "/workspace"
-                        },
-                        "messages": [
-                            {
-                                "info": {
-                                    "id": "msg_user",
-                                    "sessionID": "ses_opencode_session",
-                                    "role": "user",
-                                    "time": { "created": 1000 },
-                                    "agent": "build",
-                                    "model": { "providerID": "openai", "modelID": "gpt-5" }
-                                },
-                                "parts": [
-                                    {
-                                        "id": "part_user",
-                                        "messageID": "msg_user",
-                                        "sessionID": "ses_opencode_session",
-                                        "type": "text",
-                                        "text": "hello opencode"
-                                    }
-                                ]
-                            },
-                            {
-                                "info": {
-                                    "id": "msg_assistant",
-                                    "sessionID": "ses_opencode_session",
-                                    "role": "assistant",
-                                    "time": { "created": 2000, "completed": 3000 },
-                                    "parentID": "msg_user",
-                                    "modelID": "gpt-5",
-                                    "providerID": "openai",
-                                    "mode": "build",
-                                    "agent": "build",
-                                    "path": { "cwd": "/workspace", "root": "/workspace" },
-                                    "cost": 0,
-                                    "tokens": {
-                                        "input": 0,
-                                        "output": 0,
-                                        "reasoning": 0,
-                                        "cache": { "read": 0, "write": 0 }
-                                    },
-                                    "finish": "stop"
-                                },
-                                "parts": [
-                                    {
-                                        "id": "part_assistant",
-                                        "messageID": "msg_assistant",
-                                        "sessionID": "ses_opencode_session",
-                                        "type": "text",
-                                        "text": "hello from native export"
-                                    }
-                                ]
-                            }
-                        ]
-                    })
-                    .to_string()
-                    .into_bytes(),
-                    exit_code: Some(0),
-                    ..ExecutionOutput::default()
-                },
+                opencode_session_list_output(&["ses_opencode_session"]),
+                opencode_completed_export_output(
+                    "ses_opencode_session",
+                    "hello opencode",
+                    "hello from native export",
+                ),
             ]),
             programs: Vec::new(),
         };
 
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
-        let turns = adapter
+        let transcript = adapter
             .export_terminal_transcript(
                 RuntimeTerminalTranscriptInput {
                     session_id: Uuid::new_v4(),
@@ -1021,6 +1118,9 @@ mod tests {
             .await
             .expect("export transcript");
 
+        assert!(transcript.warnings.is_empty());
+        assert!(transcript.resumable);
+        let turns = transcript.turns;
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
         assert_eq!(turn.display_user_text, "hello opencode");
@@ -1040,8 +1140,6 @@ mod tests {
                 "list".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
-                "--max-count".to_string(),
-                "200".to_string(),
             ]
         );
         assert_eq!(
@@ -1063,6 +1161,116 @@ mod tests {
                 ("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string()),
                 ("OPENCODE_PURE".to_string(), "1".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_skips_failed_session_exports() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good", "ses_bad"]),
+                opencode_completed_export_output("ses_good", "hello", "answer"),
+                bytes_output(b"not json"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                RuntimeTerminalTranscriptInput {
+                    session_id: Uuid::new_v4(),
+                    runtime_state_root,
+                },
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert!(transcript.resumable);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "opencode-export:ses_good:msg_user:msg_assistant"
+        );
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(transcript.warnings[0].source_id, "opencode-session:ses_bad");
+        assert!(
+            transcript.warnings[0]
+                .error
+                .contains("failed to parse OpenCode export JSON"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_latest_failed_session_is_not_resumable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_bad", "ses_good"]),
+                bytes_output(b"not json"),
+                opencode_completed_export_output("ses_good", "hello", "answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                RuntimeTerminalTranscriptInput {
+                    session_id: Uuid::new_v4(),
+                    runtime_state_root,
+                },
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.warnings.len(), 1);
+        assert!(!transcript.resumable);
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_timeout_returns_partial_transcript() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut executor = HangingAfterOutputsTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good", "ses_hangs"]),
+                opencode_completed_export_output("ses_good", "hello", "answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                RuntimeTerminalTranscriptInput {
+                    session_id: Uuid::new_v4(),
+                    runtime_state_root,
+                },
+                &mut executor,
+            )
+            .await
+            .expect("partial transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert!(transcript.resumable);
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(
+            transcript.warnings[0].source_id,
+            "opencode-session:ses_hangs"
+        );
+        assert!(
+            transcript.warnings[0].error.contains("timed out"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
         );
     }
 
@@ -1090,7 +1298,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            message.contains("OpenCode native TUI transcript through the OpenCode CLI"),
+            message.contains("listing OpenCode sessions through the OpenCode CLI"),
             "unexpected error: {err}"
         );
     }
