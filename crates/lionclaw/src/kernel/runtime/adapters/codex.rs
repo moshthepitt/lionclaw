@@ -629,11 +629,10 @@ impl CodexRuntimeAdapter {
         Ok(RuntimeTerminalTranscript::new(
             turns,
             warnings,
-            RuntimeTerminalTranscriptState {
-                reconciled: target.reconciled()
-                    && (source_selection_reconciled || !target.is_empty()),
-                resumable: target.resumable(),
-            },
+            RuntimeTerminalTranscriptState::new(
+                target.reconciled() && (source_selection_reconciled || !target.is_empty()),
+                target.resumable(),
+            ),
         ))
     }
 
@@ -821,7 +820,7 @@ fn codex_record_app_server_thread_transcript(
     turns: &mut Vec<RuntimeTerminalTurn>,
 ) -> bool {
     let deadline_reached = transcript.deadline_reached;
-    target.record_export(&thread.id, transcript.resumable, !deadline_reached);
+    target.record_reconciliation(&thread.id, !deadline_reached, transcript.resumable);
     turns.extend(transcript.turns);
     deadline_reached
 }
@@ -3212,8 +3211,8 @@ mod tests {
             .expect("transcript");
 
         assert!(transcript.warnings.is_empty());
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(
             load_saved_thread_id(temp_dir.path()).expect("saved thread"),
             Some("thr_cli".to_string())
@@ -3339,8 +3338,8 @@ mod tests {
             .await
             .expect("transcript");
 
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(
             load_saved_thread_id(temp_dir.path()).expect("saved thread"),
             Some("thr_other".to_string())
@@ -3418,8 +3417,8 @@ mod tests {
             .expect("transcript");
 
         assert_eq!(transcript.turns.len(), 1);
-        assert!(!transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(
             transcript.turns[0].source_id,
             "codex-app-server:thr_good:turn_good"
@@ -3492,8 +3491,8 @@ mod tests {
             .await
             .expect("transcript");
 
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(transcript.turns.len(), 1);
         assert_eq!(
             transcript.turns[0].source_id,
@@ -3576,8 +3575,8 @@ mod tests {
             .await
             .expect("transcript");
 
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(transcript.turns.len(), 1);
         let sent = sent.lock().expect("sent lock");
         let turn_list_requests = sent
@@ -3654,8 +3653,8 @@ mod tests {
             transcript.turns[0].source_id,
             "codex-app-server:thr_cli:turn_done"
         );
-        assert!(transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert!(transcript.warnings.is_empty());
     }
 
@@ -3717,8 +3716,8 @@ mod tests {
             transcript.turns[0].source_id,
             "codex-app-server:thr_cli:turn_done"
         );
-        assert!(!transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "codex-app-server:thr_cli");
         assert!(

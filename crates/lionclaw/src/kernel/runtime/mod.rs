@@ -203,9 +203,26 @@ pub struct RuntimeTerminalTranscript {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeTerminalTranscriptState {
     /// True only when the adapter has reconciled its chosen continuation source.
-    pub reconciled: bool,
+    reconciled: bool,
     /// True only when the adapter has verified its own continuation target is valid.
-    pub resumable: bool,
+    resumable: bool,
+}
+
+impl RuntimeTerminalTranscriptState {
+    pub fn new(reconciled: bool, resumable: bool) -> Self {
+        Self {
+            reconciled,
+            resumable: reconciled && resumable,
+        }
+    }
+
+    pub fn is_reconciled(self) -> bool {
+        self.reconciled
+    }
+
+    pub fn is_resumable(self) -> bool {
+        self.resumable
+    }
 }
 
 impl RuntimeTerminalTranscript {
@@ -887,8 +904,8 @@ mod tests {
         ExecutionLimits, ExecutionOutput, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult,
         RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult, WorkspaceAccess,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalTranscriptState,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -896,6 +913,14 @@ mod tests {
         sync::mpsc,
         time::{sleep, timeout},
     };
+
+    #[test]
+    fn terminal_transcript_state_never_resumes_unreconciled_source() {
+        let state = RuntimeTerminalTranscriptState::new(false, true);
+
+        assert!(!state.is_reconciled());
+        assert!(!state.is_resumable());
+    }
 
     #[derive(Clone)]
     struct StubAttempt {

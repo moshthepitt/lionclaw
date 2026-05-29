@@ -10,7 +10,7 @@ pub use opencode::{OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
 #[derive(Debug, Default)]
 struct TerminalTranscriptTarget {
     id: Option<String>,
-    exported: bool,
+    reconciled: bool,
     resumable: bool,
 }
 
@@ -27,18 +27,18 @@ impl TerminalTranscriptTarget {
         true
     }
 
-    fn record_export(&mut self, id: &str, resumable: bool, reconciled: bool) {
+    fn record_reconciliation(&mut self, id: &str, reconciled: bool, resumable: bool) {
         if self.id.as_deref() == Some(id) {
-            self.exported = reconciled;
+            self.reconciled = reconciled;
             self.resumable = reconciled && resumable;
         }
     }
 
     fn resumable(&self) -> bool {
-        self.exported && self.resumable
+        self.reconciled && self.resumable
     }
 
     fn reconciled(&self) -> bool {
-        self.id.is_none() || self.exported
+        self.id.is_none() || self.reconciled
     }
 }

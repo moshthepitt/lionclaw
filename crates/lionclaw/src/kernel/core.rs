@@ -1113,8 +1113,8 @@ impl Kernel {
             exported_turn_count,
             imported_turn_count: imported_count,
             warning_count,
-            reconciled: state.reconciled,
-            resumable: state.resumable,
+            reconciled: state.is_reconciled(),
+            resumable: state.is_resumable(),
         })
     }
 
@@ -7068,10 +7068,7 @@ mod tests {
             Ok(RuntimeTerminalTranscript::new(
                 self.turns.clone(),
                 Vec::new(),
-                RuntimeTerminalTranscriptState {
-                    reconciled: self.reconciled,
-                    resumable: self.resumable,
-                },
+                RuntimeTerminalTranscriptState::new(self.reconciled, self.resumable),
             ))
         }
 

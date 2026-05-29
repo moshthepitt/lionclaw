@@ -447,7 +447,7 @@ async fn export_opencode_terminal_transcript_with_cli(
         }
         match parse_opencode_export(&session_id, &export_output.stdout) {
             Ok(session_transcript) => {
-                target.record_export(&session_id, session_transcript.resumable, true);
+                target.record_reconciliation(&session_id, true, session_transcript.resumable);
                 turns.extend(session_transcript.turns);
             }
             Err(err) => warnings.push(RuntimeTerminalTranscriptWarning::new(
@@ -465,10 +465,7 @@ async fn export_opencode_terminal_transcript_with_cli(
     Ok(RuntimeTerminalTranscript::new(
         turns,
         warnings,
-        RuntimeTerminalTranscriptState {
-            reconciled: target.reconciled(),
-            resumable: target.resumable(),
-        },
+        RuntimeTerminalTranscriptState::new(target.reconciled(), target.resumable()),
     ))
 }
 
@@ -1583,8 +1580,8 @@ mod tests {
             .expect("export transcript");
 
         assert!(transcript.warnings.is_empty());
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         let turns = transcript.turns;
         assert_eq!(turns.len(), 1);
         let turn = &turns[0];
@@ -1671,8 +1668,8 @@ mod tests {
             .expect("export transcript");
 
         assert_eq!(transcript.turns.len(), 2);
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(
             transcript.turns[0].source_id,
             "opencode-export:ses_latest:msg_user:msg_assistant"
@@ -1735,8 +1732,8 @@ mod tests {
 
         assert_eq!(transcript.turns.len(), 1);
         assert_eq!(transcript.warnings.len(), 1);
-        assert!(!transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(
             std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
                 .expect("saved session id"),
@@ -1788,8 +1785,8 @@ mod tests {
             transcript.turns[0].source_id,
             "opencode-export:ses_good:msg_user_1:msg_assistant_1"
         );
-        assert!(transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert!(transcript.warnings.is_empty());
     }
 
@@ -1837,8 +1834,8 @@ mod tests {
             transcript.turns[0].source_id,
             "opencode-export:ses_good:msg_user_1:msg_assistant_old"
         );
-        assert!(transcript.state.reconciled);
-        assert!(!transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert!(transcript.warnings.is_empty());
     }
 
@@ -1873,8 +1870,8 @@ mod tests {
             .expect("partial transcript");
 
         assert_eq!(transcript.turns.len(), 1);
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(
             transcript.warnings[0].source_id,
@@ -1922,8 +1919,8 @@ mod tests {
             .expect("saved session fallback");
 
         assert_eq!(transcript.turns.len(), 1);
-        assert!(transcript.state.reconciled);
-        assert!(transcript.state.resumable);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
         assert!(
