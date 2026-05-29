@@ -344,9 +344,17 @@ async fn export_opencode_terminal_transcript_with_cli(
     )
     .await
     {
-        Ok(Ok(output)) if output.success() => {
-            (parse_opencode_session_list(&output.stdout)?, Vec::new())
-        }
+        Ok(Ok(output)) if output.success() => match parse_opencode_session_list(&output.stdout) {
+            Ok(listed_sessions) => (listed_sessions, Vec::new()),
+            Err(err) if saved_session_id.is_some() => (
+                OpenCodeListedSessions::default(),
+                vec![RuntimeTerminalTranscriptWarning::new(
+                    "opencode-session-list",
+                    err.to_string(),
+                )],
+            ),
+            Err(err) => return Err(err),
+        },
         Ok(Ok(output)) => {
             let err = opencode_program_error("session list", &output);
             if saved_session_id.is_none() {
@@ -506,14 +514,11 @@ fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> 
         return Ok(OpenCodeListedSessions::default());
     }
 
-    let latest = serde_json::from_slice::<Vec<OpenCodeSessionListItem>>(stdout)
+    let sessions = serde_json::from_slice::<Vec<Value>>(stdout)
         .context("failed to parse OpenCode session list JSON")?;
-    let latest = latest
-        .into_iter()
-        .filter_map(|session| {
-            let id = normalize_opencode_session_id(&session.id)?;
-            TerminalTranscriptCandidate::new(id, opencode_session_list_updated_at(&session))
-        })
+    let latest = sessions
+        .iter()
+        .filter_map(opencode_session_list_candidate)
         .max_by(|left, right| {
             left.updated_at
                 .cmp(&right.updated_at)
@@ -523,11 +528,17 @@ fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> 
     Ok(OpenCodeListedSessions { latest })
 }
 
-fn opencode_session_list_updated_at(session: &OpenCodeSessionListItem) -> Option<DateTime<Utc>> {
-    session
-        .updated
-        .or(session.created)
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+fn opencode_session_list_candidate(session: &Value) -> Option<TerminalTranscriptCandidate> {
+    let id = session.get("id").and_then(Value::as_str)?;
+    TerminalTranscriptCandidate::new(id, opencode_session_list_updated_at(session))
+}
+
+fn opencode_session_list_updated_at(session: &Value) -> Option<DateTime<Utc>> {
+    let ms = session
+        .get("updated")
+        .and_then(Value::as_i64)
+        .or_else(|| session.get("created").and_then(Value::as_i64))?;
+    Utc.timestamp_millis_opt(ms).single()
 }
 
 fn opencode_reconcile_session_ids(
@@ -615,15 +626,6 @@ fn parse_opencode_export(
     }
 
     Ok(OpenCodeTerminalTranscript { turns, resumable })
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenCodeSessionListItem {
-    id: String,
-    #[serde(default)]
-    updated: Option<i64>,
-    #[serde(default)]
-    created: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1619,6 +1621,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opencode_session_list_skips_malformed_entries() {
+        let output = bytes_output(
+            serde_json::to_vec(&json!([
+                {"updated": 5_000},
+                {"id": "ses_good", "updated": 2_000},
+                {"id": "ses_bad_time", "updated": "later"}
+            ]))
+            .expect("session list JSON"),
+        );
+
+        let listed = parse_opencode_session_list(&output.stdout).expect("session list");
+
+        let latest = listed.latest.expect("latest session");
+        assert_eq!(latest.id, "ses_good");
+        assert_eq!(
+            latest.updated_at.expect("updated").timestamp_millis(),
+            2_000
+        );
+    }
+
     #[tokio::test]
     async fn opencode_terminal_transcript_export_uses_native_cli_export() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -2081,6 +2104,51 @@ mod tests {
         assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
         assert!(
             transcript.warnings[0].error.contains("list unavailable"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
+        );
+        assert_eq!(
+            executor.programs[1].args,
+            vec!["export".to_string(), "ses_saved".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_uses_saved_session_when_list_json_is_malformed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                bytes_output(b"{\"unexpected\":true}"),
+                opencode_completed_export_output("ses_saved", "hello", "answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("saved session fallback");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
+        assert!(
+            transcript.warnings[0]
+                .error
+                .contains("failed to parse OpenCode session list JSON"),
             "unexpected warning: {}",
             transcript.warnings[0].error
         );

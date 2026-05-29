@@ -518,8 +518,22 @@ impl CodexRuntimeAdapter {
                     return Err(err).context("failed to list Codex app-server threads");
                 }
             };
+            let listed_threads = match codex_app_server_threads(&response) {
+                Ok(threads) => threads,
+                Err(err) if request.resume_thread_id.is_some() => {
+                    warnings.push(RuntimeTerminalTranscriptWarning::new(
+                        "codex-app-server",
+                        format!("{err:#}"),
+                    ));
+                    source_selection_reconciled = false;
+                    break;
+                }
+                Err(err) => {
+                    return Err(err).context("failed to list Codex app-server threads");
+                }
+            };
             let mut deadline_reached = false;
-            for thread in codex_app_server_threads(&response) {
+            for thread in listed_threads {
                 if !seen_thread_ids.insert(thread.id.clone()) {
                     continue;
                 }
@@ -939,12 +953,13 @@ struct CodexTerminalTurnPage {
     newest_turn_resumable: Option<bool>,
 }
 
-fn codex_app_server_threads(response: &Value) -> Vec<CodexListedThread> {
-    response
+fn codex_app_server_threads(response: &Value) -> Result<Vec<CodexListedThread>> {
+    let threads = response
         .get("data")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+        .ok_or_else(|| anyhow!("codex thread/list response missing data"))?;
+    Ok(threads
+        .iter()
         .filter_map(|thread| {
             let id = thread
                 .get("id")
@@ -956,7 +971,7 @@ fn codex_app_server_threads(response: &Value) -> Vec<CodexListedThread> {
                 finished_at: codex_app_server_timestamp(thread.get("updatedAt")),
             })
         })
-        .collect()
+        .collect())
 }
 
 async fn codex_app_server_thread_terminal_transcript<T>(
@@ -3693,6 +3708,69 @@ mod tests {
             transcript.warnings[0]
                 .error
                 .contains("thread list unavailable"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_transcript_falls_back_to_saved_thread_when_listing_is_malformed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"id": 2, "result": {"unexpected": true}}),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [codex_completed_app_server_turn(
+                        "turn_saved",
+                        "hello",
+                        "answer",
+                        1780000001,
+                        1780000007,
+                    )],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_saved"),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "codex-app-server:thr_saved:turn_saved"
+        );
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(transcript.warnings[0].source_id, "codex-app-server");
+        assert!(
+            transcript.warnings[0].error.contains("missing data"),
             "unexpected warning: {}",
             transcript.warnings[0].error
         );
