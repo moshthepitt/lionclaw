@@ -227,9 +227,17 @@ LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex exports completed turns
 through Codex's app-server `thread/list` and paged `thread/turns/list` protocol
 inside the same runtime boundary, enumerating newest history first and sorting
-before canonical import. OpenCode exports completed turns by running OpenCode's
-own `session list --format json` and `export <sessionID>` commands inside the
-same runtime boundary after the native TUI exits.
+before canonical import. OpenCode continuity is a LionClaw-owned link to one
+OpenCode root session id stored in runtime-private state. Program-backed
+OpenCode turns learn that id from OpenCode's machine-readable `sessionID`
+events and then resume with `opencode run --session <sessionID>`. Native TUI
+launches resume with `opencode --session <sessionID>` when that link exists.
+After native TUI exit, LionClaw uses OpenCode's `session list --format json`
+only to identify the current newest root session in the same runtime boundary,
+then imports through `export <sessionID>` for that current linked session and,
+when different, the previously linked session. LionClaw does not depend on a
+private OpenCode SQLite schema and does not try to backfill an arbitrary
+session-list window.
 The kernel imports those turns into canonical `session_turns` with deterministic
 source-derived ids, so reconciliation is idempotent. Reconciliation runs after
 process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
@@ -238,14 +246,17 @@ normal startup fast while still recovering completed runtime turns already
 written by the harness after an unclean LionClaw exit. Per-source export/read
 failures are audited as `runtime.tui.reconcile_source_warning` and skipped, so
 one stale runtime thread cannot block valid completed turns from import.
-Pass-level enumeration failures are audited as `runtime.tui.reconcile_error`.
+Enumeration failures are audited as source warnings when a previously linked
+continuation target can still be exported; otherwise they are audited as
+`runtime.tui.reconcile_error`.
 A clean native TUI exit marks the runtime session resumable only when the
 adapter verifies that its own continuation target is valid from raw runtime
 state, not merely from turns imported into LionClaw. For Codex, the saved
 continuation thread must export cleanly far enough to prove its newest raw turn
-completed. For OpenCode, the newest root session must export cleanly and its raw
-message state must have a completed assistant answering the latest user message;
-older good sessions do not make the next `opencode run --continue` safe.
+completed. For OpenCode, the linked continuation session must export cleanly and
+its raw message state must have a completed assistant answering the latest user
+message; older good sessions do not make the next `opencode run --session`
+safe.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
