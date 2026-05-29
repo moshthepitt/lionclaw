@@ -11,19 +11,16 @@ use tokio::time::{timeout_at, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-};
-
-use super::{
-    choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
-    state_file::{load_ready_state_value, load_state_value, save_state_value},
-    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
+use lionclaw_runtime_api::{
+    choose_terminal_transcript_target, load_ready_state_value, load_state_value,
+    normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
+    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+    RuntimeTurnInput, RuntimeTurnMode, TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptTimestampPrecision,
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
@@ -83,12 +80,10 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
-        let session_id = input
-            .runtime_state_root
-            .as_deref()
-            .map(load_ready_opencode_session_id)
-            .transpose()?
-            .flatten();
+        let session_id = match input.runtime_state_root.as_deref() {
+            Some(root) => load_ready_opencode_session_id(root, input.runtime_session_ready)?,
+            None => None,
+        };
         let resumes_existing_session = session_id.is_some();
         self.sessions
             .write()
@@ -146,7 +141,10 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_opencode_terminal_program(
             &self.config,
-            load_ready_opencode_session_id(&input.runtime_state_root)?,
+            load_ready_opencode_session_id(
+                &input.runtime_state_root,
+                input.runtime_session_ready,
+            )?,
         ))
     }
 
@@ -874,8 +872,16 @@ fn load_saved_opencode_session_id(root: &Path) -> Result<Option<String>> {
     load_state_value(root, OPENCODE_SESSION_ID_STATE_FILE, "opencode session")
 }
 
-fn load_ready_opencode_session_id(root: &Path) -> Result<Option<String>> {
-    load_ready_state_value(root, OPENCODE_SESSION_ID_STATE_FILE, "opencode session")
+fn load_ready_opencode_session_id(
+    root: &Path,
+    runtime_session_ready: bool,
+) -> Result<Option<String>> {
+    load_ready_state_value(
+        root,
+        OPENCODE_SESSION_ID_STATE_FILE,
+        "opencode session",
+        runtime_session_ready,
+    )
 }
 
 fn save_opencode_session_id(root: &Path, session_id: &str) -> Result<()> {
@@ -1192,7 +1198,7 @@ fn collect_texts(value: &Value) -> Vec<String> {
 mod tests {
     use std::{collections::VecDeque, future::pending, path::PathBuf, time::Duration};
 
-    use crate::kernel::runtime::{
+    use lionclaw_runtime_api::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
         RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
@@ -1492,6 +1498,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
+                runtime_session_ready: false,
             })
             .await
             .expect("start");
@@ -1537,6 +1544,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: false,
             })
             .await
             .expect("start");
@@ -1583,11 +1591,6 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
-        std::fs::write(
             runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
             "ses_ready\n",
         )
@@ -1601,6 +1604,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
+                runtime_session_ready: true,
             })
             .await
             .expect("start");
@@ -1643,6 +1647,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: false,
             })
             .expect("program");
 
@@ -1667,11 +1672,6 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
-        std::fs::write(
             runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
             "ses_saved\n",
         )
@@ -1682,6 +1682,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: true,
             })
             .expect("program");
 
@@ -1707,6 +1708,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: false,
             })
             .expect("program");
 
@@ -1720,11 +1722,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
         let target = temp_dir.path().join("outside-session-id");
         std::fs::write(&target, "ses_outside\n").expect("write target");
         std::os::unix::fs::symlink(
@@ -1738,6 +1735,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: true,
             })
             .expect_err("symlinked session state should be rejected");
 

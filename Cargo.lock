@@ -1469,6 +1469,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lionclaw-runtime-api",
+ "lionclaw-runtime-codex",
+ "lionclaw-runtime-mock",
+ "lionclaw-runtime-opencode",
  "nix",
  "ratatui",
  "ratatui-textarea",
@@ -1482,7 +1486,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "toml_edit",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1506,6 +1509,62 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lionclaw-runtime-api"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "lionclaw-runtime-codex"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "lionclaw-runtime-api",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "lionclaw-runtime-mock"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lionclaw-runtime-api",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "lionclaw-runtime-opencode"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "lionclaw-runtime-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3297,7 +3356,6 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
- "toml_writer",
  "winnow 1.0.2",
 ]
 

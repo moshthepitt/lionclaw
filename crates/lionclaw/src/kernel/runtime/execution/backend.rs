@@ -2,6 +2,7 @@ use std::{fmt, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use lionclaw_runtime_api::RuntimeProgramSession;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -86,6 +87,31 @@ impl ExecutionSession {
         match self {
             Self::Oci(session) => session.shutdown().await,
         }
+    }
+}
+
+pub struct RuntimeExecutionSession {
+    session: ExecutionSession,
+}
+
+impl RuntimeExecutionSession {
+    pub fn new(session: ExecutionSession) -> Self {
+        Self { session }
+    }
+}
+
+#[async_trait]
+impl RuntimeProgramSession for RuntimeExecutionSession {
+    async fn write_line(&mut self, line: &str) -> Result<()> {
+        self.session.write_line(line).await
+    }
+
+    async fn read_line(&mut self) -> Result<Option<String>> {
+        self.session.read_line().await
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput> {
+        self.session.shutdown().await
     }
 }
 

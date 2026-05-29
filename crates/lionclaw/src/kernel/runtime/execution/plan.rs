@@ -2,38 +2,12 @@ use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
+pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
+
 pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
 
 pub fn skill_mount_target(alias: &str) -> String {
     format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
-}
-
-/// Adapter-produced program invocation details, independent from how LionClaw
-/// chooses to confine the process.
-#[derive(Clone, PartialEq, Eq, Default)]
-pub struct RuntimeProgramSpec {
-    pub executable: String,
-    pub args: Vec<String>,
-    pub environment: Vec<(String, String)>,
-    pub stdin: String,
-    pub auth: Option<RuntimeAuthKind>,
-}
-
-impl fmt::Debug for RuntimeProgramSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RuntimeProgramSpec")
-            .field("executable", &self.executable)
-            .field("args", &self.args)
-            .field("environment_count", &self.environment.len())
-            .field("stdin_len", &self.stdin.len())
-            .field("auth", &self.auth)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeAuthKind {
-    Codex,
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.
@@ -71,22 +45,6 @@ impl WorkspaceAccess {
         match self {
             Self::ReadOnly => "read-only",
             Self::ReadWrite => "read-write",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkMode {
-    None,
-    On,
-}
-
-impl NetworkMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::On => "on",
         }
     }
 }

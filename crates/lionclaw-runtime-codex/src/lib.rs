@@ -14,20 +14,17 @@ use tokio::{
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::kernel::runtime::{
-    spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+use lionclaw_runtime_api::{
+    choose_terminal_transcript_target, load_ready_state_value, load_state_value,
+    normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
+    NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
+    RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
+    RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
     RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
-};
-
-use super::{
-    choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
-    state_file::{load_ready_state_value, load_state_value, save_state_value},
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
@@ -120,15 +117,12 @@ impl CodexRuntimeAdapter {
     ) -> Result<RuntimeTurnResult> {
         let RuntimeProgramTurnExecution {
             input,
-            plan,
-            runtime_secrets_mount,
-            codex_home_override,
+            context,
+            mut executor,
         } = execution;
-        let network_mode = plan.network_mode;
+        let network_mode = context.network_mode;
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self
-            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
-            .await?;
+        let transport = self.start_app_server_transport(executor.as_mut()).await?;
         let mut client = CodexAppServerClient::new(transport);
 
         let result = async {
@@ -202,19 +196,16 @@ impl CodexRuntimeAdapter {
         events: RuntimeEventSender,
     ) -> Result<RuntimeControlOutcome> {
         let RuntimeControlExecution {
-            plan,
-            runtime_secrets_mount,
-            codex_home_override,
             input,
+            mut executor,
+            ..
         } = execution;
         let include_hidden = match model_list_include_hidden(&input.arguments) {
             Ok(include_hidden) => include_hidden,
             Err(outcome) => return Ok(outcome),
         };
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self
-            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
-            .await?;
+        let transport = self.start_app_server_transport(executor.as_mut()).await?;
         let mut client = CodexAppServerClient::new(transport);
         let result = async {
             client.initialize(&events, &thread_state).await?;
@@ -244,10 +235,9 @@ impl CodexRuntimeAdapter {
         events: RuntimeEventSender,
     ) -> Result<RuntimeControlOutcome> {
         let RuntimeControlExecution {
-            plan,
-            runtime_secrets_mount,
-            codex_home_override,
             input,
+            mut executor,
+            ..
         } = execution;
         let Some(saved_thread_id) = self.current_thread_id(&input.runtime_session_id)? else {
             return Ok(RuntimeControlOutcome::Failed {
@@ -265,9 +255,7 @@ impl CodexRuntimeAdapter {
         }
 
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self
-            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
-            .await?;
+        let transport = self.start_app_server_transport(executor.as_mut()).await?;
         let mut client = CodexAppServerClient::new(transport);
 
         let result = async {
@@ -333,17 +321,11 @@ impl CodexRuntimeAdapter {
 
     async fn start_app_server_transport(
         &self,
-        plan: crate::kernel::runtime::EffectiveExecutionPlan,
-        runtime_secrets_mount: Option<crate::kernel::runtime::RuntimeSecretsMount>,
-        codex_home_override: Option<PathBuf>,
+        executor: &mut dyn RuntimeProgramExecutor,
     ) -> Result<ExecutionSessionTransport> {
-        let session = spawn_interactive(ExecutionRequest {
-            plan,
-            program: build_codex_app_server_program(&self.config),
-            runtime_secrets_mount,
-            codex_home_override,
-        })
-        .await?;
+        let session = executor
+            .spawn(build_codex_app_server_program(&self.config))
+            .await?;
         Ok(ExecutionSessionTransport::new(session))
     }
 
@@ -722,12 +704,10 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let thread_id = input
-            .runtime_state_root
-            .as_deref()
-            .map(load_ready_saved_thread_id)
-            .transpose()?
-            .flatten();
+        let thread_id = match input.runtime_state_root.as_deref() {
+            Some(root) => load_ready_saved_thread_id(root, input.runtime_session_ready)?,
+            None => None,
+        };
         let resumes_existing_session = thread_id.is_some();
         self.sessions
             .write()
@@ -761,7 +741,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_codex_terminal_program(
             &self.config,
-            load_ready_saved_thread_id(&input.runtime_state_root)?,
+            load_ready_saved_thread_id(&input.runtime_state_root, input.runtime_session_ready)?,
         ))
     }
 
@@ -1290,11 +1270,11 @@ trait AppServerTransport {
 }
 
 struct ExecutionSessionTransport {
-    session: Option<ExecutionSession>,
+    session: Option<Box<dyn RuntimeProgramSession>>,
 }
 
 impl ExecutionSessionTransport {
-    fn new(session: ExecutionSession) -> Self {
+    fn new(session: Box<dyn RuntimeProgramSession>) -> Self {
         Self {
             session: Some(session),
         }
@@ -2814,8 +2794,13 @@ fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
     load_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
 }
 
-fn load_ready_saved_thread_id(root: &Path) -> Result<Option<String>> {
-    load_ready_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
+fn load_ready_saved_thread_id(root: &Path, runtime_session_ready: bool) -> Result<Option<String>> {
+    load_ready_state_value(
+        root,
+        CODEX_THREAD_ID_STATE_FILE,
+        "codex thread",
+        runtime_session_ready,
+    )
 }
 
 fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
@@ -2970,18 +2955,18 @@ mod tests {
         time::Duration,
     };
 
-    use crate::kernel::runtime::{
-        append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
-        EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
-        OciConfinementConfig, RuntimeAdapter, RuntimeAuthKind, RuntimeControlExecution,
-        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeEventSender, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
-        WorkspaceAccess,
-    };
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use lionclaw_runtime_api::{
+        append_streamed_text_boundary, append_streamed_text_delta, ExecutionOutput, NetworkMode,
+        RuntimeAdapter, RuntimeAuthKind, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
+        RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
+    };
     use serde_json::{json, Value};
     use tokio::time::Instant;
 
@@ -3023,6 +3008,33 @@ mod tests {
         }
     }
 
+    struct UnusedRuntimeProgramExecutor;
+
+    #[async_trait]
+    impl RuntimeProgramExecutor for UnusedRuntimeProgramExecutor {
+        async fn execute_streaming(
+            &mut self,
+            _program: RuntimeProgramSpec,
+            _stdout: RuntimeProgramStdoutSender,
+        ) -> Result<ExecutionOutput> {
+            anyhow::bail!("test did not expect streaming runtime execution")
+        }
+
+        async fn execute_captured(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> Result<ExecutionOutput> {
+            anyhow::bail!("test did not expect captured runtime execution")
+        }
+
+        async fn spawn(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> Result<Box<dyn RuntimeProgramSession>> {
+            anyhow::bail!("test did not expect interactive runtime execution")
+        }
+    }
+
     async fn start_codex_test_session(
         runtime_state_root: Option<PathBuf>,
     ) -> (
@@ -3043,6 +3055,7 @@ mod tests {
         super::CodexThreadState,
     ) {
         let adapter = CodexRuntimeAdapter::new(config);
+        let runtime_session_ready = false;
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -3050,6 +3063,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root,
+                runtime_session_ready,
             })
             .await
             .expect("start");
@@ -3064,10 +3078,10 @@ mod tests {
     fn codex_protocol_fixture(name: &str) -> Value {
         let raw = match name {
             "compact_context_compaction_v2" => include_str!(
-                "../../../../tests/fixtures/codex_app_server/compact_context_compaction_v2.json"
+                "../tests/fixtures/codex_app_server/compact_context_compaction_v2.json"
             ),
             "turn_interrupt_v2" => {
-                include_str!("../../../../tests/fixtures/codex_app_server/turn_interrupt_v2.json")
+                include_str!("../tests/fixtures/codex_app_server/turn_interrupt_v2.json")
             }
             other => panic!("unknown Codex protocol fixture: {other}"),
         };
@@ -3264,11 +3278,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
         save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
 
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
@@ -3279,6 +3288,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: true,
             })
             .expect("terminal program");
 
@@ -3443,6 +3453,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: false,
             })
             .expect("terminal program");
 
@@ -4466,10 +4477,7 @@ mod tests {
         assert_eq!(program.executable, "codex");
         assert_eq!(program.args, vec!["app-server".to_string()]);
         assert_eq!(program.stdin, "");
-        assert_eq!(
-            program.auth,
-            Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
-        );
+        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
     }
 
     #[test]
@@ -4780,9 +4788,13 @@ mod tests {
                         origin: RuntimeControlOrigin::SessionTurn,
                         runtime_skill_ids: Vec::new(),
                     },
-                    plan: test_execution_plan(),
-                    runtime_secrets_mount: None,
-                    codex_home_override: None,
+                    context: RuntimeExecutionContext {
+                        network_mode: NetworkMode::On,
+                        environment: Vec::new(),
+                        runtime_state_root: None,
+                        runtime_path_projections: Vec::new(),
+                    },
+                    executor: Box::new(UnusedRuntimeProgramExecutor),
                 },
                 event_tx,
             )
@@ -4898,7 +4910,7 @@ mod tests {
                     &thread_id,
                     "hello",
                     Some("gpt-5-codex"),
-                    crate::kernel::runtime::NetworkMode::None,
+                    NetworkMode::None,
                 ),
                 &event_tx,
                 &thread_state,
@@ -5196,18 +5208,13 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker");
-        std::fs::write(
             runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
             "thr_saved\n",
         )
         .expect("write thread id");
 
         let (adapter, handle, thread_state) =
-            start_codex_test_session(Some(runtime_state_root)).await;
+            start_codex_ready_test_session(runtime_state_root).await;
         let transport = FakeAppServerTransport::new(vec![
             json!({"id": 1, "result": {"thread": {"id": "thr_saved"}}}),
         ]);
@@ -5648,11 +5655,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker");
         let target = temp_dir.path().join("thread-id-target");
         std::fs::write(&target, "thread-old\n").expect("write target");
         symlink(&target, runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
@@ -5666,6 +5668,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
+                runtime_session_ready: true,
             })
             .await
             .expect_err("symlinked thread state should fail");
@@ -5679,16 +5682,6 @@ mod tests {
         let runtime_b = temp_dir.path().join("runtime-b");
         std::fs::create_dir_all(&runtime_a).expect("create runtime a");
         std::fs::create_dir_all(&runtime_b).expect("create runtime b");
-        std::fs::write(
-            runtime_a.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker a");
-        std::fs::write(
-            runtime_b.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker b");
         std::fs::write(runtime_a.join(CODEX_THREAD_ID_STATE_FILE), "thread-a\n")
             .expect("write thread a");
         std::fs::write(runtime_b.join(CODEX_THREAD_ID_STATE_FILE), "thread-b\n")
@@ -5702,6 +5695,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_a),
+                runtime_session_ready: true,
             })
             .await
             .expect("start a");
@@ -5712,6 +5706,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_b),
+                runtime_session_ready: true,
             })
             .await
             .expect("start b");
@@ -5733,21 +5728,26 @@ mod tests {
         adapter.close(&handle_b).await.expect("close b");
     }
 
-    fn test_execution_plan() -> EffectiveExecutionPlan {
-        EffectiveExecutionPlan {
-            runtime_id: "codex".to_string(),
-            preset_name: "everyday".to_string(),
-            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-            workspace_access: WorkspaceAccess::ReadWrite,
-            network_mode: NetworkMode::On,
-            working_dir: None,
-            environment: Vec::new(),
-            idle_timeout: Duration::from_secs(30),
-            hard_timeout: Duration::from_secs(90),
-            mounts: Vec::new(),
-            mount_runtime_secrets: false,
-            escape_classes: Default::default(),
-            limits: ExecutionLimits::default(),
-        }
+    async fn start_codex_ready_test_session(
+        runtime_state_root: PathBuf,
+    ) -> (
+        CodexRuntimeAdapter,
+        RuntimeSessionHandle,
+        super::CodexThreadState,
+    ) {
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+                runtime_session_ready: true,
+            })
+            .await
+            .expect("start");
+        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+        (adapter, handle, thread_state)
     }
 }

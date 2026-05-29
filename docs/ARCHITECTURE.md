@@ -89,7 +89,8 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: explicit brokered capability execution for direct runtimes and narrow kernel surfaces.
-- `kernel.runtime`: runtime adapter contract and registry.
+- `lionclaw-runtime-api`: runtime adapter contract, registry, and shared runtime-facing event/program types.
+- `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
@@ -104,6 +105,11 @@ Shared crate primitives:
 - `durable_fs`: atomic file publish/remove/rename for LionClaw-owned runtime, continuity, and operator-private state; successful file replacement syncs the file and containing directory.
 
 ## Runtime Adapter Contract
+
+The shared Rust contract lives in `crates/lionclaw-runtime-api`. Concrete
+runtime adapters live in their own crates, currently
+`crates/lionclaw-runtime-codex`, `crates/lionclaw-runtime-opencode`, and
+`crates/lionclaw-runtime-mock`.
 
 Runtime adapters implement:
 
@@ -128,6 +134,13 @@ Adapters also declare a turn mode:
 The distinction is central. Program-backed runtimes are the everyday product
 path. Direct runtimes and brokered capabilities are useful for tests, narrow
 workers, and future runtimes that do not bring a full harness.
+
+Adapters describe what they need and how to interpret runtime-owned state:
+program invocations, optional runtime auth kind, output parsing, native terminal
+programs, transcript export, and runtime controls. They do not receive the
+kernel execution plan. The kernel gives program-backed adapters a constrained
+executor plus observable runtime context, then still decides launch allowance,
+mounts, secrets, auth materialization, audit, and persistence.
 
 ## Program-Backed Runtime Flow
 
@@ -182,9 +195,9 @@ is launched through its app-server protocol with `externalSandbox` permissions
 inside the outer Podman boundary. LionClaw does not use `codex exec` as a
 fallback path. Codex app-server request/notification assumptions are pinned by
 checked-in protocol fixtures under
-`crates/lionclaw/tests/fixtures/codex_app_server`, including the target Codex
-CLI version and immutable source commit; update those fixtures with the adapter
-when the target app-server contract changes.
+`crates/lionclaw-runtime-codex/tests/fixtures/codex_app_server`, including the
+target Codex CLI version and immutable source commit; update those fixtures
+with the adapter when the target app-server contract changes.
 
 ## Native Runtime TUI Flow
 
@@ -1031,10 +1044,12 @@ home.
 
 ## Adding A Runtime
 
-1. Add `kernel/runtime/adapters/<adapter>.rs` implementing `RuntimeAdapter`.
+1. Add a `crates/lionclaw-runtime-<id>` crate implementing `RuntimeAdapter`
+   from `lionclaw-runtime-api`.
 2. Choose `ProgramBacked` or `Direct` turn mode deliberately.
-3. Export it from `kernel/runtime/adapters/mod.rs`.
-4. Wire configured registration in `operator/runtime.rs`.
+3. Reuse workspace package versions and `workspace = true` lint settings.
+4. Wire configured registration in `operator/runtime.rs` and kernel runtime
+   re-exports only as needed.
 5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
    builtin test/kernel scaffolding.
 6. Add unit tests in the adapter module plus one kernel-level integration case.

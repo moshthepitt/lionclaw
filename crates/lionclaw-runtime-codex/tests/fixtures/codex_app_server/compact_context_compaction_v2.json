@@ -1,0 +1,57 @@
+{
+  "codexCliVersion": "0.134.0",
+  "source": "https://github.com/openai/codex/blob/a75c443fdb64db48c3cf4bdb247c7ee52c0144c9/codex-rs/app-server/README.md",
+  "client": {
+    "id": 1,
+    "method": "thread/compact/start",
+    "params": {
+      "threadId": "thr_1"
+    }
+  },
+  "server": [
+    {
+      "id": 1,
+      "result": {}
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_compact_1"
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_compact_1",
+        "item": {
+          "id": "item_compact_1",
+          "type": "contextCompaction"
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_compact_1",
+        "item": {
+          "id": "item_compact_1",
+          "type": "contextCompaction"
+        }
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_compact_1",
+        "turn": {
+          "id": "turn_compact_1",
+          "status": "completed"
+        }
+      }
+    }
+  ]
+}

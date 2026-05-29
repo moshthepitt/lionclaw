@@ -1,0 +1,21 @@
+[package]
+name = "lionclaw-runtime-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde", "clock"] }
+lionclaw-runtime-api.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
+
+[dev-dependencies]
+tempfile.workspace = true

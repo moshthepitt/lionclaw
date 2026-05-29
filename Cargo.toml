@@ -2,6 +2,10 @@
 members = [
     "crates/lionclaw",
     "crates/lionclaw-channel-team-local",
+    "crates/lionclaw-runtime-api",
+    "crates/lionclaw-runtime-codex",
+    "crates/lionclaw-runtime-mock",
+    "crates/lionclaw-runtime-opencode",
 ]
 resolver = "2"
 
@@ -12,9 +16,17 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 chrono = "0.4"
+hex = "0.4"
+lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
+lionclaw-runtime-codex = { path = "crates/lionclaw-runtime-codex" }
+lionclaw-runtime-mock = { path = "crates/lionclaw-runtime-mock" }
+lionclaw-runtime-opencode = { path = "crates/lionclaw-runtime-opencode" }
 reqwest = { version = "0.12", default-features = false }
+rustix = "1.1"
 serde = "1.0"
 serde_json = "1.0"
 tempfile = "3.27"
@@ -22,6 +34,7 @@ tokio = "1.50"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+uuid = "1.23"
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

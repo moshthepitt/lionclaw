@@ -17,9 +17,9 @@ use lionclaw::{
     },
     kernel::{
         runtime::{
-            EffectiveExecutionPlan, EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter,
-            RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
-            RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeProgramTurnExecution,
+            EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo,
+            RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
+            RuntimeEventSender, RuntimeExecutionContext, RuntimeProgramTurnExecution,
             RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
             RuntimeTurnResult, WorkspaceAccess,
         },
@@ -1364,7 +1364,7 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
         execution: RuntimeProgramTurnExecution,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        run_probe_action(&self.action, &execution.plan).await?;
+        run_probe_action(&self.action, &execution.context).await?;
         drop(events.send(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
     }
@@ -1374,7 +1374,7 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
         execution: RuntimeControlExecution,
         _events: RuntimeEventSender,
     ) -> Result<RuntimeControlOutcome> {
-        run_probe_action(&self.action, &execution.plan).await?;
+        run_probe_action(&self.action, &execution.context).await?;
         Ok(RuntimeControlOutcome::Handled {
             message: "control handled".to_string(),
         })
@@ -1457,13 +1457,13 @@ impl RuntimeAdapter for DirectSocketProbeRuntime {
     }
 }
 
-async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan) -> Result<()> {
+async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionContext) -> Result<()> {
     match action {
         RuntimeAction::RecordEnvironment { observed } => {
             observed
                 .lock()
                 .expect("observed env lock")
-                .push(plan.environment.clone());
+                .push(context.environment.clone());
             Ok(())
         }
         RuntimeAction::SendRequests {
@@ -1472,17 +1472,17 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             socket_paths,
             file_setup,
         } => {
-            let runtime_root = runtime_mount_source(plan)?;
-            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+            let runtime_root = runtime_state_root(context)?;
+            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
                 .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let host_socket = host_path_for_runtime_path(context, &socket)?;
             socket_paths
                 .lock()
                 .expect("socket paths lock")
                 .push(host_socket);
             prepare_probe_files(&runtime_root, *file_setup).await?;
             for request in requests {
-                let response = send_channel_send_request(plan, request.clone()).await?;
+                let response = send_channel_send_request(context, request.clone()).await?;
                 responses.lock().expect("responses lock").push(response);
             }
             Ok(())
@@ -1492,7 +1492,7 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             responses,
         } => {
             for request in requests {
-                let response = send_raw_channel_send_request(plan, request).await?;
+                let response = send_raw_channel_send_request(context, request).await?;
                 responses.lock().expect("responses lock").push(response);
             }
             Ok(())
@@ -1501,9 +1501,9 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             socket_paths,
             duration,
         } => {
-            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
                 .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let host_socket = host_path_for_runtime_path(context, &socket)?;
             if !host_socket.exists() {
                 return Err(anyhow!(
                     "channel send socket '{}' was not created",
@@ -1518,9 +1518,9 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
         RuntimeAction::HoldOpenConnection { held_stream } => {
-            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
                 .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let host_socket = host_path_for_runtime_path(context, &socket)?;
             let stream = UnixStream::connect(&host_socket)
                 .await
                 .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1528,7 +1528,8 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
         RuntimeAction::OpenManyConnections { responses } => {
-            let (host_socket, held_streams) = open_channel_send_connections_to_limit(plan).await?;
+            let (host_socket, held_streams) =
+                open_channel_send_connections_to_limit(context).await?;
             let stream = connect_channel_send_socket(&host_socket).await?;
             let mut response = String::new();
             let mut reader = BufReader::new(stream);
@@ -1544,7 +1545,8 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
         RuntimeAction::OpenManyConnectionsAndDropRejected => {
-            let (host_socket, held_streams) = open_channel_send_connections_to_limit(plan).await?;
+            let (host_socket, held_streams) =
+                open_channel_send_connections_to_limit(context).await?;
             let stream = connect_channel_send_socket(&host_socket).await?;
             drop(stream);
             sleep(Duration::from_millis(100)).await;
@@ -1552,9 +1554,9 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
         RuntimeAction::SendAndDropConnection { request } => {
-            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
                 .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let host_socket = host_path_for_runtime_path(context, &socket)?;
             let mut stream = connect_channel_send_socket(&host_socket).await?;
             let mut line = serde_json::to_vec(request).expect("serialize request");
             line.push(b'\n');
@@ -1567,11 +1569,11 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
 }
 
 async fn open_channel_send_connections_to_limit(
-    plan: &EffectiveExecutionPlan,
+    context: &RuntimeExecutionContext,
 ) -> Result<(PathBuf, Vec<UnixStream>)> {
-    let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
         .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(plan, &socket)?;
+    let host_socket = host_path_for_runtime_path(context, &socket)?;
     let mut held_streams = Vec::new();
     for _ in 0..TEST_CHANNEL_SEND_CONNECTION_LIMIT {
         held_streams.push(connect_channel_send_socket(&host_socket).await?);
@@ -1630,10 +1632,13 @@ async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Resu
     }
 }
 
-async fn send_channel_send_request(plan: &EffectiveExecutionPlan, request: Value) -> Result<Value> {
-    let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+async fn send_channel_send_request(
+    context: &RuntimeExecutionContext,
+    request: Value,
+) -> Result<Value> {
+    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
         .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(plan, &socket)?;
+    let host_socket = host_path_for_runtime_path(context, &socket)?;
     let mut stream = UnixStream::connect(&host_socket)
         .await
         .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1652,12 +1657,12 @@ async fn send_channel_send_request(plan: &EffectiveExecutionPlan, request: Value
 }
 
 async fn send_raw_channel_send_request(
-    plan: &EffectiveExecutionPlan,
+    context: &RuntimeExecutionContext,
     request: &[u8],
 ) -> Result<Value> {
-    let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
         .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(plan, &socket)?;
+    let host_socket = host_path_for_runtime_path(context, &socket)?;
     let mut stream = UnixStream::connect(&host_socket)
         .await
         .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1692,33 +1697,20 @@ fn socket_dir_has_channel_send_socket(socket_dir: &Path) -> bool {
     })
 }
 
-fn runtime_mount_source(plan: &EffectiveExecutionPlan) -> Result<PathBuf> {
-    plan.mounts
-        .iter()
-        .find(|mount| mount.target == "/runtime")
-        .map(|mount| mount.source.clone())
+fn runtime_state_root(context: &RuntimeExecutionContext) -> Result<PathBuf> {
+    context
+        .runtime_state_root
+        .clone()
         .context("runtime mount missing")
 }
 
 fn host_path_for_runtime_path(
-    plan: &EffectiveExecutionPlan,
+    context: &RuntimeExecutionContext,
     runtime_path: &str,
 ) -> Result<PathBuf> {
-    let mount = plan
-        .mounts
-        .iter()
-        .filter(|mount| {
-            runtime_path == mount.target || runtime_path.starts_with(&format!("{}/", mount.target))
-        })
-        .max_by_key(|mount| mount.target.len())
-        .context("no mount for runtime path")?;
-    if runtime_path == mount.target {
-        return Ok(mount.source.clone());
-    }
-    let relative = Path::new(runtime_path)
-        .strip_prefix(&mount.target)
-        .context("strip mount target")?;
-    Ok(mount.source.join(relative))
+    context
+        .host_path_for_runtime_path(runtime_path)
+        .context("no mount for runtime path")
 }
 
 async fn kernel_with_channel_send_preset(env: &TestHome, enabled: bool) -> Kernel {

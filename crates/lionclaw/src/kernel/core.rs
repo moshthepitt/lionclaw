@@ -70,8 +70,8 @@ use crate::{
     durable_fs::{remove_file_if_exists, write_file_atomically},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
-        RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
+        runtime_project_partition_key, runtime_session_ready_marker_exists, LionClawHome,
+        RUNTIME_PROJECTS_DIR, RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
     },
     project_inventory::{
         ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
@@ -126,16 +126,18 @@ use super::{
     policy::{Capability, PolicyStore, Scope},
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
-        execute_captured, project_runtime_skills, register_builtin_runtime_adapters,
-        resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
-        EffectiveExecutionPlan, EscapeClass, ExecutionOutput, ExecutionPlanPurpose,
-        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
-        ExecutionRequest, ExecutionSession, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
-        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
-        RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
+        execute_captured, execute_streaming, project_runtime_skills,
+        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
+        skill_mount_target, spawn_interactive, EffectiveExecutionPlan, EscapeClass,
+        ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
+        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
+        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
         RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
@@ -529,6 +531,78 @@ struct AttachedRuntimeTranscriptProgramExecutor {
     codex_home_override: Option<PathBuf>,
 }
 
+struct KernelRuntimeProgramExecutor {
+    plan: EffectiveExecutionPlan,
+    runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    codex_home_override: Option<PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
+    async fn execute_streaming(
+        &mut self,
+        program: RuntimeProgramSpec,
+        stdout: RuntimeProgramStdoutSender,
+    ) -> anyhow::Result<ExecutionOutput> {
+        execute_streaming(
+            ExecutionRequest {
+                plan: self.plan.clone(),
+                program,
+                runtime_secrets_mount: self.runtime_secrets_mount.clone(),
+                codex_home_override: self.codex_home_override.clone(),
+            },
+            stdout,
+        )
+        .await
+    }
+
+    async fn execute_captured(
+        &mut self,
+        program: RuntimeProgramSpec,
+    ) -> anyhow::Result<ExecutionOutput> {
+        execute_captured(ExecutionRequest {
+            plan: self.plan.clone(),
+            program,
+            runtime_secrets_mount: self.runtime_secrets_mount.clone(),
+            codex_home_override: self.codex_home_override.clone(),
+        })
+        .await
+    }
+
+    async fn spawn(
+        &mut self,
+        program: RuntimeProgramSpec,
+    ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
+        let session = spawn_interactive(ExecutionRequest {
+            plan: self.plan.clone(),
+            program,
+            runtime_secrets_mount: self.runtime_secrets_mount.clone(),
+            codex_home_override: self.codex_home_override.clone(),
+        })
+        .await?;
+        Ok(Box::new(RuntimeExecutionSession::new(session)))
+    }
+}
+
+fn runtime_execution_context(plan: &EffectiveExecutionPlan) -> RuntimeExecutionContext {
+    RuntimeExecutionContext {
+        network_mode: plan.network_mode,
+        environment: plan.environment.clone(),
+        runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
+        runtime_path_projections: plan
+            .mounts
+            .iter()
+            .filter(|mount| {
+                mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
+            })
+            .map(|mount| lionclaw_runtime_api::RuntimePathProjection {
+                runtime_path: mount.target.clone(),
+                host_path: mount.source.clone(),
+            })
+            .collect(),
+    }
+}
+
 #[async_trait::async_trait]
 impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgramExecutor {
     fn hard_timeout(&self) -> std::time::Duration {
@@ -557,14 +631,18 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
         })?
     }
 
-    async fn spawn(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionSession> {
-        spawn_interactive(ExecutionRequest {
+    async fn spawn(
+        &mut self,
+        program: RuntimeProgramSpec,
+    ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
+        let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
             program,
             runtime_secrets_mount: None,
             codex_home_override: self.codex_home_override.clone(),
         })
-        .await
+        .await?;
+        Ok(Box::new(RuntimeExecutionSession::new(session)))
     }
 }
 
@@ -864,10 +942,13 @@ impl Kernel {
             .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
+        let runtime_session_ready = runtime_session_ready_marker_exists(&runtime_state_root)
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id,
                 runtime_state_root,
+                runtime_session_ready,
             })
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
@@ -6141,6 +6222,7 @@ impl Kernel {
                 environment: execution_plan.environment.clone(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
+                runtime_session_ready: false,
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
@@ -6152,6 +6234,11 @@ impl Kernel {
             runtime_skill_ids: Vec::new(),
         };
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
+        let runtime_executor = KernelRuntimeProgramExecutor {
+            plan: execution_plan,
+            runtime_secrets_mount,
+            codex_home_override: self.codex_home_override.clone(),
+        };
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
                 RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
@@ -6160,9 +6247,8 @@ impl Kernel {
                         .program_backed_turn(
                             RuntimeProgramTurnExecution {
                                 input: turn_input,
-                                plan: execution_plan,
-                                runtime_secrets_mount,
-                                codex_home_override: self.codex_home_override.clone(),
+                                context: runtime_execution_context(&runtime_executor.plan),
+                                executor: Box::new(runtime_executor),
                             },
                             event_tx,
                         )
@@ -14294,14 +14380,39 @@ impl Kernel {
                 .map_err(internal)?,
         };
 
+        let runtime_state_root = Self::runtime_state_root(&execution_plan).map(Path::to_path_buf);
+        let runtime_session_ready = match runtime_state_root
+            .as_deref()
+            .map(runtime_session_ready_marker_exists)
+            .transpose()
+        {
+            Ok(value) => value.unwrap_or(false),
+            Err(err) => {
+                let error_text = err.to_string();
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    FailedSessionTurnCompletion {
+                        assistant_text: String::new(),
+                        error_code: "runtime.error".to_string(),
+                        error_text: error_text.clone(),
+                        stream_error_emitted: false,
+                    },
+                    channel_stream_finalizer,
+                )
+                .await?;
+                return Err(KernelError::Runtime(error_text));
+            }
+        };
+
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: session.session_id,
                 working_dir: execution_plan.working_dir.clone(),
                 environment: execution_plan.environment.clone(),
                 runtime_skill_ids: runtime_skill_ids.clone(),
-                runtime_state_root: Self::runtime_state_root(&execution_plan)
-                    .map(Path::to_path_buf),
+                runtime_state_root,
+                runtime_session_ready,
             })
             .await;
 
@@ -17901,13 +18012,17 @@ impl Kernel {
             match runtime_turn_mode {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
+                    let runtime_executor = KernelRuntimeProgramExecutor {
+                        plan: execution_plan,
+                        runtime_secrets_mount,
+                        codex_home_override,
+                    };
                     adapter_for_task
                         .program_backed_turn(
                             RuntimeProgramTurnExecution {
                                 input,
-                                plan: execution_plan,
-                                runtime_secrets_mount,
-                                codex_home_override,
+                                context: runtime_execution_context(&runtime_executor.plan),
+                                executor: Box::new(runtime_executor),
                             },
                             event_tx,
                         )
@@ -18216,13 +18331,17 @@ impl Kernel {
             })?;
         let codex_home_override = self.codex_home_override.clone();
         let mut control_task = tokio::spawn(async move {
+            let runtime_executor = KernelRuntimeProgramExecutor {
+                plan: execution_plan,
+                runtime_secrets_mount,
+                codex_home_override,
+            };
             adapter_for_task
                 .runtime_control(
                     RuntimeControlExecution {
                         input,
-                        plan: execution_plan,
-                        runtime_secrets_mount,
-                        codex_home_override,
+                        context: runtime_execution_context(&runtime_executor.plan),
+                        executor: Box::new(runtime_executor),
                     },
                     event_tx,
                 )
