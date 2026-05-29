@@ -131,6 +131,12 @@ setup clears stale basic password values when replacing an older basic-auth
 configuration.
 On a TTY, `"$LIONCLAW_BIN" connect email` starts the same setup helper as a
 guided prompt.
+Do not pass the setup helper's `--env-file` or `--state-file` after an OAuth
+provider profile, such as `connect email gmail --env-file ...`; those are
+direct-helper options. The manual env-file path remains
+`connect email --env-file ./email.env`. In OAuth connect mode, LionClaw
+provides managed setup paths so state stays LionClaw-owned and rollback remains
+complete.
 
 Gmail:
 

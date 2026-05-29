@@ -30,6 +30,8 @@ const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
 const HTTP_READ_LIMIT: usize = 16 * 1024;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_SETUP_ENV_FILE_ENV: &str = "LIONCLAW_CHANNEL_SETUP_ENV_FILE";
+const CHANNEL_SETUP_STATE_DIR_ENV: &str = "LIONCLAW_CHANNEL_SETUP_STATE_DIR";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -696,6 +698,13 @@ fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> ProviderDefaults
 }
 
 fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
+    validate_channel_setup_path_overrides(
+        args.env_file.as_deref(),
+        args.state_file.as_deref(),
+        channel_setup_env_file_from_env().is_some(),
+        channel_setup_state_dir_from_env().is_some(),
+    )?;
+
     let account = normalize_address(&args.account)
         .ok_or_else(|| anyhow!("--account must be a plain email address"))?;
     let admin_to = args
@@ -898,15 +907,34 @@ fn default_env_file() -> PathBuf {
 }
 
 fn channel_setup_env_file_from_env() -> Option<PathBuf> {
-    env::var_os("LIONCLAW_CHANNEL_SETUP_ENV_FILE")
+    env::var_os(CHANNEL_SETUP_ENV_FILE_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
 fn channel_setup_state_dir_from_env() -> Option<PathBuf> {
-    env::var_os("LIONCLAW_CHANNEL_SETUP_STATE_DIR")
+    env::var_os(CHANNEL_SETUP_STATE_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn validate_channel_setup_path_overrides(
+    env_file: Option<&Path>,
+    state_file: Option<&Path>,
+    managed_env_file: bool,
+    managed_state_dir: bool,
+) -> Result<()> {
+    if managed_env_file && env_file.is_some() {
+        bail!(
+            "--env-file cannot be used when email setup is run by lionclaw connect; LionClaw provides {CHANNEL_SETUP_ENV_FILE_ENV}"
+        );
+    }
+    if managed_state_dir && state_file.is_some() {
+        bail!(
+            "--state-file cannot be used when email setup is run by lionclaw connect; LionClaw provides {CHANNEL_SETUP_STATE_DIR_ENV}"
+        );
+    }
+    Ok(())
 }
 
 fn state_root() -> PathBuf {
@@ -1631,6 +1659,29 @@ mod tests {
         assert!(env_content.contains("EMAIL_IMAP_PASSWORD=\n"));
         assert!(env_content.contains("EMAIL_SMTP_PASSWORD=\n"));
         assert!(env_content.contains("EMAIL_XOAUTH2_TOKEN_CMD=\"/usr/local/bin/lionclaw-channel-email oauth2 token --state-file /tmp/oauth-state.json\"\n"));
+    }
+
+    #[test]
+    fn lionclaw_managed_setup_rejects_explicit_path_overrides() {
+        let err =
+            validate_channel_setup_path_overrides(Some(Path::new("email.env")), None, true, true)
+                .expect_err("managed env file cannot be overridden");
+        assert!(err.to_string().contains("--env-file"));
+        assert!(err.to_string().contains(CHANNEL_SETUP_ENV_FILE_ENV));
+
+        let err =
+            validate_channel_setup_path_overrides(None, Some(Path::new("state.json")), true, true)
+                .expect_err("managed state dir cannot be overridden");
+        assert!(err.to_string().contains("--state-file"));
+        assert!(err.to_string().contains(CHANNEL_SETUP_STATE_DIR_ENV));
+
+        validate_channel_setup_path_overrides(
+            Some(Path::new("email.env")),
+            Some(Path::new("state.json")),
+            false,
+            false,
+        )
+        .expect("direct helper mode keeps explicit paths");
     }
 
     #[test]
