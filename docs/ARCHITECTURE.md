@@ -224,10 +224,14 @@ reads `/runtime/AGENTS.md` as global runtime instructions while project-level
 under LionClaw's runtime image/update path.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
-adapter contract over runtime-owned durable state. Codex exports completed turns
-through Codex's app-server `thread/list` and paged `thread/turns/list` protocol
-inside the same runtime boundary, enumerating newest history first and sorting
-before canonical import. OpenCode continuity is a LionClaw-owned link to one
+adapter contract over runtime-owned durable state. Codex continuity is a
+LionClaw-owned link to one Codex CLI thread id stored in runtime-private state.
+Native TUI launches resume with `codex resume <threadID>` when that link exists.
+After native TUI exit, Codex exports completed turns through Codex's app-server
+`thread/list` and paged `thread/turns/list` protocol inside the same runtime
+boundary, enumerating newest history first, learning the current newest CLI
+thread when no link exists, and sorting before canonical import. OpenCode
+continuity is a LionClaw-owned link to one
 OpenCode root session id stored in runtime-private state. Program-backed
 OpenCode turns learn that id from OpenCode's machine-readable `sessionID`
 events and then resume with `opencode run --session <sessionID>`. Native TUI
