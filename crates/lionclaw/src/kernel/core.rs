@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
@@ -67,6 +67,7 @@ use crate::contracts::{
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
+    durable_fs::{remove_file_if_exists, write_file_atomically},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
@@ -12285,68 +12286,24 @@ fn write_runtime_state_file_blocking(
     file_name: &str,
     contents: &[u8],
 ) -> Result<(), KernelError> {
-    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
-
     let target_name = runtime_state_file_name(file_name)?;
     let root = ensure_runtime_state_root_blocking(runtime_state_root)?;
-
-    let temp_name = OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
-    let temp = openat(
+    write_file_atomically(
         &root,
-        &temp_name,
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::TRUNC
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(0o644),
+        runtime_state_root,
+        &target_name,
+        contents,
+        0o644,
+        None,
+        "runtime state file",
     )
     .map_err(|err| {
         internal(anyhow::anyhow!(
-            "failed to create runtime state temp file '{}' in '{}': {err}",
-            Path::new(&temp_name).display(),
+            "failed to write runtime state file '{}' in '{}': {err}",
+            file_name,
             runtime_state_root.display()
         ))
-    })?;
-    let mut temp = std::fs::File::from(temp);
-
-    let write_result = (|| -> Result<(), KernelError> {
-        temp.write_all(contents).map_err(|err| {
-            internal(anyhow::anyhow!(
-                "failed to write runtime state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            ))
-        })?;
-        temp.flush().map_err(|err| {
-            internal(anyhow::anyhow!(
-                "failed to flush runtime state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            ))
-        })?;
-        renameat(&root, &temp_name, &root, &target_name).map_err(|err| {
-            internal(anyhow::anyhow!(
-                "failed to publish runtime state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            ))
-        })?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        match unlinkat(&root, &temp_name, AtFlags::empty()) {
-            Ok(()) => {}
-            Err(err) => warn!(
-                ?err,
-                path = %runtime_state_root.join(Path::new(&temp_name)).display(),
-                "failed to remove temporary runtime state file"
-            ),
-        }
-    }
-    write_result
+    })
 }
 
 async fn read_runtime_state_file(
@@ -12417,20 +12374,24 @@ fn remove_runtime_state_file_blocking(
     runtime_state_root: &Path,
     file_name: &str,
 ) -> Result<(), KernelError> {
-    use rustix::fs::{unlinkat, AtFlags};
-
     let target_name = runtime_state_file_name(file_name)?;
     let Some(root) = open_existing_runtime_state_root_blocking(runtime_state_root)? else {
         return Ok(());
     };
-    match unlinkat(&root, &target_name, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
-        Err(err) => Err(internal(anyhow::anyhow!(
+    remove_file_if_exists(
+        &root,
+        runtime_state_root,
+        &target_name,
+        "runtime state file",
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
             "failed to remove runtime state file '{}' in '{}': {err}",
             file_name,
             runtime_state_root.display()
-        ))),
-    }
+        ))
+    })
 }
 
 fn ensure_runtime_state_root_blocking(

@@ -99,6 +99,10 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 
+Shared crate primitives:
+
+- `durable_fs`: atomic file publish/remove/rename for LionClaw-owned state; successful file replacement syncs the file and containing directory.
+
 ## Runtime Adapter Contract
 
 Runtime adapters implement:

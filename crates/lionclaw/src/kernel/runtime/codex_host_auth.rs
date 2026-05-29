@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::durable_fs::write_file_atomically;
+
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
 const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
@@ -612,79 +614,18 @@ fn write_runtime_codex_file_blocking(
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
-
     let target_name = runtime_codex_file_name(file_name)?;
     let runtime_codex_home = open_runtime_codex_home(runtime_state_root)?;
     let runtime_codex_home_path = runtime_codex_home_path(runtime_state_root);
-    let temp_name = OsString::from(format!(
-        ".lionclaw-runtime-codex-{}.tmp",
-        Uuid::new_v4().simple()
-    ));
-    let temp = openat(
+    write_file_atomically(
         &runtime_codex_home,
-        &temp_name,
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::TRUNC
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(0o600),
+        &runtime_codex_home_path,
+        &target_name,
+        &contents,
+        0o600,
+        Some(permissions),
+        "runtime Codex file",
     )
-    .with_context(|| {
-        format!(
-            "failed to create runtime Codex temp file '{}' in {}",
-            Path::new(&temp_name).display(),
-            runtime_codex_home_path.display()
-        )
-    })?;
-    let mut temp = File::from(temp);
-
-    let write_result = (|| -> Result<()> {
-        temp.write_all(&contents).with_context(|| {
-            format!(
-                "failed to write runtime Codex file '{}' in {}",
-                file_name,
-                runtime_codex_home_path.display()
-            )
-        })?;
-        temp.set_permissions(permissions).with_context(|| {
-            format!(
-                "failed to chmod runtime Codex file '{}' in {}",
-                file_name,
-                runtime_codex_home_path.display()
-            )
-        })?;
-        temp.sync_all().with_context(|| {
-            format!(
-                "failed to sync runtime Codex file '{}' in {}",
-                file_name,
-                runtime_codex_home_path.display()
-            )
-        })?;
-        renameat(
-            &runtime_codex_home,
-            &temp_name,
-            &runtime_codex_home,
-            &target_name,
-        )
-        .with_context(|| {
-            format!(
-                "failed to replace runtime Codex file '{}' in {}",
-                file_name,
-                runtime_codex_home_path.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        match unlinkat(&runtime_codex_home, &temp_name, AtFlags::empty()) {
-            Ok(()) | Err(_) => {}
-        }
-    }
-    write_result
 }
 
 #[cfg(unix)]

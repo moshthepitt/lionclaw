@@ -1,16 +1,16 @@
 use std::{
     ffi::OsString,
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path},
 };
 
 use anyhow::{anyhow, Context, Result};
 use rustix::{
-    fs::{open, openat, renameat, unlinkat, AtFlags, Mode, OFlags},
+    fs::{open, openat, Mode, OFlags},
     io::Errno,
 };
-use tracing::warn;
-use uuid::Uuid;
+
+use crate::durable_fs::write_file_atomically;
 
 pub(super) fn load_state_value(
     runtime_state_root: &Path,
@@ -84,70 +84,17 @@ pub(super) fn save_state_value(
     let root = ensure_state_root(runtime_state_root)?;
     validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
 
-    let temp_name = OsString::from(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
-    let temp = openat(
+    let mut contents = value.into_bytes();
+    contents.push(b'\n');
+    write_file_atomically(
         &root,
-        &temp_name,
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::TRUNC
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(0o600),
+        runtime_state_root,
+        &target_name,
+        &contents,
+        0o600,
+        None,
+        &format!("{label} state file"),
     )
-    .with_context(|| {
-        format!(
-            "failed to create {label} state temp file '{}' in '{}'",
-            Path::new(&temp_name).display(),
-            runtime_state_root.display()
-        )
-    })?;
-    let mut temp = std::fs::File::from(temp);
-
-    let write_result = (|| -> Result<()> {
-        temp.write_all(value.as_bytes()).with_context(|| {
-            format!(
-                "failed to write {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?;
-        temp.write_all(b"\n").with_context(|| {
-            format!(
-                "failed to write {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?;
-        temp.sync_all().with_context(|| {
-            format!(
-                "failed to sync {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?;
-        renameat(&root, &temp_name, &root, &target_name).with_context(|| {
-            format!(
-                "failed to publish {label} state file '{}' in '{}'",
-                file_name,
-                runtime_state_root.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        match unlinkat(&root, &temp_name, AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(err) => warn!(
-                ?err,
-                path = %runtime_state_root.join(Path::new(&temp_name)).display(),
-                "failed to remove temporary adapter state file"
-            ),
-        }
-    }
-    write_result
 }
 
 fn validate_existing_state_file(
