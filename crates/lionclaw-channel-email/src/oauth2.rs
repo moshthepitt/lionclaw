@@ -3,7 +3,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, BufRead, ErrorKind, IsTerminal, Write},
+    io::{self, BufRead, ErrorKind, IsTerminal, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     str::FromStr,
@@ -28,6 +28,8 @@ use crate::protocol::{mailbox_id_for, normalize_address};
 const CALLBACK_PATH: &str = "/oauth2/callback";
 const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
 const HTTP_READ_LIMIT: usize = 16 * 1024;
+const OAUTH_CLIENT_JSON_MAX_BYTES: usize = 64 * 1024;
+const OAUTH_STATE_MAX_BYTES: usize = 64 * 1024;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_RESPONSE_MAX_BYTES: usize = 64 * 1024;
@@ -559,7 +561,7 @@ async fn run_setup(args: SetupArgs) -> Result<()> {
     );
     let csrf_state = random_url_token();
     let pkce = PkcePair::generate();
-    let authorization_url = build_authorization_url(&resolved, &redirect_uri, &csrf_state, &pkce);
+    let authorization_url = build_authorization_url(&resolved, &redirect_uri, &csrf_state, &pkce)?;
 
     println!(
         "Starting {} OAuth2 setup for {}.",
@@ -836,8 +838,8 @@ fn first_present<T>(preferred: Option<T>, fallback: Option<T>) -> Option<T> {
 }
 
 fn read_oauth_client_file(path: &Path) -> Result<OAuthClientFile> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    ensure_existing_regular_file(path, "OAuth client JSON")?;
+    let content = read_bounded_text_file(path, "OAuth client JSON", OAUTH_CLIENT_JSON_MAX_BYTES)?;
     let parsed: OAuthClientJson = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse OAuth client JSON {}", path.display()))?;
     let (kind, section) = if let Some(installed) = parsed.installed {
@@ -870,13 +872,22 @@ fn normalize_scopes(values: Vec<String>) -> Vec<String> {
 }
 
 fn validate_oauth_endpoint(name: &str, value: &str) -> Result<()> {
-    if value.starts_with("https://")
-        || value.starts_with("http://127.0.0.1:")
-        || value.starts_with("http://localhost:")
-    {
-        return Ok(());
+    let url = reqwest::Url::parse(value).with_context(|| format!("{name} must be a valid URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{name} must not include credentials");
     }
-    bail!("{name} must be an https URL");
+    if url.fragment().is_some() {
+        bail!("{name} must not include a fragment");
+    }
+
+    match (url.scheme(), url.host_str()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some("127.0.0.1" | "localhost")) => Ok(()),
+        ("http", Some(_)) => {
+            bail!("{name} must be an https URL unless it targets localhost")
+        }
+        _ => bail!("{name} must be an https URL"),
+    }
 }
 
 fn normalize_secure_tls_mode(name: &str, raw: &str) -> Result<String> {
@@ -984,7 +995,7 @@ fn build_authorization_url(
     redirect_uri: &str,
     state: &str,
     pkce: &PkcePair,
-) -> String {
+) -> Result<String> {
     let mut params = vec![
         ("response_type".to_string(), "code".to_string()),
         ("client_id".to_string(), setup.client_id.clone()),
@@ -999,26 +1010,16 @@ fn build_authorization_url(
     url_with_query(&setup.authorization_endpoint, &params)
 }
 
-fn url_with_query(base: &str, params: &[(String, String)]) -> String {
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let query = params
-        .iter()
-        .map(|(key, value)| format!("{}={}", url_encode(key), url_encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}{separator}{query}")
-}
-
-fn url_encode(raw: &str) -> String {
-    let mut out = String::new();
-    for byte in raw.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
+fn url_with_query(base: &str, params: &[(String, String)]) -> Result<String> {
+    let mut url = reqwest::Url::parse(base)
+        .with_context(|| format!("OAuth2 authorization URL is invalid: {base}"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in params {
+            pairs.append_pair(key, value);
         }
     }
-    out
+    Ok(url.to_string())
 }
 
 fn open_browser(url: &str) -> bool {
@@ -1321,8 +1322,7 @@ fn read_oauth2_state(path: &Path) -> Result<StoredOAuth2State> {
     ensure_parent_dirs_without_symlinks(path, "OAuth2 state file")?;
     ensure_existing_regular_file(path, "OAuth2 state file")?;
     set_private_file_permissions(path)?;
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let content = read_bounded_text_file(path, "OAuth2 state file", OAUTH_STATE_MAX_BYTES)?;
     let state: StoredOAuth2State = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse OAuth2 state {}", path.display()))?;
     if state.version != 1 {
@@ -1518,6 +1518,20 @@ fn ensure_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
         Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
     Ok(())
+}
+
+fn read_bounded_text_file(path: &Path, label: &str, max_bytes: usize) -> Result<String> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut limited = file.take((max_bytes + 1) as u64);
+    let mut content = String::new();
+    limited
+        .read_to_string(&mut content)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if content.len() > max_bytes {
+        bail!("{label} {} exceeded {max_bytes} bytes", path.display());
+    }
+    Ok(content)
 }
 
 #[cfg(unix)]
@@ -1768,6 +1782,32 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_validates_oauth_endpoint_urls() {
+        validate_oauth_endpoint(
+            "--auth-url",
+            "https://accounts.example.com/oauth2/authorize",
+        )
+        .expect("https endpoint");
+        validate_oauth_endpoint("--token-url", "http://127.0.0.1:34891/token")
+            .expect("loopback http endpoint");
+        validate_oauth_endpoint("--token-url", "http://localhost:34891/token")
+            .expect("localhost http endpoint");
+
+        let err = validate_oauth_endpoint("--auth-url", "http://accounts.example.com/oauth2")
+            .expect_err("non-loopback http must fail");
+        assert!(err.to_string().contains("https URL"));
+
+        let err = validate_oauth_endpoint("--auth-url", "https://user:secret@accounts.example.com")
+            .expect_err("endpoint credentials must fail");
+        assert!(err.to_string().contains("credentials"));
+
+        let err =
+            validate_oauth_endpoint("--auth-url", "https://accounts.example.com/oauth2#token")
+                .expect_err("endpoint fragment must fail");
+        assert!(err.to_string().contains("fragment"));
+    }
+
+    #[test]
     fn oauth2_setup_writes_canonical_tls_modes() {
         let setup = resolve_setup(SetupArgs {
             provider: Oauth2Provider::Gmail,
@@ -1802,6 +1842,75 @@ mod tests {
     }
 
     #[test]
+    fn authorization_url_appends_query_with_url_parser() {
+        let setup = resolve_setup(SetupArgs {
+            provider: Oauth2Provider::Gmail,
+            account: "assistant@gmail.com".to_string(),
+            client_secret_json: None,
+            client_id: Some("client-id".to_string()),
+            client_secret: None,
+            tenant: "common".to_string(),
+            authorization_endpoint: Some("https://accounts.example.com/oauth2?existing=1".into()),
+            token_endpoint: None,
+            scopes: vec!["scope one".to_string()],
+            auth_params: vec![KeyValueArg {
+                key: "prompt".to_string(),
+                value: "select account".to_string(),
+            }],
+            auth_results_host: None,
+            imap_host: None,
+            imap_port: None,
+            imap_tls: None,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_tls: None,
+            admin_to: None,
+            env_file: Some(PathBuf::from("email.env")),
+            state_file: None,
+            callback_host: Some("127.0.0.1".to_string()),
+            callback_port: 0,
+            no_browser: true,
+            force: false,
+        })
+        .expect("setup");
+        let pkce = PkcePair {
+            verifier: "verifier".to_string(),
+            challenge: "challenge value".to_string(),
+        };
+
+        let url = build_authorization_url(
+            &setup,
+            "http://127.0.0.1:34567/oauth2/callback",
+            "state value",
+            &pkce,
+        )
+        .expect("authorization url");
+        let parsed = reqwest::Url::parse(&url).expect("parse authorization url");
+        let params = parsed
+            .query_pairs()
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("accounts.example.com"));
+        assert_eq!(params.get("existing").map(String::as_str), Some("1"));
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("client-id")
+        );
+        assert_eq!(params.get("scope").map(String::as_str), Some("scope one"));
+        assert_eq!(params.get("state").map(String::as_str), Some("state value"));
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some("challenge value")
+        );
+        assert_eq!(
+            params.get("prompt").map(String::as_str),
+            Some("select account")
+        );
+    }
+
+    #[test]
     fn oauth_client_json_uses_installed_section() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("client.json");
@@ -1826,6 +1935,17 @@ mod tests {
             client.authorization_endpoint.as_deref(),
             Some("https://accounts.example/authorize")
         );
+    }
+
+    #[test]
+    fn oauth_client_json_read_is_bounded() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("client.json");
+        fs::write(&path, "x".repeat(OAUTH_CLIENT_JSON_MAX_BYTES + 1)).expect("write client");
+
+        let err = read_oauth_client_file(&path).expect_err("oversized client JSON should fail");
+
+        assert!(err.to_string().contains("exceeded"));
     }
 
     #[test]
@@ -2132,6 +2252,17 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn oauth_state_file_read_is_bounded() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("state.json");
+        fs::write(&path, "x".repeat(OAUTH_STATE_MAX_BYTES + 1)).expect("write state");
+
+        let err = read_oauth2_state(&path).expect_err("oversized state should fail");
+
+        assert!(err.to_string().contains("exceeded"));
     }
 
     #[cfg(unix)]
