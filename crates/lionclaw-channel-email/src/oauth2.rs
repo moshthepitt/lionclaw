@@ -30,6 +30,7 @@ const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
 const HTTP_READ_LIMIT: usize = 16 * 1024;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TOKEN_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const CHANNEL_SETUP_ENV_FILE_ENV: &str = "LIONCLAW_CHANNEL_SETUP_ENV_FILE";
 const CHANNEL_SETUP_STATE_DIR_ENV: &str = "LIONCLAW_CHANNEL_SETUP_STATE_DIR";
 
@@ -1255,10 +1256,7 @@ async fn post_token_form(
         .await
         .with_context(|| format!("failed to call OAuth2 token endpoint {token_endpoint}"))?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .context("failed to read OAuth2 token response")?;
+    let text = read_token_response_text(response).await?;
     let parsed: TokenResponse = serde_json::from_str(&text).with_context(|| {
         format!(
             "OAuth2 token endpoint returned non-JSON response: {}",
@@ -1271,6 +1269,24 @@ async fn post_token_form(
         bail!("OAuth2 token endpoint returned {status}: {error} {description}");
     }
     Ok(parsed)
+}
+
+async fn read_token_response_text(mut response: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read OAuth2 token response")?
+    {
+        if body.len().saturating_add(chunk.len()) > TOKEN_RESPONSE_MAX_BYTES {
+            bail!(
+                "OAuth2 token response exceeded {} bytes",
+                TOKEN_RESPONSE_MAX_BYTES
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("OAuth2 token response must be UTF-8")
 }
 
 fn truncate_for_error(text: &str) -> String {
@@ -2014,6 +2030,42 @@ mod tests {
         let response = refresh_access_token(&state).await.expect("refresh");
 
         assert_eq!(response.access_token.as_deref(), Some("new-access-token"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn token_response_body_is_bounded() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = vec![0; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = "x".repeat(TOKEN_RESPONSE_MAX_BYTES + 1);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let state = StoredOAuth2State {
+            version: 1,
+            provider: "generic".to_string(),
+            account: "assistant@example.com".to_string(),
+            token_endpoint: format!("http://127.0.0.1:{port}/token"),
+            client_id: "client-id".to_string(),
+            client_secret: None,
+            refresh_token: "refresh-token".to_string(),
+            access_token: None,
+            expires_at: None,
+            scope: vec!["mail".to_string()],
+        };
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("oversized token response should fail");
+
+        assert!(err.to_string().contains("exceeded"));
         server.await.expect("server task");
     }
 
