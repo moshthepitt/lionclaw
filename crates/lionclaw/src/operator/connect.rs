@@ -878,10 +878,7 @@ fn copy_regular_tree_for_rollback(source: &Path, destination: &Path, label: &str
     if !source_metadata.is_dir() {
         bail!("{label} {} is not a directory", source.display());
     }
-    fs::create_dir_all(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    fs::set_permissions(destination, source_metadata.permissions())
-        .with_context(|| format!("failed to chmod {}", destination.display()))?;
+    create_rollback_destination_dir(destination, label, &source_metadata)?;
     let mut entries = fs::read_dir(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -915,6 +912,36 @@ fn copy_regular_tree_for_rollback(source: &Path, destination: &Path, label: &str
             );
         }
     }
+    Ok(())
+}
+
+fn create_rollback_destination_dir(
+    destination: &Path,
+    label: &str,
+    source_metadata: &fs::Metadata,
+) -> Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "{label} rollback destination {} must not be a symlink",
+                    destination.display()
+                );
+            }
+            bail!(
+                "{label} rollback destination {} already exists",
+                destination.display()
+            );
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", destination.display()));
+        }
+    }
+    fs::create_dir(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    fs::set_permissions(destination, source_metadata.permissions())
+        .with_context(|| format!("failed to chmod {}", destination.display()))?;
     Ok(())
 }
 
@@ -1209,8 +1236,9 @@ mod tests {
 
     use super::{
         channel_setup_env_file, channel_setup_state_dir, connect_channel_with_binaries,
-        ensure_required_env, prepare_connect_env_inputs, ConnectAction, ConnectChannelRequest,
-        ConnectEnvInputs, PrepareConnectEnvRequest, RequiredEnvRequest,
+        copy_regular_tree_for_rollback, ensure_required_env, prepare_connect_env_inputs,
+        ConnectAction, ConnectChannelRequest, ConnectEnvInputs, PrepareConnectEnvRequest,
+        RequiredEnvRequest,
     };
     use crate::{
         home::LionClawHome,
@@ -2054,6 +2082,27 @@ exit 17
             "outside\n"
         );
         assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_copy_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("state");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("token.json"), "secret\n").expect("source token");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let destination = temp_dir.path().join("backup");
+        symlink(&outside, &destination).expect("destination symlink");
+
+        let err = copy_regular_tree_for_rollback(&source, &destination, "channel setup state")
+            .expect_err("symlinked rollback destination should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(!outside.join("token.json").exists());
     }
 
     #[cfg(unix)]
