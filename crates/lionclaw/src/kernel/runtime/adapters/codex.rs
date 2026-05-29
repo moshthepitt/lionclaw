@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -23,11 +22,14 @@ use crate::{
         RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
         RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
         RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
+        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+        RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
 };
+
+use super::state_file::{load_state_value, save_state_value};
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
@@ -637,7 +639,10 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         self.run_app_server_turn(execution, events).await
     }
 
-    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
+    fn build_terminal_program(
+        &self,
+        _input: RuntimeTerminalProgramInput,
+    ) -> Result<RuntimeProgramSpec> {
         Ok(build_codex_terminal_program(&self.config))
     }
 
@@ -2576,66 +2581,11 @@ fn model_display_name(value: &Value) -> Option<String> {
 }
 
 fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
-    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(Into::into(err)),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(anyhow!(
-            "codex thread state file '{}' cannot be a symlink",
-            path.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-
-    let thread_id = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read codex thread state '{}'", path.display()))?
-        .trim()
-        .to_string();
-    if thread_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(thread_id))
+    load_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
 }
 
 fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
-    let thread_id = thread_id.trim();
-    if thread_id.is_empty() {
-        return Ok(());
-    }
-
-    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(anyhow!(
-                    "codex thread state file '{}' cannot be a symlink",
-                    path.display()
-                ));
-            }
-            if !metadata.is_file() {
-                return Err(anyhow!(
-                    "codex thread state path '{}' must be a regular file",
-                    path.display()
-                ));
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Into::into(err)),
-    }
-
-    let temp_path = root.join(format!(
-        "{}.{}.tmp",
-        CODEX_THREAD_ID_STATE_FILE,
-        Uuid::new_v4().simple()
-    ));
-    fs::write(&temp_path, format!("{thread_id}\n"))?;
-    fs::rename(&temp_path, &path)?;
-    Ok(())
+    save_state_value(root, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
 }
 
 impl CodexThreadState {

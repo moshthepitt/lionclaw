@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -7,20 +8,25 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::{timeout_at, Instant};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     home::runtime_session_ready_marker_exists,
     kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
         RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
     },
 };
 
+use super::state_file::{load_state_value, save_state_value};
+
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
+const OPENCODE_SESSION_ID_STATE_FILE: &str = ".lionclaw-opencode-session-id";
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -42,19 +48,20 @@ impl Default for OpenCodeRuntimeConfig {
 #[derive(Debug)]
 pub struct OpenCodeRuntimeAdapter {
     config: OpenCodeRuntimeConfig,
-    sessions: RwLock<HashMap<String, OpenCodeSessionState>>,
+    sessions: Arc<RwLock<HashMap<String, OpenCodeSessionState>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct OpenCodeSessionState {
-    resumes_existing_session: bool,
+    runtime_state_root: Option<PathBuf>,
+    session_id: Option<String>,
 }
 
 impl OpenCodeRuntimeAdapter {
     pub fn new(config: OpenCodeRuntimeConfig) -> Self {
         Self {
             config,
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -75,19 +82,21 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
-        let resumes_existing_session = input
-            .runtime_state_root
-            .as_deref()
-            .map(runtime_session_ready_marker_exists)
-            .transpose()?
-            .unwrap_or(false);
+        let session_id = match input.runtime_state_root.as_deref() {
+            Some(root) if runtime_session_ready_marker_exists(root)? => {
+                load_saved_opencode_session_id(root)?
+            }
+            Some(_) | None => None,
+        };
+        let resumes_existing_session = session_id.is_some();
         self.sessions
             .write()
             .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
             .insert(
                 runtime_session_id.clone(),
                 OpenCodeSessionState {
-                    resumes_existing_session,
+                    runtime_state_root: input.runtime_state_root,
+                    session_id,
                 },
             );
 
@@ -105,7 +114,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             args: build_opencode_run_args(
                 &self.config,
                 &input.prompt,
-                session.resumes_existing_session,
+                session.session_id.as_deref(),
             ),
             environment: Vec::new(),
             stdin: String::new(),
@@ -113,23 +122,48 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         })
     }
 
+    fn program_output_parser(
+        &self,
+        input: &RuntimeTurnInput,
+    ) -> Option<Box<dyn RuntimeProgramOutputParser>> {
+        Some(Box::new(OpenCodeProgramOutputParser {
+            sessions: Arc::clone(&self.sessions),
+            runtime_session_id: input.runtime_session_id.clone(),
+            observed_session_id: get_runtime_session(&self.sessions, &input.runtime_session_id)
+                .ok()
+                .and_then(|state| state.session_id),
+        }))
+    }
+
     fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
         parse_opencode_output_line(line)
     }
 
-    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
-        Ok(build_opencode_terminal_program(&self.config))
+    fn build_terminal_program(
+        &self,
+        input: RuntimeTerminalProgramInput,
+    ) -> Result<RuntimeProgramSpec> {
+        Ok(build_opencode_terminal_program(
+            &self.config,
+            load_saved_opencode_session_id(&input.runtime_state_root)?,
+        ))
     }
 
     async fn export_terminal_transcript(
         &self,
-        _input: RuntimeTerminalTranscriptInput,
+        input: RuntimeTerminalTranscriptInput,
         executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
     ) -> Result<RuntimeTerminalTranscript> {
         let hard_timeout = executor.hard_timeout();
         let deadline = Instant::now() + hard_timeout;
-        export_opencode_terminal_transcript_with_cli(&self.config, executor, deadline, hard_timeout)
-            .await
+        export_opencode_terminal_transcript_with_cli(
+            &self.config,
+            input,
+            executor,
+            deadline,
+            hard_timeout,
+        )
+        .await
     }
 
     fn format_program_exit_error(
@@ -192,12 +226,13 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 fn build_opencode_run_args(
     config: &OpenCodeRuntimeConfig,
     prompt: &str,
-    resumes_existing_session: bool,
+    session_id: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["run".to_string()];
 
-    if resumes_existing_session {
-        args.push("--continue".to_string());
+    if let Some(session_id) = session_id {
+        args.push("--session".to_string());
+        args.push(session_id.to_string());
     }
 
     args.extend([
@@ -219,8 +254,15 @@ fn build_opencode_run_args(
     args
 }
 
-fn build_opencode_terminal_program(config: &OpenCodeRuntimeConfig) -> RuntimeProgramSpec {
+fn build_opencode_terminal_program(
+    config: &OpenCodeRuntimeConfig,
+    session_id: Option<String>,
+) -> RuntimeProgramSpec {
     let mut args = Vec::new();
+    if let Some(session_id) = session_id {
+        args.push("--session".to_string());
+        args.push(session_id);
+    }
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -285,31 +327,76 @@ fn opencode_transcript_export_environment() -> Vec<(String, String)> {
 
 async fn export_opencode_terminal_transcript_with_cli(
     config: &OpenCodeRuntimeConfig,
+    input: RuntimeTerminalTranscriptInput,
     executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
     deadline: Instant,
     hard_timeout: std::time::Duration,
 ) -> Result<RuntimeTerminalTranscript> {
-    let list_output = timeout_at(
+    let saved_session_id = load_saved_opencode_session_id(&input.runtime_state_root)?;
+    let (listed_sessions, mut warnings) = match timeout_at(
         deadline,
         executor.execute(build_opencode_session_list_program(config)),
     )
     .await
-    .map_err(|_| {
-        anyhow!(
-            "timed out after {}s while listing OpenCode sessions through the OpenCode CLI",
-            hard_timeout.as_secs_f32()
-        )
-    })?
-    .context("failed to list OpenCode sessions through the OpenCode CLI")?;
-    if !list_output.success() {
-        return Err(opencode_program_error("session list", &list_output));
-    }
+    {
+        Ok(Ok(output)) if output.success() => {
+            (parse_opencode_session_list(&output.stdout)?, Vec::new())
+        }
+        Ok(Ok(output)) => {
+            let err = opencode_program_error("session list", &output);
+            if saved_session_id.is_none() {
+                return Err(err);
+            }
+            (
+                OpenCodeListedSessions::default(),
+                vec![RuntimeTerminalTranscriptWarning::new(
+                    "opencode-session-list",
+                    err.to_string(),
+                )],
+            )
+        }
+        Ok(Err(err)) => {
+            let err = anyhow!("failed to list OpenCode sessions through the OpenCode CLI: {err}");
+            if saved_session_id.is_none() {
+                return Err(err);
+            }
+            (
+                OpenCodeListedSessions::default(),
+                vec![RuntimeTerminalTranscriptWarning::new(
+                    "opencode-session-list",
+                    err.to_string(),
+                )],
+            )
+        }
+        Err(_) => {
+            let err = anyhow!(
+                "timed out after {}s while listing OpenCode sessions through the OpenCode CLI",
+                hard_timeout.as_secs_f32()
+            );
+            if saved_session_id.is_none() {
+                return Err(err);
+            }
+            (
+                OpenCodeListedSessions::default(),
+                vec![RuntimeTerminalTranscriptWarning::new(
+                    "opencode-session-list",
+                    err.to_string(),
+                )],
+            )
+        }
+    };
 
-    let listed_sessions = parse_opencode_session_list(&list_output.stdout)?;
     let mut turns = Vec::new();
-    let mut warnings = Vec::new();
+    let target_session_id = listed_sessions
+        .latest_id
+        .clone()
+        .or_else(|| saved_session_id.clone());
     let mut resumable = false;
-    for session_id in listed_sessions.ids {
+    let mut target_exported = false;
+
+    for session_id in
+        opencode_reconcile_session_ids(target_session_id.as_deref(), saved_session_id.as_deref())
+    {
         if Instant::now() >= deadline {
             warnings.push(RuntimeTerminalTranscriptWarning::new(
                 "opencode-session-list",
@@ -352,8 +439,10 @@ async fn export_opencode_terminal_transcript_with_cli(
         }
         match parse_opencode_export(&session_id, &export_output.stdout) {
             Ok(session_transcript) => {
-                if listed_sessions.latest_id.as_deref() == Some(session_id.as_str()) {
+                if target_session_id.as_deref() == Some(session_id.as_str()) {
+                    target_exported = true;
                     resumable = session_transcript.resumable;
+                    save_opencode_session_id(&input.runtime_state_root, &session_id)?;
                 }
                 turns.extend(session_transcript.turns);
             }
@@ -363,6 +452,7 @@ async fn export_opencode_terminal_transcript_with_cli(
             )),
         }
     }
+    resumable = target_exported && resumable;
 
     turns.sort_by(|left, right| {
         left.started_at
@@ -387,9 +477,8 @@ fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Err
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpenCodeListedSessions {
-    ids: Vec<String>,
     latest_id: Option<String>,
 }
 
@@ -402,30 +491,33 @@ struct OpenCodeTerminalTranscript {
 fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> {
     let raw = String::from_utf8_lossy(stdout);
     if raw.trim().is_empty() {
-        return Ok(OpenCodeListedSessions {
-            ids: Vec::new(),
-            latest_id: None,
-        });
+        return Ok(OpenCodeListedSessions::default());
     }
 
     let sessions = serde_json::from_slice::<Vec<OpenCodeSessionListItem>>(stdout)
         .context("failed to parse OpenCode session list JSON")?;
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    let mut latest_id = None;
     for session in sessions {
-        let id = session.id.trim();
-        if id.is_empty() || !seen.insert(id.to_string()) {
-            continue;
+        if let Some(id) = normalize_opencode_session_id(&session.id) {
+            return Ok(OpenCodeListedSessions {
+                latest_id: Some(id),
+            });
         }
-        let id = id.to_string();
-        if latest_id.is_none() {
-            latest_id = Some(id.clone());
-        }
-        ids.push(id);
     }
 
-    Ok(OpenCodeListedSessions { ids, latest_id })
+    Ok(OpenCodeListedSessions::default())
+}
+
+fn opencode_reconcile_session_ids(
+    target_session_id: Option<&str>,
+    saved_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [target_session_id, saved_session_id].into_iter().flatten() {
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 fn parse_opencode_export(
@@ -672,8 +764,107 @@ fn get_runtime_session(
         .read()
         .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
         .get(runtime_session_id)
-        .copied()
+        .cloned()
         .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
+}
+
+fn load_saved_opencode_session_id(root: &Path) -> Result<Option<String>> {
+    load_state_value(root, OPENCODE_SESSION_ID_STATE_FILE, "opencode session")
+}
+
+fn save_opencode_session_id(root: &Path, session_id: &str) -> Result<()> {
+    save_state_value(
+        root,
+        OPENCODE_SESSION_ID_STATE_FILE,
+        session_id,
+        "opencode session",
+    )
+}
+
+fn normalize_opencode_session_id(session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(session_id.to_string())
+}
+
+struct OpenCodeProgramOutputParser {
+    sessions: Arc<RwLock<HashMap<String, OpenCodeSessionState>>>,
+    runtime_session_id: String,
+    observed_session_id: Option<String>,
+}
+
+impl RuntimeProgramOutputParser for OpenCodeProgramOutputParser {
+    fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(json) = serde_json::from_str::<Value>(line) else {
+            return vec![RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: line.to_string(),
+            }];
+        };
+        self.remember_session_id(&json);
+        parse_opencode_json_event_value(&json)
+    }
+}
+
+impl OpenCodeProgramOutputParser {
+    fn remember_session_id(&mut self, json: &Value) {
+        let Some(session_id) = extract_opencode_session_id(json) else {
+            return;
+        };
+        if self.observed_session_id.as_deref() == Some(session_id.as_str()) {
+            return;
+        }
+
+        let runtime_state_root = match update_runtime_session_id(
+            &self.sessions,
+            &self.runtime_session_id,
+            session_id.clone(),
+        ) {
+            Ok(root) => root,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    runtime_session_id = %self.runtime_session_id,
+                    "failed to remember OpenCode session id"
+                );
+                return;
+            }
+        };
+        if let Some(root) = runtime_state_root.as_deref() {
+            if let Err(err) = save_opencode_session_id(root, &session_id) {
+                warn!(
+                    ?err,
+                    runtime_session_id = %self.runtime_session_id,
+                    "failed to persist OpenCode session id"
+                );
+            }
+        }
+        self.observed_session_id = Some(session_id);
+    }
+}
+
+fn update_runtime_session_id(
+    sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
+    runtime_session_id: &str,
+    session_id: String,
+) -> Result<Option<PathBuf>> {
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?;
+    let session = sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))?;
+    let runtime_state_root = session.runtime_state_root.clone();
+    session.session_id = Some(session_id);
+    drop(sessions);
+    Ok(runtime_state_root)
 }
 
 #[cfg(test)]
@@ -698,16 +889,27 @@ fn parse_opencode_output_line(line: &str) -> Vec<RuntimeEvent> {
         return Vec::new();
     }
 
-    let mut events = Vec::new();
     if let Ok(json) = serde_json::from_str::<Value>(line) {
-        parse_opencode_json_event(&mut events, &json);
+        parse_opencode_json_event_value(&json)
     } else {
-        events.push(RuntimeEvent::MessageDelta {
+        vec![RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: line.to_string(),
-        });
+        }]
     }
+}
+
+fn parse_opencode_json_event_value(json: &Value) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    parse_opencode_json_event(&mut events, json);
     events
+}
+
+fn extract_opencode_session_id(json: &Value) -> Option<String> {
+    json.get("sessionID")
+        .or_else(|| json.get("sessionId"))
+        .and_then(Value::as_str)
+        .and_then(normalize_opencode_session_id)
 }
 
 fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
@@ -886,11 +1088,14 @@ mod tests {
 
     use crate::kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
-        RuntimeSessionStartInput, RuntimeTerminalTranscriptInput,
+        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTurnInput, RuntimeTurnMode,
     };
 
-    use super::{parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
+    use super::{
+        parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
+        OPENCODE_SESSION_ID_STATE_FILE,
+    };
     use serde_json::{json, Value};
     use uuid::Uuid;
 
@@ -1146,15 +1351,124 @@ mod tests {
         assert!(program.stdin.is_empty());
     }
 
+    #[tokio::test]
+    async fn opencode_program_output_parser_remembers_session_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+            })
+            .await
+            .expect("start");
+        let input = RuntimeTurnInput {
+            runtime_session_id: handle.runtime_session_id.clone(),
+            prompt: "next".to_string(),
+            fresh_prompt: None,
+            runtime_skill_ids: Vec::new(),
+        };
+
+        let mut parser = adapter.program_output_parser(&input).expect("parser");
+        let events =
+            parser.parse_line(r#"{"type":"text","sessionID":"ses_program","text":"hello"}"#);
+
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
+                .expect("saved session id"),
+            "ses_program\n"
+        );
+
+        let program = adapter.build_turn_program(&input).expect("program");
+        assert_eq!(
+            program.args,
+            vec![
+                "run".to_string(),
+                "--session".to_string(),
+                "ses_program".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--thinking".to_string(),
+                "next".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_session_start_resumes_saved_ready_session() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write ready marker");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_ready\n",
+        )
+        .expect("write session id");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+            })
+            .await
+            .expect("start");
+        assert!(handle.resumes_existing_session);
+        let program = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle.runtime_session_id,
+                prompt: "hello".to_string(),
+                fresh_prompt: None,
+                runtime_skill_ids: Vec::new(),
+            })
+            .expect("program");
+
+        assert_eq!(
+            program.args,
+            vec![
+                "run".to_string(),
+                "--session".to_string(),
+                "ses_ready".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--thinking".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn opencode_adapter_builds_terminal_program_spec() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
             executable: "opencode".to_string(),
             model: Some("gpt-5".to_string()),
             agent: Some("builder".to_string()),
         });
 
-        let program = adapter.build_terminal_program().expect("program");
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+            })
+            .expect("program");
 
         assert_eq!(program.executable, "opencode");
         assert_eq!(
@@ -1175,6 +1489,59 @@ mod tests {
         );
         assert!(program.stdin.is_empty());
         assert!(program.auth.is_none());
+    }
+
+    #[test]
+    fn opencode_adapter_builds_terminal_program_for_saved_session() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+            })
+            .expect("program");
+
+        assert_eq!(
+            program.args,
+            vec!["--session".to_string(), "ses_saved".to_string(),]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_opencode_session_file_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        let target = temp_dir.path().join("outside-session-id");
+        std::fs::write(&target, "ses_outside\n").expect("write target");
+        std::os::unix::fs::symlink(
+            &target,
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+        )
+        .expect("symlink session state");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let err = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+            })
+            .expect_err("symlinked session state should be rejected");
+
+        assert!(
+            err.to_string().contains("cannot be a symlink"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1198,7 +1565,7 @@ mod tests {
             .export_terminal_transcript(
                 RuntimeTerminalTranscriptInput {
                     session_id: Uuid::new_v4(),
-                    runtime_state_root,
+                    runtime_state_root: runtime_state_root.clone(),
                 },
                 &mut executor,
             )
@@ -1218,6 +1585,16 @@ mod tests {
         assert!(turn
             .source_id
             .contains("opencode-export:ses_opencode_session:msg_user:msg_assistant"));
+        assert_eq!(
+            std::fs::read_to_string(
+                temp_dir
+                    .path()
+                    .join("runtime-state")
+                    .join(OPENCODE_SESSION_ID_STATE_FILE)
+            )
+            .expect("saved session id"),
+            "ses_opencode_session\n"
+        );
 
         assert_eq!(executor.programs.len(), 2);
         assert_eq!(
@@ -1252,14 +1629,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_terminal_transcript_skips_failed_session_exports() {
+    async fn opencode_terminal_transcript_exports_linked_and_current_sessions_only() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
         let mut executor = FakeTranscriptExecutor {
             outputs: VecDeque::from([
-                opencode_session_list_output(&["ses_good", "ses_bad"]),
-                opencode_completed_export_output("ses_good", "hello", "answer"),
-                bytes_output(b"not json"),
+                opencode_session_list_output(&["ses_latest", "ses_ignored"]),
+                opencode_completed_export_output("ses_latest", "hello", "answer"),
+                opencode_completed_export_output("ses_saved", "before", "saved answer"),
             ]),
             programs: Vec::new(),
         };
@@ -1269,27 +1652,41 @@ mod tests {
             .export_terminal_transcript(
                 RuntimeTerminalTranscriptInput {
                     session_id: Uuid::new_v4(),
-                    runtime_state_root,
+                    runtime_state_root: runtime_state_root.clone(),
                 },
                 &mut executor,
             )
             .await
             .expect("export transcript");
 
-        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.turns.len(), 2);
         assert!(transcript.resumable);
         assert_eq!(
             transcript.turns[0].source_id,
-            "opencode-export:ses_good:msg_user:msg_assistant"
+            "opencode-export:ses_latest:msg_user:msg_assistant"
         );
-        assert_eq!(transcript.warnings.len(), 1);
-        assert_eq!(transcript.warnings[0].source_id, "opencode-session:ses_bad");
-        assert!(
-            transcript.warnings[0]
-                .error
-                .contains("failed to parse OpenCode export JSON"),
-            "unexpected warning: {}",
-            transcript.warnings[0].error
+        assert_eq!(
+            transcript.turns[1].source_id,
+            "opencode-export:ses_saved:msg_user:msg_assistant"
+        );
+        assert!(transcript.warnings.is_empty());
+        assert_eq!(executor.programs.len(), 3);
+        assert_eq!(
+            executor.programs[1].args,
+            vec!["export".to_string(), "ses_latest".to_string()]
+        );
+        assert_eq!(
+            executor.programs[2].args,
+            vec!["export".to_string(), "ses_saved".to_string()]
+        );
+        assert!(!executor
+            .programs
+            .iter()
+            .any(|program| program.args.iter().any(|arg| arg == "ses_ignored")));
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
+                .expect("saved session id"),
+            "ses_latest\n"
         );
     }
 
@@ -1297,6 +1694,12 @@ mod tests {
     async fn opencode_terminal_transcript_latest_failed_session_is_not_resumable() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_good\n",
+        )
+        .expect("write session id");
         let mut executor = FakeTranscriptExecutor {
             outputs: VecDeque::from([
                 opencode_session_list_output(&["ses_bad", "ses_good"]),
@@ -1311,7 +1714,7 @@ mod tests {
             .export_terminal_transcript(
                 RuntimeTerminalTranscriptInput {
                     session_id: Uuid::new_v4(),
-                    runtime_state_root,
+                    runtime_state_root: runtime_state_root.clone(),
                 },
                 &mut executor,
             )
@@ -1321,6 +1724,11 @@ mod tests {
         assert_eq!(transcript.turns.len(), 1);
         assert_eq!(transcript.warnings.len(), 1);
         assert!(!transcript.resumable);
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
+                .expect("saved session id"),
+            "ses_good\n"
+        );
     }
 
     #[tokio::test]
@@ -1423,9 +1831,15 @@ mod tests {
     async fn opencode_terminal_transcript_timeout_returns_partial_transcript() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_hangs\n",
+        )
+        .expect("write session id");
         let mut executor = HangingAfterOutputsTranscriptExecutor {
             outputs: VecDeque::from([
-                opencode_session_list_output(&["ses_good", "ses_hangs"]),
+                opencode_session_list_output(&["ses_good"]),
                 opencode_completed_export_output("ses_good", "hello", "answer"),
             ]),
             programs: Vec::new(),
@@ -1454,6 +1868,55 @@ mod tests {
             transcript.warnings[0].error.contains("timed out"),
             "unexpected warning: {}",
             transcript.warnings[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_uses_saved_session_when_list_fails() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                ExecutionOutput {
+                    stderr: b"list unavailable".to_vec(),
+                    exit_code: Some(1),
+                    ..ExecutionOutput::default()
+                },
+                opencode_completed_export_output("ses_saved", "hello", "answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                RuntimeTerminalTranscriptInput {
+                    session_id: Uuid::new_v4(),
+                    runtime_state_root,
+                },
+                &mut executor,
+            )
+            .await
+            .expect("saved session fallback");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert!(transcript.resumable);
+        assert_eq!(transcript.warnings.len(), 1);
+        assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
+        assert!(
+            transcript.warnings[0].error.contains("list unavailable"),
+            "unexpected warning: {}",
+            transcript.warnings[0].error
+        );
+        assert_eq!(
+            executor.programs[1].args,
+            vec!["export".to_string(), "ses_saved".to_string()]
         );
     }
 
@@ -1542,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_continue_args_resume_last_session() {
+    fn opencode_run_args_resume_linked_session() {
         let args = super::build_opencode_run_args(
             &OpenCodeRuntimeConfig {
                 executable: "opencode".to_string(),
@@ -1550,14 +2013,15 @@ mod tests {
                 agent: Some("builder".to_string()),
             },
             "hello",
-            true,
+            Some("ses_saved"),
         );
 
         assert_eq!(
             args,
             vec![
                 "run".to_string(),
-                "--continue".to_string(),
+                "--session".to_string(),
+                "ses_saved".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
                 "--thinking".to_string(),

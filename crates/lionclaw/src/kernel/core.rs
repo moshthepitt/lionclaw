@@ -135,7 +135,7 @@ use super::{
         RuntimeEvent, RuntimeExecutionProfile, RuntimeFileChange, RuntimeFileChangeStatus,
         RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
         RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
@@ -813,9 +813,6 @@ impl Kernel {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         let runtime_kind = adapter.info().await.id;
-        let program = adapter
-            .build_terminal_program()
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let RuntimeExecutionSkills {
             mounts: skill_mounts,
             ..
@@ -860,6 +857,14 @@ impl Kernel {
         }
         self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
             .await?;
+        let runtime_state_root =
+            Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id,
+                runtime_state_root,
+            })
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
         self.audit
             .append(
@@ -7034,7 +7039,10 @@ mod tests {
             })
         }
 
-        fn build_terminal_program(&self) -> anyhow::Result<RuntimeProgramSpec> {
+        fn build_terminal_program(
+            &self,
+            _input: RuntimeTerminalProgramInput,
+        ) -> anyhow::Result<RuntimeProgramSpec> {
             Ok(RuntimeProgramSpec {
                 executable: TEST_TERMINAL_RUNTIME_ID.to_string(),
                 ..RuntimeProgramSpec::default()

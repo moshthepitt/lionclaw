@@ -137,6 +137,12 @@ pub struct RuntimeTerminalTranscriptInput {
     pub runtime_state_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeTerminalProgramInput {
+    pub session_id: Uuid,
+    pub runtime_state_root: PathBuf,
+}
+
 #[async_trait]
 pub trait RuntimeTerminalTranscriptProgramExecutor: Send {
     fn hard_timeout(&self) -> Duration {
@@ -447,7 +453,10 @@ pub trait RuntimeAdapter: Send + Sync {
     fn build_turn_program(&self, _input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not support program-backed turns"))
     }
-    fn build_terminal_program(&self) -> Result<RuntimeProgramSpec> {
+    fn build_terminal_program(
+        &self,
+        _input: RuntimeTerminalProgramInput,
+    ) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not expose a native terminal UI"))
     }
     async fn export_terminal_transcript(
