@@ -1099,19 +1099,18 @@ async fn handle_callback_connection(
         write_callback_response(stream, 400, "OAuth2 authorization was not completed").await?;
         bail!("OAuth2 provider returned error: {error}");
     }
-    let state = parsed
-        .query
-        .get("state")
-        .ok_or_else(|| anyhow!("OAuth2 callback did not include state"))?;
+    let Some(state) = parsed.query.get("state") else {
+        write_callback_response(stream, 400, "OAuth2 callback did not include state").await?;
+        return Ok(None);
+    };
     if state != expected_state {
         write_callback_response(stream, 400, "OAuth2 state did not match").await?;
-        bail!("OAuth2 callback state did not match");
+        return Ok(None);
     }
-    let code = parsed
-        .query
-        .get("code")
-        .ok_or_else(|| anyhow!("OAuth2 callback did not include code"))?
-        .clone();
+    let Some(code) = parsed.query.get("code").cloned() else {
+        write_callback_response(stream, 400, "OAuth2 callback did not include code").await?;
+        return Ok(None);
+    };
     write_callback_response(
         stream,
         200,
@@ -2083,6 +2082,49 @@ mod tests {
             parsed.query.get("state").map(String::as_str),
             Some("state one")
         );
+    }
+
+    #[tokio::test]
+    async fn callback_wait_continues_after_state_mismatch() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let bad_response =
+            send_callback_request(port, "/oauth2/callback?code=bad&state=wrong").await;
+        assert!(bad_response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(bad_response.contains("OAuth2 state did not match"));
+
+        let good_response =
+            send_callback_request(port, "/oauth2/callback?code=good%2Fcode&state=expected").await;
+        assert!(good_response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "good/code");
+    }
+
+    async fn send_callback_request(port: u16, target: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to callback listener");
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write callback request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read callback response");
+        response
     }
 
     #[test]
