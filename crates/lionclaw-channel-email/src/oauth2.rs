@@ -30,6 +30,7 @@ use crate::{
 
 const CALLBACK_PATH: &str = "/oauth2/callback";
 const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
+const CALLBACK_REQUEST_LINE_WAIT: Duration = Duration::from_secs(10);
 const HTTP_READ_LIMIT: usize = 16 * 1024;
 const OAUTH_CLIENT_JSON_MAX_BYTES: usize = 64 * 1024;
 const OAUTH_STATE_MAX_BYTES: usize = 64 * 1024;
@@ -1159,17 +1160,11 @@ async fn handle_callback_connection(
     stream: &mut TcpStream,
     expected_state: &str,
 ) -> Result<Option<String>> {
-    let mut buffer = vec![0; HTTP_READ_LIMIT];
-    let bytes = stream
-        .read(&mut buffer)
-        .await
-        .context("failed to read OAuth2 callback request")?;
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
-    let Some(first_line) = request.lines().next() else {
+    let Some(first_line) = read_callback_request_line(stream).await? else {
         write_callback_response(stream, 400, "Bad request").await?;
         return Ok(None);
     };
-    let Some(target) = parse_http_get_target(first_line) else {
+    let Some(target) = parse_http_get_target(&first_line) else {
         write_callback_response(stream, 404, "Waiting for OAuth2 callback").await?;
         return Ok(None);
     };
@@ -1201,6 +1196,51 @@ async fn handle_callback_connection(
     )
     .await?;
     Ok(Some(code))
+}
+
+async fn read_callback_request_line(stream: &mut TcpStream) -> Result<Option<String>> {
+    match timeout(
+        CALLBACK_REQUEST_LINE_WAIT,
+        read_callback_request_line_inner(stream),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
+async fn read_callback_request_line_inner(stream: &mut TcpStream) -> Result<Option<String>> {
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 512];
+
+    loop {
+        let remaining = HTTP_READ_LIMIT.saturating_sub(request.len());
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let read_len = remaining.min(chunk.len());
+        let bytes = stream
+            .read(&mut chunk[..read_len])
+            .await
+            .context("failed to read OAuth2 callback request")?;
+        if bytes == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..bytes]);
+        if let Some(line_end) = request.iter().position(|byte| *byte == b'\n') {
+            request.truncate(line_end);
+            break;
+        }
+    }
+
+    if request.is_empty() {
+        return Ok(None);
+    }
+    if request.ends_with(b"\r") {
+        request.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&request).to_string()))
 }
 
 fn parse_http_get_target(first_line: &str) -> Option<&str> {
@@ -2190,6 +2230,46 @@ mod tests {
             .expect("join callback wait")
             .expect("callback code");
         assert_eq!(code, "good/code");
+    }
+
+    #[tokio::test]
+    async fn callback_accepts_fragmented_request_line() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to callback listener");
+        stream
+            .write_all(b"GET /oauth2/callback?code=split")
+            .await
+            .expect("write first callback fragment");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream
+            .write_all(
+                format!(
+                    "%2Fcode&state=expected HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write second callback fragment");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read callback response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "split/code");
     }
 
     async fn send_callback_request(port: u16, target: &str) -> String {
