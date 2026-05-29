@@ -1447,6 +1447,7 @@ async fn post_token_form(
     let token_endpoint_url = validate_oauth_endpoint("OAuth2 token endpoint", token_endpoint)?;
     let client = reqwest::Client::builder()
         .timeout(TOKEN_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build OAuth2 HTTP client")?;
     let response = client
@@ -1456,6 +1457,11 @@ async fn post_token_form(
         .await
         .with_context(|| format!("failed to call OAuth2 token endpoint {token_endpoint}"))?;
     let status = response.status();
+    if status.is_redirection() {
+        bail!(
+            "OAuth2 token endpoint returned redirect {status}; configure the final token endpoint URL directly"
+        );
+    }
     let text = read_token_response_text(response).await?;
     let parsed: TokenResponse = serde_json::from_str(&text).with_context(|| {
         format!(
@@ -2592,6 +2598,47 @@ mod tests {
             .expect_err("non-loopback HTTP token endpoint should fail");
 
         assert!(err.to_string().contains("https URL"));
+    }
+
+    #[tokio::test]
+    async fn token_post_rejects_redirect_without_reposting_refresh_token() {
+        let redirect_target = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("redirect target listener");
+        let redirect_target_port = redirect_target.local_addr().expect("target addr").port();
+        let token_endpoint = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("token endpoint listener");
+        let token_endpoint_port = token_endpoint.local_addr().expect("endpoint addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = token_endpoint.accept().await.expect("accept token post");
+            let mut request = vec![0; 4096];
+            let bytes = stream.read(&mut request).await.expect("read token post");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.contains("refresh_token=refresh-token"));
+            let location = format!("http://127.0.0.1:{redirect_target_port}/token");
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect");
+        });
+        let state = test_token_state(format!("http://127.0.0.1:{token_endpoint_port}/token"));
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("token endpoint redirects should fail");
+
+        assert!(err.to_string().contains("returned redirect"));
+        server.await.expect("server task");
+        assert!(
+            timeout(Duration::from_millis(100), redirect_target.accept())
+                .await
+                .is_err(),
+            "token POST must not be replayed to redirect target"
+        );
     }
 
     #[tokio::test]
