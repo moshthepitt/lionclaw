@@ -35,6 +35,16 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const CHANNEL_SETUP_ENV_FILE_ENV: &str = "LIONCLAW_CHANNEL_SETUP_ENV_FILE";
 const CHANNEL_SETUP_STATE_DIR_ENV: &str = "LIONCLAW_CHANNEL_SETUP_STATE_DIR";
+const RESERVED_AUTHORIZATION_PARAMS: &[&str] = &[
+    "response_type",
+    "client_id",
+    "redirect_uri",
+    "scope",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+    "login_hint",
+];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -118,6 +128,7 @@ impl FromStr for KeyValueArg {
         {
             bail!("OAuth auth parameter names must be plain ASCII names");
         }
+        validate_custom_authorization_param_name(key)?;
         Ok(Self {
             key: key.to_string(),
             value: value.trim().to_string(),
@@ -641,9 +652,9 @@ async fn run_token(args: TokenArgs) -> Result<()> {
     Ok(())
 }
 
-fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> ProviderDefaults {
+fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> Result<ProviderDefaults> {
     match provider {
-        Oauth2Provider::Gmail => ProviderDefaults {
+        Oauth2Provider::Gmail => Ok(ProviderDefaults {
             authorization_endpoint: Some("https://accounts.google.com/o/oauth2/v2/auth".into()),
             token_endpoint: Some("https://oauth2.googleapis.com/token".into()),
             scopes: vec!["https://mail.google.com/".into()],
@@ -658,11 +669,10 @@ fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> ProviderDefaults
             smtp_host: Some("smtp.gmail.com".into()),
             smtp_port: Some(587),
             smtp_tls: Some("starttls".into()),
-        },
+        }),
         Oauth2Provider::Microsoft365 => {
-            let tenant = tenant.trim().trim_matches('/');
-            let tenant = if tenant.is_empty() { "common" } else { tenant };
-            ProviderDefaults {
+            let tenant = normalize_microsoft_tenant(tenant)?;
+            Ok(ProviderDefaults {
                 authorization_endpoint: Some(format!(
                     "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
                 )),
@@ -682,9 +692,9 @@ fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> ProviderDefaults
                 smtp_host: Some("smtp.office365.com".into()),
                 smtp_port: Some(587),
                 smtp_tls: Some("starttls".into()),
-            }
+            })
         }
-        Oauth2Provider::Generic => ProviderDefaults {
+        Oauth2Provider::Generic => Ok(ProviderDefaults {
             authorization_endpoint: None,
             token_endpoint: None,
             scopes: Vec::new(),
@@ -696,7 +706,7 @@ fn provider_defaults(provider: Oauth2Provider, tenant: &str) -> ProviderDefaults
             smtp_host: None,
             smtp_port: Some(587),
             smtp_tls: Some("starttls".into()),
-        },
+        }),
     }
 }
 
@@ -732,7 +742,7 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
             "Gmail OAuth setup requires a Google OAuth Desktop app client JSON with an installed section"
         );
     }
-    let defaults = provider_defaults(args.provider, &args.tenant);
+    let defaults = provider_defaults(args.provider, &args.tenant)?;
 
     let client_id = first_present(
         args.client_id,
@@ -765,7 +775,8 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
     )
     .or(defaults.token_endpoint.clone())
     .ok_or_else(|| anyhow!("OAuth2 setup requires --token-url for --provider generic"))?;
-    validate_oauth_endpoint("--auth-url", &authorization_endpoint)?;
+    let authorization_url = validate_oauth_endpoint("--auth-url", &authorization_endpoint)?;
+    validate_authorization_endpoint_query("--auth-url", &authorization_url)?;
     validate_oauth_endpoint("--token-url", &token_endpoint)?;
 
     let scopes = normalize_scopes(args.scopes);
@@ -801,6 +812,9 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         .state_file
         .unwrap_or_else(|| default_state_file(args.provider, &account));
     let env_file = args.env_file.unwrap_or_else(default_env_file);
+    for param in &args.auth_params {
+        validate_custom_authorization_param_name(&param.key)?;
+    }
     let mut auth_params = defaults.auth_params.clone();
     auth_params.extend(args.auth_params.into_iter().map(|arg| (arg.key, arg.value)));
 
@@ -871,7 +885,22 @@ fn normalize_scopes(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn validate_oauth_endpoint(name: &str, value: &str) -> Result<()> {
+fn normalize_microsoft_tenant(raw: &str) -> Result<String> {
+    let tenant = raw.trim();
+    if tenant.is_empty() {
+        return Ok("common".to_string());
+    }
+    if !tenant
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+        || tenant.split('.').any(str::is_empty)
+    {
+        bail!("--tenant must be a tenant id, domain, common, organizations, or consumers");
+    }
+    Ok(tenant.to_string())
+}
+
+fn validate_oauth_endpoint(name: &str, value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value).with_context(|| format!("{name} must be a valid URL"))?;
     if !url.username().is_empty() || url.password().is_some() {
         bail!("{name} must not include credentials");
@@ -881,13 +910,35 @@ fn validate_oauth_endpoint(name: &str, value: &str) -> Result<()> {
     }
 
     match (url.scheme(), url.host_str()) {
-        ("https", Some(_)) => Ok(()),
-        ("http", Some("127.0.0.1" | "localhost")) => Ok(()),
+        ("https", Some(_)) => Ok(url),
+        ("http", Some("127.0.0.1" | "localhost")) => Ok(url),
         ("http", Some(_)) => {
             bail!("{name} must be an https URL unless it targets localhost")
         }
         _ => bail!("{name} must be an https URL"),
     }
+}
+
+fn validate_authorization_endpoint_query(name: &str, url: &reqwest::Url) -> Result<()> {
+    for (key, _) in url.query_pairs() {
+        if is_reserved_authorization_param(&key) {
+            bail!("{name} must not include OAuth parameter '{key}' in its query");
+        }
+    }
+    Ok(())
+}
+
+fn validate_custom_authorization_param_name(name: &str) -> Result<()> {
+    if is_reserved_authorization_param(name) {
+        bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be passed with --auth-param");
+    }
+    Ok(())
+}
+
+fn is_reserved_authorization_param(name: &str) -> bool {
+    RESERVED_AUTHORIZATION_PARAMS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 fn normalize_secure_tls_mode(name: &str, raw: &str) -> Result<String> {
@@ -1245,12 +1296,13 @@ async fn post_token_form(
     token_endpoint: &str,
     form: Vec<(String, String)>,
 ) -> Result<TokenResponse> {
+    let token_endpoint_url = validate_oauth_endpoint("OAuth2 token endpoint", token_endpoint)?;
     let client = reqwest::Client::builder()
         .timeout(TOKEN_REQUEST_TIMEOUT)
         .build()
         .context("failed to build OAuth2 HTTP client")?;
     let response = client
-        .post(token_endpoint)
+        .post(token_endpoint_url)
         .form(&form)
         .send()
         .await
@@ -1647,14 +1699,17 @@ fn shell_quote_arg(value: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn gmail_setup_resolves_full_channel_env() {
-        let setup = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Gmail,
-            account: "Assistant@Gmail.COM".to_string(),
+    fn test_setup_args(provider: Oauth2Provider) -> SetupArgs {
+        let mut args = SetupArgs {
+            provider,
+            account: match provider {
+                Oauth2Provider::Gmail => "assistant@gmail.com",
+                Oauth2Provider::Microsoft365 | Oauth2Provider::Generic => "assistant@example.com",
+            }
+            .to_string(),
             client_secret_json: None,
             client_id: Some("client-id".to_string()),
-            client_secret: Some("client-secret".to_string()),
+            client_secret: None,
             tenant: "common".to_string(),
             authorization_endpoint: None,
             token_endpoint: None,
@@ -1667,15 +1722,55 @@ mod tests {
             smtp_host: None,
             smtp_port: None,
             smtp_tls: None,
-            admin_to: Some("Operator@Example.COM".to_string()),
+            admin_to: None,
             env_file: Some(PathBuf::from("email.env")),
-            state_file: Some(PathBuf::from("/tmp/oauth-state.json")),
+            state_file: None,
             callback_host: Some("127.0.0.1".to_string()),
             callback_port: 0,
             no_browser: true,
             force: false,
-        })
-        .expect("setup");
+        };
+        match provider {
+            Oauth2Provider::Gmail => {}
+            Oauth2Provider::Microsoft365 => {
+                args.auth_results_host = Some("mx.example.com".to_string());
+            }
+            Oauth2Provider::Generic => {
+                args.authorization_endpoint = Some("https://accounts.example.com/oauth2".into());
+                args.token_endpoint = Some("https://accounts.example.com/token".into());
+                args.scopes = vec!["mail".to_string()];
+                args.auth_results_host = Some("mx.example.com".to_string());
+                args.imap_host = Some("imap.example.com".to_string());
+                args.smtp_host = Some("smtp.example.com".to_string());
+            }
+        }
+        args
+    }
+
+    fn test_token_state(token_endpoint: impl Into<String>) -> StoredOAuth2State {
+        StoredOAuth2State {
+            version: 1,
+            provider: "generic".to_string(),
+            account: "assistant@example.com".to_string(),
+            token_endpoint: token_endpoint.into(),
+            client_id: "client-id".to_string(),
+            client_secret: None,
+            refresh_token: "refresh-token".to_string(),
+            access_token: None,
+            expires_at: None,
+            scope: vec!["mail".to_string()],
+        }
+    }
+
+    #[test]
+    fn gmail_setup_resolves_full_channel_env() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.account = "Assistant@Gmail.COM".to_string();
+        args.client_secret = Some("client-secret".to_string());
+        args.admin_to = Some("Operator@Example.COM".to_string());
+        args.state_file = Some(PathBuf::from("/tmp/oauth-state.json"));
+
+        let setup = resolve_setup(args).expect("setup");
 
         assert_eq!(setup.account, "assistant@gmail.com");
         assert_eq!(setup.auth_results_host, "mx.google.com");
@@ -1716,66 +1811,22 @@ mod tests {
 
     #[test]
     fn generic_setup_requires_provider_specific_values() {
-        let err = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Generic,
-            account: "assistant@example.com".to_string(),
-            client_secret_json: None,
-            client_id: Some("client-id".to_string()),
-            client_secret: None,
-            tenant: "common".to_string(),
-            authorization_endpoint: None,
-            token_endpoint: None,
-            scopes: vec!["mail.read".to_string()],
-            auth_params: Vec::new(),
-            auth_results_host: None,
-            imap_host: None,
-            imap_port: None,
-            imap_tls: None,
-            smtp_host: None,
-            smtp_port: None,
-            smtp_tls: None,
-            admin_to: None,
-            env_file: Some(PathBuf::from("email.env")),
-            state_file: None,
-            callback_host: Some("127.0.0.1".to_string()),
-            callback_port: 0,
-            no_browser: true,
-            force: false,
-        })
-        .expect_err("generic setup should require endpoints");
+        let mut args = test_setup_args(Oauth2Provider::Generic);
+        args.authorization_endpoint = None;
+        args.token_endpoint = None;
+
+        let err = resolve_setup(args).expect_err("generic setup should require endpoints");
 
         assert!(err.to_string().contains("--auth-url"));
     }
 
     #[test]
     fn oauth2_setup_rejects_insecure_tls_modes() {
-        let err = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Gmail,
-            account: "assistant@gmail.com".to_string(),
-            client_secret_json: None,
-            client_id: Some("client-id".to_string()),
-            client_secret: None,
-            tenant: "common".to_string(),
-            authorization_endpoint: None,
-            token_endpoint: None,
-            scopes: Vec::new(),
-            auth_params: Vec::new(),
-            auth_results_host: None,
-            imap_host: None,
-            imap_port: None,
-            imap_tls: Some("none".to_string()),
-            smtp_host: None,
-            smtp_port: None,
-            smtp_tls: None,
-            admin_to: None,
-            env_file: Some(PathBuf::from("email.env")),
-            state_file: None,
-            callback_host: Some("127.0.0.1".to_string()),
-            callback_port: 0,
-            no_browser: true,
-            force: false,
-        })
-        .expect_err("OAuth2 setup must not produce non-TLS mail settings");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.imap_tls = Some("none".to_string());
+
+        let err =
+            resolve_setup(args).expect_err("OAuth2 setup must not produce non-TLS mail settings");
 
         assert!(err.to_string().contains("must use TLS"));
     }
@@ -1807,34 +1858,48 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_rejects_reserved_authorization_query_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.authorization_endpoint =
+            Some("https://accounts.example.com/oauth2?state=attacker".to_string());
+
+        let err = resolve_setup(args).expect_err("reserved auth query parameter should fail");
+
+        assert!(err.to_string().contains("state"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_reserved_auth_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.auth_params = vec![KeyValueArg {
+            key: "redirect_uri".to_string(),
+            value: "https://example.com/callback".to_string(),
+        }];
+
+        let err = resolve_setup(args).expect_err("reserved auth parameter should fail");
+
+        assert!(err.to_string().contains("--auth-param"));
+    }
+
+    #[test]
+    fn microsoft_setup_rejects_url_shaped_tenant() {
+        for tenant in ["common/oauth2", "..", "contoso..example.com"] {
+            let mut args = test_setup_args(Oauth2Provider::Microsoft365);
+            args.tenant = tenant.to_string();
+
+            let err = resolve_setup(args).expect_err("URL-shaped tenant should fail");
+
+            assert!(err.to_string().contains("--tenant"));
+        }
+    }
+
+    #[test]
     fn oauth2_setup_writes_canonical_tls_modes() {
-        let setup = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Gmail,
-            account: "assistant@gmail.com".to_string(),
-            client_secret_json: None,
-            client_id: Some("client-id".to_string()),
-            client_secret: None,
-            tenant: "common".to_string(),
-            authorization_endpoint: None,
-            token_endpoint: None,
-            scopes: Vec::new(),
-            auth_params: Vec::new(),
-            auth_results_host: None,
-            imap_host: None,
-            imap_port: None,
-            imap_tls: Some("TLS".to_string()),
-            smtp_host: None,
-            smtp_port: None,
-            smtp_tls: Some("STARTTLS".to_string()),
-            admin_to: None,
-            env_file: Some(PathBuf::from("email.env")),
-            state_file: None,
-            callback_host: Some("127.0.0.1".to_string()),
-            callback_port: 0,
-            no_browser: true,
-            force: false,
-        })
-        .expect("setup");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.imap_tls = Some("TLS".to_string());
+        args.smtp_tls = Some("STARTTLS".to_string());
+
+        let setup = resolve_setup(args).expect("setup");
 
         assert_eq!(setup.imap_tls, "implicit");
         assert_eq!(setup.smtp_tls, "starttls");
@@ -1842,36 +1907,14 @@ mod tests {
 
     #[test]
     fn authorization_url_appends_query_with_url_parser() {
-        let setup = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Gmail,
-            account: "assistant@gmail.com".to_string(),
-            client_secret_json: None,
-            client_id: Some("client-id".to_string()),
-            client_secret: None,
-            tenant: "common".to_string(),
-            authorization_endpoint: Some("https://accounts.example.com/oauth2?existing=1".into()),
-            token_endpoint: None,
-            scopes: vec!["scope one".to_string()],
-            auth_params: vec![KeyValueArg {
-                key: "prompt".to_string(),
-                value: "select account".to_string(),
-            }],
-            auth_results_host: None,
-            imap_host: None,
-            imap_port: None,
-            imap_tls: None,
-            smtp_host: None,
-            smtp_port: None,
-            smtp_tls: None,
-            admin_to: None,
-            env_file: Some(PathBuf::from("email.env")),
-            state_file: None,
-            callback_host: Some("127.0.0.1".to_string()),
-            callback_port: 0,
-            no_browser: true,
-            force: false,
-        })
-        .expect("setup");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.authorization_endpoint = Some("https://accounts.example.com/oauth2?existing=1".into());
+        args.scopes = vec!["scope one".to_string()];
+        args.auth_params = vec![KeyValueArg {
+            key: "prompt".to_string(),
+            value: "select account".to_string(),
+        }];
+        let setup = resolve_setup(args).expect("setup");
         let pkce = PkcePair {
             verifier: "verifier".to_string(),
             challenge: "challenge value".to_string(),
@@ -1964,33 +2007,11 @@ mod tests {
         )
         .expect("write client");
 
-        let err = resolve_setup(SetupArgs {
-            provider: Oauth2Provider::Gmail,
-            account: "assistant@gmail.com".to_string(),
-            client_secret_json: Some(path),
-            client_id: None,
-            client_secret: None,
-            tenant: "common".to_string(),
-            authorization_endpoint: None,
-            token_endpoint: None,
-            scopes: Vec::new(),
-            auth_params: Vec::new(),
-            auth_results_host: None,
-            imap_host: None,
-            imap_port: None,
-            imap_tls: None,
-            smtp_host: None,
-            smtp_port: None,
-            smtp_tls: None,
-            admin_to: None,
-            env_file: Some(PathBuf::from("email.env")),
-            state_file: None,
-            callback_host: Some("127.0.0.1".to_string()),
-            callback_port: 0,
-            no_browser: true,
-            force: false,
-        })
-        .expect_err("Gmail setup should require desktop client JSON");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.client_secret_json = Some(path);
+        args.client_id = None;
+
+        let err = resolve_setup(args).expect_err("Gmail setup should require desktop client JSON");
 
         assert!(err.to_string().contains("Desktop app client JSON"));
     }
@@ -2176,23 +2197,24 @@ mod tests {
                 .await
                 .expect("write response");
         });
-        let state = StoredOAuth2State {
-            version: 1,
-            provider: "generic".to_string(),
-            account: "assistant@example.com".to_string(),
-            token_endpoint: format!("http://127.0.0.1:{port}/token"),
-            client_id: "client-id".to_string(),
-            client_secret: Some("client-secret".to_string()),
-            refresh_token: "refresh-token".to_string(),
-            access_token: None,
-            expires_at: None,
-            scope: vec!["mail".to_string()],
-        };
+        let mut state = test_token_state(format!("http://127.0.0.1:{port}/token"));
+        state.client_secret = Some("client-secret".to_string());
 
         let response = refresh_access_token(&state).await.expect("refresh");
 
         assert_eq!(response.access_token.as_deref(), Some("new-access-token"));
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_revalidates_stored_token_endpoint() {
+        let state = test_token_state("http://accounts.example.com/token");
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("non-loopback HTTP token endpoint should fail");
+
+        assert!(err.to_string().contains("https URL"));
     }
 
     #[tokio::test]
@@ -2210,18 +2232,7 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes()).await;
         });
-        let state = StoredOAuth2State {
-            version: 1,
-            provider: "generic".to_string(),
-            account: "assistant@example.com".to_string(),
-            token_endpoint: format!("http://127.0.0.1:{port}/token"),
-            client_id: "client-id".to_string(),
-            client_secret: None,
-            refresh_token: "refresh-token".to_string(),
-            access_token: None,
-            expires_at: None,
-            scope: vec!["mail".to_string()],
-        };
+        let state = test_token_state(format!("http://127.0.0.1:{port}/token"));
 
         let err = refresh_access_token(&state)
             .await

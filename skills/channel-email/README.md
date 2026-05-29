@@ -178,8 +178,9 @@ cd "$PROJ_A"
 
 Register the Microsoft app as a public/native client, add
 `http://localhost/oauth2/callback` as a redirect URI, and grant delegated
-permissions for IMAP and SMTP. Microsoft ignores the ephemeral port for
-matching localhost redirect URIs. The Microsoft preset uses
+permissions for IMAP and SMTP. `--tenant` must be `common`, `organizations`,
+`consumers`, a tenant id, or a tenant domain, not a URL path. Microsoft ignores
+the ephemeral port for matching localhost redirect URIs. The Microsoft preset uses
 `outlook.office365.com:993`, `smtp.office365.com:587`, and the documented
 delegated scopes `offline_access`,
 `https://outlook.office.com/IMAP.AccessAsUser.All`, and
@@ -204,6 +205,11 @@ provider facts:
   --imap-host imap.example.com \
   --smtp-host smtp.example.com
 ```
+
+`--auth-param` is only for provider-specific authorization URL extras. LionClaw
+owns the core OAuth fields, including `client_id`, `redirect_uri`, `scope`,
+`state`, and PKCE parameters, and rejects attempts to pass them through
+`--auth-param` or pre-seed them in the authorization URL query.
 
 To replace existing OAuth state for the same provider/account, pass `--force`
 after the provider profile. For direct helper use outside `connect`, the same
