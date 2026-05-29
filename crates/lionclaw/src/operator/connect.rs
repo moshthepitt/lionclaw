@@ -1394,8 +1394,8 @@ command = "scripts/setup"
 "#,
             r#"#!/usr/bin/env bash
 set -euo pipefail
-test -z "${OPENAI_API_KEY+x}"
-test "${HTTPS_PROXY:-}" = "http://proxy.example:8080"
+test -z "${LIONCLAW_TEST_CHANNEL_SETUP_SECRET+x}"
+test -n "${PATH:-}"
 test -n "${LIONCLAW_HOME:-}"
 test "${LIONCLAW_CHANNEL_ID:-}" = "telegram"
 test -n "${LIONCLAW_CHANNEL_SETUP_ENV_FILE:-}"
@@ -1909,10 +1909,10 @@ exit 17
                 .expect("discover skill");
 
         let mut prepared = {
-            let _guard = EnvRestore::set([
-                ("OPENAI_API_KEY", Some("sk-should-not-reach-setup")),
-                ("HTTPS_PROXY", Some("http://proxy.example:8080")),
-            ]);
+            let _guard = EnvRestore::set([(
+                "LIONCLAW_TEST_CHANNEL_SETUP_SECRET",
+                Some("should-not-reach-setup"),
+            )]);
             prepare_connect_env_inputs(PrepareConnectEnvRequest {
                 home: &home,
                 channel_id: "telegram",

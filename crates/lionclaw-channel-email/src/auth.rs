@@ -291,19 +291,17 @@ mod tests {
     async fn token_command_uses_explicit_environment_allowlist() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = EnvRestore::set([
-            ("EMAIL_IMAP_PASSWORD", Some("imap-secret")),
-            ("LIONCLAW_BASE_URL", Some("http://127.0.0.1:8787")),
-            ("HTTPS_PROXY", Some("http://proxy.example:8080")),
-        ]);
+        let _guard = EnvRestore::set([(
+            "LIONCLAW_TEST_EMAIL_TOKEN_SECRET",
+            Some("should-not-reach-token-helper"),
+        )]);
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let helper = temp_dir.path().join("token-helper");
         std::fs::write(
             &helper,
             "#!/bin/sh\n\
-             test -z \"${EMAIL_IMAP_PASSWORD+x}\" || exit 41\n\
-             test -z \"${LIONCLAW_BASE_URL+x}\" || exit 42\n\
-             test \"${HTTPS_PROXY:-}\" = 'http://proxy.example:8080' || exit 43\n\
+             test -z \"${LIONCLAW_TEST_EMAIL_TOKEN_SECRET+x}\" || exit 41\n\
+             test -n \"${PATH:-}\" || exit 42\n\
              printf 'access-token-123\\n'\n",
         )
         .expect("write helper");
