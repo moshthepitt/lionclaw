@@ -1656,9 +1656,10 @@ fn build_email_env_content(setup: &ResolvedSetup, executable: &Path) -> String {
     values.insert("EMAIL_SMTP_PORT", setup.smtp_port.to_string());
     values.insert("EMAIL_SMTP_USERNAME", setup.account.clone());
     values.insert("EMAIL_SMTP_TLS", setup.smtp_tls.clone());
-    if let Some(admin_to) = &setup.admin_to {
-        values.insert("EMAIL_ADMIN_DIGEST_TO", admin_to.clone());
-    }
+    values.insert(
+        "EMAIL_ADMIN_DIGEST_TO",
+        setup.admin_to.clone().unwrap_or_default(),
+    );
 
     let mut content = String::new();
     for (key, value) in values {
@@ -1783,7 +1784,18 @@ mod tests {
         assert!(env_content.contains("EMAIL_IMAP_HOST=imap.gmail.com\n"));
         assert!(env_content.contains("EMAIL_IMAP_PASSWORD=\n"));
         assert!(env_content.contains("EMAIL_SMTP_PASSWORD=\n"));
+        assert!(env_content.contains("EMAIL_ADMIN_DIGEST_TO=operator@example.com\n"));
         assert!(env_content.contains("EMAIL_XOAUTH2_TOKEN_CMD=\"/usr/local/bin/lionclaw-channel-email oauth2 token --state-file /tmp/oauth-state.json\"\n"));
+    }
+
+    #[test]
+    fn oauth2_setup_clears_omitted_admin_digest_recipient() {
+        let setup = resolve_setup(test_setup_args(Oauth2Provider::Gmail)).expect("setup");
+
+        let env_content =
+            build_email_env_content(&setup, Path::new("/usr/local/bin/lionclaw-channel-email"));
+
+        assert!(env_content.contains("EMAIL_ADMIN_DIGEST_TO=\n"));
     }
 
     #[test]
