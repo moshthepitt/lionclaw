@@ -863,7 +863,7 @@ pub async fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             } else {
-                run_local(RunLocalInvocation {
+                Box::pin(run_local(RunLocalInvocation {
                     home: &target.instance_home,
                     project_root: target.project_root.as_deref(),
                     work_root: target.require_work_root()?,
@@ -872,7 +872,7 @@ pub async fn run() -> Result<ExitCode> {
                     requested_runtime: args.runtime,
                     continue_last_session: args.continue_last_session,
                     timeout_override,
-                })
+                }))
                 .await?;
             }
         }

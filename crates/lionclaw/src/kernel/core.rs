@@ -128,17 +128,18 @@ use super::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         execute_captured, execute_streaming, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        skill_mount_target, spawn_interactive, EffectiveExecutionPlan, EscapeClass,
-        ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        safe_relative_path, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
         ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
         MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
         RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
         RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
         RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
-        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
-        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
-        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
+        RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
@@ -595,9 +596,12 @@ fn runtime_execution_context(plan: &EffectiveExecutionPlan) -> RuntimeExecutionC
             .filter(|mount| {
                 mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
             })
-            .map(|mount| lionclaw_runtime_api::RuntimePathProjection {
-                runtime_path: mount.target.clone(),
-                host_path: mount.source.clone(),
+            .map(|mount| {
+                if mount.target == "/runtime" {
+                    RuntimePathProjection::directory(mount.target.clone(), mount.source.clone())
+                } else {
+                    RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
+                }
             })
             .collect(),
     }
@@ -12849,19 +12853,12 @@ fn runtime_channel_send_host_path(
             "attachment path must be under /runtime",
         )
     })?;
-    let mut normalized = PathBuf::new();
-    for component in Path::new(relative).components() {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(RuntimeChannelSendProblem::new(
-                    "invalid_attachment",
-                    "attachment path must stay under /runtime",
-                ));
-            }
-        }
-    }
+    let Some(normalized) = safe_relative_path(relative) else {
+        return Err(RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must stay under /runtime",
+        ));
+    };
     if normalized.as_os_str().is_empty() {
         return Err(RuntimeChannelSendProblem::new(
             "invalid_attachment",

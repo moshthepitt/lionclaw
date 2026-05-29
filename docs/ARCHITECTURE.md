@@ -142,6 +142,13 @@ kernel execution plan. The kernel gives program-backed adapters a constrained
 executor plus observable runtime context, then still decides launch allowance,
 mounts, secrets, auth materialization, audit, and persistence.
 
+Runtime context may include host projections for runtime-visible paths. A
+directory projection maps a runtime tree such as `/runtime` to the runtime state
+root. An exact projection maps one runtime path, such as the channel-send Unix
+socket, to one host path and intentionally blocks descendants. Shared helpers in
+`lionclaw-runtime-api` normalize relative runtime paths and reject parent
+traversal before adapters turn runtime protocol fields into host paths.
+
 ## Program-Backed Runtime Flow
 
 For `lionclaw run <runtime>`, channel turns, or scheduled jobs:

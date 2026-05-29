@@ -16,13 +16,13 @@ use uuid::Uuid;
 
 use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
-    normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
-    NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
-    RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
-    RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    normalize_terminal_transcript_launch_started_at, safe_relative_path, save_state_value,
+    ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact,
+    RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome,
+    RuntimeEvent, RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus,
+    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
     RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
@@ -1835,19 +1835,24 @@ where
             return Ok(None);
         };
 
-        let artifact_id = format!("codex:image:{thread_id}:{call_id}");
-        if !self.emitted_artifact_ids.insert(artifact_id.clone()) {
-            return Ok(None);
-        }
         let filename = format!("{call_id}.png");
-        let path = codex_generated_image_path(payload, &runtime_state_root).unwrap_or_else(|| {
+        let path = if let Some(saved_path) = codex_generated_image_saved_path(payload) {
+            let Some(path) = codex_generated_image_path(saved_path, &runtime_state_root) else {
+                return Ok(None);
+            };
+            path
+        } else {
             runtime_state_root
                 .join("home")
                 .join(".codex")
                 .join("generated_images")
                 .join(&thread_id)
                 .join(&filename)
-        });
+        };
+        let artifact_id = format!("codex:image:{thread_id}:{call_id}");
+        if !self.emitted_artifact_ids.insert(artifact_id.clone()) {
+            return Ok(None);
+        }
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -2377,30 +2382,35 @@ fn codex_generated_image_call_id(payload: &Value) -> Option<String> {
 }
 
 fn codex_generated_image_has_saved_path(payload: &Value) -> bool {
+    codex_generated_image_saved_path(payload).is_some()
+}
+
+fn codex_generated_image_saved_path(payload: &Value) -> Option<&str> {
     payload
         .get("saved_path")
         .or_else(|| payload.get("savedPath"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+        .filter(|value| !value.is_empty())
 }
 
-fn codex_generated_image_path(payload: &Value, runtime_state_root: &Path) -> Option<PathBuf> {
-    let raw = payload
-        .get("saved_path")
-        .or_else(|| payload.get("savedPath"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+fn codex_generated_image_path(raw: &str, runtime_state_root: &Path) -> Option<PathBuf> {
     let path = Path::new(raw);
     if let Ok(container_relative) = path.strip_prefix("/runtime") {
-        return Some(runtime_state_root.join(container_relative));
+        return runtime_state_child_path(runtime_state_root, container_relative);
     }
     if path.is_absolute() {
-        Some(path.to_path_buf())
-    } else {
-        Some(runtime_state_root.join(path))
+        return None;
     }
+    runtime_state_child_path(runtime_state_root, path)
+}
+
+fn runtime_state_child_path(runtime_state_root: &Path, relative_path: &Path) -> Option<PathBuf> {
+    let safe_path = safe_relative_path(relative_path)?;
+    if safe_path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(runtime_state_root.join(safe_path))
 }
 
 fn app_server_event_payload<'a>(
@@ -5089,6 +5099,97 @@ mod tests {
             }
         }))
         .await;
+    }
+
+    #[test]
+    fn codex_generated_image_path_rejects_runtime_root_traversal() {
+        let runtime_state_root = PathBuf::from("/host/runtime-state");
+
+        assert_eq!(
+            super::codex_generated_image_path(
+                "/runtime/./home/.codex/generated_images/thr_1/ig_1.png",
+                &runtime_state_root,
+            ),
+            Some(PathBuf::from(
+                "/host/runtime-state/home/.codex/generated_images/thr_1/ig_1.png"
+            ))
+        );
+        assert_eq!(
+            super::codex_generated_image_path("/runtime/../outside.png", &runtime_state_root),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path("../outside.png", &runtime_state_root),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path("/tmp/outside.png", &runtime_state_root),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path("/runtime", &runtime_state_root),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path(".", &runtime_state_root),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_unsafe_saved_path_does_not_use_default_artifact() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let generated_dir = runtime_state_root
+            .join("home")
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1");
+        std::fs::create_dir_all(&generated_dir).expect("create generated image dir");
+        std::fs::write(generated_dir.join("ig_1.png"), b"png").expect("write generated image");
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root)).await;
+        thread_state
+            .persist_thread_id("thr_1")
+            .expect("persist thread id");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "ig_1",
+                    "status": "generating",
+                    "saved_path": "/runtime/../outside.png"
+                }
+            }),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let artifacts = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| matches!(event, RuntimeEvent::Artifact { .. }))
+            .count();
+        assert_eq!(artifacts, 0);
+
+        adapter.close(&handle).await.expect("close");
     }
 
     #[tokio::test]

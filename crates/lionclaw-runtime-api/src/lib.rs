@@ -832,25 +832,21 @@ impl RuntimeExecutionContext {
         let mut best_component_count = 0;
 
         for projection in &self.runtime_path_projections {
-            let projected_runtime_path = Path::new(&projection.runtime_path);
-            let Ok(relative_path) = runtime_path.strip_prefix(projected_runtime_path) else {
+            let Some((component_count, resolution)) = projection.resolve_host_path(runtime_path)
+            else {
                 continue;
             };
-            let component_count = projected_runtime_path.components().count();
             if component_count < best_component_count {
                 continue;
             }
-            let host_path = if relative_path.as_os_str().is_empty() {
-                projection.host_path.clone()
-            } else {
-                projection.host_path.join(relative_path)
-            };
-            best_match = Some(host_path);
+            best_match = Some(resolution);
             best_component_count = component_count;
         }
 
-        if best_match.is_some() {
-            return best_match;
+        match best_match {
+            Some(RuntimePathProjectionResolution::Resolved(host_path)) => return Some(host_path),
+            Some(RuntimePathProjectionResolution::Blocked) => return None,
+            None => {}
         }
 
         let runtime_state_root = self.runtime_state_root.as_ref()?;
@@ -858,14 +854,92 @@ impl RuntimeExecutionContext {
             return Some(runtime_state_root.clone());
         }
         let relative_path = runtime_path.strip_prefix("/runtime").ok()?;
-        Some(runtime_state_root.join(relative_path))
+        Some(runtime_state_root.join(safe_relative_path(relative_path)?))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePathProjectionKind {
+    /// The runtime path maps a directory tree onto a host directory tree.
+    Directory,
+    /// The runtime path maps one exact runtime path onto one host path.
+    Exact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePathProjection {
     pub runtime_path: String,
     pub host_path: PathBuf,
+    pub kind: RuntimePathProjectionKind,
+}
+
+impl RuntimePathProjection {
+    pub fn directory(runtime_path: impl Into<String>, host_path: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_path: runtime_path.into(),
+            host_path: host_path.into(),
+            kind: RuntimePathProjectionKind::Directory,
+        }
+    }
+
+    pub fn exact(runtime_path: impl Into<String>, host_path: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_path: runtime_path.into(),
+            host_path: host_path.into(),
+            kind: RuntimePathProjectionKind::Exact,
+        }
+    }
+
+    fn resolve_host_path(
+        &self,
+        runtime_path: &Path,
+    ) -> Option<(usize, RuntimePathProjectionResolution)> {
+        let projected_runtime_path = Path::new(&self.runtime_path);
+        let Ok(relative_path) = runtime_path.strip_prefix(projected_runtime_path) else {
+            return None;
+        };
+        let component_count = projected_runtime_path.components().count();
+        if relative_path.as_os_str().is_empty() {
+            return Some((
+                component_count,
+                RuntimePathProjectionResolution::Resolved(self.host_path.clone()),
+            ));
+        }
+
+        match self.kind {
+            RuntimePathProjectionKind::Directory => {
+                let Some(relative_path) = safe_relative_path(relative_path) else {
+                    return Some((component_count, RuntimePathProjectionResolution::Blocked));
+                };
+                Some((
+                    component_count,
+                    RuntimePathProjectionResolution::Resolved(self.host_path.join(relative_path)),
+                ))
+            }
+            RuntimePathProjectionKind::Exact => {
+                Some((component_count, RuntimePathProjectionResolution::Blocked))
+            }
+        }
+    }
+}
+
+enum RuntimePathProjectionResolution {
+    Resolved(PathBuf),
+    Blocked,
+}
+
+/// Normalize a relative path while rejecting absolute paths and parent traversal.
+pub fn safe_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
+    let path = path.as_ref();
+    let mut safe_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => safe_path.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(safe_path)
 }
 
 #[derive(Debug, Clone)]
@@ -1397,11 +1471,12 @@ mod tests {
     };
 
     use super::{
-        execute_program_backed_turn, ExecutionOutput, NetworkMode, RuntimeAdapter,
-        RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-        RuntimeExecutionContext, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        execute_program_backed_turn, safe_relative_path, ExecutionOutput, NetworkMode,
+        RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
+        RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane, RuntimePathProjection,
+        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnMode,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1601,14 +1676,11 @@ mod tests {
             environment: Vec::new(),
             runtime_state_root: Some(PathBuf::from("/host/runtime-root")),
             runtime_path_projections: vec![
-                RuntimePathProjection {
-                    runtime_path: "/runtime".to_string(),
-                    host_path: PathBuf::from("/host/runtime-root"),
-                },
-                RuntimePathProjection {
-                    runtime_path: "/runtime/lionclaw/channel-send.sock".to_string(),
-                    host_path: PathBuf::from("/tmp/lionclaw/cs.sock"),
-                },
+                RuntimePathProjection::directory("/runtime", "/host/runtime-root"),
+                RuntimePathProjection::exact(
+                    "/runtime/lionclaw/channel-send.sock",
+                    "/tmp/lionclaw/cs.sock",
+                ),
             ],
         };
 
@@ -1620,7 +1692,34 @@ mod tests {
             context.host_path_for_runtime_path("/runtime/lionclaw/channel-send.sock"),
             Some(PathBuf::from("/tmp/lionclaw/cs.sock"))
         );
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/lionclaw/channel-send.sock/file"),
+            None
+        );
         assert_eq!(context.host_path_for_runtime_path("/runtime2/file"), None);
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/./artifacts/sketch.txt"),
+            Some(PathBuf::from("/host/runtime-root/artifacts/sketch.txt"))
+        );
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/../outside"),
+            None
+        );
+        assert_eq!(
+            context.host_path_for_runtime_path("/runtime/lionclaw/channel-send.sock/../outside"),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_relative_path_normalizes_without_parent_traversal() {
+        assert_eq!(
+            safe_relative_path("artifacts/./sketch.txt"),
+            Some(PathBuf::from("artifacts/sketch.txt"))
+        );
+        assert_eq!(safe_relative_path("."), Some(PathBuf::new()));
+        assert_eq!(safe_relative_path("../outside"), None);
+        assert_eq!(safe_relative_path("/absolute"), None);
     }
 
     #[tokio::test]
