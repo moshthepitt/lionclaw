@@ -1246,6 +1246,7 @@ mod tests {
         runtime_state_root: PathBuf,
         launch_started_at: Option<DateTime<Utc>>,
     ) -> RuntimeTerminalTranscriptInput {
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         RuntimeTerminalTranscriptInput {
             session_id: Uuid::new_v4(),
             runtime_state_root,
@@ -1439,6 +1440,7 @@ mod tests {
     async fn opencode_program_output_parser_remembers_session_id() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
         let handle = adapter
             .session_start(RuntimeSessionStartInput {

@@ -81,7 +81,7 @@ pub(super) fn save_state_value(
         Some(value) => value,
         None => return Ok(()),
     };
-    let root = ensure_state_root(runtime_state_root)?;
+    let root = open_state_root(runtime_state_root)?;
     validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
 
     let mut contents = value.into_bytes();
@@ -144,12 +144,6 @@ fn validate_existing_state_file(
         ));
     }
     Ok(())
-}
-
-fn ensure_state_root(runtime_state_root: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(runtime_state_root)
-        .with_context(|| format!("failed to create '{}'", runtime_state_root.display()))?;
-    open_state_root(runtime_state_root)
 }
 
 fn open_state_root(runtime_state_root: &Path) -> Result<std::fs::File> {

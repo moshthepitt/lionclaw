@@ -499,8 +499,6 @@ async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()>
 
 #[cfg(unix)]
 fn ensure_runtime_codex_directory_blocking(runtime_state_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(runtime_state_root)
-        .with_context(|| format!("failed to create {}", runtime_state_root.display()))?;
     let root = open_runtime_state_root(runtime_state_root)?;
     let home_path = runtime_state_root.join("home");
     let home = ensure_runtime_codex_child_dir(&root, "home", &home_path)?;
@@ -1125,6 +1123,9 @@ command = "/host/tool"
         )
         .await
         .expect("write config");
+        tokio::fs::create_dir(&runtime_root)
+            .await
+            .expect("runtime root");
 
         sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
             .await

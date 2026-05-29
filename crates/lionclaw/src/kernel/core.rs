@@ -8345,6 +8345,110 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_runtime_launch_rejects_symlinked_runtime_private_parent() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_root = temp_dir.path().join("outside-runtime-parent");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        fs::create_dir_all(&outside_root).expect("outside root");
+        std::os::unix::fs::symlink(&outside_root, runtime_root.join(TEST_TERMINAL_RUNTIME_ID))
+            .expect("symlink runtime parent");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let exports = Arc::new(AtomicUsize::new(0));
+        kernel
+            .register_runtime_adapter(
+                TEST_TERMINAL_RUNTIME_ID,
+                Arc::new(CountingTerminalRuntimeAdapter {
+                    exports,
+                    turns: Vec::new(),
+                    resumable: false,
+                    reconciled: true,
+                }),
+            )
+            .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let err = match kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+            .await
+        {
+            Ok(_) => panic!("symlinked runtime-private parent should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("not a regular directory")
+        ));
+        assert!(
+            !outside_root.join("main").exists(),
+            "runtime launch must not create directories through a symlinked runtime-private parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_plan_reset_rejects_symlinked_runtime_private_parent() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        let outside_root = temp_dir.path().join("outside-runtime-parent");
+        let outside_state_root = outside_root.join("main/projects/project/sessions/session");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        fs::create_dir_all(&outside_state_root).expect("outside state root");
+        fs::write(outside_state_root.join("kept"), "outside\n").expect("outside marker");
+        std::os::unix::fs::symlink(&outside_root, runtime_root.join(TEST_TERMINAL_RUNTIME_ID))
+            .expect("symlink runtime parent");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan(TEST_TERMINAL_RUNTIME_ID);
+        plan.mounts = vec![MountSpec {
+            source: runtime_root
+                .join(TEST_TERMINAL_RUNTIME_ID)
+                .join("main/projects/project/sessions/session"),
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        let err = kernel
+            .reset_runtime_plan_state(&plan)
+            .await
+            .expect_err("symlinked runtime-private parent should fail");
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("not a regular directory")
+        ));
+        assert_eq!(
+            fs::read_to_string(outside_state_root.join("kept")).expect("outside marker"),
+            "outside\n"
+        );
+    }
+
     #[tokio::test]
     async fn attached_runtime_exit_audit_records_signal_status() {
         let temp_dir = tempdir().expect("temp dir");
@@ -11232,34 +11336,132 @@ async fn create_owner_private_directory_all(
     root: Option<&Path>,
     path: &Path,
 ) -> Result<(), KernelError> {
+    let Some(root) = root.filter(|root| path.starts_with(root)) else {
+        tokio::fs::create_dir_all(path).await.map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to create private runtime directory '{}': {err}",
+                path.display()
+            ))
+        })?;
+        return ensure_owner_private_directory(path).await;
+    };
+
+    create_owner_private_root_directory(root).await?;
+    let mut current = root.to_path_buf();
+    for component in private_runtime_relative_components(root, path)? {
+        current.push(component);
+        create_owner_private_directory(&current).await?;
+    }
+    Ok(())
+}
+
+async fn remove_owner_private_directory_all(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<(), KernelError> {
+    let Some(root) = root.filter(|root| path.starts_with(root)) else {
+        return remove_safe_directory_tree(path).await;
+    };
+
+    if !owner_private_directory_exists(root).await? {
+        return Ok(());
+    }
+    let mut current = root.to_path_buf();
+    for component in private_runtime_relative_components(root, path)? {
+        current.push(component);
+        if !owner_private_directory_exists(&current).await? {
+            return Ok(());
+        }
+    }
+    remove_safe_directory_tree(path).await
+}
+
+fn private_runtime_relative_components(
+    root: &Path,
+    path: &Path,
+) -> Result<Vec<OsString>, KernelError> {
+    let relative = path.strip_prefix(root).map_err(|err| {
+        KernelError::Internal(format!(
+            "private runtime directory '{}' is not under '{}': {err}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(OsString::from(name)),
+            _ => Err(KernelError::Internal(format!(
+                "private runtime directory '{}' contains an unsupported path component",
+                path.display()
+            ))),
+        })
+        .collect()
+}
+
+async fn create_owner_private_root_directory(path: &Path) -> Result<(), KernelError> {
     tokio::fs::create_dir_all(path).await.map_err(|err| {
         KernelError::Internal(format!(
             "failed to create private runtime directory '{}': {err}",
             path.display()
         ))
     })?;
-    let Some(root) = root.filter(|root| path.starts_with(root)) else {
-        return ensure_owner_private_directory(path).await;
-    };
+    ensure_owner_private_directory(path).await
+}
 
-    let mut current = path;
-    let mut directories = Vec::new();
-    loop {
-        directories.push(current.to_path_buf());
-        if current == root {
-            break;
+async fn create_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => ensure_owner_private_directory(path).await,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            tokio::fs::create_dir(path).await.map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to create private runtime directory '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            ensure_owner_private_directory(path).await
         }
-        current = current.parent().ok_or_else(|| {
-            KernelError::Internal(format!(
-                "private runtime directory '{}' is not under '{}'",
-                path.display(),
-                root.display()
-            ))
-        })?;
+        Err(err) => Err(KernelError::Internal(format!(
+            "failed to inspect private runtime directory '{}': {err}",
+            path.display()
+        ))),
     }
-    for directory in directories.into_iter().rev() {
-        ensure_owner_private_directory(&directory).await?;
+}
+
+async fn owner_private_directory_exists(path: &Path) -> Result<bool, KernelError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {
+            ensure_owner_private_directory(path).await?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(KernelError::Internal(format!(
+            "failed to inspect private runtime directory '{}': {err}",
+            path.display()
+        ))),
     }
+}
+
+async fn remove_safe_directory_tree(path: &Path) -> Result<(), KernelError> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(KernelError::Internal(format!(
+                "failed to inspect runtime storage directory '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KernelError::Conflict(format!(
+            "runtime storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    }
+    tokio::fs::remove_dir_all(path)
+        .await
+        .map_err(|err| KernelError::Internal(err.to_string()))?;
     Ok(())
 }
 
@@ -12469,7 +12671,8 @@ fn write_runtime_state_file_blocking(
     contents: &[u8],
 ) -> Result<(), KernelError> {
     let target_name = runtime_state_file_name(file_name)?;
-    let root = ensure_runtime_state_root_blocking(runtime_state_root)?;
+    let root = open_runtime_state_root_blocking(runtime_state_root)?;
+    harden_runtime_state_root_blocking(&root, runtime_state_root)?;
     write_file_atomically(
         &root,
         runtime_state_root,
@@ -12576,20 +12779,6 @@ fn remove_runtime_state_file_blocking(
     })
 }
 
-fn ensure_runtime_state_root_blocking(
-    runtime_state_root: &Path,
-) -> Result<std::fs::File, KernelError> {
-    std::fs::create_dir_all(runtime_state_root).map_err(|err| {
-        internal(anyhow::anyhow!(
-            "failed to create runtime state root '{}': {err}",
-            runtime_state_root.display()
-        ))
-    })?;
-    let root = open_runtime_state_root_blocking(runtime_state_root)?;
-    harden_runtime_state_root_blocking(&root, runtime_state_root)?;
-    Ok(root)
-}
-
 fn open_runtime_state_root_blocking(
     runtime_state_root: &Path,
 ) -> Result<std::fs::File, KernelError> {
@@ -12692,7 +12881,8 @@ fn acquire_attached_runtime_launch_lock_blocking(
 ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
     use rustix::fs::{openat, Mode, OFlags};
 
-    let root = ensure_runtime_state_root_blocking(runtime_state_root)?;
+    let root = open_runtime_state_root_blocking(runtime_state_root)?;
+    harden_runtime_state_root_blocking(&root, runtime_state_root)?;
     let lock_name = runtime_state_file_name(RUNTIME_TUI_LOCK_FILE)?;
     let lock_path = runtime_state_root.join(RUNTIME_TUI_LOCK_FILE);
     let file = match openat(
@@ -15113,11 +15303,7 @@ impl Kernel {
             return Ok(());
         };
 
-        match tokio::fs::remove_dir_all(runtime_state_root).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(internal(err.into())),
-        }
+        remove_owner_private_directory_all(self.runtime_root.as_deref(), runtime_state_root).await
     }
 
     async fn acquire_attached_runtime_launch_lock(
@@ -15125,6 +15311,8 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
     ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
+        create_owner_private_directory_all(self.runtime_root.as_deref(), &runtime_state_root)
+            .await?;
         tokio::task::spawn_blocking(move || {
             acquire_attached_runtime_launch_lock_blocking(&runtime_state_root)
         })
