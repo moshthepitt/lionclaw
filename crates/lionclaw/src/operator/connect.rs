@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs,
     io::{BufRead, ErrorKind, Write},
     path::{Path, PathBuf},
@@ -39,6 +40,58 @@ use crate::{
         runtime::resolve_runtime_id,
     },
 };
+
+const CHANNEL_SETUP_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "APPDATA",
+    "BROWSER",
+    "COLORTERM",
+    "ComSpec",
+    "CURL_CA_BUNDLE",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DESKTOP_SESSION",
+    "DISPLAY",
+    "FORCE_COLOR",
+    "GNOME_DESKTOP_SESSION_ID",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "KDE_FULL_SESSION",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "NO_COLOR",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SystemDrive",
+    "SystemRoot",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WAYLAND_DISPLAY",
+    "WINDIR",
+    "XAUTHORITY",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "XDG_STATE_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct ConnectEnvInputs {
@@ -589,6 +642,8 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
     }
     process.args(setup_args);
     process
+        .env_clear()
+        .envs(channel_setup_ambient_env())
         .env("LIONCLAW_HOME", home.root())
         .env("LIONCLAW_CHANNEL_ID", channel_id)
         .env("LIONCLAW_CHANNEL_SETUP_ENV_FILE", env_file)
@@ -609,6 +664,13 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn channel_setup_ambient_env() -> Vec<(&'static str, OsString)> {
+    CHANNEL_SETUP_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+        .collect()
 }
 
 fn installed_channel_skill_dir(home: &LionClawHome, alias: &str) -> Result<PathBuf> {
@@ -1135,7 +1197,15 @@ fn read_secret_line() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, net::TcpListener, path::Path};
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        io::Cursor,
+        net::TcpListener,
+        path::Path,
+        sync::{Mutex, MutexGuard},
+    };
 
     use super::{
         channel_setup_env_file, channel_setup_state_dir, connect_channel_with_binaries,
@@ -1171,6 +1241,8 @@ mod tests {
         let addr = listener.local_addr().expect("read test bind");
         format!("127.0.0.1:{}", addr.port())
     }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     fn write_executable(path: &Path, content: &str) {
@@ -1258,15 +1330,25 @@ optional_env = ["TELEGRAM_POLL_MS"]
     }
 
     #[cfg(unix)]
-    fn write_channel_skill_with_setup(root: &Path) {
+    fn write_channel_skill_with_setup_script(root: &Path, metadata: &str, setup_script: &str) {
         fs::create_dir_all(root.join("scripts")).expect("scripts dir");
         fs::write(
             root.join("SKILL.md"),
             "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
         )
         .expect("skill md");
-        fs::write(
-            root.join("lionclaw.toml"),
+        fs::write(root.join("lionclaw.toml"), metadata).expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
+        write_executable(root.join("scripts/setup").as_path(), setup_script);
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_setup(root: &Path) {
+        write_channel_skill_with_setup_script(
+            root,
             r#"version = 1
 
 [channel]
@@ -1280,14 +1362,6 @@ optional_env = ["TELEGRAM_POLL_MS"]
 command = "scripts/setup"
 args = ["bootstrap"]
 "#,
-        )
-        .expect("channel metadata");
-        write_executable(
-            root.join("scripts/worker").as_path(),
-            "#!/usr/bin/env bash\n",
-        );
-        write_executable(
-            root.join("scripts/setup").as_path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 test "${1:-}" = "bootstrap"
@@ -1304,15 +1378,37 @@ printf 'TELEGRAM_BOT_TOKEN=setup-token\nTELEGRAM_POLL_MS=250\n' > "$LIONCLAW_CHA
     }
 
     #[cfg(unix)]
+    fn write_channel_skill_with_setup_env_probe(root: &Path) {
+        write_channel_skill_with_setup_script(
+            root,
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test -z "${OPENAI_API_KEY+x}"
+test "${HTTPS_PROXY:-}" = "http://proxy.example:8080"
+test -n "${LIONCLAW_HOME:-}"
+test "${LIONCLAW_CHANNEL_ID:-}" = "telegram"
+test -n "${LIONCLAW_CHANNEL_SETUP_ENV_FILE:-}"
+test -n "${LIONCLAW_CHANNEL_SETUP_STATE_DIR:-}"
+printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+"#,
+        );
+    }
+
+    #[cfg(unix)]
     fn write_channel_skill_with_interactive_setup(root: &Path) {
-        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
-        )
-        .expect("skill md");
-        fs::write(
-            root.join("lionclaw.toml"),
+        write_channel_skill_with_setup_script(
+            root,
             r#"version = 1
 
 [channel]
@@ -1325,14 +1421,6 @@ env = ["TELEGRAM_BOT_TOKEN"]
 command = "scripts/setup"
 args = ["bootstrap"]
 "#,
-        )
-        .expect("channel metadata");
-        write_executable(
-            root.join("scripts/worker").as_path(),
-            "#!/usr/bin/env bash\n",
-        );
-        write_executable(
-            root.join("scripts/setup").as_path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 test "${1:-}" = "bootstrap"
@@ -1344,14 +1432,8 @@ printf 'TELEGRAM_BOT_TOKEN=interactive-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_F
 
     #[cfg(unix)]
     fn write_channel_skill_with_public_setup_env(root: &Path) {
-        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
-        )
-        .expect("skill md");
-        fs::write(
-            root.join("lionclaw.toml"),
+        write_channel_skill_with_setup_script(
+            root,
             r#"version = 1
 
 [channel]
@@ -1363,14 +1445,6 @@ env = ["TELEGRAM_BOT_TOKEN"]
 [channel.setup]
 command = "scripts/setup"
 "#,
-        )
-        .expect("channel metadata");
-        write_executable(
-            root.join("scripts/worker").as_path(),
-            "#!/usr/bin/env bash\n",
-        );
-        write_executable(
-            root.join("scripts/setup").as_path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
@@ -1381,14 +1455,8 @@ chmod 0644 "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
 
     #[cfg(unix)]
     fn write_channel_skill_with_setup_state(root: &Path) {
-        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
-        )
-        .expect("skill md");
-        fs::write(
-            root.join("lionclaw.toml"),
+        write_channel_skill_with_setup_script(
+            root,
             r#"version = 1
 
 [channel]
@@ -1400,14 +1468,6 @@ env = ["TELEGRAM_BOT_TOKEN"]
 [channel.setup]
 command = "scripts/setup"
 "#,
-        )
-        .expect("channel metadata");
-        write_executable(
-            root.join("scripts/worker").as_path(),
-            "#!/usr/bin/env bash\n",
-        );
-        write_executable(
-            root.join("scripts/setup").as_path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail"
@@ -1419,14 +1479,8 @@ printf 'TELEGRAM_BOT_TOKEN=setup-token\n' > "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
 
     #[cfg(unix)]
     fn write_channel_skill_with_failing_setup_state(root: &Path) {
-        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
-        fs::write(
-            root.join("SKILL.md"),
-            "---\nname: Telegram\ndescription: test channel\n---\nsetup\n",
-        )
-        .expect("skill md");
-        fs::write(
-            root.join("lionclaw.toml"),
+        write_channel_skill_with_setup_script(
+            root,
             r#"version = 1
 
 [channel]
@@ -1438,14 +1492,6 @@ env = ["TELEGRAM_BOT_TOKEN"]
 [channel.setup]
 command = "scripts/setup"
 "#,
-        )
-        .expect("channel metadata");
-        write_executable(
-            root.join("scripts/worker").as_path(),
-            "#!/usr/bin/env bash\n",
-        );
-        write_executable(
-            root.join("scripts/setup").as_path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$LIONCLAW_CHANNEL_SETUP_STATE_DIR/gmail"
@@ -1464,6 +1510,44 @@ exit 17
             format!("---\nname: {skill_name}\ndescription: normal skill\n---\n{token}\n"),
         )
         .expect("skill md");
+    }
+
+    struct EnvRestore {
+        _guard: MutexGuard<'static, ()>,
+        original: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn set<const N: usize>(values: [(&'static str, Option<&str>); N]) -> Self {
+            let guard = ENV_LOCK.lock().expect("env lock");
+            let original = values
+                .iter()
+                .map(|(name, _)| (*name, env::var_os(name)))
+                .collect::<Vec<_>>();
+            for (name, value) in values {
+                if let Some(value) = value {
+                    env::set_var(name, value);
+                } else {
+                    env::remove_var(name);
+                }
+            }
+            Self {
+                _guard: guard,
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.original.drain(..) {
+                if let Some(value) = value {
+                    env::set_var(name, value);
+                } else {
+                    env::remove_var(name);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1806,6 +1890,45 @@ exit 17
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        prepared
+            .cleanup_generated_env(&home)
+            .expect("cleanup setup env");
+        prepared.commit(&home).expect("commit setup state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_hook_receives_only_contract_and_allowlisted_ambient_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("create base dirs");
+        let skill_source = temp_dir.path().join("telegram-setup-env-probe");
+        write_channel_skill_with_setup_env_probe(&skill_source);
+        let discovered =
+            discover_channel_skill(&home, skill_source.to_str().expect("utf8 skill source"))
+                .expect("discover skill");
+
+        let mut prepared = {
+            let _guard = EnvRestore::set([
+                ("OPENAI_API_KEY", Some("sk-should-not-reach-setup")),
+                ("HTTPS_PROXY", Some("http://proxy.example:8080")),
+            ]);
+            prepare_connect_env_inputs(PrepareConnectEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &discovered.metadata.env,
+                optional_env: &discovered.metadata.optional_env,
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    ..ConnectEnvInputs::default()
+                },
+                interactive: false,
+                installed_skill_dir: &skill_source,
+                discovered: &discovered,
+            })
+            .expect("prepare setup env")
+        };
+
         prepared
             .cleanup_generated_env(&home)
             .expect("cleanup setup env");

@@ -995,7 +995,10 @@ manually by the operator.
   generated env through the same declared-env contract as `--env-file`. Core
   does not contain provider-specific channel setup logic.
   Helpers launched by `connect` receive LionClaw-managed setup env and state
-  paths and should not move generated credentials outside those paths.
+  paths plus a small ambient allowlist for browser, proxy, locale, certificate,
+  terminal, and temp-dir behavior; they do not inherit arbitrary shell secrets
+  from the operator process and should not move generated credentials outside
+  the managed paths.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally
