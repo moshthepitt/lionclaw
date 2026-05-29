@@ -221,8 +221,10 @@ EMAIL_CHANNEL_BIN="${EMAIL_CHANNEL_BIN:-$(command -v lionclaw-channel-email)}"
 
 The generated `EMAIL_XOAUTH2_TOKEN_CMD` starts with the absolute installed
 channel helper path. The worker parses arguments, executes the helper without a
-shell, closes stdin, drops stderr, reads one UTF-8 access token from stdout,
-enforces a 10 second timeout and a 16 KiB stdout cap, and never logs the token.
+shell, passes only a small ambient environment allowlist such as home, path,
+proxy, locale, and TLS certificate settings, closes stdin, drops stderr, reads
+one UTF-8 access token from stdout, enforces a 10 second timeout and a 16 KiB
+stdout cap, and never logs the token.
 OAuth refresh state is stored in a private local state file; LionClaw consumes
 only the short-lived access token and never projects it to runtimes.
 

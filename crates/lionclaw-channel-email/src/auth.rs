@@ -1,4 +1,6 @@
 use std::{
+    env,
+    ffi::OsString,
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -10,6 +12,33 @@ use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_COMMAND_MAX_STDOUT: usize = 16 * 1024;
+const TOKEN_COMMAND_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "APPDATA",
+    "CURL_CA_BUNDLE",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "NO_PROXY",
+    "PATH",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SystemRoot",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
 
 #[derive(Clone)]
 pub enum MailboxAuthConfig {
@@ -77,6 +106,8 @@ impl TokenCommand {
     pub async fn access_token(&self) -> Result<String> {
         let mut child = Command::new(&self.executable)
             .args(&self.args)
+            .env_clear()
+            .envs(token_command_env())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -187,9 +218,20 @@ async fn kill_child(child: &mut tokio::process::Child) -> Result<()> {
     Ok(())
 }
 
+fn token_command_env() -> Vec<(&'static str, OsString)> {
+    TOKEN_COMMAND_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|name| env::var_os(name).map(|value| (*name, value)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn token_command_requires_absolute_executable() {
@@ -242,5 +284,76 @@ mod tests {
             command.access_token().await.expect("access token"),
             "access-token-123"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_command_uses_explicit_environment_allowlist() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvRestore::set([
+            ("EMAIL_IMAP_PASSWORD", Some("imap-secret")),
+            ("LIONCLAW_BASE_URL", Some("http://127.0.0.1:8787")),
+            ("HTTPS_PROXY", Some("http://proxy.example:8080")),
+        ]);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let helper = temp_dir.path().join("token-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n\
+             test -z \"${EMAIL_IMAP_PASSWORD+x}\" || exit 41\n\
+             test -z \"${LIONCLAW_BASE_URL+x}\" || exit 42\n\
+             test \"${HTTPS_PROXY:-}\" = 'http://proxy.example:8080' || exit 43\n\
+             printf 'access-token-123\\n'\n",
+        )
+        .expect("write helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod helper");
+
+        let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
+            .expect("token command");
+
+        assert_eq!(
+            command.access_token().await.expect("access token"),
+            "access-token-123"
+        );
+    }
+
+    struct EnvRestore {
+        _guard: MutexGuard<'static, ()>,
+        original: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn set<const N: usize>(values: [(&'static str, Option<&str>); N]) -> Self {
+            let guard = ENV_LOCK.lock().expect("env lock");
+            let original = values
+                .iter()
+                .map(|(name, _)| (*name, env::var_os(name)))
+                .collect::<Vec<_>>();
+            for (name, value) in values {
+                if let Some(value) = value {
+                    env::set_var(name, value);
+                } else {
+                    env::remove_var(name);
+                }
+            }
+            Self {
+                _guard: guard,
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.original.drain(..) {
+                if let Some(value) = value {
+                    env::set_var(name, value);
+                } else {
+                    env::remove_var(name);
+                }
+            }
+        }
     }
 }
