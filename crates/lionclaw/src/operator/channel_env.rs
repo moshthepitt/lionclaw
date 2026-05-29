@@ -306,6 +306,20 @@ mod tests {
     }
 
     #[test]
+    fn channel_env_rejects_non_file_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.channel_env_path("telegram")).expect("env path dir");
+        let mut values = ChannelEnv::new();
+        values.insert("TOKEN".to_string(), "secret".to_string());
+
+        let err = save_channel_env(&home, "telegram", &values)
+            .expect_err("directory env target should fail");
+
+        assert!(err.to_string().contains("is not a file"));
+    }
+
+    #[test]
     fn channel_env_merge_removes_empty_updates() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
@@ -356,6 +370,37 @@ mod tests {
         let err = save_channel_env(&home, "telegram", &values).expect_err("symlink should fail");
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn channel_env_file_replace_is_atomic_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let env_path = home.channel_env_path("telegram");
+        let env_dir = env_path.parent().expect("env parent");
+        fs::create_dir_all(env_dir).expect("env parent");
+        fs::write(&env_path, "TOKEN=old\n").expect("old env");
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644)).expect("public old env");
+
+        let mut values = ChannelEnv::new();
+        values.insert("TOKEN".to_string(), "new".to_string());
+        save_channel_env(&home, "telegram", &values).expect("replace env");
+
+        assert_eq!(fs::read_to_string(&env_path).expect("env"), "TOKEN=new\n");
+        let mode = fs::metadata(&env_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let leftover_temp = fs::read_dir(env_dir)
+            .expect("env dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .any(|name| name.to_string_lossy().starts_with(".telegram.env.tmp-"));
+        assert!(!leftover_temp);
     }
 
     #[cfg(unix)]
