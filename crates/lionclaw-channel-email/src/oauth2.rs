@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, BufRead, ErrorKind, IsTerminal, Write},
     path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -1404,12 +1406,45 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn write_private_text(path: &Path, content: &str) -> Result<()> {
     ensure_parent_dirs_without_symlinks(path, "private file")?;
     ensure_write_target_not_symlink(path, "private file")?;
-    let mut file = open_private_file(path)?;
+    let temp_path = private_temp_path(path)?;
+    let result = write_private_text_atomically(path, &temp_path, content);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_private_text_atomically(path: &Path, temp_path: &Path, content: &str) -> Result<()> {
+    let mut file = open_private_new_file(temp_path)?;
     file.write_all(content.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
     file.flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    set_private_file_permissions(path)
+        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+    set_private_file_permissions(temp_path)?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    drop(file);
+
+    ensure_parent_dirs_without_symlinks(path, "private file")?;
+    ensure_write_target_not_symlink(path, "private file")?;
+    fs::rename(temp_path, path).with_context(|| {
+        format!(
+            "failed to replace '{}' with '{}'",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    sync_parent_dir(path)
+}
+
+fn private_temp_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("private file {} does not have a file name", path.display()))?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".tmp-{}", Uuid::new_v4()));
+    Ok(path.with_file_name(temp_name))
 }
 
 fn ensure_existing_regular_file(path: &Path, label: &str) -> Result<()> {
@@ -1441,26 +1476,40 @@ fn ensure_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn open_private_file(path: &Path) -> Result<fs::File> {
+fn open_private_new_file(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn open_private_file(path: &Path) -> Result<fs::File> {
+fn open_private_new_file(path: &Path) -> Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private file {} does not have a parent", path.display()))?;
+    let dir = fs::File::open(parent)
+        .with_context(|| format!("failed to open parent directory {}", parent.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("failed to sync parent directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2041,5 +2090,32 @@ mod tests {
             .mode();
         assert_eq!(state_mode & 0o077, 0);
         assert_eq!(provider_mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oauth_private_write_replaces_existing_file_atomically_and_privately() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let parent = temp_dir.path().join("state/gmail");
+        fs::create_dir_all(&parent).expect("state dir");
+        let path = parent.join("state.json");
+        fs::write(&path, "old\n").expect("old state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("public old state");
+
+        write_private_text(&path, "new\n").expect("write state");
+
+        assert_eq!(fs::read_to_string(&path).expect("state"), "new\n");
+        let mode = fs::metadata(&path)
+            .expect("state metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let leftover_temp = fs::read_dir(&parent)
+            .expect("state dir entries")
+            .map(|entry| entry.expect("entry").file_name())
+            .any(|name| name.to_string_lossy().starts_with(".state.json.tmp-"));
+        assert!(!leftover_temp);
     }
 }
