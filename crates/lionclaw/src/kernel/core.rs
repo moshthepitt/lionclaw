@@ -510,6 +510,7 @@ pub struct AttachedRuntimeLaunchInput {
 const RUNTIME_TUI_STATE_RUNNING: &str = "running";
 const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
 const RUNTIME_TUI_LOCK_FILE: &str = ".lionclaw-runtime-tui.lock";
+const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-at";
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct PreparedAttachedRuntimeLaunch {
@@ -1055,6 +1056,7 @@ impl Kernel {
         let transcript_input = RuntimeTerminalTranscriptInput {
             session_id,
             runtime_state_root,
+            launch_started_at: self.attached_runtime_launch_started_at(plan).await,
         };
         let mut executor = AttachedRuntimeTranscriptProgramExecutor {
             plan: plan.clone(),
@@ -7194,6 +7196,16 @@ mod tests {
         );
     }
 
+    async fn read_runtime_tui_launch_started_at(runtime_state_root: &Path) -> DateTime<Utc> {
+        let contents =
+            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE))
+                .await
+                .expect("read runtime TUI launch timestamp");
+        DateTime::parse_from_rfc3339(contents.trim())
+            .expect("parse runtime TUI launch timestamp")
+            .with_timezone(&Utc)
+    }
+
     #[tokio::test]
     async fn safe_child_directory_rejects_current_and_parent_components() {
         let temp_dir = tempdir().expect("temp dir");
@@ -7845,6 +7857,7 @@ mod tests {
 
         assert_eq!(exports.load(Ordering::SeqCst), 0);
         assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
+        read_runtime_tui_launch_started_at(&runtime_state_root).await;
 
         kernel
             .finish_attached_runtime_launch(
@@ -7871,6 +7884,7 @@ mod tests {
 
         assert_eq!(exports.load(Ordering::SeqCst), 1);
         assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
+        read_runtime_tui_launch_started_at(&runtime_state_root).await;
         assert!(!runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
             .exists());
@@ -15030,6 +15044,8 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         self.clear_runtime_session_ready(plan).await;
+        self.write_runtime_tui_launch_started_at(plan, Utc::now())
+            .await?;
         self.write_runtime_tui_state(plan, RUNTIME_TUI_STATE_RUNNING)
             .await
     }
@@ -15057,6 +15073,57 @@ impl Kernel {
             format!("{state}\n").into_bytes(),
         )
         .await
+    }
+
+    async fn write_runtime_tui_launch_started_at(
+        &self,
+        plan: &EffectiveExecutionPlan,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(());
+        };
+        write_runtime_state_file(
+            runtime_state_root,
+            RUNTIME_TUI_LAUNCH_STARTED_AT_FILE,
+            format!("{}\n", started_at.to_rfc3339()).into_bytes(),
+        )
+        .await
+    }
+
+    async fn attached_runtime_launch_started_at(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Option<DateTime<Utc>> {
+        let runtime_state_root = Self::runtime_state_root(plan)?;
+        let contents = match read_runtime_state_file(
+            runtime_state_root,
+            RUNTIME_TUI_LAUNCH_STARTED_AT_FILE,
+        )
+        .await
+        {
+            Ok(Some(contents)) => contents,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    path = %runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE).display(),
+                    "failed to read runtime TUI launch timestamp"
+                );
+                return None;
+            }
+        };
+        match DateTime::parse_from_rfc3339(contents.trim()) {
+            Ok(started_at) => Some(started_at.with_timezone(&Utc)),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    path = %runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE).display(),
+                    "failed to parse runtime TUI launch timestamp"
+                );
+                None
+            }
+        }
     }
 
     async fn mark_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {

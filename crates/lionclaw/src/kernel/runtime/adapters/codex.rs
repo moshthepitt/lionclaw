@@ -30,8 +30,9 @@ use crate::{
 };
 
 use super::{
+    choose_terminal_transcript_target,
     state_file::{load_state_value, save_state_value},
-    TerminalTranscriptTarget,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
@@ -103,6 +104,7 @@ struct CodexTerminalTranscriptExportRequest<'a> {
     thread_state: &'a CodexThreadState,
     runtime_state_root: &'a Path,
     resume_thread_id: Option<&'a str>,
+    launch_started_at: Option<DateTime<Utc>>,
     deadline: Instant,
     hard_timeout: Duration,
 }
@@ -454,6 +456,7 @@ impl CodexRuntimeAdapter {
                             thread_state: &thread_state,
                             runtime_state_root: &input.runtime_state_root,
                             resume_thread_id: resume_thread_id.as_deref(),
+                            launch_started_at: input.launch_started_at,
                             deadline,
                             hard_timeout,
                         },
@@ -520,8 +523,20 @@ impl CodexRuntimeAdapter {
                 if !seen_thread_ids.insert(thread.id.clone()) {
                     continue;
                 }
-                if target.choose_if_empty(&thread.id) {
-                    save_thread_id(request.runtime_state_root, &thread.id)?;
+                if target.is_empty() {
+                    let latest = TerminalTranscriptCandidate::new(
+                        thread.id.clone(),
+                        codex_listed_thread_updated_at(&thread),
+                    );
+                    if let Some(thread_id) = choose_terminal_transcript_target(
+                        request.resume_thread_id,
+                        latest.as_ref(),
+                        codex_thread_list_launch_started_at(request.launch_started_at),
+                    ) {
+                        if target.choose_if_empty(&thread_id) {
+                            save_thread_id(request.runtime_state_root, &thread_id)?;
+                        }
+                    }
                 }
                 match codex_app_server_thread_terminal_transcript(
                     client,
@@ -578,10 +593,17 @@ impl CodexRuntimeAdapter {
             cursor = Some(next_cursor);
         }
 
-        if target.is_empty() {
-            if let Some(resume_thread_id) = request.resume_thread_id {
+        let fallback_thread_id = target.unreconciled_id().map(str::to_string).or_else(|| {
+            request
+                .resume_thread_id
+                .filter(|_| target.is_empty())
+                .map(str::to_string)
+        });
+
+        if let Some(thread_id) = fallback_thread_id {
+            if !seen_thread_ids.contains(&thread_id) {
                 let thread = CodexListedThread {
-                    id: resume_thread_id.to_string(),
+                    id: thread_id,
                     started_at: None,
                     finished_at: None,
                 };
@@ -891,6 +913,21 @@ struct CodexListedThread {
     id: String,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
+}
+
+fn codex_listed_thread_updated_at(thread: &CodexListedThread) -> Option<DateTime<Utc>> {
+    thread
+        .finished_at
+        .as_ref()
+        .or(thread.started_at.as_ref())
+        .cloned()
+}
+
+fn codex_thread_list_launch_started_at(
+    launch_started_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    launch_started_at
+        .and_then(|started_at| DateTime::<Utc>::from_timestamp(started_at.timestamp(), 0))
 }
 
 #[derive(Debug, Clone)]
@@ -2851,6 +2888,7 @@ mod tests {
     };
     use anyhow::Result;
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use serde_json::{json, Value};
     use tokio::time::Instant;
 
@@ -3017,6 +3055,10 @@ mod tests {
         (Instant::now() + hard_timeout, hard_timeout)
     }
 
+    fn codex_test_timestamp(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(seconds, 0).expect("valid test timestamp")
+    }
+
     fn codex_transcript_export_request<'a>(
         events: &'a RuntimeEventSender,
         thread_state: &'a super::CodexThreadState,
@@ -3025,11 +3067,32 @@ mod tests {
         deadline: Instant,
         hard_timeout: Duration,
     ) -> CodexTerminalTranscriptExportRequest<'a> {
+        codex_transcript_export_request_after(
+            events,
+            thread_state,
+            runtime_state_root,
+            resume_thread_id,
+            None,
+            deadline,
+            hard_timeout,
+        )
+    }
+
+    fn codex_transcript_export_request_after<'a>(
+        events: &'a RuntimeEventSender,
+        thread_state: &'a super::CodexThreadState,
+        runtime_state_root: &'a Path,
+        resume_thread_id: Option<&'a str>,
+        launch_started_at: Option<DateTime<Utc>>,
+        deadline: Instant,
+        hard_timeout: Duration,
+    ) -> CodexTerminalTranscriptExportRequest<'a> {
         CodexTerminalTranscriptExportRequest {
             events,
             thread_state,
             runtime_state_root,
             resume_thread_id,
+            launch_started_at,
             deadline,
             hard_timeout,
         }
@@ -3281,7 +3344,18 @@ mod tests {
             json!({
                 "id": 2,
                 "result": {
-                    "data": [{"id": "thr_other"}, {"id": "thr_saved"}],
+                    "data": [
+                        {
+                            "id": "thr_other",
+                            "createdAt": 1780000010,
+                            "updatedAt": 1780000018
+                        },
+                        {
+                            "id": "thr_saved",
+                            "createdAt": 1780000001,
+                            "updatedAt": 1780000007
+                        }
+                    ],
                     "nextCursor": null,
                     "backwardsCursor": null
                 }
@@ -3326,11 +3400,12 @@ mod tests {
         let transcript = adapter
             .export_terminal_transcript_from_app_server_client(
                 &mut client,
-                codex_transcript_export_request(
+                codex_transcript_export_request_after(
                     &events,
                     &thread_state,
                     temp_dir.path(),
                     Some("thr_saved"),
+                    Some(codex_test_timestamp(1780000009)),
                     deadline,
                     hard_timeout,
                 ),
@@ -3356,6 +3431,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_terminal_transcript_keeps_saved_thread_when_latest_predates_launch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{
+                        "id": "thr_stale",
+                        "createdAt": 1780000001,
+                        "updatedAt": 1780000009
+                    }],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "result": {
+                    "data": [codex_completed_app_server_turn(
+                        "turn_stale",
+                        "stale",
+                        "stale answer",
+                        1780000002,
+                        1780000008,
+                    )],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 4,
+                "result": {
+                    "data": [codex_completed_app_server_turn(
+                        "turn_saved",
+                        "hello",
+                        "answer",
+                        1780000001,
+                        1780000007,
+                    )],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request_after(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    Some("thr_saved"),
+                    Some(codex_test_timestamp(1780000010)),
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert_eq!(
+            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
+            Some("thr_saved".to_string())
+        );
+        assert_eq!(transcript.turns.len(), 2);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "codex-app-server:thr_saved:turn_saved"
+        );
+        assert_eq!(
+            transcript.turns[1].source_id,
+            "codex-app-server:thr_stale:turn_stale"
+        );
+    }
+
+    #[tokio::test]
     async fn codex_terminal_transcript_tracks_failed_current_thread_without_resumability() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
@@ -3366,7 +3531,18 @@ mod tests {
             json!({
                 "id": 2,
                 "result": {
-                    "data": [{"id": "thr_bad"}, {"id": "thr_good"}],
+                    "data": [
+                        {
+                            "id": "thr_bad",
+                            "createdAt": 1780000010,
+                            "updatedAt": 1780000020
+                        },
+                        {
+                            "id": "thr_good",
+                            "createdAt": 1780000001,
+                            "updatedAt": 1780000007
+                        }
+                    ],
                     "nextCursor": null,
                     "backwardsCursor": null
                 }
@@ -3404,11 +3580,12 @@ mod tests {
         let transcript = adapter
             .export_terminal_transcript_from_app_server_client(
                 &mut client,
-                codex_transcript_export_request(
+                codex_transcript_export_request_after(
                     &events,
                     &thread_state,
                     temp_dir.path(),
-                    Some("thr_bad"),
+                    Some("thr_good"),
+                    Some(codex_test_timestamp(1780000009)),
                     deadline,
                     hard_timeout,
                 ),

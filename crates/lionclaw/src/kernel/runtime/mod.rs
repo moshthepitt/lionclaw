@@ -135,6 +135,7 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTerminalTranscriptInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
+    pub launch_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]

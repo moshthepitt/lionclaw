@@ -25,8 +25,9 @@ use crate::{
 };
 
 use super::{
+    choose_terminal_transcript_target,
     state_file::{load_state_value, save_state_value},
-    TerminalTranscriptTarget,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget,
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
@@ -391,10 +392,11 @@ async fn export_opencode_terminal_transcript_with_cli(
     };
 
     let mut turns = Vec::new();
-    let target_session_id = listed_sessions
-        .latest_id
-        .clone()
-        .or_else(|| saved_session_id.clone());
+    let target_session_id = choose_terminal_transcript_target(
+        saved_session_id.as_deref(),
+        listed_sessions.latest.as_ref(),
+        input.launch_started_at,
+    );
     let mut target = TerminalTranscriptTarget::default();
     if let Some(session_id) = target_session_id.as_deref() {
         if target.choose_if_empty(session_id) {
@@ -486,7 +488,7 @@ fn opencode_program_error(action: &str, output: &ExecutionOutput) -> anyhow::Err
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpenCodeListedSessions {
-    latest_id: Option<String>,
+    latest: Option<TerminalTranscriptCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,12 +508,22 @@ fn parse_opencode_session_list(stdout: &[u8]) -> Result<OpenCodeListedSessions> 
     for session in sessions {
         if let Some(id) = normalize_opencode_session_id(&session.id) {
             return Ok(OpenCodeListedSessions {
-                latest_id: Some(id),
+                latest: TerminalTranscriptCandidate::new(
+                    id,
+                    opencode_session_list_updated_at(&session),
+                ),
             });
         }
     }
 
     Ok(OpenCodeListedSessions::default())
+}
+
+fn opencode_session_list_updated_at(session: &OpenCodeSessionListItem) -> Option<DateTime<Utc>> {
+    session
+        .updated
+        .or(session.created)
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
 }
 
 fn opencode_reconcile_session_ids(
@@ -604,6 +616,10 @@ fn parse_opencode_export(
 #[derive(Debug, Deserialize)]
 struct OpenCodeSessionListItem {
     id: String,
+    #[serde(default)]
+    updated: Option<i64>,
+    #[serde(default)]
+    created: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1091,7 +1107,7 @@ fn collect_texts(value: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, future::pending, time::Duration};
+    use std::{collections::VecDeque, future::pending, path::PathBuf, time::Duration};
 
     use crate::kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
@@ -1103,6 +1119,7 @@ mod tests {
         parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
         OPENCODE_SESSION_ID_STATE_FILE,
     };
+    use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
     use uuid::Uuid;
 
@@ -1184,16 +1201,45 @@ mod tests {
         }
     }
 
+    fn opencode_test_timestamp(ms: i64) -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(ms)
+            .single()
+            .expect("valid test timestamp")
+    }
+
+    fn opencode_transcript_input(runtime_state_root: PathBuf) -> RuntimeTerminalTranscriptInput {
+        opencode_transcript_input_after(runtime_state_root, None)
+    }
+
+    fn opencode_transcript_input_after(
+        runtime_state_root: PathBuf,
+        launch_started_at: Option<DateTime<Utc>>,
+    ) -> RuntimeTerminalTranscriptInput {
+        RuntimeTerminalTranscriptInput {
+            session_id: Uuid::new_v4(),
+            runtime_state_root,
+            launch_started_at,
+        }
+    }
+
     fn opencode_session_list_output(session_ids: &[&str]) -> ExecutionOutput {
-        json_output(json!(session_ids
+        let sessions = session_ids
             .iter()
             .enumerate()
-            .map(|(index, session_id)| {
+            .map(|(index, session_id)| (*session_id, 10_000 - index as i64))
+            .collect::<Vec<_>>();
+        opencode_session_list_output_with_times(&sessions)
+    }
+
+    fn opencode_session_list_output_with_times(sessions: &[(&str, i64)]) -> ExecutionOutput {
+        json_output(json!(sessions
+            .iter()
+            .map(|(session_id, updated)| {
                 json!({
                     "id": session_id,
                     "title": session_id,
-                    "updated": 10_000 - index as i64,
-                    "created": 1_000 + index as i64,
+                    "updated": updated,
+                    "created": updated,
                     "projectId": "proj",
                     "directory": "/workspace"
                 })
@@ -1570,10 +1616,7 @@ mod tests {
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root: runtime_state_root.clone(),
-                },
+                opencode_transcript_input(runtime_state_root.clone()),
                 &mut executor,
             )
             .await
@@ -1658,10 +1701,10 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root: runtime_state_root.clone(),
-                },
+                opencode_transcript_input_after(
+                    runtime_state_root.clone(),
+                    Some(opencode_test_timestamp(9_500)),
+                ),
                 &mut executor,
             )
             .await
@@ -1700,6 +1743,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opencode_terminal_transcript_keeps_saved_session_when_latest_predates_launch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_saved\n",
+        )
+        .expect("write session id");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output_with_times(&[("ses_stale", 1_000)]),
+                opencode_completed_export_output("ses_saved", "hello", "answer"),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input_after(
+                    runtime_state_root.clone(),
+                    Some(opencode_test_timestamp(1_500)),
+                ),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].source_id,
+            "opencode-export:ses_saved:msg_user:msg_assistant"
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+        assert_eq!(executor.programs.len(), 2);
+        assert_eq!(
+            executor.programs[1].args,
+            vec!["export".to_string(), "ses_saved".to_string()]
+        );
+        assert!(!executor
+            .programs
+            .iter()
+            .any(|program| program.args.iter().any(|arg| arg == "ses_stale")));
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
+                .expect("saved session id"),
+            "ses_saved\n"
+        );
+    }
+
+    #[tokio::test]
     async fn opencode_terminal_transcript_tracks_failed_current_session_without_resumability() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -1721,10 +1818,10 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root: runtime_state_root.clone(),
-                },
+                opencode_transcript_input_after(
+                    runtime_state_root.clone(),
+                    Some(opencode_test_timestamp(9_500)),
+                ),
                 &mut executor,
             )
             .await
@@ -1771,10 +1868,7 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root,
-                },
+                opencode_transcript_input(runtime_state_root),
                 &mut executor,
             )
             .await
@@ -1820,10 +1914,7 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root,
-                },
+                opencode_transcript_input(runtime_state_root),
                 &mut executor,
             )
             .await
@@ -1860,10 +1951,10 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
+                opencode_transcript_input_after(
                     runtime_state_root,
-                },
+                    Some(opencode_test_timestamp(0)),
+                ),
                 &mut executor,
             )
             .await
@@ -1909,10 +2000,7 @@ mod tests {
 
         let transcript = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root,
-                },
+                opencode_transcript_input(runtime_state_root),
                 &mut executor,
             )
             .await
@@ -1943,10 +2031,7 @@ mod tests {
 
         let err = adapter
             .export_terminal_transcript(
-                RuntimeTerminalTranscriptInput {
-                    session_id: Uuid::new_v4(),
-                    runtime_state_root,
-                },
+                opencode_transcript_input(runtime_state_root),
                 &mut executor,
             )
             .await
