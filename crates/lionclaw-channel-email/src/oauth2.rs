@@ -828,11 +828,11 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
     let env_file = args.env_file.unwrap_or_else(default_env_file);
     let (state_file, env_file) =
         validate_setup_file_paths(args.client_secret_json.as_deref(), &state_file, &env_file)?;
-    for param in &args.auth_params {
-        validate_custom_authorization_param_name(&param.key)?;
-    }
-    let mut auth_params = defaults.auth_params.clone();
-    auth_params.extend(args.auth_params.into_iter().map(|arg| (arg.key, arg.value)));
+    let auth_params = resolve_authorization_params(
+        &authorization_url,
+        defaults.auth_params.clone(),
+        args.auth_params,
+    )?;
 
     Ok(ResolvedSetup {
         provider: args.provider,
@@ -1009,6 +1009,43 @@ fn validate_custom_authorization_param_name(name: &str) -> Result<()> {
     if is_reserved_authorization_param(name) {
         bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be passed with --auth-param");
     }
+    Ok(())
+}
+
+fn resolve_authorization_params(
+    authorization_url: &reqwest::Url,
+    defaults: Vec<(String, String)>,
+    custom: Vec<KeyValueArg>,
+) -> Result<Vec<(String, String)>> {
+    let mut seen = BTreeMap::new();
+    for (key, _) in authorization_url.query_pairs() {
+        remember_authorization_param_name(&mut seen, &key, "--auth-url query")?;
+    }
+
+    let mut params = Vec::with_capacity(defaults.len() + custom.len());
+    for (key, value) in defaults {
+        validate_custom_authorization_param_name(&key)?;
+        remember_authorization_param_name(&mut seen, &key, "provider preset")?;
+        params.push((key, value));
+    }
+    for param in custom {
+        validate_custom_authorization_param_name(&param.key)?;
+        remember_authorization_param_name(&mut seen, &param.key, "--auth-param")?;
+        params.push((param.key, param.value));
+    }
+    Ok(params)
+}
+
+fn remember_authorization_param_name(
+    seen: &mut BTreeMap<String, &'static str>,
+    name: &str,
+    source: &'static str,
+) -> Result<()> {
+    let normalized = name.to_ascii_lowercase();
+    if let Some(previous) = seen.get(&normalized) {
+        bail!("OAuth authorization parameter '{name}' from {source} duplicates {previous}");
+    }
+    seen.insert(normalized, source);
     Ok(())
 }
 
@@ -1212,7 +1249,15 @@ async fn handle_callback_connection(
         write_callback_response_best_effort(stream, 404, "Waiting for OAuth2 callback").await;
         return Ok(None);
     };
-    let parsed = parse_callback_target(target);
+    let parsed = match parse_callback_target(target) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::debug!(error = %err, "rejected malformed OAuth2 callback query");
+            write_callback_response_best_effort(stream, 400, "OAuth2 callback query was invalid")
+                .await;
+            return Ok(None);
+        }
+    };
     if parsed.path != CALLBACK_PATH {
         write_callback_response_best_effort(stream, 404, "Waiting for OAuth2 callback").await;
         return Ok(None);
@@ -1323,21 +1368,25 @@ struct ParsedCallbackTarget {
     query: BTreeMap<String, String>,
 }
 
-fn parse_callback_target(target: &str) -> ParsedCallbackTarget {
+fn parse_callback_target(target: &str) -> Result<ParsedCallbackTarget> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    ParsedCallbackTarget {
+    Ok(ParsedCallbackTarget {
         path: path.to_string(),
-        query: parse_urlencoded_query(query),
-    }
+        query: parse_urlencoded_query(query)?,
+    })
 }
 
-fn parse_urlencoded_query(query: &str) -> BTreeMap<String, String> {
+fn parse_urlencoded_query(query: &str) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        values.insert(percent_decode(key), percent_decode(value));
+        let key = percent_decode(key);
+        if values.contains_key(&key) {
+            bail!("OAuth2 callback query contains duplicate '{key}' parameter");
+        }
+        values.insert(key, percent_decode(value));
     }
-    values
+    Ok(values)
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -2126,6 +2175,33 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_rejects_duplicate_authorization_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.auth_params = vec![KeyValueArg {
+            key: "prompt".to_string(),
+            value: "select_account".to_string(),
+        }];
+
+        let err = resolve_setup(args).expect_err("preset auth parameter duplicate should fail");
+
+        assert!(err.to_string().contains("prompt"));
+        assert!(err.to_string().contains("duplicates provider preset"));
+
+        let mut args = test_setup_args(Oauth2Provider::Generic);
+        args.authorization_endpoint =
+            Some("https://accounts.example.com/oauth2?audience=mail".into());
+        args.auth_params = vec![KeyValueArg {
+            key: "audience".to_string(),
+            value: "calendar".to_string(),
+        }];
+
+        let err = resolve_setup(args).expect_err("auth URL query duplicate should fail");
+
+        assert!(err.to_string().contains("audience"));
+        assert!(err.to_string().contains("duplicates --auth-url query"));
+    }
+
+    #[test]
     fn oauth2_setup_rejects_invalid_required_text_values() {
         let mut args = test_setup_args(Oauth2Provider::Gmail);
         args.client_id = Some(" ".to_string());
@@ -2173,8 +2249,8 @@ mod tests {
         args.authorization_endpoint = Some("https://accounts.example.com/oauth2?existing=1".into());
         args.scopes = vec!["scope one".to_string()];
         args.auth_params = vec![KeyValueArg {
-            key: "prompt".to_string(),
-            value: "select account".to_string(),
+            key: "audience".to_string(),
+            value: "mail account".to_string(),
         }];
         let setup = resolve_setup(args).expect("setup");
         let pkce = PkcePair {
@@ -2209,8 +2285,8 @@ mod tests {
             Some("challenge value")
         );
         assert_eq!(
-            params.get("prompt").map(String::as_str),
-            Some("select account")
+            params.get("audience").map(String::as_str),
+            Some("mail account")
         );
     }
 
@@ -2357,7 +2433,8 @@ mod tests {
 
     #[test]
     fn callback_query_decodes_code_and_state() {
-        let parsed = parse_callback_target("/oauth2/callback?code=a%2Fb%2Bc&state=state+one");
+        let parsed = parse_callback_target("/oauth2/callback?code=a%2Fb%2Bc&state=state+one")
+            .expect("callback target");
 
         assert_eq!(parsed.path, CALLBACK_PATH);
         assert_eq!(parsed.query.get("code").map(String::as_str), Some("a/b+c"));
@@ -2365,6 +2442,14 @@ mod tests {
             parsed.query.get("state").map(String::as_str),
             Some("state one")
         );
+    }
+
+    #[test]
+    fn callback_query_rejects_duplicate_parameters() {
+        let err = parse_callback_target("/oauth2/callback?code=first&code=second&state=expected")
+            .expect_err("duplicate callback parameters should fail");
+
+        assert!(err.to_string().contains("duplicate 'code'"));
     }
 
     #[tokio::test]
@@ -2436,6 +2521,32 @@ mod tests {
             .expect("join callback wait")
             .expect("callback code");
         assert_eq!(code, "good/code");
+    }
+
+    #[tokio::test]
+    async fn callback_wait_continues_after_duplicate_query_parameters() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let ambiguous_response =
+            send_callback_request(port, "/oauth2/callback?code=bad&state=wrong&state=expected")
+                .await;
+        assert!(ambiguous_response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(ambiguous_response.contains("OAuth2 callback query was invalid"));
+
+        let good_response =
+            send_callback_request(port, "/oauth2/callback?code=good&state=expected").await;
+        assert!(good_response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "good");
     }
 
     #[tokio::test]
