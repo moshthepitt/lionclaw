@@ -1107,12 +1107,11 @@ fn codex_app_server_terminal_turns<'a>(
         let Some(assistant_text) = codex_app_server_turn_assistant_text(turn) else {
             continue;
         };
-        let started_at = codex_app_server_timestamp(turn.get("startedAt"))
-            .or(thread_started_at)
-            .unwrap_or_else(Utc::now);
-        let finished_at = codex_app_server_timestamp(turn.get("completedAt"))
-            .or(thread_finished_at)
-            .unwrap_or(started_at);
+        let Some((started_at, finished_at)) =
+            codex_app_server_turn_times(turn, thread_started_at, thread_finished_at)
+        else {
+            continue;
+        };
         let (status, error_code, error_text) = codex_app_server_turn_status(turn);
 
         terminal_turns.push(RuntimeTerminalTurn {
@@ -1129,6 +1128,23 @@ fn codex_app_server_terminal_turns<'a>(
     }
 
     terminal_turns
+}
+
+fn codex_app_server_turn_times(
+    turn: &Value,
+    thread_started_at: Option<DateTime<Utc>>,
+    thread_finished_at: Option<DateTime<Utc>>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let turn_started_at = codex_app_server_timestamp(turn.get("startedAt"));
+    let turn_finished_at = codex_app_server_timestamp(turn.get("completedAt"));
+    let started_at = turn_started_at
+        .or(thread_started_at)
+        .or(turn_finished_at)
+        .or(thread_finished_at)?;
+    let finished_at = turn_finished_at
+        .or(thread_finished_at)
+        .unwrap_or(started_at);
+    Some((started_at, finished_at))
 }
 
 fn codex_app_server_turn_user_text(turn: &Value) -> Option<String> {
@@ -3898,6 +3914,36 @@ mod tests {
             "unexpected warning: {}",
             transcript.warnings[0].error
         );
+    }
+
+    #[test]
+    fn codex_app_server_turns_use_thread_time_when_turn_time_is_missing() {
+        let mut turn = codex_completed_app_server_turn("turn_done", "hello", "answer", 1, 2);
+        turn["startedAt"] = Value::Null;
+        turn["completedAt"] = Value::Null;
+
+        let turns = super::codex_app_server_terminal_turns(
+            "thr_cli",
+            Some(codex_test_timestamp(1780000010)),
+            Some(codex_test_timestamp(1780000020)),
+            std::iter::once(&turn),
+        );
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].started_at, codex_test_timestamp(1780000010));
+        assert_eq!(turns[0].finished_at, codex_test_timestamp(1780000020));
+    }
+
+    #[test]
+    fn codex_app_server_turns_skip_turns_without_deterministic_time() {
+        let mut turn = codex_completed_app_server_turn("turn_done", "hello", "answer", 1, 2);
+        turn["startedAt"] = Value::Null;
+        turn["completedAt"] = Value::Null;
+
+        let turns =
+            super::codex_app_server_terminal_turns("thr_cli", None, None, std::iter::once(&turn));
+
+        assert!(turns.is_empty());
     }
 
     #[test]
