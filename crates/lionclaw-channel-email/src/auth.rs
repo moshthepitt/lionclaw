@@ -171,7 +171,7 @@ impl TokenCommand {
         let token = String::from_utf8(output)
             .context("EMAIL_XOAUTH2_TOKEN_CMD stdout must be UTF-8 access-token text")?;
         let token = token.trim().to_string();
-        validate_access_token(&token)?;
+        validate_access_token("EMAIL_XOAUTH2_TOKEN_CMD", &token)?;
         Ok(token)
     }
 }
@@ -199,15 +199,15 @@ fn validate_executable_path(env_name: &str, executable: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_access_token(token: &str) -> Result<()> {
+pub(crate) fn validate_access_token(source: &str, token: &str) -> Result<()> {
     if token.is_empty() {
-        bail!("EMAIL_XOAUTH2_TOKEN_CMD returned an empty access token");
+        bail!("{source} returned an empty access token");
     }
     if token.chars().any(char::is_whitespace) {
-        bail!("EMAIL_XOAUTH2_TOKEN_CMD access token must not contain whitespace");
+        bail!("{source} access token must not contain whitespace");
     }
     if token.chars().any(char::is_control) {
-        bail!("EMAIL_XOAUTH2_TOKEN_CMD access token must not contain control characters");
+        bail!("{source} access token must not contain control characters");
     }
     Ok(())
 }
@@ -261,7 +261,8 @@ mod tests {
 
     #[test]
     fn access_token_rejects_whitespace() {
-        let err = validate_access_token("abc def").expect_err("space should fail");
+        let err = validate_access_token("EMAIL_XOAUTH2_TOKEN_CMD", "abc def")
+            .expect_err("space should fail");
 
         assert!(err.to_string().contains("whitespace"));
     }

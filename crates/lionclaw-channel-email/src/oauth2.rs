@@ -24,6 +24,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    auth::validate_access_token,
     config::validate_authserv_id,
     protocol::{mailbox_id_for, normalize_address},
 };
@@ -635,7 +636,7 @@ async fn run_setup(args: SetupArgs) -> Result<()> {
 
 async fn run_token(args: TokenArgs) -> Result<()> {
     let mut state = read_oauth2_state(&args.state_file)?;
-    if let Some(token) = cached_access_token(&state) {
+    if let Some(token) = cached_access_token(&state)? {
         println!("{token}");
         return Ok(());
     }
@@ -1475,6 +1476,9 @@ async fn post_token_form(
         let description = parsed.error_description.as_deref().unwrap_or("");
         bail!("OAuth2 token endpoint returned {status}: {error} {description}");
     }
+    if let Some(access_token) = parsed.access_token.as_deref() {
+        validate_access_token("OAuth2 token endpoint", access_token)?;
+    }
     Ok(parsed)
 }
 
@@ -1514,13 +1518,18 @@ fn expires_at(expires_in: Option<i64>) -> Option<DateTime<Utc>> {
     expires_in.and_then(|seconds| Utc::now().checked_add_signed(TimeDelta::seconds(seconds)))
 }
 
-fn cached_access_token(state: &StoredOAuth2State) -> Option<String> {
-    let token = state.access_token.as_ref()?;
-    let expires_at = state.expires_at?;
+fn cached_access_token(state: &StoredOAuth2State) -> Result<Option<String>> {
+    let Some(token) = state.access_token.as_ref() else {
+        return Ok(None);
+    };
+    let Some(expires_at) = state.expires_at else {
+        return Ok(None);
+    };
     if expires_at - Utc::now() > TimeDelta::seconds(TOKEN_REFRESH_SKEW_SECONDS) {
-        Some(token.clone())
+        validate_access_token("cached OAuth2 state", token)?;
+        Ok(Some(token.clone()))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -2566,7 +2575,23 @@ mod tests {
             scope: vec!["https://mail.google.com/".to_string()],
         };
 
-        assert_eq!(cached_access_token(&state).as_deref(), Some("access"));
+        assert_eq!(
+            cached_access_token(&state)
+                .expect("cached token")
+                .as_deref(),
+            Some("access")
+        );
+    }
+
+    #[test]
+    fn cached_access_token_rejects_invalid_token_text() {
+        let mut state = test_token_state("https://oauth2.googleapis.com/token");
+        state.access_token = Some("bad token".to_string());
+        state.expires_at = Some(Utc::now() + TimeDelta::seconds(120));
+
+        let err = cached_access_token(&state).expect_err("invalid cached token should fail");
+
+        assert!(err.to_string().contains("whitespace"));
     }
 
     #[test]
@@ -2683,6 +2708,34 @@ mod tests {
             .expect_err("oversized token response should fail");
 
         assert!(err.to_string().contains("exceeded"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn token_response_rejects_invalid_access_token_text() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = vec![0; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"access_token":"bad token","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let state = test_token_state(format!("http://127.0.0.1:{port}/token"));
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("invalid access token should fail");
+
+        assert!(err.to_string().contains("whitespace"));
         server.await.expect("server task");
     }
 
