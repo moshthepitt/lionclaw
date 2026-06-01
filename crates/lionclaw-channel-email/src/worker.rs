@@ -19,6 +19,7 @@ use crate::{
     },
     classifier::{classify_headers, MailClassification},
     config::{validate_max_message_bytes, SenderAuthConfig, WorkerConfig},
+    diagnostics::render_operator_error,
     mailbox::{
         attachment_provider_ref, is_stale_mailbox_candidate, CandidateHeader, MailboxEngine,
         MailboxFactory, MalformedCandidateHeader, OutboundAttachment, OutboundEmail,
@@ -803,7 +804,7 @@ where
                     .await?;
             }
             Err(err) => {
-                let error_text = redact_error_text(&err.to_string());
+                let error_text = render_operator_error(&err);
                 store
                     .record_held_digest_attempt(HeldDigestAttemptInput {
                         delivery_id: &delivery_id,
@@ -875,6 +876,7 @@ where
         {
             Ok(()) => store.clear_pending_grant_consumption(grant_id).await?,
             Err(err) => {
+                let error_text = render_operator_error(&err);
                 warn!(
                     grant_id,
                     held_id,
@@ -887,7 +889,7 @@ where
                         channel_id,
                         held_id,
                         expected_label,
-                        &err.to_string(),
+                        &error_text,
                     )
                     .await?;
             }
@@ -983,10 +985,7 @@ where
             checks.push(health_check(
                 "email.tick",
                 "error",
-                format!(
-                    "email worker tick failed: {}",
-                    redact_error_text(&err.to_string())
-                ),
+                format!("email worker tick failed: {}", render_operator_error(err)),
                 json!({}),
             ));
         }
@@ -1054,7 +1053,7 @@ where
                 "warning",
                 format!(
                     "held-mail digest audit is unavailable: {}",
-                    redact_error_text(&err.to_string())
+                    render_operator_error(&err)
                 ),
                 json!({ "enabled": true }),
             ),
@@ -1683,38 +1682,17 @@ fn aggregate_health_status(checks: &[ChannelHealthCheckReport]) -> &'static str 
     }
 }
 
-fn redact_error_text(raw: &str) -> String {
-    let one_line = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_control() || ch == '\r' || ch == '\n' {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    let trimmed = one_line.trim();
-    let mut chars = trimmed.chars();
-    let preview = chars.by_ref().take(240).collect::<String>();
-    if chars.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
-    }
-}
-
 fn retryable(code: &'static str, err: anyhow::Error) -> DeliveryResult {
     DeliveryResult::RetryableFailed {
         code,
-        text: err.to_string(),
+        text: render_operator_error(&err),
     }
 }
 
 fn terminal(code: &'static str, err: anyhow::Error) -> DeliveryResult {
     DeliveryResult::TerminalFailed {
         code,
-        text: err.to_string(),
+        text: render_operator_error(&err),
     }
 }
 
@@ -2808,7 +2786,9 @@ mod tests {
         let fixture = EmailFixture::new(false).await;
         let mut config = fixture.config();
         config.digest.admin_to = Some("operator@example.com".to_string());
-        fixture.mailbox.set_send_fails(true);
+        fixture.mailbox.set_send_error(
+            "EMAIL_XOAUTH2_TOKEN_CMD exited with status exit status: 17; stderr: invalid_grant refresh_token : secret-refresh-token revoked",
+        );
         let worker = EmailWorker::new(config, fixture.mailbox.clone()).expect("worker");
 
         let err = worker.tick().await.expect_err("digest send should fail");
@@ -2823,10 +2803,12 @@ mod tests {
         assert_eq!(attempt.status, HeldDigestAttemptStatus::Failed);
         assert_eq!(attempt.held_count, 1);
         assert_eq!(attempt.error_code.as_deref(), Some("digest_send_failed"));
-        assert!(attempt
-            .error_text
-            .as_deref()
-            .is_some_and(|text| text.contains("temporary SMTP send failure")));
+        let error_text = attempt.error_text.as_deref().expect("digest error text");
+        assert!(error_text.contains("failed to obtain XOAUTH2 access token for SMTP"));
+        assert!(error_text.contains("invalid_grant"));
+        assert!(error_text.contains("revoked"));
+        assert!(error_text.contains("[redacted]"));
+        assert!(!error_text.contains("secret-refresh-token"));
         assert!(fixture.mailbox.sent().is_empty());
 
         let health = fixture.latest_health_report();
@@ -2834,8 +2816,17 @@ mod tests {
         let digest = health_check_by_code(&health, "email.digest");
         assert_eq!(digest["status"], "warning");
         assert_eq!(digest["details"]["latest_status"], "failed");
+        let digest_message = digest["message"].as_str().expect("digest message");
+        assert!(digest_message.contains("invalid_grant"));
+        assert!(digest_message.contains("[redacted]"));
+        assert!(!digest_message.contains("secret-refresh-token"));
         let tick = health_check_by_code(&health, "email.tick");
         assert_eq!(tick["status"], "error");
+        let tick_message = tick["message"].as_str().expect("tick message");
+        assert!(tick_message.contains("failed to send held-mail digest"));
+        assert!(tick_message.contains("invalid_grant"));
+        assert!(tick_message.contains("[redacted]"));
+        assert!(!tick_message.contains("secret-refresh-token"));
     }
 
     struct EmailFixture {
@@ -3087,6 +3078,7 @@ mod tests {
                     stale_uid_validity: AtomicBool::new(false),
                     fail_full_fetch: AtomicBool::new(false),
                     fail_send: AtomicBool::new(false),
+                    send_error: Mutex::new(None),
                     full_fetches: AtomicUsize::new(0),
                     seen: AtomicUsize::new(0),
                     sent: Mutex::new(Vec::new()),
@@ -3118,8 +3110,9 @@ mod tests {
             self.state.fail_full_fetch.store(fail, Ordering::SeqCst);
         }
 
-        fn set_send_fails(&self, fail: bool) {
-            self.state.fail_send.store(fail, Ordering::SeqCst);
+        fn set_send_error(&self, error: impl Into<String>) {
+            *self.state.send_error.lock().unwrap() = Some(error.into());
+            self.state.fail_send.store(true, Ordering::SeqCst);
         }
 
         fn sent(&self) -> Vec<OutboundEmail> {
@@ -3135,6 +3128,7 @@ mod tests {
         stale_uid_validity: AtomicBool,
         fail_full_fetch: AtomicBool,
         fail_send: AtomicBool,
+        send_error: Mutex<Option<String>>,
         full_fetches: AtomicUsize,
         seen: AtomicUsize,
         sent: Mutex<Vec<OutboundEmail>>,
@@ -3212,6 +3206,10 @@ mod tests {
 
         async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value> {
             if self.state.fail_send.load(Ordering::SeqCst) {
+                if let Some(error) = self.state.send_error.lock().unwrap().clone() {
+                    return Err(anyhow!(error))
+                        .context("failed to obtain XOAUTH2 access token for SMTP");
+                }
                 bail!("temporary SMTP send failure");
             }
             self.state.sent.lock().unwrap().push(email);

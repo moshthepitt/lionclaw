@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod classifier;
 mod config;
+mod diagnostics;
 mod mailbox;
 mod mime;
 mod oauth2;

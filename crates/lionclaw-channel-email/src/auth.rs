@@ -14,16 +14,11 @@ use tokio::{
     time::timeout,
 };
 
+use crate::diagnostics::render_operator_diagnostic;
+
 const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_COMMAND_MAX_STDOUT: usize = 16 * 1024;
 const TOKEN_COMMAND_MAX_STDERR: usize = 16 * 1024;
-const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "client_secret",
-    "password",
-];
 const TOKEN_COMMAND_ENV_ALLOWLIST: &[&str] = &[
     "ALL_PROXY",
     "APPDATA",
@@ -193,16 +188,7 @@ struct TokenCommandDiagnostic {
 impl TokenCommandDiagnostic {
     fn render(&self) -> Option<String> {
         let text = String::from_utf8_lossy(&self.bytes);
-        let redacted = redact_diagnostic_text(&text);
-        let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
-        if compact.is_empty() {
-            return None;
-        }
-        if self.truncated {
-            Some(format!("{compact} [truncated]"))
-        } else {
-            Some(compact)
-        }
+        render_operator_diagnostic(&text, self.truncated)
     }
 }
 
@@ -280,85 +266,6 @@ where
             truncated = true;
         }
     }
-}
-
-fn redact_diagnostic_text(text: &str) -> String {
-    text.lines()
-        .map(redact_diagnostic_line)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_diagnostic_line(line: &str) -> String {
-    let trimmed = line.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("authorization:") || lower.starts_with("cookie:") {
-        return "[redacted sensitive header]".to_string();
-    }
-    trimmed
-        .split_whitespace()
-        .map(redact_diagnostic_word)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_diagnostic_word(word: &str) -> String {
-    let mut redacted = word.to_string();
-    for key in SENSITIVE_DIAGNOSTIC_KEYS {
-        redacted = redact_sensitive_key_values(&redacted, key);
-    }
-    redacted
-}
-
-fn redact_sensitive_key_values(word: &str, key: &str) -> String {
-    let mut redacted = word.to_string();
-    let replacement = "[redacted]";
-    let mut search_start = 0;
-    loop {
-        let lower = redacted.to_ascii_lowercase();
-        let Some(relative_key_start) = lower[search_start..].find(key) else {
-            return redacted;
-        };
-        let after_key = search_start + relative_key_start + key.len();
-        let Some((value_start, value_end)) = sensitive_value_span(&redacted, after_key) else {
-            search_start = after_key;
-            continue;
-        };
-        redacted.replace_range(value_start..value_end, replacement);
-        search_start = value_start + replacement.len();
-    }
-}
-
-fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
-    index = skip_diagnostic_spacing_or_quotes(text, index);
-    let separator = text[index..].chars().next()?;
-    if separator != '=' && separator != ':' {
-        return None;
-    }
-    index += separator.len_utf8();
-    index = skip_diagnostic_spacing_or_quotes(text, index);
-    let start = index;
-    while index < text.len() {
-        let ch = text[index..].chars().next()?;
-        if ch.is_whitespace() || matches!(ch, '&' | ',' | ';' | '"' | '\'') {
-            break;
-        }
-        index += ch.len_utf8();
-    }
-    (start < index).then_some((start, index))
-}
-
-fn skip_diagnostic_spacing_or_quotes(text: &str, mut index: usize) -> usize {
-    while index < text.len() {
-        let Some(ch) = text[index..].chars().next() else {
-            return index;
-        };
-        if !(ch.is_whitespace() || matches!(ch, '"' | '\'')) {
-            return index;
-        }
-        index += ch.len_utf8();
-    }
-    index
 }
 
 impl fmt::Debug for TokenCommand {
