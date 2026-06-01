@@ -876,6 +876,9 @@ fn validate_setup_file_paths(
     if state_file == env_file {
         bail!("--state-file and --env-file must be different paths");
     }
+    if state_file.starts_with(&env_file) || env_file.starts_with(&state_file) {
+        bail!("--state-file and --env-file must not be nested under each other");
+    }
     if let Some(client_secret_json) = client_secret_json {
         let client_secret_json = fs::canonicalize(client_secret_json)
             .with_context(|| format!("failed to resolve {}", client_secret_json.display()))?;
@@ -2085,6 +2088,17 @@ mod tests {
         let err = resolve_setup(args).expect_err("env and state outputs must not overlap");
 
         assert!(err.to_string().contains("must be different paths"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_nested_output_paths() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.env_file = Some(PathBuf::from("./oauth-output/generated.env"));
+        args.state_file = Some(PathBuf::from("./oauth-output"));
+
+        let err = resolve_setup(args).expect_err("env and state outputs must not be nested");
+
+        assert!(err.to_string().contains("must not be nested"));
     }
 
     #[test]
