@@ -269,8 +269,9 @@ written by the harness after an unclean LionClaw exit. Per-source export/read
 failures are audited as `runtime.tui.reconcile_source_warning` and skipped, so
 one stale runtime thread cannot block valid completed turns from import.
 Enumeration failures are audited as source warnings when a previously linked
-continuation target can still be exported; otherwise they are audited as
-`runtime.tui.reconcile_error`.
+continuation target can still be exported, but fallback export of that saved
+target does not prove the current continuation source; otherwise they are
+audited as `runtime.tui.reconcile_error`.
 A clean native TUI exit clears LionClaw's dirty launch marker only when the
 adapter proves its chosen continuation source was reconciled; partial exports of
 that continuation source keep the marker dirty so the next native launch retries

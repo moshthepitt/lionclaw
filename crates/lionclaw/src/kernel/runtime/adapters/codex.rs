@@ -21,9 +21,8 @@ use crate::kernel::runtime::{
     RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
     RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
     RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptState,
-    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnMode, RuntimeTurnResult,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
 };
 
 use super::{
@@ -665,10 +664,7 @@ impl CodexRuntimeAdapter {
         Ok(RuntimeTerminalTranscript::new(
             turns,
             warnings,
-            RuntimeTerminalTranscriptState::new(
-                target.reconciled() && (source_selection_reconciled || !target.is_empty()),
-                target.resumable(),
-            ),
+            target.transcript_state(source_selection_reconciled),
         ))
     }
 
@@ -3737,7 +3733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_terminal_transcript_falls_back_to_saved_thread_when_listing_fails() {
+    async fn codex_list_failure_fallback_imports_without_reconciling() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
             start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
@@ -3789,8 +3785,8 @@ mod tests {
             .await
             .expect("transcript");
 
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(transcript.turns.len(), 1);
         assert_eq!(
             transcript.turns[0].source_id,
@@ -3812,7 +3808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_terminal_transcript_falls_back_to_saved_thread_when_listing_is_malformed() {
+    async fn codex_malformed_list_fallback_imports_without_reconciling() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let (adapter, _handle, thread_state) =
             start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
@@ -3858,8 +3854,8 @@ mod tests {
             .await
             .expect("transcript");
 
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(transcript.turns.len(), 1);
         assert_eq!(
             transcript.turns[0].source_id,

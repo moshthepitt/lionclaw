@@ -16,9 +16,8 @@ use crate::kernel::runtime::{
     RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
     RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
     RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptState,
-    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnInput, RuntimeTurnMode,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
 };
 
 use super::{
@@ -335,16 +334,17 @@ async fn export_opencode_terminal_transcript_with_cli(
     hard_timeout: std::time::Duration,
 ) -> Result<RuntimeTerminalTranscript> {
     let saved_session_id = load_saved_opencode_session_id(&input.runtime_state_root)?;
-    let (listed_sessions, mut warnings) = match timeout_at(
+    let (listed_sessions, source_selection_reconciled, mut warnings) = match timeout_at(
         deadline,
         executor.execute(build_opencode_session_list_program(config)),
     )
     .await
     {
         Ok(Ok(output)) if output.success() => match parse_opencode_session_list(&output.stdout) {
-            Ok(listed_sessions) => (listed_sessions, Vec::new()),
+            Ok(listed_sessions) => (listed_sessions, true, Vec::new()),
             Err(err) if saved_session_id.is_some() => (
                 OpenCodeListedSessions::default(),
+                false,
                 vec![RuntimeTerminalTranscriptWarning::new(
                     "opencode-session-list",
                     err.to_string(),
@@ -359,6 +359,7 @@ async fn export_opencode_terminal_transcript_with_cli(
             }
             (
                 OpenCodeListedSessions::default(),
+                false,
                 vec![RuntimeTerminalTranscriptWarning::new(
                     "opencode-session-list",
                     err.to_string(),
@@ -372,6 +373,7 @@ async fn export_opencode_terminal_transcript_with_cli(
             }
             (
                 OpenCodeListedSessions::default(),
+                false,
                 vec![RuntimeTerminalTranscriptWarning::new(
                     "opencode-session-list",
                     err.to_string(),
@@ -388,6 +390,7 @@ async fn export_opencode_terminal_transcript_with_cli(
             }
             (
                 OpenCodeListedSessions::default(),
+                false,
                 vec![RuntimeTerminalTranscriptWarning::new(
                     "opencode-session-list",
                     err.to_string(),
@@ -475,7 +478,7 @@ async fn export_opencode_terminal_transcript_with_cli(
     Ok(RuntimeTerminalTranscript::new(
         turns,
         warnings,
-        RuntimeTerminalTranscriptState::new(target.reconciled(), target.resumable()),
+        target.transcript_state(source_selection_reconciled),
     ))
 }
 
@@ -2481,7 +2484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_terminal_transcript_uses_saved_session_when_list_fails() {
+    async fn opencode_list_failure_fallback_imports_without_reconciling() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -2512,8 +2515,8 @@ mod tests {
             .expect("saved session fallback");
 
         assert_eq!(transcript.turns.len(), 1);
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
         assert!(
@@ -2528,7 +2531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_terminal_transcript_uses_saved_session_when_list_json_is_malformed() {
+    async fn opencode_malformed_list_fallback_imports_without_reconciling() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -2555,8 +2558,8 @@ mod tests {
             .expect("saved session fallback");
 
         assert_eq!(transcript.turns.len(), 1);
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
+        assert!(!transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
         assert_eq!(transcript.warnings.len(), 1);
         assert_eq!(transcript.warnings[0].source_id, "opencode-session-list");
         assert!(

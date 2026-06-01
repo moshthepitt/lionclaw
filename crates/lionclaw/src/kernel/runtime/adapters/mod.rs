@@ -5,6 +5,8 @@ mod state_file;
 
 use chrono::{DateTime, TimeZone, Utc};
 
+use super::RuntimeTerminalTranscriptState;
+
 pub use codex::{CodexRuntimeAdapter, CodexRuntimeConfig};
 pub use mock::MockRuntimeAdapter;
 pub use opencode::{OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
@@ -75,6 +77,16 @@ impl TerminalTranscriptTarget {
 
     fn reconciled(&self) -> bool {
         self.id.is_none() || self.reconciled
+    }
+
+    fn transcript_state(
+        &self,
+        source_selection_reconciled: bool,
+    ) -> RuntimeTerminalTranscriptState {
+        RuntimeTerminalTranscriptState::new(
+            source_selection_reconciled && self.reconciled(),
+            self.resumable(),
+        )
     }
 }
 
