@@ -723,7 +723,15 @@ fn opencode_assistant_status(info: &OpenCodeExportMessageInfo) -> RuntimeTermina
         };
     }
 
-    if info.finish.is_some() || info.time.completed.is_some() {
+    if let Some(finish) = opencode_assistant_finish(info) {
+        return if opencode_assistant_finish_is_final(finish) {
+            RuntimeTerminalTurnStatus::Completed
+        } else {
+            RuntimeTerminalTurnStatus::Interrupted
+        };
+    }
+
+    if info.time.completed.is_some() {
         RuntimeTerminalTurnStatus::Completed
     } else {
         RuntimeTerminalTurnStatus::Interrupted
@@ -743,15 +751,21 @@ fn opencode_resumable_message_pair(
         < opencode_raw_message_order(&latest_assistant.info)
         && latest_assistant.info.parent_id.as_deref() == Some(latest_user.info.id.as_str())
         && latest_assistant.info.error.is_none()
-        && latest_assistant
-            .info
-            .finish
-            .as_ref()
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|finish| !finish.is_empty())
-            .is_some_and(|finish| finish != "tool-calls"))
+        && opencode_assistant_finish(&latest_assistant.info)
+            .is_some_and(opencode_assistant_finish_is_final))
     .then_some((latest_user, latest_assistant))
+}
+
+fn opencode_assistant_finish(info: &OpenCodeExportMessageInfo) -> Option<&str> {
+    info.finish
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|finish| !finish.is_empty())
+}
+
+fn opencode_assistant_finish_is_final(finish: &str) -> bool {
+    !finish.eq_ignore_ascii_case("tool-calls") && !finish.eq_ignore_ascii_case("unknown")
 }
 
 fn opencode_latest_raw_message<'a>(
@@ -1139,7 +1153,8 @@ mod tests {
     use crate::kernel::runtime::{
         ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
         RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
+        RuntimeTurnMode,
     };
 
     use super::{
@@ -1993,6 +2008,61 @@ mod tests {
             transcript.turns[0].source_id,
             "opencode-export:ses_good:msg_user_1:msg_assistant_1"
         );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_marks_nonfinal_finish_interrupted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good"]),
+                opencode_export_output(
+                    "ses_good",
+                    vec![
+                        opencode_user_message("ses_good", "msg_user_1", "needs tool", 1_000),
+                        opencode_assistant_message(
+                            "ses_good",
+                            "msg_assistant_1",
+                            "msg_user_1",
+                            Some("checking"),
+                            2_000,
+                            Some(3_000),
+                            Some("tool-calls"),
+                        ),
+                        opencode_user_message("ses_good", "msg_user_2", "unknown finish", 4_000),
+                        opencode_assistant_message(
+                            "ses_good",
+                            "msg_assistant_2",
+                            "msg_user_2",
+                            Some("partial"),
+                            5_000,
+                            Some(6_000),
+                            Some("unknown"),
+                        ),
+                    ],
+                ),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 2);
+        assert!(transcript
+            .turns
+            .iter()
+            .all(|turn| turn.status == RuntimeTerminalTurnStatus::Interrupted));
         assert!(transcript.state.is_reconciled());
         assert!(!transcript.state.is_resumable());
         assert!(transcript.warnings.is_empty());

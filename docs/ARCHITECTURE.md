@@ -278,8 +278,9 @@ represented in LionClaw's canonical transcript. For Codex, the saved
 continuation thread must export cleanly far enough to prove its newest turn is
 explicitly completed, importable, and free of a non-null app-server error. For
 OpenCode, the linked continuation session must export cleanly and its raw
-message state must have a completed assistant answering the latest user message;
-older good sessions do not make the next `opencode run --session` safe.
+message state must have a final assistant finish reason answering the latest
+user message; older good sessions do not make the next `opencode run --session`
+safe.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
