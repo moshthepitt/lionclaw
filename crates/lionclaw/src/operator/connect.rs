@@ -468,6 +468,11 @@ fn prepare_connect_env_inputs(
     let env_file = channel_setup_env_file(home, channel_id);
     let state_dir = channel_setup_state_dir(home, channel_id);
     let setup_state = SetupStateRollback::capture(home, channel_id)?;
+    if let Err(err) =
+        remove_private_dir_all_if_exists(home, &state_dir, "channel setup state directory")
+    {
+        return Err(rollback_setup_state(home, setup_state, err));
+    }
     if let Err(err) = create_private_dir_all(home, &state_dir, "channel setup state directory") {
         return Err(rollback_setup_state(home, setup_state, err));
     }
@@ -2165,6 +2170,58 @@ exit 17
         assert!(!channel_setup_env_file(&home, "telegram").exists());
         assert!(!home.channel_env_path("telegram").exists());
         assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_setup_replaces_previous_setup_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let old_state_file = channel_setup_state_dir(&home, "telegram").join("gmail/old.json");
+        fs::create_dir_all(old_state_file.parent().expect("state parent")).expect("state dir");
+        fs::write(&old_state_file, "old-state\n").expect("old state");
+        let skill_source = temp_dir.path().join("telegram-setup-state-success");
+        write_channel_skill_with_setup_state(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        let outcome = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("connect with replacement setup state");
+
+        assert_eq!(outcome.channel_id, "telegram");
+        assert!(!old_state_file.exists());
+        assert_eq!(
+            fs::read_to_string(channel_setup_state_dir(&home, "telegram").join("gmail/new.json"))
+                .expect("new state"),
+            "new-state\n"
+        );
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("channel env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("setup-token")
+        );
+        assert!(!channel_setup_env_file(&home, "telegram").exists());
     }
 
     #[cfg(unix)]

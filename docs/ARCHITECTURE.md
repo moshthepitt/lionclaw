@@ -999,7 +999,9 @@ manually by the operator.
   terminal, and temp-dir behavior; they do not inherit arbitrary shell secrets
   from the operator process, run with the installed channel skill directory as
   their working directory, and should not move generated credentials outside the
-  managed paths.
+  managed paths. When setup runs, LionClaw backs up previous managed setup
+  state, gives the helper a fresh managed state directory, and restores the
+  previous state if setup or later channel startup fails.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally

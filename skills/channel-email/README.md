@@ -220,9 +220,10 @@ client ids and IMAP/SMTP hosts must be non-empty plain values, and
 `--auth-results-host` must be an Authentication-Results authserv-id rather than
 a full header value.
 
-To replace existing OAuth state for the same provider/account, pass `--force`
-after the provider profile. For direct helper use outside `connect`, the same
-implementation remains available:
+Re-running `connect email <provider>` replaces LionClaw-managed OAuth state
+transactionally: the previous state is restored if setup or worker startup
+fails. For direct helper use outside `connect`, the same implementation remains
+available; pass `--force` when replacing existing direct-helper output files:
 
 ```bash
 EMAIL_CHANNEL_BIN="${EMAIL_CHANNEL_BIN:-$(command -v lionclaw-channel-email)}"
