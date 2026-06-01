@@ -7,9 +7,15 @@ const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
     "refresh_token",
     "id_token",
     "client_secret",
+    "code_verifier",
     "password",
 ];
-const SENSITIVE_HEADER_NAMES: &[&str] = &["authorization", "cookie", "set-cookie"];
+const SENSITIVE_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
 
 pub(crate) fn render_operator_error(err: &Error) -> String {
     render_operator_diagnostic(&format!("{err:#}"), false)
@@ -45,20 +51,35 @@ fn sanitize_diagnostic_text(raw: &str) -> String {
 
 fn redact_sensitive_header_line(line: &str) -> String {
     let trimmed = line.trim();
-    for name in SENSITIVE_HEADER_NAMES {
-        if starts_with_header_name(trimmed, name) {
-            return "[redacted sensitive header]".to_string();
-        }
+    if contains_sensitive_header(trimmed) {
+        return "[redacted sensitive header]".to_string();
     }
     trimmed.to_string()
 }
 
-fn starts_with_header_name(line: &str, name: &str) -> bool {
+fn contains_sensitive_header(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix(name) else {
-        return false;
-    };
-    rest.trim_start().starts_with(':')
+    SENSITIVE_HEADER_NAMES
+        .iter()
+        .any(|name| contains_header_name(&lower, name))
+}
+
+fn contains_header_name(line: &str, name: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_start) = line[search_start..].find(name) {
+        let start = search_start + relative_start;
+        let after_name = start + name.len();
+        let starts_at_boundary = start == 0 || !is_header_name_byte(line.as_bytes()[start - 1]);
+        if starts_at_boundary && line[after_name..].trim_start().starts_with(':') {
+            return true;
+        }
+        search_start = after_name;
+    }
+    false
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
 fn redact_sensitive_key_values(text: &str, key: &str) -> String {
@@ -87,11 +108,46 @@ fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> 
         return None;
     }
     index += separator.len_utf8();
-    index = skip_diagnostic_spacing_or_quotes(text, index);
+    index = skip_diagnostic_spacing(text, index);
+    if let Some(quote) = text[index..]
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\''))
+    {
+        return quoted_sensitive_value_span(text, index, quote);
+    }
     let start = index;
     while index < text.len() {
         let ch = text[index..].chars().next()?;
         if ch.is_whitespace() || matches!(ch, '&' | ',' | ';' | '"' | '\'') {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    (start < index).then_some((start, index))
+}
+
+fn quoted_sensitive_value_span(
+    text: &str,
+    mut index: usize,
+    quote: char,
+) -> Option<(usize, usize)> {
+    index += quote.len_utf8();
+    let start = index;
+    let mut escaped = false;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if escaped {
+            escaped = false;
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == quote {
             break;
         }
         index += ch.len_utf8();
@@ -105,6 +161,19 @@ fn skip_diagnostic_spacing_or_quotes(text: &str, mut index: usize) -> usize {
             return index;
         };
         if !(ch.is_whitespace() || matches!(ch, '"' | '\'')) {
+            return index;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn skip_diagnostic_spacing(text: &str, mut index: usize) -> usize {
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            return index;
+        };
+        if !ch.is_whitespace() {
             return index;
         }
         index += ch.len_utf8();
@@ -133,7 +202,7 @@ mod tests {
     #[test]
     fn diagnostics_redact_spaced_secret_assignments() {
         let rendered = render_operator_diagnostic(
-            "invalid_grant refresh_token : secret-refresh client_secret = secret-client",
+            "invalid_grant refresh_token : secret-refresh client_secret = secret-client code_verifier=secret-verifier",
             false,
         )
         .expect("diagnostic");
@@ -142,6 +211,7 @@ mod tests {
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("secret-refresh"));
         assert!(!rendered.contains("secret-client"));
+        assert!(!rendered.contains("secret-verifier"));
     }
 
     #[test]
@@ -163,6 +233,22 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_redact_quoted_sensitive_values_with_spaces() {
+        let rendered = render_operator_diagnostic(
+            r#"password: "secret password with spaces" client_secret='client secret with spaces'"#,
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            r#"password: "[redacted]" client_secret='[redacted]'"#
+        );
+        assert!(!rendered.contains("secret password"));
+        assert!(!rendered.contains("client secret"));
+    }
+
+    #[test]
     fn diagnostics_redact_sensitive_headers_and_truncate() {
         let rendered = render_operator_diagnostic(
             &format!("Authorization : Bearer secret-token\n{}", "x".repeat(600)),
@@ -174,6 +260,22 @@ mod tests {
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.chars().count() <= OPERATOR_DIAGNOSTIC_MAX_CHARS);
         assert!(!rendered.contains("secret-token"));
+    }
+
+    #[test]
+    fn diagnostics_redact_prefixed_sensitive_headers() {
+        let rendered = render_operator_diagnostic(
+            "> Authorization: Bearer secret-token\nDEBUG Proxy-Authorization : Basic secret-proxy",
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "[redacted sensitive header] [redacted sensitive header]"
+        );
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("secret-proxy"));
     }
 
     #[test]
