@@ -5,7 +5,6 @@ id = "email"
 launch = "background"
 worker = "scripts/worker"
 env = [
-  "EMAIL_AUTH_MODE",
   "EMAIL_IMAP_HOST",
   "EMAIL_IMAP_USERNAME",
   "EMAIL_SMTP_HOST",
@@ -16,6 +15,7 @@ env = [
 
 optional_env = [
   "EMAIL_ADMIN_DIGEST_TO",
+  "EMAIL_AUTH_MODE",
   "EMAIL_DIGEST_INTERVAL_MS",
   "EMAIL_FETCH_LIMIT",
   "EMAIL_FROM_NAME",

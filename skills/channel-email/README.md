@@ -116,9 +116,9 @@ EOF
 "$LIONCLAW_BIN" doctor
 ```
 
-`EMAIL_AUTH_MODE=basic` is explicit for new configs; existing basic-auth
-channel env from older installs that lacks `EMAIL_AUTH_MODE` is still treated
-as basic by the worker.
+`EMAIL_AUTH_MODE=basic` is explicit for new configs, but the worker treats a
+missing mode as basic so existing basic-auth channel env and old env files keep
+working.
 
 ### OAuth2 / XOAUTH2
 

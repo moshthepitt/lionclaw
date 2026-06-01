@@ -694,6 +694,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bundled_email_auth_mode_is_optional_for_basic_compatibility() {
+        let metadata =
+            load_channel_metadata(&bundled_channel_skill_dir("email")).expect("email metadata");
+
+        assert!(!metadata.env.iter().any(|key| key == "EMAIL_AUTH_MODE"));
+        assert!(metadata
+            .optional_env
+            .iter()
+            .any(|key| key == "EMAIL_AUTH_MODE"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn parses_setup_metadata_without_requiring_source_command_file() {
