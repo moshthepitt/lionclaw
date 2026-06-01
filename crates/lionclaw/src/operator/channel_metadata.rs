@@ -8,7 +8,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::{
-    home::LionClawHome, kernel::skills::validate_skill_alias, operator::config::ChannelLaunchMode,
+    home::LionClawHome,
+    kernel::skills::validate_skill_alias,
+    operator::{config::ChannelLaunchMode, snapshot::installed_snapshot_matches_source},
 };
 
 pub const CHANNEL_METADATA_FILE: &str = "lionclaw.toml";
@@ -105,17 +107,22 @@ pub fn discover_channel_skill(home: &LionClawHome, raw: &str) -> Result<Discover
     }
 
     validate_channel_id(raw)?;
-    if let Some(bundled) = discover_bundled_channel_skill(raw)? {
-        return Ok(bundled);
+    let installed = discover_installed_channel_skill(home, raw)?;
+    let bundled = discover_bundled_channel_skill(raw)?;
+    match (installed, bundled) {
+        (Some(installed), Some(bundled)) => {
+            if installed_channel_is_refreshable_bundled_snapshot(raw, &installed, &bundled)? {
+                Ok(bundled)
+            } else {
+                Ok(installed)
+            }
+        }
+        (Some(installed), _) => Ok(installed),
+        (None, Some(bundled)) => Ok(bundled),
+        (None, None) => bail!(
+            "channel '{raw}' was not found; pass an explicit skill path or install a skill with matching channel metadata"
+        ),
     }
-
-    if let Some(installed) = discover_installed_channel_skill(home, raw)? {
-        return Ok(installed);
-    }
-
-    bail!(
-        "channel '{raw}' was not found; pass an explicit skill path or install a skill with matching channel metadata"
-    )
 }
 
 pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
@@ -428,6 +435,36 @@ fn discover_bundled_channel_skill(channel_id: &str) -> Result<Option<DiscoveredC
     }))
 }
 
+fn installed_channel_is_refreshable_bundled_snapshot(
+    channel_id: &str,
+    installed: &DiscoveredChannelSkill,
+    bundled: &DiscoveredChannelSkill,
+) -> Result<bool> {
+    let ChannelSkillSource::Installed { alias } = &installed.source else {
+        return Ok(false);
+    };
+
+    installed_channel_snapshot_is_from_bundled_source(
+        alias,
+        channel_id,
+        &installed.skill_dir,
+        &bundled.skill_dir,
+    )
+    .with_context(|| format!("failed to verify installed channel skill '{alias}' source metadata"))
+}
+
+pub(crate) fn installed_channel_snapshot_is_from_bundled_source(
+    alias: &str,
+    channel_id: &str,
+    snapshot_dir: &Path,
+    bundled_skill_dir: &Path,
+) -> Result<bool> {
+    if alias != channel_id {
+        return Ok(false);
+    }
+    installed_snapshot_matches_source(snapshot_dir, bundled_skill_dir)
+}
+
 fn canonical_skill_dir(path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat skill directory {}", path.display()))?;
@@ -584,11 +621,14 @@ mod tests {
     use std::fs;
 
     use super::{
-        bundled_channel_skill_dir_from_exe, discover_channel_skill, load_channel_metadata,
-        render_contact_template, resolve_channel_setup_command_entrypoint,
+        bundled_channel_skill_dir, bundled_channel_skill_dir_from_exe, discover_channel_skill,
+        load_channel_metadata, render_contact_template, resolve_channel_setup_command_entrypoint,
         validate_channel_env_name, ChannelSkillSource,
     };
-    use crate::{home::LionClawHome, operator::snapshot::copy_snapshot_tree};
+    use crate::{
+        home::LionClawHome,
+        operator::snapshot::{copy_snapshot_tree, install_snapshot},
+    };
 
     #[cfg(unix)]
     fn make_executable(path: &std::path::Path) {
@@ -877,17 +917,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discovery_prefers_bundled_channel_over_stale_installed_snapshot() {
+    fn discovery_refreshes_prior_bundled_channel_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         fs::create_dir_all(home.skills_dir()).expect("skills");
-        let stale = write_channel_skill(temp_dir.path(), "stale-telegram", "telegram");
-        copy_snapshot_tree(&stale, &home.skills_dir().join("telegram")).expect("stale install");
+        let bundled = bundled_channel_skill_dir("telegram");
+        install_snapshot(
+            &home,
+            "telegram",
+            bundled.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("install bundled snapshot");
+        fs::write(
+            home.skills_dir().join("telegram/SKILL.md"),
+            "---\nname: channel-telegram\ndescription: old\n---\nold snapshot\n",
+        )
+        .expect("stale skill");
+        fs::remove_file(home.skills_dir().join("telegram/lionclaw.toml"))
+            .expect("remove stale metadata");
 
         let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
 
         assert_eq!(discovered.source, ChannelSkillSource::Bundled);
         assert_eq!(discovered.metadata.id, "telegram");
         assert!(discovered.skill_dir.ends_with("skills/channel-telegram"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_preserves_external_channel_snapshot_over_bundled_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let external = write_channel_skill(temp_dir.path(), "external-telegram", "telegram");
+        copy_snapshot_tree(&external, &home.skills_dir().join("telegram")).expect("install");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(
+            discovered.source,
+            ChannelSkillSource::Installed {
+                alias: "telegram".to_string()
+            }
+        );
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert_eq!(
+            discovered.skill_dir,
+            fs::canonicalize(home.skills_dir().join("telegram")).expect("installed path")
+        );
     }
 }

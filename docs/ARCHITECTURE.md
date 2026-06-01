@@ -991,10 +991,10 @@ manually by the operator.
 - Setup hooks are channel-owned commands declared under `[channel.setup]`.
   `lionclaw connect <channel> <profile> ...` and helper-style flags such as
   `lionclaw connect <channel> --provider gmail ...` pass setup arguments to
-  that command after installing or refreshing the bundled channel snapshot, or
-  selecting an installed external channel snapshot, and validate the generated
-  env through the same declared-env contract as `--env-file`. Core does not
-  contain provider-specific channel setup logic.
+  that command after installing or refreshing a prior bundled channel snapshot,
+  or selecting an installed external channel snapshot, and validate the
+  generated env through the same declared-env contract as `--env-file`. Core
+  does not contain provider-specific channel setup logic.
   Helpers launched by `connect` receive absolute LionClaw-managed setup env
   and state paths plus a small ambient allowlist for browser, proxy, locale,
   certificate, terminal, and temp-dir behavior; they do not inherit arbitrary

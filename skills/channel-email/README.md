@@ -121,9 +121,10 @@ EOF
 For providers that require OAuth, use the provider profile on `connect`
 (`connect email gmail`) or pass the helper's provider flag
 (`connect email --provider gmail`).
-LionClaw installs the bundled email channel snapshot, runs the channel's setup
-helper from that snapshot, stores the generated channel env in the selected
-instance home, and starts the background worker. The generated env points
+LionClaw installs or refreshes the bundled email channel snapshot, runs the
+channel's setup helper from that snapshot, stores the generated channel env in
+the selected instance home, and starts the background worker. The generated env
+points
 `EMAIL_XOAUTH2_TOKEN_CMD` back to `lionclaw-channel-email oauth2 token`, so the
 worker refreshes access tokens through the same packaged channel binary.
 The setup helper receives only LionClaw's absolute managed setup paths plus a
@@ -256,9 +257,9 @@ authserv-id that can be supplied by external senders.
 default for port 465. Use `insecure` only for loopback or private test relays;
 production mailbox providers should use `starttls` or `implicit`.
 
-`connect email` installs the bundled channel snapshot, stores declared channel
-env in the selected instance home, starts the background stack, and leaves
-mailbox secrets out of runtime skill projection.
+`connect email` installs or refreshes the bundled channel snapshot, stores
+declared channel env in the selected instance home, starts the background stack,
+and leaves mailbox secrets out of runtime skill projection.
 
 ## Manual QA
 
