@@ -115,7 +115,7 @@ impl TeamLocalWorker {
     }
 
     async fn report_health(&self, discovery: &ProjectDiscovery, worker_id: &str) {
-        let _ = self
+        if let Err(err) = self
             .local_api
             .report_health(
                 &self.config.channel_id,
@@ -129,7 +129,9 @@ impl TeamLocalWorker {
                 }),
             )
             .await
-            .inspect_err(|err| warn!(error = %err, "failed to report team-local health"));
+        {
+            warn!(error = %err, "failed to report team-local health");
+        }
     }
 
     async fn deliver(

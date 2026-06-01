@@ -23,7 +23,6 @@
         clippy::significant_drop_in_scrutinee,
         clippy::significant_drop_tightening,
         clippy::uninlined_format_args,
-        clippy::unnecessary_sort_by,
         clippy::unused_result_ok,
         clippy::unwrap_in_result,
         clippy::unwrap_used,
