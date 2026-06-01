@@ -834,6 +834,12 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         args.auth_params,
     )?;
 
+    let callback_host = normalize_callback_host(
+        args.callback_host
+            .as_deref()
+            .unwrap_or_else(|| default_callback_host(args.provider)),
+    )?;
+
     Ok(ResolvedSetup {
         provider: args.provider,
         account,
@@ -853,10 +859,7 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
         admin_to,
         state_file,
         env_file,
-        callback_host: args.callback_host.unwrap_or_else(|| match args.provider {
-            Oauth2Provider::Microsoft365 => "localhost".to_string(),
-            Oauth2Provider::Gmail | Oauth2Provider::Generic => "127.0.0.1".to_string(),
-        }),
+        callback_host,
         callback_port: args.callback_port,
         no_browser: args.no_browser,
         force: args.force,
@@ -1149,11 +1152,24 @@ fn uuid_token_part() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-async fn bind_callback_listener(host: &str, port: u16) -> Result<TcpListener> {
+fn default_callback_host(provider: Oauth2Provider) -> &'static str {
+    match provider {
+        Oauth2Provider::Microsoft365 => "localhost",
+        Oauth2Provider::Gmail | Oauth2Provider::Generic => "127.0.0.1",
+    }
+}
+
+fn normalize_callback_host(host: &str) -> Result<String> {
+    let host = host.trim();
     if host != "127.0.0.1" && host != "localhost" {
         bail!("--host must be 127.0.0.1 or localhost");
     }
-    TcpListener::bind((host, port))
+    Ok(host.to_string())
+}
+
+async fn bind_callback_listener(host: &str, port: u16) -> Result<TcpListener> {
+    let host = normalize_callback_host(host)?;
+    TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("failed to bind OAuth2 callback listener on {host}:{port}"))
 }
@@ -1583,7 +1599,9 @@ fn oauth_endpoint_for_diagnostic(url: &reqwest::Url) -> String {
 }
 
 fn expires_at(expires_in: Option<i64>) -> Option<DateTime<Utc>> {
-    expires_in.and_then(|seconds| Utc::now().checked_add_signed(TimeDelta::seconds(seconds)))
+    expires_in
+        .and_then(TimeDelta::try_seconds)
+        .and_then(|delta| Utc::now().checked_add_signed(delta))
 }
 
 fn cached_access_token(state: &StoredOAuth2State) -> Result<Option<String>> {
@@ -2181,6 +2199,33 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_rejects_invalid_callback_host_during_resolution() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.callback_host = Some("0.0.0.0".to_string());
+
+        let err = resolve_setup(args).expect_err("invalid callback host should fail");
+
+        assert!(err.to_string().contains("--host"));
+    }
+
+    #[tokio::test]
+    async fn oauth2_setup_rejects_invalid_callback_host_before_creating_outputs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.callback_host = Some("0.0.0.0".to_string());
+        args.state_file = Some(temp_dir.path().join("state/oauth.json"));
+        args.env_file = Some(temp_dir.path().join("env/email.env"));
+
+        let err = run_setup(args)
+            .await
+            .expect_err("invalid callback host should fail");
+
+        assert!(err.to_string().contains("--host"));
+        assert!(!temp_dir.path().join("state").exists());
+        assert!(!temp_dir.path().join("env").exists());
+    }
+
+    #[test]
     fn oauth_endpoint_diagnostic_strips_query_values() {
         let url = validate_oauth_endpoint(
             "--token-url",
@@ -2728,6 +2773,13 @@ mod tests {
             let _ = self;
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn expires_at_treats_out_of_range_provider_values_as_uncacheable() {
+        assert!(expires_at(Some(3600)).is_some());
+        assert!(expires_at(Some(i64::MAX)).is_none());
+        assert!(expires_at(Some(i64::MIN)).is_none());
     }
 
     #[test]
