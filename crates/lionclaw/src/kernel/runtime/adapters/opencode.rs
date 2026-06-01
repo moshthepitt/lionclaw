@@ -775,7 +775,7 @@ fn opencode_assistant_finish(info: &OpenCodeExportMessageInfo) -> Option<&str> {
 }
 
 fn opencode_assistant_finish_is_final(finish: &str) -> bool {
-    !finish.eq_ignore_ascii_case("tool-calls") && !finish.eq_ignore_ascii_case("unknown")
+    !finish.eq_ignore_ascii_case("tool-calls")
 }
 
 fn opencode_assistant_has_pending_tool_followup(message: &OpenCodeExportMessage) -> bool {
@@ -2083,7 +2083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opencode_terminal_transcript_marks_nonfinal_finish_interrupted() {
+    async fn opencode_terminal_transcript_marks_tool_call_finish_interrupted() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let mut executor = FakeTranscriptExecutor {
@@ -2102,14 +2102,49 @@ mod tests {
                             Some(3_000),
                             Some("tool-calls"),
                         ),
-                        opencode_user_message("ses_good", "msg_user_2", "unknown finish", 4_000),
+                    ],
+                ),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].status,
+            RuntimeTerminalTurnStatus::Interrupted
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_treats_unknown_finish_as_final() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good"]),
+                opencode_export_output(
+                    "ses_good",
+                    vec![
+                        opencode_user_message("ses_good", "msg_user", "hello", 1_000),
                         opencode_assistant_message(
                             "ses_good",
-                            "msg_assistant_2",
-                            "msg_user_2",
-                            Some("partial"),
-                            5_000,
-                            Some(6_000),
+                            "msg_assistant",
+                            "msg_user",
+                            Some("answer"),
+                            2_000,
+                            Some(3_000),
                             Some("unknown"),
                         ),
                     ],
@@ -2127,13 +2162,13 @@ mod tests {
             .await
             .expect("export transcript");
 
-        assert_eq!(transcript.turns.len(), 2);
-        assert!(transcript
-            .turns
-            .iter()
-            .all(|turn| turn.status == RuntimeTerminalTurnStatus::Interrupted));
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].status,
+            RuntimeTerminalTurnStatus::Completed
+        );
         assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
+        assert!(transcript.state.is_resumable());
         assert!(transcript.warnings.is_empty());
     }
 
