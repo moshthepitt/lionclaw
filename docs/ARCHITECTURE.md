@@ -994,14 +994,15 @@ manually by the operator.
   that command after installing/selecting the channel snapshot, and validate the
   generated env through the same declared-env contract as `--env-file`. Core
   does not contain provider-specific channel setup logic.
-  Helpers launched by `connect` receive LionClaw-managed setup env and state
-  paths plus a small ambient allowlist for browser, proxy, locale, certificate,
-  terminal, and temp-dir behavior; they do not inherit arbitrary shell secrets
-  from the operator process, run with the installed channel skill directory as
-  their working directory, and should not move generated credentials outside the
-  managed paths. When setup runs, LionClaw backs up previous managed setup
-  state, gives the helper a fresh managed state directory, and restores the
-  previous state if setup or later channel startup fails.
+  Helpers launched by `connect` receive absolute LionClaw-managed setup env
+  and state paths plus a small ambient allowlist for browser, proxy, locale,
+  certificate, terminal, and temp-dir behavior; they do not inherit arbitrary
+  shell secrets from the operator process, run with the installed channel skill
+  directory as their working directory, and should not move generated
+  credentials outside the managed paths. When setup runs, LionClaw backs up
+  previous managed setup state, gives the helper a fresh managed state
+  directory, and restores the previous state if setup or later channel startup
+  fails.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally

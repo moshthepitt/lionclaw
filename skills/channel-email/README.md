@@ -126,9 +126,9 @@ helper from that snapshot, stores the generated channel env in the selected
 instance home, and starts the background worker. The generated env points
 `EMAIL_XOAUTH2_TOKEN_CMD` back to `lionclaw-channel-email oauth2 token`, so the
 worker refreshes access tokens through the same packaged channel binary.
-The setup helper receives only LionClaw's managed setup paths plus a small
-ambient allowlist for browser, proxy, locale, certificate, terminal, and temp
-directory behavior; arbitrary shell secrets are not inherited.
+The setup helper receives only LionClaw's absolute managed setup paths plus a
+small ambient allowlist for browser, proxy, locale, certificate, terminal, and
+temp directory behavior; arbitrary shell secrets are not inherited.
 `EMAIL_AUTH_MODE` selects which credential family the worker uses, and OAuth
 setup clears stale basic password values and omitted admin digest recipients
 when replacing an older configuration.

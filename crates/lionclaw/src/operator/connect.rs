@@ -640,6 +640,9 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
         state_dir,
     } = request;
     let command = resolve_channel_setup_command_entrypoint(skill_dir, setup)?;
+    let home_root = absolute_setup_env_path(&home.root(), "LionClaw home")?;
+    let env_file = absolute_setup_env_path(env_file, "channel setup env file")?;
+    let state_dir = absolute_setup_env_path(state_dir, "channel setup state directory")?;
     let mut process = Command::new(&command);
     process.args(&setup.args);
     if let Some(profile) = setup_profile {
@@ -650,7 +653,7 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
         .current_dir(skill_dir)
         .env_clear()
         .envs(channel_setup_ambient_env())
-        .env("LIONCLAW_HOME", home.root())
+        .env("LIONCLAW_HOME", home_root)
         .env("LIONCLAW_CHANNEL_ID", channel_id)
         .env("LIONCLAW_CHANNEL_SETUP_ENV_FILE", env_file)
         .env("LIONCLAW_CHANNEL_SETUP_STATE_DIR", state_dir)
@@ -670,6 +673,15 @@ fn run_channel_setup_command(request: ChannelSetupRunRequest<'_>) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn absolute_setup_env_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let current_dir = std::env::current_dir()
+        .with_context(|| format!("failed to resolve current directory for {label}"))?;
+    Ok(current_dir.join(path))
 }
 
 fn channel_setup_ambient_env() -> Vec<(&'static str, OsString)> {
@@ -1236,22 +1248,22 @@ mod tests {
         fs,
         io::Cursor,
         net::TcpListener,
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Mutex, MutexGuard},
     };
 
     use super::{
         channel_setup_env_file, channel_setup_state_dir, connect_channel_with_binaries,
         copy_regular_tree_for_rollback, ensure_required_env, prepare_connect_env_inputs,
-        ConnectAction, ConnectChannelRequest, ConnectEnvInputs, PrepareConnectEnvRequest,
-        RequiredEnvRequest,
+        run_channel_setup_command, ChannelSetupRunRequest, ConnectAction, ConnectChannelRequest,
+        ConnectEnvInputs, PrepareConnectEnvRequest, RequiredEnvRequest,
     };
     use crate::{
         home::LionClawHome,
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
-            channel_metadata::discover_channel_skill,
+            channel_metadata::{discover_channel_skill, ChannelSetupMetadata},
             config::{
                 ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
                 RuntimeProfileConfig,
@@ -1997,6 +2009,51 @@ exit 17
             .cleanup_generated_env(&home)
             .expect("cleanup setup env");
         prepared.commit(&home).expect("commit setup state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_hook_receives_absolute_contract_paths_with_relative_home() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill_source = temp_dir.path().join("telegram-relative-home-setup");
+        fs::create_dir_all(skill_source.join("scripts")).expect("setup scripts dir");
+        write_executable(
+            skill_source.join("scripts/setup").as_path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+test "${LIONCLAW_HOME:-}" = "${1:?}"
+test "${LIONCLAW_CHANNEL_SETUP_ENV_FILE:-}" = "${2:?}"
+test "${LIONCLAW_CHANNEL_SETUP_STATE_DIR:-}" = "${3:?}"
+case "$LIONCLAW_HOME" in /*) ;; *) exit 44;; esac
+case "$LIONCLAW_CHANNEL_SETUP_ENV_FILE" in /*) ;; *) exit 45;; esac
+case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
+"#,
+        );
+        let home = LionClawHome::new(PathBuf::from(".relative-lionclaw-home"));
+        let env_file = channel_setup_env_file(&home, "telegram");
+        let state_dir = channel_setup_state_dir(&home, "telegram");
+        let current_dir = env::current_dir().expect("current dir");
+        let setup_args = vec![
+            current_dir.join(home.root()).display().to_string(),
+            current_dir.join(&env_file).display().to_string(),
+            current_dir.join(&state_dir).display().to_string(),
+        ];
+        let setup = ChannelSetupMetadata {
+            command: "scripts/setup".to_string(),
+            args: Vec::new(),
+        };
+
+        run_channel_setup_command(ChannelSetupRunRequest {
+            skill_dir: &skill_source,
+            setup: &setup,
+            home: &home,
+            channel_id: "telegram",
+            setup_profile: None,
+            setup_args: &setup_args,
+            env_file: &env_file,
+            state_dir: &state_dir,
+        })
+        .expect("setup command receives absolute paths");
     }
 
     #[cfg(unix)]
