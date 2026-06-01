@@ -147,9 +147,16 @@ mounts, secrets, auth materialization, audit, and persistence.
 Runtime context may include host projections for runtime-visible paths. A
 directory projection maps a runtime tree such as `/runtime` to the runtime state
 root. An exact projection maps one runtime path, such as the channel-send Unix
-socket, to one host path and intentionally blocks descendants. Shared helpers in
-`lionclaw-runtime-api` normalize relative runtime paths and reject parent
-traversal before adapters turn runtime protocol fields into host paths.
+socket, to one host path and intentionally blocks descendants. Projection fields
+are private; constructors validate absolute runtime and host paths before the
+kernel exposes them to adapters. Shared helpers in `lionclaw-runtime-api`
+normalize relative runtime paths and reject parent traversal before adapters
+turn runtime protocol fields into host paths.
+
+Native terminal resume readiness is a typed adapter input, not a raw boolean.
+The only positive `RuntimeSessionReady` value is derived from the hardened
+LionClaw ready-marker check in `lionclaw-runtime-api`; adapters use it only to
+gate loading runtime-private continuation state.
 
 ## Program-Backed Runtime Flow
 

@@ -48,8 +48,8 @@ use lionclaw_runtime_api::{
     normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
     RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
     RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
@@ -907,7 +907,7 @@ fn load_saved_opencode_session_id(root: &Path) -> Result<Option<String>> {
 
 fn load_ready_opencode_session_id(
     root: &Path,
-    runtime_session_ready: bool,
+    runtime_session_ready: RuntimeSessionReady,
 ) -> Result<Option<String>> {
     load_ready_state_value(
         root,
@@ -1229,14 +1229,19 @@ fn collect_texts(value: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, future::pending, path::PathBuf, time::Duration};
+    use std::{
+        collections::VecDeque,
+        future::pending,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use lionclaw_runtime_api::{
         ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent, RuntimeExecutionContext,
-        RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionStartInput,
+        RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionReady, RuntimeSessionStartInput,
         RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
-        RuntimeTurnMode,
+        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
@@ -1254,6 +1259,20 @@ mod tests {
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
         }
+    }
+
+    fn runtime_not_ready() -> RuntimeSessionReady {
+        RuntimeSessionReady::not_ready()
+    }
+
+    fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
+        std::fs::write(
+            runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write runtime ready marker");
+        RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+            .expect("runtime ready marker should be valid")
     }
 
     #[derive(Debug)]
@@ -1541,7 +1560,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
-                runtime_session_ready: false,
+                runtime_session_ready: runtime_not_ready(),
             })
             .await
             .expect("start");
@@ -1590,7 +1609,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root.clone()),
-                runtime_session_ready: false,
+                runtime_session_ready: runtime_not_ready(),
             })
             .await
             .expect("start");
@@ -1644,6 +1663,7 @@ mod tests {
         )
         .expect("write session id");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -1652,7 +1672,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .await
             .expect("start");
@@ -1698,7 +1718,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: false,
+                runtime_session_ready: runtime_not_ready(),
             })
             .expect("program");
 
@@ -1728,12 +1748,13 @@ mod tests {
         )
         .expect("write session id");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .expect("program");
 
@@ -1759,7 +1780,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: false,
+                runtime_session_ready: runtime_not_ready(),
             })
             .expect("program");
 
@@ -1781,12 +1802,13 @@ mod tests {
         )
         .expect("symlink session state");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let err = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .expect_err("symlinked session state should be rejected");
 

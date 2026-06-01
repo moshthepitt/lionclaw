@@ -53,11 +53,12 @@ use lionclaw_runtime_api::{
     RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome,
     RuntimeEvent, RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus,
     RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
-    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
+    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+    RuntimeTurnMode, RuntimeTurnResult, TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptTimestampPrecision,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
@@ -2836,7 +2837,10 @@ fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
     load_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
 }
 
-fn load_ready_saved_thread_id(root: &Path, runtime_session_ready: bool) -> Result<Option<String>> {
+fn load_ready_saved_thread_id(
+    root: &Path,
+    runtime_session_ready: RuntimeSessionReady,
+) -> Result<Option<String>> {
     load_ready_state_value(
         root,
         CODEX_THREAD_ID_STATE_FILE,
@@ -3006,18 +3010,33 @@ mod tests {
         RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
         RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
         RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
+        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
+        RUNTIME_SESSION_READY_MARKER,
     };
     use serde_json::{json, Value};
     use tokio::time::Instant;
+    use uuid::Uuid;
 
     use super::{
         build_codex_app_server_program, build_codex_terminal_program, load_saved_thread_id,
         save_thread_id, AppServerTransport, CodexAppServerClient, CodexRuntimeAdapter,
         CodexRuntimeConfig, CodexTerminalTranscriptExportRequest, CODEX_THREAD_ID_STATE_FILE,
     };
-    use uuid::Uuid;
+
+    fn runtime_not_ready() -> RuntimeSessionReady {
+        RuntimeSessionReady::not_ready()
+    }
+
+    fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
+        std::fs::write(
+            runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write runtime ready marker");
+        RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+            .expect("runtime ready marker should be valid")
+    }
 
     #[derive(Clone)]
     struct FakeAppServerTransport {
@@ -3097,7 +3116,7 @@ mod tests {
         super::CodexThreadState,
     ) {
         let adapter = CodexRuntimeAdapter::new(config);
-        let runtime_session_ready = false;
+        let runtime_session_ready = runtime_not_ready();
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -3326,11 +3345,12 @@ mod tests {
             executable: "codex".to_string(),
             model: Some("gpt-5.5".to_string()),
         });
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .expect("terminal program");
 
@@ -3495,7 +3515,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready: false,
+                runtime_session_ready: runtime_not_ready(),
             })
             .expect("terminal program");
 
@@ -5794,6 +5814,7 @@ mod tests {
             .expect("create symlink");
 
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
         let err = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -5801,7 +5822,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .await
             .expect_err("symlinked thread state should fail");
@@ -5821,6 +5842,8 @@ mod tests {
             .expect("write thread b");
 
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let runtime_a_ready = mark_runtime_ready(&runtime_a);
+        let runtime_b_ready = mark_runtime_ready(&runtime_b);
         let handle_a = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -5828,7 +5851,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_a),
-                runtime_session_ready: true,
+                runtime_session_ready: runtime_a_ready,
             })
             .await
             .expect("start a");
@@ -5839,7 +5862,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_b),
-                runtime_session_ready: true,
+                runtime_session_ready: runtime_b_ready,
             })
             .await
             .expect("start b");
@@ -5869,6 +5892,7 @@ mod tests {
         super::CodexThreadState,
     ) {
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -5876,7 +5900,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
-                runtime_session_ready: true,
+                runtime_session_ready,
             })
             .await
             .expect("start");

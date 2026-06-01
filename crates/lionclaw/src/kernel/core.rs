@@ -69,8 +69,8 @@ use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        runtime_project_partition_key, runtime_session_ready_marker_exists, LionClawHome,
-        RUNTIME_PROJECTS_DIR, RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
+        runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
+        RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
     },
     project_inventory::{
         ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
@@ -138,10 +138,10 @@ use super::{
         RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
         RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
-        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-        RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult,
+        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -585,26 +585,30 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     }
 }
 
-fn runtime_execution_context(plan: &EffectiveExecutionPlan) -> RuntimeExecutionContext {
-    RuntimeExecutionContext {
+fn runtime_execution_context(
+    plan: &EffectiveExecutionPlan,
+) -> anyhow::Result<RuntimeExecutionContext> {
+    let runtime_path_projections = plan
+        .mounts
+        .iter()
+        .filter(|mount| {
+            mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
+        })
+        .map(|mount| {
+            if mount.target == "/runtime" {
+                RuntimePathProjection::directory(mount.target.clone(), mount.source.clone())
+            } else {
+                RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(RuntimeExecutionContext {
         network_mode: plan.network_mode,
         environment: plan.environment.clone(),
         runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
-        runtime_path_projections: plan
-            .mounts
-            .iter()
-            .filter(|mount| {
-                mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
-            })
-            .map(|mount| {
-                if mount.target == "/runtime" {
-                    RuntimePathProjection::directory(mount.target.clone(), mount.source.clone())
-                } else {
-                    RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
-                }
-            })
-            .collect(),
-    }
+        runtime_path_projections,
+    })
 }
 
 #[async_trait::async_trait]
@@ -946,8 +950,9 @@ impl Kernel {
             .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
-        let runtime_session_ready = runtime_session_ready_marker_exists(&runtime_state_root)
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let runtime_session_ready =
+            RuntimeSessionReady::from_runtime_state_root(&runtime_state_root)
+                .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id,
@@ -6226,7 +6231,7 @@ impl Kernel {
                 environment: execution_plan.environment.clone(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
-                runtime_session_ready: false,
+                runtime_session_ready: RuntimeSessionReady::not_ready(),
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
@@ -6251,7 +6256,7 @@ impl Kernel {
                         .program_backed_turn(
                             RuntimeProgramTurnExecution {
                                 input: turn_input,
-                                context: runtime_execution_context(&runtime_executor.plan),
+                                context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
                             event_tx,
@@ -14380,10 +14385,10 @@ impl Kernel {
         let runtime_state_root = Self::runtime_state_root(&execution_plan).map(Path::to_path_buf);
         let runtime_session_ready = match runtime_state_root
             .as_deref()
-            .map(runtime_session_ready_marker_exists)
+            .map(RuntimeSessionReady::from_runtime_state_root)
             .transpose()
         {
-            Ok(value) => value.unwrap_or(false),
+            Ok(value) => value.unwrap_or_else(RuntimeSessionReady::not_ready),
             Err(err) => {
                 let error_text = err.to_string();
                 self.persist_failed_session_turn(
@@ -18018,7 +18023,7 @@ impl Kernel {
                         .program_backed_turn(
                             RuntimeProgramTurnExecution {
                                 input,
-                                context: runtime_execution_context(&runtime_executor.plan),
+                                context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
                             event_tx,
@@ -18337,7 +18342,7 @@ impl Kernel {
                 .runtime_control(
                     RuntimeControlExecution {
                         input,
-                        context: runtime_execution_context(&runtime_executor.plan),
+                        context: runtime_execution_context(&runtime_executor.plan)?,
                         executor: Box::new(runtime_executor),
                     },
                     event_tx,

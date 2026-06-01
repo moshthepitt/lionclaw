@@ -4,81 +4,16 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-#[cfg(unix)]
-use rustix::{
-    fs::{open, openat, Mode, OFlags},
-    io::Errno,
-};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+pub use lionclaw_runtime_api::{runtime_session_ready_marker_exists, RUNTIME_SESSION_READY_MARKER};
 
 pub const DEFAULT_WORKSPACE: &str = "main";
 pub const RUNTIME_PROJECTS_DIR: &str = "projects";
 pub const RUNTIME_SESSIONS_DIR: &str = "sessions";
 pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
-pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
 pub const RUNTIME_TUI_STATE_MARKER: &str = ".lionclaw-runtime-tui-state";
-
-#[cfg(unix)]
-pub fn runtime_session_ready_marker_exists(root: &Path) -> Result<bool> {
-    let marker_path = root.join(RUNTIME_SESSION_READY_MARKER);
-    let root_dir = match open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(root_dir) => std::fs::File::from(root_dir),
-        Err(Errno::NOENT) => return Ok(false),
-        Err(Errno::LOOP | Errno::NOTDIR) => {
-            return Err(anyhow!(
-                "runtime session marker root '{}' must be a directory and cannot be a symlink",
-                root.display()
-            ))
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to open {}", root.display()));
-        }
-    };
-    let marker = match openat(
-        &root_dir,
-        RUNTIME_SESSION_READY_MARKER,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(marker) => std::fs::File::from(marker),
-        Err(Errno::NOENT) => return Ok(false),
-        Err(Errno::LOOP) => {
-            return Err(anyhow!(
-                "runtime session marker '{}' cannot be a symlink",
-                marker_path.display()
-            ))
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to open {}", marker_path.display()));
-        }
-    };
-    let metadata = marker
-        .metadata()
-        .with_context(|| format!("failed to stat {}", marker_path.display()))?;
-    Ok(metadata.is_file())
-}
-
-#[cfg(not(unix))]
-pub fn runtime_session_ready_marker_exists(root: &Path) -> Result<bool> {
-    let path = root.join(RUNTIME_SESSION_READY_MARKER);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(anyhow!(
-            "runtime session marker '{}' cannot be a symlink",
-            path.display()
-        ));
-    }
-    Ok(metadata.is_file())
-}
 
 #[derive(Debug, Clone)]
 pub struct LionClawHome {

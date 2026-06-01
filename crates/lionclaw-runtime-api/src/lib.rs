@@ -204,7 +204,7 @@ pub struct RuntimeSessionStartInput {
     pub environment: Vec<(String, String)>,
     pub runtime_skill_ids: Vec<String>,
     pub runtime_state_root: Option<PathBuf>,
-    pub runtime_session_ready: bool,
+    pub runtime_session_ready: RuntimeSessionReady,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +224,32 @@ pub struct RuntimeTerminalTranscriptInput {
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
-    pub runtime_session_ready: bool,
+    pub runtime_session_ready: RuntimeSessionReady,
+}
+
+pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeSessionReady {
+    marker_present: bool,
+}
+
+impl RuntimeSessionReady {
+    pub const fn not_ready() -> Self {
+        Self {
+            marker_present: false,
+        }
+    }
+
+    pub fn from_runtime_state_root(runtime_state_root: &Path) -> Result<Self> {
+        Ok(Self {
+            marker_present: runtime_session_ready_marker_exists(runtime_state_root)?,
+        })
+    }
+
+    pub const fn is_ready(self) -> bool {
+        self.marker_present
+    }
 }
 
 #[async_trait]
@@ -464,12 +489,41 @@ pub fn load_ready_state_value(
     runtime_state_root: &Path,
     file_name: &str,
     label: &str,
-    runtime_session_ready: bool,
+    runtime_session_ready: RuntimeSessionReady,
 ) -> Result<Option<String>> {
-    if !runtime_session_ready {
+    if !runtime_session_ready.is_ready() {
         return Ok(None);
     }
     load_state_value(runtime_state_root, file_name, label)
+}
+
+pub fn runtime_session_ready_marker_exists(runtime_state_root: &Path) -> Result<bool> {
+    let marker_path = runtime_state_root.join(RUNTIME_SESSION_READY_MARKER);
+    let Some(root) = open_existing_state_root(runtime_state_root)? else {
+        return Ok(false);
+    };
+    let marker = match openat(
+        &root,
+        RUNTIME_SESSION_READY_MARKER,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(marker) => File::from(marker),
+        Err(Errno::NOENT) => return Ok(false),
+        Err(Errno::LOOP) => {
+            return Err(anyhow!(
+                "runtime session marker '{}' cannot be a symlink",
+                marker_path.display()
+            ))
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to open {}", marker_path.display()))
+        }
+    };
+    let metadata = marker
+        .metadata()
+        .with_context(|| format!("failed to stat {}", marker_path.display()))?;
+    Ok(metadata.is_file())
 }
 
 pub fn load_state_value(
@@ -607,12 +661,23 @@ fn validate_existing_state_file(
 }
 
 fn open_state_root(runtime_state_root: &Path) -> Result<File> {
-    let root = open(
+    let root = match open(
         runtime_state_root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-    )
-    .with_context(|| format!("failed to open '{}'", runtime_state_root.display()))?;
+    ) {
+        Ok(root) => root,
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(anyhow!(
+                "runtime state root '{}' must be a directory and cannot be a symlink",
+                runtime_state_root.display()
+            ))
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open '{}'", runtime_state_root.display()))
+        }
+    };
     Ok(File::from(root))
 }
 
@@ -624,6 +689,10 @@ fn open_existing_state_root(runtime_state_root: &Path) -> Result<Option<File>> {
     ) {
         Ok(root) => Ok(Some(File::from(root))),
         Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => Err(anyhow!(
+            "runtime state root '{}' must be a directory and cannot be a symlink",
+            runtime_state_root.display()
+        )),
         Err(err) => Err(anyhow!(
             "failed to open runtime state root '{}': {err}",
             runtime_state_root.display()
@@ -800,26 +869,45 @@ pub enum RuntimePathProjectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePathProjection {
-    pub runtime_path: String,
-    pub host_path: PathBuf,
-    pub kind: RuntimePathProjectionKind,
+    runtime_path: String,
+    host_path: PathBuf,
+    kind: RuntimePathProjectionKind,
 }
 
 impl RuntimePathProjection {
-    pub fn directory(runtime_path: impl Into<String>, host_path: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime_path: runtime_path.into(),
-            host_path: host_path.into(),
-            kind: RuntimePathProjectionKind::Directory,
-        }
+    pub fn directory(
+        runtime_path: impl Into<String>,
+        host_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Self::new(
+            runtime_path,
+            host_path,
+            RuntimePathProjectionKind::Directory,
+        )
     }
 
-    pub fn exact(runtime_path: impl Into<String>, host_path: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime_path: runtime_path.into(),
-            host_path: host_path.into(),
-            kind: RuntimePathProjectionKind::Exact,
+    pub fn exact(runtime_path: impl Into<String>, host_path: impl Into<PathBuf>) -> Result<Self> {
+        Self::new(runtime_path, host_path, RuntimePathProjectionKind::Exact)
+    }
+
+    fn new(
+        runtime_path: impl Into<String>,
+        host_path: impl Into<PathBuf>,
+        kind: RuntimePathProjectionKind,
+    ) -> Result<Self> {
+        let runtime_path = normalize_absolute_runtime_path(runtime_path.into())?;
+        let host_path = host_path.into();
+        if !host_path.is_absolute() {
+            return Err(anyhow!(
+                "runtime path projection host path '{}' must be absolute",
+                host_path.display()
+            ));
         }
+        Ok(Self {
+            runtime_path,
+            host_path,
+            kind,
+        })
     }
 
     fn resolve_host_path(
@@ -853,6 +941,33 @@ impl RuntimePathProjection {
             }
         }
     }
+}
+
+fn normalize_absolute_runtime_path(runtime_path: String) -> Result<String> {
+    let path = Path::new(&runtime_path);
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "runtime path projection '{runtime_path}' must be absolute"
+        ));
+    }
+
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "runtime path projection '{runtime_path}' must be normalized"
+                ));
+            }
+        }
+    }
+
+    normalized
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("runtime path projection '{runtime_path}' is not valid UTF-8"))
 }
 
 enum RuntimePathProjectionResolution {
@@ -1410,12 +1525,12 @@ mod tests {
     };
 
     use super::{
-        execute_program_backed_turn, safe_relative_path, ExecutionOutput, NetworkMode,
-        RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
+        execute_program_backed_turn, load_ready_state_value, safe_relative_path, ExecutionOutput,
+        NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
         RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane, RuntimePathProjection,
         RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1638,11 +1753,13 @@ mod tests {
             environment: Vec::new(),
             runtime_state_root: Some(PathBuf::from("/host/runtime-root")),
             runtime_path_projections: vec![
-                RuntimePathProjection::directory("/runtime", "/host/runtime-root"),
+                RuntimePathProjection::directory("/runtime", "/host/runtime-root")
+                    .expect("valid runtime projection"),
                 RuntimePathProjection::exact(
                     "/runtime/lionclaw/channel-send.sock",
                     "/tmp/lionclaw/cs.sock",
-                ),
+                )
+                .expect("valid runtime projection"),
             ],
         };
 
@@ -1680,14 +1797,100 @@ mod tests {
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: vec![
-                RuntimePathProjection::exact("/runtime/channel.sock", "/tmp/channel.sock"),
-                RuntimePathProjection::directory("/runtime/channel.sock", "/tmp/channel-tree"),
+                RuntimePathProjection::exact("/runtime/channel.sock", "/tmp/channel.sock")
+                    .expect("valid runtime projection"),
+                RuntimePathProjection::directory("/runtime/channel.sock", "/tmp/channel-tree")
+                    .expect("valid runtime projection"),
             ],
         };
 
         assert_eq!(
             context.host_path_for_runtime_path("/runtime/channel.sock/file"),
             None
+        );
+    }
+
+    #[test]
+    fn runtime_session_ready_gates_ready_state_loading() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        std::fs::write(runtime_state_root.join("session-id"), "session_saved\n")
+            .expect("write state file");
+
+        assert_eq!(
+            load_ready_state_value(
+                runtime_state_root,
+                "session-id",
+                "test session",
+                RuntimeSessionReady::not_ready()
+            )
+            .expect("load state"),
+            None
+        );
+
+        let missing_marker_ready = RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+            .expect("missing marker is not an error");
+        assert!(!missing_marker_ready.is_ready());
+        assert_eq!(
+            load_ready_state_value(
+                runtime_state_root,
+                "session-id",
+                "test session",
+                missing_marker_ready
+            )
+            .expect("load state"),
+            None
+        );
+
+        std::fs::write(
+            runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write ready marker");
+        let runtime_session_ready =
+            RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+                .expect("ready marker should load");
+        assert!(runtime_session_ready.is_ready());
+        assert_eq!(
+            load_ready_state_value(
+                runtime_state_root,
+                "session-id",
+                "test session",
+                runtime_session_ready
+            )
+            .expect("load state"),
+            Some("session_saved".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_path_projection_rejects_unvalidated_paths() {
+        let relative_runtime_path =
+            RuntimePathProjection::directory("runtime", "/host/runtime-root")
+                .expect_err("relative runtime path should be rejected");
+        assert!(
+            relative_runtime_path
+                .to_string()
+                .contains("must be absolute"),
+            "unexpected error: {relative_runtime_path}"
+        );
+
+        let parent_runtime_path =
+            RuntimePathProjection::directory("/runtime/../outside", "/host/runtime-root")
+                .expect_err("parent runtime path should be rejected");
+        assert!(
+            parent_runtime_path
+                .to_string()
+                .contains("must be normalized"),
+            "unexpected error: {parent_runtime_path}"
+        );
+
+        let relative_host_path =
+            RuntimePathProjection::exact("/runtime/channel.sock", "channel.sock")
+                .expect_err("relative host path should be rejected");
+        assert!(
+            relative_host_path.to_string().contains("host path"),
+            "unexpected error: {relative_host_path}"
         );
     }
 
