@@ -990,7 +990,7 @@ where
     let mut newest_turn_resumable = None;
 
     loop {
-        let Some(response) = codex_app_server_request_until(
+        let response = codex_app_server_request_until(
             client,
             "thread/turns/list",
             codex_thread_turns_list_params(&thread.id, cursor.as_deref()),
@@ -998,19 +998,31 @@ where
             thread_state,
             deadline,
         )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to list Codex app-server turns for thread {}",
-                thread.id
-            )
-        })?
-        else {
-            return Ok(CodexThreadTerminalTranscript {
-                turns,
-                resumable: newest_turn_resumable.unwrap_or(false),
-                deadline_reached: true,
-            });
+        .await;
+        let response = match response {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                return Ok(CodexThreadTerminalTranscript {
+                    turns,
+                    resumable: newest_turn_resumable.unwrap_or(false),
+                    deadline_reached: true,
+                });
+            }
+            Err(err) if codex_thread_turns_unmaterialized_error(&err) => {
+                return Ok(CodexThreadTerminalTranscript {
+                    turns,
+                    resumable: false,
+                    deadline_reached: false,
+                });
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to list Codex app-server turns for thread {}",
+                        thread.id
+                    )
+                });
+            }
         };
         let page = codex_app_server_terminal_turn_page(thread, &response)?;
         if newest_turn_resumable.is_none() {
@@ -1078,6 +1090,19 @@ fn codex_app_server_deadline_warning(hard_timeout: Duration, action: &str) -> St
         "timed out after {}s while {action} for Codex native TUI transcript through app-server; returning partial transcript",
         hard_timeout.as_secs_f32()
     )
+}
+
+fn codex_thread_turns_unmaterialized_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<CodexAppServerResponseError>()
+            .is_some_and(|err| {
+                err.method == "thread/turns/list"
+                    && err
+                        .message
+                        .contains("thread/turns/list is unavailable before first user message")
+            })
+    })
 }
 
 fn codex_app_server_terminal_turn_page(
@@ -2019,13 +2044,41 @@ fn response_id(message: &Value) -> Option<u64> {
 
 fn parse_app_server_response(message: Value, method: &str) -> Result<Value> {
     if let Some(error) = message.get("error") {
-        bail!(
-            "codex app-server {method} failed: {}",
-            app_server_error_text(error)
-        );
+        return Err(CodexAppServerResponseError {
+            method: method.to_string(),
+            code: error.get("code").and_then(Value::as_i64),
+            message: app_server_error_text(error),
+        }
+        .into());
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
+
+#[derive(Debug)]
+struct CodexAppServerResponseError {
+    method: String,
+    code: Option<i64>,
+    message: String,
+}
+
+impl std::fmt::Display for CodexAppServerResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(
+                formatter,
+                "codex app-server {} failed with code {}: {}",
+                self.method, code, self.message
+            ),
+            None => write!(
+                formatter,
+                "codex app-server {} failed: {}",
+                self.method, self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodexAppServerResponseError {}
 
 fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {
     if output.success() {
@@ -3791,6 +3844,66 @@ mod tests {
             transcript.warnings[0].error.contains("missing data"),
             "unexpected warning: {}",
             transcript.warnings[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_transcript_treats_unmaterialized_thread_as_empty() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (adapter, _handle, thread_state) =
+            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "data": [{
+                        "id": "thr_empty",
+                        "createdAt": 1780000000,
+                        "updatedAt": 1780000001
+                    }],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }
+            }),
+            json!({
+                "id": 3,
+                "error": {
+                    "code": -32602,
+                    "message": "thread thr_empty is not materialized yet; thread/turns/list is unavailable before first user message"
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .initialize(&events, &thread_state)
+            .await
+            .expect("initialize");
+        let (deadline, hard_timeout) = codex_test_deadline();
+        let transcript = adapter
+            .export_terminal_transcript_from_app_server_client(
+                &mut client,
+                codex_transcript_export_request(
+                    &events,
+                    &thread_state,
+                    temp_dir.path(),
+                    None,
+                    deadline,
+                    hard_timeout,
+                ),
+            )
+            .await
+            .expect("transcript");
+
+        assert!(transcript.turns.is_empty());
+        assert!(transcript.warnings.is_empty());
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert_eq!(
+            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
+            Some("thr_empty".to_string())
         );
     }
 

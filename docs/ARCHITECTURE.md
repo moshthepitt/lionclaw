@@ -242,12 +242,13 @@ boundary, enumerating newest history first, recording the chosen CLI thread as
 the native UI continuation link, proving program-backed resumability separately
 from that thread's exported turn state, falling back to the saved link when
 listing cannot produce a current thread, and sorting before canonical import.
-OpenCode
-continuity is a LionClaw-owned link to one
-OpenCode root session id stored in runtime-private state. Program-backed
-OpenCode turns learn that id from OpenCode's machine-readable `sessionID`
-events and then resume with `opencode run --session <sessionID>`. Native TUI
-launches resume with `opencode --session <sessionID>` when that link exists.
+Codex threads that the app-server reports as not yet materialized before the
+first user message reconcile as empty, non-resumable continuation sources.
+OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
+stored in runtime-private state. Program-backed OpenCode turns learn that id
+from OpenCode's machine-readable `sessionID` events and then resume with
+`opencode run --session <sessionID>`. Native TUI launches resume with
+`opencode --session <sessionID>` when that link exists.
 After native TUI exit, LionClaw uses OpenCode's `session list --format json`
 only to identify whether the runtime moved to a newer root session during the
 launch, choosing by exported update timestamp instead of relying on list order.
