@@ -105,26 +105,12 @@ pub fn discover_channel_skill(home: &LionClawHome, raw: &str) -> Result<Discover
     }
 
     validate_channel_id(raw)?;
-    if let Some(installed) = discover_installed_channel_skill(home, raw)? {
-        return Ok(installed);
+    if let Some(bundled) = discover_bundled_channel_skill(raw)? {
+        return Ok(bundled);
     }
 
-    let bundled = bundled_channel_skill_dir(raw);
-    if bundled.exists() {
-        let skill_dir = canonical_skill_dir(&bundled)?;
-        let metadata = load_channel_metadata(&skill_dir)?;
-        if metadata.id != raw {
-            bail!(
-                "bundled channel skill '{}' declares channel id '{}'",
-                bundled.display(),
-                metadata.id
-            );
-        }
-        return Ok(DiscoveredChannelSkill {
-            source: ChannelSkillSource::Bundled,
-            skill_dir,
-            metadata,
-        });
+    if let Some(installed) = discover_installed_channel_skill(home, raw)? {
+        return Ok(installed);
     }
 
     bail!(
@@ -421,6 +407,27 @@ fn discover_installed_channel_skill(
     }
 }
 
+fn discover_bundled_channel_skill(channel_id: &str) -> Result<Option<DiscoveredChannelSkill>> {
+    let bundled = bundled_channel_skill_dir(channel_id);
+    if !bundled.exists() {
+        return Ok(None);
+    }
+    let skill_dir = canonical_skill_dir(&bundled)?;
+    let metadata = load_channel_metadata(&skill_dir)?;
+    if metadata.id != channel_id {
+        bail!(
+            "bundled channel skill '{}' declares channel id '{}'",
+            bundled.display(),
+            metadata.id
+        );
+    }
+    Ok(Some(DiscoveredChannelSkill {
+        source: ChannelSkillSource::Bundled,
+        skill_dir,
+        metadata,
+    }))
+}
+
 fn canonical_skill_dir(path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat skill directory {}", path.display()))?;
@@ -579,7 +586,7 @@ mod tests {
     use super::{
         bundled_channel_skill_dir_from_exe, discover_channel_skill, load_channel_metadata,
         render_contact_template, resolve_channel_setup_command_entrypoint,
-        validate_channel_env_name,
+        validate_channel_env_name, ChannelSkillSource,
     };
     use crate::{home::LionClawHome, operator::snapshot::copy_snapshot_tree};
 
@@ -858,13 +865,29 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         fs::create_dir_all(home.skills_dir()).expect("skills");
-        let first = write_channel_skill(temp_dir.path(), "first", "telegram");
-        let second = write_channel_skill(temp_dir.path(), "second", "telegram");
+        let first = write_channel_skill(temp_dir.path(), "first", "matrix");
+        let second = write_channel_skill(temp_dir.path(), "second", "matrix");
         copy_snapshot_tree(&first, &home.skills_dir().join("first")).expect("first");
         copy_snapshot_tree(&second, &home.skills_dir().join("second")).expect("second");
 
-        let err = discover_channel_skill(&home, "telegram").expect_err("ambiguous");
+        let err = discover_channel_skill(&home, "matrix").expect_err("ambiguous");
 
         assert!(err.to_string().contains("multiple installed skills"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_prefers_bundled_channel_over_stale_installed_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let stale = write_channel_skill(temp_dir.path(), "stale-telegram", "telegram");
+        copy_snapshot_tree(&stale, &home.skills_dir().join("telegram")).expect("stale install");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(discovered.source, ChannelSkillSource::Bundled);
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert!(discovered.skill_dir.ends_with("skills/channel-telegram"));
     }
 }

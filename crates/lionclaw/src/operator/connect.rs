@@ -20,9 +20,10 @@ use crate::{
             validate_no_undeclared_channel_env, ChannelEnv,
         },
         channel_metadata::{
-            discover_channel_skill, resolve_channel_setup_command_entrypoint,
-            validate_channel_env_name, ChannelSetupMetadata, ChannelSkillSource,
-            DiscoveredChannelSkill,
+            discover_channel_skill, load_channel_metadata,
+            resolve_channel_setup_command_entrypoint, validate_channel_env_name,
+            ChannelSetupMetadata, ChannelSkillSource, DiscoveredChannelSkill,
+            CHANNEL_METADATA_FILE,
         },
         command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
@@ -354,6 +355,7 @@ fn validate_channel_skill_alias_install_target(
         .collect::<Vec<_>>();
     match bound_channels.as_slice() {
         [existing_channel] if *existing_channel == channel_id => Ok(()),
+        [] if existing_alias_declares_channel_id(&alias_path, alias, channel_id)? => Ok(()),
         [] => bail!(
             "skill alias '{alias}' already exists and is not bound to channel '{channel_id}'; remove or rename it before connecting this channel"
         ),
@@ -362,6 +364,41 @@ fn validate_channel_skill_alias_install_target(
             channels.join(", ")
         ),
     }
+}
+
+fn existing_alias_declares_channel_id(
+    alias_path: &Path,
+    alias: &str,
+    channel_id: &str,
+) -> Result<bool> {
+    let metadata = fs::symlink_metadata(alias_path)
+        .with_context(|| format!("failed to stat {}", alias_path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("skill alias '{alias}' must not be a symlink");
+    }
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+
+    let metadata_path = alias_path.join(CHANNEL_METADATA_FILE);
+    match fs::symlink_metadata(&metadata_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "channel metadata {} must not be a symlink",
+                    metadata_path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", metadata_path.display()));
+        }
+    }
+
+    let metadata = load_channel_metadata(alias_path)
+        .with_context(|| format!("installed skill alias '{alias}' has invalid channel metadata"))?;
+    Ok(metadata.id == channel_id)
 }
 
 struct PrepareConnectEnvRequest<'a> {
@@ -3182,6 +3219,57 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
             .channels
             .iter()
             .any(|channel| channel.id == "telegram"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bundled_connect_refreshes_existing_unbound_channel_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let old_skill = temp_dir.path().join("old-telegram");
+        write_channel_skill_with_id(&old_skill, "Telegram", "telegram", "old snapshot");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            old_skill.display().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install old channel skill");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeUnitManager::default();
+
+        let outcome = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("connect bundled telegram");
+
+        assert_eq!(outcome.channel_id, "telegram");
+        assert_eq!(outcome.action, ConnectAction::BackgroundStarted);
+        let installed = fs::read_to_string(home.skills_dir().join("telegram/SKILL.md"))
+            .expect("installed bundled skill");
+        assert!(installed.contains("channel-telegram"));
+        assert!(!installed.contains("old snapshot"));
     }
 
     #[cfg(unix)]
