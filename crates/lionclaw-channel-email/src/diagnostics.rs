@@ -85,12 +85,20 @@ fn contains_header_name(line: &str, name: &str) -> bool {
         let start = search_start + relative_start;
         let after_name = start + name.len();
         let starts_at_boundary = start == 0 || !is_header_name_byte(line.as_bytes()[start - 1]);
-        if starts_at_boundary && line[after_name..].trim_start().starts_with(':') {
+        if starts_at_boundary && header_separator_follows(&line[after_name..]) {
             return true;
         }
         search_start = after_name;
     }
     false
+}
+
+fn header_separator_follows(text: &str) -> bool {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix('"').or_else(|| text.strip_prefix('\'')) {
+        return rest.trim_start().starts_with(':');
+    }
+    text.starts_with(':')
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
@@ -305,6 +313,25 @@ mod tests {
             "[redacted sensitive header] [redacted sensitive header]"
         );
         assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("secret-proxy"));
+    }
+
+    #[test]
+    fn diagnostics_redact_quoted_sensitive_header_names() {
+        let rendered = render_operator_diagnostic(
+            r#"{"Authorization": "Bearer secret-token", "error": "invalid_grant"}
+'Set-Cookie' : "session=secret-cookie"
+DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "[redacted sensitive header] [redacted sensitive header] [redacted sensitive header]"
+        );
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("secret-cookie"));
         assert!(!rendered.contains("secret-proxy"));
     }
 
