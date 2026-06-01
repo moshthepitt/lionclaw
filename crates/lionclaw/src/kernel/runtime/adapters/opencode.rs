@@ -659,6 +659,10 @@ struct OpenCodeExportPart {
     #[serde(default)]
     ignored: bool,
     text: Option<String>,
+    #[serde(default)]
+    state: Option<Value>,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 fn opencode_export_turn(
@@ -688,7 +692,7 @@ fn opencode_export_turn(
         prompt_user_text: display_user_text.clone(),
         display_user_text,
         assistant_text,
-        status: opencode_assistant_status(&assistant.info),
+        status: opencode_assistant_status(assistant),
         error_code,
         error_text,
         started_at: opencode_message_time(user, false)?,
@@ -708,7 +712,8 @@ fn opencode_message_export_text(message: &OpenCodeExportMessage) -> String {
         .join("\n")
 }
 
-fn opencode_assistant_status(info: &OpenCodeExportMessageInfo) -> RuntimeTerminalTurnStatus {
+fn opencode_assistant_status(message: &OpenCodeExportMessage) -> RuntimeTerminalTurnStatus {
+    let info = &message.info;
     if let Some(error) = &info.error {
         let name = error
             .get("name")
@@ -721,6 +726,10 @@ fn opencode_assistant_status(info: &OpenCodeExportMessageInfo) -> RuntimeTermina
         } else {
             RuntimeTerminalTurnStatus::Failed
         };
+    }
+
+    if opencode_assistant_has_pending_tool_followup(message) {
+        return RuntimeTerminalTurnStatus::Interrupted;
     }
 
     if let Some(finish) = opencode_assistant_finish(info) {
@@ -752,7 +761,8 @@ fn opencode_resumable_message_pair(
         && latest_assistant.info.parent_id.as_deref() == Some(latest_user.info.id.as_str())
         && latest_assistant.info.error.is_none()
         && opencode_assistant_finish(&latest_assistant.info)
-            .is_some_and(opencode_assistant_finish_is_final))
+            .is_some_and(opencode_assistant_finish_is_final)
+        && !opencode_assistant_has_pending_tool_followup(latest_assistant))
     .then_some((latest_user, latest_assistant))
 }
 
@@ -766,6 +776,34 @@ fn opencode_assistant_finish(info: &OpenCodeExportMessageInfo) -> Option<&str> {
 
 fn opencode_assistant_finish_is_final(finish: &str) -> bool {
     !finish.eq_ignore_ascii_case("tool-calls") && !finish.eq_ignore_ascii_case("unknown")
+}
+
+fn opencode_assistant_has_pending_tool_followup(message: &OpenCodeExportMessage) -> bool {
+    message
+        .parts
+        .iter()
+        .any(opencode_tool_part_needs_model_followup)
+}
+
+fn opencode_tool_part_needs_model_followup(part: &OpenCodeExportPart) -> bool {
+    part.kind == "tool"
+        && !part
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("providerExecuted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && !opencode_tool_part_is_orphaned_interrupted(part)
+}
+
+fn opencode_tool_part_is_orphaned_interrupted(part: &OpenCodeExportPart) -> bool {
+    part.state.as_ref().is_some_and(|state| {
+        state.get("status").and_then(Value::as_str) == Some("error")
+            && state
+                .pointer("/metadata/interrupted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    })
 }
 
 fn opencode_latest_raw_message<'a>(
@@ -1206,12 +1244,13 @@ mod tests {
     struct HangingAfterOutputsTranscriptExecutor {
         outputs: VecDeque<ExecutionOutput>,
         programs: Vec<RuntimeProgramSpec>,
+        hard_timeout: Duration,
     }
 
     #[async_trait::async_trait]
     impl RuntimeTerminalTranscriptProgramExecutor for HangingAfterOutputsTranscriptExecutor {
         fn hard_timeout(&self) -> Duration {
-            Duration::from_millis(10)
+            self.hard_timeout
         }
 
         async fn execute(
@@ -1401,6 +1440,36 @@ mod tests {
                 })]
             }).unwrap_or_default()
         })
+    }
+
+    fn opencode_tool_part(
+        session_id: &str,
+        message_id: &str,
+        part_id: &str,
+        status: &str,
+        provider_executed: bool,
+        interrupted: bool,
+    ) -> Value {
+        let mut state = json!({
+            "status": status,
+            "input": {},
+        });
+        if interrupted {
+            state["metadata"] = json!({ "interrupted": true });
+        }
+        let mut part = json!({
+            "id": part_id,
+            "messageID": message_id,
+            "sessionID": session_id,
+            "type": "tool",
+            "callID": format!("{part_id}_call"),
+            "tool": "bash",
+            "state": state,
+        });
+        if provider_executed {
+            part["metadata"] = json!({ "providerExecuted": true });
+        }
+        part
     }
 
     #[tokio::test]
@@ -2069,6 +2138,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opencode_terminal_transcript_resumability_requires_no_pending_tools() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut assistant = opencode_assistant_message(
+            "ses_good",
+            "msg_assistant",
+            "msg_user",
+            Some("I will check."),
+            2_000,
+            Some(3_000),
+            Some("stop"),
+        );
+        assistant["parts"]
+            .as_array_mut()
+            .expect("assistant parts")
+            .push(opencode_tool_part(
+                "ses_good",
+                "msg_assistant",
+                "tool_part",
+                "pending",
+                false,
+                false,
+            ));
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good"]),
+                opencode_export_output(
+                    "ses_good",
+                    vec![
+                        opencode_user_message("ses_good", "msg_user", "hello", 1_000),
+                        assistant,
+                    ],
+                ),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].status,
+            RuntimeTerminalTurnStatus::Interrupted
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(!transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opencode_terminal_transcript_allows_nonblocking_tool_parts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let mut assistant = opencode_assistant_message(
+            "ses_good",
+            "msg_assistant",
+            "msg_user",
+            Some("Provider handled it."),
+            2_000,
+            Some(3_000),
+            Some("stop"),
+        );
+        assistant["parts"]
+            .as_array_mut()
+            .expect("assistant parts")
+            .push(opencode_tool_part(
+                "ses_good",
+                "msg_assistant",
+                "tool_part",
+                "completed",
+                true,
+                false,
+            ));
+        assistant["parts"]
+            .as_array_mut()
+            .expect("assistant parts")
+            .push(opencode_tool_part(
+                "ses_good",
+                "msg_assistant",
+                "orphaned_tool_part",
+                "error",
+                false,
+                true,
+            ));
+        let mut executor = FakeTranscriptExecutor {
+            outputs: VecDeque::from([
+                opencode_session_list_output(&["ses_good"]),
+                opencode_export_output(
+                    "ses_good",
+                    vec![
+                        opencode_user_message("ses_good", "msg_user", "hello", 1_000),
+                        assistant,
+                    ],
+                ),
+            ]),
+            programs: Vec::new(),
+        };
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+
+        let transcript = adapter
+            .export_terminal_transcript(
+                opencode_transcript_input(runtime_state_root),
+                &mut executor,
+            )
+            .await
+            .expect("export transcript");
+
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(
+            transcript.turns[0].status,
+            RuntimeTerminalTurnStatus::Completed
+        );
+        assert!(transcript.state.is_reconciled());
+        assert!(transcript.state.is_resumable());
+        assert!(transcript.warnings.is_empty());
+    }
+
+    #[tokio::test]
     async fn opencode_terminal_transcript_resumability_requires_latest_user_parent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -2187,6 +2381,7 @@ mod tests {
                 opencode_completed_export_output("ses_good", "hello", "answer"),
             ]),
             programs: Vec::new(),
+            hard_timeout: Duration::from_millis(200),
         };
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
 
