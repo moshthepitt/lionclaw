@@ -768,16 +768,22 @@ where
         }
         store.mark_digest_attempt_now().await?;
 
-        let held = store.held_since_last_digest(DEFAULT_DIGEST_LIMIT).await?;
-        let suppressed_count = store.suppressed_count_since_last_digest().await?;
-        if held.is_empty() && suppressed_count == 0 {
-            store.mark_digest_sent(&held).await?;
+        let digest = store.pending_digest(DEFAULT_DIGEST_LIMIT).await?;
+        if digest.is_empty() {
+            store.mark_digest_sent(&digest).await?;
             return Ok(());
         }
 
-        let text = digest_text(&self.config.mailbox.address, &held, suppressed_count);
-        let delivery_id =
-            digest_delivery_id(&self.config.mailbox.mailbox_id, &held, suppressed_count);
+        let text = digest_text(
+            &self.config.mailbox.address,
+            digest.held(),
+            digest.suppressed_count(),
+        );
+        let delivery_id = digest_delivery_id(
+            &self.config.mailbox.mailbox_id,
+            digest.held(),
+            digest.suppressed_count(),
+        );
         let send_result = mailbox
             .send_threaded_reply(OutboundEmail {
                 delivery_id: delivery_id.clone(),
@@ -795,9 +801,9 @@ where
                     .record_held_digest_attempt(HeldDigestAttemptInput {
                         delivery_id: &delivery_id,
                         status: HeldDigestAttemptStatus::Delivered,
-                        held_count: i64::try_from(held.len()).unwrap_or(i64::MAX),
-                        suppressed_count,
-                        last_held_digest_rowid: held.last().map(|item| item.digest_rowid),
+                        held_count: digest.held_count(),
+                        suppressed_count: digest.suppressed_count(),
+                        last_held_digest_rowid: digest.last_held_digest_rowid(),
                         error_code: None,
                         error_text: None,
                     })
@@ -809,9 +815,9 @@ where
                     .record_held_digest_attempt(HeldDigestAttemptInput {
                         delivery_id: &delivery_id,
                         status: HeldDigestAttemptStatus::Failed,
-                        held_count: i64::try_from(held.len()).unwrap_or(i64::MAX),
-                        suppressed_count,
-                        last_held_digest_rowid: held.last().map(|item| item.digest_rowid),
+                        held_count: digest.held_count(),
+                        suppressed_count: digest.suppressed_count(),
+                        last_held_digest_rowid: digest.last_held_digest_rowid(),
                         error_code: Some("digest_send_failed"),
                         error_text: Some(&error_text),
                     })
@@ -819,7 +825,7 @@ where
                 return Err(err).context("failed to send held-mail digest");
             }
         }
-        store.mark_digest_sent(&held).await?;
+        store.mark_digest_sent(&digest).await?;
         Ok(())
     }
 

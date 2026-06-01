@@ -60,6 +60,35 @@ pub struct HeldItem {
     pub classification_reason: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingDigest {
+    held: Vec<HeldItem>,
+    suppressed_count: i64,
+    cutoff: String,
+}
+
+impl PendingDigest {
+    pub fn held(&self) -> &[HeldItem] {
+        &self.held
+    }
+
+    pub fn suppressed_count(&self) -> i64 {
+        self.suppressed_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty() && self.suppressed_count == 0
+    }
+
+    pub fn held_count(&self) -> i64 {
+        i64::try_from(self.held.len()).unwrap_or(i64::MAX)
+    }
+
+    pub fn last_held_digest_rowid(&self) -> Option<i64> {
+        self.held.last().map(|item| item.digest_rowid)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ThreadContext {
     pub sender_address: String,
@@ -642,27 +671,48 @@ impl EmailStore {
             .collect()
     }
 
-    pub async fn suppressed_count_since_last_digest(&self) -> Result<i64> {
+    pub async fn pending_digest(&self, limit: i64) -> Result<PendingDigest> {
+        self.pending_digest_until(limit, Utc::now().to_rfc3339())
+            .await
+    }
+
+    async fn pending_digest_until(&self, limit: i64, cutoff: String) -> Result<PendingDigest> {
+        let held = self.held_since_last_digest(limit).await?;
+        let suppressed_count = self.suppressed_count_since_last_digest(&cutoff).await?;
+        Ok(PendingDigest {
+            held,
+            suppressed_count,
+            cutoff,
+        })
+    }
+
+    async fn suppressed_count_since_last_digest(&self, cutoff: &str) -> Result<i64> {
         let since = self
             .state_value(LAST_DIGEST_AT_KEY)
             .await?
             .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
         let row = sqlx::query(
-            "SELECT COUNT(*) AS count FROM mail_items WHERE status = 'suppressed' AND created_at > ?",
+            "SELECT COUNT(*) AS count FROM mail_items WHERE status = 'suppressed' AND created_at > ? AND created_at <= ?",
         )
         .bind(since)
+        .bind(cutoff)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("count")?)
     }
 
-    pub async fn mark_digest_sent(&self, held: &[HeldItem]) -> Result<()> {
-        if let Some(item) = held.last() {
-            self.set_state_value(LAST_HELD_DIGEST_ROWID_KEY, &item.digest_rowid.to_string())
-                .await?;
-        }
-        self.set_state_value(LAST_DIGEST_AT_KEY, &Utc::now().to_rfc3339())
+    pub async fn mark_digest_sent(&self, digest: &PendingDigest) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(item) = digest.held.last() {
+            set_state_value_in_tx(
+                &mut tx,
+                LAST_HELD_DIGEST_ROWID_KEY,
+                &item.digest_rowid.to_string(),
+            )
             .await?;
+        }
+        set_state_value_in_tx(&mut tx, LAST_DIGEST_AT_KEY, &digest.cutoff).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -906,18 +956,29 @@ impl EmailStore {
     }
 
     async fn set_state_value(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO worker_state (key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            "#,
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        set_state_value_in_tx(&mut tx, key, value).await?;
+        tx.commit().await?;
         Ok(())
     }
+}
+
+async fn set_state_value_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO worker_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        "#,
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub fn held_id_for(event_id: &str) -> String {
@@ -1153,16 +1214,53 @@ mod tests {
             record_held_for_digest(&store, &candidate).await;
         }
 
-        let first = store.held_since_last_digest(20).await.expect("first batch");
-        assert_eq!(first.len(), 20);
+        let first = store
+            .pending_digest_until(20, "2026-01-01T00:00:01+00:00".to_string())
+            .await
+            .expect("first batch");
+        assert_eq!(first.held().len(), 20);
         store.mark_digest_sent(&first).await.expect("mark first");
 
         let second = store
-            .held_since_last_digest(20)
+            .pending_digest_until(20, "2026-01-01T00:00:02+00:00".to_string())
             .await
             .expect("second batch");
-        assert_eq!(second.len(), 5);
-        assert_eq!(second[0].event_id, "email:imap:assistant:7:21");
+        assert_eq!(second.held().len(), 5);
+        assert_eq!(second.held()[0].event_id, "email:imap:assistant:7:21");
+    }
+
+    #[tokio::test]
+    async fn suppressed_digest_cursor_uses_attempt_cutoff() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = EmailStore::open(temp_dir.path()).await.expect("store");
+        store
+            .set_state_value(LAST_DIGEST_AT_KEY, "2026-01-01T00:00:00+00:00")
+            .await
+            .expect("seed last digest");
+        record_suppressed_at(&store, 1, "2026-01-01T00:00:02+00:00").await;
+        record_suppressed_at(&store, 2, "2026-01-01T00:00:03+00:00").await;
+
+        let first_cutoff = "2026-01-01T00:00:02+00:00";
+        let first = store
+            .pending_digest_until(20, first_cutoff.to_string())
+            .await
+            .expect("first digest");
+        assert_eq!(first.suppressed_count(), 1);
+        store.mark_digest_sent(&first).await.expect("mark first");
+        assert_eq!(
+            store
+                .state_value(LAST_DIGEST_AT_KEY)
+                .await
+                .expect("last digest")
+                .as_deref(),
+            Some(first_cutoff)
+        );
+
+        let second = store
+            .pending_digest_until(20, "2026-01-01T00:00:04+00:00".to_string())
+            .await
+            .expect("second digest");
+        assert_eq!(second.suppressed_count(), 1);
     }
 
     #[tokio::test]
@@ -1512,6 +1610,21 @@ mod tests {
             )
             .await
             .expect("record held");
+    }
+
+    async fn record_suppressed_at(store: &EmailStore, index: u32, created_at: &str) {
+        let candidate = candidate(index);
+        store
+            .record_suppressed(&candidate, "duplicate_message_ref")
+            .await
+            .expect("record suppressed");
+        sqlx::query("UPDATE mail_items SET created_at = ?, updated_at = ? WHERE event_id = ?")
+            .bind(created_at)
+            .bind(created_at)
+            .bind(&candidate.event_id)
+            .execute(&store.pool)
+            .await
+            .expect("set suppressed timestamp");
     }
 
     fn candidate(index: u32) -> CandidateHeader {
