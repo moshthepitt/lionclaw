@@ -382,20 +382,18 @@ pub fn parse_setup_command_from_args(args: Vec<String>) -> Result<Option<Oauth2C
         return prompt_setup_command().map(|args| Some(Oauth2Command::Setup(Box::new(args))));
     }
 
-    let has_positional_provider = args.first().is_some_and(|first| !first.starts_with('-'));
-    if has_positional_provider
-        && args
-            .iter()
-            .any(|arg| arg == "--provider" || arg.starts_with("--provider="))
-    {
-        bail!("email setup provider can be specified either positionally or with --provider, not both");
-    }
+    let has_provider_flag = args
+        .iter()
+        .any(|arg| arg == "--provider" || arg.starts_with("--provider="));
 
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push("lionclaw-channel-email setup".to_string());
     argv.extend(args);
     match EmailSetupCli::try_parse_from(argv) {
         Ok(mut cli) => {
+            if cli.provider_profile.is_some() && has_provider_flag {
+                bail!("email setup provider can be specified either positionally or with --provider, not both");
+            }
             if let Some(provider) = cli.provider_profile {
                 cli.args.provider = provider;
             }
@@ -2398,6 +2396,20 @@ mod tests {
             "assistant@gmail.com".to_string(),
         ])
         .expect_err("provider should not be ambiguous");
+
+        assert!(err
+            .to_string()
+            .contains("either positionally or with --provider"));
+
+        let err = parse_setup_command_from_args(vec![
+            "--no-browser".to_string(),
+            "gmail".to_string(),
+            "--provider".to_string(),
+            "generic".to_string(),
+            "--account".to_string(),
+            "assistant@gmail.com".to_string(),
+        ])
+        .expect_err("provider should not be ambiguous after leading flags");
 
         assert!(err
             .to_string()
