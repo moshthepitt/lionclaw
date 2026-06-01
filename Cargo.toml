@@ -2,6 +2,7 @@
 members = [
     "crates/lionclaw",
     "crates/lionclaw-channel-team-local",
+    "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
     "crates/lionclaw-runtime-codex",
     "crates/lionclaw-runtime-mock",
@@ -21,6 +22,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = "0.4"
 hex = "0.4"
+lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
 lionclaw-runtime-codex = { path = "crates/lionclaw-runtime-codex" }
 lionclaw-runtime-mock = { path = "crates/lionclaw-runtime-mock" }

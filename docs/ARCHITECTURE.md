@@ -102,7 +102,9 @@ Skill text can influence prompt context. It cannot grant permissions.
 
 Shared crate primitives:
 
-- `durable_fs`: atomic file publish/remove/rename for LionClaw-owned runtime, continuity, and operator-private state; successful file replacement syncs the file and containing directory.
+- `lionclaw-durable-fs`: atomic file publish/remove/rename for
+  LionClaw-owned runtime, continuity, and operator-private state; successful
+  file replacement syncs the file and containing directory.
 
 ## Runtime Adapter Contract
 

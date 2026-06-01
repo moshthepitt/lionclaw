@@ -67,7 +67,6 @@ use crate::contracts::{
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
-    durable_fs::{remove_file_if_exists, write_file_atomically},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, runtime_session_ready_marker_exists, LionClawHome,
@@ -80,6 +79,7 @@ use crate::{
     runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
     workspace::{read_workspace_sections, AGENTS_FILE, GENERATED_AGENTS_FILE},
 };
+use lionclaw_durable_fs::{remove_file_if_exists, write_file_atomically};
 
 use super::{
     audit::AuditLog,

@@ -21,6 +21,7 @@ crossterm = "0.29"
 hex.workspace = true
 hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+lionclaw-durable-fs.workspace = true
 lionclaw-runtime-api.workspace = true
 lionclaw-runtime-codex.workspace = true
 lionclaw-runtime-mock.workspace = true

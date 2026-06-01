@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fmt,
     fs::File,
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -13,8 +13,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use lionclaw_durable_fs::write_file_atomically;
 use rustix::{
-    fs::{open, openat, renameat, unlinkat, AtFlags, Mode, OFlags},
+    fs::{open, openat, Mode, OFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -513,12 +514,13 @@ pub fn save_state_value(
 
     let mut contents = value.into_bytes();
     contents.push(b'\n');
-    write_state_file_atomically(
+    write_file_atomically(
         &root,
         runtime_state_root,
         &target_name,
         &contents,
         0o600,
+        None,
         &format!("{label} state file"),
     )
 }
@@ -618,117 +620,6 @@ fn normalize_state_value(value: impl AsRef<str>, label: &str) -> Result<Option<S
         return Err(anyhow!("{label} state value must be a single line"));
     }
     Ok(Some(value.to_string()))
-}
-
-fn write_state_file_atomically(
-    parent: &File,
-    parent_path: &Path,
-    file_name: &OsStr,
-    contents: &[u8],
-    mode: u32,
-    label: &str,
-) -> Result<()> {
-    ensure_state_file_name(file_name, label)?;
-    let (temp_name, mut temp_file) = create_temp_state_file(parent, parent_path, mode, label)?;
-    let temp_path = Path::new(&temp_name);
-    let target_path = Path::new(file_name);
-
-    let write_result = (|| -> Result<()> {
-        temp_file.write_all(contents).with_context(|| {
-            format!(
-                "failed to write {label} '{}' in '{}'",
-                target_path.display(),
-                parent_path.display()
-            )
-        })?;
-        temp_file.flush().with_context(|| {
-            format!(
-                "failed to flush {label} '{}' in '{}'",
-                target_path.display(),
-                parent_path.display()
-            )
-        })?;
-        temp_file.sync_all().with_context(|| {
-            format!(
-                "failed to sync {label} '{}' in '{}'",
-                target_path.display(),
-                parent_path.display()
-            )
-        })?;
-        renameat(parent, temp_path, parent, file_name).with_context(|| {
-            format!(
-                "failed to publish {label} '{}' in '{}'",
-                target_path.display(),
-                parent_path.display()
-            )
-        })?;
-        sync_state_directory(parent, parent_path, label)
-    })();
-
-    if write_result.is_err() {
-        let _ = unlinkat(parent, temp_path, AtFlags::empty());
-    }
-
-    write_result
-}
-
-fn sync_state_directory(directory: &File, path: &Path, label: &str) -> Result<()> {
-    directory.sync_all().with_context(|| {
-        format!(
-            "failed to sync directory '{}' after updating {label}",
-            path.display()
-        )
-    })
-}
-
-fn ensure_state_file_name(file_name: &OsStr, label: &str) -> Result<()> {
-    let path = Path::new(file_name);
-    let mut components = path.components();
-    let Some(Component::Normal(_)) = components.next() else {
-        return Err(anyhow!("{label} file name '{}' is invalid", path.display()));
-    };
-    if components.next().is_some() {
-        return Err(anyhow!("{label} file name '{}' is invalid", path.display()));
-    }
-    Ok(())
-}
-
-fn create_temp_state_file(
-    parent: &File,
-    parent_path: &Path,
-    mode: u32,
-    label: &str,
-) -> Result<(OsString, File)> {
-    const TEMP_CREATE_ATTEMPTS: usize = 4;
-
-    for _ in 0..TEMP_CREATE_ATTEMPTS {
-        let temp_name = OsString::from(format!(".lionclaw-atomic-{}.tmp", Uuid::new_v4().simple()));
-        match openat(
-            parent,
-            &temp_name,
-            OFlags::WRONLY
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::TRUNC
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW,
-            Mode::from_raw_mode(mode),
-        ) {
-            Ok(file) => return Ok((temp_name, File::from(file))),
-            Err(Errno::EXIST) => continue,
-            Err(err) => {
-                return Err(anyhow!(
-                    "failed to create temporary {label} file in '{}': {err}",
-                    parent_path.display()
-                ))
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "failed to allocate temporary {label} file name in '{}'",
-        parent_path.display()
-    ))
 }
 
 #[derive(Debug, Clone)]

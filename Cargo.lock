@@ -1469,6 +1469,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lionclaw-durable-fs",
  "lionclaw-runtime-api",
  "lionclaw-runtime-codex",
  "lionclaw-runtime-mock",
@@ -1512,12 +1513,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lionclaw-durable-fs"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "rustix",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lionclaw-runtime-api"
 version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "lionclaw-durable-fs",
  "rustix",
  "serde",
  "serde_json",
