@@ -47,12 +47,12 @@ use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
     normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
-    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnInput, RuntimeTurnMode, TerminalTranscriptCandidate, TerminalTranscriptTarget,
-    TerminalTranscriptTimestampPrecision,
+    RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
 const OPENCODE_RUNTIME_CONFIG_DIR: &str = "/runtime";
@@ -134,7 +134,11 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         })
     }
 
-    fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+    fn build_turn_program(
+        &self,
+        input: &RuntimeTurnInput,
+        _context: &RuntimeExecutionContext,
+    ) -> Result<RuntimeProgramSpec> {
         let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
 
         Ok(RuntimeProgramSpec {
@@ -1228,8 +1232,9 @@ mod tests {
     use std::{collections::VecDeque, future::pending, path::PathBuf, time::Duration};
 
     use lionclaw_runtime_api::{
-        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
+        ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
         RuntimeTurnMode,
     };
@@ -1241,6 +1246,15 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
     use uuid::Uuid;
+
+    fn execution_context() -> RuntimeExecutionContext {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: None,
+            runtime_path_projections: Vec::new(),
+        }
+    }
 
     #[derive(Debug)]
     struct FakeTranscriptExecutor {
@@ -1533,12 +1547,15 @@ mod tests {
             .expect("start");
 
         let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id,
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
+            .build_turn_program(
+                &RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                    fresh_prompt: None,
+                    runtime_skill_ids: Vec::new(),
+                },
+                &execution_context(),
+            )
             .expect("program");
 
         assert_eq!(program.executable, "opencode");
@@ -1598,7 +1615,9 @@ mod tests {
             "ses_program\n"
         );
 
-        let program = adapter.build_turn_program(&input).expect("program");
+        let program = adapter
+            .build_turn_program(&input, &execution_context())
+            .expect("program");
         assert_eq!(
             program.args,
             vec![
@@ -1639,12 +1658,15 @@ mod tests {
             .expect("start");
         assert!(handle.resumes_existing_session);
         let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id,
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
+            .build_turn_program(
+                &RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                    fresh_prompt: None,
+                    runtime_skill_ids: Vec::new(),
+                },
+                &execution_context(),
+            )
             .expect("program");
 
         assert_eq!(

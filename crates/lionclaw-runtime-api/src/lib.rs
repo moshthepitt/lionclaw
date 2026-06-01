@@ -31,7 +31,7 @@
 )]
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     ffi::OsString,
     fmt,
     fs::File,
@@ -1016,7 +1016,11 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> Result<RuntimeTurnResult> {
         Err(anyhow!("runtime does not implement direct turns"))
     }
-    fn build_turn_program(&self, _input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+    fn build_turn_program(
+        &self,
+        _input: &RuntimeTurnInput,
+        _context: &RuntimeExecutionContext,
+    ) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not support program-backed turns"))
     }
     fn build_terminal_program(
@@ -1108,7 +1112,7 @@ pub trait RuntimeAdapter: Send + Sync {
 
 #[derive(Default, Clone)]
 pub struct RuntimeRegistry {
-    adapters: Arc<RwLock<HashMap<String, Arc<dyn RuntimeAdapter>>>>,
+    adapters: Arc<RwLock<BTreeMap<String, Arc<dyn RuntimeAdapter>>>>,
 }
 
 impl RuntimeRegistry {
@@ -1131,25 +1135,27 @@ impl RuntimeRegistry {
 
 pub async fn execute_program_backed_turn<A>(
     adapter: &A,
-    mut execution: RuntimeProgramTurnExecution,
+    execution: RuntimeProgramTurnExecution,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
 {
-    execute_program_backed_turn_with_executor(
-        adapter,
-        execution.executor.as_mut(),
-        execution.input,
-        events,
-    )
-    .await
+    let RuntimeProgramTurnExecution {
+        input,
+        context,
+        mut executor,
+    } = execution;
+
+    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, events)
+        .await
 }
 
 async fn execute_program_backed_turn_with_executor<A>(
     adapter: &A,
     executor: &mut dyn RuntimeProgramExecutor,
     input: RuntimeTurnInput,
+    context: &RuntimeExecutionContext,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult>
 where
@@ -1160,7 +1166,7 @@ where
 
     loop {
         let attempt =
-            run_program_backed_attempt(adapter, executor, &current_input, &events).await?;
+            run_program_backed_attempt(adapter, executor, &current_input, context, &events).await?;
 
         if attempt.output.success() {
             flush_buffered_program_output_events(&events, attempt.buffered_errors);
@@ -1210,12 +1216,13 @@ async fn run_program_backed_attempt<A>(
     adapter: &A,
     executor: &mut dyn RuntimeProgramExecutor,
     input: &RuntimeTurnInput,
+    context: &RuntimeExecutionContext,
     events: &RuntimeEventSender,
 ) -> Result<ProgramBackedAttemptOutcome>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
 {
-    let program = adapter.build_turn_program(input)?;
+    let program = adapter.build_turn_program(input, context)?;
     let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
     let execution = executor.execute_streaming(program, stdout_tx);
     tokio::pin!(execution);
@@ -1407,8 +1414,8 @@ mod tests {
         RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
         RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane, RuntimePathProjection,
         RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1459,7 +1466,14 @@ mod tests {
             })
         }
 
-        fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+        fn build_turn_program(
+            &self,
+            input: &RuntimeTurnInput,
+            context: &RuntimeExecutionContext,
+        ) -> Result<RuntimeProgramSpec> {
+            if context.network_mode != NetworkMode::On {
+                return Err(anyhow!("unexpected runtime execution context"));
+            }
             Ok(RuntimeProgramSpec {
                 executable: "agent".to_string(),
                 args: vec!["run".to_string()],
@@ -1599,6 +1613,22 @@ mod tests {
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_lists_ids_deterministically() {
+        let registry = RuntimeRegistry::new();
+        registry
+            .register("z-runtime", Arc::new(TestProgramAdapter::default()))
+            .await;
+        registry
+            .register("a-runtime", Arc::new(TestProgramAdapter::default()))
+            .await;
+
+        assert_eq!(
+            registry.list().await,
+            vec!["a-runtime".to_string(), "z-runtime".to_string()]
+        );
     }
 
     #[test]
