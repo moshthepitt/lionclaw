@@ -897,6 +897,22 @@ fn copy_regular_tree_for_rollback(source: &Path, destination: &Path, label: &str
         bail!("{label} {} is not a directory", source.display());
     }
     create_rollback_destination_dir(destination, label, &source_metadata)?;
+    if let Err(err) = copy_regular_tree_entries_for_rollback(source, destination, label) {
+        if let Err(cleanup_err) = remove_created_rollback_destination(destination, label) {
+            return Err(anyhow!(
+                "{err}; additionally failed to clean up partial {label} rollback destination: {cleanup_err}"
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn copy_regular_tree_entries_for_rollback(
+    source: &Path,
+    destination: &Path,
+    label: &str,
+) -> Result<()> {
     let mut entries = fs::read_dir(source)
         .with_context(|| format!("failed to read {}", source.display()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -931,6 +947,30 @@ fn copy_regular_tree_for_rollback(source: &Path, destination: &Path, label: &str
         }
     }
     Ok(())
+}
+
+fn remove_created_rollback_destination(destination: &Path, label: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", destination.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{label} rollback destination {} must not be a symlink",
+            destination.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "{label} rollback destination {} is not a directory",
+            destination.display()
+        );
+    }
+    fs::remove_dir_all(destination)
+        .with_context(|| format!("failed to remove {}", destination.display()))
 }
 
 fn create_rollback_destination_dir(
@@ -2168,6 +2208,34 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
 
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(!outside.join("token.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_copy_cleans_partial_destination_after_entry_failure() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("state");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("a-copied-first.json"), "secret\n").expect("source token");
+        let outside = temp_dir.path().join("outside-token.json");
+        fs::write(&outside, "outside\n").expect("outside token");
+        symlink(&outside, source.join("z-bad-link.json")).expect("source symlink");
+        let destination = temp_dir.path().join("backup");
+
+        let err = copy_regular_tree_for_rollback(&source, &destination, "channel setup state")
+            .expect_err("symlinked source entry should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(
+            fs::symlink_metadata(&destination).is_err(),
+            "failed rollback copy must not leave a partial backup"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside token"),
+            "outside\n"
+        );
     }
 
     #[cfg(unix)]
