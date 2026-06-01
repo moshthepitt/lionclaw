@@ -3,15 +3,27 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Component, Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+    time::timeout,
+};
 
 const TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_COMMAND_MAX_STDOUT: usize = 16 * 1024;
+const TOKEN_COMMAND_MAX_STDERR: usize = 16 * 1024;
+const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "password",
+];
 const TOKEN_COMMAND_ENV_ALLOWLIST: &[&str] = &[
     "ALL_PROXY",
     "APPDATA",
@@ -110,7 +122,7 @@ impl TokenCommand {
             .envs(token_command_env())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| {
                 format!(
@@ -123,18 +135,20 @@ impl TokenCommand {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to capture EMAIL_XOAUTH2_TOKEN_CMD stdout"))?;
-        let mut output = Vec::new();
-        let mut limited_stdout = stdout.take((TOKEN_COMMAND_MAX_STDOUT + 1) as u64);
-        match timeout(
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture EMAIL_XOAUTH2_TOKEN_CMD stderr"))?;
+        let output = match timeout(
             TOKEN_COMMAND_TIMEOUT,
-            limited_stdout.read_to_end(&mut output),
+            collect_token_command_output(&mut child, stdout, stderr),
         )
         .await
         {
-            Ok(Ok(_)) => {}
+            Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 let _ = kill_child(&mut child).await;
-                return Err(err).context("failed to read EMAIL_XOAUTH2_TOKEN_CMD stdout");
+                return Err(err);
             }
             Err(_) => {
                 let _ = kill_child(&mut child).await;
@@ -143,37 +157,208 @@ impl TokenCommand {
                     TOKEN_COMMAND_TIMEOUT.as_secs()
                 );
             }
-        }
-
-        if output.len() > TOKEN_COMMAND_MAX_STDOUT {
-            let _ = kill_child(&mut child).await;
+        };
+        if !output.status.success() {
+            if let Some(diagnostic) = output.stderr.render() {
+                bail!(
+                    "EMAIL_XOAUTH2_TOKEN_CMD exited with status {}; stderr: {diagnostic}",
+                    output.status
+                );
+            }
             bail!(
-                "EMAIL_XOAUTH2_TOKEN_CMD stdout exceeded {} bytes",
-                TOKEN_COMMAND_MAX_STDOUT
+                "EMAIL_XOAUTH2_TOKEN_CMD exited with status {}",
+                output.status
             );
         }
 
-        let status = match timeout(TOKEN_COMMAND_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => return Err(err).context("failed to wait for EMAIL_XOAUTH2_TOKEN_CMD"),
-            Err(_) => {
-                let _ = kill_child(&mut child).await;
-                bail!(
-                    "EMAIL_XOAUTH2_TOKEN_CMD did not exit after stdout closed within {} seconds",
-                    TOKEN_COMMAND_TIMEOUT.as_secs()
-                );
-            }
-        };
-        if !status.success() {
-            bail!("EMAIL_XOAUTH2_TOKEN_CMD exited with status {status}");
-        }
-
-        let token = String::from_utf8(output)
+        let token = String::from_utf8(output.stdout)
             .context("EMAIL_XOAUTH2_TOKEN_CMD stdout must be UTF-8 access-token text")?;
         let token = token.trim().to_string();
         validate_access_token("EMAIL_XOAUTH2_TOKEN_CMD", &token)?;
         Ok(token)
     }
+}
+
+struct TokenCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: TokenCommandDiagnostic,
+}
+
+struct TokenCommandDiagnostic {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl TokenCommandDiagnostic {
+    fn render(&self) -> Option<String> {
+        let text = String::from_utf8_lossy(&self.bytes);
+        let redacted = redact_diagnostic_text(&text);
+        let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact.is_empty() {
+            return None;
+        }
+        if self.truncated {
+            Some(format!("{compact} [truncated]"))
+        } else {
+            Some(compact)
+        }
+    }
+}
+
+async fn collect_token_command_output<R, E>(
+    child: &mut Child,
+    stdout: R,
+    stderr: E,
+) -> Result<TokenCommandOutput>
+where
+    R: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
+    let (stdout, stderr, status) = tokio::try_join!(
+        read_token_stdout(stdout),
+        read_token_stderr(stderr),
+        async {
+            child
+                .wait()
+                .await
+                .context("failed to wait for EMAIL_XOAUTH2_TOKEN_CMD")
+        }
+    )?;
+    Ok(TokenCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_token_stdout<R>(mut reader: R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        let bytes = reader
+            .read(&mut chunk)
+            .await
+            .context("failed to read EMAIL_XOAUTH2_TOKEN_CMD stdout")?;
+        if bytes == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(bytes) > TOKEN_COMMAND_MAX_STDOUT {
+            bail!(
+                "EMAIL_XOAUTH2_TOKEN_CMD stdout exceeded {} bytes",
+                TOKEN_COMMAND_MAX_STDOUT
+            );
+        }
+        output.extend_from_slice(&chunk[..bytes]);
+    }
+}
+
+async fn read_token_stderr<R>(mut reader: R) -> Result<TokenCommandDiagnostic>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 512];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .context("failed to read EMAIL_XOAUTH2_TOKEN_CMD stderr")?;
+        if read == 0 {
+            return Ok(TokenCommandDiagnostic { bytes, truncated });
+        }
+        let remaining = TOKEN_COMMAND_MAX_STDERR.saturating_sub(bytes.len());
+        if remaining > 0 {
+            let kept = remaining.min(read);
+            bytes.extend_from_slice(&chunk[..kept]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+}
+
+fn redact_diagnostic_text(text: &str) -> String {
+    text.lines()
+        .map(redact_diagnostic_line)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_diagnostic_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("authorization:") || lower.starts_with("cookie:") {
+        return "[redacted sensitive header]".to_string();
+    }
+    trimmed
+        .split_whitespace()
+        .map(redact_diagnostic_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_diagnostic_word(word: &str) -> String {
+    let mut redacted = word.to_string();
+    for key in SENSITIVE_DIAGNOSTIC_KEYS {
+        redacted = redact_sensitive_key_values(&redacted, key);
+    }
+    redacted
+}
+
+fn redact_sensitive_key_values(word: &str, key: &str) -> String {
+    let mut redacted = word.to_string();
+    let replacement = "[redacted]";
+    let mut search_start = 0;
+    loop {
+        let lower = redacted.to_ascii_lowercase();
+        let Some(relative_key_start) = lower[search_start..].find(key) else {
+            return redacted;
+        };
+        let after_key = search_start + relative_key_start + key.len();
+        let Some((value_start, value_end)) = sensitive_value_span(&redacted, after_key) else {
+            search_start = after_key;
+            continue;
+        };
+        redacted.replace_range(value_start..value_end, replacement);
+        search_start = value_start + replacement.len();
+    }
+}
+
+fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
+    index = skip_diagnostic_spacing_or_quotes(text, index);
+    let separator = text[index..].chars().next()?;
+    if separator != '=' && separator != ':' {
+        return None;
+    }
+    index += separator.len_utf8();
+    index = skip_diagnostic_spacing_or_quotes(text, index);
+    let start = index;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if ch.is_whitespace() || matches!(ch, '&' | ',' | ';' | '"' | '\'') {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    (start < index).then_some((start, index))
+}
+
+fn skip_diagnostic_spacing_or_quotes(text: &str, mut index: usize) -> usize {
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            return index;
+        };
+        if !(ch.is_whitespace() || matches!(ch, '"' | '\'')) {
+            return index;
+        }
+        index += ch.len_utf8();
+    }
+    index
 }
 
 impl fmt::Debug for TokenCommand {
@@ -270,13 +455,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn token_command_reads_single_token_line() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let helper = temp_dir.path().join("token-helper");
-        std::fs::write(&helper, "#!/bin/sh\nprintf 'access-token-123\\n'\n").expect("write helper");
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod helper");
+        write_token_helper(&helper, "#!/bin/sh\nprintf 'access-token-123\\n'\n");
 
         let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
             .expect("token command");
@@ -290,24 +471,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn token_command_uses_explicit_environment_allowlist() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _guard = EnvRestore::set([(
             "LIONCLAW_TEST_EMAIL_TOKEN_SECRET",
             Some("should-not-reach-token-helper"),
         )]);
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let helper = temp_dir.path().join("token-helper");
-        std::fs::write(
+        write_token_helper(
             &helper,
             "#!/bin/sh\n\
              test -z \"${LIONCLAW_TEST_EMAIL_TOKEN_SECRET+x}\" || exit 41\n\
              test -n \"${PATH:-}\" || exit 42\n\
              printf 'access-token-123\\n'\n",
-        )
-        .expect("write helper");
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod helper");
+        );
 
         let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
             .expect("token command");
@@ -316,6 +492,63 @@ mod tests {
             command.access_token().await.expect("access token"),
             "access-token-123"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_command_failure_includes_redacted_stderr_diagnostic() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let helper = temp_dir.path().join("token-helper");
+        write_token_helper(
+            &helper,
+            "#!/bin/sh\n\
+             printf 'invalid_grant refresh_token=secret-refresh-token revoked\\n' >&2\n\
+             exit 17\n",
+        );
+
+        let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
+            .expect("token command");
+        let err = command
+            .access_token()
+            .await
+            .expect_err("failing token helper should include stderr");
+        let message = err.to_string();
+
+        assert!(message.contains("exit status"));
+        assert!(message.contains("invalid_grant"));
+        assert!(message.contains("revoked"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("secret-refresh-token"));
+    }
+
+    #[test]
+    fn token_command_diagnostic_redaction_keeps_safe_context() {
+        let diagnostic = TokenCommandDiagnostic {
+            bytes: br#"authorization: Bearer secret
+error=invalid_grant&refresh_token=secret-refresh-token client_secret:"secret-client" revoked
+"#
+            .to_vec(),
+            truncated: true,
+        };
+
+        let rendered = diagnostic.render().expect("diagnostic");
+
+        assert!(rendered.contains("invalid_grant"));
+        assert!(rendered.contains("revoked"));
+        assert!(rendered.contains("[redacted]"));
+        assert!(rendered.contains("[truncated]"));
+        assert!(!rendered.contains("secret-refresh-token"));
+        assert!(!rendered.contains("secret-client"));
+        assert!(!rendered.contains("Bearer secret"));
+    }
+
+    #[cfg(unix)]
+    fn write_token_helper(path: &Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, content).expect("write helper");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod helper");
     }
 
     struct EnvRestore {
