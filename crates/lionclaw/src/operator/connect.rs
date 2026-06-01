@@ -30,7 +30,8 @@ use crate::{
         private_paths::{
             create_private_dir_all, ensure_private_file_readable, ensure_private_file_write_target,
             private_dir_exists, private_file_exists, remove_private_dir_all_if_exists,
-            remove_private_file_if_exists,
+            remove_private_dir_if_empty, remove_private_file_if_exists,
+            remove_private_path_if_exists,
         },
         reconcile::{
             add_channel_with_worker, add_skill, resolve_channel_contact_config,
@@ -383,7 +384,7 @@ struct PreparedConnectEnvInputs {
 impl PreparedConnectEnvInputs {
     fn cleanup_generated_env(&mut self, home: &LionClawHome) -> Result<()> {
         if let Some(path) = self.generated_env_file.take() {
-            remove_private_file_if_exists(home, &path, "channel setup env file")?;
+            remove_private_path_if_exists(home, &path, "channel setup env file")?;
         }
         Ok(())
     }
@@ -526,7 +527,7 @@ fn cleanup_generated_setup_env(
     err: anyhow::Error,
 ) -> anyhow::Error {
     if let Err(cleanup_err) =
-        remove_private_file_if_exists(home, env_file, "channel setup env file")
+        remove_private_path_if_exists(home, env_file, "channel setup env file")
     {
         return anyhow!(
             "{err}; additionally failed to clean up channel setup env file: {cleanup_err}"
@@ -588,7 +589,13 @@ impl SetupStateRollback {
     }
 
     fn restore(self, home: &LionClawHome) -> Result<()> {
-        remove_private_dir_all_if_exists(home, &self.state_dir, "channel setup state directory")?;
+        let setup_dir = self.state_dir.parent().ok_or_else(|| {
+            anyhow!(
+                "channel setup state directory {} does not have a parent",
+                self.state_dir.display()
+            )
+        })?;
+        remove_private_path_if_exists(home, &self.state_dir, "channel setup state directory")?;
         if let Some(backup_dir) = self.backup_dir {
             fs::rename(&backup_dir, &self.state_dir).with_context(|| {
                 format!(
@@ -597,6 +604,10 @@ impl SetupStateRollback {
                     backup_dir.display()
                 )
             })?;
+        }
+        remove_private_dir_if_empty(home, setup_dir, "channel setup directory")?;
+        if let Some(setup_root_dir) = setup_dir.parent() {
+            remove_private_dir_if_empty(home, setup_root_dir, "channel setup root directory")?;
         }
         Ok(())
     }
@@ -1293,10 +1304,11 @@ mod tests {
     };
 
     use super::{
-        channel_setup_env_file, channel_setup_state_dir, connect_channel_with_binaries,
-        copy_regular_tree_for_rollback, ensure_required_env, prepare_connect_env_inputs,
-        run_channel_setup_command, ChannelSetupRunRequest, ConnectAction, ConnectChannelRequest,
-        ConnectEnvInputs, PrepareConnectEnvRequest, RequiredEnvRequest,
+        channel_setup_dir, channel_setup_env_file, channel_setup_state_dir,
+        connect_channel_with_binaries, copy_regular_tree_for_rollback, ensure_required_env,
+        prepare_connect_env_inputs, run_channel_setup_command, ChannelSetupRunRequest,
+        ConnectAction, ConnectChannelRequest, ConnectEnvInputs, PrepareConnectEnvRequest,
+        RequiredEnvRequest,
     };
     use crate::{
         home::LionClawHome,
@@ -1613,6 +1625,32 @@ rm -f "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
 ln -s "$outside_env" "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
 rm -rf "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
 ln -s "$outside_state" "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
+exit 17
+"#,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill_with_wrong_type_setup_outputs(root: &Path) {
+        write_channel_skill_with_setup_script(
+            root,
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "background"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+
+[channel.setup]
+command = "scripts/setup"
+"#,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+rm -f "$LIONCLAW_CHANNEL_SETUP_ENV_FILE"
+mkdir -p "$LIONCLAW_CHANNEL_SETUP_ENV_FILE/nested"
+rm -rf "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
+printf 'not a state directory\n' > "$LIONCLAW_CHANNEL_SETUP_STATE_DIR"
 exit 17
 "#,
         );
@@ -2131,6 +2169,8 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
         assert!(err.to_string().contains("exited with"));
         assert!(!channel_setup_env_file(&home, "telegram").exists());
         assert!(!channel_setup_state_dir(&home, "telegram").exists());
+        assert!(!channel_setup_dir(&home, "telegram").exists());
+        assert!(!home.config_dir().join("channel-setup").exists());
         assert!(!home.channel_env_path("telegram").exists());
         assert!(!home.skills_dir().join("telegram").exists());
     }
@@ -2178,6 +2218,8 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
         assert!(err.to_string().contains("exited with"));
         assert!(fs::symlink_metadata(channel_setup_env_file(&home, "telegram")).is_err());
         assert!(fs::symlink_metadata(channel_setup_state_dir(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(channel_setup_dir(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(home.config_dir().join("channel-setup")).is_err());
         assert_eq!(
             fs::read_to_string(&outside_env).expect("outside env"),
             "outside\n"
@@ -2186,6 +2228,47 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
             fs::read_to_string(outside_state.join("token.json")).expect("outside token"),
             "outside\n"
         );
+        assert!(!home.skills_dir().join("telegram").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_setup_hook_removes_wrong_type_generated_outputs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("telegram-wrong-type-setup-outputs");
+        write_channel_skill_with_wrong_type_setup_outputs(&skill_source);
+        let manager = FakeUnitManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: temp_dir.path(),
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
+                env_inputs: ConnectEnvInputs {
+                    setup_profile: Some("testprofile".to_string()),
+                    ..ConnectEnvInputs::default()
+                },
+                contact: ChannelContactSetup::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("failing setup hook should fail connect");
+
+        assert!(err.to_string().contains("exited with"));
+        assert!(fs::symlink_metadata(channel_setup_env_file(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(channel_setup_state_dir(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(channel_setup_dir(&home, "telegram")).is_err());
+        assert!(fs::symlink_metadata(home.config_dir().join("channel-setup")).is_err());
+        assert!(!home.channel_env_path("telegram").exists());
         assert!(!home.skills_dir().join("telegram").exists());
     }
 

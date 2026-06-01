@@ -78,13 +78,8 @@ pub(crate) fn read_private_file_to_string(
     path: &Path,
     label: &str,
 ) -> Result<Option<String>> {
-    if !private_parent_chain_exists(home, path, label)? {
+    let Some(metadata) = private_path_metadata_if_exists(home, path, label)? else {
         return Ok(None);
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     ensure_private_file_metadata(path, label, metadata)?;
     harden_private_file(path, label)?;
@@ -94,13 +89,8 @@ pub(crate) fn read_private_file_to_string(
 }
 
 pub(crate) fn private_file_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<bool> {
-    if !private_parent_chain_exists(home, path, label)? {
+    let Some(metadata) = private_path_metadata_if_exists(home, path, label)? else {
         return Ok(false);
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     ensure_private_file_metadata(path, label, metadata)?;
     Ok(true)
@@ -111,13 +101,8 @@ pub(crate) fn remove_private_file_if_exists(
     path: &Path,
     label: &str,
 ) -> Result<()> {
-    if !private_parent_chain_exists(home, path, label)? {
+    let Some(metadata) = private_path_metadata_if_exists(home, path, label)? else {
         return Ok(());
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     if metadata.file_type().is_symlink() {
         return fs::remove_file(path)
@@ -132,13 +117,8 @@ pub(crate) fn remove_private_dir_all_if_exists(
     path: &Path,
     label: &str,
 ) -> Result<()> {
-    if !private_parent_chain_exists(home, path, label)? {
+    let Some(metadata) = private_path_metadata_if_exists(home, path, label)? else {
         return Ok(());
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     if metadata.file_type().is_symlink() {
         return fs::remove_file(path)
@@ -146,6 +126,44 @@ pub(crate) fn remove_private_dir_all_if_exists(
     }
     ensure_private_dir_metadata(path, label, metadata)?;
     fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+pub(crate) fn remove_private_dir_if_empty(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    if !private_dir_exists(home, path, label)? {
+        return Ok(());
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+pub(crate) fn remove_private_path_if_exists(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    let Some(metadata) = private_path_metadata_if_exists(home, path, label)? else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()));
+    }
+    if metadata.is_dir() {
+        ensure_private_dir_metadata(path, label, metadata)?;
+        return fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove {}", path.display()));
+    }
+    bail!(
+        "{label} {} is not a regular file or directory",
+        path.display()
+    );
 }
 
 pub(crate) fn read_private_dir_file_paths(
@@ -209,6 +227,21 @@ fn create_home_root(root: &Path) -> Result<()> {
             ensure_private_dir(root, "LionClaw home")
         }
         Err(err) => Err(err).with_context(|| format!("failed to stat {}", root.display())),
+    }
+}
+
+fn private_path_metadata_if_exists(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<Option<fs::Metadata>> {
+    if !private_parent_chain_exists(home, path, label)? {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
 }
 
@@ -582,5 +615,77 @@ mod tests {
             fs::read_to_string(outside.join("token.json")).expect("outside token"),
             "outside\n"
         );
+    }
+
+    #[test]
+    fn private_path_cleanup_removes_generated_file_or_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let file_path = home.config_dir().join("channel-setup/email/generated.env");
+        create_private_dir_all(
+            &home,
+            file_path.parent().expect("setup env parent"),
+            "setup env dir",
+        )
+        .expect("setup env parent");
+        fs::write(&file_path, "generated\n").expect("generated file");
+
+        remove_private_path_if_exists(&home, &file_path, "channel setup output")
+            .expect("remove generated file");
+
+        assert!(fs::symlink_metadata(&file_path).is_err());
+
+        let dir_path = home.config_dir().join("channel-setup/email/state");
+        fs::create_dir(&dir_path).expect("generated dir");
+        fs::write(dir_path.join("token.json"), "generated\n").expect("generated state");
+
+        remove_private_path_if_exists(&home, &dir_path, "channel setup output")
+            .expect("remove generated dir");
+
+        assert!(fs::symlink_metadata(&dir_path).is_err());
+    }
+
+    #[test]
+    fn private_empty_dir_cleanup_preserves_non_empty_dir() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let setup_dir = home.config_dir().join("channel-setup/email");
+        create_private_dir_all(&home, &setup_dir, "channel setup dir").expect("setup dir");
+        fs::write(setup_dir.join("state.json"), "state\n").expect("state file");
+
+        remove_private_dir_if_empty(&home, &setup_dir, "channel setup dir")
+            .expect("non-empty cleanup");
+
+        assert!(setup_dir.exists());
+        fs::remove_file(setup_dir.join("state.json")).expect("remove state file");
+
+        remove_private_dir_if_empty(&home, &setup_dir, "channel setup dir").expect("empty cleanup");
+
+        assert!(fs::symlink_metadata(&setup_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_path_cleanup_unlinks_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let path = home.config_dir().join("channel-setup/email/generated.env");
+        create_private_dir_all(
+            &home,
+            path.parent().expect("setup env parent"),
+            "setup env dir",
+        )
+        .expect("setup env parent");
+        let outside = temp_dir.path().join("outside.env");
+        fs::write(&outside, "outside\n").expect("outside");
+        symlink(&outside, &path).expect("target symlink");
+
+        remove_private_path_if_exists(&home, &path, "channel setup output")
+            .expect("remove target symlink");
+
+        assert!(fs::symlink_metadata(&path).is_err());
+        assert_eq!(fs::read_to_string(&outside).expect("outside"), "outside\n");
     }
 }
