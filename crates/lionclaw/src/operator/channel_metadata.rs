@@ -627,7 +627,7 @@ mod tests {
     };
     use crate::{
         home::LionClawHome,
-        operator::snapshot::{copy_snapshot_tree, install_snapshot},
+        operator::snapshot::{copy_snapshot_tree, install_snapshot, SKILL_INSTALL_METADATA_FILE},
     };
 
     #[cfg(unix)]
@@ -965,6 +965,36 @@ mod tests {
         assert_eq!(
             discovered.skill_dir,
             fs::canonicalize(home.skills_dir().join("telegram")).expect("installed path")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_preserves_external_channel_snapshot_with_malformed_install_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let external = write_channel_skill(temp_dir.path(), "external-telegram", "telegram");
+        let snapshot_dir = home.skills_dir().join("telegram");
+        copy_snapshot_tree(&external, &snapshot_dir).expect("install");
+        fs::write(
+            snapshot_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "source = [\n",
+        )
+        .expect("malformed metadata");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(
+            discovered.source,
+            ChannelSkillSource::Installed {
+                alias: "telegram".to_string()
+            }
+        );
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert_eq!(
+            discovered.skill_dir,
+            fs::canonicalize(snapshot_dir).expect("installed path")
         );
     }
 }

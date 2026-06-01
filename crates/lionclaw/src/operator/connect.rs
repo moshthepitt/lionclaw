@@ -1426,6 +1426,7 @@ mod tests {
                 UnitManager,
             },
             reconcile::{add_skill, ChannelContactSetup, StackBinaryPaths},
+            snapshot::SKILL_INSTALL_METADATA_FILE,
         },
     };
 
@@ -3283,7 +3284,7 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bundled_connect_preserves_external_same_id_channel_snapshot() {
+    async fn bundled_connect_preserves_external_same_id_channel_snapshot_with_malformed_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
@@ -3302,6 +3303,13 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
         )
         .await
         .expect("install external channel skill");
+        fs::write(
+            home.skills_dir()
+                .join("telegram")
+                .join(SKILL_INSTALL_METADATA_FILE),
+            "source = [\n",
+        )
+        .expect("malformed install metadata");
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
         let manager = FakeUnitManager::default();

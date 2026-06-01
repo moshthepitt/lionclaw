@@ -438,7 +438,7 @@ pub(crate) fn installed_snapshot_matches_source(
     snapshot_dir: &Path,
     source_path: &Path,
 ) -> Result<bool> {
-    let Some(metadata) = read_install_metadata_file(snapshot_dir)? else {
+    let Some(metadata) = read_install_metadata_file_for_source_match(snapshot_dir)? else {
         return Ok(false);
     };
     let source = metadata.source.trim();
@@ -451,6 +451,27 @@ pub(crate) fn installed_snapshot_matches_source(
 }
 
 fn read_install_metadata_file(snapshot_dir: &Path) -> Result<Option<InstallMetadataFile>> {
+    let Some((metadata_path, content)) = read_install_metadata_content(snapshot_dir)? else {
+        return Ok(None);
+    };
+    let metadata = parse_install_metadata_file(&metadata_path, &content)?;
+    Ok(Some(metadata))
+}
+
+fn read_install_metadata_file_for_source_match(
+    snapshot_dir: &Path,
+) -> Result<Option<InstallMetadataFile>> {
+    let Some((metadata_path, content)) = read_install_metadata_content(snapshot_dir)? else {
+        return Ok(None);
+    };
+    // Malformed metadata is not evidence that a snapshot came from a given source.
+    match parse_install_metadata_file(&metadata_path, &content) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_install_metadata_content(snapshot_dir: &Path) -> Result<Option<(PathBuf, String)>> {
     let metadata_path = snapshot_dir.join(SKILL_INSTALL_METADATA_FILE);
     let metadata = match fs::symlink_metadata(&metadata_path) {
         Ok(metadata) => metadata,
@@ -474,9 +495,11 @@ fn read_install_metadata_file(snapshot_dir: &Path) -> Result<Option<InstallMetad
 
     let content = fs::read_to_string(&metadata_path)
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
-    let metadata: InstallMetadataFile = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
-    Ok(Some(metadata))
+    Ok(Some((metadata_path, content)))
+}
+
+fn parse_install_metadata_file(metadata_path: &Path, content: &str) -> Result<InstallMetadataFile> {
+    toml::from_str(content).with_context(|| format!("failed to parse {}", metadata_path.display()))
 }
 
 fn snapshot_mode_bits(metadata: &fs::Metadata) -> u32 {
@@ -533,7 +556,7 @@ mod tests {
 
     use super::{
         install_snapshot, install_snapshot_with_overlays, installed_snapshot_matches_source,
-        SnapshotOverlay,
+        SnapshotOverlay, SKILL_INSTALL_METADATA_FILE,
     };
 
     fn write_skill_source(root: &Path, name: &str) -> PathBuf {
@@ -612,6 +635,32 @@ mod tests {
             !installed_snapshot_matches_source(&installed.snapshot_abs_dir, &other_source)
                 .expect("source mismatch")
         );
+    }
+
+    #[test]
+    fn treats_malformed_install_metadata_as_source_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-telegram");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+        let installed = install_snapshot(
+            &home,
+            "telegram",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("snapshot");
+        fs::write(
+            installed.snapshot_abs_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "source = [\n",
+        )
+        .expect("malformed metadata");
+
+        let matches_source =
+            installed_snapshot_matches_source(&installed.snapshot_abs_dir, &source_dir)
+                .expect("source mismatch");
+
+        assert!(!matches_source);
     }
 
     #[test]
