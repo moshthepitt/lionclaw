@@ -1499,6 +1499,7 @@ async fn post_token_form(
     form: Vec<(String, String)>,
 ) -> Result<TokenResponse> {
     let token_endpoint_url = validate_oauth_endpoint("OAuth2 token endpoint", token_endpoint)?;
+    let token_endpoint_diagnostic = oauth_endpoint_for_diagnostic(&token_endpoint_url);
     let client = reqwest::Client::builder()
         .timeout(TOKEN_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -1509,7 +1510,9 @@ async fn post_token_form(
         .form(&form)
         .send()
         .await
-        .with_context(|| format!("failed to call OAuth2 token endpoint {token_endpoint}"))?;
+        .with_context(|| {
+            format!("failed to call OAuth2 token endpoint {token_endpoint_diagnostic}")
+        })?;
     let status = response.status();
     if status.is_redirection() {
         bail!(
@@ -1570,6 +1573,13 @@ async fn read_token_response_text(mut response: reqwest::Response) -> Result<Str
 
 fn render_token_endpoint_diagnostic(raw: &str) -> String {
     render_operator_diagnostic(raw, false).unwrap_or_else(|| "empty response".to_string())
+}
+
+fn oauth_endpoint_for_diagnostic(url: &reqwest::Url) -> String {
+    let mut diagnostic = url.clone();
+    diagnostic.set_query(None);
+    diagnostic.set_fragment(None);
+    diagnostic.to_string()
 }
 
 fn expires_at(expires_in: Option<i64>) -> Option<DateTime<Utc>> {
@@ -2168,6 +2178,21 @@ mod tests {
             validate_oauth_endpoint("--auth-url", "https://accounts.example.com/oauth2#token")
                 .expect_err("endpoint fragment must fail");
         assert!(err.to_string().contains("fragment"));
+    }
+
+    #[test]
+    fn oauth_endpoint_diagnostic_strips_query_values() {
+        let url = validate_oauth_endpoint(
+            "--token-url",
+            "https://accounts.example.com/oauth2/token?client_secret=secret-client&tenant=contoso",
+        )
+        .expect("token endpoint");
+
+        let diagnostic = oauth_endpoint_for_diagnostic(&url);
+
+        assert_eq!(diagnostic, "https://accounts.example.com/oauth2/token");
+        assert!(!diagnostic.contains("secret-client"));
+        assert!(!diagnostic.contains("tenant"));
     }
 
     #[test]
