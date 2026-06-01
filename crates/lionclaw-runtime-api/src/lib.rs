@@ -673,9 +673,12 @@ fn write_state_file_atomically(
 }
 
 fn sync_state_directory(directory: &File, path: &Path, label: &str) -> Result<()> {
-    directory
-        .sync_all()
-        .with_context(|| format!("failed to sync directory '{}' after updating {label}", path.display()))
+    directory.sync_all().with_context(|| {
+        format!(
+            "failed to sync directory '{}' after updating {label}",
+            path.display()
+        )
+    })
 }
 
 fn ensure_state_file_name(file_name: &OsStr, label: &str) -> Result<()> {

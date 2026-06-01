@@ -141,10 +141,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_opencode_terminal_program(
             &self.config,
-            load_ready_opencode_session_id(
-                &input.runtime_state_root,
-                input.runtime_session_ready,
-            )?,
+            load_ready_opencode_session_id(&input.runtime_state_root, input.runtime_session_ready)?,
         ))
     }
 
