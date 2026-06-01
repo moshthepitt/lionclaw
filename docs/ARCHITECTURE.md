@@ -1002,9 +1002,9 @@ manually by the operator.
   credentials outside the managed paths. When setup runs, LionClaw backs up
   previous managed setup state, gives the helper a fresh managed state
   directory, and restores the previous state if setup or later channel startup
-  fails. Before committing generated state, LionClaw revalidates the managed
-  state directory as a private regular tree, rejects symlinks and special
-  files, and hardens retained setup state permissions.
+  fails. Before retaining generated or restored state, LionClaw revalidates the
+  managed state directory as a private regular tree, rejects symlinks and
+  special files, and hardens retained setup state permissions.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally

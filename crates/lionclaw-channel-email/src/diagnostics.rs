@@ -4,10 +4,25 @@ const OPERATOR_DIAGNOSTIC_MAX_CHARS: usize = 512;
 const TRUNCATED_MARKER: &str = " [truncated]";
 const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
     "access_token",
+    "access-token",
+    "access token",
+    "accesstoken",
     "refresh_token",
+    "refresh-token",
+    "refresh token",
+    "refreshtoken",
     "id_token",
+    "id-token",
+    "id token",
+    "idtoken",
     "client_secret",
+    "client-secret",
+    "client secret",
+    "clientsecret",
     "code_verifier",
+    "code-verifier",
+    "code verifier",
+    "codeverifier",
     "password",
 ];
 const SENSITIVE_HEADER_NAMES: &[&str] = &[
@@ -246,6 +261,21 @@ mod tests {
         );
         assert!(!rendered.contains("secret password"));
         assert!(!rendered.contains("client secret"));
+    }
+
+    #[test]
+    fn diagnostics_redact_common_oauth_secret_key_spellings() {
+        let rendered = render_operator_diagnostic(
+            "refreshToken=secret-refresh client-secret: secret-client access token = secret-access codeVerifier: secret-verifier",
+            false,
+        )
+        .expect("diagnostic");
+
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("secret-refresh"));
+        assert!(!rendered.contains("secret-client"));
+        assert!(!rendered.contains("secret-access"));
+        assert!(!rendered.contains("secret-verifier"));
     }
 
     #[test]

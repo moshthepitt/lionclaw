@@ -643,6 +643,7 @@ impl SetupStateRollback {
                     backup_dir.display()
                 )
             })?;
+            harden_private_setup_state_tree(home, &self.state_dir)?;
         }
         remove_private_dir_if_empty(home, setup_dir, "channel setup directory")?;
         if let Some(setup_root_dir) = setup_dir.parent() {
@@ -2574,12 +2575,21 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_connect_after_setup_restores_previous_setup_state() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
         let state_file = channel_setup_state_dir(&home, "telegram").join("gmail/old.json");
         fs::create_dir_all(state_file.parent().expect("state parent")).expect("state dir");
         fs::write(&state_file, "old-state\n").expect("old state");
+        fs::set_permissions(
+            state_file.parent().expect("state parent"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("loosen state dir");
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644))
+            .expect("loosen state file");
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
         let mut config = OperatorConfig::load(&home).await.expect("load config");
         config.daemon.bind = format!(
@@ -2618,6 +2628,22 @@ case "$LIONCLAW_CHANNEL_SETUP_STATE_DIR" in /*) ;; *) exit 46;; esac
         assert_eq!(
             fs::read_to_string(&state_file).expect("restored state"),
             "old-state\n"
+        );
+        assert_eq!(
+            fs::metadata(state_file.parent().expect("state parent"))
+                .expect("restored state dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&state_file)
+                .expect("restored state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
         assert!(
             !channel_setup_state_dir(&home, "telegram")
