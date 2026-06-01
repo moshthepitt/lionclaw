@@ -1011,9 +1011,10 @@ manually by the operator.
 - Channel env is selected-instance state under `config/channels/` and may
   contain only names declared by the channel metadata. Generated unit env may
   reference that private file, but generated unit env is not the source of
-  truth. Env updates merge by declared key; an empty value clears an existing
-  stored key, so channel-owned setup helpers can remove obsolete optional
-  values during reconfiguration.
+  truth. Env updates merge by declared key; required values must stay
+  non-empty, while an empty optional value clears the existing stored key so
+  channel-owned setup helpers can remove obsolete optional values during
+  reconfiguration.
 
 Worker entrypoint resolution uses the metadata `worker` path and rejects
 symlink escapes outside the skill directory.

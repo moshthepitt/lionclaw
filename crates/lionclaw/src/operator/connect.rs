@@ -1095,7 +1095,15 @@ fn ensure_required_env<R: BufRead, W: Write>(
         optional_env,
         &env_inputs.from_env,
     )?;
-    updates.extend(collect_from_process_env(&env_inputs.from_env)?);
+    let env_updates = collect_from_process_env(&env_inputs.from_env)?;
+    validate_declared_env_updates(
+        channel_id,
+        required_env,
+        optional_env,
+        &env_updates,
+        "process environment",
+    )?;
+    updates.extend(env_updates);
     validate_no_undeclared_channel_env(home, channel_id, required_env, optional_env)?;
     if !updates.is_empty() {
         merge_channel_env_if_changed(home, channel_id, &updates)?;
@@ -1185,18 +1193,31 @@ fn validate_declared_env_updates(
 ) -> Result<()> {
     let declared = declared_env_set(required_env, optional_env)?;
     let mut undeclared = Vec::new();
-    for key in updates.keys() {
+    let required = required_env
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut empty_required = Vec::new();
+    for (key, value) in updates {
         if !declared.contains(key.as_str()) {
             undeclared.push(key.as_str());
+        } else if required.contains(key.as_str()) && value.is_empty() {
+            empty_required.push(key.as_str());
         }
     }
-    if undeclared.is_empty() {
-        return Ok(());
+    if !undeclared.is_empty() {
+        bail!(
+            "{source} contains environment values not declared by channel '{channel_id}' metadata: {}",
+            undeclared.join(", ")
+        )
     }
-    bail!(
-        "{source} contains environment values not declared by channel '{channel_id}' metadata: {}",
-        undeclared.join(", ")
-    )
+    if !empty_required.is_empty() {
+        bail!(
+            "{source} contains empty required environment values for channel '{channel_id}': {}",
+            empty_required.join(", ")
+        )
+    }
+    Ok(())
 }
 
 fn validate_declared_env_input_names(
@@ -1864,6 +1885,47 @@ exit 17
     }
 
     #[test]
+    fn env_file_empty_required_value_rejects_without_changing_existing_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut existing = ChannelEnv::new();
+        existing.insert("TELEGRAM_BOT_TOKEN".to_string(), "old-token".to_string());
+        save_channel_env(&home, "telegram", &existing).expect("save env");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=\n").expect("env file");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: &[],
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                    ..ConnectEnvInputs::default()
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect_err("empty required env should fail before merge");
+
+        assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("load env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("old-token")
+        );
+    }
+
+    #[test]
     fn from_env_rejects_undeclared_names_before_reading_process_env() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
@@ -1891,6 +1953,48 @@ exit 17
 
         assert!(err.to_string().contains("EXTRA_SECRET"));
         assert!(!err.to_string().contains("is not set"));
+    }
+
+    #[test]
+    fn from_env_empty_required_value_rejects_without_changing_existing_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut existing = ChannelEnv::new();
+        existing.insert("TELEGRAM_BOT_TOKEN".to_string(), "old-token".to_string());
+        save_channel_env(&home, "telegram", &existing).expect("save env");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = {
+            let _guard = EnvRestore::set([("TELEGRAM_BOT_TOKEN", Some(""))]);
+            ensure_required_env(
+                RequiredEnvRequest {
+                    home: &home,
+                    channel_id: "telegram",
+                    required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                    optional_env: &[],
+                    env_inputs: ConnectEnvInputs {
+                        env_file: None,
+                        from_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+                        ..ConnectEnvInputs::default()
+                    },
+                    interactive: false,
+                    hide_prompt_input: false,
+                },
+                &mut input,
+                &mut output,
+            )
+            .expect_err("empty required env should fail before merge")
+        };
+
+        assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("load env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("old-token")
+        );
     }
 
     #[test]
