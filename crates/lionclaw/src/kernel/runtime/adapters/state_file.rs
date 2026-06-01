@@ -10,7 +10,18 @@ use rustix::{
     io::Errno,
 };
 
-use crate::durable_fs::write_file_atomically;
+use crate::{durable_fs::write_file_atomically, home::runtime_session_ready_marker_exists};
+
+pub(super) fn load_ready_state_value(
+    runtime_state_root: &Path,
+    file_name: &str,
+    label: &str,
+) -> Result<Option<String>> {
+    if !runtime_session_ready_marker_exists(runtime_state_root)? {
+        return Ok(None);
+    }
+    load_state_value(runtime_state_root, file_name, label)
+}
 
 pub(super) fn load_state_value(
     runtime_state_root: &Path,

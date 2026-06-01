@@ -14,24 +14,21 @@ use tokio::{
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{
-    home::runtime_session_ready_marker_exists,
-    kernel::runtime::{
-        spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
-        RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
-        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-        RuntimeTerminalTranscriptState, RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn,
-        RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
-    },
+use crate::kernel::runtime::{
+    spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptState,
+    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+    RuntimeTurnMode, RuntimeTurnResult,
 };
 
 use super::{
     choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
-    state_file::{load_state_value, save_state_value},
+    state_file::{load_ready_state_value, load_state_value, save_state_value},
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
@@ -729,10 +726,12 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let thread_id = match input.runtime_state_root.as_deref() {
-            Some(root) if runtime_session_ready_marker_exists(root)? => load_saved_thread_id(root)?,
-            Some(_) | None => None,
-        };
+        let thread_id = input
+            .runtime_state_root
+            .as_deref()
+            .map(load_ready_saved_thread_id)
+            .transpose()?
+            .flatten();
         let resumes_existing_session = thread_id.is_some();
         self.sessions
             .write()
@@ -766,7 +765,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_codex_terminal_program(
             &self.config,
-            load_saved_thread_id(&input.runtime_state_root)?,
+            load_ready_saved_thread_id(&input.runtime_state_root)?,
         ))
     }
 
@@ -2819,6 +2818,10 @@ fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
     load_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
 }
 
+fn load_ready_saved_thread_id(root: &Path) -> Result<Option<String>> {
+    load_ready_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
+}
+
 fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
     save_state_value(root, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
 }
@@ -3265,6 +3268,11 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write ready marker");
         save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
 
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
@@ -3425,6 +3433,25 @@ mod tests {
             sent[4].pointer("/params/cursor").and_then(Value::as_str),
             Some("turns-page-2")
         );
+    }
+
+    #[test]
+    fn codex_terminal_program_ignores_saved_thread_without_ready_marker() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+            })
+            .expect("terminal program");
+
+        assert!(!program.args.iter().any(|arg| arg == "resume"));
+        assert!(!program.args.iter().any(|arg| arg == "thr_saved"));
     }
 
     #[tokio::test]
