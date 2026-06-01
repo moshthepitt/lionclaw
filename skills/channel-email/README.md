@@ -116,6 +116,10 @@ EOF
 "$LIONCLAW_BIN" doctor
 ```
 
+`EMAIL_AUTH_MODE=basic` is explicit for new configs; existing basic-auth
+channel env from older installs that lacks `EMAIL_AUTH_MODE` is still treated
+as basic by the worker.
+
 ### OAuth2 / XOAUTH2
 
 For providers that require OAuth, use the provider profile on `connect`

@@ -174,7 +174,7 @@ impl WorkerCommand {
         )?;
         let sender_auth = parse_sender_auth_config(required_env("EMAIL_AUTH_RESULTS_HOST")?)?;
         let auth = parse_mailbox_auth_config(
-            required_env("EMAIL_AUTH_MODE")?,
+            optional_env("EMAIL_AUTH_MODE"),
             optional_env("EMAIL_IMAP_PASSWORD"),
             optional_env("EMAIL_SMTP_PASSWORD"),
             optional_env("EMAIL_XOAUTH2_TOKEN_CMD"),
@@ -278,13 +278,14 @@ fn parse_sender_auth_config(authserv_id: String) -> Result<SenderAuthConfig> {
 }
 
 fn parse_mailbox_auth_config(
-    mode: String,
+    mode: Option<String>,
     imap_password: Option<String>,
     smtp_password: Option<String>,
     token_command: Option<String>,
     imap_tls: ImapTlsMode,
     smtp_tls: SmtpTlsMode,
 ) -> Result<MailboxAuthConfig> {
+    let mode = mode.unwrap_or_else(|| "basic".to_string());
     match mode.trim().to_ascii_lowercase().as_str() {
         "basic" => Ok(MailboxAuthConfig::Basic {
             imap_password: imap_password.ok_or_else(|| {
@@ -541,7 +542,7 @@ mod tests {
     #[test]
     fn mailbox_auth_basic_requires_passwords() {
         let err = parse_mailbox_auth_config(
-            "basic".to_string(),
+            Some("basic".to_string()),
             Some("imap-secret".to_string()),
             None,
             None,
@@ -556,7 +557,7 @@ mod tests {
     #[test]
     fn mailbox_auth_xoauth2_requires_token_command_and_tls() {
         let err = parse_mailbox_auth_config(
-            "xoauth2".to_string(),
+            Some("xoauth2".to_string()),
             None,
             None,
             None,
@@ -567,7 +568,7 @@ mod tests {
         assert!(err.to_string().contains("EMAIL_XOAUTH2_TOKEN_CMD"));
 
         let err = parse_mailbox_auth_config(
-            "xoauth2".to_string(),
+            Some("xoauth2".to_string()),
             None,
             None,
             Some("/usr/local/bin/token".to_string()),
@@ -581,7 +582,7 @@ mod tests {
     #[test]
     fn mailbox_auth_mode_ignores_inactive_credential_family() {
         let auth = parse_mailbox_auth_config(
-            "xoauth2".to_string(),
+            Some("xoauth2".to_string()),
             Some("imap-secret".to_string()),
             Some("smtp-secret".to_string()),
             Some("/usr/local/bin/token".to_string()),
@@ -592,7 +593,7 @@ mod tests {
         assert_eq!(auth.mode_name(), "xoauth2");
 
         let auth = parse_mailbox_auth_config(
-            "basic".to_string(),
+            Some("basic".to_string()),
             Some("imap-secret".to_string()),
             Some("smtp-secret".to_string()),
             Some("relative-token-helper".to_string()),
@@ -600,6 +601,21 @@ mod tests {
             SmtpTlsMode::StartTls,
         )
         .expect("basic auth should ignore stale token helper");
+        assert_eq!(auth.mode_name(), "basic");
+    }
+
+    #[test]
+    fn mailbox_auth_defaults_to_basic_for_legacy_env() {
+        let auth = parse_mailbox_auth_config(
+            None,
+            Some("imap-secret".to_string()),
+            Some("smtp-secret".to_string()),
+            None,
+            ImapTlsMode::Implicit,
+            SmtpTlsMode::StartTls,
+        )
+        .expect("legacy basic auth should default to basic");
+
         assert_eq!(auth.mode_name(), "basic");
     }
 }
