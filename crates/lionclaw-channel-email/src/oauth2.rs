@@ -1535,13 +1535,16 @@ fn validate_successful_token_response(response: &TokenResponse) -> Result<()> {
     if let Some(access_token) = response.access_token.as_deref() {
         validate_access_token("OAuth2 token endpoint", access_token)?;
     }
-    if let Some(token_type) = response.token_type.as_deref() {
-        if !token_type.eq_ignore_ascii_case("bearer") {
-            bail!(
-                "OAuth2 token endpoint returned token_type {:?}; email XOAUTH2 requires Bearer access tokens",
-                truncate_for_error(token_type)
-            );
-        }
+    let token_type = response.token_type.as_deref().ok_or_else(|| {
+        anyhow!(
+            "OAuth2 token endpoint omitted token_type; email XOAUTH2 requires Bearer access tokens"
+        )
+    })?;
+    if !token_type.eq_ignore_ascii_case("bearer") {
+        bail!(
+            "OAuth2 token endpoint returned token_type {:?}; email XOAUTH2 requires Bearer access tokens",
+            truncate_for_error(token_type)
+        );
     }
     Ok(())
 }
@@ -2864,6 +2867,22 @@ mod tests {
             .expect_err("invalid access token should fail");
 
         assert!(err.to_string().contains("whitespace"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn token_response_requires_bearer_token_type() {
+        let (endpoint, server) =
+            token_endpoint_with_body(r#"{"access_token":"new-access-token","expires_in":3600}"#)
+                .await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("token response without token_type should fail");
+
+        assert!(err.to_string().contains("token_type"));
+        assert!(err.to_string().contains("Bearer"));
         server.await.expect("server task");
     }
 
