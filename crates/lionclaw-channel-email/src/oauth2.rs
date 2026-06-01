@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     auth::validate_access_token,
     config::validate_authserv_id,
+    diagnostics::render_operator_diagnostic,
     protocol::{mailbox_id_for, normalize_address},
 };
 
@@ -1517,15 +1518,14 @@ async fn post_token_form(
     }
     let text = read_token_response_text(response).await?;
     let parsed: TokenResponse = serde_json::from_str(&text).with_context(|| {
-        format!(
-            "OAuth2 token endpoint returned non-JSON response: {}",
-            truncate_for_error(&text)
-        )
+        let diagnostic = render_token_endpoint_diagnostic(&text);
+        format!("OAuth2 token endpoint returned non-JSON response: {diagnostic}")
     })?;
     if !status.is_success() || parsed.error.is_some() {
         let error = parsed.error.as_deref().unwrap_or("token_endpoint_error");
         let description = parsed.error_description.as_deref().unwrap_or("");
-        bail!("OAuth2 token endpoint returned {status}: {error} {description}");
+        let diagnostic = render_token_endpoint_diagnostic(&format!("{error} {description}"));
+        bail!("OAuth2 token endpoint returned {status}: {diagnostic}");
     }
     validate_successful_token_response(&parsed)?;
     Ok(parsed)
@@ -1541,9 +1541,10 @@ fn validate_successful_token_response(response: &TokenResponse) -> Result<()> {
         )
     })?;
     if !token_type.eq_ignore_ascii_case("bearer") {
+        let token_type = render_token_endpoint_diagnostic(token_type);
         bail!(
             "OAuth2 token endpoint returned token_type {:?}; email XOAUTH2 requires Bearer access tokens",
-            truncate_for_error(token_type)
+            token_type
         );
     }
     Ok(())
@@ -1567,18 +1568,8 @@ async fn read_token_response_text(mut response: reqwest::Response) -> Result<Str
     String::from_utf8(body).context("OAuth2 token response must be UTF-8")
 }
 
-fn truncate_for_error(text: &str) -> String {
-    const MAX: usize = 512;
-    if text.len() <= MAX {
-        return text.to_string();
-    }
-    let end = text
-        .char_indices()
-        .map(|(index, ch)| index + ch.len_utf8())
-        .take_while(|end| *end <= MAX)
-        .last()
-        .unwrap_or(0);
-    format!("{}...", &text[..end])
+fn render_token_endpoint_diagnostic(raw: &str) -> String {
+    render_operator_diagnostic(raw, false).unwrap_or_else(|| "empty response".to_string())
 }
 
 fn expires_at(expires_in: Option<i64>) -> Option<DateTime<Utc>> {
@@ -2749,13 +2740,13 @@ mod tests {
     }
 
     #[test]
-    fn token_error_truncation_preserves_utf8_boundaries() {
-        let message = "é".repeat(300);
+    fn token_endpoint_diagnostic_truncation_preserves_utf8_boundaries() {
+        let message = "é".repeat(600);
 
-        let truncated = truncate_for_error(&message);
+        let rendered = render_token_endpoint_diagnostic(&message);
 
-        assert!(truncated.ends_with("..."));
-        assert!(truncated.len() <= 515);
+        assert!(rendered.ends_with("[truncated]"));
+        assert!(rendered.chars().count() <= 512);
     }
 
     #[tokio::test]
@@ -2857,6 +2848,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_json_error_diagnostic_is_redacted() {
+        let (endpoint, server) = token_endpoint_with_status(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"refresh_token : secret-refresh client_secret=secret-client revoked"}"#,
+        )
+        .await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("token endpoint error should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("invalid_grant"));
+        assert!(message.contains("revoked"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("secret-refresh"));
+        assert!(!message.contains("secret-client"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn token_non_json_error_diagnostic_is_redacted() {
+        let (endpoint, server) = token_endpoint_with_status(
+            "400 Bad Request",
+            "upstream echoed refresh_token=secret-refresh client_secret : secret-client",
+        )
+        .await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("non-JSON token endpoint error should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("non-JSON"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("secret-refresh"));
+        assert!(!message.contains("secret-client"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn token_response_rejects_invalid_access_token_text() {
         let (endpoint, server) =
             token_endpoint_with_body(r#"{"access_token":"bad token","expires_in":3600}"#).await;
@@ -2903,18 +2937,45 @@ mod tests {
         server.await.expect("server task");
     }
 
+    #[tokio::test]
+    async fn token_type_diagnostic_is_redacted() {
+        let (endpoint, server) = token_endpoint_with_body(
+            r#"{"access_token":"new-access-token","token_type":"client_secret=secret-client","expires_in":3600}"#,
+        )
+        .await;
+        let state = test_token_state(endpoint);
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("unsupported token type should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("token_type"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("secret-client"));
+        server.await.expect("server task");
+    }
+
     async fn token_endpoint_with_body(
+        body: impl Into<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        token_endpoint_with_status("200 OK", body).await
+    }
+
+    async fn token_endpoint_with_status(
+        status: impl Into<String>,
         body: impl Into<String>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
         let port = listener.local_addr().expect("addr").port();
         let body = body.into();
+        let status = status.into();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = vec![0; 1024];
             let _ = stream.read(&mut request).await.expect("read request");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream
