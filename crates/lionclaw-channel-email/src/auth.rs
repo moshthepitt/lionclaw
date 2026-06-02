@@ -451,11 +451,17 @@ error=invalid_grant&refresh_token=secret-refresh-token client_secret:"secret-cli
 
     #[cfg(unix)]
     fn write_token_helper(path: &Path, content: &str) {
-        use std::os::unix::fs::PermissionsExt;
+        use std::{io::Write as _, os::unix::fs::PermissionsExt};
 
-        std::fs::write(path, content).expect("write helper");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        let temp_path = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temp_path).expect("create helper temp");
+        file.write_all(content.as_bytes())
+            .expect("write helper temp");
+        file.sync_all().expect("sync helper temp");
+        drop(file);
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod helper");
+        std::fs::rename(&temp_path, path).expect("publish helper");
     }
 
     struct EnvRestore {
