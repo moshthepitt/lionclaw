@@ -1455,7 +1455,8 @@ where
     if request.ends_with(b"\r") {
         request.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&request).to_string()))
+    let line = String::from_utf8(request).context("OAuth2 callback request line must be UTF-8")?;
+    Ok(Some(line))
 }
 
 fn parse_http_get_target(first_line: &str) -> Option<&str> {
@@ -1483,17 +1484,20 @@ fn parse_callback_target(target: &str) -> Result<ParsedCallbackTarget> {
 fn parse_urlencoded_query(query: &str) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode(key);
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_query_component(raw_key)
+            .map_err(|err| anyhow!("OAuth2 callback query parameter name is invalid: {err}"))?;
         if values.contains_key(&key) {
             bail!("OAuth2 callback query contains duplicate '{key}' parameter");
         }
-        values.insert(key, percent_decode(value));
+        let value = percent_decode_query_component(raw_value)
+            .map_err(|err| anyhow!("OAuth2 callback query parameter '{key}' is invalid: {err}"))?;
+        values.insert(key, value);
     }
     Ok(values)
 }
 
-fn percent_decode(raw: &str) -> String {
+fn percent_decode_query_component(raw: &str) -> Result<String> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -1503,16 +1507,18 @@ fn percent_decode(raw: &str) -> String {
                 out.push(b' ');
                 index += 1;
             }
-            b'%' if index + 2 < bytes.len() => {
-                if let (Some(hi), Some(lo)) =
-                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-                {
-                    out.push((hi << 4) | lo);
-                    index += 3;
-                } else {
-                    out.push(bytes[index]);
-                    index += 1;
-                }
+            b'%' => {
+                let Some(encoded) = bytes.get(index + 1..index + 3) else {
+                    bail!("invalid percent encoding");
+                };
+                let Some(hi) = hex_value(encoded[0]) else {
+                    bail!("invalid percent encoding");
+                };
+                let Some(lo) = hex_value(encoded[1]) else {
+                    bail!("invalid percent encoding");
+                };
+                out.push((hi << 4) | lo);
+                index += 3;
             }
             byte => {
                 out.push(byte);
@@ -1520,7 +1526,7 @@ fn percent_decode(raw: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8(out).context("invalid UTF-8")
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -2794,6 +2800,27 @@ mod tests {
         assert!(err.to_string().contains("duplicate 'code'"));
     }
 
+    #[test]
+    fn callback_query_rejects_invalid_percent_encoding() {
+        for target in [
+            "/oauth2/callback?code=bad%zz&state=expected",
+            "/oauth2/callback?code=bad%&state=expected",
+        ] {
+            let err =
+                parse_callback_target(target).expect_err("invalid percent encoding should fail");
+
+            assert!(err.to_string().contains("invalid percent encoding"));
+        }
+    }
+
+    #[test]
+    fn callback_query_rejects_non_utf8_percent_encoding() {
+        let err = parse_callback_target("/oauth2/callback?code=%ff&state=expected")
+            .expect_err("non-UTF-8 callback query should fail");
+
+        assert!(err.to_string().contains("UTF-8"));
+    }
+
     #[tokio::test]
     async fn callback_request_read_is_best_effort() {
         let mut reader = FailingReader;
@@ -2801,6 +2828,19 @@ mod tests {
         assert!(read_callback_request_line_best_effort(&mut reader)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_request_line_rejects_invalid_utf8() {
+        let mut reader = std::io::Cursor::new(
+            b"GET /oauth2/callback?code=\xff&state=expected HTTP/1.1\r\n".to_vec(),
+        );
+
+        let err = read_callback_request_line(&mut reader)
+            .await
+            .expect_err("invalid UTF-8 request line should fail");
+
+        assert!(err.to_string().contains("UTF-8"));
     }
 
     #[tokio::test]
@@ -2879,6 +2919,31 @@ mod tests {
                 .await;
         assert!(ambiguous_response.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(ambiguous_response.contains("OAuth2 callback query was invalid"));
+
+        let good_response =
+            send_callback_request(port, "/oauth2/callback?code=good&state=expected").await;
+        assert!(good_response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "good");
+    }
+
+    #[tokio::test]
+    async fn callback_wait_continues_after_invalid_percent_encoding() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let malformed_response =
+            send_callback_request(port, "/oauth2/callback?code=bad%zz&state=expected").await;
+        assert!(malformed_response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(malformed_response.contains("OAuth2 callback query was invalid"));
 
         let good_response =
             send_callback_request(port, "/oauth2/callback?code=good&state=expected").await;
