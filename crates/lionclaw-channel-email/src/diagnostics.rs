@@ -1,4 +1,8 @@
 use anyhow::Error;
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
 
 const OPERATOR_DIAGNOSTIC_MAX_CHARS: usize = 512;
 const TRUNCATED_MARKER: &str = " [truncated]";
@@ -197,7 +201,7 @@ fn redact_sensitive_credential_schemes(text: &str) -> String {
             search_start = after_scheme;
             continue;
         };
-        if credential_scheme_value_is_sensitive(&redacted[value_start..value_end]) {
+        if credential_scheme_value_is_sensitive(scheme, &redacted[value_start..value_end]) {
             redacted.replace_range(value_start..value_end, replacement);
             search_start = value_start + replacement.len();
         } else {
@@ -258,8 +262,23 @@ fn credential_scheme_value_span(text: &str, mut index: usize) -> Option<(usize, 
     (start < index).then_some((start, index))
 }
 
-fn credential_scheme_value_is_sensitive(value: &str) -> bool {
-    value.chars().count() >= 8
+fn credential_scheme_value_is_sensitive(scheme: &str, value: &str) -> bool {
+    match scheme {
+        "basic" => looks_like_basic_credential(value),
+        "bearer" => value.chars().count() >= 8,
+        _ => false,
+    }
+}
+
+fn looks_like_basic_credential(value: &str) -> bool {
+    decode_base64(value).is_some_and(|decoded| decoded.contains(&b':'))
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    STANDARD
+        .decode(value)
+        .or_else(|_| STANDARD_NO_PAD.decode(value))
+        .ok()
 }
 
 fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
@@ -531,6 +550,19 @@ DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
         );
         assert!(!rendered.contains("lowercaseopaque"));
         assert!(!rendered.contains("dXNlcjpwYXNz"));
+    }
+
+    #[test]
+    fn diagnostics_redact_short_basic_credentials_without_redacting_plain_words() {
+        let rendered =
+            render_operator_diagnostic("Basic dTpw failed; Basic auth still enabled", false)
+                .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "Basic [redacted] failed; Basic auth still enabled"
+        );
+        assert!(!rendered.contains("dTpw"));
     }
 
     #[test]
