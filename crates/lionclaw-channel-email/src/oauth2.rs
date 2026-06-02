@@ -14,6 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use lionclaw_durable_fs::write_file_atomically;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -1848,45 +1849,7 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn write_private_text(path: &Path, content: &str) -> Result<()> {
     ensure_parent_dirs_without_symlinks(path, "private file")?;
     ensure_write_target_not_symlink(path, "private file")?;
-    let temp_path = private_temp_path(path)?;
-    let result = write_private_text_atomically(path, &temp_path, content);
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
-fn write_private_text_atomically(path: &Path, temp_path: &Path, content: &str) -> Result<()> {
-    let mut file = open_private_new_file(temp_path)?;
-    file.write_all(content.as_bytes())
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-    set_private_file_permissions(temp_path)?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
-    drop(file);
-
-    ensure_parent_dirs_without_symlinks(path, "private file")?;
-    ensure_write_target_not_symlink(path, "private file")?;
-    fs::rename(temp_path, path).with_context(|| {
-        format!(
-            "failed to replace '{}' with '{}'",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
-    sync_parent_dir(path)
-}
-
-fn private_temp_path(path: &Path) -> Result<PathBuf> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("private file {} does not have a file name", path.display()))?;
-    let mut temp_name = OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".tmp-{}", Uuid::new_v4()));
-    Ok(path.with_file_name(temp_name))
+    write_private_text_atomically(path, content.as_bytes())
 }
 
 fn ensure_existing_regular_file(path: &Path, label: &str) -> Result<()> {
@@ -1917,6 +1880,120 @@ fn ensure_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn write_private_text_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (parent, parent_path, file_name) = open_private_file_parent(path, "private file")?;
+    write_file_atomically(
+        &parent,
+        &parent_path,
+        &file_name,
+        content,
+        0o600,
+        Some(fs::Permissions::from_mode(0o600)),
+        "private file",
+    )
+}
+
+#[cfg(not(unix))]
+fn write_private_text_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    set_private_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn open_private_file_parent(path: &Path, label: &str) -> Result<(fs::File, PathBuf, OsString)> {
+    let file_name = path
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| anyhow!("{label} {} does not name a file", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{label} {} does not have a parent", path.display()))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let (parent, parent_path) = open_private_dir(parent, label)?;
+    Ok((parent, parent_path, file_name))
+}
+
+#[cfg(unix)]
+fn open_private_dir(path: &Path, label: &str) -> Result<(fs::File, PathBuf)> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+    use rustix::io::Errno;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut components = path.components();
+    let (mut current, mut current_path) = if path.is_absolute() {
+        match components.next() {
+            Some(Component::RootDir) => {}
+            Some(_) | None => bail!("{label} parent directory {} is invalid", path.display()),
+        }
+        let root = Path::new("/");
+        let root_dir = open(root, flags, Mode::empty()).with_context(|| {
+            format!("failed to open {label} parent directory {}", root.display())
+        })?;
+        (fs::File::from(root_dir), PathBuf::from(root))
+    } else {
+        let current_dir = Path::new(".");
+        let dir = open(current_dir, flags, Mode::empty()).with_context(|| {
+            format!(
+                "failed to open {label} parent directory {}",
+                current_dir.display()
+            )
+        })?;
+        (
+            fs::File::from(dir),
+            env::current_dir().context("failed to resolve current directory")?,
+        )
+    };
+
+    for component in components {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!(
+                    "{label} parent directory {} must not contain '..'",
+                    path.display()
+                );
+            }
+            Component::Normal(name) => {
+                current_path.push(name);
+                let next = match openat(&current, name, flags, Mode::empty()) {
+                    Ok(next) => next,
+                    Err(Errno::NOENT) => {
+                        bail!(
+                            "{label} parent directory {} does not exist",
+                            current_path.display()
+                        )
+                    }
+                    Err(Errno::LOOP | Errno::NOTDIR) => bail!(
+                        "{label} parent directory {} must not be a symlink",
+                        current_path.display()
+                    ),
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "failed to open {label} parent directory {}",
+                                current_path.display()
+                            )
+                        })
+                    }
+                };
+                current = fs::File::from(next);
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("{label} parent directory {} is invalid", path.display());
+            }
+        }
+    }
+
+    Ok((current, current_path))
+}
+
 fn read_bounded_text_file(path: &Path, label: &str, max_bytes: usize) -> Result<String> {
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -1929,43 +2006,6 @@ fn read_bounded_text_file(path: &Path, label: &str, max_bytes: usize) -> Result<
         bail!("{label} {} exceeded {max_bytes} bytes", path.display());
     }
     Ok(content)
-}
-
-#[cfg(unix)]
-fn open_private_new_file(path: &Path) -> Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn open_private_new_file(path: &Path) -> Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
-}
-
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("private file {} does not have a parent", path.display()))?;
-    let dir = fs::File::open(parent)
-        .with_context(|| format!("failed to open parent directory {}", parent.display()))?;
-    dir.sync_all()
-        .with_context(|| format!("failed to sync parent directory {}", parent.display()))
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -3495,7 +3535,7 @@ mod tests {
         let leftover_temp = fs::read_dir(&parent)
             .expect("state dir entries")
             .map(|entry| entry.expect("entry").file_name())
-            .any(|name| name.to_string_lossy().starts_with(".state.json.tmp-"));
+            .any(|name| name.to_string_lossy().starts_with(".lionclaw-atomic-"));
         assert!(!leftover_temp);
     }
 }
