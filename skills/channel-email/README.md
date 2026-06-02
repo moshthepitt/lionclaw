@@ -218,9 +218,10 @@ provider facts:
 owns the core OAuth fields, including `client_id`, `redirect_uri`, `scope`,
 `state`, and PKCE parameters, and rejects attempts to pass them through
 `--auth-param` or pre-seed them in the authorization URL query.
-Setup also rejects malformed or secret-bearing authorization parameter names,
-such as `client_secret`, plus duplicate names across the provider preset,
-`--auth-url` query, and `--auth-param`.
+Setup also rejects malformed, duplicate, LionClaw-managed, or secret-bearing
+OAuth query parameter names before opening the browser or storing refresh state.
+Token endpoint secrets and grant fields belong in the POST body, not
+`--token-url`.
 Setup also validates required provider facts before opening the browser:
 client ids and IMAP/SMTP hosts must be non-empty plain values, and
 `--auth-results-host` must be an Authentication-Results authserv-id rather than

@@ -51,7 +51,16 @@ const RESERVED_AUTHORIZATION_PARAMS: &[&str] = &[
     "code_challenge_method",
     "login_hint",
 ];
-const SECRET_BEARING_AUTHORIZATION_PARAMS: &[&str] = &[
+const TOKEN_ENDPOINT_FORM_PARAMS: &[&str] = &[
+    "grant_type",
+    "code",
+    "redirect_uri",
+    "client_id",
+    "code_verifier",
+    "refresh_token",
+    "client_secret",
+];
+const SECRET_BEARING_OAUTH_PARAMS: &[&str] = &[
     "access_token",
     "authorization_code",
     "auth_code",
@@ -794,7 +803,8 @@ fn resolve_setup(args: SetupArgs) -> Result<ResolvedSetup> {
     .ok_or_else(|| anyhow!("OAuth2 setup requires --token-url for --provider generic"))?;
     let authorization_url = validate_oauth_endpoint("--auth-url", &authorization_endpoint)?;
     validate_authorization_endpoint_query("--auth-url", &authorization_url)?;
-    validate_oauth_endpoint("--token-url", &token_endpoint)?;
+    let token_url = validate_oauth_endpoint("--token-url", &token_endpoint)?;
+    validate_token_endpoint_query("--token-url", &token_url)?;
 
     let scopes = normalize_scopes(args.scopes);
     let scopes = if scopes.is_empty() {
@@ -1013,27 +1023,56 @@ fn validate_oauth_endpoint(name: &str, value: &str) -> Result<reqwest::Url> {
     }
 }
 
-fn validate_authorization_endpoint_query(name: &str, url: &reqwest::Url) -> Result<()> {
+fn validate_authorization_endpoint_query(source: &'static str, url: &reqwest::Url) -> Result<()> {
+    validate_endpoint_query_params(
+        "OAuth authorization query parameter",
+        source,
+        url,
+        RESERVED_AUTHORIZATION_PARAMS,
+    )
+}
+
+fn validate_authorization_param_name(name: &str, source: &str) -> Result<()> {
+    validate_oauth_param_name(name, source, RESERVED_AUTHORIZATION_PARAMS)
+}
+
+fn validate_token_endpoint_query(source: &'static str, url: &reqwest::Url) -> Result<()> {
+    validate_endpoint_query_params(
+        "OAuth token endpoint query parameter",
+        source,
+        url,
+        TOKEN_ENDPOINT_FORM_PARAMS,
+    )
+}
+
+fn validate_endpoint_query_params(
+    label: &'static str,
+    source: &'static str,
+    url: &reqwest::Url,
+    managed: &[&str],
+) -> Result<()> {
+    let mut seen = BTreeMap::new();
     for (key, _) in url.query_pairs() {
-        validate_authorization_param_name(&key, name)?;
+        validate_oauth_param_name(&key, source, managed)?;
+        remember_oauth_param_name(&mut seen, &key, source, label)?;
     }
     Ok(())
 }
 
-fn validate_authorization_param_name(name: &str, source: &str) -> Result<()> {
-    if !is_plain_authorization_param_name(name) {
+fn validate_oauth_param_name(name: &str, source: &str, managed: &[&str]) -> Result<()> {
+    if !is_plain_oauth_param_name(name) {
         bail!("OAuth parameter name '{name}' in {source} must be a plain ASCII name");
     }
-    if is_reserved_authorization_param(name) {
+    if is_managed_oauth_param(name, managed) {
         bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be set in {source}");
     }
-    if is_secret_bearing_authorization_param(name) {
+    if is_secret_bearing_oauth_param(name) {
         bail!("OAuth parameter '{name}' may carry secret material and cannot be set in {source}");
     }
     Ok(())
 }
 
-fn is_plain_authorization_param_name(name: &str) -> bool {
+fn is_plain_oauth_param_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
@@ -1069,21 +1108,30 @@ fn remember_authorization_param_name(
     name: &str,
     source: &'static str,
 ) -> Result<()> {
+    remember_oauth_param_name(seen, name, source, "OAuth authorization parameter")
+}
+
+fn remember_oauth_param_name(
+    seen: &mut BTreeMap<String, &'static str>,
+    name: &str,
+    source: &'static str,
+    label: &'static str,
+) -> Result<()> {
     let normalized = name.to_ascii_lowercase();
     if let Some(previous) = seen.get(&normalized) {
-        bail!("OAuth authorization parameter '{name}' from {source} duplicates {previous}");
+        bail!("{label} '{name}' from {source} duplicates {previous}");
     }
     seen.insert(normalized, source);
     Ok(())
 }
 
-fn is_reserved_authorization_param(name: &str) -> bool {
-    RESERVED_AUTHORIZATION_PARAMS
+fn is_managed_oauth_param(name: &str, managed: &[&str]) -> bool {
+    managed
         .iter()
-        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        .any(|managed| managed.eq_ignore_ascii_case(name))
 }
 
-fn is_secret_bearing_authorization_param(name: &str) -> bool {
+fn is_secret_bearing_oauth_param(name: &str) -> bool {
     let normalized = name
         .chars()
         .map(|ch| match ch {
@@ -1092,7 +1140,7 @@ fn is_secret_bearing_authorization_param(name: &str) -> bool {
         })
         .collect::<String>();
     let compact = normalized.replace('_', "");
-    SECRET_BEARING_AUTHORIZATION_PARAMS
+    SECRET_BEARING_OAUTH_PARAMS
         .iter()
         .any(|secret| *secret == normalized || secret.replace('_', "") == compact)
 }
@@ -1551,6 +1599,7 @@ async fn post_token_form(
     form: Vec<(String, String)>,
 ) -> Result<TokenResponse> {
     let token_endpoint_url = validate_oauth_endpoint("OAuth2 token endpoint", token_endpoint)?;
+    validate_token_endpoint_query("OAuth2 token endpoint", &token_endpoint_url)?;
     let token_endpoint_diagnostic = oauth_endpoint_for_diagnostic(&token_endpoint_url);
     let client = reqwest::Client::builder()
         .timeout(TOKEN_REQUEST_TIMEOUT)
@@ -2312,6 +2361,30 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_rejects_malformed_token_query_param_names() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.token_endpoint =
+            Some("https://accounts.example.com/token?client+secret=value".to_string());
+
+        let err = resolve_setup(args).expect_err("malformed token query parameter should fail");
+
+        assert!(err.to_string().contains("client secret"));
+        assert!(err.to_string().contains("plain ASCII"));
+    }
+
+    #[test]
+    fn oauth2_setup_accepts_provider_token_query_params() {
+        let token_endpoint =
+            "https://accounts.example.com/token?resource=mail&api-version=1".to_string();
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.token_endpoint = Some(token_endpoint.clone());
+
+        let setup = resolve_setup(args).expect("provider token query parameter");
+
+        assert_eq!(setup.token_endpoint, token_endpoint);
+    }
+
+    #[test]
     fn oauth2_setup_rejects_secret_bearing_authorization_query_params() {
         let mut args = test_setup_args(Oauth2Provider::Gmail);
         args.authorization_endpoint =
@@ -2321,6 +2394,42 @@ mod tests {
 
         assert!(err.to_string().contains("client-secret"));
         assert!(err.to_string().contains("secret material"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_managed_token_query_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.token_endpoint =
+            Some("https://accounts.example.com/token?grant_type=refresh_token".to_string());
+
+        let err = resolve_setup(args).expect_err("managed token query parameter should fail");
+
+        assert!(err.to_string().contains("grant_type"));
+        assert!(err.to_string().contains("managed"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_secret_bearing_token_query_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.token_endpoint =
+            Some("https://accounts.example.com/token?private-key=secret".to_string());
+
+        let err = resolve_setup(args).expect_err("secret token query parameter should fail");
+
+        assert!(err.to_string().contains("private-key"));
+        assert!(err.to_string().contains("secret material"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_duplicate_token_query_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.token_endpoint =
+            Some("https://accounts.example.com/token?resource=mail&resource=calendar".to_string());
+
+        let err = resolve_setup(args).expect_err("duplicate token query parameter should fail");
+
+        assert!(err.to_string().contains("resource"));
+        assert!(err.to_string().contains("duplicates --token-url"));
     }
 
     #[test]
@@ -2950,6 +3059,7 @@ mod tests {
             let mut request = vec![0; 4096];
             let bytes = stream.read(&mut request).await.expect("read request");
             let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.contains("POST /token?resource=mail HTTP/1.1"));
             assert!(request.contains("grant_type=refresh_token"));
             assert!(request.contains("refresh_token=refresh-token"));
             let body =
@@ -2963,7 +3073,7 @@ mod tests {
                 .await
                 .expect("write response");
         });
-        let mut state = test_token_state(format!("http://127.0.0.1:{port}/token"));
+        let mut state = test_token_state(format!("http://127.0.0.1:{port}/token?resource=mail"));
         state.client_secret = Some("client-secret".to_string());
 
         let response = refresh_access_token(&state).await.expect("refresh");
@@ -2982,6 +3092,18 @@ mod tests {
             .expect_err("non-loopback HTTP token endpoint should fail");
 
         assert!(err.to_string().contains("https URL"));
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_revalidates_stored_token_endpoint_query() {
+        let state = test_token_state("https://accounts.example.com/token?grant_type=refresh_token");
+
+        let err = refresh_access_token(&state)
+            .await
+            .expect_err("managed stored token query parameter should fail");
+
+        assert!(err.to_string().contains("grant_type"));
+        assert!(err.to_string().contains("managed"));
     }
 
     #[tokio::test]
