@@ -140,13 +140,6 @@ impl FromStr for KeyValueArg {
             bail!("expected KEY=VALUE");
         };
         let key = key.trim();
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        {
-            bail!("OAuth auth parameter names must be plain ASCII names");
-        }
         validate_authorization_param_name(key, "--auth-param")?;
         Ok(Self {
             key: key.to_string(),
@@ -1028,6 +1021,9 @@ fn validate_authorization_endpoint_query(name: &str, url: &reqwest::Url) -> Resu
 }
 
 fn validate_authorization_param_name(name: &str, source: &str) -> Result<()> {
+    if !is_plain_authorization_param_name(name) {
+        bail!("OAuth parameter name '{name}' in {source} must be a plain ASCII name");
+    }
     if is_reserved_authorization_param(name) {
         bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be set in {source}");
     }
@@ -1035,6 +1031,13 @@ fn validate_authorization_param_name(name: &str, source: &str) -> Result<()> {
         bail!("OAuth parameter '{name}' may carry secret material and cannot be set in {source}");
     }
     Ok(())
+}
+
+fn is_plain_authorization_param_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 fn resolve_authorization_params(
@@ -2294,6 +2297,18 @@ mod tests {
         let err = resolve_setup(args).expect_err("reserved auth query parameter should fail");
 
         assert!(err.to_string().contains("state"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_malformed_authorization_query_param_names() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.authorization_endpoint =
+            Some("https://accounts.example.com/oauth2?client+secret=value".to_string());
+
+        let err = resolve_setup(args).expect_err("malformed auth query parameter should fail");
+
+        assert!(err.to_string().contains("client secret"));
+        assert!(err.to_string().contains("plain ASCII"));
     }
 
     #[test]
