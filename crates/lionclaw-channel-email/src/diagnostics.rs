@@ -208,27 +208,7 @@ fn credential_scheme_value_span(text: &str, mut index: usize) -> Option<(usize, 
 }
 
 fn credential_scheme_value_is_sensitive(value: &str) -> bool {
-    if value.len() < 8 {
-        return false;
-    }
-
-    let mut has_digit = false;
-    let mut has_lowercase = false;
-    let mut has_uppercase = false;
-    let mut has_token_punctuation = false;
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
-            has_digit = true;
-        } else if ch.is_ascii_lowercase() {
-            has_lowercase = true;
-        } else if ch.is_ascii_uppercase() {
-            has_uppercase = true;
-        } else if matches!(ch, '.' | '_' | '-' | '+' | '/' | '=' | ':' | '~') {
-            has_token_punctuation = true;
-        }
-    }
-
-    has_digit || has_token_punctuation || (has_lowercase && has_uppercase)
+    value.chars().count() >= 8
 }
 
 fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
@@ -462,7 +442,7 @@ DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
     #[test]
     fn diagnostics_redact_standalone_credential_scheme_values() {
         let rendered = render_operator_diagnostic(
-            "invalid_grant xbearer ignored Bearer ya29.secret-token revoked Basic dXNlcjpwYXNz",
+            "invalid_grant xbearer ignored Bearer lowercaseopaque revoked Basic dXNlcjpwYXNz",
             false,
         )
         .expect("diagnostic");
@@ -471,7 +451,7 @@ DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
             rendered,
             "invalid_grant xbearer ignored Bearer [redacted] revoked Basic [redacted]"
         );
-        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("lowercaseopaque"));
         assert!(!rendered.contains("dXNlcjpwYXNz"));
     }
 
