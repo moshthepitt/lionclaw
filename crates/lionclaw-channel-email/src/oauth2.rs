@@ -346,6 +346,7 @@ struct StoredOAuth2State {
     client_secret: Option<String>,
     refresh_token: String,
     access_token: Option<String>,
+    access_token_type: Option<String>,
     expires_at: Option<DateTime<Utc>>,
     scope: Vec<String>,
 }
@@ -594,6 +595,7 @@ async fn run_setup(args: SetupArgs) -> Result<()> {
     let token = exchange_authorization_code(&resolved, &redirect_uri, &code, &pkce.verifier)
         .await
         .context("OAuth2 authorization code exchange failed")?;
+    let access_token_type = bearer_token_type(&token)?.to_string();
     let refresh_token = token.refresh_token.ok_or_else(|| {
         anyhow!(
             "{} did not return a refresh token; re-run setup and approve offline access",
@@ -613,6 +615,7 @@ async fn run_setup(args: SetupArgs) -> Result<()> {
         client_secret: resolved.client_secret.clone(),
         refresh_token,
         access_token: Some(access_token),
+        access_token_type: Some(access_token_type),
         expires_at: expires_at(token.expires_in),
         scope: resolved.scopes.clone(),
     };
@@ -644,6 +647,7 @@ async fn run_token(args: TokenArgs) -> Result<()> {
     let token = refresh_access_token(&state)
         .await
         .context("OAuth2 token refresh failed")?;
+    let access_token_type = bearer_token_type(&token)?.to_string();
     let access_token = token
         .access_token
         .ok_or_else(|| anyhow!("OAuth2 refresh response did not include an access token"))?;
@@ -651,6 +655,7 @@ async fn run_token(args: TokenArgs) -> Result<()> {
         state.refresh_token = refresh_token;
     }
     state.access_token = Some(access_token.clone());
+    state.access_token_type = Some(access_token_type);
     state.expires_at = expires_at(token.expires_in);
     write_private_json(&args.state_file, &state)?;
     println!("{access_token}");
@@ -1554,6 +1559,11 @@ fn validate_successful_token_response(response: &TokenResponse) -> Result<()> {
     if let Some(access_token) = response.access_token.as_deref() {
         validate_access_token("OAuth2 token endpoint", access_token)?;
     }
+    bearer_token_type(response)?;
+    Ok(())
+}
+
+fn bearer_token_type(response: &TokenResponse) -> Result<&str> {
     let token_type = response.token_type.as_deref().ok_or_else(|| {
         anyhow!(
             "OAuth2 token endpoint omitted token_type; email XOAUTH2 requires Bearer access tokens"
@@ -1566,7 +1576,7 @@ fn validate_successful_token_response(response: &TokenResponse) -> Result<()> {
             token_type
         );
     }
-    Ok(())
+    Ok(token_type)
 }
 
 async fn read_token_response_text(mut response: reqwest::Response) -> Result<String> {
@@ -1608,6 +1618,12 @@ fn cached_access_token(state: &StoredOAuth2State) -> Result<Option<String>> {
     let Some(token) = state.access_token.as_ref() else {
         return Ok(None);
     };
+    let Some(token_type) = state.access_token_type.as_deref() else {
+        return Ok(None);
+    };
+    if !token_type.eq_ignore_ascii_case("bearer") {
+        return Ok(None);
+    }
     let Some(expires_at) = state.expires_at else {
         return Ok(None);
     };
@@ -2015,6 +2031,7 @@ mod tests {
             client_secret: None,
             refresh_token: "refresh-token".to_string(),
             access_token: None,
+            access_token_type: None,
             expires_at: None,
             scope: vec!["mail".to_string()],
         }
@@ -2793,6 +2810,7 @@ mod tests {
             client_secret: None,
             refresh_token: "refresh".to_string(),
             access_token: Some("access".to_string()),
+            access_token_type: Some("Bearer".to_string()),
             expires_at: Some(Utc::now() + TimeDelta::seconds(120)),
             scope: vec!["https://mail.google.com/".to_string()],
         };
@@ -2806,9 +2824,34 @@ mod tests {
     }
 
     #[test]
+    fn cached_access_token_requires_bearer_token_type() {
+        let mut state = test_token_state("https://oauth2.googleapis.com/token");
+        state.access_token = Some("access".to_string());
+        state.expires_at = Some(Utc::now() + TimeDelta::seconds(120));
+
+        assert_eq!(
+            cached_access_token(&state).expect("missing token type"),
+            None
+        );
+
+        state.access_token_type = Some("mac".to_string());
+        assert_eq!(
+            cached_access_token(&state).expect("unsupported token type"),
+            None
+        );
+
+        state.access_token_type = Some("Bearer".to_string());
+        assert_eq!(
+            cached_access_token(&state).expect("bearer token type"),
+            Some("access".to_string())
+        );
+    }
+
+    #[test]
     fn cached_access_token_rejects_invalid_token_text() {
         let mut state = test_token_state("https://oauth2.googleapis.com/token");
         state.access_token = Some("bad token".to_string());
+        state.access_token_type = Some("Bearer".to_string());
         state.expires_at = Some(Utc::now() + TimeDelta::seconds(120));
 
         let err = cached_access_token(&state).expect_err("invalid cached token should fail");
