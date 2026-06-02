@@ -10,9 +10,11 @@ runtime configuration, confinement, policy, and audit.
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
 path is designed for Linux/macOS-style Unix environments. When attached to a
 terminal, `run` opens the project operator console; `run --plain` and
-non-terminal use keep the command on the line-oriented interactive path. Managed background
-paths, including `lionclaw up` and channel auto-start, currently use the
-systemd user manager; launchd support is a future portability item.
+non-terminal use keep the command on the line-oriented interactive path;
+`run --runtime-tui` attaches the selected runtime's native terminal UI inside
+the same LionClaw boundary. Managed background paths, including
+`lionclaw up` and channel auto-start, currently use the systemd user manager;
+launchd support is a future portability item.
 
 ## System Shape
 
@@ -87,7 +89,8 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: explicit brokered capability execution for direct runtimes and narrow kernel surfaces.
-- `kernel.runtime`: runtime adapter contract and registry.
+- `lionclaw-runtime-api`: runtime adapter contract, registry, and shared runtime-facing event/program types.
+- `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
@@ -97,7 +100,18 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 
+Shared crate primitives:
+
+- `lionclaw-durable-fs`: atomic file publish/remove/rename for
+  LionClaw-owned runtime, continuity, and operator-private state; successful
+  file replacement syncs the file and containing directory.
+
 ## Runtime Adapter Contract
+
+The shared Rust contract lives in `crates/lionclaw-runtime-api`. Concrete
+runtime adapters live in their own crates, currently
+`crates/lionclaw-runtime-codex`, `crates/lionclaw-runtime-opencode`, and
+`crates/lionclaw-runtime-mock`.
 
 Runtime adapters implement:
 
@@ -105,6 +119,8 @@ Runtime adapters implement:
 - `session_start()`
 - `turn()`
 - `program_backed_turn()`
+- `build_terminal_program()`
+- `export_terminal_transcript()`
 - `runtime_control()`
 - `resolve_capability_requests()`
 - `cancel()`
@@ -120,6 +136,27 @@ Adapters also declare a turn mode:
 The distinction is central. Program-backed runtimes are the everyday product
 path. Direct runtimes and brokered capabilities are useful for tests, narrow
 workers, and future runtimes that do not bring a full harness.
+
+Adapters describe what they need and how to interpret runtime-owned state:
+program invocations, optional runtime auth kind, output parsing, native terminal
+programs, transcript export, and runtime controls. They do not receive the
+kernel execution plan. The kernel gives program-backed adapters a constrained
+executor plus observable runtime context, then still decides launch allowance,
+mounts, secrets, auth materialization, audit, and persistence.
+
+Runtime context may include host projections for runtime-visible paths. A
+directory projection maps a runtime tree such as `/runtime` to the runtime state
+root. An exact projection maps one runtime path, such as the channel-send Unix
+socket, to one host path and intentionally blocks descendants. Projection fields
+are private; constructors validate absolute runtime and host paths before the
+kernel exposes them to adapters. Shared helpers in `lionclaw-runtime-api`
+normalize relative runtime paths and reject parent traversal before adapters
+turn runtime protocol fields into host paths.
+
+Native terminal resume readiness is a typed adapter input, not a raw boolean.
+The only positive `RuntimeSessionReady` value is derived from the hardened
+LionClaw ready-marker check in `lionclaw-runtime-api`; adapters use it only to
+gate loading runtime-private continuation state.
 
 ## Program-Backed Runtime Flow
 
@@ -173,17 +210,148 @@ LionClaw receives typed events instead of a degraded plain-text stream. Codex
 is launched through its app-server protocol with `externalSandbox` permissions
 inside the outer Podman boundary. LionClaw does not use `codex exec` as a
 fallback path. Codex app-server request/notification assumptions are pinned by
-checked-in protocol fixtures under `tests/fixtures/codex_app_server`, including
-the target Codex CLI version and immutable source commit; update those fixtures
+checked-in protocol fixtures under
+`crates/lionclaw-runtime-codex/tests/fixtures/codex_app_server`, including the
+target Codex CLI version and immutable source commit; update those fixtures
 with the adapter when the target app-server contract changes.
+
+## Native Runtime TUI Flow
+
+`lionclaw run --runtime-tui` is an explicit attached-runtime path for operators
+who want the selected harness's own terminal UI. It is not the default
+line-oriented turn path and it is not used by channels or scheduled jobs.
+
+Flow:
+
+1. The operator CLI resolves the normal LionClaw project, runtime, and durable
+   interactive session.
+2. The kernel materializes the confined runtime layout, runtime-visible skills,
+   and a fresh attached-session context directly into runtime-private state as
+   both `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
+3. The runtime adapter supplies a terminal program through
+   `build_terminal_program()`.
+4. The execution planner compiles the same mounted workspace, staged auth,
+   network mode, and secret policy used by the selected runtime preset.
+5. The OCI backend attaches the operator's terminal to the runtime process with
+   a TTY.
+6. On launch and exit, the kernel writes `runtime.tui.launch`,
+   `runtime.tui.exit`, and transcript reconciliation audit events.
+
+For Codex, the attached terminal program runs the real Codex CLI in
+danger-full-access mode with approval disabled. That is intentional: LionClaw's
+outer container, mounts, runtime state root, network preset, auth staging, and
+audit trail are the active boundary. Codex also receives
+`/runtime/AGENTS.generated.md` as its model instructions file, so LionClaw
+memory, active context, prior LionClaw session history, skills, and project
+continuity are included without shadowing `/workspace/AGENTS.md`.
+LionClaw also materializes the runtime-private Codex config with
+`[projects."/workspace"] trust_level = "trusted"` and
+`check_for_update_on_startup = false`, matching the result of approving Codex's
+own workspace prompt inside the container while keeping runtime updates under
+LionClaw's runtime image/update path. The host Codex home is not mutated.
+
+For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime` and sets
+`OPENCODE_DISABLE_AUTOUPDATE=1`. OpenCode's native instruction loader then
+reads `/runtime/AGENTS.md` as global runtime instructions while project-level
+`.opencode` and `AGENTS.md` files remain project-owned. Runtime updates stay
+under LionClaw's runtime image/update path.
+
+LionClaw does not scrape terminal output. Native TUI transcript import is an
+adapter contract over runtime-owned durable state. Codex continuity is a
+LionClaw-owned link to one Codex CLI thread id stored in runtime-private state.
+Native TUI launches resume with `codex resume <threadID>` only when that link
+also has LionClaw's ready marker from a proven resumable reconciliation.
+Before launching an attached native TUI, LionClaw records a launch timestamp in
+runtime-private state. After exit, adapters keep the saved continuation link
+authoritative unless the runtime's public session/thread list shows a different
+newest target updated during that launch; when no link exists, the newest public
+target starts the link.
+After native TUI exit, Codex exports completed turns through Codex's app-server
+`thread/list` and paged `thread/turns/list` protocol inside the same runtime
+boundary, enumerating newest history first, recording the chosen CLI thread as
+the native UI continuation link, proving program-backed resumability separately
+from that thread's exported turn state, falling back to the saved link when
+listing cannot produce a current thread, and sorting before canonical import.
+Codex threads that the app-server reports as not yet materialized before the
+first user message reconcile as empty, non-resumable continuation sources.
+OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
+stored in runtime-private state. Program-backed OpenCode turns learn that id
+from OpenCode's machine-readable `sessionID` events and then resume with
+`opencode run --session <sessionID>`. Native TUI launches resume with
+`opencode --session <sessionID>` only when that link also has LionClaw's ready
+marker from a proven resumable reconciliation.
+After native TUI exit, LionClaw uses OpenCode's `session list --format json`
+only to identify whether the runtime moved to a newer root session during the
+launch, choosing by exported update timestamp instead of relying on list order.
+It records the chosen root session as the native UI continuation link, then
+imports through `export <sessionID>` for that current linked session and, when
+different, the previously linked session. Program-backed OpenCode resumability
+is proved separately from the current linked session's exported message state.
+LionClaw does not depend on a private OpenCode SQLite schema and does not try to
+backfill an arbitrary session-list window.
+The kernel imports those turns into canonical `session_turns` with deterministic
+source-derived ids, so reconciliation is idempotent. Reconciliation runs after
+process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
+shows the prior attached launch did not complete its after-exit pass; that keeps
+normal startup fast while still recovering completed runtime turns already
+written by the harness after an unclean LionClaw exit. Per-source export/read
+failures are audited as `runtime.tui.reconcile_source_warning` and skipped, so
+one stale runtime thread cannot block valid completed turns from import.
+Enumeration failures are audited as source warnings when a previously linked
+continuation target can still be exported, but fallback export of that saved
+target does not prove the current continuation source; otherwise they are
+audited as `runtime.tui.reconcile_error`.
+A clean native TUI exit clears LionClaw's dirty launch marker only when the
+adapter proves its chosen continuation source was reconciled; partial exports of
+that continuation source keep the marker dirty so the next native launch retries
+before rendering context.
+It marks the runtime session resumable only when that reconciled continuation
+target is valid from runtime-owned state and the latest continuation turn can be
+represented in LionClaw's canonical transcript. For Codex, the saved
+continuation thread must export cleanly far enough to prove its newest turn is
+explicitly completed, importable, and free of a non-null app-server error. For
+OpenCode, the linked continuation session must export cleanly and its raw
+message state must have an assistant finish reason that OpenCode's own prompt
+loop treats as terminal, answering the latest user message with no unresolved
+non-provider-executed tool part; older good sessions do not make the next
+`opencode run --session` safe.
+Transcript export passes are bounded by a kernel native-export timeout no greater
+than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
+TUI exit handling unbounded. Adapters may return partial transcripts with source
+warnings when the deadline is reached; resumability remains adapter-owned but is
+not accepted until the adapter has reconciled the continuation source. The
+attached native UI itself is not a LionClaw turn, so
+LionClaw turn timeout overrides do not wrap the runtime's own interactive
+session.
+Each native TUI launch also holds a LionClaw-owned file lock in the session's
+runtime state root, preventing separate operator processes from attaching two
+native UIs to the same LionClaw session state at once.
+
+Native TUI mode does not provide typed live answer/reasoning events to
+channels. The normal operator console, `run --plain`, channel turns, and
+scheduled jobs remain the paths that stream typed runtime events directly into
+LionClaw while a turn is active. Runtime skill facets that depend on an active
+LionClaw turn bridge, such as channel-bound `channel.send` facets, are not
+projected into native TUI sessions, even when the selected execution preset
+would enable those facets for normal kernel-managed turns.
+
+Native TUI mode has no LionClaw command layer inside the attached runtime UI.
+Once the TTY is attached, first-column commands belong to the selected
+runtime's own interface; operators exit through the runtime's normal exit
+gesture, such as Codex's Ctrl-D. This avoids terminal-editor proxying and keeps
+runtime command semantics out of the kernel.
+Terminal-generated interrupts and quits remain runtime-owned; LionClaw keeps
+the parent process alive so it can reconcile durable runtime state after the
+native UI exits.
 
 ## Runtime Control Commands
 
-The first column is command space. `lionclaw run` and channel inbound routing
-reserve `/lionclaw ...` for LionClaw-owned controls such as
-`/lionclaw retry`, `/lionclaw reset`, and `/lionclaw exit`. Local-only controls
-such as `/lionclaw exit` are acknowledged by channel routing but do not exit a
-channel worker.
+The first column is command space on LionClaw-owned interactive surfaces.
+`lionclaw run`, `run --plain`, and channel inbound routing reserve
+`/lionclaw ...` for LionClaw-owned controls such as `/lionclaw retry`,
+`/lionclaw reset`, and `/lionclaw exit`. Local-only controls such as
+`/lionclaw exit` are acknowledged by channel routing but do not exit a channel
+worker.
 
 Other first-column slash commands are classified as runtime controls and are
 persisted as `runtime_control` turns. The kernel records
@@ -192,9 +360,10 @@ persisted as `runtime_control` turns. The kernel records
 decide whether a control is handled, unsupported, interactive-only, or failed.
 
 This keeps native runtime commands such as `/compact` and `/rename` native to
-the selected runtime without teaching the kernel runtime-specific command
-semantics. Leading-space slash input and path-like slash input remain ordinary
-prompts.
+the selected runtime on LionClaw-owned turn paths without teaching the kernel
+runtime-specific command semantics. In native TUI mode those commands are
+handled directly by the runtime UI. Leading-space slash input and path-like
+slash input remain ordinary prompts.
 
 ## Direct Runtime And Brokered Capability Flow
 
@@ -223,8 +392,8 @@ kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
 at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
 environment variable and usable socket are absent. The bridge is valid only
 while the runtime turn is active; turn completion or timeout removes the socket
-and invalidates open connections. Native runtime controls do not receive this
-bridge.
+and invalidates open connections. Native runtime controls and native runtime
+TUI sessions do not receive this bridge.
 
 The host socket is created under the operator's short per-user runtime directory
 rather than under the instance home, so long project paths do not exceed Unix
@@ -427,9 +596,10 @@ are summarized as live activity for the active turn and exposed through control
 panes instead of being appended as transcript lines.
 
 The planner injects runtime-private environment defaults such as
-`HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
-`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted
-assets, so engine-specific caches and config stay out of assistant continuity.
+`HOME=/runtime/home`, XDG config/cache/data/state roots under `/runtime/home`,
+`LIONCLAW_DRAFTS_DIR=/drafts`, and `LIONCLAW_SKILLS_DIR=/lionclaw/skills`
+when runtime-visible skills have mounted assets, so engine-specific caches,
+data, and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
 request, but the mounted `/runtime` state root is scoped to the LionClaw
@@ -470,9 +640,11 @@ and the runtime secret file to `0600` on Unix before loading it.
 Host-only runtime auth comes from the host runtime itself. Before a confined
 Codex turn, LionClaw reads the host Codex auth store, normally
 `~/.codex/auth.json`, refreshes that host auth when needed, then stages
-session-local copies of `auth.json` and `config.toml` under
-`/runtime/home/.codex` before launch. The real host Codex home is never mounted
-into the runtime container.
+session-local `auth.json` under `/runtime/home/.codex` before launch. LionClaw
+also writes a small runtime-owned Codex `config.toml` there with the trusted
+`/workspace` project entry and update checks disabled. Host Codex config,
+plugins, apps, MCP servers, and paths are not imported into the confined
+runtime. The real host Codex home is never mounted into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
 `lionclaw up` persists that same override into the managed daemon environment
@@ -888,10 +1060,12 @@ home.
 
 ## Adding A Runtime
 
-1. Add `kernel/runtime/adapters/<adapter>.rs` implementing `RuntimeAdapter`.
+1. Add a `crates/lionclaw-runtime-<id>` crate implementing `RuntimeAdapter`
+   from `lionclaw-runtime-api`.
 2. Choose `ProgramBacked` or `Direct` turn mode deliberately.
-3. Export it from `kernel/runtime/adapters/mod.rs`.
-4. Wire configured registration in `operator/runtime.rs`.
+3. Reuse workspace package versions and `workspace = true` lint settings.
+4. Wire configured registration in `operator/runtime.rs` and kernel runtime
+   re-exports only as needed.
 5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
    builtin test/kernel scaffolding.
 6. Add unit tests in the adapter module plus one kernel-level integration case.

@@ -11,10 +11,7 @@ use crate::{
     operator::{
         channel_metadata::validate_channel_env_name,
         command_display::shell_quote_arg,
-        private_paths::{
-            ensure_private_file_write_target, read_private_file_to_string,
-            set_private_file_permissions,
-        },
+        private_paths::{read_private_file_to_string, write_private_file},
     },
 };
 
@@ -30,7 +27,6 @@ pub fn load_channel_env(home: &LionClawHome, channel_id: &str) -> Result<Channel
 
 pub fn save_channel_env(home: &LionClawHome, channel_id: &str, values: &ChannelEnv) -> Result<()> {
     let path = home.channel_env_path(channel_id);
-    ensure_private_file_write_target(home, &path, "channel env file")?;
 
     let mut content = String::new();
     for (key, value) in values {
@@ -40,9 +36,7 @@ pub fn save_channel_env(home: &LionClawHome, channel_id: &str, values: &ChannelE
         content.push_str(&escape_env_value(value));
         content.push('\n');
     }
-    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_file_permissions(&path)?;
-    Ok(())
+    write_private_file(home, &path, content.as_bytes(), "channel env file")
 }
 
 pub fn merge_channel_env(

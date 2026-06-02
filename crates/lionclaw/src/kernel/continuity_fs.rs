@@ -9,12 +9,11 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use lionclaw_durable_fs::{rename_file, sync_directory, write_file_atomically};
 use rustix::{
-    fs::{mkdirat, openat, renameat, unlinkat, AtFlags, Dir, Mode, OFlags},
+    fs::{mkdirat, openat, Dir, Mode, OFlags},
     io::Errno,
 };
-use tracing::warn;
-use uuid::Uuid;
 
 const DIR_MODE: Mode = Mode::from_raw_mode(0o755);
 const FILE_MODE: Mode = Mode::from_raw_mode(0o644);
@@ -102,8 +101,18 @@ impl ContinuityFs {
     }
 
     pub fn write_bytes(&self, relative: &Path, content: &[u8]) -> Result<()> {
-        let (parent, name) = self.open_parent_dir(relative, true)?;
-        self.write_atomic_in_parent(&parent, &name, content)
+        let relative = normalize_relative_path(relative)?;
+        let parent_relative = parent_relative_path(&relative);
+        let (parent, name) = self.open_parent_dir(&relative, true)?;
+        write_file_atomically(
+            &parent,
+            &self.root_path.join(parent_relative),
+            &name,
+            content,
+            0o644,
+            None,
+            "continuity file",
+        )
     }
 
     pub fn append_string_with_header(
@@ -112,7 +121,10 @@ impl ContinuityFs {
         header_if_new: Option<&str>,
         body: &str,
     ) -> Result<()> {
-        let (parent, name) = self.open_parent_dir(relative, true)?;
+        let relative = normalize_relative_path(relative)?;
+        let parent_relative = parent_relative_path(&relative);
+        let parent_path = self.root_path.join(&parent_relative);
+        let (parent, name) = self.open_parent_dir(&relative, true)?;
         match self.open_regular_file(
             &parent,
             &name,
@@ -122,12 +134,10 @@ impl ContinuityFs {
                 file.write_all(body.as_bytes()).with_context(|| {
                     format!(
                         "failed to append {}",
-                        self.absolute_path(relative).display()
+                        self.absolute_path(&relative).display()
                     )
                 })?;
-                file.flush().with_context(|| {
-                    format!("failed to flush {}", self.absolute_path(relative).display())
-                })?;
+                self.sync_written_file(&mut file, &relative)?;
                 Ok(())
             }
             Err(err) if matches!(err.downcast_ref::<Errno>(), Some(&Errno::NOENT)) => {
@@ -143,19 +153,18 @@ impl ContinuityFs {
                             file.write_all(header.as_bytes()).with_context(|| {
                                 format!(
                                     "failed to initialize {}",
-                                    self.absolute_path(relative).display()
+                                    self.absolute_path(&relative).display()
                                 )
                             })?;
                         }
                         file.write_all(body.as_bytes()).with_context(|| {
                             format!(
                                 "failed to append {}",
-                                self.absolute_path(relative).display()
+                                self.absolute_path(&relative).display()
                             )
                         })?;
-                        file.flush().with_context(|| {
-                            format!("failed to flush {}", self.absolute_path(relative).display())
-                        })?;
+                        self.sync_written_file(&mut file, &relative)?;
+                        sync_directory(&parent, &parent_path, "continuity file")?;
                         Ok(())
                     }
                     Err(create_err)
@@ -169,12 +178,10 @@ impl ContinuityFs {
                         file.write_all(body.as_bytes()).with_context(|| {
                             format!(
                                 "failed to append {}",
-                                self.absolute_path(relative).display()
+                                self.absolute_path(&relative).display()
                             )
                         })?;
-                        file.flush().with_context(|| {
-                            format!("failed to flush {}", self.absolute_path(relative).display())
-                        })?;
+                        self.sync_written_file(&mut file, &relative)?;
                         Ok(())
                     }
                     Err(create_err) => Err(create_err),
@@ -197,18 +204,21 @@ impl ContinuityFs {
     }
 
     pub fn rename(&self, source: &Path, target: &Path) -> Result<()> {
-        let (source_parent, source_name) = self.open_parent_dir(source, false)?;
-        let (target_parent, target_name) = self.open_parent_dir(target, true)?;
-        renameat(&source_parent, &source_name, &target_parent, &target_name).with_context(
-            || {
-                format!(
-                    "failed to rename {} to {}",
-                    self.absolute_path(source).display(),
-                    self.absolute_path(target).display()
-                )
-            },
-        )?;
-        Ok(())
+        let source = normalize_relative_path(source)?;
+        let target = normalize_relative_path(target)?;
+        let source_parent_relative = parent_relative_path(&source);
+        let target_parent_relative = parent_relative_path(&target);
+        let (source_parent, source_name) = self.open_parent_dir(&source, false)?;
+        let (target_parent, target_name) = self.open_parent_dir(&target, true)?;
+        rename_file(
+            &source_parent,
+            &self.root_path.join(source_parent_relative),
+            &source_name,
+            &target_parent,
+            &self.root_path.join(target_parent_relative),
+            &target_name,
+            "continuity file",
+        )
     }
 
     pub fn list_markdown_files(&self, relative_root: &Path) -> Result<Vec<PathBuf>> {
@@ -395,8 +405,8 @@ impl ContinuityFs {
             .file_name()
             .map(OsString::from)
             .ok_or_else(|| anyhow!("continuity path '{}' has no file name", relative.display()))?;
-        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-        let parent_dir = self.open_dir(parent, create)?;
+        let parent = parent_relative_path(&relative);
+        let parent_dir = self.open_dir(&parent, create)?;
         Ok((parent_dir, name))
     }
 
@@ -444,57 +454,20 @@ impl ContinuityFs {
         Ok(current)
     }
 
-    fn write_atomic_in_parent(&self, parent: &File, name: &OsString, content: &[u8]) -> Result<()> {
-        let temp_name = OsString::from(format!(".tmp-{}", Uuid::new_v4()));
-        let temp_path = Path::new(&temp_name);
-        let mut temp_file = match self.open_regular_file(
-            parent,
-            &temp_name,
-            OFlags::WRONLY
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::TRUNC
-                | OFlags::CLOEXEC
-                | OFlags::NOFOLLOW,
-        ) {
-            Ok(file) => file,
-            Err(err) => {
-                if matches!(err.downcast_ref::<Errno>(), Some(&Errno::EXIST)) {
-                    return self.write_atomic_in_parent(parent, name, content);
-                }
-                return Err(err);
-            }
-        };
-
-        let write_result = (|| -> Result<()> {
-            temp_file
-                .write_all(content)
-                .with_context(|| format!("failed to write {}", Path::new(name).display()))?;
-            temp_file
-                .flush()
-                .with_context(|| format!("failed to flush {}", Path::new(name).display()))?;
-            renameat(parent, temp_path, parent, name).with_context(|| {
-                format!(
-                    "failed to rename {} to {}",
-                    Path::new(&temp_name).display(),
-                    Path::new(name).display()
-                )
-            })?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            match unlinkat(parent, temp_path, AtFlags::empty()) {
-                Ok(()) => {}
-                Err(err) => warn!(
-                    ?err,
-                    temp_name = %Path::new(&temp_name).display(),
-                    "failed to remove temporary continuity file"
-                ),
-            }
-        }
-        write_result
+    fn sync_written_file(&self, file: &mut File, relative: &Path) -> Result<()> {
+        file.flush().with_context(|| {
+            format!("failed to flush {}", self.absolute_path(relative).display())
+        })?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", self.absolute_path(relative).display()))
     }
+}
+
+fn parent_relative_path(relative: &Path) -> PathBuf {
+    relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf()
 }
 
 fn normalize_relative_path(path: &Path) -> Result<PathBuf> {

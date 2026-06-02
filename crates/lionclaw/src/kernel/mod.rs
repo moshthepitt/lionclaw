@@ -24,6 +24,9 @@ pub mod sessions;
 pub mod skills;
 
 pub use cancellation::TurnCancellation;
-pub use core::{ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelOptions};
+pub use core::{
+    AttachedRuntimeLaunchInput, ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel,
+    KernelOptions,
+};
 pub use error::KernelError;
 pub use runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};

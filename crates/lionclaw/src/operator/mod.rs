@@ -13,6 +13,7 @@ pub(crate) mod private_paths;
 pub mod reconcile;
 pub(crate) mod redaction;
 pub mod run;
+pub(crate) mod run_runtime_tui;
 pub(crate) mod run_tui;
 pub mod runtime;
 pub mod runtime_integration;

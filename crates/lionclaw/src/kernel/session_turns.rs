@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{SessionTurnKind, SessionTurnStatus, SessionTurnView},
-    kernel::db::{ms_to_datetime, now_ms},
+    kernel::db::{datetime_to_ms, ms_to_datetime, now_ms},
 };
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,23 @@ pub struct NewSessionTurn {
     pub prompt_user_text: String,
     pub attachment_source_turn_id: Option<Uuid>,
     pub runtime_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportedSessionTurn {
+    pub turn_id: Uuid,
+    pub session_id: Uuid,
+    pub kind: SessionTurnKind,
+    pub status: SessionTurnStatus,
+    pub display_user_text: String,
+    pub prompt_user_text: String,
+    pub assistant_text: String,
+    pub error_code: Option<String>,
+    pub error_text: Option<String>,
+    pub attachment_source_turn_id: Option<Uuid>,
+    pub runtime_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +190,42 @@ impl SessionTurnStore {
         }
 
         self.get(turn_id).await
+    }
+
+    pub async fn insert_imported_turn_if_absent(
+        &self,
+        turn: ImportedSessionTurn,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let started_at_ms = datetime_to_ms(turn.started_at);
+        let finished_at_ms = turn.finished_at.map(datetime_to_ms);
+        let result = sqlx::query(
+            "INSERT INTO session_turns \
+             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(turn_id) DO NOTHING",
+        )
+        .bind(turn.turn_id.to_string())
+        .bind(turn.session_id.to_string())
+        .bind(turn.kind.as_str())
+        .bind(turn.status.as_str())
+        .bind(&turn.display_user_text)
+        .bind(&turn.prompt_user_text)
+        .bind(&turn.assistant_text)
+        .bind(turn.error_code)
+        .bind(turn.error_text)
+        .bind(turn.attachment_source_turn_id.map(|turn_id| turn_id.to_string()))
+        .bind(&turn.runtime_id)
+        .bind(started_at_ms)
+        .bind(finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert imported session turn")?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(turn.turn_id).await
     }
 
     pub async fn checkpoint_assistant_text(
@@ -670,5 +723,67 @@ mod tests {
                     | SessionTurnStatus::Interrupted
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn imported_turn_insert_is_idempotent() {
+        let (store, session_id) = new_store_with_session().await;
+        let turn_id = Uuid::new_v4();
+        let started_at = DateTime::parse_from_rfc3339("2026-05-25T10:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let finished_at = DateTime::parse_from_rfc3339("2026-05-25T10:00:01Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+
+        let inserted = store
+            .insert_imported_turn_if_absent(ImportedSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                status: SessionTurnStatus::Completed,
+                display_user_text: "hello".to_string(),
+                prompt_user_text: "hello".to_string(),
+                assistant_text: "answer".to_string(),
+                error_code: None,
+                error_text: None,
+                attachment_source_turn_id: None,
+                runtime_id: "codex".to_string(),
+                started_at,
+                finished_at: Some(finished_at),
+            })
+            .await
+            .expect("insert imported")
+            .expect("inserted");
+
+        let duplicate = store
+            .insert_imported_turn_if_absent(ImportedSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                status: SessionTurnStatus::Completed,
+                display_user_text: "hello".to_string(),
+                prompt_user_text: "hello".to_string(),
+                assistant_text: "answer".to_string(),
+                error_code: None,
+                error_text: None,
+                attachment_source_turn_id: None,
+                runtime_id: "codex".to_string(),
+                started_at,
+                finished_at: Some(finished_at),
+            })
+            .await
+            .expect("duplicate insert");
+
+        assert!(duplicate.is_none());
+        assert_eq!(inserted.sequence_no, 1);
+        assert_eq!(
+            store
+                .list_recent(session_id, 10)
+                .await
+                .expect("turns")
+                .len(),
+            1
+        );
     }
 }

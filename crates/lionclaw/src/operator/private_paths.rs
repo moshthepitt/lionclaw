@@ -1,9 +1,13 @@
 use std::{
+    ffi::OsString,
     fs,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use lionclaw_durable_fs::{
+    remove_file_if_exists as remove_file_if_exists_durably, write_file_atomically,
+};
 
 use crate::home::LionClawHome;
 
@@ -56,7 +60,17 @@ pub(crate) fn ensure_private_file_write_target(
         )
     })?;
     create_private_dir_all(home, parent, &format!("{label} directory"))?;
-    ensure_file_target_not_symlink(path, label)
+    ensure_file_target_regular_or_absent(path, label)
+}
+
+pub(crate) fn write_private_file(
+    home: &LionClawHome,
+    path: &Path,
+    contents: &[u8],
+    label: &str,
+) -> Result<()> {
+    ensure_private_file_write_target(home, path, label)?;
+    write_private_file_contents(home, path, contents, label)
 }
 
 pub(crate) fn read_private_file_to_string(
@@ -106,7 +120,7 @@ pub(crate) fn remove_private_file_if_exists(
         Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     ensure_private_file_metadata(path, label, metadata)?;
-    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+    remove_private_file_after_validation(home, path, label)
 }
 
 pub(crate) fn read_private_dir_file_paths(
@@ -327,13 +341,13 @@ fn private_dir_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<b
     Ok(true)
 }
 
-fn ensure_file_target_not_symlink(path: &Path, label: &str) -> Result<()> {
+fn ensure_file_target_regular_or_absent(path: &Path, label: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
                 bail!("{label} {} must not be a symlink", path.display());
             }
-            if metadata.is_dir() {
+            if !metadata.is_file() {
                 bail!("{label} {} is not a file", path.display());
             }
             Ok(())
@@ -341,4 +355,146 @@ fn ensure_file_target_not_symlink(path: &Path, label: &str) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
+}
+
+#[cfg(unix)]
+fn write_private_file_contents(
+    home: &LionClawHome,
+    path: &Path,
+    contents: &[u8],
+    label: &str,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((parent, parent_path, file_name)) = open_private_file_parent(home, path, label)?
+    else {
+        bail!(
+            "{label} {} does not have an existing private parent directory",
+            path.display()
+        );
+    };
+    write_file_atomically(
+        &parent,
+        &parent_path,
+        &file_name,
+        contents,
+        0o600,
+        Some(fs::Permissions::from_mode(0o600)),
+        label,
+    )
+}
+
+#[cfg(not(unix))]
+fn write_private_file_contents(
+    _home: &LionClawHome,
+    path: &Path,
+    contents: &[u8],
+    _label: &str,
+) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    set_private_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn remove_private_file_after_validation(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    let Some((parent, parent_path, file_name)) = open_private_file_parent(home, path, label)?
+    else {
+        return Ok(());
+    };
+    remove_file_if_exists_durably(&parent, &parent_path, &file_name, label).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn remove_private_file_after_validation(
+    _home: &LionClawHome,
+    path: &Path,
+    _label: &str,
+) -> Result<()> {
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+#[cfg(unix)]
+fn open_private_file_parent(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<Option<(fs::File, PathBuf, OsString)>> {
+    let root = home.root();
+    ensure_path_under_home(&root, path, label)?;
+    let relative = path.strip_prefix(&root).with_context(|| {
+        format!(
+            "{label} {} is not under LionClaw home {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let file_name = relative
+        .file_name()
+        .map(OsString::from)
+        .ok_or_else(|| anyhow!("{label} {} does not name a file", path.display()))?;
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let Some(parent) = open_private_dir_relative(&root, parent_relative, label)? else {
+        return Ok(None);
+    };
+    Ok(Some((parent, root.join(parent_relative), file_name)))
+}
+
+#[cfg(unix)]
+fn open_private_dir_relative(
+    root: &Path,
+    relative: &Path,
+    label: &str,
+) -> Result<Option<fs::File>> {
+    use rustix::fs::{open, Mode, OFlags};
+    use rustix::{fs::openat, io::Errno};
+
+    let root_dir = match open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(root_dir) => root_dir,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => bail!(
+            "LionClaw home {} must be a directory and cannot be a symlink",
+            root.display()
+        ),
+        Err(err) => return Err(err).with_context(|| format!("failed to open {}", root.display())),
+    };
+    let mut current = fs::File::from(root_dir);
+    let mut current_path = root.to_path_buf();
+
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!(
+                "{label} {} contains an unsupported path component",
+                root.join(relative).display()
+            );
+        };
+        current_path.push(name);
+        let next = match openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(next) => next,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(Errno::LOOP | Errno::NOTDIR) => bail!(
+                "{label} directory {} must be a directory and cannot be a symlink",
+                current_path.display()
+            ),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to open {}", current_path.display()))
+            }
+        };
+        current = fs::File::from(next);
+    }
+
+    Ok(Some(current))
 }

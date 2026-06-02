@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -14,8 +19,8 @@ use super::{
         validate_configured_mounts, MountSourceProtection,
     },
     plan::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-        NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
+        ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionPreset, MountAccess,
+        MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
         SKILLS_MOUNT_TARGET_ROOT,
     },
 };
@@ -146,6 +151,7 @@ pub struct ExecutionPlanRequest {
 pub enum ExecutionPlanPurpose {
     #[default]
     Interactive,
+    AttachedRuntimeTui,
     HiddenCompaction,
 }
 
@@ -241,23 +247,24 @@ impl ExecutionPlanner {
             extra_mounts: &request.extra_mounts,
             purpose: request.purpose,
         })?;
+        let has_workspace_mount = has_mount_target(&mounts, WORKSPACE_MOUNT_TARGET);
+        let has_runtime_mount = has_mount_target(&mounts, RUNTIME_MOUNT_TARGET);
+        let has_drafts_mount = has_mount_target(&mounts, DRAFTS_MOUNT_TARGET);
+        let has_skills_mount = mounts
+            .iter()
+            .any(|mount| is_skills_mount_target(&mount.target));
+        if request.purpose == ExecutionPlanPurpose::AttachedRuntimeTui && !has_runtime_mount {
+            return Err("runtime TUI requires a runtime state mount at /runtime".to_string());
+        }
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
         let environment = build_runtime_environment(
             execution_context.environment,
-            mounts
-                .iter()
-                .any(|mount| mount.target == WORKSPACE_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| mount.target == RUNTIME_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
-            mounts
-                .iter()
-                .any(|mount| is_skills_mount_target(&mount.target)),
+            has_workspace_mount,
+            has_runtime_mount,
+            has_drafts_mount,
+            has_skills_mount,
         );
         let working_dir = execution_context
             .working_dir
@@ -275,7 +282,7 @@ impl ExecutionPlanner {
             hard_timeout: execution_context.hard_timeout,
             mounts,
             mount_runtime_secrets: preset.mount_runtime_secrets,
-            escape_classes: preset.escape_classes,
+            escape_classes: escape_classes_for_purpose(request.purpose, preset.escape_classes),
             limits,
         })
     }
@@ -447,6 +454,10 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
     }
 }
 
+fn has_mount_target(mounts: &[MountSpec], target: &str) -> bool {
+    mounts.iter().any(|mount| mount.target == target)
+}
+
 fn is_skills_mount_target(target: &str) -> bool {
     target == SKILLS_MOUNT_TARGET_ROOT
         || target
@@ -560,7 +571,7 @@ fn default_working_dir_for_purpose(
     purpose: ExecutionPlanPurpose,
     mounts: &[MountSpec],
 ) -> Option<String> {
-    if purpose != ExecutionPlanPurpose::Interactive {
+    if purpose == ExecutionPlanPurpose::HiddenCompaction {
         return None;
     }
 
@@ -570,63 +581,104 @@ fn default_working_dir_for_purpose(
         .map(|mount| mount.source.to_string_lossy().to_string())
 }
 
+fn escape_classes_for_purpose(
+    purpose: ExecutionPlanPurpose,
+    escape_classes: BTreeSet<EscapeClass>,
+) -> BTreeSet<EscapeClass> {
+    match purpose {
+        ExecutionPlanPurpose::Interactive => escape_classes,
+        ExecutionPlanPurpose::AttachedRuntimeTui | ExecutionPlanPurpose::HiddenCompaction => {
+            BTreeSet::new()
+        }
+    }
+}
+
 fn build_runtime_environment(
-    mut passthrough_environment: Vec<(String, String)>,
+    mut environment: Vec<(String, String)>,
     has_workspace_mount: bool,
     has_runtime_mount: bool,
     has_drafts_mount: bool,
     has_skills_mount: bool,
 ) -> Vec<(String, String)> {
     if has_workspace_mount {
-        passthrough_environment.push((
-            "LIONCLAW_WORKSPACE_DIR".to_string(),
-            WORKSPACE_MOUNT_TARGET.to_string(),
-        ));
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_WORKSPACE_DIR",
+            WORKSPACE_MOUNT_TARGET,
+        );
     }
 
     if has_runtime_mount {
-        passthrough_environment.extend([
-            ("HOME".to_string(), format!("{RUNTIME_MOUNT_TARGET}/home")),
-            (
-                "XDG_CONFIG_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.config"),
-            ),
-            (
-                "XDG_CACHE_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.cache"),
-            ),
-            (
-                "XDG_STATE_HOME".to_string(),
-                format!("{RUNTIME_MOUNT_TARGET}/home/.local/state"),
-            ),
-            (
-                "LIONCLAW_RUNTIME_DIR".to_string(),
-                RUNTIME_MOUNT_TARGET.to_string(),
-            ),
-        ]);
+        let runtime_home = format!("{RUNTIME_MOUNT_TARGET}/home");
+        set_environment_value(&mut environment, "HOME", runtime_home.clone());
+        set_environment_value(
+            &mut environment,
+            "XDG_CONFIG_HOME",
+            format!("{runtime_home}/.config"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_CACHE_HOME",
+            format!("{runtime_home}/.cache"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_DATA_HOME",
+            format!("{runtime_home}/.local/share"),
+        );
+        set_environment_value(
+            &mut environment,
+            "XDG_STATE_HOME",
+            format!("{runtime_home}/.local/state"),
+        );
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_RUNTIME_DIR",
+            RUNTIME_MOUNT_TARGET,
+        );
     }
 
     if has_drafts_mount {
-        passthrough_environment.push((
-            "LIONCLAW_DRAFTS_DIR".to_string(),
-            DRAFTS_MOUNT_TARGET.to_string(),
-        ));
+        set_environment_value(&mut environment, "LIONCLAW_DRAFTS_DIR", DRAFTS_MOUNT_TARGET);
     }
 
     if has_skills_mount {
-        passthrough_environment.push((
-            "LIONCLAW_SKILLS_DIR".to_string(),
-            SKILLS_MOUNT_TARGET_ROOT.to_string(),
-        ));
+        set_environment_value(
+            &mut environment,
+            "LIONCLAW_SKILLS_DIR",
+            SKILLS_MOUNT_TARGET_ROOT,
+        );
     }
 
-    passthrough_environment.push(("TMPDIR".to_string(), "/tmp".to_string()));
-    passthrough_environment
+    set_environment_value(&mut environment, "TMPDIR", "/tmp");
+    environment
+}
+
+fn set_environment_value(
+    environment: &mut Vec<(String, String)>,
+    key: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let key = key.into();
+    let value = value.into();
+
+    if let Some((_, existing_value)) = environment
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing_value = value;
+    } else {
+        environment.push((key, value));
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        time::Duration,
+    };
 
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -637,7 +689,7 @@ mod tests {
     };
     use crate::home::{runtime_project_partition_key, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR};
     use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
+        ConfinementConfig, EscapeClass, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, WorkspaceAccess,
     };
     use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};
@@ -781,6 +833,10 @@ mod tests {
                     "/runtime/home/.cache".to_string()
                 ),
                 (
+                    "XDG_DATA_HOME".to_string(),
+                    "/runtime/home/.local/share".to_string()
+                ),
+                (
                     "XDG_STATE_HOME".to_string(),
                     "/runtime/home/.local/state".to_string()
                 ),
@@ -788,6 +844,127 @@ mod tests {
                 ("LIONCLAW_DRAFTS_DIR".to_string(), "/drafts".to_string()),
                 ("TMPDIR".to_string(), "/tmp".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_environment_defaults_replace_passthrough_paths() {
+        let environment = super::build_runtime_environment(
+            vec![
+                ("XDG_CONFIG_HOME".to_string(), "/host/config".to_string()),
+                ("XDG_DATA_HOME".to_string(), "/host/share".to_string()),
+                ("TMPDIR".to_string(), "/host/tmp".to_string()),
+                ("USER_DEFINED".to_string(), "kept".to_string()),
+            ],
+            false,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            single_environment_value(&environment, "XDG_CONFIG_HOME"),
+            "/runtime/home/.config"
+        );
+        assert_eq!(
+            single_environment_value(&environment, "XDG_DATA_HOME"),
+            "/runtime/home/.local/share"
+        );
+        assert_eq!(single_environment_value(&environment, "TMPDIR"), "/tmp");
+        assert_eq!(
+            single_environment_value(&environment, "USER_DEFINED"),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn attached_runtime_tui_preserves_execution_shape_without_turn_scoped_escapes() {
+        let sandbox = tempdir().expect("temp dir");
+        let workspace_root = sandbox.path().join("project");
+        let runtime_root = sandbox.path().join("home/runtime");
+        let presets = [(
+            "team-local".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: true,
+                escape_classes: BTreeSet::from([EscapeClass::ChannelSend]),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: Some("team-local".to_string()),
+            presets,
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(workspace_root.clone()),
+            project_workspace_root: Some(workspace_root.clone()),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::AttachedRuntimeTui,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plan");
+
+        assert_eq!(plan.preset_name, "team-local");
+        assert_eq!(plan.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(plan.network_mode, NetworkMode::On);
+        assert!(plan.mount_runtime_secrets);
+        assert_eq!(
+            plan.working_dir.as_deref(),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert!(plan.escape_classes.is_empty());
+    }
+
+    #[test]
+    fn attached_runtime_tui_requires_runtime_state_mount() {
+        let sandbox = tempdir().expect("temp dir");
+        let workspace_root = sandbox.path().join("project");
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(workspace_root),
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::AttachedRuntimeTui,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("attached runtime TUI should require runtime state");
+
+        assert!(
+            err.contains("runtime TUI requires a runtime state mount at /runtime"),
+            "unexpected planner error: {err}"
         );
     }
 
@@ -1539,5 +1716,15 @@ mod tests {
 
         let debug = format!("{planner:?}");
         assert!(!debug.contains("ghp_secret"));
+    }
+
+    fn single_environment_value<'a>(environment: &'a [(String, String)], key: &str) -> &'a str {
+        let values: Vec<&str> = environment
+            .iter()
+            .filter(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values.len(), 1, "{key} should appear exactly once");
+        values[0]
     }
 }

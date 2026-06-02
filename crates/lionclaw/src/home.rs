@@ -7,11 +7,13 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use lionclaw_runtime_api::{runtime_session_ready_marker_exists, RUNTIME_SESSION_READY_MARKER};
+
 pub const DEFAULT_WORKSPACE: &str = "main";
 pub const RUNTIME_PROJECTS_DIR: &str = "projects";
 pub const RUNTIME_SESSIONS_DIR: &str = "sessions";
 pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
-pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
+pub const RUNTIME_TUI_STATE_MARKER: &str = ".lionclaw-runtime-tui-state";
 
 #[derive(Debug, Clone)]
 pub struct LionClawHome {
@@ -373,8 +375,9 @@ async fn resolve_private_env_file(path: &Path, label: &str) -> Result<Option<Pat
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_profile_partition_key, runtime_project_partition_key, LionClawHome,
-        DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
+        runtime_profile_partition_key, runtime_project_partition_key,
+        runtime_session_ready_marker_exists, LionClawHome, DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR,
+        RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR, RUNTIME_SESSION_READY_MARKER,
     };
     use uuid::Uuid;
 
@@ -547,6 +550,40 @@ mod tests {
             .resolve_runtime_secrets_file()
             .await
             .expect_err("symlink should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_session_ready_marker_rejects_symlinks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path().join("runtime");
+        std::fs::create_dir(&root).expect("runtime root");
+        let target = temp_dir.path().join("target");
+        std::fs::write(&target, "ready\n").expect("write target");
+        std::os::unix::fs::symlink(&target, root.join(RUNTIME_SESSION_READY_MARKER))
+            .expect("symlink marker");
+
+        let err =
+            runtime_session_ready_marker_exists(&root).expect_err("symlink marker should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_session_ready_marker_rejects_symlinked_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("real-runtime");
+        let linked_root = temp_dir.path().join("linked-runtime");
+        std::fs::create_dir(&real_root).expect("real root");
+        std::fs::write(real_root.join(RUNTIME_SESSION_READY_MARKER), "ready\n")
+            .expect("write marker");
+        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
+
+        let err = runtime_session_ready_marker_exists(&linked_root)
+            .expect_err("symlinked marker root should fail");
+
+        assert!(err.to_string().contains("root"));
         assert!(err.to_string().contains("cannot be a symlink"));
     }
 }

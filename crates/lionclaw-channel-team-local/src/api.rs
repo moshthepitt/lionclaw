@@ -336,7 +336,7 @@ impl LionClawApi {
     async fn post_json<T, B>(&self, path: &str, body: &B) -> Result<T>
     where
         T: for<'de> Deserialize<'de>,
-        B: Serialize + ?Sized,
+        B: Serialize + Sync + ?Sized,
     {
         let response = self
             .client

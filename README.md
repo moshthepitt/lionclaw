@@ -83,6 +83,36 @@ lionclaw run --plain
 
 Non-terminal use automatically stays on the plain path.
 
+Use the selected runtime's own terminal UI when you specifically want the
+native harness surface:
+
+```bash
+lionclaw run --runtime-tui
+```
+
+That path still goes through LionClaw's runtime plan, mounts, staged auth,
+generated memory/continuity context, and audit trail. LionClaw writes that
+context into the runtime-private state as both `AGENTS.generated.md` and the
+runtime-standard `AGENTS.md`. For Codex, LionClaw uses the outer container as
+the sandbox boundary and starts the inner Codex UI without Codex's own
+sandbox/approval layer; the runtime-private Codex config marks the container
+workspace as trusted so project-local Codex config and hooks behave like an
+approved native Codex launch without importing or mutating the host Codex
+config. Completed Codex and OpenCode native UI turns are reconciled from
+durable runtime state into LionClaw session history on exit. OpenCode receives
+its runtime config under `/runtime` and starts with its auto-update prompt
+disabled, so runtime updates stay under LionClaw's runtime image path. If a
+prior native launch did not finish cleanly, LionClaw reconciles before the next
+launch; prior LionClaw session history is then included in the generated
+runtime context.
+LionClaw does not scrape terminal output.
+Because this is the runtime's own TUI, there is no LionClaw command layer
+inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable
+there; use the normal `lionclaw run`, `run --plain`, or channel paths when you
+need LionClaw-owned controls. Turn-scoped LionClaw features that require an
+active kernel-managed turn, such as the program-backed `channel.send` bridge,
+are not projected into native runtime TUI sessions.
+
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,
 the credentials that are staged, the durable session, and the record of what
@@ -108,7 +138,9 @@ lionclaw run
 ```
 
 In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
-for the line-oriented interactive path.
+for the line-oriented interactive path, or `lionclaw run --runtime-tui` to
+attach directly to the selected runtime's own terminal UI inside the LionClaw
+boundary.
 
 Inside the console, `Tab` and `Shift+Tab` move between Run and controls.
 `Ctrl+O` focuses controls, `Left` and `Right` cycle project, runtime, boundary,

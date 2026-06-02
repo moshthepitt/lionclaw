@@ -8996,11 +8996,9 @@ impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
         event_tx: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         let runtime_state_root = execution
-            .plan
-            .mounts
-            .iter()
-            .find(|mount| mount.target == "/runtime")
-            .map(|mount| mount.source.as_path())
+            .context
+            .runtime_state_root
+            .as_deref()
             .ok_or_else(|| anyhow::anyhow!("runtime state root missing"))?;
         let outside_current_state = runtime_state_root
             .parent()

@@ -48,6 +48,7 @@ use crate::{
             ChannelContactSetup,
         },
         run::{run_local, RunLocalInvocation},
+        run_runtime_tui::{run_runtime_tui, RunRuntimeTuiInvocation},
         run_tui::{
             run_console, run_launch_blocker, run_project_launch_blocker, LaunchBlocker,
             RunConsoleInvocation,
@@ -153,13 +154,20 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("run_mode").args(["plain", "runtime_tui"])))]
 struct RunArgs {
     #[arg(long, help = "Use the plain line-oriented interactive path")]
     plain: bool,
+    #[arg(
+        long,
+        help = "Attach directly to the selected runtime's own terminal UI"
+    )]
+    runtime_tui: bool,
     #[arg(long)]
     continue_last_session: bool,
     #[arg(
         long,
+        conflicts_with = "runtime_tui",
         value_parser = parse_runtime_timeout,
         help = "Runtime turn limit, such as 30m, 2h, or 7200s"
     )]
@@ -826,7 +834,20 @@ pub async fn run() -> Result<ExitCode> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_turn_timeout);
-            if should_use_run_tui(
+            if args.runtime_tui {
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    bail!("run --runtime-tui requires terminal stdin and stdout");
+                }
+                run_runtime_tui(RunRuntimeTuiInvocation {
+                    home: &target.instance_home,
+                    work_root: target.require_work_root()?,
+                    instance_name: target.instance_name.as_deref(),
+                    project_instance_runtime: target.project_instance_runtime_context()?,
+                    requested_runtime: args.runtime,
+                    continue_last_session: args.continue_last_session,
+                })
+                .await?;
+            } else if should_use_run_tui(
                 &args,
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
@@ -842,7 +863,7 @@ pub async fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             } else {
-                run_local(RunLocalInvocation {
+                Box::pin(run_local(RunLocalInvocation {
                     home: &target.instance_home,
                     project_root: target.project_root.as_deref(),
                     work_root: target.require_work_root()?,
@@ -851,7 +872,7 @@ pub async fn run() -> Result<ExitCode> {
                     requested_runtime: args.runtime,
                     continue_last_session: args.continue_last_session,
                     timeout_override,
-                })
+                }))
                 .await?;
             }
         }
@@ -1678,7 +1699,7 @@ pub async fn run() -> Result<ExitCode> {
 }
 
 fn should_use_run_tui(args: &RunArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
-    !args.plain && stdin_is_terminal && stdout_is_terminal
+    !args.plain && !args.runtime_tui && stdin_is_terminal && stdout_is_terminal
 }
 
 fn empty_project_for_tui_launch_blocker(selection: &TargetSelection) -> Option<PathBuf> {
@@ -2792,6 +2813,7 @@ mod tests {
                 "run",
                 Command::Run(RunArgs {
                     plain: false,
+                    runtime_tui: false,
                     continue_last_session: false,
                     timeout: None,
                     runtime: None,
@@ -2916,6 +2938,7 @@ mod tests {
         };
         let command = Command::Run(RunArgs {
             plain: false,
+            runtime_tui: false,
             continue_last_session: false,
             timeout: None,
             runtime: None,
@@ -2942,12 +2965,21 @@ mod tests {
     fn run_tui_selection_requires_tty_and_honors_plain() {
         let tui_args = RunArgs {
             plain: false,
+            runtime_tui: false,
             continue_last_session: false,
             timeout: None,
             runtime: None,
         };
         let plain_args = RunArgs {
             plain: true,
+            runtime_tui: false,
+            continue_last_session: false,
+            timeout: None,
+            runtime: None,
+        };
+        let runtime_tui_args = RunArgs {
+            plain: false,
+            runtime_tui: true,
             continue_last_session: false,
             timeout: None,
             runtime: None,
@@ -2957,6 +2989,16 @@ mod tests {
         assert!(!should_use_run_tui(&tui_args, false, true));
         assert!(!should_use_run_tui(&tui_args, true, false));
         assert!(!should_use_run_tui(&plain_args, true, true));
+        assert!(!should_use_run_tui(&runtime_tui_args, true, true));
+    }
+
+    #[test]
+    fn run_runtime_tui_parse_conflicts_with_plain_mode() {
+        assert!(Cli::try_parse_from(["lionclaw", "run", "--runtime-tui"]).is_ok());
+        assert!(Cli::try_parse_from(["lionclaw", "run", "--plain", "--runtime-tui"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lionclaw", "run", "--runtime-tui", "--timeout", "30s"]).is_err()
+        );
     }
 
     #[test]

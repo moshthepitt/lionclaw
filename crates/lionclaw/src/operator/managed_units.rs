@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -14,6 +13,7 @@ use crate::{
     home::LionClawHome,
     operator::private_paths::{
         create_private_dir_all, ensure_private_file_readable, ensure_private_file_write_target,
+        write_private_file,
     },
 };
 
@@ -327,15 +327,12 @@ fn read_unit_group_id(home: &LionClawHome) -> Result<Option<String>> {
 fn write_unit_group_id(home: &LionClawHome, unit_group_id: &str) -> Result<()> {
     Uuid::parse_str(unit_group_id).context("unit group id must be a UUID")?;
     let path = home.unit_group_id_path();
-    ensure_private_file_write_target(home, &path, "unit group id file")?;
-    std::fs::write(&path, format!("{unit_group_id}\n"))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
-    }
-    Ok(())
+    write_private_file(
+        home,
+        &path,
+        format!("{unit_group_id}\n").as_bytes(),
+        "unit group id file",
+    )
 }
 
 fn futures_home_id(home: &LionClawHome) -> Result<Option<String>> {
@@ -546,13 +543,12 @@ impl UnitManager for SystemdUserUnitManager {
             tokio::fs::write(&unit_path, &unit.unit_content)
                 .await
                 .with_context(|| format!("failed to write {}", unit_path.display()))?;
-            tokio::fs::write(&unit.env_path, &unit.env_content)
-                .await
-                .with_context(|| format!("failed to write {}", unit.env_path.display()))?;
-
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&unit.env_path, permissions)
-                .with_context(|| format!("failed to chmod {}", unit.env_path.display()))?;
+            write_private_file(
+                home,
+                &unit.env_path,
+                unit.env_content.as_bytes(),
+                "unit env file",
+            )?;
 
             if unit_changed || env_changed {
                 changed_units.push(unit.name.clone());
@@ -810,8 +806,12 @@ impl UnitManager for FakeUnitManager {
                     })
                     .unwrap_or(true);
                 stored.insert(unit.name.clone(), unit.clone());
-                std::fs::write(&unit.env_path, &unit.env_content)
-                    .with_context(|| format!("failed to write {}", unit.env_path.display()))?;
+                write_private_file(
+                    home,
+                    &unit.env_path,
+                    unit.env_content.as_bytes(),
+                    "unit env file",
+                )?;
                 if was_changed {
                     changed.push(unit.name.clone());
                 }

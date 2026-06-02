@@ -8,6 +8,10 @@ images.
 `containers/runtime/Containerfile` is the product runtime image. It contains the
 agent CLIs and common assistant tools used by `lionclaw run`.
 
+The image pins the tested `@openai/codex` and `opencode-ai` package versions in
+the Containerfile and fails the build if the installed global packages do not
+match those pins.
+
 ```bash
 podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 ```

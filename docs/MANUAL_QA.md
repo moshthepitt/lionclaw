@@ -146,7 +146,7 @@ Expected on a TTY:
   console; the status changes to stopping and the console returns to idle after
   the cancelled turn is recorded
 
-For the plain fallback:
+For the plain line-oriented path:
 
 ```bash
 printf '/lionclaw exit\n' | "$LIONCLAW_BIN" run
@@ -158,6 +158,44 @@ Expected:
 - piped non-TTY usage avoids the console
 - `--plain` uses the line-oriented prompt even on a TTY
 
+Check the selected runtime's native terminal UI:
+
+```bash
+printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_MEMORY_OK\n' >> \
+  .lionclaw/instances/main/workspaces/main/MEMORY.md
+"$LIONCLAW_BIN" run --runtime-tui
+```
+
+Prompt inside the native runtime UI:
+
+```text
+Reply with exactly the LionClaw native runtime TUI memory sentinel from your instructions.
+```
+
+Expected:
+
+- the selected runtime's own terminal UI opens inside the LionClaw launch
+  boundary
+- Codex shows `/workspace` as the directory and no inner Codex sandbox or
+  workspace-trust prompt
+- OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
+  without showing an auto-update prompt
+- the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
+- exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
+  audit events
+- completed Codex and OpenCode native UI turns are present in LionClaw session
+  history and are available to later `lionclaw run`, `run --plain`, and
+  channel context
+- opening and exiting the native UI without completing a turn leaves the launch
+  clean but does not prime a later program-backed continuation
+- after a clean exit, relaunching the native UI starts without a prelaunch
+  transcript-export pass
+- after an unclean LionClaw exit, relaunching the native UI reconciles durable
+  runtime transcript state without duplicating already imported turns
+- a second `run --runtime-tui --continue-last-session` targeting the same
+  active native UI reports a conflict instead of attaching to the same runtime
+  state concurrently
+
 Use these prompts:
 
 ```text
@@ -166,21 +204,20 @@ Reply with exactly RUN_OK_A_1 and nothing else.
 Read project-marker.txt from the current workspace and reply with exactly its contents.
 Write a draft file named keep.txt under LIONCLAW_DRAFTS_DIR containing exactly KEEP_OK, and reply only with keep.txt. Do not explain.
 /compact
-/lionclaw retry
-/lionclaw reset
-Reply with exactly RESET_OK and nothing else.
-/lionclaw exit
 ```
 
 Expected:
 
 - the first answer is `RUN_OK_A_1`
-- `/rename` and `/compact` are handled as native runtime controls,
-  not sent as ordinary prompt text
+- `/rename` and `/compact` are handled by the native runtime UI
+- native interrupt keys such as Codex's Ctrl+C remain handled by the runtime UI
 - the marker read returns `project-a`
-- `/lionclaw retry` reruns the previous prompt through LionClaw history
-- `/lionclaw reset` starts a fresh interactive session
 - generated drafts stay outside the project checkout
+- LionClaw slash controls such as `/lionclaw retry`, `/lionclaw reset`, and
+  `/lionclaw exit` are not available inside `run --runtime-tui`; exit through
+  the runtime's native exit gesture
+- turn-scoped LionClaw bridges such as runtime `channel.send` are not exposed
+  inside `run --runtime-tui`
 
 ## Phase 3: Instances And Work Roots
 
@@ -255,8 +292,10 @@ printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
 
 Expected when credentials are available:
 
-- the default runtime image can run common assistant probes such as
-  `codex --version`, `opencode --version`, `python3 --version`,
+- the default runtime image reports Codex and OpenCode versions matching the
+  `CODEX_VERSION` and `OPENCODE_VERSION` pins in
+  `containers/runtime/Containerfile`, and can run common assistant probes such
+  as `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - scoped grant approval is explicit
 - the channel response comes from the configured runtime

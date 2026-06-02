@@ -10,6 +10,9 @@ RUN rustup component add \
 
 FROM ${RUNTIME_IMAGE}
 
+# Dev inherits runtime CLIs from the runtime image; assert the required packages
+# are present without duplicating the runtime image's version pins.
+
 USER root
 
 RUN apt-get update \
@@ -64,6 +67,10 @@ USER lionclaw
 WORKDIR /workspace
 
 RUN rustc --version \
+    && npm ls -g @openai/codex opencode-ai --depth=0 --json \
+        | jq -e \
+            '.dependencies["@openai/codex"].version and .dependencies["opencode-ai"].version' \
+            >/dev/null \
     && cargo --version \
     && cargo fmt --version \
     && cargo clippy --version \

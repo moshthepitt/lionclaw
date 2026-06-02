@@ -20,7 +20,10 @@ use super::{
     },
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
-    process::{run_process_streaming, spawn_process_session, ProcessInvocation, ProcessSession},
+    process::{
+        run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
+        ProcessSession,
+    },
     runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
@@ -104,36 +107,19 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
-        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-        let prepared = prepare_oci_process_launch(
-            &request,
-            runtime_secrets
-                .as_ref()
-                .map(|secrets| secrets.secret_name.as_str()),
-        )?;
-        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
-        let result = run_process_streaming(&invocation, move |line| {
-            drop(stdout.send(line.to_string()));
-            Ok(())
-        })
-        .await;
-        let runtime_secrets_cleanup_result = match runtime_secrets {
-            Some(cleanup) => cleanup.shutdown().await,
-            None => Ok(()),
-        };
+        execute_oci_process(
+            request,
+            move |line| {
+                drop(stdout.send(line.to_string()));
+                Ok(())
+            },
+            "streaming OCI runtime turn",
+        )
+        .await
+    }
 
-        match (result, runtime_secrets_cleanup_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(output), Err(err)) => {
-                warn!(
-                    error = %err,
-                    "runtime secret cleanup failed after successful OCI runtime turn"
-                );
-                Ok(output)
-            }
-            (Err(err), _) => Err(err),
-        }
+    async fn execute_captured(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        execute_oci_process(request, |_| Ok(()), "captured OCI runtime command").await
     }
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
@@ -151,6 +137,72 @@ impl ExecutionBackend for OciExecutionBackend {
             process,
             runtime_secrets,
         }))
+    }
+
+    async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+        let prepared = prepare_oci_process_launch(
+            &request,
+            runtime_secrets
+                .as_ref()
+                .map(|secrets| secrets.secret_name.as_str()),
+        )?;
+        let invocation = build_oci_attached_process_invocation(prepared, &runtime_auth_environment);
+        let result = run_process_attached(&invocation).await;
+        let runtime_secrets_cleanup_result = match runtime_secrets {
+            Some(cleanup) => cleanup.shutdown().await,
+            None => Ok(()),
+        };
+
+        match (result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(err)) => {
+                warn!(
+                    error = %err,
+                    "runtime secret cleanup failed after attached OCI runtime"
+                );
+                Ok(output)
+            }
+            (Err(err), _) => Err(err),
+        }
+    }
+}
+
+async fn execute_oci_process<F>(
+    request: ExecutionRequest,
+    on_stdout_line: F,
+    cleanup_context: &'static str,
+) -> Result<ExecutionOutput>
+where
+    F: FnMut(&str) -> Result<()> + Send,
+{
+    let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+    let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+    let prepared = prepare_oci_process_launch(
+        &request,
+        runtime_secrets
+            .as_ref()
+            .map(|secrets| secrets.secret_name.as_str()),
+    )?;
+    let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+    let result = run_process_streaming(&invocation, on_stdout_line).await;
+    let runtime_secrets_cleanup_result = match runtime_secrets {
+        Some(cleanup) => cleanup.shutdown().await,
+        None => Ok(()),
+    };
+
+    match (result, runtime_secrets_cleanup_result) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(output), Err(err)) => {
+            warn!(
+                error = %err,
+                context = cleanup_context,
+                "runtime secret cleanup failed after successful OCI runtime"
+            );
+            Ok(output)
+        }
+        (Err(err), _) => Err(err),
     }
 }
 
@@ -203,9 +255,9 @@ pub async fn validate_oci_private_network_prerequisites(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         bail!(
-            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with code {:?} while starting a private network on this host",
+            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with {} while starting a private network on this host",
             confinement.engine,
-            output.exit_code
+            output.status_description()
         );
     }
 
@@ -239,9 +291,9 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
             bail!(
-                "failed to resolve OCI image identity for '{}'; OCI engine exited with code {:?}",
+                "failed to resolve OCI image identity for '{}'; OCI engine exited with {}",
                 image,
-                output.exit_code
+                output.status_description()
             );
         }
         bail!("failed to resolve OCI image identity for '{image}': {stderr}");
@@ -406,9 +458,9 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 bail!(
-                    "failed to inspect OCI image '{}'; OCI engine exited with code {:?}",
+                    "failed to inspect OCI image '{}'; OCI engine exited with {}",
                     image,
-                    output.exit_code
+                    output.status_description()
                 );
             }
             bail!("failed to inspect OCI image '{image}': {stderr}");
@@ -472,7 +524,25 @@ fn build_oci_process_invocation(
     prepared: PreparedOciProcessLaunch,
     runtime_auth_environment: &[(String, String)],
 ) -> ProcessInvocation {
+    build_oci_process_invocation_with_terminal(prepared, runtime_auth_environment, false)
+}
+
+fn build_oci_attached_process_invocation(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth_environment: &[(String, String)],
+) -> ProcessInvocation {
+    build_oci_process_invocation_with_terminal(prepared, runtime_auth_environment, true)
+}
+
+fn build_oci_process_invocation_with_terminal(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth_environment: &[(String, String)],
+    attach_terminal: bool,
+) -> ProcessInvocation {
     let mut args = prepared.args;
+    if attach_terminal {
+        args.push("--tty".to_string());
+    }
 
     append_bind_mount_identity_args(&mut args);
 
@@ -540,8 +610,8 @@ async fn ensure_runtime_secrets_registered(
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         bail!(
-            "failed to register OCI runtime secrets; podman secret create exited with code {:?}",
-            output.exit_code
+            "failed to register OCI runtime secrets; podman secret create exited with {}",
+            output.status_description()
         );
     }
 
@@ -593,9 +663,9 @@ impl OciRuntimeSecretsCleanup {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
             bail!(
-                "failed to remove OCI runtime secret '{}'; OCI engine exited with code {:?}",
+                "failed to remove OCI runtime secret '{}'; OCI engine exited with {}",
                 self.secret_name,
-                output.exit_code
+                output.status_description()
             );
         }
 
@@ -809,8 +879,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        build_oci_process_invocation, prepare_oci_process_launch,
-        private_network_probe_reached_process_exec, OciExecutionBackend,
+        build_oci_attached_process_invocation, build_oci_process_invocation,
+        prepare_oci_process_launch, private_network_probe_reached_process_exec,
+        OciExecutionBackend,
     };
     use crate::kernel::runtime::execution::backend::{
         ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
@@ -997,6 +1068,18 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn oci_backend_adds_tty_only_for_attached_invocation() {
+        let request = sample_execution_request();
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        let captured = build_oci_process_invocation(prepared.clone(), &[]);
+        let attached = build_oci_attached_process_invocation(prepared, &[]);
+
+        assert!(!captured.args.iter().any(|arg| arg == "--tty"));
+        assert!(attached.args.iter().any(|arg| arg == "--tty"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{fmt, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use lionclaw_runtime_api::RuntimeProgramSession;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -89,6 +90,31 @@ impl ExecutionSession {
     }
 }
 
+pub struct RuntimeExecutionSession {
+    session: ExecutionSession,
+}
+
+impl RuntimeExecutionSession {
+    pub fn new(session: ExecutionSession) -> Self {
+        Self { session }
+    }
+}
+
+#[async_trait]
+impl RuntimeProgramSession for RuntimeExecutionSession {
+    async fn write_line(&mut self, line: &str) -> Result<()> {
+        self.session.write_line(line).await
+    }
+
+    async fn read_line(&mut self) -> Result<Option<String>> {
+        self.session.read_line().await
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput> {
+        self.session.shutdown().await
+    }
+}
+
 #[async_trait]
 pub trait ExecutionBackend: Send + Sync {
     fn kind(&self) -> ConfinementBackend;
@@ -99,7 +125,11 @@ pub trait ExecutionBackend: Send + Sync {
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput>;
 
+    async fn execute_captured(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
+
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession>;
+
+    async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
 }
 
 pub async fn execute_streaming(
@@ -111,9 +141,21 @@ pub async fn execute_streaming(
     }
 }
 
+pub async fn execute_captured(request: ExecutionRequest) -> Result<ExecutionOutput> {
+    match request.plan.confinement.backend() {
+        ConfinementBackend::Oci => OciExecutionBackend.execute_captured(request).await,
+    }
+}
+
 pub async fn spawn_interactive(request: ExecutionRequest) -> Result<ExecutionSession> {
     match request.plan.confinement.backend() {
         ConfinementBackend::Oci => OciExecutionBackend.spawn_interactive(request).await,
+    }
+}
+
+pub async fn execute_attached(request: ExecutionRequest) -> Result<ExecutionOutput> {
+    match request.plan.confinement.backend() {
+        ConfinementBackend::Oci => OciExecutionBackend.execute_attached(request).await,
     }
 }
 

@@ -9,25 +9,31 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 axum = { workspace = true, features = ["macros", "json", "multipart"] }
-base64 = "0.22"
+base64.workspace = true
 chrono-tz = "0.10"
 cron = "0.16"
 http-body-util = "0.1"
 chrono = { workspace = true, features = ["serde", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
-hex = "0.4"
+hex.workspace = true
 hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+lionclaw-durable-fs.workspace = true
+lionclaw-runtime-api.workspace = true
+lionclaw-runtime-codex.workspace = true
+lionclaw-runtime-mock.workspace = true
+lionclaw-runtime-opencode.workspace = true
+nix = { version = "0.29", default-features = false, features = ["signal"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2 = "0.11"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "json", "migrate"] }
-rustix = { version = "1.1", features = ["fs", "process", "termios"] }
+rustix = { workspace = true, features = ["fs", "process", "termios"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 thiserror = "2.0"
 tempfile.workspace = true
@@ -37,5 +43,5 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tui-markdown = { version = "0.3.7", default-features = false }
-uuid = { version = "1.23", features = ["serde", "v4", "v5"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 which = "8.0"
