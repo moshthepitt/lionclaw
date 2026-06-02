@@ -31,6 +31,7 @@ const SENSITIVE_HEADER_NAMES: &[&str] = &[
     "cookie",
     "set-cookie",
 ];
+const SENSITIVE_CREDENTIAL_SCHEMES: &[&str] = &["bearer", "basic"];
 
 pub(crate) fn render_operator_error(err: &Error) -> String {
     render_operator_diagnostic(&format!("{err:#}"), false)
@@ -61,6 +62,7 @@ fn sanitize_diagnostic_text(raw: &str) -> String {
     for key in SENSITIVE_DIAGNOSTIC_KEYS {
         redacted = redact_sensitive_key_values(&redacted, key);
     }
+    redacted = redact_sensitive_credential_schemes(&redacted);
     redacted.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -126,6 +128,107 @@ fn redact_sensitive_key_values(text: &str, key: &str) -> String {
         redacted.replace_range(value_start..value_end, replacement);
         search_start = value_start + replacement.len();
     }
+}
+
+fn redact_sensitive_credential_schemes(text: &str) -> String {
+    let mut redacted = text.to_string();
+    let replacement = "[redacted]";
+    let mut search_start = 0;
+    loop {
+        let lower = redacted.to_ascii_lowercase();
+        let Some((scheme_start, scheme)) = next_credential_scheme(&lower, search_start) else {
+            return redacted;
+        };
+        let after_scheme = scheme_start + scheme.len();
+        let value_start = skip_diagnostic_spacing(&redacted, after_scheme);
+        let Some((value_start, value_end)) = credential_scheme_value_span(&redacted, value_start)
+        else {
+            search_start = after_scheme;
+            continue;
+        };
+        if credential_scheme_value_is_sensitive(&redacted[value_start..value_end]) {
+            redacted.replace_range(value_start..value_end, replacement);
+            search_start = value_start + replacement.len();
+        } else {
+            search_start = after_scheme;
+        }
+    }
+}
+
+fn next_credential_scheme(text: &str, search_start: usize) -> Option<(usize, &'static str)> {
+    SENSITIVE_CREDENTIAL_SCHEMES
+        .iter()
+        .filter_map(|scheme| next_credential_scheme_for(text, search_start, scheme))
+        .min_by_key(|(start, _)| *start)
+}
+
+fn next_credential_scheme_for(
+    text: &str,
+    mut search_start: usize,
+    scheme: &'static str,
+) -> Option<(usize, &'static str)> {
+    while let Some(relative) = text[search_start..].find(scheme) {
+        let start = search_start + relative;
+        let after_scheme = start + scheme.len();
+        if credential_scheme_has_boundaries(text, start, after_scheme) {
+            return Some((start, scheme));
+        }
+        search_start = after_scheme;
+    }
+    None
+}
+
+fn credential_scheme_has_boundaries(text: &str, start: usize, after_scheme: usize) -> bool {
+    let starts_at_boundary = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+    let followed_by_spacing = text[after_scheme..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace);
+    starts_at_boundary && followed_by_spacing
+}
+
+fn credential_scheme_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
+    if let Some(quote) = text[index..]
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\''))
+    {
+        return quoted_sensitive_value_span(text, index, quote);
+    }
+
+    let start = index;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\'') {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    (start < index).then_some((start, index))
+}
+
+fn credential_scheme_value_is_sensitive(value: &str) -> bool {
+    if value.len() < 8 {
+        return false;
+    }
+
+    let mut has_digit = false;
+    let mut has_lowercase = false;
+    let mut has_uppercase = false;
+    let mut has_token_punctuation = false;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+        } else if ch.is_ascii_lowercase() {
+            has_lowercase = true;
+        } else if ch.is_ascii_uppercase() {
+            has_uppercase = true;
+        } else if matches!(ch, '.' | '_' | '-' | '+' | '/' | '=' | ':' | '~') {
+            has_token_punctuation = true;
+        }
+    }
+
+    has_digit || has_token_punctuation || (has_lowercase && has_uppercase)
 }
 
 fn sensitive_value_span(text: &str, mut index: usize) -> Option<(usize, usize)> {
@@ -354,6 +457,36 @@ DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
         assert!(!rendered.contains("secret-token"));
         assert!(!rendered.contains("secret-cookie"));
         assert!(!rendered.contains("secret-proxy"));
+    }
+
+    #[test]
+    fn diagnostics_redact_standalone_credential_scheme_values() {
+        let rendered = render_operator_diagnostic(
+            "invalid_grant xbearer ignored Bearer ya29.secret-token revoked Basic dXNlcjpwYXNz",
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "invalid_grant xbearer ignored Bearer [redacted] revoked Basic [redacted]"
+        );
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("dXNlcjpwYXNz"));
+    }
+
+    #[test]
+    fn diagnostics_keep_plain_credential_scheme_words() {
+        let rendered = render_operator_diagnostic(
+            "OAuth2 token endpoint omitted token_type; email XOAUTH2 requires Bearer access tokens",
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "OAuth2 token endpoint omitted token_type; email XOAUTH2 requires Bearer access tokens"
+        );
     }
 
     #[test]
