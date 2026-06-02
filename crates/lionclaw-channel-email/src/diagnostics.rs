@@ -96,9 +96,13 @@ fn contains_header_name(line: &str, name: &str) -> bool {
 fn header_separator_follows(text: &str) -> bool {
     let text = text.trim_start();
     if let Some(rest) = text.strip_prefix('"').or_else(|| text.strip_prefix('\'')) {
-        return rest.trim_start().starts_with(':');
+        return header_value_separator_follows(rest);
     }
-    text.starts_with(':')
+    header_value_separator_follows(text)
+}
+
+fn header_value_separator_follows(text: &str) -> bool {
+    matches!(text.trim_start().chars().next(), Some(':' | '='))
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
@@ -322,6 +326,23 @@ mod tests {
             r#"{"Authorization": "Bearer secret-token", "error": "invalid_grant"}
 'Set-Cookie' : "session=secret-cookie"
 DEBUG "Proxy-Authorization" : "Basic secret-proxy""#,
+            false,
+        )
+        .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "[redacted sensitive header] [redacted sensitive header] [redacted sensitive header]"
+        );
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("secret-cookie"));
+        assert!(!rendered.contains("secret-proxy"));
+    }
+
+    #[test]
+    fn diagnostics_redact_sensitive_header_assignments() {
+        let rendered = render_operator_diagnostic(
+            "Authorization=Bearer secret-token\nCookie = session=secret-cookie\nProxy-Authorization = Basic secret-proxy",
             false,
         )
         .expect("diagnostic");
