@@ -51,6 +51,19 @@ const RESERVED_AUTHORIZATION_PARAMS: &[&str] = &[
     "code_challenge_method",
     "login_hint",
 ];
+const SECRET_BEARING_AUTHORIZATION_PARAMS: &[&str] = &[
+    "access_token",
+    "authorization_code",
+    "auth_code",
+    "client_assertion",
+    "client_secret",
+    "code",
+    "code_verifier",
+    "id_token",
+    "password",
+    "private_key",
+    "refresh_token",
+];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -134,7 +147,7 @@ impl FromStr for KeyValueArg {
         {
             bail!("OAuth auth parameter names must be plain ASCII names");
         }
-        validate_custom_authorization_param_name(key)?;
+        validate_authorization_param_name(key, "--auth-param")?;
         Ok(Self {
             key: key.to_string(),
             value: value.trim().to_string(),
@@ -1009,16 +1022,17 @@ fn validate_oauth_endpoint(name: &str, value: &str) -> Result<reqwest::Url> {
 
 fn validate_authorization_endpoint_query(name: &str, url: &reqwest::Url) -> Result<()> {
     for (key, _) in url.query_pairs() {
-        if is_reserved_authorization_param(&key) {
-            bail!("{name} must not include OAuth parameter '{key}' in its query");
-        }
+        validate_authorization_param_name(&key, name)?;
     }
     Ok(())
 }
 
-fn validate_custom_authorization_param_name(name: &str) -> Result<()> {
+fn validate_authorization_param_name(name: &str, source: &str) -> Result<()> {
     if is_reserved_authorization_param(name) {
-        bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be passed with --auth-param");
+        bail!("OAuth parameter '{name}' is managed by LionClaw and cannot be set in {source}");
+    }
+    if is_secret_bearing_authorization_param(name) {
+        bail!("OAuth parameter '{name}' may carry secret material and cannot be set in {source}");
     }
     Ok(())
 }
@@ -1035,12 +1049,12 @@ fn resolve_authorization_params(
 
     let mut params = Vec::with_capacity(defaults.len() + custom.len());
     for (key, value) in defaults {
-        validate_custom_authorization_param_name(&key)?;
+        validate_authorization_param_name(&key, "provider preset")?;
         remember_authorization_param_name(&mut seen, &key, "provider preset")?;
         params.push((key, value));
     }
     for param in custom {
-        validate_custom_authorization_param_name(&param.key)?;
+        validate_authorization_param_name(&param.key, "--auth-param")?;
         remember_authorization_param_name(&mut seen, &param.key, "--auth-param")?;
         params.push((param.key, param.value));
     }
@@ -1064,6 +1078,20 @@ fn is_reserved_authorization_param(name: &str) -> bool {
     RESERVED_AUTHORIZATION_PARAMS
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+fn is_secret_bearing_authorization_param(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .map(|ch| match ch {
+            '-' | '.' => '_',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect::<String>();
+    let compact = normalized.replace('_', "");
+    SECRET_BEARING_AUTHORIZATION_PARAMS
+        .iter()
+        .any(|secret| *secret == normalized || secret.replace('_', "") == compact)
 }
 
 fn normalize_secure_tls_mode(name: &str, raw: &str) -> Result<String> {
@@ -2269,6 +2297,18 @@ mod tests {
     }
 
     #[test]
+    fn oauth2_setup_rejects_secret_bearing_authorization_query_params() {
+        let mut args = test_setup_args(Oauth2Provider::Gmail);
+        args.authorization_endpoint =
+            Some("https://accounts.example.com/oauth2?client-secret=secret".to_string());
+
+        let err = resolve_setup(args).expect_err("secret auth query parameter should fail");
+
+        assert!(err.to_string().contains("client-secret"));
+        assert!(err.to_string().contains("secret material"));
+    }
+
+    #[test]
     fn oauth2_setup_rejects_reserved_auth_params() {
         let mut args = test_setup_args(Oauth2Provider::Gmail);
         args.auth_params = vec![KeyValueArg {
@@ -2279,6 +2319,23 @@ mod tests {
         let err = resolve_setup(args).expect_err("reserved auth parameter should fail");
 
         assert!(err.to_string().contains("--auth-param"));
+    }
+
+    #[test]
+    fn oauth2_setup_rejects_secret_bearing_auth_params() {
+        let err = "client.secret=secret"
+            .parse::<KeyValueArg>()
+            .expect_err("secret auth parameter should fail");
+
+        assert!(err.to_string().contains("client.secret"));
+        assert!(err.to_string().contains("secret material"));
+
+        let err = "clientSecret=secret"
+            .parse::<KeyValueArg>()
+            .expect_err("camel-case secret auth parameter should fail");
+
+        assert!(err.to_string().contains("clientSecret"));
+        assert!(err.to_string().contains("secret material"));
     }
 
     #[test]
