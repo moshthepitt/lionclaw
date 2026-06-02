@@ -5,11 +5,11 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-
-use crate::{
-    durable_fs::{remove_file_if_exists as remove_file_if_exists_durably, write_file_atomically},
-    home::LionClawHome,
+use lionclaw_durable_fs::{
+    remove_file_if_exists as remove_file_if_exists_durably, write_file_atomically,
 };
+
+use crate::home::LionClawHome;
 
 pub(crate) fn create_private_dir_all(home: &LionClawHome, path: &Path, label: &str) -> Result<()> {
     let root = home.root();

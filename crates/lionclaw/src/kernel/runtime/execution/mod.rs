@@ -12,7 +12,8 @@ pub(crate) mod process;
 pub(crate) mod runtime_auth;
 pub use backend::{
     execute_attached, execute_captured, execute_streaming, spawn_interactive, ExecutionBackend,
-    ExecutionOutput, ExecutionRequest, ExecutionSession, RuntimeSecretsMount,
+    ExecutionOutput, ExecutionRequest, ExecutionSession, RuntimeExecutionSession,
+    RuntimeSecretsMount,
 };
 pub use oci::{
     resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,

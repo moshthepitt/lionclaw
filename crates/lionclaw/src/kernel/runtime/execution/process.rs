@@ -6,6 +6,8 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
+pub use lionclaw_runtime_api::ExecutionOutput as ProcessOutput;
+
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
@@ -30,30 +32,6 @@ impl fmt::Debug for ProcessInvocation {
             .field("environment_count", &self.environment.len())
             .field("input_len", &self.input.len())
             .finish()
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ProcessOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: Option<i32>,
-    pub exit_signal: Option<i32>,
-}
-
-impl ProcessOutput {
-    pub fn success(&self) -> bool {
-        self.exit_code == Some(0) && self.exit_signal.is_none()
-    }
-
-    pub fn status_description(&self) -> String {
-        if let Some(code) = self.exit_code {
-            return format!("code {code}");
-        }
-        if let Some(signal) = self.exit_signal {
-            return format!("signal {signal}");
-        }
-        "unknown status".to_string()
     }
 }
 

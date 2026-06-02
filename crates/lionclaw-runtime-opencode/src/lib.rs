@@ -1,3 +1,35 @@
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::allow_attributes_without_reason,
+        clippy::clone_on_ref_ptr,
+        clippy::expect_used,
+        clippy::future_not_send,
+        clippy::get_unwrap,
+        clippy::indexing_slicing,
+        clippy::large_futures,
+        clippy::large_stack_arrays,
+        clippy::large_types_passed_by_value,
+        clippy::let_underscore_must_use,
+        clippy::mutex_atomic,
+        clippy::mutex_integer,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::pathbuf_init_then_push,
+        clippy::rc_buffer,
+        clippy::rc_mutex,
+        clippy::redundant_clone,
+        clippy::same_name_method,
+        clippy::significant_drop_in_scrutinee,
+        clippy::significant_drop_tightening,
+        clippy::uninlined_format_args,
+        clippy::unused_result_ok,
+        clippy::unwrap_in_result,
+        clippy::unwrap_used,
+        reason = "production code follows LionClaw's strict Clippy profile; tests keep fail-fast ergonomics"
+    )
+)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -11,18 +43,15 @@ use tokio::time::{timeout_at, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+use lionclaw_runtime_api::{
+    choose_terminal_transcript_target, load_ready_state_value, load_state_value,
+    normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+    RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
     RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-};
-
-use super::{
-    choose_terminal_transcript_target, normalize_terminal_transcript_launch_started_at,
-    state_file::{load_ready_state_value, load_state_value, save_state_value},
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
@@ -83,12 +112,10 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
-        let session_id = input
-            .runtime_state_root
-            .as_deref()
-            .map(load_ready_opencode_session_id)
-            .transpose()?
-            .flatten();
+        let session_id = match input.runtime_state_root.as_deref() {
+            Some(root) => load_ready_opencode_session_id(root, input.runtime_session_ready)?,
+            None => None,
+        };
         let resumes_existing_session = session_id.is_some();
         self.sessions
             .write()
@@ -107,7 +134,11 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         })
     }
 
-    fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+    fn build_turn_program(
+        &self,
+        input: &RuntimeTurnInput,
+        _context: &RuntimeExecutionContext,
+    ) -> Result<RuntimeProgramSpec> {
         let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
 
         Ok(RuntimeProgramSpec {
@@ -146,7 +177,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     ) -> Result<RuntimeProgramSpec> {
         Ok(build_opencode_terminal_program(
             &self.config,
-            load_ready_opencode_session_id(&input.runtime_state_root)?,
+            load_ready_opencode_session_id(&input.runtime_state_root, input.runtime_session_ready)?,
         ))
     }
 
@@ -874,8 +905,16 @@ fn load_saved_opencode_session_id(root: &Path) -> Result<Option<String>> {
     load_state_value(root, OPENCODE_SESSION_ID_STATE_FILE, "opencode session")
 }
 
-fn load_ready_opencode_session_id(root: &Path) -> Result<Option<String>> {
-    load_ready_state_value(root, OPENCODE_SESSION_ID_STATE_FILE, "opencode session")
+fn load_ready_opencode_session_id(
+    root: &Path,
+    runtime_session_ready: RuntimeSessionReady,
+) -> Result<Option<String>> {
+    load_ready_state_value(
+        root,
+        OPENCODE_SESSION_ID_STATE_FILE,
+        "opencode session",
+        runtime_session_ready,
+    )
 }
 
 fn save_opencode_session_id(root: &Path, session_id: &str) -> Result<()> {
@@ -1190,13 +1229,19 @@ fn collect_texts(value: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, future::pending, path::PathBuf, time::Duration};
+    use std::{
+        collections::VecDeque,
+        future::pending,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
-    use crate::kernel::runtime::{
-        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeProgramSpec,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
+    use lionclaw_runtime_api::{
+        ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
-        RuntimeTurnMode,
+        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
@@ -1206,6 +1251,29 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
     use uuid::Uuid;
+
+    fn execution_context() -> RuntimeExecutionContext {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: None,
+            runtime_path_projections: Vec::new(),
+        }
+    }
+
+    fn runtime_not_ready() -> RuntimeSessionReady {
+        RuntimeSessionReady::not_ready()
+    }
+
+    fn mark_runtime_ready(runtime_state_root: &Path) -> RuntimeSessionReady {
+        std::fs::write(
+            runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
+            "ready\n",
+        )
+        .expect("write runtime ready marker");
+        RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
+            .expect("runtime ready marker should be valid")
+    }
 
     #[derive(Debug)]
     struct FakeTranscriptExecutor {
@@ -1492,17 +1560,21 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
+                runtime_session_ready: runtime_not_ready(),
             })
             .await
             .expect("start");
 
         let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id,
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
+            .build_turn_program(
+                &RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                    fresh_prompt: None,
+                    runtime_skill_ids: Vec::new(),
+                },
+                &execution_context(),
+            )
             .expect("program");
 
         assert_eq!(program.executable, "opencode");
@@ -1537,6 +1609,7 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: runtime_not_ready(),
             })
             .await
             .expect("start");
@@ -1561,7 +1634,9 @@ mod tests {
             "ses_program\n"
         );
 
-        let program = adapter.build_turn_program(&input).expect("program");
+        let program = adapter
+            .build_turn_program(&input, &execution_context())
+            .expect("program");
         assert_eq!(
             program.args,
             vec![
@@ -1583,16 +1658,12 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
-        std::fs::write(
             runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
             "ses_ready\n",
         )
         .expect("write session id");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -1601,17 +1672,21 @@ mod tests {
                 environment: Vec::new(),
                 runtime_skill_ids: Vec::new(),
                 runtime_state_root: Some(runtime_state_root),
+                runtime_session_ready,
             })
             .await
             .expect("start");
         assert!(handle.resumes_existing_session);
         let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id,
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
+            .build_turn_program(
+                &RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                    fresh_prompt: None,
+                    runtime_skill_ids: Vec::new(),
+                },
+                &execution_context(),
+            )
             .expect("program");
 
         assert_eq!(
@@ -1643,6 +1718,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: runtime_not_ready(),
             })
             .expect("program");
 
@@ -1667,21 +1743,18 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
-        std::fs::write(
             runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
             "ses_saved\n",
         )
         .expect("write session id");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready,
             })
             .expect("program");
 
@@ -1707,6 +1780,7 @@ mod tests {
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready: runtime_not_ready(),
             })
             .expect("program");
 
@@ -1720,11 +1794,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "ready\n",
-        )
-        .expect("write ready marker");
         let target = temp_dir.path().join("outside-session-id");
         std::fs::write(&target, "ses_outside\n").expect("write target");
         std::os::unix::fs::symlink(
@@ -1733,11 +1802,13 @@ mod tests {
         )
         .expect("symlink session state");
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
 
         let err = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
+                runtime_session_ready,
             })
             .expect_err("symlinked session state should be rejected");
 
