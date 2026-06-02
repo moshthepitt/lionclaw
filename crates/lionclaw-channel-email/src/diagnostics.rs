@@ -19,12 +19,21 @@ const SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &[
     "client-secret",
     "client secret",
     "clientsecret",
+    "authorization_code",
+    "authorization-code",
+    "authorization code",
+    "authorizationcode",
+    "auth_code",
+    "auth-code",
+    "auth code",
+    "authcode",
     "code_verifier",
     "code-verifier",
     "code verifier",
     "codeverifier",
     "password",
 ];
+const CONDITIONAL_SENSITIVE_DIAGNOSTIC_KEYS: &[&str] = &["code"];
 const SENSITIVE_HEADER_NAMES: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -60,7 +69,10 @@ fn sanitize_diagnostic_text(raw: &str) -> String {
         .join("\n");
     let mut redacted = header_redacted;
     for key in SENSITIVE_DIAGNOSTIC_KEYS {
-        redacted = redact_sensitive_key_values(&redacted, key);
+        redacted = redact_sensitive_key_values(&redacted, key, false, always_sensitive);
+    }
+    for key in CONDITIONAL_SENSITIVE_DIAGNOSTIC_KEYS {
+        redacted = redact_sensitive_key_values(&redacted, key, true, looks_like_credential_value);
     }
     redacted = redact_sensitive_credential_schemes(&redacted);
     redacted.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -111,7 +123,12 @@ fn is_header_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-'
 }
 
-fn redact_sensitive_key_values(text: &str, key: &str) -> String {
+fn redact_sensitive_key_values(
+    text: &str,
+    key: &str,
+    require_boundary: bool,
+    should_redact: fn(&str) -> bool,
+) -> String {
     let mut redacted = text.to_string();
     let replacement = "[redacted]";
     let mut search_start = 0;
@@ -120,14 +137,48 @@ fn redact_sensitive_key_values(text: &str, key: &str) -> String {
         let Some(relative_key_start) = lower[search_start..].find(key) else {
             return redacted;
         };
-        let after_key = search_start + relative_key_start + key.len();
+        let key_start = search_start + relative_key_start;
+        let after_key = key_start + key.len();
+        if require_boundary && !sensitive_key_has_boundaries(&lower, key_start, after_key) {
+            search_start = after_key;
+            continue;
+        }
         let Some((value_start, value_end)) = sensitive_value_span(&redacted, after_key) else {
             search_start = after_key;
             continue;
         };
+        if !should_redact(&redacted[value_start..value_end]) {
+            search_start = value_end;
+            continue;
+        }
         redacted.replace_range(value_start..value_end, replacement);
         search_start = value_start + replacement.len();
     }
+}
+
+fn sensitive_key_has_boundaries(text: &str, start: usize, after_key: usize) -> bool {
+    let starts_at_boundary = start == 0 || !is_sensitive_key_byte(text.as_bytes()[start - 1]);
+    let ends_at_boundary = text[after_key..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_sensitive_key_char(ch));
+    starts_at_boundary && ends_at_boundary
+}
+
+fn is_sensitive_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_sensitive_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+fn always_sensitive(_value: &str) -> bool {
+    true
+}
+
+fn looks_like_credential_value(value: &str) -> bool {
+    value.chars().count() >= 16 && value.chars().any(|ch| ch.is_ascii_alphanumeric())
 }
 
 fn redact_sensitive_credential_schemes(text: &str) -> String {
@@ -371,6 +422,33 @@ mod tests {
         assert!(!rendered.contains("secret-client"));
         assert!(!rendered.contains("secret-access"));
         assert!(!rendered.contains("secret-verifier"));
+    }
+
+    #[test]
+    fn diagnostics_redact_oauth_authorization_code_echoes() {
+        let rendered = render_operator_diagnostic(
+            "invalid_grant code=4/0AbCdEfGhIjKlMnOpQrStUvWxYz authorization_code=secret-auth-code code_verifier=secret-verifier",
+            false,
+        )
+        .expect("diagnostic");
+
+        assert!(rendered.contains("invalid_grant"));
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("0AbCdEfGhIjKlMnOpQrStUvWxYz"));
+        assert!(!rendered.contains("secret-auth-code"));
+        assert!(!rendered.contains("secret-verifier"));
+    }
+
+    #[test]
+    fn diagnostics_keep_plain_error_code_context() {
+        let rendered =
+            render_operator_diagnostic("provider error code: invalid_grant status_code=400", false)
+                .expect("diagnostic");
+
+        assert_eq!(
+            rendered,
+            "provider error code: invalid_grant status_code=400"
+        );
     }
 
     #[test]
