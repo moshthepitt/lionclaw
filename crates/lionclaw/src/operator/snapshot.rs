@@ -168,15 +168,22 @@ fn apply_snapshot_overlays(destination_root: &Path, overlays: &[SnapshotOverlay]
             }
         }
 
-        fs::copy(&overlay.source_path, &destination).with_context(|| {
-            format!(
-                "failed to copy snapshot overlay '{}' to '{}'",
-                overlay.source_path.display(),
-                destination.display()
-            )
-        })?;
+        copy_regular_file(&overlay.source_path, &destination, &source_metadata)?;
     }
 
+    Ok(())
+}
+
+fn copy_regular_file(source: &Path, destination: &Path, metadata: &fs::Metadata) -> Result<()> {
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to copy '{}' to '{}'",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    fs::set_permissions(destination, metadata.permissions())
+        .with_context(|| format!("failed to set permissions on {}", destination.display()))?;
     Ok(())
 }
 
@@ -370,13 +377,7 @@ pub(crate) fn copy_snapshot_tree(source: &Path, destination: &Path) -> Result<()
         if metadata.is_dir() {
             copy_snapshot_tree(&path, &target)?;
         } else if metadata.is_file() {
-            fs::copy(&path, &target).with_context(|| {
-                format!(
-                    "failed to copy '{}' to '{}'",
-                    path.display(),
-                    target.display()
-                )
-            })?;
+            copy_regular_file(&path, &target, &metadata)?;
         } else {
             return Err(anyhow!(
                 "skill source entry '{}' is not a regular file or directory",
@@ -582,6 +583,21 @@ mod tests {
         }
     }
 
+    fn assert_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(path).expect("metadata").permissions().mode();
+            assert_ne!(mode & 0o111, 0, "{} is not executable", path.display());
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
     #[test]
     fn installs_idempotent_snapshot_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -701,15 +717,14 @@ mod tests {
 
         assert_ne!(first.hash, second.hash);
         assert_ne!(first.skill_id, second.skill_id);
+        let installed_worker = second
+            .snapshot_abs_dir
+            .join("runtime/team-local/bin/lionclaw-channel-team-local");
         assert_eq!(
-            fs::read_to_string(
-                second
-                    .snapshot_abs_dir
-                    .join("runtime/team-local/bin/lionclaw-channel-team-local")
-            )
-            .expect("installed worker"),
+            fs::read_to_string(&installed_worker).expect("installed worker"),
             "worker v2\n"
         );
+        assert_executable(&installed_worker);
     }
 
     #[test]
