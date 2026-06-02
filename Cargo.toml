@@ -22,6 +22,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = "0.4"
+clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }

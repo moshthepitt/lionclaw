@@ -10,9 +10,9 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-base64 = "0.22"
+base64.workspace = true
 chrono = { workspace = true, features = ["serde", "clock"] }
-clap = { version = "4.6", features = ["derive"] }
+clap.workspace = true
 hex.workspace = true
 imap-client = "0.3"
 mail-parser = "0.11"
