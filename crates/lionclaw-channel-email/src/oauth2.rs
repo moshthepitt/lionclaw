@@ -1461,8 +1461,8 @@ where
 
 fn parse_http_get_target(first_line: &str) -> Option<&str> {
     let mut parts = first_line.split_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("GET"), Some(target), Some(_version)) => Some(target),
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("GET"), Some(target), Some("HTTP/1.0" | "HTTP/1.1"), None) => Some(target),
         _ => None,
     }
 }
@@ -2957,6 +2957,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_wait_continues_after_malformed_request_line() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("callback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let wait =
+            tokio::spawn(async move { wait_for_authorization_code(listener, "expected").await });
+
+        let malformed_response = send_callback_request_line(
+            port,
+            "GET /oauth2/callback?code=bad&state=expected not-http",
+        )
+        .await;
+        assert!(malformed_response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(malformed_response.contains("Waiting for OAuth2 callback"));
+
+        let extra_tokens_response = send_callback_request_line(
+            port,
+            "GET /oauth2/callback?code=bad&state=expected HTTP/1.1 extra",
+        )
+        .await;
+        assert!(extra_tokens_response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(extra_tokens_response.contains("Waiting for OAuth2 callback"));
+
+        let good_response =
+            send_callback_request(port, "/oauth2/callback?code=good&state=expected").await;
+        assert!(good_response.starts_with("HTTP/1.1 200 OK"));
+
+        let code = wait
+            .await
+            .expect("join callback wait")
+            .expect("callback code");
+        assert_eq!(code, "good");
+    }
+
+    #[tokio::test]
     async fn callback_provider_error_with_matching_state_aborts_wait() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3019,11 +3055,15 @@ mod tests {
     }
 
     async fn send_callback_request(port: u16, target: &str) -> String {
+        send_callback_request_line(port, &format!("GET {target} HTTP/1.1")).await
+    }
+
+    async fn send_callback_request_line(port: u16, first_line: &str) -> String {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect to callback listener");
         let request =
-            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+            format!("{first_line}\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .await
