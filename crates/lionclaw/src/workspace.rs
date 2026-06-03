@@ -2,7 +2,10 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::kernel::{continuity::ContinuityLayout, continuity_fs::ContinuityFs};
+use crate::kernel::{
+    continuity::{ContinuityLayout, MEMORY_FILE},
+    continuity_fs::ContinuityFs,
+};
 
 pub const IDENTITY_FILE: &str = "IDENTITY.md";
 pub const SOUL_FILE: &str = "SOUL.md";
@@ -28,6 +31,26 @@ pub async fn bootstrap_workspace(workspace_root: &Path) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+#[deprecated(note = "runtime prompt construction must use policy-selected targeted reads")]
+pub async fn read_workspace_sections(workspace_root: &Path) -> Result<Vec<(String, String)>> {
+    let mut sections = Vec::new();
+    for file_name in [IDENTITY_FILE, SOUL_FILE, AGENTS_FILE, USER_FILE] {
+        if let Some(content) = read_workspace_section(workspace_root, file_name).await? {
+            sections.push((file_name.to_string(), content));
+        }
+    }
+
+    let continuity = ContinuityLayout::new(workspace_root);
+    if let Some(content) = continuity.read_memory_prompt_section().await? {
+        sections.push((MEMORY_FILE.to_string(), content));
+    }
+    if let Some(content) = continuity.read_active_prompt_section().await? {
+        sections.push(("continuity/ACTIVE.md".to_string(), content));
+    }
+
+    Ok(sections)
 }
 
 pub async fn read_workspace_section(
@@ -61,6 +84,27 @@ mod tests {
             .await
             .expect_err("bootstrap should fail");
         assert!(err.to_string().contains("failed to open"));
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn compatibility_workspace_sections_reject_symlinked_files() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        bootstrap_workspace(&workspace)
+            .await
+            .expect("bootstrap workspace");
+
+        let outside = temp_dir.path().join("outside.md");
+        std::fs::write(&outside, "# Outside\n").expect("write outside file");
+        std::fs::remove_file(workspace.join(SOUL_FILE)).expect("remove soul file");
+        symlink(&outside, workspace.join(SOUL_FILE)).expect("symlink soul file");
+
+        let err = super::read_workspace_sections(&workspace)
+            .await
+            .expect_err("read workspace sections should fail");
+        let message = err.to_string();
+        assert!(message.contains("failed to open") || message.contains("not a regular file"));
     }
 
     #[tokio::test]

@@ -1,6 +1,11 @@
 use serde_json::{json, Value};
 
-use crate::contracts::{SessionHistoryPolicy, TrustTier};
+use crate::{
+    contracts::{SessionHistoryPolicy, TrustTier},
+    workspace::{AGENTS_FILE, IDENTITY_FILE, SOUL_FILE, USER_FILE},
+};
+
+use super::continuity::MEMORY_FILE;
 
 pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 1;
 
@@ -30,6 +35,7 @@ const HANDOFF_UNTRUSTED_INTERACTIVE_BUDGET: usize = 1024;
 const HANDOFF_UNTRUSTED_CONSERVATIVE_BUDGET: usize = 512;
 const GENERATED_NOTE_BUDGET: usize = 4096;
 const CURRENT_INPUT_BUDGET: usize = usize::MAX;
+const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptContextMode {
@@ -156,10 +162,10 @@ pub(crate) enum WorkspaceContextFile {
 impl WorkspaceContextFile {
     pub(crate) fn file_name(self) -> &'static str {
         match self {
-            Self::Agents => "AGENTS.md",
-            Self::Identity => "IDENTITY.md",
-            Self::Soul => "SOUL.md",
-            Self::User => "USER.md",
+            Self::Agents => AGENTS_FILE,
+            Self::Identity => IDENTITY_FILE,
+            Self::Soul => SOUL_FILE,
+            Self::User => USER_FILE,
         }
     }
 }
@@ -173,8 +179,8 @@ pub(crate) enum ContinuityContextFile {
 impl ContinuityContextFile {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Memory => "MEMORY.md",
-            Self::Active => "continuity/ACTIVE.md",
+            Self::Memory => MEMORY_FILE,
+            Self::Active => ACTIVE_CONTEXT_FILE,
         }
     }
 }
@@ -423,7 +429,7 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
         },
         ContextItemSpec {
             id: ContextItemId::WorkspaceRules,
-            title: "AGENTS.md",
+            title: AGENTS_FILE,
             class: ContextClass::WorkspaceRules,
             source: ContextSource::WorkspaceFile(WorkspaceContextFile::Agents),
             required: false,
@@ -437,35 +443,35 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
         },
         ContextItemSpec {
             id: ContextItemId::Identity,
-            title: "IDENTITY.md",
+            title: IDENTITY_FILE,
             class: ContextClass::OperatorPrivate,
             source: ContextSource::WorkspaceFile(WorkspaceContextFile::Identity),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::StyleProfile,
-            title: "SOUL.md",
+            title: SOUL_FILE,
             class: ContextClass::OperatorPrivate,
             source: ContextSource::WorkspaceFile(WorkspaceContextFile::Soul),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::UserContext,
-            title: "USER.md",
+            title: USER_FILE,
             class: ContextClass::UserPrivate,
             source: ContextSource::WorkspaceFile(WorkspaceContextFile::User),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::MemoryContext,
-            title: "MEMORY.md",
+            title: MEMORY_FILE,
             class: ContextClass::Memory,
             source: ContextSource::ContinuityFile(ContinuityContextFile::Memory),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::ActiveContinuity,
-            title: "continuity/ACTIVE.md",
+            title: ACTIVE_CONTEXT_FILE,
             class: ContextClass::ActiveContinuity,
             source: ContextSource::ContinuityFile(ContinuityContextFile::Active),
             required: false,
@@ -832,6 +838,41 @@ mod tests {
             .expect("safe workspace rules");
         assert!(policy.allows(safe).is_ok());
         assert_eq!(policy.transcript_tail_limit, 4);
+    }
+
+    #[test]
+    fn untrusted_conservative_policy_tightens_allowed_context() {
+        let interactive = PromptContextPolicy::new(
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+            PromptContextMode::ProgramPrimary,
+            "codex",
+        );
+        let conservative = PromptContextPolicy::new(
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Conservative,
+            PromptContextMode::ProgramPrimary,
+            "codex",
+        );
+        let items = context_item_specs(PromptContextMode::ProgramPrimary);
+        let active = items
+            .iter()
+            .find(|item| item.id == ContextItemId::ActiveContinuity)
+            .expect("active continuity");
+        let handoff = items
+            .iter()
+            .find(|item| item.id == ContextItemId::SessionHandoff)
+            .expect("session handoff");
+        let private = items
+            .iter()
+            .find(|item| item.id == ContextItemId::UserContext)
+            .expect("user context");
+
+        assert_eq!(interactive.transcript_tail_limit, 4);
+        assert_eq!(conservative.transcript_tail_limit, 2);
+        assert!(conservative.max_bytes(active) < interactive.max_bytes(active));
+        assert!(conservative.max_bytes(handoff) < interactive.max_bytes(handoff));
+        assert!(conservative.allows(private).is_err());
     }
 
     #[test]
