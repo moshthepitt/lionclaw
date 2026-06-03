@@ -282,16 +282,18 @@ impl PromptContextPolicy {
                 Ok(())
             }
             TrustTier::Untrusted => match item.class {
-                ContextClass::RuntimeNote if item.id == ContextItemId::RuntimeSecretsNote => {
-                    Err(ExclusionDecision {
+                ContextClass::RuntimeNote => match item.id {
+                    ContextItemId::RuntimeSessionNote
+                    | ContextItemId::NativeTuiSessionNote
+                    | ContextItemId::DraftOutputsNote => Ok(()),
+                    _ => Err(ExclusionDecision {
                         reason: "trust_tier_untrusted",
-                    })
-                }
+                    }),
+                },
                 ContextClass::Kernel
                 | ContextClass::ActiveContinuity
                 | ContextClass::SessionHandoff
                 | ContextClass::Transcript
-                | ContextClass::RuntimeNote
                 | ContextClass::CurrentInput => Ok(()),
                 ContextClass::WorkspaceRules if item.id == ContextItemId::SafeWorkspaceRules => {
                     Ok(())
@@ -892,6 +894,42 @@ mod tests {
             .allows(&item)
             .expect_err("untrusted runtime excludes secret guidance");
         assert_eq!(err.reason, "trust_tier_untrusted");
+    }
+
+    #[test]
+    fn untrusted_policy_allows_only_safe_runtime_notes() {
+        for (mode, expected_runtime_note) in [
+            (
+                PromptContextMode::ProgramResumePrimary,
+                ContextItemId::RuntimeSessionNote,
+            ),
+            (
+                PromptContextMode::AttachedNativeTui,
+                ContextItemId::NativeTuiSessionNote,
+            ),
+            (
+                PromptContextMode::ProgramPrimary,
+                ContextItemId::DraftOutputsNote,
+            ),
+        ] {
+            let policy = PromptContextPolicy::new(
+                TrustTier::Untrusted,
+                SessionHistoryPolicy::Interactive,
+                mode,
+                "codex",
+            );
+            let item = context_item_specs(mode)
+                .into_iter()
+                .find(|item| item.id == expected_runtime_note)
+                .unwrap_or_else(|| panic!("missing {}", expected_runtime_note.as_str()));
+
+            assert!(
+                policy.allows(&item).is_ok(),
+                "{} should be allowed for untrusted {}",
+                expected_runtime_note.as_str(),
+                mode.as_str()
+            );
+        }
     }
 
     #[test]
