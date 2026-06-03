@@ -770,6 +770,28 @@ mod tests {
     }
 
     #[test]
+    fn context_item_specs_are_unique_and_consistent() {
+        for mode in [
+            PromptContextMode::ProgramPrimary,
+            PromptContextMode::ProgramResumePrimary,
+            PromptContextMode::ProgramFresh,
+            PromptContextMode::AttachedNativeTui,
+        ] {
+            let mut ids = Vec::new();
+            for item in context_item_specs(mode) {
+                assert!(
+                    !ids.contains(&item.id),
+                    "duplicate context item id '{}' in {}",
+                    item.id.as_str(),
+                    mode.as_str()
+                );
+                ids.push(item.id);
+                assert_context_item_shape(item);
+            }
+        }
+    }
+
+    #[test]
     fn main_interactive_policy_allows_private_context() {
         let policy = PromptContextPolicy::new(
             TrustTier::Main,
@@ -1007,5 +1029,121 @@ mod tests {
         assert!(raw.contains("\"user_context\""));
         assert!(raw.contains("\"user_private\""));
         assert!(!raw.contains("SECRET_USER_FACT_SHOULD_NOT_APPEAR"));
+    }
+
+    fn assert_context_item_shape(item: ContextItemSpec) {
+        match item.id {
+            ContextItemId::KernelPolicy => {
+                assert_eq!(item.class, ContextClass::Kernel);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::KernelPolicy)
+                );
+                assert!(item.required);
+            }
+            ContextItemId::WorkspaceRules => {
+                assert_eq!(item.class, ContextClass::WorkspaceRules);
+                assert_eq!(
+                    item.source,
+                    ContextSource::WorkspaceFile(WorkspaceContextFile::Agents)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::SafeWorkspaceRules => {
+                assert_eq!(item.class, ContextClass::WorkspaceRules);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::SafeWorkspaceRules)
+                );
+                assert!(item.required);
+            }
+            ContextItemId::Identity => {
+                assert_eq!(item.class, ContextClass::OperatorPrivate);
+                assert_eq!(
+                    item.source,
+                    ContextSource::WorkspaceFile(WorkspaceContextFile::Identity)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::StyleProfile => {
+                assert_eq!(item.class, ContextClass::OperatorPrivate);
+                assert_eq!(
+                    item.source,
+                    ContextSource::WorkspaceFile(WorkspaceContextFile::Soul)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::UserContext => {
+                assert_eq!(item.class, ContextClass::UserPrivate);
+                assert_eq!(
+                    item.source,
+                    ContextSource::WorkspaceFile(WorkspaceContextFile::User)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::MemoryContext => {
+                assert_eq!(item.class, ContextClass::Memory);
+                assert_eq!(
+                    item.source,
+                    ContextSource::ContinuityFile(ContinuityContextFile::Memory)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::ActiveContinuity => {
+                assert_eq!(item.class, ContextClass::ActiveContinuity);
+                assert_eq!(
+                    item.source,
+                    ContextSource::ContinuityFile(ContinuityContextFile::Active)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::SessionHandoff => {
+                assert_eq!(item.class, ContextClass::SessionHandoff);
+                assert_eq!(item.source, ContextSource::CompactionSummary);
+                assert!(!item.required);
+            }
+            ContextItemId::RecentTranscript => {
+                assert_eq!(item.class, ContextClass::Transcript);
+                assert_eq!(item.source, ContextSource::TranscriptTail);
+                assert!(!item.required);
+            }
+            ContextItemId::RuntimeSessionNote => {
+                assert_eq!(item.class, ContextClass::RuntimeNote);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::RuntimeSessionNote)
+                );
+                assert!(item.required);
+            }
+            ContextItemId::NativeTuiSessionNote => {
+                assert_eq!(item.class, ContextClass::RuntimeNote);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::NativeTuiSessionNote)
+                );
+                assert!(item.required);
+            }
+            ContextItemId::DraftOutputsNote => {
+                assert_eq!(item.class, ContextClass::RuntimeNote);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::DraftOutputsNote)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::RuntimeSecretsNote => {
+                assert_eq!(item.class, ContextClass::RuntimeNote);
+                assert_eq!(
+                    item.source,
+                    ContextSource::Generated(GeneratedContextSource::RuntimeSecretsNote)
+                );
+                assert!(!item.required);
+            }
+            ContextItemId::UserInput => {
+                assert_eq!(item.class, ContextClass::CurrentInput);
+                assert_eq!(item.source, ContextSource::CurrentUserInput);
+                assert!(item.required);
+            }
+        }
     }
 }
