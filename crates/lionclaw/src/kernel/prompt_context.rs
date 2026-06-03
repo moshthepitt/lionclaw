@@ -8,6 +8,14 @@ use crate::{
 use super::continuity::MEMORY_FILE;
 
 pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 1;
+pub(crate) const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
+
+const GENERATED_KERNEL_POLICY: &str = "kernel_policy";
+const GENERATED_SAFE_WORKSPACE_RULES: &str = "safe_workspace_rules";
+const GENERATED_RUNTIME_SESSION_NOTE: &str = "runtime_session_note";
+const GENERATED_NATIVE_TUI_SESSION_NOTE: &str = "native_tui_session_note";
+const GENERATED_DRAFT_OUTPUTS_NOTE: &str = "draft_outputs_note";
+const GENERATED_RUNTIME_SECRETS_NOTE: &str = "runtime_secrets_note";
 
 const MAIN_INTERACTIVE_TRANSCRIPT_TAIL: usize = 12;
 const MAIN_CONSERVATIVE_TRANSCRIPT_TAIL: usize = 6;
@@ -35,7 +43,6 @@ const HANDOFF_UNTRUSTED_INTERACTIVE_BUDGET: usize = 1024;
 const HANDOFF_UNTRUSTED_CONSERVATIVE_BUDGET: usize = 512;
 const GENERATED_NOTE_BUDGET: usize = 4096;
 const CURRENT_INPUT_BUDGET: usize = usize::MAX;
-const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptContextMode {
@@ -129,67 +136,10 @@ impl ContextItemId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GeneratedContextSource {
-    KernelPolicy,
-    SafeWorkspaceRules,
-    RuntimeSessionNote,
-    NativeTuiSessionNote,
-    DraftOutputsNote,
-    RuntimeSecretsNote,
-}
-
-impl GeneratedContextSource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::KernelPolicy => "kernel_policy",
-            Self::SafeWorkspaceRules => "safe_workspace_rules",
-            Self::RuntimeSessionNote => "runtime_session_note",
-            Self::NativeTuiSessionNote => "native_tui_session_note",
-            Self::DraftOutputsNote => "draft_outputs_note",
-            Self::RuntimeSecretsNote => "runtime_secrets_note",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkspaceContextFile {
-    Agents,
-    Identity,
-    Soul,
-    User,
-}
-
-impl WorkspaceContextFile {
-    pub(crate) fn file_name(self) -> &'static str {
-        match self {
-            Self::Agents => AGENTS_FILE,
-            Self::Identity => IDENTITY_FILE,
-            Self::Soul => SOUL_FILE,
-            Self::User => USER_FILE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContinuityContextFile {
-    Memory,
-    Active,
-}
-
-impl ContinuityContextFile {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Memory => MEMORY_FILE,
-            Self::Active => ACTIVE_CONTEXT_FILE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextSource {
-    Generated(GeneratedContextSource),
-    WorkspaceFile(WorkspaceContextFile),
-    ContinuityFile(ContinuityContextFile),
+    Generated(&'static str),
+    WorkspaceFile(&'static str),
+    ContinuityFile(&'static str),
     CompactionSummary,
     TranscriptTail,
     CurrentUserInput,
@@ -198,9 +148,9 @@ pub(crate) enum ContextSource {
 impl ContextSource {
     pub(crate) fn as_str(self) -> String {
         match self {
-            Self::Generated(source) => format!("generated:{}", source.as_str()),
-            Self::WorkspaceFile(file) => format!("workspace_file:{}", file.file_name()),
-            Self::ContinuityFile(file) => format!("continuity_file:{}", file.as_str()),
+            Self::Generated(name) => format!("generated:{name}"),
+            Self::WorkspaceFile(file_name) => format!("workspace_file:{file_name}"),
+            Self::ContinuityFile(file_name) => format!("continuity_file:{file_name}"),
             Self::CompactionSummary => "compaction_summary".to_string(),
             Self::TranscriptTail => "transcript_tail".to_string(),
             Self::CurrentUserInput => "current_user_input".to_string(),
@@ -426,56 +376,56 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
             id: ContextItemId::KernelPolicy,
             title: "LionClaw",
             class: ContextClass::Kernel,
-            source: ContextSource::Generated(GeneratedContextSource::KernelPolicy),
+            source: ContextSource::Generated(GENERATED_KERNEL_POLICY),
             required: true,
         },
         ContextItemSpec {
             id: ContextItemId::WorkspaceRules,
             title: AGENTS_FILE,
             class: ContextClass::WorkspaceRules,
-            source: ContextSource::WorkspaceFile(WorkspaceContextFile::Agents),
+            source: ContextSource::WorkspaceFile(AGENTS_FILE),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::SafeWorkspaceRules,
             title: "Workspace Rules",
             class: ContextClass::WorkspaceRules,
-            source: ContextSource::Generated(GeneratedContextSource::SafeWorkspaceRules),
+            source: ContextSource::Generated(GENERATED_SAFE_WORKSPACE_RULES),
             required: true,
         },
         ContextItemSpec {
             id: ContextItemId::Identity,
             title: IDENTITY_FILE,
             class: ContextClass::OperatorPrivate,
-            source: ContextSource::WorkspaceFile(WorkspaceContextFile::Identity),
+            source: ContextSource::WorkspaceFile(IDENTITY_FILE),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::StyleProfile,
             title: SOUL_FILE,
             class: ContextClass::OperatorPrivate,
-            source: ContextSource::WorkspaceFile(WorkspaceContextFile::Soul),
+            source: ContextSource::WorkspaceFile(SOUL_FILE),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::UserContext,
             title: USER_FILE,
             class: ContextClass::UserPrivate,
-            source: ContextSource::WorkspaceFile(WorkspaceContextFile::User),
+            source: ContextSource::WorkspaceFile(USER_FILE),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::MemoryContext,
             title: MEMORY_FILE,
             class: ContextClass::Memory,
-            source: ContextSource::ContinuityFile(ContinuityContextFile::Memory),
+            source: ContextSource::ContinuityFile(MEMORY_FILE),
             required: false,
         },
         ContextItemSpec {
             id: ContextItemId::ActiveContinuity,
             title: ACTIVE_CONTEXT_FILE,
             class: ContextClass::ActiveContinuity,
-            source: ContextSource::ContinuityFile(ContinuityContextFile::Active),
+            source: ContextSource::ContinuityFile(ACTIVE_CONTEXT_FILE),
             required: false,
         },
         ContextItemSpec {
@@ -497,7 +447,7 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
                 id: ContextItemId::RuntimeSessionNote,
                 title: "Runtime Session",
                 class: ContextClass::RuntimeNote,
-                source: ContextSource::Generated(GeneratedContextSource::RuntimeSessionNote),
+                source: ContextSource::Generated(GENERATED_RUNTIME_SESSION_NOTE),
                 required: true,
             });
             items.push(transcript_item());
@@ -508,7 +458,7 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
                 id: ContextItemId::NativeTuiSessionNote,
                 title: "Native Runtime TUI Session",
                 class: ContextClass::RuntimeNote,
-                source: ContextSource::Generated(GeneratedContextSource::NativeTuiSessionNote),
+                source: ContextSource::Generated(GENERATED_NATIVE_TUI_SESSION_NOTE),
                 required: true,
             });
             items.push(transcript_item());
@@ -519,14 +469,14 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
         id: ContextItemId::DraftOutputsNote,
         title: "Draft Outputs",
         class: ContextClass::RuntimeNote,
-        source: ContextSource::Generated(GeneratedContextSource::DraftOutputsNote),
+        source: ContextSource::Generated(GENERATED_DRAFT_OUTPUTS_NOTE),
         required: false,
     });
     items.push(ContextItemSpec {
         id: ContextItemId::RuntimeSecretsNote,
         title: "Runtime Secrets",
         class: ContextClass::RuntimeNote,
-        source: ContextSource::Generated(GeneratedContextSource::RuntimeSecretsNote),
+        source: ContextSource::Generated(GENERATED_RUNTIME_SECRETS_NOTE),
         required: false,
     });
 
@@ -1037,63 +987,48 @@ mod tests {
                 assert_eq!(item.class, ContextClass::Kernel);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::KernelPolicy)
+                    ContextSource::Generated(GENERATED_KERNEL_POLICY)
                 );
                 assert!(item.required);
             }
             ContextItemId::WorkspaceRules => {
                 assert_eq!(item.class, ContextClass::WorkspaceRules);
-                assert_eq!(
-                    item.source,
-                    ContextSource::WorkspaceFile(WorkspaceContextFile::Agents)
-                );
+                assert_eq!(item.source, ContextSource::WorkspaceFile(AGENTS_FILE));
                 assert!(!item.required);
             }
             ContextItemId::SafeWorkspaceRules => {
                 assert_eq!(item.class, ContextClass::WorkspaceRules);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::SafeWorkspaceRules)
+                    ContextSource::Generated(GENERATED_SAFE_WORKSPACE_RULES)
                 );
                 assert!(item.required);
             }
             ContextItemId::Identity => {
                 assert_eq!(item.class, ContextClass::OperatorPrivate);
-                assert_eq!(
-                    item.source,
-                    ContextSource::WorkspaceFile(WorkspaceContextFile::Identity)
-                );
+                assert_eq!(item.source, ContextSource::WorkspaceFile(IDENTITY_FILE));
                 assert!(!item.required);
             }
             ContextItemId::StyleProfile => {
                 assert_eq!(item.class, ContextClass::OperatorPrivate);
-                assert_eq!(
-                    item.source,
-                    ContextSource::WorkspaceFile(WorkspaceContextFile::Soul)
-                );
+                assert_eq!(item.source, ContextSource::WorkspaceFile(SOUL_FILE));
                 assert!(!item.required);
             }
             ContextItemId::UserContext => {
                 assert_eq!(item.class, ContextClass::UserPrivate);
-                assert_eq!(
-                    item.source,
-                    ContextSource::WorkspaceFile(WorkspaceContextFile::User)
-                );
+                assert_eq!(item.source, ContextSource::WorkspaceFile(USER_FILE));
                 assert!(!item.required);
             }
             ContextItemId::MemoryContext => {
                 assert_eq!(item.class, ContextClass::Memory);
-                assert_eq!(
-                    item.source,
-                    ContextSource::ContinuityFile(ContinuityContextFile::Memory)
-                );
+                assert_eq!(item.source, ContextSource::ContinuityFile(MEMORY_FILE));
                 assert!(!item.required);
             }
             ContextItemId::ActiveContinuity => {
                 assert_eq!(item.class, ContextClass::ActiveContinuity);
                 assert_eq!(
                     item.source,
-                    ContextSource::ContinuityFile(ContinuityContextFile::Active)
+                    ContextSource::ContinuityFile(ACTIVE_CONTEXT_FILE)
                 );
                 assert!(!item.required);
             }
@@ -1111,7 +1046,7 @@ mod tests {
                 assert_eq!(item.class, ContextClass::RuntimeNote);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::RuntimeSessionNote)
+                    ContextSource::Generated(GENERATED_RUNTIME_SESSION_NOTE)
                 );
                 assert!(item.required);
             }
@@ -1119,7 +1054,7 @@ mod tests {
                 assert_eq!(item.class, ContextClass::RuntimeNote);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::NativeTuiSessionNote)
+                    ContextSource::Generated(GENERATED_NATIVE_TUI_SESSION_NOTE)
                 );
                 assert!(item.required);
             }
@@ -1127,7 +1062,7 @@ mod tests {
                 assert_eq!(item.class, ContextClass::RuntimeNote);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::DraftOutputsNote)
+                    ContextSource::Generated(GENERATED_DRAFT_OUTPUTS_NOTE)
                 );
                 assert!(!item.required);
             }
@@ -1135,7 +1070,7 @@ mod tests {
                 assert_eq!(item.class, ContextClass::RuntimeNote);
                 assert_eq!(
                     item.source,
-                    ContextSource::Generated(GeneratedContextSource::RuntimeSecretsNote)
+                    ContextSource::Generated(GENERATED_RUNTIME_SECRETS_NOTE)
                 );
                 assert!(!item.required);
             }
