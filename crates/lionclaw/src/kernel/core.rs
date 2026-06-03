@@ -7226,6 +7226,7 @@ mod tests {
     }
 
     const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
+    const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -7295,6 +7296,67 @@ mod tests {
         }
 
         async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ClosingDirectRuntimeAdapter {
+        starts: Arc<AtomicUsize>,
+        turns: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ClosingDirectRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("pre-turn-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!(
+                "prompt context failure test should not reach runtime turn"
+            ))
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -8250,6 +8312,96 @@ mod tests {
         ] {
             assert!(!details.contains(poison));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn program_prompt_context_failure_closes_started_runtime_and_fails_turn() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        crate::workspace::bootstrap_workspace(&workspace_root)
+            .await
+            .expect("bootstrap workspace");
+        let outside_user = temp_dir.path().join("outside-user.md");
+        fs::write(&outside_user, "outside user context\n").expect("write outside user");
+        fs::remove_file(workspace_root.join(crate::workspace::USER_FILE))
+            .expect("remove generated user file");
+        std::os::unix::fs::symlink(
+            &outside_user,
+            workspace_root.join(crate::workspace::USER_FILE),
+        )
+        .expect("symlink user file");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(temp_dir.path().join("runtime")),
+                workspace_name: Some("main".to_string()),
+                workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        kernel
+            .register_runtime_adapter(
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+                Arc::new(ClosingDirectRuntimeAdapter {
+                    starts: Arc::clone(&starts),
+                    turns: Arc::clone(&turns),
+                    closes: Arc::clone(&closes),
+                }),
+            )
+            .await;
+        let session_id = open_test_session(&kernel).await;
+
+        let err = kernel
+            .turn_session(SessionTurnRequest {
+                session_id,
+                user_text: "hello".to_string(),
+                runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect_err("symlinked prompt context source should fail the turn");
+
+        assert!(
+            matches!(&err, KernelError::Internal(message) if message.contains("failed to open")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            0,
+            "prompt context failure must happen before runtime turn delivery"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "started runtime sessions must be closed on pre-turn prompt context failure"
+        );
+
+        let history = kernel
+            .session_history(SessionHistoryRequest {
+                session_id,
+                limit: Some(4),
+            })
+            .await
+            .expect("history");
+        let turn = history.turns.last().expect("failed turn");
+        assert_eq!(turn.status, SessionTurnStatus::Failed);
+        assert_eq!(turn.runtime_id, TEST_PRE_TURN_FAILURE_RUNTIME_ID);
+        assert_eq!(turn.error_code.as_deref(), Some("runtime.error"));
+        assert!(turn
+            .error_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed to open"));
     }
 
     #[tokio::test]
@@ -14478,6 +14630,22 @@ struct FailedSessionTurnCompletion {
     stream_error_emitted: bool,
 }
 
+struct ProgramPromptEnvelopes {
+    prompt: String,
+    fresh_prompt: Option<String>,
+}
+
+struct StartedRuntimePreTurnFailure<'a> {
+    adapter: Arc<dyn RuntimeAdapter>,
+    runtime_id: &'a str,
+    session: &'a super::sessions::Session,
+    persisted_turn: &'a SessionTurnRecord,
+    execution_plan: &'a EffectiveExecutionPlan,
+    handle: &'a RuntimeSessionHandle,
+    error: &'a KernelError,
+    channel_stream_finalizer: ChannelStreamFinalizer<'a>,
+}
+
 #[derive(Clone, Copy)]
 struct ChannelStreamFinalizer<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
@@ -14785,6 +14953,111 @@ impl Kernel {
         self.execute_session_turn(&session, execution).await
     }
 
+    async fn build_program_prompt_envelopes(
+        &self,
+        session: &super::sessions::Session,
+        runtime_id: &str,
+        execution_plan: &EffectiveExecutionPlan,
+        handle: &RuntimeSessionHandle,
+        user_text: &str,
+        history_before_sequence_no: u64,
+    ) -> Result<ProgramPromptEnvelopes, KernelError> {
+        let prompt_mode = if handle.resumes_existing_session {
+            PromptContextMode::ProgramResumePrimary
+        } else {
+            PromptContextMode::ProgramPrimary
+        };
+        let prompt_build = self
+            .build_prompt_context(
+                session,
+                runtime_id,
+                execution_plan,
+                prompt_mode,
+                Some(user_text),
+                Some(history_before_sequence_no),
+            )
+            .await?;
+        let prompt = prompt_build.sections.join("\n\n");
+        let mut audits = vec![prompt_build.audit];
+
+        let fresh_prompt = if handle.resumes_existing_session {
+            let fresh_prompt_build = self
+                .build_prompt_context(
+                    session,
+                    runtime_id,
+                    execution_plan,
+                    PromptContextMode::ProgramFresh,
+                    Some(user_text),
+                    Some(history_before_sequence_no),
+                )
+                .await?;
+            let fresh_prompt = fresh_prompt_build.sections.join("\n\n");
+            audits.push(fresh_prompt_build.audit);
+            Some(fresh_prompt)
+        } else {
+            None
+        };
+
+        for audit in audits {
+            self.append_prompt_context_audit(session.session_id, audit)
+                .await?;
+        }
+
+        Ok(ProgramPromptEnvelopes {
+            prompt,
+            fresh_prompt,
+        })
+    }
+
+    async fn fail_started_runtime_before_turn(
+        &self,
+        failure: StartedRuntimePreTurnFailure<'_>,
+    ) -> Result<(), KernelError> {
+        let StartedRuntimePreTurnFailure {
+            adapter,
+            runtime_id,
+            session,
+            persisted_turn,
+            execution_plan,
+            handle,
+            error,
+            channel_stream_finalizer,
+        } = failure;
+
+        self.clear_runtime_session_ready(execution_plan).await;
+        if let Err(close_err) = self
+            .close_runtime_session(
+                adapter,
+                runtime_id,
+                session.session_id,
+                handle,
+                RuntimeSessionCloseContext::Turn,
+            )
+            .await
+        {
+            warn!(
+                ?close_err,
+                runtime_id,
+                session_id = %session.session_id,
+                "failed to close runtime session after pre-turn failure"
+            );
+        }
+
+        self.persist_failed_session_turn(
+            session,
+            persisted_turn,
+            FailedSessionTurnCompletion {
+                assistant_text: String::new(),
+                error_code: "runtime.error".to_string(),
+                error_text: error.to_string(),
+                stream_error_emitted: false,
+            },
+            channel_stream_finalizer,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn execute_session_turn(
         &self,
         session: &super::sessions::Session,
@@ -15038,40 +15311,32 @@ impl Kernel {
                 .await;
         }
 
-        let prompt_mode = if handle.resumes_existing_session {
-            PromptContextMode::ProgramResumePrimary
-        } else {
-            PromptContextMode::ProgramPrimary
-        };
-        let prompt_build = self
-            .build_prompt_context(
+        let prompt_envelopes = match self
+            .build_program_prompt_envelopes(
                 session,
                 &runtime_id,
                 &execution_plan,
-                prompt_mode,
-                Some(&execution_prompt_user_text),
-                Some(persisted_turn.sequence_no),
+                &handle,
+                &execution_prompt_user_text,
+                persisted_turn.sequence_no,
             )
-            .await?;
-        self.append_prompt_context_audit(session.session_id, prompt_build.audit)
-            .await?;
-        let prompt_envelope = prompt_build.sections.join("\n\n");
-        let fresh_prompt_envelope = if handle.resumes_existing_session {
-            let fresh_prompt_build = self
-                .build_prompt_context(
+            .await
+        {
+            Ok(envelopes) => envelopes,
+            Err(err) => {
+                self.fail_started_runtime_before_turn(StartedRuntimePreTurnFailure {
+                    adapter: Arc::clone(&adapter),
+                    runtime_id: &runtime_id,
                     session,
-                    &runtime_id,
-                    &execution_plan,
-                    PromptContextMode::ProgramFresh,
-                    Some(&execution_prompt_user_text),
-                    Some(persisted_turn.sequence_no),
-                )
+                    persisted_turn: &persisted_turn,
+                    execution_plan: &execution_plan,
+                    handle: &handle,
+                    error: &err,
+                    channel_stream_finalizer,
+                })
                 .await?;
-            self.append_prompt_context_audit(session.session_id, fresh_prompt_build.audit)
-                .await?;
-            Some(fresh_prompt_build.sections.join("\n\n"))
-        } else {
-            None
+                return Err(err);
+            }
         };
 
         let turn_result = self
@@ -15086,8 +15351,8 @@ impl Kernel {
                 hard_timeout: execution_plan.hard_timeout,
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: prompt_envelope,
-                    fresh_prompt: fresh_prompt_envelope,
+                    prompt: prompt_envelopes.prompt,
+                    fresh_prompt: prompt_envelopes.fresh_prompt,
                     runtime_skill_ids: runtime_skill_ids.clone(),
                 },
                 stream_context: channel_stream_context.clone(),
