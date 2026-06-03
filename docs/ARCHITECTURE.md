@@ -92,6 +92,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `lionclaw-runtime-api`: runtime adapter contract, registry, and shared runtime-facing event/program types.
 - `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
+- `kernel.prompt_context`: session-aware prompt context policy, section capping, and audit metadata for runtime-visible context.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
 - `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
@@ -164,12 +165,14 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
 
 1. The caller submits a turn through the operator CLI, channel API, or scheduler.
 2. The kernel opens or reuses a durable session.
-3. The kernel renders the prompt envelope from identity, continuity, skills,
-   history, and current input.
-4. The execution planner resolves the runtime profile, preset, work root,
+3. The execution planner resolves the runtime profile, preset, work root,
    runtime state root, drafts root, network mode, secret mount decision, image,
    timeouts, and compatibility key.
-5. The kernel audits `runtime.plan.allow` or `runtime.plan.deny`.
+4. The kernel audits `runtime.plan.allow` or `runtime.plan.deny`.
+5. The kernel renders the prompt envelope through typed prompt context policy:
+   session trust tier, history policy, runtime id, execution plan, and prompt
+   target select ordered context items, byte caps, transcript tail, and current
+   input.
 6. The OCI backend launches the runtime in the confined layout.
 7. The adapter maps runtime output into typed stream events. Codex uses its
    native `app-server` JSON-RPC protocol over stdio inside the confined
@@ -226,8 +229,9 @@ Flow:
 1. The operator CLI resolves the normal LionClaw project, runtime, and durable
    interactive session.
 2. The kernel materializes the confined runtime layout, runtime-visible skills,
-   and a fresh attached-session context directly into runtime-private state as
-   both `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
+   and a fresh attached-session context through the same typed prompt context
+   policy directly into runtime-private state as both `AGENTS.generated.md` and
+   the runtime-standard `AGENTS.md`.
 3. The runtime adapter supplies a terminal program through
    `build_terminal_program()`.
 4. The execution planner compiles the same mounted workspace, staged auth,
@@ -242,8 +246,7 @@ danger-full-access mode with approval disabled. That is intentional: LionClaw's
 outer container, mounts, runtime state root, network preset, auth staging, and
 audit trail are the active boundary. Codex also receives
 `/runtime/AGENTS.generated.md` as its model instructions file, so LionClaw
-memory, active context, prior LionClaw session history, skills, and project
-continuity are included without shadowing `/workspace/AGENTS.md`.
+policy-selected context is included without shadowing `/workspace/AGENTS.md`.
 LionClaw also materializes the runtime-private Codex config with
 `[projects."/workspace"] trust_level = "trusted"` and
 `check_for_update_on_startup = false`, matching the result of approving Codex's
@@ -836,6 +839,7 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.timeout`
 - `runtime.cancelled`
 - `runtime.interrupted`
+- `prompt.context.built`
 
 Stream events produced by actual runtime turns include `session_id` and
 `turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
@@ -887,6 +891,15 @@ prompts:
 - `error_code`
 - `error_text`
 - `runtime_id`
+
+Runtime-visible prompt history is selected by `kernel.prompt_context`, not by a
+global replay constant. The transcript tail is bounded by session trust tier
+and history policy: Main interactive sessions get the broadest tail, Main
+conservative sessions get less, and Untrusted sessions get smaller tails.
+When a program-backed runtime resumes an existing runtime conversation, the
+primary prompt includes a runtime-session note and audits the transcript tail
+as excluded; the separate fresh prompt is built and audited as its own context
+surface.
 
 Answer-lane text is checkpointed while a turn is still running so restart
 reconciliation can preserve partial replies already emitted to the user.
@@ -952,10 +965,12 @@ The assistant home workspace contains:
 - `continuity/artifacts/...`
 - `continuity/proposals/memory/...`
 
-`MEMORY.md` is prompt-loaded but human-curated in v1. `ACTIVE.md` is a
-kernel-generated hot projection from deterministic state and existing
-continuity files. Daily notes, artifacts, proposals, and open loops are
-visible Markdown records, not hidden memory database rows.
+`MEMORY.md` is human-curated in v1 and can be selected as the `Memory` context
+class for Main sessions under budget. Untrusted sessions do not receive it.
+`ACTIVE.md` is a kernel-generated hot projection from deterministic state and
+existing continuity files; it can be selected under smaller Untrusted budgets.
+Daily notes, artifacts, proposals, and open loops are visible Markdown records,
+not hidden memory database rows.
 
 Continuity search uses a derived SQLite FTS index in `lionclaw.db`; Markdown
 files remain the canonical source of truth.

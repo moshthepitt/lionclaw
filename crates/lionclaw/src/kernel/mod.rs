@@ -14,6 +14,7 @@ pub mod error;
 pub mod input_routing;
 pub mod jobs;
 pub mod policy;
+pub mod prompt_context;
 pub mod runtime;
 pub mod runtime_policy;
 pub mod scheduler;

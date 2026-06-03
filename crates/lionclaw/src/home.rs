@@ -106,20 +106,6 @@ impl LionClawHome {
         )
     }
 
-    pub fn runtime_project_generated_agents_path(
-        &self,
-        runtime_id: &str,
-        workspace: &str,
-        project_root: &Path,
-    ) -> PathBuf {
-        runtime_project_generated_agents_path_from_parts(
-            &self.runtime_dir(),
-            runtime_id,
-            workspace,
-            Some(project_root),
-        )
-    }
-
     pub fn runtime_project_drafts_dir(
         &self,
         runtime_id: &str,
@@ -255,16 +241,6 @@ pub fn runtime_project_dir_from_parts(
         .join(workspace)
         .join(RUNTIME_PROJECTS_DIR)
         .join(runtime_project_partition_key(project_root))
-}
-
-pub fn runtime_project_generated_agents_path_from_parts(
-    runtime_root: &Path,
-    runtime_id: &str,
-    workspace: &str,
-    project_root: Option<&Path>,
-) -> PathBuf {
-    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
-        .join("AGENTS.generated.md")
 }
 
 pub fn runtime_project_drafts_dir_from_parts(

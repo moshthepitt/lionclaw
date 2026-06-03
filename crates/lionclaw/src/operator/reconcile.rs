@@ -33,7 +33,7 @@ use crate::{
             unit_status_is_active, ChannelUnitSpec, DaemonProjectInstanceSpec, DaemonUnitSpec,
             ManagedUnit, UnitIdentity, UnitManager,
         },
-        private_paths::{create_private_dir_all, write_private_file},
+        private_paths::create_private_dir_all,
         redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
@@ -47,7 +47,7 @@ use crate::{
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
-    workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
+    workspace::bootstrap_workspace,
 };
 
 #[cfg(test)]
@@ -430,7 +430,7 @@ pub async fn up_for_work_root<M: UnitManager>(
                 project_root: context.project_root.as_path(),
                 instance_name: context.instance_name.as_str(),
             });
-    render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
+    ensure_runtime_project_dirs_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
         &state.config,
@@ -781,17 +781,18 @@ pub(crate) fn resolve_channel_env(
 }
 
 #[cfg(test)]
-pub(crate) async fn render_runtime_cache(
+pub(crate) async fn ensure_runtime_project_dirs(
     home: &LionClawHome,
     config: &OperatorConfig,
     runtime_id: &str,
 ) -> Result<()> {
     let project_workspace_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    render_runtime_cache_for_work_root(home, config, runtime_id, &project_workspace_root).await
+    ensure_runtime_project_dirs_for_work_root(home, config, runtime_id, &project_workspace_root)
+        .await
 }
 
-pub(crate) async fn render_runtime_cache_for_work_root(
+pub(crate) async fn ensure_runtime_project_dirs_for_work_root(
     home: &LionClawHome,
     config: &OperatorConfig,
     runtime_id: &str,
@@ -800,42 +801,15 @@ pub(crate) async fn render_runtime_cache_for_work_root(
     let workspace = &config.daemon.workspace;
     let target_dir = home.runtime_project_dir(runtime_id, workspace, project_workspace_root);
     for path in [
-        target_dir.clone(),
+        target_dir,
         home.runtime_project_drafts_dir(runtime_id, workspace, project_workspace_root),
     ] {
-        create_private_dir_all(home, &path, "runtime cache directory")?;
+        create_private_dir_all(home, &path, "runtime project directory")?;
     }
-    let target_path = target_dir.join(GENERATED_AGENTS_FILE);
-
-    let mut sections = Vec::new();
-    for (name, content) in read_workspace_sections(&config.workspace_root(home)).await? {
-        sections.push(format!("## {}\n\n{}", name, content.trim()));
-    }
-
-    sections.push(
-        "## Draft Outputs\n\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.".to_string(),
-    );
-
-    sections.push(
-        "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
-    );
-
-    let rendered = render_marker_file(
-        &format!(
-            "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n"
-        ),
-        &sections.join("\n\n"),
-    );
-
-    write_private_file(
-        home,
-        &target_path,
-        rendered.as_bytes(),
-        "generated runtime context file",
-    )?;
     Ok(())
 }
 
+#[cfg(test)]
 fn render_marker_file(header: &str, body: &str) -> String {
     let start = "<!-- LIONCLAW:START -->";
     let end = "<!-- LIONCLAW:END -->";
@@ -1092,9 +1066,9 @@ mod tests {
 
     use super::{
         add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
-        ensure_managed_bind_configured, logs, open_kernel, open_kernel_with_project_root,
-        pairing_approve_sender, pairing_list, render_marker_file, render_runtime_cache,
-        render_runtime_cache_for_work_root, resolve_channel_env,
+        ensure_managed_bind_configured, ensure_runtime_project_dirs,
+        ensure_runtime_project_dirs_for_work_root, logs, open_kernel, open_kernel_with_project_root,
+        pairing_approve_sender, pairing_list, render_marker_file, resolve_channel_env,
         resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, up_for_work_root,
         ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
@@ -1116,7 +1090,6 @@ mod tests {
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
         },
-        workspace::GENERATED_AGENTS_FILE,
     };
     use axum::{routing::get, Json, Router};
 
@@ -1357,31 +1330,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_runtime_cache_includes_runtime_secret_guidance() {
+    async fn ensure_runtime_project_dirs_creates_runtime_and_drafts_dirs() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
         let config = load_test_config(&home).await;
 
-        render_runtime_cache(&home, &config, "codex")
+        ensure_runtime_project_dirs(&home, &config, "codex")
             .await
-            .expect("render runtime cache");
+            .expect("ensure runtime project dirs");
         let project_workspace_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
 
-        let rendered = tokio::fs::read_to_string(
-            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
-                .join(GENERATED_AGENTS_FILE),
-        )
-        .await
-        .expect("read generated agents");
-        assert!(rendered.contains("/run/secrets"));
-        assert!(rendered.contains("lionclaw-runtime-secrets-"));
-        assert!(rendered.contains("do not print its contents"));
+        assert!(home
+            .runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
+            .is_dir());
+        assert!(home
+            .runtime_project_drafts_dir("codex", &config.daemon.workspace, &project_workspace_root)
+            .is_dir());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn render_runtime_cache_rejects_symlinked_project_cache_dir() {
+    async fn ensure_runtime_project_dirs_rejects_symlinked_project_runtime_dir() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1391,49 +1361,27 @@ mod tests {
         fs::create_dir(&project_workspace_root).expect("work root");
         let target_dir =
             home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
-        let outside = temp_dir.path().join("outside-cache");
+        let outside = temp_dir.path().join("outside-runtime-project");
         fs::create_dir_all(target_dir.parent().expect("target parent")).expect("target parent");
         fs::create_dir(&outside).expect("outside cache");
-        symlink(&outside, &target_dir).expect("runtime cache dir symlink");
+        symlink(&outside, &target_dir).expect("runtime project dir symlink");
 
-        let err =
-            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
-                .await
-                .expect_err("symlinked runtime cache dir should fail");
+        let err = ensure_runtime_project_dirs_for_work_root(
+            &home,
+            &config,
+            "codex",
+            &project_workspace_root,
+        )
+        .await
+        .expect_err("symlinked runtime project dir should fail");
 
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(
-            !outside.join(GENERATED_AGENTS_FILE).exists(),
-            "runtime cache rendering must not write through a symlinked project cache dir"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn render_runtime_cache_rejects_symlinked_generated_context_file() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-        let config = load_test_config(&home).await;
-        let project_workspace_root = temp_dir.path().join("work");
-        fs::create_dir(&project_workspace_root).expect("work root");
-        let target_dir =
-            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
-        let outside = temp_dir.path().join("outside-generated.md");
-        fs::create_dir_all(&target_dir).expect("target dir");
-        fs::write(&outside, "outside\n").expect("outside generated");
-        symlink(&outside, target_dir.join(GENERATED_AGENTS_FILE)).expect("generated symlink");
-
-        let err =
-            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
-                .await
-                .expect_err("symlinked generated context should fail");
-
-        assert!(err.to_string().contains("must not be a symlink"));
-        assert_eq!(
-            fs::read_to_string(&outside).expect("outside contents"),
-            "outside\n"
+            fs::read_dir(&outside)
+                .expect("outside cache dir")
+                .next()
+                .is_none(),
+            "runtime project dir preparation must not write through a symlinked project runtime dir"
         );
     }
 
@@ -2184,10 +2132,10 @@ mod tests {
             resolve_project_workspace_root().expect("resolve project workspace root");
 
         assert_eq!(state.applied_state.channels().len(), 1);
-        assert!(home
-            .runtime_project_dir("codex", "main", &project_workspace_root)
-            .join("AGENTS.generated.md")
-            .exists());
+        let runtime_project_dir =
+            home.runtime_project_dir("codex", "main", &project_workspace_root);
+        assert!(runtime_project_dir.exists());
+        assert!(!runtime_project_dir.join("AGENTS.generated.md").exists());
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());

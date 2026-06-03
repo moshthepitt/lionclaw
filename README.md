@@ -91,8 +91,8 @@ lionclaw run --runtime-tui
 ```
 
 That path still goes through LionClaw's runtime plan, mounts, staged auth,
-generated memory/continuity context, and audit trail. LionClaw writes that
-context into the runtime-private state as both `AGENTS.generated.md` and the
+policy-selected prompt context, and audit trail. LionClaw writes that context
+into the runtime-private state as both `AGENTS.generated.md` and the
 runtime-standard `AGENTS.md`. For Codex, LionClaw uses the outer container as
 the sandbox boundary and starts the inner Codex UI without Codex's own
 sandbox/approval layer; the runtime-private Codex config marks the container
@@ -207,7 +207,8 @@ containing `:`.
 `lionclaw project init` creates `.lionclaw/project.toml` and a default `main`
 instance at `.lionclaw/instances/main`. A project is the local management
 boundary. An instance home stores one LionClaw instance's config, database,
-logs, installed skills, runtime cache, and assistant-home continuity.
+logs, installed skills, runtime-private state, drafts, and assistant-home
+continuity.
 
 Each project instance records a default work root. `project init` points `main`
 at the project root, and `instance create <name>` does the same unless you pass

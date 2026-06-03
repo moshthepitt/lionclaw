@@ -172,7 +172,7 @@ async fn try_open_selected_instance(
         Some(work_root),
     )
     .await?;
-    render_runtime_cache_for_work_root(&home, &config, &runtime_id, work_root).await?;
+    ensure_runtime_project_dirs_for_work_root(&home, &config, &runtime_id, work_root).await?;
     let effective_timeouts = launch
         .timeout_override
         .unwrap_or_else(RuntimeTurnTimeouts::interactive);

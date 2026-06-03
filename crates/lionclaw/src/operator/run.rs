@@ -20,7 +20,7 @@ use crate::{
     },
     operator::{
         config::OperatorConfig,
-        reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
+        reconcile::{ensure_runtime_project_dirs_for_work_root, open_runtime_kernel_for_work_root},
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites_for_work_root},
     },
     project_inventory::ProjectInstanceRuntimeContext,
@@ -102,7 +102,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         Some(work_root),
     )
     .await?;
-    render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
+    ensure_runtime_project_dirs_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = open_runtime_kernel_for_work_root(

@@ -42,7 +42,7 @@ use crate::{
     },
     operator::{
         config::OperatorConfig,
-        reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
+        reconcile::{ensure_runtime_project_dirs_for_work_root, open_runtime_kernel_for_work_root},
         run::{
             kernel_to_anyhow, local_peer_id_for_project, partial_history_marker,
             resolve_repl_session, resolve_run_runtime_id,
