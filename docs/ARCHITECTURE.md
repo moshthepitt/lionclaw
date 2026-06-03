@@ -689,6 +689,11 @@ with the CLI.
 - `POST /v0/policy/revoke`
 - `GET /v0/audit/query`
 
+Prompt context selection emits `prompt.context.built` audit events. The payload
+records session policy, runtime id, context mode, included/excluded/capped item
+names, classes, sources, reasons, and byte counts. It does not store prompt
+body content or content hashes.
+
 ### Daemon Metadata
 
 - `GET /health`
@@ -839,7 +844,6 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.timeout`
 - `runtime.cancelled`
 - `runtime.interrupted`
-- `prompt.context.built`
 
 Stream events produced by actual runtime turns include `session_id` and
 `turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
