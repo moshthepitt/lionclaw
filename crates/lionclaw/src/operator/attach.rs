@@ -19,7 +19,7 @@ use crate::{
         managed_units::UnitManager,
         reconcile::{
             base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint,
-            resolve_required_channel_env, up_for_work_root, StackBinaryPaths,
+            resolve_channel_env, up_for_work_root, StackBinaryPaths,
         },
         runtime::{
             resolve_runtime_execution_context, resolve_runtime_id,
@@ -311,7 +311,12 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
             env.insert("PATH".to_string(), path);
         }
     }
-    for (key, value) in resolve_required_channel_env(home, &channel.id, &channel.required_env)? {
+    for (key, value) in resolve_channel_env(
+        home,
+        &channel.id,
+        &channel.required_env,
+        &channel.optional_env,
+    )? {
         env.insert(key, value);
     }
 
@@ -388,7 +393,7 @@ mod tests {
             channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager, UnitManager},
-            reconcile::{add_channel, add_skill},
+            reconcile::{add_channel, add_channel_with_worker, add_skill, ChannelWorkerSetup},
             runtime::resolve_runtime_execution_context,
         },
     };
@@ -744,17 +749,23 @@ mod tests {
     async fn prepare_channel_attach_requires_and_exports_required_env_for_interactive_channels() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
-        add_channel(
+        add_channel_with_worker(
             &home,
             "loopback".to_string(),
             "loopback".to_string(),
             ChannelLaunchMode::Interactive,
-            vec!["PATH".to_string()],
+            ChannelWorkerSetup {
+                worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+                required_env: vec!["PATH".to_string()],
+                optional_env: vec!["OPTIONAL_PATH".to_string()],
+                contact: None,
+            },
         )
         .await
-        .expect("update channel required env");
+        .expect("update channel env");
         let mut channel_env = ChannelEnv::new();
         channel_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        channel_env.insert("OPTIONAL_PATH".to_string(), "/opt/channel/bin".to_string());
         merge_channel_env(&home, "loopback", &channel_env).expect("persist channel env");
 
         let spec = prepare_channel_attach(
@@ -776,6 +787,10 @@ mod tests {
             .env
             .iter()
             .any(|(key, value)| key == "PATH" && value == "/usr/bin:/bin"));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(key, value)| key == "OPTIONAL_PATH" && value == "/opt/channel/bin"));
 
         add_channel(
             &home,

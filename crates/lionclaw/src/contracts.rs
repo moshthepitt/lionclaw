@@ -986,6 +986,10 @@ pub struct ChannelActorAuthorizeResponse {
     #[serde(default)]
     pub grant_id: Option<Uuid>,
     #[serde(default)]
+    pub grant_routing_profile: Option<ChannelRoutingProfile>,
+    #[serde(default)]
+    pub grant_label: Option<String>,
+    #[serde(default)]
     pub session_key: Option<String>,
 }
 
@@ -1136,6 +1140,16 @@ pub struct ChannelGrantRevokeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelGrantConsumeRequest {
+    pub channel_id: String,
+    pub grant_id: Uuid,
+    pub expected_label: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelGrantView {
     pub grant_id: Uuid,
     pub channel_id: String,
@@ -1165,6 +1179,12 @@ pub struct ChannelGrantResponse {
 pub struct ChannelGrantRevokeResponse {
     pub grant_id: Uuid,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantConsumeResponse {
+    pub grant_id: Uuid,
+    pub consumed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

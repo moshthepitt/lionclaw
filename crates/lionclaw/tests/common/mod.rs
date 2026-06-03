@@ -10,7 +10,9 @@ use lionclaw::{
     operator::{
         channel_metadata::discover_channel_skill,
         config::ChannelLaunchMode,
-        reconcile::{add_channel, add_channel_with_worker, add_skill, remove_skill},
+        reconcile::{
+            add_channel, add_channel_with_worker, add_skill, remove_skill, ChannelWorkerSetup,
+        },
         target::init_project,
     },
 };
@@ -76,6 +78,7 @@ impl TestHome {
             .expect("discover generated channel fixture");
         assert_eq!(discovered.metadata.id, channel_id);
         assert_eq!(discovered.metadata.env, Vec::<String>::new());
+        assert_eq!(discovered.metadata.optional_env, Vec::<String>::new());
 
         add_skill(
             &self.home,
@@ -90,9 +93,12 @@ impl TestHome {
             discovered.metadata.id.clone(),
             alias.to_string(),
             discovered.metadata.launch,
-            discovered.metadata.worker.clone(),
-            discovered.metadata.env.clone(),
-            None,
+            ChannelWorkerSetup {
+                worker: discovered.metadata.worker.clone(),
+                required_env: discovered.metadata.env.clone(),
+                optional_env: discovered.metadata.optional_env.clone(),
+                contact: None,
+            },
         )
         .await
         .expect("bind channel fixture");

@@ -16,7 +16,7 @@ chrono-tz = "0.10"
 cron = "0.16"
 http-body-util = "0.1"
 chrono = { workspace = true, features = ["serde", "clock"] }
-clap = { version = "4.6", features = ["derive"] }
+clap.workspace = true
 crossterm = "0.29"
 hex.workspace = true
 hyper = { version = "1.10", features = ["client", "http1"] }
@@ -31,8 +31,8 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2 = "0.11"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "json", "migrate"] }
+sha2.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "json", "migrate"] }
 rustix = { workspace = true, features = ["fs", "process", "termios"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 thiserror = "2.0"

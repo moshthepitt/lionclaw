@@ -10,7 +10,7 @@ runtime configuration, confinement, policy, and audit.
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
 path is designed for Linux/macOS-style Unix environments. When attached to a
 terminal, `run` opens the project operator console; `run --plain` and
-non-terminal use keep the command on the line-oriented interactive path;
+non-terminal invocations use the line-oriented interactive path;
 `run --runtime-tui` attaches the selected runtime's native terminal UI inside
 the same LionClaw boundary. Managed background paths, including
 `lionclaw up` and channel auto-start, currently use the systemd user manager;
@@ -76,8 +76,8 @@ Instead, LionClaw constrains the runtime launch:
 ### Skill-Owned Edges
 
 Skills are installable packages of instructions, channel workers, and
-integration logic. Channels are skills. Telegram and future transports stay
-outside the trusted Rust core and integrate through kernel APIs.
+integration logic. Channels are skills. Provider transports stay outside the
+trusted Rust core and integrate through kernel APIs.
 
 Skill text can influence prompt context. It cannot grant permissions.
 
@@ -484,8 +484,8 @@ through `LIONCLAW_PROJECT_INSTANCE`. Neighbor entries contain one of:
   "name": "reviewer",
   "channel_send": {
     "status": "configured",
-    "channel_id": "team-local",
-    "conversation_ref": "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f",
+    "channel_id": "example-channel",
+    "conversation_ref": "provider:conversation:123",
     "thread_ref": null
   }
 }
@@ -503,13 +503,13 @@ new contact marker clears any older preferred marker in the same instance:
 
 ```toml
 [[channels]]
-id = "team-local"
-skill = "team-local"
+id = "example-channel"
+skill = "example-skill"
 launch_mode = "background"
 worker = "scripts/worker"
 
 [channels.contact]
-conversation_ref = "team-local:peer:8b60cfd8-1af1-45a0-a6de-bf3a4c0bc28f"
+conversation_ref = "provider:conversation:123"
 # thread_ref is omitted when absent; TOML has no null value.
 ```
 
@@ -517,7 +517,7 @@ Channel metadata can provide a default contact template for `--contact`:
 
 ```toml
 [contact]
-conversation_ref_template = "member:{instance}"
+conversation_ref_template = "provider:member:{instance}"
 ```
 
 Only the `{instance}` variable is supported, and default templates must include
@@ -526,52 +526,22 @@ routes; `--thread-ref` stays optional. `--contact` requires a project instance
 target because direct homes do not have a stable project instance identity for
 template rendering or neighbor projection.
 
-## Team-Local Channel
-
-`channel-team-local` is bundled as a first-party channel skill. Its installed
-snapshot is self-contained: `scripts/worker` execs
-`runtime/team-local/bin/lionclaw-channel-team-local` from the skill directory,
-and install plumbing copies the compiled worker binary into that snapshot
-before computing the installed skill hash. The same binary also backs the
-runtime-facing `runtime/team-local/scripts/list`,
-`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages. The send helper resolves
-routes from the projected inventory and forwards provider-neutral text,
-format hints, reply refs, and `/runtime` attachments to the existing audited
-`channel.send` bridge. Its attachment option is intentionally path-only; the
-kernel derives the delivered filename and media type from the runtime file when
-it prepares the channel-send attachment.
+## Channel Skill Runtime Projection
 
 Channel-bound skill roots remain host-only by default. A channel skill can
 publish a runtime-facing Agent Skill only by including a complete embedded skill
 at `runtime/<alias>/SKILL.md`, where the embedded skill name matches `<alias>`.
 Only that embedded skill root is mounted read-only under
 `/lionclaw/skills/<alias>`; the channel package, worker script, metadata, and
-other host-side assets are not projected into the runtime. The worker is a
-separate Rust workspace crate named `lionclaw-channel-team-local`; it does not
-depend on the `lionclaw` crate.
+other host-side assets are not projected into the runtime. Concrete worker
+binaries, contact templates, routing schemes, and provider behavior belong in
+the owning channel skill directory.
 
-Project setup installs and configures `team-local` for project instances by
-default. It also ensures a `team-local` execution preset with the existing
-`channel-send` escape class; that preset becomes the default only when the
-instance has no default preset yet. Each instance publishes its own contact
-route as
-`team-local:peer:<home-id>`. Setup also approves existing sibling instances with
-ordinary direct channel grants:
-
-```text
-channel_id = team-local
-sender_ref = team-local:instance:<sibling-home-id>
-routing_profile = direct
-trust_tier = main
-```
-
-The worker delivers only through existing channel APIs. It pulls local outbox
-deliveries, resolves the target route from project instance state, verifies the
-target daemon is `lionclawd` with the expected home id and canonical home path,
-preflights `/v0/channels/authorize`, then posts inbound events and attachments
-to the target daemon. Attachment bytes move through the existing attachment
-stage/finalize endpoints.
+First-party channel snapshots can carry host-side worker assets and embedded
+runtime-facing facets, but those details remain skill-owned. The kernel contract
+is only that channel workers authenticate to LionClaw and use the channel
+authorize, inbound, attachment, outbox, health, and grant approve/revoke/consume
+APIs without importing the `lionclaw` crate.
 
 Configured extra mounts are instance/runtime-profile scoped. Operators manage
 them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
@@ -673,6 +643,7 @@ with the CLI.
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/approve`
 - `POST /v0/channels/grants/revoke`
+- `POST /v0/channels/grants/consume`
 - `POST /v0/channels/authorize`
 - `POST /v0/channels/inbound`
 - `POST /v0/channels/attachments/stage` (multipart worker upload)
@@ -741,6 +712,18 @@ does not broaden the approved grant scope, then derives the session key itself.
 Workers never supply raw session keys, templates, or metadata-derived session
 identity.
 
+Actor-qualified conversation/thread bindings may be covered by an approved
+direct actor grant because they narrow that actor into a more specific history
+key. Actorless conversation/thread bindings require an approved route grant and
+cannot be opened from a direct actor grant alone.
+
+`POST /v0/channels/authorize` returns the admission decision plus the derived
+`session_key` when authorized. Authorized responses also include the matched
+`grant_id`, `grant_routing_profile`, and optional `grant_label` so workers can
+apply grant-scoped transport behavior without inferring trust state from local
+configuration. Labels are operator-controlled metadata on the matched grant;
+workers must treat them as exact data, not executable instructions.
+
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
    a deterministic `(channel_id, session_key)`.
 2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
@@ -784,16 +767,21 @@ identity.
    oversized identities or timestamps more than two minutes in the future are
    rejected; stored far-future reports are excluded from latest-health selection.
 9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
-10. Direct grant approval, pairing invite/claim, pairing approve/block, and
-   grant revoke endpoints manage channel trust. Direct approval creates a
-   durable grant for already-known normalized channel refs without creating a
-   pairing row, and closes exact matching pending operator approvals in the
+10. Direct grant approval, pairing invite/claim, pairing approve/block, grant
+   revoke, and grant consume endpoints manage channel trust. Direct approval
+   creates a durable grant for already-known normalized channel refs without
+   creating a pairing row, and closes exact matching pending operator approvals in the
    same transaction. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
    pairing requests. Blocking a token invite by `pairing_id` marks that invite
    blocked without creating a sender grant. Blocks are enforced from the
    most-specific scope back to the direct sender.
+   Grant consume is worker-facing cleanup for approved labeled grants that have
+   already produced their intended terminal effect. It requires the exact
+   `grant_id` and expected label, deletes only that approved grant, audits
+   `channel.grant.consumed`, and does not leave a revoked scope. Operator
+   denial remains `revoke` or `block`.
 
 Attachment files are stored under LionClaw runtime state at
 `runtime/channels/sha256-<channel-id-digest>/attachments/sha256-<event-id-digest>/sha256-<attachment-id-digest>/`.
@@ -911,7 +899,7 @@ deterministic session keys from either the approved grant or the constrained
 channel contract; the kernel resolves runtime execution from the
 instance/default runtime configuration.
 Session-key components escape `:` and `%` so provider refs such as
-`telegram:chat:-123` remain unambiguous.
+`provider:conversation:123` remain unambiguous.
 Channel turn state is terminalized independently from the session turn state so
 queue workers can distinguish `completed`, `failed`, `timed_out`, `cancelled`,
 and `interrupted` without parsing runtime text. Cancelling a waiting or pending
@@ -996,16 +984,40 @@ manually by the operator.
 ## Operator Launch Model
 
 - Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
-  worker entrypoint, and required env names. The v1 metadata contract is small
-  by design and does not claim permissions LionClaw does not enforce.
+  worker entrypoint, required env names, optional env names that the operator
+  may persist and pass through when present, and an optional setup hook. The v1
+  metadata contract is small by design and does not claim permissions LionClaw
+  does not enforce.
+- Setup hooks are channel-owned commands declared under `[channel.setup]`.
+  `lionclaw connect <channel> <profile> ...` and helper-style flags such as
+  `lionclaw connect <channel> --provider gmail ...` pass setup arguments to
+  that command after installing or refreshing a prior bundled channel snapshot,
+  or selecting an installed external channel snapshot, and validate the
+  generated env through the same declared-env contract as `--env-file`. Core
+  does not contain provider-specific channel setup logic.
+  Helpers launched by `connect` receive absolute LionClaw-managed setup env
+  and state paths plus a small ambient allowlist for browser, proxy, locale,
+  certificate, terminal, and temp-dir behavior; they do not inherit arbitrary
+  shell secrets from the operator process, run with the installed channel skill
+  directory as their working directory, and should not move generated
+  credentials outside the managed paths. When setup runs, LionClaw backs up
+  previous managed setup state, gives the helper a fresh managed state
+  directory, and restores the previous state if setup or later channel startup
+  fails. Before retaining generated or restored state, LionClaw revalidates the
+  managed state directory as a private regular tree, rejects symlinks and
+  special files, and hardens retained setup state permissions.
 - `launch=background`: the channel worker is supervised through the platform
   backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally
   started by `lionclaw connect <channel>` in the current terminal. The low-level
   attach path remains available for debugging.
-- Required channel env is selected-instance state under `config/channels/`.
-  Generated unit env may reference that private file, but generated unit env is
-  not the source of truth.
+- Channel env is selected-instance state under `config/channels/` and may
+  contain only names declared by the channel metadata. Generated unit env may
+  reference that private file, but generated unit env is not the source of
+  truth. Env updates merge by declared key; required values must stay
+  non-empty, while an empty optional value clears the existing stored key so
+  channel-owned setup helpers can remove obsolete optional values during
+  reconfiguration.
 
 Worker entrypoint resolution uses the metadata `worker` path and rejects
 symlink escapes outside the skill directory.

@@ -1,0 +1,886 @@
+use std::{error::Error, fmt, num::NonZeroU32};
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use imap_client::{
+    client::tokio::Client as ImapClient,
+    imap_next::imap_types::{
+        body::{Body, BodyStructure, SinglePartExtensionData, SpecificFields},
+        core::{AString, IString, NString, Vec1},
+        fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName, Section},
+        flag::{Flag, StoreType},
+        search::SearchKey,
+        sequence::SequenceSet,
+    },
+};
+use mail_send::{mail_builder::MessageBuilder, Credentials, SmtpClientBuilder};
+use serde_json::{json, Value};
+use tracing::warn;
+
+use crate::{
+    auth::MailboxAuthConfig,
+    config::{ImapTlsMode, MailboxConfig, SmtpTlsMode},
+    mime::{parse_header_facts, HeaderFacts},
+    protocol::{
+        conversation_ref, event_id, generated_message_id, message_ref, provider_file_ref,
+        sender_ref, short_hash, stable_message_root, thread_ref,
+    },
+};
+
+const MAX_CANDIDATE_HEADER_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct CandidateHeader {
+    pub uid_validity: u32,
+    pub uid: u32,
+    pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    pub thread_ref: String,
+    pub message_ref: String,
+    pub attachment_count: usize,
+    pub rfc822_size: Option<u32>,
+    pub sender_auth: Option<SenderAuthVerdict>,
+    pub facts: HeaderFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderAuthVerdict {
+    pub policy: String,
+    pub authenticated: bool,
+}
+
+impl CandidateHeader {
+    pub fn with_sender_auth(&self, sender_auth: SenderAuthVerdict) -> Self {
+        let mut candidate = self.clone();
+        candidate.sender_auth = Some(sender_auth);
+        candidate
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidateHeaderBatch {
+    pub candidates: Vec<CandidateHeader>,
+    pub malformed: Vec<MalformedCandidateHeader>,
+}
+
+impl CandidateHeaderBatch {
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty() && self.malformed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MalformedCandidateHeader {
+    pub uid_validity: u32,
+    pub uid: u32,
+    pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    pub thread_ref: String,
+    pub message_ref: String,
+    pub subject: String,
+    pub snippet: String,
+    pub attachment_count: usize,
+    pub rfc822_size: Option<u32>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleMailboxCandidate {
+    pub expected_uid_validity: u32,
+    pub actual_uid_validity: u32,
+}
+
+impl fmt::Display for StaleMailboxCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "IMAP UIDVALIDITY changed from {} to {}",
+            self.expected_uid_validity, self.actual_uid_validity
+        )
+    }
+}
+
+impl Error for StaleMailboxCandidate {}
+
+pub fn is_stale_mailbox_candidate(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StaleMailboxCandidate>().is_some())
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedMessage {
+    pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundEmail {
+    pub delivery_id: String,
+    pub to: String,
+    pub subject: String,
+    pub text: String,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+    pub attachments: Vec<OutboundAttachment>,
+}
+
+#[async_trait]
+pub trait MailboxEngine: Send {
+    async fn list_candidate_headers(&mut self) -> Result<CandidateHeaderBatch>;
+    async fn fetch_full_message_after_authorize(
+        &mut self,
+        candidate: &CandidateHeader,
+    ) -> Result<FetchedMessage>;
+    async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()>;
+    async fn record_malformed_seen_or_processed(
+        &mut self,
+        candidate: &MalformedCandidateHeader,
+    ) -> Result<()>;
+    async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value>;
+}
+
+pub trait MailboxFactory: Clone + Send + Sync + 'static {
+    fn open(&self, config: MailboxConfig) -> Box<dyn MailboxEngine>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RealMailboxFactory;
+
+impl MailboxFactory for RealMailboxFactory {
+    fn open(&self, config: MailboxConfig) -> Box<dyn MailboxEngine> {
+        Box::new(RealMailboxEngine { config })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RealMailboxEngine {
+    config: MailboxConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeaderCandidateInput<'a> {
+    uid_validity: u32,
+    uid: NonZeroU32,
+    raw_headers: &'a [u8],
+    attachment_count: usize,
+    rfc822_size: Option<u32>,
+}
+
+impl RealMailboxEngine {
+    async fn imap(&self) -> Result<ImapClient> {
+        let mut client = match self.config.imap_tls {
+            ImapTlsMode::Implicit => {
+                ImapClient::rustls(
+                    self.config.imap_host.clone(),
+                    self.config.imap_port,
+                    false,
+                    None,
+                )
+                .await
+            }
+            ImapTlsMode::StartTls => {
+                ImapClient::rustls(
+                    self.config.imap_host.clone(),
+                    self.config.imap_port,
+                    true,
+                    None,
+                )
+                .await
+            }
+            ImapTlsMode::Insecure => {
+                ImapClient::insecure(self.config.imap_host.clone(), self.config.imap_port).await
+            }
+        }
+        .context("failed to connect to IMAP server")?;
+        self.authenticate_imap(&mut client).await?;
+        if let Err(err) = client.id(Some(Self::imap_id_params())).await {
+            warn!(error = %err, "IMAP ID command failed");
+        }
+        Ok(client)
+    }
+
+    async fn authenticate_imap(&self, client: &mut ImapClient) -> Result<()> {
+        match &self.config.auth {
+            MailboxAuthConfig::Basic { imap_password, .. } => client
+                .authenticate_plain(self.config.imap_username.clone(), imap_password.clone())
+                .await
+                .context("failed to authenticate to IMAP server with basic auth"),
+            MailboxAuthConfig::Xoauth2TokenCommand { token_command } => {
+                let token = token_command
+                    .access_token()
+                    .await
+                    .context("failed to obtain XOAUTH2 access token for IMAP")?;
+                client
+                    .authenticate_xoauth2(self.config.imap_username.clone(), token)
+                    .await
+                    .context("failed to authenticate to IMAP server with XOAUTH2")
+            }
+        }
+    }
+
+    async fn smtp_credentials(&self) -> Result<Credentials<String>> {
+        match &self.config.auth {
+            MailboxAuthConfig::Basic { smtp_password, .. } => Ok(Credentials::new(
+                self.config.smtp_username.clone(),
+                smtp_password.clone(),
+            )),
+            MailboxAuthConfig::Xoauth2TokenCommand { token_command } => {
+                let token = token_command
+                    .access_token()
+                    .await
+                    .context("failed to obtain XOAUTH2 access token for SMTP")?;
+                Ok(Credentials::new_xoauth2(
+                    self.config.smtp_username.clone(),
+                    token,
+                ))
+            }
+        }
+    }
+
+    fn imap_id_params() -> Vec<(IString<'static>, NString<'static>)> {
+        [
+            ("name", "lionclaw-channel-email"),
+            ("version", env!("CARGO_PKG_VERSION")),
+            ("vendor", "LionClaw"),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                IString::try_from(name).expect("valid IMAP ID field"),
+                NString::try_from(value).expect("valid IMAP ID value"),
+            )
+        })
+        .collect()
+    }
+
+    async fn selected_imap(&self, read_only: bool) -> Result<(ImapClient, u32)> {
+        let mut client = self.imap().await?;
+        let selected = if read_only {
+            client
+                .examine(self.config.imap_mailbox.as_str())
+                .await
+                .context("failed to examine IMAP mailbox")?
+        } else {
+            client
+                .select(self.config.imap_mailbox.as_str())
+                .await
+                .context("failed to select IMAP mailbox")?
+        };
+        let uid_validity = selected
+            .uid_validity
+            .map(NonZeroU32::get)
+            .ok_or_else(|| anyhow!("IMAP server did not return UIDVALIDITY"))?;
+        Ok((client, uid_validity))
+    }
+
+    async fn selected_candidate_imap(
+        &self,
+        read_only: bool,
+        candidate: &CandidateHeader,
+    ) -> Result<ImapClient> {
+        let (client, uid_validity) = self.selected_imap(read_only).await?;
+        if uid_validity != candidate.uid_validity {
+            return Err(StaleMailboxCandidate {
+                expected_uid_validity: candidate.uid_validity,
+                actual_uid_validity: uid_validity,
+            }
+            .into());
+        }
+        Ok(client)
+    }
+
+    fn header_fetch_items() -> MacroOrMessageDataItemNames<'static> {
+        let fields = [
+            "From",
+            "To",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "In-Reply-To",
+            "References",
+            "Authentication-Results",
+            "Auto-Submitted",
+            "Precedence",
+            "List-Id",
+            "List-Unsubscribe",
+            "List-Post",
+            "Return-Path",
+            "X-Auto-Response-Suppress",
+            "Content-Type",
+        ]
+        .into_iter()
+        .map(|field| AString::try_from(field).expect("valid IMAP header field"))
+        .collect::<Vec<_>>();
+        MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+            MessageDataItemName::BodyExt {
+                section: Some(Section::HeaderFields(
+                    None,
+                    Vec1::try_from(fields).expect("nonempty header list"),
+                )),
+                partial: Some((0, candidate_header_fetch_limit())),
+                peek: true,
+            },
+            MessageDataItemName::BodyStructure,
+            MessageDataItemName::Rfc822Size,
+        ])
+    }
+
+    fn full_fetch_items(max_message_bytes: usize) -> MacroOrMessageDataItemNames<'static> {
+        let fetch_limit = u32::try_from(max_message_bytes.saturating_add(1)).unwrap_or(u32::MAX);
+        let fetch_limit = NonZeroU32::new(fetch_limit).unwrap_or(NonZeroU32::MIN);
+        MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::BodyExt {
+            section: None,
+            partial: Some((0, fetch_limit)),
+            peek: true,
+        }])
+    }
+
+    fn candidate_from_headers(&self, input: HeaderCandidateInput<'_>) -> Result<CandidateHeader> {
+        if input.raw_headers.len() > MAX_CANDIDATE_HEADER_BYTES {
+            return Err(anyhow!(
+                "email candidate headers exceed {MAX_CANDIDATE_HEADER_BYTES} bytes"
+            ));
+        }
+
+        let facts = parse_header_facts(input.raw_headers)?;
+        let sender = sender_ref(&facts.sender.address);
+        let conversation = conversation_ref(&self.config.mailbox_id);
+        let provider = facts
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("imap:{}:{}", input.uid_validity, input.uid));
+        let root = stable_message_root(
+            facts.message_id.as_deref(),
+            facts.in_reply_to.as_deref(),
+            &facts.references,
+            &provider,
+        );
+        let thread = thread_ref(&root);
+        let message = message_ref(&provider);
+        Ok(CandidateHeader {
+            uid_validity: input.uid_validity,
+            uid: input.uid.get(),
+            event_id: event_id(&self.config.mailbox_id, input.uid_validity, input.uid.get()),
+            sender_ref: sender,
+            conversation_ref: conversation,
+            thread_ref: thread,
+            message_ref: message,
+            attachment_count: input.attachment_count,
+            rfc822_size: input.rfc822_size,
+            sender_auth: None,
+            facts,
+        })
+    }
+
+    fn push_candidate_from_headers(
+        &self,
+        batch: &mut CandidateHeaderBatch,
+        input: HeaderCandidateInput<'_>,
+    ) -> bool {
+        match self.candidate_from_headers(input) {
+            Ok(candidate) => {
+                batch.candidates.push(candidate);
+                true
+            }
+            Err(err) => {
+                batch.malformed.push(self.malformed_candidate_from_uid(
+                    input.uid_validity,
+                    input.uid,
+                    "malformed_headers",
+                    input.rfc822_size,
+                ));
+                warn!(
+                    uid_validity = input.uid_validity,
+                    uid = input.uid.get(),
+                    error = %err,
+                    "skipping email candidate with malformed headers"
+                );
+                false
+            }
+        }
+    }
+
+    fn malformed_candidate_from_uid(
+        &self,
+        uid_validity: u32,
+        uid: NonZeroU32,
+        reason: &str,
+        rfc822_size: Option<u32>,
+    ) -> MalformedCandidateHeader {
+        let event_id = event_id(&self.config.mailbox_id, uid_validity, uid.get());
+        let provider = format!("imap:{}:{}:malformed", uid_validity, uid);
+        let thread_root = format!("malformed:{event_id}");
+        MalformedCandidateHeader {
+            uid_validity,
+            uid: uid.get(),
+            event_id,
+            sender_ref: format!(
+                "email:malformed:{}",
+                short_hash(&format!(
+                    "{}:{}:{}",
+                    self.config.mailbox_id,
+                    uid_validity,
+                    uid.get()
+                ))
+            ),
+            conversation_ref: conversation_ref(&self.config.mailbox_id),
+            thread_ref: thread_ref(&thread_root),
+            message_ref: message_ref(&provider),
+            subject: "(malformed headers)".to_string(),
+            snippet: "Header facts could not be parsed; body was not downloaded.".to_string(),
+            attachment_count: 0,
+            rfc822_size,
+            reason: reason.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl MailboxEngine for RealMailboxEngine {
+    async fn list_candidate_headers(&mut self) -> Result<CandidateHeaderBatch> {
+        let (mut client, uid_validity) = self.selected_imap(true).await?;
+        let mut uids = client
+            .uid_search([SearchKey::Unseen])
+            .await
+            .context("failed to search IMAP mailbox")?;
+        order_candidate_uids(&mut uids, self.config.fetch_limit);
+        if uids.is_empty() {
+            return Ok(CandidateHeaderBatch::default());
+        }
+        let sequence_set = SequenceSet::try_from(uids.clone())?;
+        let fetched = client
+            .uid_fetch(sequence_set, Self::header_fetch_items())
+            .await
+            .context("failed to fetch IMAP message headers")?;
+        let mut batch = CandidateHeaderBatch::default();
+        for uid in uids {
+            let Some(items) = fetched.get(&uid) else {
+                continue;
+            };
+            let Some(raw_headers) = body_data(items.as_ref()) else {
+                warn!(
+                    uid_validity,
+                    uid = uid.get(),
+                    "skipping email candidate with missing fetched headers"
+                );
+                batch.malformed.push(self.malformed_candidate_from_uid(
+                    uid_validity,
+                    uid,
+                    "missing_headers",
+                    rfc822_size(items.as_ref()),
+                ));
+                continue;
+            };
+            let attachment_count = bodystructure_attachment_count(items.as_ref());
+            let rfc822_size = rfc822_size(items.as_ref());
+            self.push_candidate_from_headers(
+                &mut batch,
+                HeaderCandidateInput {
+                    uid_validity,
+                    uid,
+                    raw_headers: &raw_headers,
+                    attachment_count,
+                    rfc822_size,
+                },
+            );
+        }
+        Ok(batch)
+    }
+
+    async fn fetch_full_message_after_authorize(
+        &mut self,
+        candidate: &CandidateHeader,
+    ) -> Result<FetchedMessage> {
+        let mut client = self.selected_candidate_imap(true, candidate).await?;
+        let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
+        let fetched = client
+            .uid_fetch(
+                SequenceSet::try_from(vec![uid])?,
+                Self::full_fetch_items(self.config.max_message_bytes),
+            )
+            .await
+            .context("failed to fetch full IMAP message")?;
+        let raw = fetched
+            .get(&uid)
+            .and_then(|items| body_data(items.as_ref()))
+            .ok_or_else(|| anyhow!("IMAP full message fetch returned no body"))?;
+        Ok(FetchedMessage { raw })
+    }
+
+    async fn record_seen_or_processed(&mut self, candidate: &CandidateHeader) -> Result<()> {
+        let mut client = self.selected_candidate_imap(false, candidate).await?;
+        let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
+        client
+            .uid_silent_store(
+                SequenceSet::try_from(vec![uid])?,
+                StoreType::Add,
+                [Flag::Seen],
+            )
+            .await
+            .context("failed to mark IMAP message seen")?;
+        Ok(())
+    }
+
+    async fn record_malformed_seen_or_processed(
+        &mut self,
+        candidate: &MalformedCandidateHeader,
+    ) -> Result<()> {
+        let mut client = self.imap().await?;
+        let selected = client
+            .select(self.config.imap_mailbox.as_str())
+            .await
+            .context("failed to select IMAP mailbox")?;
+        let uid_validity = selected
+            .uid_validity
+            .map(NonZeroU32::get)
+            .ok_or_else(|| anyhow!("IMAP server did not return UIDVALIDITY"))?;
+        if uid_validity != candidate.uid_validity {
+            return Err(StaleMailboxCandidate {
+                expected_uid_validity: candidate.uid_validity,
+                actual_uid_validity: uid_validity,
+            }
+            .into());
+        }
+        let uid = NonZeroU32::new(candidate.uid).ok_or_else(|| anyhow!("invalid uid"))?;
+        client
+            .uid_silent_store(
+                SequenceSet::try_from(vec![uid])?,
+                StoreType::Add,
+                [Flag::Seen],
+            )
+            .await
+            .context("failed to mark malformed IMAP message seen")?;
+        Ok(())
+    }
+
+    async fn send_threaded_reply(&mut self, email: OutboundEmail) -> Result<Value> {
+        let message_id = generated_message_id(&email.delivery_id, &self.config.address);
+        let from_name = self.config.from_name.as_deref().unwrap_or("LionClaw");
+        let mut message = MessageBuilder::new()
+            .from((from_name, self.config.address.as_str()))
+            .to(email.to.as_str())
+            .subject(email.subject.as_str())
+            .message_id(message_id.as_str())
+            .text_body(email.text.as_str());
+        if let Some(in_reply_to) = &email.in_reply_to {
+            message = message.in_reply_to(in_reply_to.as_str());
+        }
+        if !email.references.is_empty() {
+            message = message.references(email.references.clone());
+        }
+        for attachment in &email.attachments {
+            message = message.attachment(
+                attachment.mime_type.as_str(),
+                attachment.filename.as_str(),
+                attachment.content.as_slice(),
+            );
+        }
+
+        let credentials = self.smtp_credentials().await?;
+        let builder = SmtpClientBuilder::new(self.config.smtp_host.clone(), self.config.smtp_port)
+            .map_err(|err| anyhow!("failed to build SMTP client: {err}"))?
+            .credentials(credentials);
+        match self.config.smtp_tls {
+            SmtpTlsMode::Implicit | SmtpTlsMode::StartTls => {
+                let mut client = builder
+                    .implicit_tls(matches!(self.config.smtp_tls, SmtpTlsMode::Implicit))
+                    .connect()
+                    .await
+                    .context("failed to connect to SMTP server")?;
+                client
+                    .send(message)
+                    .await
+                    .map_err(|err| anyhow!("failed to send SMTP message: {err}"))?;
+            }
+            SmtpTlsMode::Insecure => {
+                let mut client = builder
+                    .connect_plain()
+                    .await
+                    .context("failed to connect to SMTP server")?;
+                client
+                    .send(message)
+                    .await
+                    .map_err(|err| anyhow!("failed to send SMTP message: {err}"))?;
+            }
+        }
+        Ok(json!({
+            "provider": "smtp",
+            "message_id": message_id,
+            "recipient": email.to,
+        }))
+    }
+}
+
+pub fn attachment_provider_ref(
+    mailbox_id: &str,
+    uid_validity: u32,
+    uid: u32,
+    part_index: usize,
+) -> String {
+    provider_file_ref(mailbox_id, uid_validity, uid, part_index)
+}
+
+fn body_data(items: &[MessageDataItem<'_>]) -> Option<Vec<u8>> {
+    items.iter().find_map(|item| match item {
+        MessageDataItem::BodyExt { data, .. } => data.0.as_ref().map(|data| data.as_ref().to_vec()),
+        _ => None,
+    })
+}
+
+fn candidate_header_fetch_limit() -> NonZeroU32 {
+    let limit = u32::try_from(MAX_CANDIDATE_HEADER_BYTES.saturating_add(1))
+        .expect("candidate header fetch limit fits u32");
+    NonZeroU32::new(limit).expect("candidate header fetch limit is nonzero")
+}
+
+fn order_candidate_uids(uids: &mut Vec<NonZeroU32>, fetch_limit: usize) {
+    uids.sort();
+    uids.truncate(fetch_limit);
+}
+
+fn bodystructure_attachment_count(items: &[MessageDataItem<'_>]) -> usize {
+    items
+        .iter()
+        .find_map(|item| match item {
+            MessageDataItem::BodyStructure(body) => Some(count_attachments(body)),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn rfc822_size(items: &[MessageDataItem<'_>]) -> Option<u32> {
+    items.iter().find_map(|item| match item {
+        MessageDataItem::Rfc822Size(size) => Some(*size),
+        _ => None,
+    })
+}
+
+fn count_attachments(body: &BodyStructure<'_>) -> usize {
+    match body {
+        BodyStructure::Single {
+            body,
+            extension_data,
+        } => usize::from(is_attachment_like_body(body, extension_data.as_ref())),
+        BodyStructure::Multi { bodies, .. } => bodies.as_ref().iter().map(count_attachments).sum(),
+    }
+}
+
+fn is_attachment_like_body(
+    body: &Body<'_>,
+    extension_data: Option<&SinglePartExtensionData<'_>>,
+) -> bool {
+    if has_parameter_name(&body.basic.parameter_list, "name") {
+        return true;
+    }
+    if let Some(disposition) = extension_data
+        .and_then(|data| data.tail.as_ref())
+        .and_then(|tail| tail.disposition.as_ref())
+    {
+        if i_string_eq(&disposition.0, "attachment")
+            || disposition
+                .1
+                .iter()
+                .any(|(name, _)| i_string_eq(name, "filename"))
+        {
+            return true;
+        }
+    }
+
+    match &body.specific {
+        SpecificFields::Basic { r#type, .. } => !i_string_eq(r#type, "text"),
+        SpecificFields::Message { .. } => true,
+        SpecificFields::Text { .. } => false,
+    }
+}
+
+fn has_parameter_name(
+    params: &[(
+        imap_client::imap_next::imap_types::core::IString<'_>,
+        imap_client::imap_next::imap_types::core::IString<'_>,
+    )],
+    name: &str,
+) -> bool {
+    params.iter().any(|(param, _)| i_string_eq(param, name))
+}
+
+fn i_string_eq(
+    value: &imap_client::imap_next::imap_types::core::IString<'_>,
+    expected: &str,
+) -> bool {
+    value.as_ref().eq_ignore_ascii_case(expected.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ImapTlsMode, SmtpTlsMode};
+
+    #[test]
+    fn malformed_candidate_headers_do_not_discard_well_formed_candidates() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let mut batch = CandidateHeaderBatch::default();
+
+        let malformed_added = engine.push_candidate_from_headers(
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(41).expect("nonzero uid"),
+                raw_headers: b"Subject: Missing sender\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            },
+        );
+        let well_formed_added = engine.push_candidate_from_headers(
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers: b"From: Alice <alice@example.com>\r\nSubject: Build failed\r\nMessage-ID: <m1@example.com>\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(256),
+            },
+        );
+
+        assert!(!malformed_added);
+        assert!(well_formed_added);
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.malformed.len(), 1);
+        assert_eq!(batch.malformed[0].reason, "malformed_headers");
+        assert_eq!(batch.candidates[0].uid, 42);
+        assert_eq!(
+            batch.candidates[0].sender_ref,
+            "email:addr:alice@example.com"
+        );
+    }
+
+    #[test]
+    fn oversized_candidate_headers_are_rejected_before_admission() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let mut raw_headers = b"From: Alice <alice@example.com>\r\nSubject: ".to_vec();
+        raw_headers.extend(vec![b'x'; MAX_CANDIDATE_HEADER_BYTES]);
+        raw_headers.extend_from_slice(b"\r\n\r\n");
+        let mut batch = CandidateHeaderBatch::default();
+
+        let added = engine.push_candidate_from_headers(
+            &mut batch,
+            HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers: &raw_headers,
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            },
+        );
+
+        assert!(!added);
+        assert!(batch.candidates.is_empty());
+        assert_eq!(batch.malformed.len(), 1);
+        assert_eq!(batch.malformed[0].reason, "malformed_headers");
+    }
+
+    #[test]
+    fn candidate_header_fetch_window_keeps_one_extra_byte_for_overflow_detection() {
+        assert_eq!(
+            candidate_header_fetch_limit().get() as usize,
+            MAX_CANDIDATE_HEADER_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn candidate_uids_are_processed_oldest_first_with_fetch_limit() {
+        let mut uids = vec![
+            NonZeroU32::new(42).expect("uid"),
+            NonZeroU32::new(7).expect("uid"),
+            NonZeroU32::new(13).expect("uid"),
+        ];
+
+        order_candidate_uids(&mut uids, 2);
+
+        assert_eq!(
+            uids,
+            vec![
+                NonZeroU32::new(7).expect("uid"),
+                NonZeroU32::new(13).expect("uid")
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_message_ids_do_not_share_thread_identity() {
+        let engine = RealMailboxEngine {
+            config: test_mailbox_config(),
+        };
+        let first = engine
+            .candidate_from_headers(HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(41).expect("nonzero uid"),
+                raw_headers: b"From: Alice <alice@example.com>\r\nSubject: First\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            })
+            .expect("first candidate");
+        let second = engine
+            .candidate_from_headers(HeaderCandidateInput {
+                uid_validity: 7,
+                uid: NonZeroU32::new(42).expect("nonzero uid"),
+                raw_headers:
+                    b"From: Alice <alice@example.com>\r\nSubject: Second\r\nMessage-ID: <>\r\n\r\n",
+                attachment_count: 0,
+                rfc822_size: Some(128),
+            })
+            .expect("second candidate");
+
+        assert_ne!(first.thread_ref, second.thread_ref);
+        assert_ne!(first.message_ref, second.message_ref);
+        assert!(first.facts.message_id.is_none());
+        assert!(second.facts.message_id.is_none());
+    }
+
+    #[test]
+    fn stale_mailbox_candidate_error_is_detected_through_context() {
+        let error: anyhow::Error = StaleMailboxCandidate {
+            expected_uid_validity: 7,
+            actual_uid_validity: 8,
+        }
+        .into();
+        let error = error.context("failed to fetch authorized email body");
+
+        assert!(is_stale_mailbox_candidate(&error));
+    }
+
+    fn test_mailbox_config() -> MailboxConfig {
+        MailboxConfig {
+            mailbox_id: "assistant-example-com".to_string(),
+            address: "assistant@example.com".to_string(),
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            imap_tls: ImapTlsMode::Implicit,
+            imap_username: "assistant@example.com".to_string(),
+            imap_mailbox: "INBOX".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            smtp_tls: SmtpTlsMode::StartTls,
+            smtp_username: "assistant@example.com".to_string(),
+            auth: MailboxAuthConfig::Basic {
+                imap_password: "secret".to_string(),
+                smtp_password: "secret".to_string(),
+            },
+            from_name: Some("LionClaw".to_string()),
+            fetch_limit: 25,
+            max_message_bytes: crate::config::DEFAULT_MAX_MESSAGE_BYTES,
+        }
+    }
+}

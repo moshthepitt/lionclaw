@@ -294,6 +294,11 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
             hasher.update(key.as_bytes());
             hasher.update(b"\0");
         }
+        for key in &channel.optional_env {
+            hasher.update(b"optional_env\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"\0");
+        }
         if let Some(contact) = &channel.contact {
             hasher.update(b"contact\0");
             if let Some(conversation_ref) = &contact.conversation_ref {
@@ -806,6 +811,7 @@ pub struct AppliedChannel {
     pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
+    pub optional_env: Vec<String>,
     pub contact: Option<ChannelContactConfig>,
 }
 
@@ -817,6 +823,7 @@ impl AppliedChannel {
             worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
+            optional_env: config.optional_env.clone(),
             contact: config.contact.clone(),
         }
     }
@@ -867,9 +874,11 @@ fn read_installed_skill_metadata(snapshot_root: &Path) -> Result<Option<Installe
 
     let content = fs::read_to_string(&metadata_path)
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
-    let metadata = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
-    Ok(Some(metadata))
+    // Install metadata is auxiliary provenance; malformed content should not block state loading.
+    match toml::from_str(&content) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -877,7 +886,10 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{publish_materialized_snapshot_root, AppliedState};
-    use crate::{home::LionClawHome, operator::target::init_project};
+    use crate::{
+        home::LionClawHome,
+        operator::{snapshot::SKILL_INSTALL_METADATA_FILE, target::init_project},
+    };
 
     fn test_home(project_root: &Path) -> LionClawHome {
         let project = init_project(project_root).expect("init project");
@@ -913,6 +925,28 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(aliases, vec!["visible"]);
+    }
+
+    #[tokio::test]
+    async fn load_treats_malformed_install_metadata_as_absent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+
+        let visible = home.skills_dir().join("visible");
+        fs::create_dir_all(&visible).expect("visible dir");
+        fs::write(
+            visible.join("SKILL.md"),
+            "---\nname: visible\ndescription: visible\n---\n",
+        )
+        .expect("visible skill");
+        fs::write(visible.join(SKILL_INSTALL_METADATA_FILE), "source = [\n")
+            .expect("malformed metadata");
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+        let skill = applied.skill_by_alias("visible").expect("visible skill");
+
+        assert_eq!(skill.source, skill.snapshot_path.display().to_string());
+        assert!(skill.reference.is_none());
     }
 
     #[cfg(unix)]
@@ -970,6 +1004,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -1012,6 +1047,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -1069,6 +1105,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save first config");
@@ -1081,6 +1118,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save second config");
@@ -1088,6 +1126,21 @@ mod tests {
         let second = AppliedState::load(&home).await.expect("load second state");
 
         assert_ne!(first.fingerprint(), second.fingerprint());
+
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "loopback".to_string(),
+            skill: "visible".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
+            required_env: vec!["SECOND_KEY".to_string()],
+            optional_env: vec!["OPTIONAL_KEY".to_string()],
+            contact: None,
+        });
+        config.save(&home).await.expect("save optional env config");
+
+        let third = AppliedState::load(&home).await.expect("load third state");
+
+        assert_ne!(second.fingerprint(), third.fingerprint());
     }
 
     #[tokio::test]

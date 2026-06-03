@@ -36,27 +36,28 @@ use crate::contracts::{
     ChannelActorAuthorizeResponse, ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
     ChannelAttachmentFinalizeRequest, ChannelAttachmentFinalizeResponse,
     ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelBindingView,
-    ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
-    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
-    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
-    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
-    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
-    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
-    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
-    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
-    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelSessionBinding,
-    ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamEventView,
-    ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
-    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
-    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
-    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
-    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
-    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
-    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
-    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    ChannelGrantApproveRequest, ChannelGrantConsumeRequest, ChannelGrantConsumeResponse,
+    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
+    ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
+    ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
+    ChannelListResponse, ChannelOutboxAttachmentDto, ChannelOutboxAttemptStatusDto,
+    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
+    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
+    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
+    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
+    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
+    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
+    ChannelPairingView, ChannelRoutingProfile, ChannelSessionBinding, ChannelStreamAckRequest,
+    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
+    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
+    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
+    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
+    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
+    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -3394,6 +3395,93 @@ impl Kernel {
         })
     }
 
+    pub async fn consume_channel_grant(
+        &self,
+        req: ChannelGrantConsumeRequest,
+    ) -> Result<ChannelGrantConsumeResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        let expected_label = trim_required(req.expected_label, "expected_label")?;
+        self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+
+        let Some(grant) = self
+            .channel_state
+            .get_grant_in_tx(&mut tx, req.grant_id)
+            .await
+            .map_err(internal)?
+        else {
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(ChannelGrantConsumeResponse {
+                grant_id: req.grant_id,
+                consumed: false,
+            });
+        };
+
+        if grant.channel_id != channel_id {
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(ChannelGrantConsumeResponse {
+                grant_id: req.grant_id,
+                consumed: false,
+            });
+        }
+        if grant.status != ChannelGrantStatus::Approved {
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(ChannelGrantConsumeResponse {
+                grant_id: req.grant_id,
+                consumed: false,
+            });
+        }
+        if grant.label.as_deref() != Some(expected_label.as_str()) {
+            return Err(KernelError::Conflict("grant_label_mismatch".to_string()));
+        }
+
+        self.channel_state
+            .delete_grant_in_tx(&mut tx, &channel_id, req.grant_id)
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.grant.consumed",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": grant.sender_ref,
+                    "conversation_ref": grant.conversation_ref,
+                    "thread_ref": grant.thread_ref,
+                    "reason_code": req.reason.unwrap_or_else(|| "worker_consumed".to_string()),
+                    "grant_id": grant.grant_id,
+                    "routing_profile": grant.routing_profile.as_str(),
+                    "label": expected_label,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.consumed",
+            None,
+            "api",
+            json!({
+                "channel_id": channel_id,
+                "grant_id": req.grant_id,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantConsumeResponse {
+            grant_id: req.grant_id,
+            consumed: true,
+        })
+    }
+
     pub async fn ingest_channel_inbound(
         &self,
         req: ChannelInboundRequest,
@@ -3416,10 +3504,13 @@ impl Kernel {
             .map_err(|err| internal(err.into()))?;
         let authorization = self.authorize_channel_actor_in_tx(&mut tx, &input).await?;
         tx.commit().await.map_err(|err| internal(err.into()))?;
+        let admission_grant = authorization.admission_grant;
         Ok(ChannelActorAuthorizeResponse {
             authorized: authorization.outcome == ChannelActorAuthorizationOutcome::Authorized,
             reason_code: authorization.outcome.reason_code().to_string(),
-            grant_id: authorization.admission_grant.map(|grant| grant.grant_id),
+            grant_id: admission_grant.as_ref().map(|grant| grant.grant_id),
+            grant_routing_profile: admission_grant.as_ref().map(|grant| grant.routing_profile),
+            grant_label: admission_grant.and_then(|grant| grant.label),
             session_key: authorization.session_key,
         })
     }
@@ -7675,6 +7766,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -7710,6 +7802,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -7753,6 +7846,7 @@ mod tests {
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -13622,6 +13716,7 @@ fn approved_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
         } => {
             let mut lookups = Vec::new();
             if let Some(sender_ref) = sender_ref {
+                lookups.push(direct_session_grant_lookup(sender_ref));
                 lookups.push(ChannelSessionGrantLookup {
                     sender_ref: Some(sender_ref),
                     conversation_ref: Some(conversation_ref),
@@ -13644,6 +13739,7 @@ fn approved_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
         } => {
             let mut lookups = Vec::new();
             if let Some(sender_ref) = sender_ref {
+                lookups.push(direct_session_grant_lookup(sender_ref));
                 lookups.push(ChannelSessionGrantLookup {
                     sender_ref: Some(sender_ref),
                     conversation_ref: Some(conversation_ref),

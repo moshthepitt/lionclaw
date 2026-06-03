@@ -22,6 +22,8 @@ pub const SKILL_INSTALL_METADATA_FILE: &str = ".lionclaw-skill.toml";
 #[derive(Debug, Default, Deserialize)]
 struct InstallMetadataFile {
     #[serde(default)]
+    source: String,
+    #[serde(default)]
     install_id: String,
 }
 
@@ -166,15 +168,22 @@ fn apply_snapshot_overlays(destination_root: &Path, overlays: &[SnapshotOverlay]
             }
         }
 
-        fs::copy(&overlay.source_path, &destination).with_context(|| {
-            format!(
-                "failed to copy snapshot overlay '{}' to '{}'",
-                overlay.source_path.display(),
-                destination.display()
-            )
-        })?;
+        copy_regular_file(&overlay.source_path, &destination, &source_metadata)?;
     }
 
+    Ok(())
+}
+
+fn copy_regular_file(source: &Path, destination: &Path, metadata: &fs::Metadata) -> Result<()> {
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to copy '{}' to '{}'",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    fs::set_permissions(destination, metadata.permissions())
+        .with_context(|| format!("failed to set permissions on {}", destination.display()))?;
     Ok(())
 }
 
@@ -368,13 +377,7 @@ pub(crate) fn copy_snapshot_tree(source: &Path, destination: &Path) -> Result<()
         if metadata.is_dir() {
             copy_snapshot_tree(&path, &target)?;
         } else if metadata.is_file() {
-            fs::copy(&path, &target).with_context(|| {
-                format!(
-                    "failed to copy '{}' to '{}'",
-                    path.display(),
-                    target.display()
-                )
-            })?;
+            copy_regular_file(&path, &target, &metadata)?;
         } else {
             return Err(anyhow!(
                 "skill source entry '{}' is not a regular file or directory",
@@ -425,6 +428,51 @@ fn existing_install_id_for_same_content(
 }
 
 fn read_existing_install_id(snapshot_dir: &Path) -> Result<Option<String>> {
+    Ok(
+        read_install_metadata_file(snapshot_dir)?.and_then(|metadata| {
+            (!metadata.install_id.trim().is_empty()).then_some(metadata.install_id)
+        }),
+    )
+}
+
+pub(crate) fn installed_snapshot_matches_source(
+    snapshot_dir: &Path,
+    source_path: &Path,
+) -> Result<bool> {
+    let Some(metadata) = read_install_metadata_file_for_source_match(snapshot_dir)? else {
+        return Ok(false);
+    };
+    let source = metadata.source.trim();
+    if source.is_empty() {
+        return Ok(false);
+    }
+
+    let expected = normalize_local_source(source_path.to_string_lossy().as_ref())?;
+    Ok(source == expected)
+}
+
+fn read_install_metadata_file(snapshot_dir: &Path) -> Result<Option<InstallMetadataFile>> {
+    let Some((metadata_path, content)) = read_install_metadata_content(snapshot_dir)? else {
+        return Ok(None);
+    };
+    let metadata = parse_install_metadata_file(&metadata_path, &content)?;
+    Ok(Some(metadata))
+}
+
+fn read_install_metadata_file_for_source_match(
+    snapshot_dir: &Path,
+) -> Result<Option<InstallMetadataFile>> {
+    let Some((metadata_path, content)) = read_install_metadata_content(snapshot_dir)? else {
+        return Ok(None);
+    };
+    // Malformed metadata is not evidence that a snapshot came from a given source.
+    match parse_install_metadata_file(&metadata_path, &content) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_install_metadata_content(snapshot_dir: &Path) -> Result<Option<(PathBuf, String)>> {
     let metadata_path = snapshot_dir.join(SKILL_INSTALL_METADATA_FILE);
     let metadata = match fs::symlink_metadata(&metadata_path) {
         Ok(metadata) => metadata,
@@ -448,9 +496,11 @@ fn read_existing_install_id(snapshot_dir: &Path) -> Result<Option<String>> {
 
     let content = fs::read_to_string(&metadata_path)
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
-    let metadata: InstallMetadataFile = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
-    Ok((!metadata.install_id.trim().is_empty()).then_some(metadata.install_id))
+    Ok(Some((metadata_path, content)))
+}
+
+fn parse_install_metadata_file(metadata_path: &Path, content: &str) -> Result<InstallMetadataFile> {
+    toml::from_str(content).with_context(|| format!("failed to parse {}", metadata_path.display()))
 }
 
 fn snapshot_mode_bits(metadata: &fs::Metadata) -> u32 {
@@ -505,7 +555,10 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{install_snapshot, install_snapshot_with_overlays, SnapshotOverlay};
+    use super::{
+        install_snapshot, install_snapshot_with_overlays, installed_snapshot_matches_source,
+        SnapshotOverlay, SKILL_INSTALL_METADATA_FILE,
+    };
 
     fn write_skill_source(root: &Path, name: &str) -> PathBuf {
         let source_dir = root.join(name);
@@ -527,6 +580,21 @@ mod tests {
             let mut permissions = fs::metadata(path).expect("metadata").permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("chmod");
+        }
+    }
+
+    fn assert_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(path).expect("metadata").permissions().mode();
+            assert_ne!(mode & 0o111, 0, "{} is not executable", path.display());
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
         }
     }
 
@@ -557,6 +625,58 @@ mod tests {
         assert_eq!(first.skill_id, second.skill_id);
         assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
         assert!(first.snapshot_abs_dir.join("scripts/worker").exists());
+    }
+
+    #[test]
+    fn detects_installed_snapshot_source() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-telegram");
+        let other_source = write_skill_source(temp_dir.path(), "channel-other");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+
+        let installed = install_snapshot(
+            &home,
+            "telegram",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("snapshot");
+
+        assert!(
+            installed_snapshot_matches_source(&installed.snapshot_abs_dir, &source_dir)
+                .expect("source match")
+        );
+        assert!(
+            !installed_snapshot_matches_source(&installed.snapshot_abs_dir, &other_source)
+                .expect("source mismatch")
+        );
+    }
+
+    #[test]
+    fn treats_malformed_install_metadata_as_source_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-telegram");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+        let installed = install_snapshot(
+            &home,
+            "telegram",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("snapshot");
+        fs::write(
+            installed.snapshot_abs_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "source = [\n",
+        )
+        .expect("malformed metadata");
+
+        let matches_source =
+            installed_snapshot_matches_source(&installed.snapshot_abs_dir, &source_dir)
+                .expect("source mismatch");
+
+        assert!(!matches_source);
     }
 
     #[test]
@@ -597,15 +717,14 @@ mod tests {
 
         assert_ne!(first.hash, second.hash);
         assert_ne!(first.skill_id, second.skill_id);
+        let installed_worker = second
+            .snapshot_abs_dir
+            .join("runtime/team-local/bin/lionclaw-channel-team-local");
         assert_eq!(
-            fs::read_to_string(
-                second
-                    .snapshot_abs_dir
-                    .join("runtime/team-local/bin/lionclaw-channel-team-local")
-            )
-            .expect("installed worker"),
+            fs::read_to_string(&installed_worker).expect("installed worker"),
             "worker v2\n"
         );
+        assert_executable(&installed_worker);
     }
 
     #[test]

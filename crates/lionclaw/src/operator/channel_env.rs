@@ -27,7 +27,6 @@ pub fn load_channel_env(home: &LionClawHome, channel_id: &str) -> Result<Channel
 
 pub fn save_channel_env(home: &LionClawHome, channel_id: &str, values: &ChannelEnv) -> Result<()> {
     let path = home.channel_env_path(channel_id);
-
     let mut content = String::new();
     for (key, value) in values {
         validate_channel_env_name(key)?;
@@ -47,45 +46,23 @@ pub fn merge_channel_env(
     let mut existing = load_channel_env(home, channel_id)?;
     for (key, value) in updates {
         validate_channel_env_name(key)?;
-        existing.insert(key.clone(), value.clone());
+        if value.is_empty() {
+            existing.remove(key);
+        } else {
+            existing.insert(key.clone(), value.clone());
+        }
     }
     save_channel_env(home, channel_id, &existing)?;
     Ok(existing)
-}
-
-pub fn validate_required_channel_env(
-    home: &LionClawHome,
-    channel_id: &str,
-    required_env: &[String],
-) -> Result<()> {
-    let stored = load_channel_env(home, channel_id)?;
-    for key in required_env {
-        validate_channel_env_name(key)?;
-        if required_value_is_missing(&stored, key) {
-            return Err(anyhow!(
-                "required environment value '{key}' is not configured for channel '{channel_id}'"
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub fn validate_channel_env_contract(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<()> {
-    let stored = load_channel_env(home, channel_id)?;
-    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)?;
-
-    for key in required_env {
-        validate_channel_env_name(key)?;
-        if required_value_is_missing(&stored, key) {
-            return Err(anyhow!(
-                "required environment value '{key}' is not configured for channel '{channel_id}'"
-            ));
-        }
-    }
+    load_declared_channel_env(home, channel_id, required_env, optional_env)?;
     Ok(())
 }
 
@@ -93,18 +70,21 @@ pub fn validate_no_undeclared_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<()> {
     let stored = load_channel_env(home, channel_id)?;
-    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)
+    validate_stored_channel_env_keys(home, channel_id, required_env, optional_env, &stored)
 }
 
-pub fn load_required_channel_env(
+pub fn load_declared_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<Vec<(String, String)>> {
     let stored = load_channel_env(home, channel_id)?;
-    let mut values = Vec::with_capacity(required_env.len());
+    validate_stored_channel_env_keys(home, channel_id, required_env, optional_env, &stored)?;
+    let mut values = Vec::with_capacity(required_env.len() + optional_env.len());
     for key in required_env {
         validate_channel_env_name(key)?;
         let Some(value) = stored.get(key).filter(|value| !value.is_empty()) else {
@@ -113,6 +93,12 @@ pub fn load_required_channel_env(
             ));
         };
         values.push((key.clone(), value.clone()));
+    }
+    for key in optional_env {
+        validate_channel_env_name(key)?;
+        if let Some(value) = stored.get(key).filter(|value| !value.is_empty()) {
+            values.push((key.clone(), value.clone()));
+        }
     }
     Ok(values)
 }
@@ -136,10 +122,15 @@ fn validate_stored_channel_env_keys(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
     stored: &ChannelEnv,
 ) -> Result<()> {
     let mut declared = BTreeSet::new();
     for key in required_env {
+        validate_channel_env_name(key)?;
+        declared.insert(key.as_str());
+    }
+    for key in optional_env {
         validate_channel_env_name(key)?;
         declared.insert(key.as_str());
     }
@@ -279,7 +270,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_channel_env, load_required_channel_env, missing_required_env, parse_env_file,
+        load_channel_env, load_declared_channel_env, missing_required_env, parse_env_file,
         save_channel_env, ChannelEnv,
     };
     use crate::home::LionClawHome;
@@ -310,7 +301,49 @@ mod tests {
         let err = save_channel_env(&home, "telegram", &values).expect_err("reserved env");
 
         assert!(err.to_string().contains("reserved LionClaw namespace"));
+        assert!(!home.config_dir().exists());
         assert!(!home.channel_env_path("telegram").exists());
+    }
+
+    #[test]
+    fn channel_env_rejects_non_file_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.channel_env_path("telegram")).expect("env path dir");
+        let mut values = ChannelEnv::new();
+        values.insert("TOKEN".to_string(), "secret".to_string());
+
+        let err = save_channel_env(&home, "telegram", &values)
+            .expect_err("directory env target should fail");
+
+        assert!(err.to_string().contains("is not a file"));
+    }
+
+    #[test]
+    fn channel_env_merge_removes_empty_updates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret".to_string());
+        values.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
+        save_channel_env(&home, "telegram", &values).expect("save env");
+
+        let mut updates = ChannelEnv::new();
+        updates.insert("TELEGRAM_POLL_MS".to_string(), String::new());
+        updates.insert("TELEGRAM_TIMEOUT_MS".to_string(), "5000".to_string());
+        let merged = super::merge_channel_env(&home, "telegram", &updates).expect("merge env");
+
+        assert_eq!(
+            merged.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert!(!merged.contains_key("TELEGRAM_POLL_MS"));
+        assert_eq!(
+            merged.get("TELEGRAM_TIMEOUT_MS").map(String::as_str),
+            Some("5000")
+        );
+        let stored = load_channel_env(&home, "telegram").expect("load env");
+        assert!(!stored.contains_key("TELEGRAM_POLL_MS"));
     }
 
     #[cfg(unix)]
@@ -337,6 +370,37 @@ mod tests {
         let err = save_channel_env(&home, "telegram", &values).expect_err("symlink should fail");
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn channel_env_file_replace_is_atomic_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let env_path = home.channel_env_path("telegram");
+        let env_dir = env_path.parent().expect("env parent");
+        fs::create_dir_all(env_dir).expect("env parent");
+        fs::write(&env_path, "TOKEN=old\n").expect("old env");
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644)).expect("public old env");
+
+        let mut values = ChannelEnv::new();
+        values.insert("TOKEN".to_string(), "new".to_string());
+        save_channel_env(&home, "telegram", &values).expect("replace env");
+
+        assert_eq!(fs::read_to_string(&env_path).expect("env"), "TOKEN=new\n");
+        let mode = fs::metadata(&env_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let leftover_temp = fs::read_dir(env_dir)
+            .expect("env dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .any(|name| name.to_string_lossy().starts_with(".telegram.env.tmp-"));
+        assert!(!leftover_temp);
     }
 
     #[cfg(unix)]
@@ -390,16 +454,58 @@ mod tests {
     }
 
     #[test]
-    fn load_required_channel_env_rejects_empty_values() {
+    fn load_declared_channel_env_rejects_empty_required_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         let mut values = ChannelEnv::new();
         values.insert("TELEGRAM_BOT_TOKEN".to_string(), String::new());
         save_channel_env(&home, "telegram", &values).expect("save env");
 
-        let err = load_required_channel_env(&home, "telegram", &["TELEGRAM_BOT_TOKEN".to_string()])
-            .expect_err("empty required env should fail");
+        let err =
+            load_declared_channel_env(&home, "telegram", &["TELEGRAM_BOT_TOKEN".to_string()], &[])
+                .expect_err("empty required env should fail");
 
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn load_declared_channel_env_includes_present_optional_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        values.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
+        save_channel_env(&home, "telegram", &values).expect("save env");
+
+        let loaded = load_declared_channel_env(
+            &home,
+            "telegram",
+            &["TELEGRAM_BOT_TOKEN".to_string()],
+            &["TELEGRAM_POLL_MS".to_string(), "TELEGRAM_EMPTY".to_string()],
+        )
+        .expect("load declared env");
+
+        assert_eq!(
+            loaded,
+            vec![
+                ("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string()),
+                ("TELEGRAM_POLL_MS".to_string(), "1000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_declared_channel_env_rejects_stored_values_without_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("STALE_SECRET".to_string(), "secret".to_string());
+        save_channel_env(&home, "loopback", &values).expect("save env");
+
+        let err = load_declared_channel_env(&home, "loopback", &[], &[])
+            .expect_err("undeclared env should fail");
+
+        assert!(err.to_string().contains("STALE_SECRET"));
+        assert!(!err.to_string().contains("secret"));
     }
 }

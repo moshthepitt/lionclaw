@@ -8,7 +8,7 @@ LionClaw releases are a two-stage GitHub Actions flow.
 2. Review and merge the generated `release/vX.Y.Z` pull request into `main`.
 3. Wait for the `release` workflow to build the binaries, push tag `vX.Y.Z`, and publish the GitHub Release.
 
-## What gets published
+## What Gets Published
 
 Each GitHub Release includes:
 
@@ -19,7 +19,9 @@ The tarball contains:
 
 - `lionclaw`
 - `lionclawd`
+- `lionclaw-channel-email`
 - `lionclaw-channel-team-local`
+- `skills/channel-email/`
 - `skills/channel-team-local/`
 - `LICENSE`
 

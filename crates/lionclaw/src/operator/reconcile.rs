@@ -10,14 +10,15 @@ use uuid::Uuid;
 use crate::{
     applied::{compute_daemon_fingerprint_with_project_context, AppliedState},
     contracts::{
-        ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-        ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
+        ChannelGrantApproveRequest, ChannelGrantResponse, ChannelGrantRevokeRequest,
+        ChannelGrantRevokeResponse, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingInviteRequest, ChannelPairingInviteResponse,
+        ChannelPairingListResponse, ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
     },
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
+        bundled_channels::snapshot_overlays_for_source,
         channel_metadata::{
             load_channel_metadata, render_contact_template, resolve_channel_worker_entrypoint,
             ChannelMetadata, CHANNEL_METADATA_FILE,
@@ -43,7 +44,6 @@ use crate::{
             project_instance_runtime_context_for_home_in_project_with_contacts,
             project_instance_runtime_context_with_contacts,
         },
-        team_local::snapshot_overlays_for_source,
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -189,9 +189,12 @@ pub async fn add_channel_with_contact(
         id,
         skill,
         launch_mode,
-        crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
-        required_env,
-        contact,
+        ChannelWorkerSetup {
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env,
+            optional_env: Vec::new(),
+            contact,
+        },
     )
     .await
 }
@@ -227,26 +230,33 @@ impl ChannelContactSetup {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelWorkerSetup {
+    pub worker: String,
+    pub required_env: Vec<String>,
+    pub optional_env: Vec<String>,
+    pub contact: Option<ChannelContactConfig>,
+}
+
 pub async fn add_channel_with_worker(
     home: &LionClawHome,
     id: String,
     skill: String,
     launch_mode: ChannelLaunchMode,
-    worker: String,
-    required_env: Vec<String>,
-    contact: Option<ChannelContactConfig>,
+    setup: ChannelWorkerSetup,
 ) -> Result<()> {
     validate_skill_alias(&skill)?;
     let skill_dir = resolve_installed_skill_dir(home, &skill)?;
-    resolve_channel_worker_entrypoint(&skill_dir, Some(&worker))?;
+    resolve_channel_worker_entrypoint(&skill_dir, Some(&setup.worker))?;
     let mut config = OperatorConfig::load(home).await?;
     config.upsert_channel(ManagedChannelConfig {
         id,
         skill,
         launch_mode,
-        worker,
-        required_env,
-        contact,
+        worker: setup.worker,
+        required_env: setup.required_env,
+        optional_env: setup.optional_env,
+        contact: setup.contact,
     });
     config.save(home).await
 }
@@ -574,6 +584,30 @@ pub async fn pairing_approve(
         .map_err(to_anyhow)
 }
 
+pub async fn pairing_approve_sender(
+    home: &LionClawHome,
+    channel_id: String,
+    sender_ref: String,
+    trust_tier: TrustTier,
+    label: Option<String>,
+) -> Result<ChannelGrantResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel
+        .approve_channel_grant(ChannelGrantApproveRequest {
+            channel_id,
+            sender_ref: non_empty_trimmed(Some(sender_ref)),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+            trust_tier: Some(trust_tier),
+            label,
+            reason: Some("operator_direct_sender_approval".to_string()),
+        })
+        .await
+        .map_err(to_anyhow)
+}
+
 pub async fn pairing_invite(
     home: &LionClawHome,
     req: ChannelPairingInviteRequest,
@@ -705,10 +739,15 @@ pub(crate) fn build_managed_units(
                 home.runtime_channel_dir(&channel.id).display().to_string(),
             ),
         ];
-        let channel_env_path = if channel.required_env.is_empty() {
+        let channel_env_values = resolve_channel_env(
+            home,
+            &channel.id,
+            &channel.required_env,
+            &channel.optional_env,
+        )?;
+        let channel_env_path = if channel_env_values.is_empty() {
             None
         } else {
-            validate_required_channel_env(home, &channel.id, &channel.required_env)?;
             Some(home.channel_env_path(&channel.id))
         };
 
@@ -727,20 +766,18 @@ pub(crate) fn build_managed_units(
     Ok(units)
 }
 
-pub(crate) fn resolve_required_channel_env(
+pub(crate) fn resolve_channel_env(
     home: &LionClawHome,
     channel_id: &str,
     required_env: &[String],
+    optional_env: &[String],
 ) -> Result<Vec<(String, String)>> {
-    crate::operator::channel_env::load_required_channel_env(home, channel_id, required_env)
-}
-
-pub(crate) fn validate_required_channel_env(
-    home: &LionClawHome,
-    channel_id: &str,
-    required_env: &[String],
-) -> Result<()> {
-    crate::operator::channel_env::validate_channel_env_contract(home, channel_id, required_env)
+    crate::operator::channel_env::load_declared_channel_env(
+        home,
+        channel_id,
+        required_env,
+        optional_env,
+    )
 }
 
 #[cfg(test)]
@@ -1054,16 +1091,17 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_channel_with_contact, add_skill, down, ensure_managed_bind_configured,
-        logs, open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
-        render_runtime_cache_for_work_root, resolve_installed_skill_worker_entrypoint,
-        resolve_required_channel_env, resolve_worker_entrypoint, up_for_work_root,
-        ChannelContactSetup, StackBinaryPaths,
+        add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
+        ensure_managed_bind_configured, logs, open_kernel, open_kernel_with_project_root,
+        pairing_approve_sender, pairing_list, render_marker_file, render_runtime_cache,
+        render_runtime_cache_for_work_root, resolve_channel_env,
+        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, up_for_work_root,
+        ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
         config::resolve_project_workspace_root,
-        contracts::DaemonInfoResponse,
+        contracts::{ChannelRoutingProfile, DaemonInfoResponse, TrustTier},
         home::{runtime_project_partition_key, LionClawHome},
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
@@ -1430,12 +1468,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_required_channel_env_rejects_invalid_env_keys_without_panicking() {
+    fn resolve_channel_env_rejects_invalid_env_keys_without_panicking() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         for key in ["", "BAD=KEY", "BAD\0KEY"] {
             let result = std::panic::catch_unwind(|| {
-                resolve_required_channel_env(&home, "loopback", &[key.to_string()])
+                resolve_channel_env(&home, "loopback", &[key.to_string()], &[])
             })
             .expect("invalid required_env key should not panic");
 
@@ -1611,6 +1649,61 @@ mod tests {
             .await
             .expect_err("channel-bound alias should fail");
         assert!(err.to_string().contains("remove the channel first"));
+    }
+
+    #[tokio::test]
+    async fn pairing_approve_sender_creates_direct_channel_grant() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source = write_skill_source(temp_dir.path(), "channel-email", "email", true);
+        add_skill(
+            &home,
+            "email".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "email".to_string(),
+            "email".to_string(),
+            ChannelLaunchMode::Background,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        let approved = pairing_approve_sender(
+            &home,
+            "email".to_string(),
+            "email:addr:alice@example.com".to_string(),
+            TrustTier::Main,
+            Some("email-release:held-1".to_string()),
+        )
+        .await
+        .expect("approve sender");
+
+        assert_eq!(approved.grant.channel_id, "email");
+        assert_eq!(
+            approved.grant.sender_ref.as_deref(),
+            Some("email:addr:alice@example.com")
+        );
+        assert_eq!(
+            approved.grant.routing_profile,
+            ChannelRoutingProfile::Direct
+        );
+        assert_eq!(
+            approved.grant.label.as_deref(),
+            Some("email-release:held-1")
+        );
+
+        let listed = pairing_list(&home, Some("email".to_string()), None)
+            .await
+            .expect("list pairing state");
+        assert!(listed.pairings.is_empty());
+        assert_eq!(listed.grants.len(), 1);
+        assert_eq!(listed.grants[0].grant_id, approved.grant.grant_id);
     }
 
     #[tokio::test]
@@ -2136,17 +2229,23 @@ mod tests {
         )
         .await
         .expect("install skill");
-        add_channel(
+        add_channel_with_worker(
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
             ChannelLaunchMode::Background,
-            vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            ChannelWorkerSetup {
+                worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+                required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+                optional_env: vec!["TELEGRAM_POLL_MS".to_string()],
+                contact: None,
+            },
         )
         .await
         .expect("add channel");
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        env.insert("TELEGRAM_POLL_MS".to_string(), "1000".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
 
         let manager = FakeUnitManager::default();
@@ -2170,7 +2269,9 @@ mod tests {
             .expect("telegram unit");
 
         assert!(!unit.env_content.contains("TELEGRAM_BOT_TOKEN"));
+        assert!(!unit.env_content.contains("TELEGRAM_POLL_MS"));
         assert!(!unit.env_content.contains("secret-token"));
+        assert!(!unit.env_content.contains("1000"));
         assert_eq!(
             unit.extra_env_files,
             vec![home.channel_env_path("telegram")]
@@ -2311,6 +2412,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lionclaw",
+    "crates/lionclaw-channel-email",
     "crates/lionclaw-channel-team-local",
     "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
@@ -21,6 +22,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = "0.4"
+clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
@@ -31,6 +33,8 @@ reqwest = { version = "0.12", default-features = false }
 rustix = "1.1"
 serde = "1.0"
 serde_json = "1.0"
+sha2 = "0.11"
+sqlx = "0.8"
 tempfile = "3.27"
 tokio = "1.50"
 toml = "1.1"

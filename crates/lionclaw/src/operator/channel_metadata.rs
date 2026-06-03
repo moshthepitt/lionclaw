@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -7,7 +8,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::{
-    home::LionClawHome, kernel::skills::validate_skill_alias, operator::config::ChannelLaunchMode,
+    home::LionClawHome,
+    kernel::skills::validate_skill_alias,
+    operator::{config::ChannelLaunchMode, snapshot::installed_snapshot_matches_source},
 };
 
 pub const CHANNEL_METADATA_FILE: &str = "lionclaw.toml";
@@ -19,8 +22,16 @@ pub struct ChannelMetadata {
     pub id: String,
     pub launch: ChannelLaunchMode,
     pub worker: String,
+    pub setup: Option<ChannelSetupMetadata>,
     pub env: Vec<String>,
+    pub optional_env: Vec<String>,
     pub contact: Option<ChannelContactMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelSetupMetadata {
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +69,19 @@ struct ChannelMetadataSection {
     launch: String,
     worker: String,
     #[serde(default)]
+    setup: Option<ChannelSetupMetadataSection>,
+    #[serde(default)]
     env: Vec<String>,
+    #[serde(default)]
+    optional_env: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelSetupMetadataSection {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,31 +107,22 @@ pub fn discover_channel_skill(home: &LionClawHome, raw: &str) -> Result<Discover
     }
 
     validate_channel_id(raw)?;
-    if let Some(installed) = discover_installed_channel_skill(home, raw)? {
-        return Ok(installed);
-    }
-
-    let bundled = bundled_channel_skill_dir(raw);
-    if bundled.exists() {
-        let skill_dir = canonical_skill_dir(&bundled)?;
-        let metadata = load_channel_metadata(&skill_dir)?;
-        if metadata.id != raw {
-            bail!(
-                "bundled channel skill '{}' declares channel id '{}'",
-                bundled.display(),
-                metadata.id
-            );
+    let installed = discover_installed_channel_skill(home, raw)?;
+    let bundled = discover_bundled_channel_skill(raw)?;
+    match (installed, bundled) {
+        (Some(installed), Some(bundled)) => {
+            if installed_channel_is_refreshable_bundled_snapshot(raw, &installed, &bundled)? {
+                Ok(bundled)
+            } else {
+                Ok(installed)
+            }
         }
-        return Ok(DiscoveredChannelSkill {
-            source: ChannelSkillSource::Bundled,
-            skill_dir,
-            metadata,
-        });
+        (Some(installed), _) => Ok(installed),
+        (None, Some(bundled)) => Ok(bundled),
+        (None, None) => bail!(
+            "channel '{raw}' was not found; pass an explicit skill path or install a skill with matching channel metadata"
+        ),
     }
-
-    bail!(
-        "channel '{raw}' was not found; pass an explicit skill path or install a skill with matching channel metadata"
-    )
 }
 
 pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
@@ -144,17 +158,13 @@ pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
         .map_err(anyhow::Error::msg)?;
     let worker = parsed.channel.worker.trim().to_string();
     validate_channel_worker(&skill_dir, &worker)?;
-    let mut env = parsed
+    let setup = parsed
         .channel
-        .env
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .collect::<Vec<_>>();
-    for key in &env {
-        validate_channel_env_name(key)?;
-    }
-    env.sort();
-    env.dedup();
+        .setup
+        .map(normalize_channel_setup_metadata)
+        .transpose()?;
+    let (env, optional_env) =
+        normalize_channel_env_metadata(parsed.channel.env, parsed.channel.optional_env)?;
     let contact = parsed
         .contact
         .map(|contact| -> Result<ChannelContactMetadata> {
@@ -170,9 +180,41 @@ pub fn load_channel_metadata(skill_dir: &Path) -> Result<ChannelMetadata> {
         id,
         launch,
         worker,
+        setup,
         env,
+        optional_env,
         contact,
     })
+}
+
+fn normalize_channel_env_metadata(
+    required: Vec<String>,
+    optional: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let required = normalize_env_names(required)?;
+    let optional = normalize_env_names(optional)?;
+    let required_set = required.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let duplicate_optional = optional
+        .iter()
+        .find(|key| required_set.contains(key.as_str()));
+    if let Some(key) = duplicate_optional {
+        bail!("channel optional_env duplicates required env key '{key}'");
+    }
+
+    Ok((required, optional))
+}
+
+fn normalize_env_names(raw: Vec<String>) -> Result<Vec<String>> {
+    let mut names = raw
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .collect::<Vec<_>>();
+    for key in &names {
+        validate_channel_env_name(key)?;
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 pub fn render_contact_template(template: &str, instance_name: &str) -> Result<String> {
@@ -191,6 +233,13 @@ pub fn resolve_channel_worker_entrypoint(
 ) -> Result<PathBuf> {
     let worker = worker.unwrap_or(DEFAULT_CHANNEL_WORKER);
     validate_channel_worker(skill_dir, worker)
+}
+
+pub fn resolve_channel_setup_command_entrypoint(
+    skill_dir: &Path,
+    setup: &ChannelSetupMetadata,
+) -> Result<PathBuf> {
+    resolve_channel_entrypoint(skill_dir, &setup.command, "channel setup command")
 }
 
 pub fn validate_channel_id(id: &str) -> Result<()> {
@@ -365,6 +414,57 @@ fn discover_installed_channel_skill(
     }
 }
 
+fn discover_bundled_channel_skill(channel_id: &str) -> Result<Option<DiscoveredChannelSkill>> {
+    let bundled = bundled_channel_skill_dir(channel_id);
+    if !bundled.exists() {
+        return Ok(None);
+    }
+    let skill_dir = canonical_skill_dir(&bundled)?;
+    let metadata = load_channel_metadata(&skill_dir)?;
+    if metadata.id != channel_id {
+        bail!(
+            "bundled channel skill '{}' declares channel id '{}'",
+            bundled.display(),
+            metadata.id
+        );
+    }
+    Ok(Some(DiscoveredChannelSkill {
+        source: ChannelSkillSource::Bundled,
+        skill_dir,
+        metadata,
+    }))
+}
+
+fn installed_channel_is_refreshable_bundled_snapshot(
+    channel_id: &str,
+    installed: &DiscoveredChannelSkill,
+    bundled: &DiscoveredChannelSkill,
+) -> Result<bool> {
+    let ChannelSkillSource::Installed { alias } = &installed.source else {
+        return Ok(false);
+    };
+
+    installed_channel_snapshot_is_from_bundled_source(
+        alias,
+        channel_id,
+        &installed.skill_dir,
+        &bundled.skill_dir,
+    )
+    .with_context(|| format!("failed to verify installed channel skill '{alias}' source metadata"))
+}
+
+pub(crate) fn installed_channel_snapshot_is_from_bundled_source(
+    alias: &str,
+    channel_id: &str,
+    snapshot_dir: &Path,
+    bundled_skill_dir: &Path,
+) -> Result<bool> {
+    if alias != channel_id {
+        return Ok(false);
+    }
+    installed_snapshot_matches_source(snapshot_dir, bundled_skill_dir)
+}
+
 fn canonical_skill_dir(path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat skill directory {}", path.display()))?;
@@ -378,60 +478,92 @@ fn canonical_skill_dir(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_channel_worker(skill_dir: &Path, worker: &str) -> Result<PathBuf> {
-    if worker.is_empty() {
-        bail!("channel worker path is required");
-    }
-    let worker_path = Path::new(worker);
-    if worker_path.is_absolute() {
-        bail!("channel worker path '{worker}' must be relative to the skill directory");
-    }
-    if worker_path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        bail!("channel worker path '{worker}' must stay inside the skill directory");
-    }
+    resolve_channel_entrypoint(skill_dir, worker, "channel worker")
+}
 
+fn normalize_channel_setup_metadata(
+    setup: ChannelSetupMetadataSection,
+) -> Result<ChannelSetupMetadata> {
+    let command = setup.command.trim().to_string();
+    validate_channel_entrypoint_path(&command, "channel setup command")?;
+    let args = setup
+        .args
+        .into_iter()
+        .map(normalize_setup_arg)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ChannelSetupMetadata { command, args })
+}
+
+fn normalize_setup_arg(arg: String) -> Result<String> {
+    if arg.is_empty() {
+        bail!("channel setup args must not include empty values");
+    }
+    if arg.chars().any(char::is_control) {
+        bail!("channel setup args must not include control characters");
+    }
+    Ok(arg)
+}
+
+fn resolve_channel_entrypoint(
+    skill_dir: &Path,
+    relative_path: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    validate_channel_entrypoint_path(relative_path, label)?;
     let skill_dir = canonical_skill_dir(skill_dir)?;
-    let candidate = skill_dir.join(worker_path);
+    let candidate = skill_dir.join(relative_path);
     let metadata = match fs::symlink_metadata(&candidate) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             bail!(
-                "worker entrypoint is missing under '{}'; expected '{}'",
+                "{label} entrypoint is missing under '{}'; expected '{}'",
                 skill_dir.display(),
-                worker
+                relative_path
             );
         }
         Err(err) => {
             return Err(err)
-                .with_context(|| format!("failed to stat channel worker {}", candidate.display()));
+                .with_context(|| format!("failed to stat {label} {}", candidate.display()));
         }
     };
     if metadata.file_type().is_symlink() {
-        bail!(
-            "channel worker {} must not be a symlink",
-            candidate.display()
-        );
+        bail!("{label} {} must not be a symlink", candidate.display());
     }
     if !metadata.is_file() {
-        bail!("channel worker {} is not a file", candidate.display());
+        bail!("{label} {} is not a file", candidate.display());
     }
     if !is_executable_file(&metadata) {
-        bail!("channel worker {} is not executable", candidate.display());
+        bail!("{label} {} is not executable", candidate.display());
     }
     let canonical = fs::canonicalize(&candidate)
         .with_context(|| format!("failed to resolve {}", candidate.display()))?;
     if !canonical.starts_with(&skill_dir) {
         bail!(
-            "channel worker {} escapes skill directory {}",
+            "{label} {} escapes skill directory {}",
             canonical.display(),
             skill_dir.display()
         );
     }
     Ok(canonical)
+}
+
+fn validate_channel_entrypoint_path(relative_path: &str, label: &str) -> Result<()> {
+    if relative_path.is_empty() {
+        bail!("{label} path is required");
+    }
+    let path = Path::new(relative_path);
+    if path.is_absolute() {
+        bail!("{label} path '{relative_path}' must be relative to the skill directory");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("{label} path '{relative_path}' must stay inside the skill directory");
+    }
+    Ok(())
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -489,10 +621,14 @@ mod tests {
     use std::fs;
 
     use super::{
-        bundled_channel_skill_dir_from_exe, discover_channel_skill, load_channel_metadata,
-        render_contact_template, validate_channel_env_name,
+        bundled_channel_skill_dir, bundled_channel_skill_dir_from_exe, discover_channel_skill,
+        load_channel_metadata, render_contact_template, resolve_channel_setup_command_entrypoint,
+        validate_channel_env_name, ChannelSkillSource,
     };
-    use crate::{home::LionClawHome, operator::snapshot::copy_snapshot_tree};
+    use crate::{
+        home::LionClawHome,
+        operator::snapshot::{copy_snapshot_tree, install_snapshot, SKILL_INSTALL_METADATA_FILE},
+    };
 
     #[cfg(unix)]
     fn make_executable(path: &std::path::Path) {
@@ -535,6 +671,114 @@ mod tests {
         assert_eq!(metadata.id, "telegram");
         assert_eq!(metadata.worker, "scripts/worker");
         assert_eq!(metadata.env, vec!["TELEGRAM_BOT_TOKEN"]);
+        assert!(metadata.optional_env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_optional_channel_env_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"EMAIL_ADDRESS\"]\noptional_env = [\"EMAIL_ADMIN_DIGEST_TO\", \"EMAIL_MAX_MESSAGE_BYTES\"]\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+
+        assert_eq!(metadata.env, vec!["EMAIL_ADDRESS"]);
+        assert_eq!(
+            metadata.optional_env,
+            vec!["EMAIL_ADMIN_DIGEST_TO", "EMAIL_MAX_MESSAGE_BYTES"]
+        );
+    }
+
+    #[test]
+    fn bundled_email_auth_mode_is_optional_for_basic_compatibility() {
+        let metadata =
+            load_channel_metadata(&bundled_channel_skill_dir("email")).expect("email metadata");
+
+        assert!(!metadata.env.iter().any(|key| key == "EMAIL_AUTH_MODE"));
+        assert!(metadata
+            .optional_env
+            .iter()
+            .any(|key| key == "EMAIL_AUTH_MODE"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_setup_metadata_without_requiring_source_command_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"EMAIL_ADDRESS\"]\n\n[channel.setup]\ncommand = \"bin/lionclaw-channel-email\"\nargs = [\"setup\"]\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+        let setup = metadata.setup.expect("setup metadata");
+
+        assert_eq!(setup.command, "bin/lionclaw-channel-email");
+        assert_eq!(setup.args, vec!["setup"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_setup_metadata_that_escapes_skill_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[channel.setup]\ncommand = \"../helper\"\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("escaping setup command should fail");
+
+        assert!(err.to_string().contains("must stay inside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_installed_setup_command_entrypoint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::create_dir_all(skill.join("bin")).expect("bin dir");
+        fs::write(skill.join("bin/setup"), "#!/usr/bin/env bash\n").expect("setup");
+        make_executable(&skill.join("bin/setup"));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[channel.setup]\ncommand = \"bin/setup\"\n",
+        )
+        .expect("metadata");
+
+        let setup = load_channel_metadata(&skill)
+            .expect("metadata")
+            .setup
+            .expect("setup");
+
+        assert_eq!(
+            resolve_channel_setup_command_entrypoint(&skill, &setup).expect("entrypoint"),
+            fs::canonicalize(skill.join("bin/setup")).expect("canonical setup")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_optional_env_that_duplicates_required_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"EMAIL_ADDRESS\"]\noptional_env = [\"EMAIL_ADDRESS\"]\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("duplicate env should fail");
+
+        assert!(err.to_string().contains("optional_env duplicates"));
     }
 
     #[cfg(unix)]
@@ -673,13 +917,96 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         fs::create_dir_all(home.skills_dir()).expect("skills");
-        let first = write_channel_skill(temp_dir.path(), "first", "telegram");
-        let second = write_channel_skill(temp_dir.path(), "second", "telegram");
+        let first = write_channel_skill(temp_dir.path(), "first", "matrix");
+        let second = write_channel_skill(temp_dir.path(), "second", "matrix");
         copy_snapshot_tree(&first, &home.skills_dir().join("first")).expect("first");
         copy_snapshot_tree(&second, &home.skills_dir().join("second")).expect("second");
 
-        let err = discover_channel_skill(&home, "telegram").expect_err("ambiguous");
+        let err = discover_channel_skill(&home, "matrix").expect_err("ambiguous");
 
         assert!(err.to_string().contains("multiple installed skills"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_refreshes_prior_bundled_channel_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let bundled = bundled_channel_skill_dir("telegram");
+        install_snapshot(
+            &home,
+            "telegram",
+            bundled.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("install bundled snapshot");
+        fs::write(
+            home.skills_dir().join("telegram/SKILL.md"),
+            "---\nname: channel-telegram\ndescription: old\n---\nold snapshot\n",
+        )
+        .expect("stale skill");
+        fs::remove_file(home.skills_dir().join("telegram/lionclaw.toml"))
+            .expect("remove stale metadata");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(discovered.source, ChannelSkillSource::Bundled);
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert!(discovered.skill_dir.ends_with("skills/channel-telegram"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_preserves_external_channel_snapshot_over_bundled_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let external = write_channel_skill(temp_dir.path(), "external-telegram", "telegram");
+        copy_snapshot_tree(&external, &home.skills_dir().join("telegram")).expect("install");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(
+            discovered.source,
+            ChannelSkillSource::Installed {
+                alias: "telegram".to_string()
+            }
+        );
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert_eq!(
+            discovered.skill_dir,
+            fs::canonicalize(home.skills_dir().join("telegram")).expect("installed path")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_preserves_external_channel_snapshot_with_malformed_install_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let external = write_channel_skill(temp_dir.path(), "external-telegram", "telegram");
+        let snapshot_dir = home.skills_dir().join("telegram");
+        copy_snapshot_tree(&external, &snapshot_dir).expect("install");
+        fs::write(
+            snapshot_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "source = [\n",
+        )
+        .expect("malformed metadata");
+
+        let discovered = discover_channel_skill(&home, "telegram").expect("discover telegram");
+
+        assert_eq!(
+            discovered.source,
+            ChannelSkillSource::Installed {
+                alias: "telegram".to_string()
+            }
+        );
+        assert_eq!(discovered.metadata.id, "telegram");
+        assert_eq!(
+            discovered.skill_dir,
+            fs::canonicalize(snapshot_dir).expect("installed path")
+        );
     }
 }

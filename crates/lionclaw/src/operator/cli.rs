@@ -43,9 +43,9 @@ use crate::{
         },
         reconcile::{
             add_channel_with_contact, add_skill, open_kernel, open_runtime_kernel_for_work_root,
-            pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
-            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
-            ChannelContactSetup,
+            pairing_approve, pairing_approve_sender, pairing_block, pairing_invite, pairing_list,
+            pairing_revoke, remove_channel, remove_skill,
+            resolve_installed_skill_worker_entrypoint, ChannelContactSetup,
         },
         run::{run_local, RunLocalInvocation},
         run_runtime_tui::{run_runtime_tui, RunRuntimeTuiInvocation},
@@ -182,18 +182,51 @@ struct ConfigureArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  lionclaw connect email gmail --account assistant@gmail.com --client-secret-json ~/Downloads/client_secret_desktop.json\n  lionclaw connect email --env-file ./email.env"
+)]
 struct ConnectArgs {
+    #[arg(help = "Channel id, installed channel id, bundled channel id, or channel skill path")]
     channel_or_path: String,
-    #[arg(long = "env-file", value_name = "PATH")]
+    #[arg(
+        long = "env-file",
+        value_name = "PATH",
+        help = "Read declared channel environment values from an env file"
+    )]
     env_file: Option<PathBuf>,
-    #[arg(long = "from-env", value_name = "NAME")]
+    #[arg(
+        long = "from-env",
+        value_name = "NAME",
+        help = "Copy a declared channel environment value from the current process"
+    )]
     from_env: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Configure this channel as a preferred project contact")]
     contact: bool,
-    #[arg(long = "conversation-ref", value_name = "REF")]
+    #[arg(
+        long = "conversation-ref",
+        value_name = "REF",
+        help = "Preferred contact conversation route"
+    )]
     conversation_ref: Option<String>,
-    #[arg(long = "thread-ref", value_name = "REF")]
+    #[arg(
+        long = "thread-ref",
+        value_name = "REF",
+        help = "Preferred contact thread route"
+    )]
     thread_ref: Option<String>,
+    #[arg(
+        value_name = "SETUP",
+        allow_hyphen_values = true,
+        help = "Optional channel setup profile passed to the channel helper, such as gmail"
+    )]
+    setup_profile: Option<String>,
+    #[arg(
+        value_name = "SETUP_ARG",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Arguments passed through to the selected channel setup helper"
+    )]
+    setup_args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -529,9 +562,17 @@ struct PairingListArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("approve_target")
+        .required(true)
+        .args(["pairing", "sender_ref"])
+))]
 struct PairingApproveArgs {
     channel_id: String,
-    pairing: String,
+    #[arg(value_name = "PAIRING")]
+    pairing: Option<String>,
+    #[arg(long = "sender-ref", value_name = "SENDER_REF")]
+    sender_ref: Option<String>,
     #[arg(long)]
     label: Option<String>,
     #[arg(long = "routing-profile")]
@@ -813,6 +854,8 @@ pub async fn run() -> Result<ExitCode> {
                     env_inputs: ConnectEnvInputs {
                         env_file: args.env_file,
                         from_env: args.from_env,
+                        setup_profile: args.setup_profile,
+                        setup_args: args.setup_args,
                     },
                     contact: ChannelContactSetup {
                         enabled: args.contact,
@@ -1276,15 +1319,37 @@ pub async fn run() -> Result<ExitCode> {
                         .map(ChannelRoutingProfile::from_str)
                         .transpose()
                         .map_err(anyhow::Error::msg)?;
-                    let grant = pairing_approve(
-                        &home,
-                        args.channel_id,
-                        args.pairing,
-                        routing_profile,
-                        trust_tier,
-                        args.label,
-                    )
-                    .await?;
+                    let grant = match (args.pairing, args.sender_ref) {
+                        (Some(pairing), None) => {
+                            pairing_approve(
+                                &home,
+                                args.channel_id,
+                                pairing,
+                                routing_profile,
+                                trust_tier,
+                                args.label,
+                            )
+                            .await?
+                        }
+                        (None, Some(sender_ref)) => {
+                            let routing_profile =
+                                routing_profile.unwrap_or(ChannelRoutingProfile::Direct);
+                            if routing_profile != ChannelRoutingProfile::Direct {
+                                bail!(
+                                    "--sender-ref approval creates direct sender grants; use a pending pairing for scoped route approval"
+                                );
+                            }
+                            pairing_approve_sender(
+                                &home,
+                                args.channel_id,
+                                sender_ref,
+                                trust_tier,
+                                args.label,
+                            )
+                            .await?
+                        }
+                        _ => bail!("channel pairing approve requires a pairing or --sender-ref"),
+                    };
                     println!(
                         "approved channel={} grant={} profile={} trust={}",
                         grant.grant.channel_id,
@@ -2641,6 +2706,89 @@ mod tests {
     }
 
     #[test]
+    fn connect_parses_channel_setup_profile_and_passthrough_args() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "connect",
+            "email",
+            "gmail",
+            "--account",
+            "assistant@gmail.com",
+            "--client-secret-json",
+            "/tmp/client.json",
+        ])
+        .expect("parse connect setup");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.setup_profile.as_deref(), Some("gmail"));
+                assert_eq!(
+                    args.setup_args,
+                    vec![
+                        "--account".to_string(),
+                        "assistant@gmail.com".to_string(),
+                        "--client-secret-json".to_string(),
+                        "/tmp/client.json".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_keeps_env_file_as_core_option_without_setup_profile() {
+        let cli =
+            Cli::try_parse_from(["lionclaw", "connect", "email", "--env-file", "./email.env"])
+                .expect("parse connect env file");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.env_file, Some(PathBuf::from("./email.env")));
+                assert!(args.setup_profile.is_none());
+                assert!(args.setup_args.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_passes_unknown_helper_flags_to_channel_setup() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "connect",
+            "email",
+            "--provider",
+            "gmail",
+            "--account",
+            "assistant@gmail.com",
+            "--client-secret-json",
+            "/tmp/client.json",
+        ])
+        .expect("parse connect setup helper flags");
+
+        match cli.command {
+            Command::Connect(args) => {
+                assert_eq!(args.channel_or_path, "email");
+                assert_eq!(args.setup_profile.as_deref(), Some("--provider"));
+                assert_eq!(
+                    args.setup_args,
+                    vec![
+                        "gmail".to_string(),
+                        "--account".to_string(),
+                        "assistant@gmail.com".to_string(),
+                        "--client-secret-json".to_string(),
+                        "/tmp/client.json".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn runtime_mount_commands_parse_under_runtime_namespace() {
         let cli = Cli::try_parse_from([
             "lionclaw",
@@ -3111,6 +3259,87 @@ mod tests {
     }
 
     #[test]
+    fn channel_pairing_approve_accepts_pairing_target() {
+        let pairing_id = Uuid::new_v4().to_string();
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "telegram",
+            pairing_id.as_str(),
+            "--label",
+            "alice",
+        ])
+        .expect("parse pairing approve");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Approve(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "telegram");
+                assert_eq!(args.pairing.as_deref(), Some(pairing_id.as_str()));
+                assert!(args.sender_ref.is_none());
+                assert_eq!(args.label.as_deref(), Some("alice"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_approve_accepts_known_sender_ref() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "email",
+            "--sender-ref",
+            "email:addr:alice@example.com",
+            "--label",
+            "email-release:held-1",
+        ])
+        .expect("parse direct sender approve");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Approve(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "email");
+                assert!(args.pairing.is_none());
+                assert_eq!(
+                    args.sender_ref.as_deref(),
+                    Some("email:addr:alice@example.com")
+                );
+                assert_eq!(args.label.as_deref(), Some("email-release:held-1"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_approve_rejects_ambiguous_targets() {
+        let err = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "approve",
+            "email",
+            "pairing-1",
+            "--sender-ref",
+            "email:addr:alice@example.com",
+        ])
+        .expect_err("approve target must be unambiguous");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn channel_pairing_block_keeps_uuid_shaped_sender_ref_positional() {
         let sender_ref = Uuid::new_v4().to_string();
         let cli = Cli::try_parse_from([
@@ -3291,6 +3520,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Interactive,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
+            optional_env: Vec::new(),
             contact: None,
         });
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
@@ -3299,6 +3529,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -3332,6 +3563,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
@@ -3360,6 +3592,7 @@ mod tests {
             launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            optional_env: Vec::new(),
             contact: None,
         });
         config.save(&home).await.expect("save config");
