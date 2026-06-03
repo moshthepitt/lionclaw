@@ -7607,6 +7607,7 @@ mod tests {
     const SECRET_USER_FACT: &str = "SECRET_USER_FACT_SHOULD_NOT_REACH_UNTRUSTED";
     const BROAD_MEMORY: &str = "BROAD_MEMORY_SHOULD_NOT_REACH_UNTRUSTED";
     const ACTIVE_ALLOWED: &str = "ACTIVE_ALLOWED_UNDER_SMALL_BUDGET";
+    const ACTIVE_AFTER_CAP: &str = "ACTIVE_CONTEXT_AFTER_CAP_SHOULD_NOT_REACH_UNTRUSTED";
     const STYLE_PROFILE_LEGACY: &str = "STYLE_PROFILE_LEGACY_SHOULD_NOT_REACH_UNTRUSTED";
     const AGENTS_MAIN_ONLY: &str = "AGENTS_MAIN_ONLY_OPERATOR_RULE";
 
@@ -8010,6 +8011,48 @@ mod tests {
         ] {
             assert!(!audit_json.contains(poison));
         }
+    }
+
+    #[tokio::test]
+    async fn program_prompt_untrusted_includes_capped_active_context_under_policy_budget() {
+        let fixture = prompt_context_fixture().await;
+        let mut active = format!("# Active Context\n\n{ACTIVE_ALLOWED}\n");
+        for index in 0..80 {
+            active.push_str(&format!(
+                "filler line {index:02} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            ));
+        }
+        active.push_str(ACTIVE_AFTER_CAP);
+        active.push('\n');
+        let active_path = fixture
+            .kernel
+            .continuity
+            .as_ref()
+            .expect("continuity layout")
+            .active_path();
+        tokio::fs::write(active_path, active)
+            .await
+            .expect("write oversized active context");
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains(ACTIVE_ALLOWED), "{rendered}");
+        assert!(!rendered.contains(ACTIVE_AFTER_CAP));
+        assert!(build.audit.capped.iter().any(|item| {
+            item.id == ContextItemId::ActiveContinuity && item.original_bytes > item.included_bytes
+        }));
+        assert!(!audit_json.contains(ACTIVE_ALLOWED));
+        assert!(!audit_json.contains(ACTIVE_AFTER_CAP));
     }
 
     #[tokio::test]
