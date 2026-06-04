@@ -7382,6 +7382,48 @@ mod tests {
         }
     }
 
+    struct RuntimeCallCounters {
+        starts: Arc<AtomicUsize>,
+        turns: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl RuntimeCallCounters {
+        fn new() -> Self {
+            Self {
+                starts: Arc::new(AtomicUsize::new(0)),
+                turns: Arc::new(AtomicUsize::new(0)),
+                closes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn assert_no_calls(&self) {
+            assert_eq!(self.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(self.turns.load(Ordering::SeqCst), 0);
+            assert_eq!(self.closes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    async fn kernel_with_pre_turn_failure_runtime(
+        temp_dir: &TempDir,
+    ) -> (Kernel, RuntimeCallCounters) {
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let counters = RuntimeCallCounters::new();
+        kernel
+            .register_runtime_adapter(
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+                Arc::new(ClosingDirectRuntimeAdapter {
+                    starts: Arc::clone(&counters.starts),
+                    turns: Arc::clone(&counters.turns),
+                    closes: Arc::clone(&counters.closes),
+                }),
+            )
+            .await;
+        (kernel, counters)
+    }
+
     async fn open_test_session(kernel: &Kernel) -> Uuid {
         kernel
             .open_session(SessionOpenRequest {
@@ -7778,6 +7820,24 @@ mod tests {
             )
             .await
             .expect("open prompt context session")
+    }
+
+    fn current_input_budget(
+        session: &crate::kernel::sessions::Session,
+        mode: PromptContextMode,
+        runtime_id: &str,
+    ) -> usize {
+        let policy = PromptContextPolicy::new(
+            session.trust_tier.clone(),
+            session.history_policy,
+            mode,
+            runtime_id,
+        );
+        let current_input = context_item_specs(mode)
+            .into_iter()
+            .find(|item| item.id == ContextItemId::UserInput)
+            .expect("current input item");
+        policy.max_bytes(&current_input)
     }
 
     async fn build_test_prompt_context(
@@ -8201,6 +8261,156 @@ mod tests {
         assert!(!untrusted_rendered.contains("previous user 03"));
         assert!(untrusted_rendered.contains("previous user 04"));
         assert!(untrusted_rendered.contains("previous user 05"));
+    }
+
+    #[tokio::test]
+    async fn program_prompt_rejects_over_budget_current_input_without_truncating() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let budget = current_input_budget(&session, PromptContextMode::ProgramPrimary, "mock");
+        let user_text = "x".repeat(budget + 1);
+
+        let err = fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &fixture.plan,
+                PromptContextMode::ProgramPrimary,
+                Some(&user_text),
+                None,
+            )
+            .await
+            .expect_err("over-budget current input should fail");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message)
+                if message.contains("user_text exceeds prompt context budget")
+        ));
+    }
+
+    #[tokio::test]
+    async fn over_budget_turn_input_fails_before_runtime_start_or_turn_persistence() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, runtime_calls) = kernel_with_pre_turn_failure_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let user_text = "x".repeat(
+            current_input_budget(
+                &session,
+                PromptContextMode::ProgramPrimary,
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+            ) + 1,
+        );
+
+        let err = kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text,
+                runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect_err("over-budget current input should fail before runtime start");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message)
+                if message.contains("user_text exceeds prompt context budget")
+        ));
+        runtime_calls.assert_no_calls();
+
+        let history = kernel
+            .session_history(SessionHistoryRequest {
+                session_id: session.session_id,
+                limit: Some(1),
+            })
+            .await
+            .expect("history");
+        assert!(
+            history.turns.is_empty(),
+            "request validation failures should not create durable turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_over_budget_turn_input_fails_before_runtime_start() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, runtime_calls) = kernel_with_pre_turn_failure_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let user_text = "x".repeat(
+            current_input_budget(
+                &session,
+                PromptContextMode::ProgramPrimary,
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+            ) + 1,
+        );
+        let turn_id = Uuid::new_v4();
+        let prepared_turn = kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: user_text.clone(),
+                prompt_user_text: user_text.clone(),
+                attachment_source_turn_id: None,
+                runtime_id: TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string(),
+            })
+            .await
+            .expect("begin prepared turn");
+
+        let err = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: user_text.clone(),
+                    prompt_user_text: user_text,
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: Some(prepared_turn),
+                    requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect_err("over-budget prepared input should fail before runtime start");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message)
+                if message.contains("user_text exceeds prompt context budget")
+        ));
+        runtime_calls.assert_no_calls();
     }
 
     #[tokio::test]
@@ -15123,6 +15333,35 @@ impl Kernel {
         })
     }
 
+    fn validate_current_input_prompt_context_budget(
+        session: &super::sessions::Session,
+        user_text: &str,
+    ) -> Result<(), KernelError> {
+        let mode = PromptContextMode::ProgramPrimary;
+        let policy = PromptContextPolicy::new(
+            session.trust_tier.clone(),
+            session.history_policy,
+            mode,
+            "validation",
+        );
+        let item = context_item_specs(mode)
+            .into_iter()
+            .find(|item| item.id == ContextItemId::UserInput)
+            .ok_or_else(|| {
+                KernelError::Internal("prompt context policy has no current input item".to_string())
+            })?;
+        let max_bytes = policy.max_bytes(&item);
+        let Some(rendered) = Self::render_current_user_input_context(&item, user_text) else {
+            return Ok(());
+        };
+        if cap_utf8_at_line_boundary(&rendered, max_bytes).was_capped {
+            return Err(KernelError::BadRequest(format!(
+                "user_text exceeds prompt context budget of {max_bytes} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     async fn append_runtime_control_route_audit(
         &self,
         session_id: Uuid,
@@ -15262,6 +15501,12 @@ impl Kernel {
                     runtime_control = Some(control);
                 }
             }
+        }
+        if kind != SessionTurnKind::RuntimeControl {
+            Self::validate_current_input_prompt_context_budget(
+                session,
+                &execution_prompt_user_text,
+            )?;
         }
 
         let prepared_turn = if let Some(turn) = prepared_turn {
@@ -18693,6 +18938,11 @@ impl Kernel {
                 )));
             }
             let capped = cap_utf8_at_line_boundary(content.trim(), max_bytes);
+            if item.id == ContextItemId::UserInput && capped.was_capped {
+                return Err(KernelError::BadRequest(format!(
+                    "user_text exceeds prompt context budget of {max_bytes} bytes"
+                )));
+            }
             if capped.content.trim().is_empty() && !content.trim().is_empty() {
                 if item.required {
                     return Err(KernelError::Internal(format!(
@@ -18810,15 +19060,19 @@ impl Kernel {
                     Ok(Some(sections.join("\n\n")))
                 }
             }
-            ContextSource::CurrentUserInput => {
-                let content = user_text.unwrap_or_default().trim();
-                if content.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(format!("## {}\n\n{}", item.title, content)))
-                }
-            }
+            ContextSource::CurrentUserInput => Ok(Self::render_current_user_input_context(
+                item,
+                user_text.unwrap_or_default(),
+            )),
         }
+    }
+
+    fn render_current_user_input_context(
+        item: &ContextItemSpec,
+        user_text: &str,
+    ) -> Option<String> {
+        let content = user_text.trim();
+        (!content.is_empty()).then(|| format!("## {}\n\n{}", item.title, content))
     }
 
     fn render_generated_prompt_context_item(

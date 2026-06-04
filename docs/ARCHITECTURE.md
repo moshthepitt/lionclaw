@@ -692,7 +692,8 @@ with the CLI.
 Prompt context selection emits `prompt.context.built` audit events. The payload
 records session policy, runtime id, context mode, included/excluded/capped item
 names, classes, sources, reasons, and byte counts. It does not store prompt
-body content or content hashes.
+body content or content hashes. Current user input is also budgeted; LionClaw
+rejects over-budget input instead of silently truncating operator intent.
 
 ### Daemon Metadata
 
@@ -900,6 +901,8 @@ Runtime-visible prompt history is selected by `kernel.prompt_context`, not by a
 global replay constant. The transcript tail is bounded by session trust tier
 and history policy: Main interactive sessions get the broadest tail, Main
 conservative sessions get less, and Untrusted sessions get smaller tails.
+The current user input has a finite prompt-context budget and over-budget input
+fails before runtime execution rather than being clipped.
 When a program-backed runtime resumes an existing runtime conversation, the
 primary prompt includes a runtime-session note and audits the transcript tail
 as excluded; the separate fresh prompt is built and audited as its own context

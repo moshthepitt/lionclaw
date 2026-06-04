@@ -42,7 +42,7 @@ const HANDOFF_MAIN_CONSERVATIVE_BUDGET: usize = 3072;
 const HANDOFF_UNTRUSTED_INTERACTIVE_BUDGET: usize = 1024;
 const HANDOFF_UNTRUSTED_CONSERVATIVE_BUDGET: usize = 512;
 const GENERATED_NOTE_BUDGET: usize = 4096;
-const CURRENT_INPUT_BUDGET: usize = usize::MAX;
+const CURRENT_INPUT_BUDGET: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptContextMode {
@@ -932,6 +932,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn current_input_budget_is_finite() {
+        let policy = PromptContextPolicy::new(
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+            PromptContextMode::ProgramPrimary,
+            "codex",
+        );
+        let current_input = context_item_specs(PromptContextMode::ProgramPrimary)
+            .into_iter()
+            .find(|item| item.id == ContextItemId::UserInput)
+            .expect("current input item");
+
+        assert_eq!(policy.max_bytes(&current_input), CURRENT_INPUT_BUDGET);
+        assert!(policy.max_bytes(&current_input) < usize::MAX);
     }
 
     #[test]
