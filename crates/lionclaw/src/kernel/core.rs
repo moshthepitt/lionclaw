@@ -8632,6 +8632,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blank_runtime_prompt_override_does_not_erase_stored_current_input() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, prompts) = kernel_with_capture_prompt_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let stored_user_text = "STORED_SOURCE_MUST_REMAIN_CURRENT_INPUT";
+
+        let response = execute_prepared_runtime_prompt_override(
+            &kernel,
+            session,
+            SessionTurnKind::Retry,
+            "/lionclaw retry",
+            stored_user_text.to_string(),
+            " \n\t ".to_string(),
+            TEST_CAPTURE_PROMPT_RUNTIME_ID,
+        )
+        .await
+        .expect("execute prepared prompt override turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        let prompts = prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains(&format!("## User Input\n\n{stored_user_text}")),
+            "blank runtime prompt override erased stored current input:\n{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_effective_current_input_fails_before_runtime_start() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, runtime_calls) = kernel_with_pre_turn_failure_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let err = execute_prepared_runtime_prompt_override(
+            &kernel,
+            session,
+            SessionTurnKind::Retry,
+            "/lionclaw retry",
+            " \n".to_string(),
+            "\t".to_string(),
+            TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+        )
+        .await
+        .expect_err("blank effective current input should fail before runtime start");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message) if message == "user_text is required"
+        ));
+        runtime_calls.assert_no_calls();
+    }
+
+    #[tokio::test]
     async fn prepared_continue_runtime_prompt_override_is_rendered_as_current_input() {
         assert_prepared_runtime_prompt_override_is_current_input(
             SessionTurnKind::Continue,
@@ -15581,7 +15645,7 @@ impl Kernel {
             })?;
         let max_bytes = policy.max_bytes(&item);
         let Some(rendered) = Self::render_current_user_input_context(&item, user_text) else {
-            return Ok(());
+            return Err(KernelError::BadRequest("user_text is required".to_string()));
         };
         if cap_utf8_at_line_boundary(&rendered, max_bytes).was_capped {
             return Err(KernelError::BadRequest(format!(
@@ -15597,6 +15661,7 @@ impl Kernel {
     ) -> String {
         runtime_prompt_user_text
             .take()
+            .filter(|prompt| !prompt.trim().is_empty())
             .unwrap_or_else(|| stored_prompt_user_text.to_string())
     }
 
