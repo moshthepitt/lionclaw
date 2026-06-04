@@ -1067,10 +1067,10 @@ mod tests {
     use super::{
         add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
         ensure_managed_bind_configured, ensure_runtime_project_dirs,
-        ensure_runtime_project_dirs_for_work_root, logs, open_kernel, open_kernel_with_project_root,
-        pairing_approve_sender, pairing_list, render_marker_file, resolve_channel_env,
-        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, up_for_work_root,
-        ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
+        ensure_runtime_project_dirs_for_work_root, logs, open_kernel,
+        open_kernel_with_project_root, pairing_approve_sender, pairing_list, render_marker_file,
+        resolve_channel_env, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
+        up_for_work_root, ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
