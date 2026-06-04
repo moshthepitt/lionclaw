@@ -7812,6 +7812,22 @@ mod tests {
         build.audit.to_details_json().to_string()
     }
 
+    fn assert_prompt_context_audit_excludes_prompt_body(audit_json: &str) {
+        for poison in [
+            AGENTS_MAIN_ONLY,
+            STYLE_PROFILE_LEGACY,
+            SECRET_USER_FACT,
+            BROAD_MEMORY,
+            ACTIVE_ALLOWED,
+            ACTIVE_AFTER_CAP,
+        ] {
+            assert!(
+                !audit_json.contains(poison),
+                "prompt context audit leaked prompt body text: {poison}\n{audit_json}"
+            );
+        }
+    }
+
     #[test]
     fn assistant_text_preserves_runtime_message_boundaries() {
         let literal_events = vec![
@@ -8013,8 +8029,7 @@ mod tests {
             .included
             .iter()
             .any(|item| item.id == ContextItemId::MemoryContext));
-        assert!(!prompt_context_audit_json(&build).contains(SECRET_USER_FACT));
-        assert!(!prompt_context_audit_json(&build).contains(BROAD_MEMORY));
+        assert_prompt_context_audit_excludes_prompt_body(&prompt_context_audit_json(&build));
     }
 
     #[tokio::test]
@@ -8065,14 +8080,7 @@ mod tests {
             .included
             .iter()
             .any(|item| item.id == ContextItemId::ActiveContinuity));
-        for poison in [
-            AGENTS_MAIN_ONLY,
-            STYLE_PROFILE_LEGACY,
-            SECRET_USER_FACT,
-            BROAD_MEMORY,
-        ] {
-            assert!(!audit_json.contains(poison));
-        }
+        assert_prompt_context_audit_excludes_prompt_body(&audit_json);
     }
 
     #[tokio::test]
@@ -8113,8 +8121,7 @@ mod tests {
         assert!(build.audit.capped.iter().any(|item| {
             item.id == ContextItemId::ActiveContinuity && item.original_bytes > item.included_bytes
         }));
-        assert!(!audit_json.contains(ACTIVE_ALLOWED));
-        assert!(!audit_json.contains(ACTIVE_AFTER_CAP));
+        assert_prompt_context_audit_excludes_prompt_body(&audit_json);
     }
 
     #[tokio::test]
@@ -8235,8 +8242,7 @@ mod tests {
         assert!(modes.contains(&"program_fresh"));
         for event in events {
             let details = event.details.to_string();
-            assert!(!details.contains(SECRET_USER_FACT));
-            assert!(!details.contains(BROAD_MEMORY));
+            assert_prompt_context_audit_excludes_prompt_body(&details);
         }
     }
 
@@ -8304,14 +8310,7 @@ mod tests {
         let details = events[0].details.to_string();
         assert!(details.contains("safe_workspace_rules"));
         assert!(details.contains("trust_tier_untrusted"));
-        for poison in [
-            AGENTS_MAIN_ONLY,
-            STYLE_PROFILE_LEGACY,
-            SECRET_USER_FACT,
-            BROAD_MEMORY,
-        ] {
-            assert!(!details.contains(poison));
-        }
+        assert_prompt_context_audit_excludes_prompt_body(&details);
     }
 
     #[cfg(unix)]
