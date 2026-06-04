@@ -7248,6 +7248,7 @@ mod tests {
 
     const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
+    const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -7382,6 +7383,62 @@ mod tests {
         }
     }
 
+    struct CapturePromptRuntimeAdapter {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for CapturePromptRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_CAPTURE_PROMPT_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("capture-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            input: RuntimeTurnInput,
+            events: RuntimeEventSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            self.prompts.lock().await.push(input.prompt);
+            drop(events.send(RuntimeEvent::Done));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     struct RuntimeCallCounters {
         starts: Arc<AtomicUsize>,
         turns: Arc<AtomicUsize>,
@@ -7422,6 +7479,76 @@ mod tests {
             )
             .await;
         (kernel, counters)
+    }
+
+    async fn kernel_with_capture_prompt_runtime(
+        temp_dir: &TempDir,
+    ) -> (Kernel, Arc<Mutex<Vec<String>>>) {
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        kernel
+            .register_runtime_adapter(
+                TEST_CAPTURE_PROMPT_RUNTIME_ID,
+                Arc::new(CapturePromptRuntimeAdapter {
+                    prompts: Arc::clone(&prompts),
+                }),
+            )
+            .await;
+        (kernel, prompts)
+    }
+
+    async fn execute_prepared_runtime_prompt_override(
+        kernel: &Kernel,
+        session: crate::kernel::sessions::Session,
+        kind: SessionTurnKind,
+        display_user_text: &str,
+        stored_user_text: String,
+        runtime_prompt_user_text: String,
+        runtime_id: &str,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+        let prepared_turn = kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id,
+                session_id,
+                kind,
+                display_user_text: display_user_text.to_string(),
+                prompt_user_text: stored_user_text.clone(),
+                attachment_source_turn_id: None,
+                runtime_id: runtime_id.to_string(),
+            })
+            .await
+            .expect("begin prepared prompt override turn");
+
+        kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind,
+                    display_user_text: display_user_text.to_string(),
+                    prompt_user_text: stored_user_text,
+                    runtime_prompt_user_text: Some(runtime_prompt_user_text),
+                    attachment_source_turn_id: None,
+                    prepared_turn: Some(prepared_turn),
+                    requested_runtime_id: Some(runtime_id.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
     }
 
     async fn open_test_session(kernel: &Kernel) -> Uuid {
@@ -8411,6 +8538,108 @@ mod tests {
                 if message.contains("user_text exceeds prompt context budget")
         ));
         runtime_calls.assert_no_calls();
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_runtime_prompt_override_is_budgeted_before_runtime_start() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, runtime_calls) = kernel_with_pre_turn_failure_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let stored_user_text = "stored retry source stays small".to_string();
+        let runtime_prompt_user_text = "x".repeat(
+            current_input_budget(
+                &session,
+                PromptContextMode::ProgramPrimary,
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+            ) + 1,
+        );
+
+        let err = execute_prepared_runtime_prompt_override(
+            &kernel,
+            session,
+            SessionTurnKind::Retry,
+            "/lionclaw retry",
+            stored_user_text,
+            runtime_prompt_user_text,
+            TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+        )
+        .await
+        .expect_err("over-budget retry runtime prompt override should fail before runtime start");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message)
+                if message.contains("user_text exceeds prompt context budget")
+        ));
+        runtime_calls.assert_no_calls();
+    }
+
+    async fn assert_prepared_runtime_prompt_override_is_current_input(
+        kind: SessionTurnKind,
+        display_user_text: &str,
+        stored_user_text: &str,
+        runtime_prompt_user_text: &str,
+    ) {
+        let temp_dir = tempdir().expect("temp dir");
+        let (kernel, prompts) = kernel_with_capture_prompt_runtime(&temp_dir).await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let response = execute_prepared_runtime_prompt_override(
+            &kernel,
+            session,
+            kind,
+            display_user_text,
+            stored_user_text.to_string(),
+            runtime_prompt_user_text.to_string(),
+            TEST_CAPTURE_PROMPT_RUNTIME_ID,
+        )
+        .await
+        .expect("execute prepared prompt override turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        let prompts = prompts.lock().await;
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains(&format!("## User Input\n\n{runtime_prompt_user_text}")),
+            "runtime prompt override was not rendered as current input:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains(stored_user_text),
+            "stored source leaked into prompt current input:\n{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_runtime_prompt_override_is_rendered_as_current_input() {
+        assert_prepared_runtime_prompt_override_is_current_input(
+            SessionTurnKind::Retry,
+            "/lionclaw retry",
+            "STORED_RETRY_SOURCE_SHOULD_NOT_BE_CURRENT_INPUT",
+            "runtime retry source\n\nATTACHMENT_MANIFEST_SHOULD_BE_CURRENT_INPUT",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepared_continue_runtime_prompt_override_is_rendered_as_current_input() {
+        assert_prepared_runtime_prompt_override_is_current_input(
+            SessionTurnKind::Continue,
+            "/lionclaw continue",
+            "STORED_CONTINUE_SOURCE_SHOULD_NOT_BE_CURRENT_INPUT",
+            "runtime continue source\n\nATTACHMENT_MANIFEST_SHOULD_BE_CURRENT_INPUT",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -15362,6 +15591,15 @@ impl Kernel {
         Ok(())
     }
 
+    fn take_runtime_prompt_or_stored(
+        runtime_prompt_user_text: &mut Option<String>,
+        stored_prompt_user_text: &str,
+    ) -> String {
+        runtime_prompt_user_text
+            .take()
+            .unwrap_or_else(|| stored_prompt_user_text.to_string())
+    }
+
     async fn append_runtime_control_route_audit(
         &self,
         session_id: Uuid,
@@ -15464,7 +15702,7 @@ impl Kernel {
         let mut display_user_text = display_user_text;
         let mut stored_prompt_user_text = prompt_user_text;
         let mut runtime_prompt_user_text = runtime_prompt_user_text;
-        let mut execution_prompt_user_text = stored_prompt_user_text.clone();
+        let mut execution_prompt_user_text = String::new();
         let mut runtime_control = None;
         let preserve_prepared_display_text = prepared_turn.is_some();
 
@@ -15483,9 +15721,10 @@ impl Kernel {
                         display_user_text = prompt.clone();
                     }
                     stored_prompt_user_text = prompt;
-                    execution_prompt_user_text = runtime_prompt_user_text
-                        .take()
-                        .unwrap_or_else(|| stored_prompt_user_text.clone());
+                    execution_prompt_user_text = Self::take_runtime_prompt_or_stored(
+                        &mut runtime_prompt_user_text,
+                        &stored_prompt_user_text,
+                    );
                 }
                 ClassifiedInput::LionClawControl(control) => {
                     return Err(KernelError::BadRequest(format!(
@@ -15501,6 +15740,11 @@ impl Kernel {
                     runtime_control = Some(control);
                 }
             }
+        } else if kind != SessionTurnKind::RuntimeControl {
+            execution_prompt_user_text = Self::take_runtime_prompt_or_stored(
+                &mut runtime_prompt_user_text,
+                &stored_prompt_user_text,
+            );
         }
         if kind != SessionTurnKind::RuntimeControl {
             Self::validate_current_input_prompt_context_budget(
