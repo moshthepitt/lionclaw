@@ -1017,10 +1017,15 @@ impl Kernel {
             )
             .await?;
 
-        self.append_prompt_context_audit(session.session_id, build.audit)
-            .await?;
         let rendered = render_attached_runtime_context_file(runtime_id, &build.sections);
         write_attached_runtime_context_files(runtime_state_root, &rendered).await?;
+        if let Err(err) = self
+            .append_prompt_context_audit(session.session_id, build.audit)
+            .await
+        {
+            remove_attached_runtime_context_files_best_effort(runtime_state_root).await;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -8019,6 +8024,19 @@ mod tests {
         build.sections.join("\n\n")
     }
 
+    fn assert_prompt_contains_in_order(rendered: &str, earlier: &str, later: &str) {
+        let earlier_index = rendered
+            .find(earlier)
+            .unwrap_or_else(|| panic!("prompt missing earlier text '{earlier}':\n{rendered}"));
+        let later_index = rendered
+            .find(later)
+            .unwrap_or_else(|| panic!("prompt missing later text '{later}':\n{rendered}"));
+        assert!(
+            earlier_index < later_index,
+            "'{earlier}' should appear before '{later}' in prompt:\n{rendered}"
+        );
+    }
+
     fn prompt_context_audit_json(build: &PromptContextBuild) -> String {
         build.audit.to_details_json().to_string()
     }
@@ -8241,6 +8259,52 @@ mod tests {
             .iter()
             .any(|item| item.id == ContextItemId::MemoryContext));
         assert_prompt_context_audit_excludes_prompt_body(&prompt_context_audit_json(&build));
+    }
+
+    #[tokio::test]
+    async fn program_prompt_keeps_current_user_input_as_terminal_section() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+        let mut plan = fixture.plan.clone();
+        plan.mounts.push(MountSpec {
+            source: fixture.workspace_root.clone(),
+            target: "/drafts".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+        plan.mount_runtime_secrets = true;
+        let user_text = "CURRENT_INPUT_MUST_BE_TERMINAL";
+
+        let build = fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &plan,
+                PromptContextMode::ProgramPrimary,
+                Some(user_text),
+                None,
+            )
+            .await
+            .expect("build prompt context");
+        let rendered = rendered_prompt(&build);
+
+        assert_prompt_contains_in_order(&rendered, "## Draft Outputs", "previous user 01");
+        assert_prompt_contains_in_order(&rendered, "## Runtime Secrets", "previous user 01");
+        assert_prompt_contains_in_order(&rendered, "previous assistant 01", "## User Input");
+        assert_prompt_contains_in_order(&rendered, "## Draft Outputs", "## User Input");
+        assert_prompt_contains_in_order(&rendered, "## Runtime Secrets", "## User Input");
+        assert!(
+            rendered
+                .trim_end()
+                .ends_with(&format!("## User Input\n\n{user_text}")),
+            "current user input should be the terminal prompt section:\n{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -8894,11 +8958,70 @@ mod tests {
         );
         assert!(
             !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
-            "generated attached context must not be written before a durable audit"
+            "generated attached context must not remain after audit failure"
         );
         assert!(
             !runtime_state_root.join(AGENTS_FILE).exists(),
-            "native AGENTS context must not be written before a durable audit"
+            "native AGENTS context must not remain after audit failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_tui_context_write_failure_records_no_prompt_context_audit() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let runtime_state_root = fixture
+            .workspace_root
+            .parent()
+            .expect("fixture root")
+            .join("runtime-state");
+        tokio::fs::create_dir(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        tokio::fs::create_dir(runtime_state_root.join(AGENTS_FILE))
+            .await
+            .expect("directory blocks native AGENTS context file");
+        let mut plan = fixture.plan.clone();
+        plan.mounts.push(MountSpec {
+            source: runtime_state_root.clone(),
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+
+        let err = fixture
+            .kernel
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .await
+            .expect_err("attached context file failure should abort materialization");
+
+        assert!(
+            err.to_string()
+                .contains("failed to write runtime state file"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
+            "partial generated context should be cleaned after native AGENTS write failure"
+        );
+        let events = fixture
+            .kernel
+            .query_audit(
+                Some(session.session_id),
+                Some("prompt.context.built".to_string()),
+                None,
+                Some(5),
+            )
+            .await
+            .expect("query prompt context audit")
+            .events;
+        assert!(
+            events.is_empty(),
+            "failed attached materialization must not audit a context file the runtime did not receive"
         );
     }
 

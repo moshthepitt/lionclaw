@@ -439,48 +439,69 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
 
     match mode {
         PromptContextMode::ProgramPrimary | PromptContextMode::ProgramFresh => {
+            extend_runtime_operational_notes(&mut items);
             items.push(transcript_item());
             items.push(current_input_item());
         }
         PromptContextMode::ProgramResumePrimary => {
-            items.push(ContextItemSpec {
-                id: ContextItemId::RuntimeSessionNote,
-                title: "Runtime Session",
-                class: ContextClass::RuntimeNote,
-                source: ContextSource::Generated(GENERATED_RUNTIME_SESSION_NOTE),
-                required: true,
-            });
+            items.push(runtime_session_note_item());
+            extend_runtime_operational_notes(&mut items);
             items.push(transcript_item());
             items.push(current_input_item());
         }
         PromptContextMode::AttachedNativeTui => {
-            items.push(ContextItemSpec {
-                id: ContextItemId::NativeTuiSessionNote,
-                title: "Native Runtime TUI Session",
-                class: ContextClass::RuntimeNote,
-                source: ContextSource::Generated(GENERATED_NATIVE_TUI_SESSION_NOTE),
-                required: true,
-            });
+            items.push(native_tui_session_note_item());
+            extend_runtime_operational_notes(&mut items);
             items.push(transcript_item());
         }
     }
 
-    items.push(ContextItemSpec {
+    items
+}
+
+fn extend_runtime_operational_notes(items: &mut Vec<ContextItemSpec>) {
+    items.push(draft_outputs_note_item());
+    items.push(runtime_secrets_note_item());
+}
+
+fn runtime_session_note_item() -> ContextItemSpec {
+    ContextItemSpec {
+        id: ContextItemId::RuntimeSessionNote,
+        title: "Runtime Session",
+        class: ContextClass::RuntimeNote,
+        source: ContextSource::Generated(GENERATED_RUNTIME_SESSION_NOTE),
+        required: true,
+    }
+}
+
+fn native_tui_session_note_item() -> ContextItemSpec {
+    ContextItemSpec {
+        id: ContextItemId::NativeTuiSessionNote,
+        title: "Native Runtime TUI Session",
+        class: ContextClass::RuntimeNote,
+        source: ContextSource::Generated(GENERATED_NATIVE_TUI_SESSION_NOTE),
+        required: true,
+    }
+}
+
+fn draft_outputs_note_item() -> ContextItemSpec {
+    ContextItemSpec {
         id: ContextItemId::DraftOutputsNote,
         title: "Draft Outputs",
         class: ContextClass::RuntimeNote,
         source: ContextSource::Generated(GENERATED_DRAFT_OUTPUTS_NOTE),
         required: false,
-    });
-    items.push(ContextItemSpec {
+    }
+}
+
+fn runtime_secrets_note_item() -> ContextItemSpec {
+    ContextItemSpec {
         id: ContextItemId::RuntimeSecretsNote,
         title: "Runtime Secrets",
         class: ContextClass::RuntimeNote,
         source: ContextSource::Generated(GENERATED_RUNTIME_SECRETS_NOTE),
         required: false,
-    });
-
-    items
+    }
 }
 
 fn transcript_item() -> ContextItemSpec {
@@ -535,9 +556,11 @@ pub(crate) fn cap_utf8_at_line_boundary(content: &str, max_bytes: usize) -> Capp
         limit -= 1;
     }
 
-    let capped_at = content[..limit]
-        .rfind('\n')
-        .filter(|idx| *idx > 0)
+    let capped_at = content
+        .char_indices()
+        .take_while(|(idx, _)| *idx <= limit)
+        .filter_map(|(idx, ch)| (ch == '\n').then_some(idx))
+        .last()
         .unwrap_or(limit);
     let capped = content[..capped_at].to_string();
     CappedSection {
@@ -691,8 +714,16 @@ mod tests {
     }
 
     #[test]
-    fn cap_uses_newline_boundary() {
+    fn cap_uses_newline_boundary_at_budget() {
         let capped = cap_utf8_at_line_boundary("first\nsecond\nthird", 12);
+        assert_eq!(capped.content, "first\nsecond");
+        assert_eq!(capped.included_bytes, 12);
+        assert!(capped.was_capped);
+    }
+
+    #[test]
+    fn cap_uses_previous_newline_boundary() {
+        let capped = cap_utf8_at_line_boundary("first\nsecond\nthird", 11);
         assert_eq!(capped.content, "first");
         assert!(capped.was_capped);
     }
@@ -739,6 +770,57 @@ mod tests {
                 assert_context_item_shape(item);
             }
         }
+    }
+
+    #[test]
+    fn context_item_specs_keep_program_user_input_terminal() {
+        for mode in [
+            PromptContextMode::ProgramPrimary,
+            PromptContextMode::ProgramResumePrimary,
+            PromptContextMode::ProgramFresh,
+        ] {
+            let items = context_item_specs(mode);
+            assert_eq!(
+                items.last().map(|item| item.id),
+                Some(ContextItemId::UserInput),
+                "program context mode {} should end with current user input",
+                mode.as_str()
+            );
+            assert_item_before(
+                &items,
+                ContextItemId::DraftOutputsNote,
+                ContextItemId::UserInput,
+            );
+            assert_item_before(
+                &items,
+                ContextItemId::RuntimeSecretsNote,
+                ContextItemId::UserInput,
+            );
+        }
+    }
+
+    #[test]
+    fn context_item_specs_keep_attached_tui_transcript_after_runtime_notes() {
+        let items = context_item_specs(PromptContextMode::AttachedNativeTui);
+        assert_eq!(
+            items.last().map(|item| item.id),
+            Some(ContextItemId::RecentTranscript)
+        );
+        assert_item_before(
+            &items,
+            ContextItemId::NativeTuiSessionNote,
+            ContextItemId::RecentTranscript,
+        );
+        assert_item_before(
+            &items,
+            ContextItemId::DraftOutputsNote,
+            ContextItemId::RecentTranscript,
+        );
+        assert_item_before(
+            &items,
+            ContextItemId::RuntimeSecretsNote,
+            ContextItemId::RecentTranscript,
+        );
     }
 
     #[test]
@@ -996,6 +1078,23 @@ mod tests {
         assert!(raw.contains("\"user_context\""));
         assert!(raw.contains("\"user_private\""));
         assert!(!raw.contains("SECRET_USER_FACT_SHOULD_NOT_APPEAR"));
+    }
+
+    fn assert_item_before(items: &[ContextItemSpec], earlier: ContextItemId, later: ContextItemId) {
+        let earlier_index = items
+            .iter()
+            .position(|item| item.id == earlier)
+            .unwrap_or_else(|| panic!("missing {}", earlier.as_str()));
+        let later_index = items
+            .iter()
+            .position(|item| item.id == later)
+            .unwrap_or_else(|| panic!("missing {}", later.as_str()));
+        assert!(
+            earlier_index < later_index,
+            "{} should appear before {}",
+            earlier.as_str(),
+            later.as_str()
+        );
     }
 
     fn assert_context_item_shape(item: ContextItemSpec) {
