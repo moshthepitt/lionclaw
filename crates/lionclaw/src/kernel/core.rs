@@ -7991,14 +7991,31 @@ mod tests {
         runtime_id: &str,
         index: usize,
     ) {
+        record_completed_test_turn_with_text(
+            kernel,
+            session_id,
+            runtime_id,
+            format!("previous user {index:02}"),
+            format!("previous assistant {index:02}"),
+        )
+        .await;
+    }
+
+    async fn record_completed_test_turn_with_text(
+        kernel: &Kernel,
+        session_id: Uuid,
+        runtime_id: &str,
+        user_text: String,
+        assistant_text: String,
+    ) {
         let turn = kernel
             .session_turns
             .begin_turn(NewSessionTurn {
                 turn_id: Uuid::new_v4(),
                 session_id,
                 kind: SessionTurnKind::Normal,
-                display_user_text: format!("previous user {index:02}"),
-                prompt_user_text: format!("previous user {index:02}"),
+                display_user_text: user_text.clone(),
+                prompt_user_text: user_text,
                 attachment_source_turn_id: None,
                 runtime_id: runtime_id.to_string(),
             })
@@ -8010,7 +8027,7 @@ mod tests {
                 turn.turn_id,
                 SessionTurnCompletion {
                     status: SessionTurnStatus::Completed,
-                    assistant_text: format!("previous assistant {index:02}"),
+                    assistant_text,
                     error_code: None,
                     error_text: None,
                 },
@@ -8452,6 +8469,48 @@ mod tests {
         assert!(!untrusted_rendered.contains("previous user 03"));
         assert!(untrusted_rendered.contains("previous user 04"));
         assert!(untrusted_rendered.contains("previous user 05"));
+    }
+
+    #[tokio::test]
+    async fn prompt_context_transcript_budget_preserves_newest_prior_turns() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Conservative,
+        )
+        .await;
+        record_completed_test_turn_with_text(
+            &fixture.kernel,
+            session.session_id,
+            "mock",
+            "OLDER_HUGE_TURN_SHOULD_DROP".to_string(),
+            format!("older huge assistant body {}", "x".repeat(8 * 1024)),
+        )
+        .await;
+        record_completed_test_turn_with_text(
+            &fixture.kernel,
+            session.session_id,
+            "mock",
+            "NEWEST_PRIOR_TURN_SHOULD_STAY".to_string(),
+            "newest assistant should stay".to_string(),
+        )
+        .await;
+
+        let build = build_test_prompt_context(
+            &fixture,
+            &session,
+            PromptContextMode::ProgramPrimary,
+            "current",
+        )
+        .await;
+        let rendered = rendered_prompt(&build);
+
+        assert!(!rendered.contains("OLDER_HUGE_TURN_SHOULD_DROP"));
+        assert!(rendered.contains("NEWEST_PRIOR_TURN_SHOULD_STAY"));
+        assert!(build.audit.capped.iter().any(|item| {
+            item.id == ContextItemId::RecentTranscript && item.original_bytes > item.included_bytes
+        }));
     }
 
     #[tokio::test]
@@ -15375,6 +15434,71 @@ struct ProgramPromptEnvelopes {
     fresh_prompt: Option<String>,
 }
 
+struct RenderedPromptContextItem {
+    content: String,
+    original_bytes: usize,
+}
+
+struct PromptContextRenderInput<'a> {
+    item: &'a ContextItemSpec,
+    session: &'a super::sessions::Session,
+    execution_plan: &'a EffectiveExecutionPlan,
+    user_text: Option<&'a str>,
+    history_before_sequence_no: Option<u64>,
+    transcript_tail_limit: usize,
+    max_bytes: usize,
+}
+
+fn render_recent_transcript_tail_context(
+    sections: Vec<String>,
+    max_bytes: usize,
+) -> Option<RenderedPromptContextItem> {
+    let sections = sections
+        .into_iter()
+        .map(|section| section.trim().to_string())
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>();
+    if sections.is_empty() {
+        return None;
+    }
+
+    let original_content = sections.join("\n\n");
+    let original_bytes = original_content.len();
+    if original_bytes <= max_bytes {
+        return Some(RenderedPromptContextItem {
+            content: original_content,
+            original_bytes,
+        });
+    }
+
+    let mut selected = Vec::new();
+    let mut included_bytes = 0usize;
+    for section in sections.into_iter().rev() {
+        let separator_bytes = if selected.is_empty() { 0 } else { 2 };
+        let candidate_bytes = separator_bytes + section.len();
+        if included_bytes.saturating_add(candidate_bytes) <= max_bytes {
+            selected.push(section);
+            included_bytes += candidate_bytes;
+            continue;
+        }
+
+        if selected.is_empty() {
+            let capped = cap_utf8_at_line_boundary(&section, max_bytes);
+            if !capped.content.trim().is_empty() {
+                selected.push(capped.content);
+            }
+        }
+        break;
+    }
+
+    selected.reverse();
+    let content = selected.join("\n\n");
+    Some(RenderedPromptContextItem {
+        content,
+        original_bytes,
+    })
+}
+
 struct StartedRuntimePreTurnFailure<'a> {
     adapter: Arc<dyn RuntimeAdapter>,
     runtime_id: &'a str,
@@ -19341,15 +19465,24 @@ impl Kernel {
                 continue;
             }
 
-            let Some(content) = self
-                .render_prompt_context_item(
-                    &item,
+            let max_bytes = policy.max_bytes(&item);
+            if max_bytes == 0 {
+                return Err(KernelError::Internal(format!(
+                    "allowed prompt context item '{}' has no byte budget",
+                    item.id.as_str()
+                )));
+            }
+
+            let Some(rendered) = self
+                .render_prompt_context_item(PromptContextRenderInput {
+                    item: &item,
                     session,
                     execution_plan,
                     user_text,
                     history_before_sequence_no,
-                    policy.transcript_tail_limit,
-                )
+                    transcript_tail_limit: policy.transcript_tail_limit,
+                    max_bytes,
+                })
                 .await?
             else {
                 if item.required {
@@ -19362,20 +19495,15 @@ impl Kernel {
                 continue;
             };
 
-            let max_bytes = policy.max_bytes(&item);
-            if max_bytes == 0 {
-                return Err(KernelError::Internal(format!(
-                    "allowed prompt context item '{}' has no byte budget",
-                    item.id.as_str()
-                )));
-            }
-            let capped = cap_utf8_at_line_boundary(content.trim(), max_bytes);
+            let mut capped = cap_utf8_at_line_boundary(rendered.content.trim(), max_bytes);
+            capped.original_bytes = rendered.original_bytes;
+            capped.was_capped = capped.included_bytes < capped.original_bytes;
             if item.id == ContextItemId::UserInput && capped.was_capped {
                 return Err(KernelError::BadRequest(format!(
                     "user_text exceeds prompt context budget of {max_bytes} bytes"
                 )));
             }
-            if capped.content.trim().is_empty() && !content.trim().is_empty() {
+            if capped.content.trim().is_empty() && !rendered.content.trim().is_empty() {
                 if item.required {
                     return Err(KernelError::Internal(format!(
                         "required prompt context item '{}' was capped to empty",
@@ -19403,19 +19531,30 @@ impl Kernel {
         Ok(PromptContextBuild { sections, audit })
     }
 
+    fn rendered_prompt_context_item(content: String) -> RenderedPromptContextItem {
+        RenderedPromptContextItem {
+            original_bytes: content.trim().len(),
+            content,
+        }
+    }
+
     async fn render_prompt_context_item(
         &self,
-        item: &ContextItemSpec,
-        session: &super::sessions::Session,
-        execution_plan: &EffectiveExecutionPlan,
-        user_text: Option<&str>,
-        history_before_sequence_no: Option<u64>,
-        transcript_tail_limit: usize,
-    ) -> Result<Option<String>, KernelError> {
+        input: PromptContextRenderInput<'_>,
+    ) -> Result<Option<RenderedPromptContextItem>, KernelError> {
+        let PromptContextRenderInput {
+            item,
+            session,
+            execution_plan,
+            user_text,
+            history_before_sequence_no,
+            transcript_tail_limit,
+            max_bytes,
+        } = input;
         match item.source {
-            ContextSource::Generated(_) => {
-                Ok(self.render_generated_prompt_context_item(item, session, execution_plan))
-            }
+            ContextSource::Generated(_) => Ok(self
+                .render_generated_prompt_context_item(item, session, execution_plan)
+                .map(Self::rendered_prompt_context_item)),
             ContextSource::WorkspaceFile(file_name) => {
                 let Some(workspace_root) = &self.workspace_root else {
                     return Ok(None);
@@ -19432,7 +19571,11 @@ impl Kernel {
                 else {
                     return Ok(None);
                 };
-                Ok(Some(format!("## {}\n\n{}", item.title, content.trim())))
+                Ok(Some(Self::rendered_prompt_context_item(format!(
+                    "## {}\n\n{}",
+                    item.title,
+                    content.trim()
+                ))))
             }
             ContextSource::ContinuityFile(file_name) => {
                 let Some(layout) = &self.continuity else {
@@ -19453,7 +19596,13 @@ impl Kernel {
                         )));
                     }
                 };
-                Ok(content.map(|content| format!("## {}\n\n{}", item.title, content.trim())))
+                Ok(content.map(|content| {
+                    Self::rendered_prompt_context_item(format!(
+                        "## {}\n\n{}",
+                        item.title,
+                        content.trim()
+                    ))
+                }))
             }
             ContextSource::CompactionSummary => {
                 let Some(record) = self
@@ -19472,7 +19621,7 @@ impl Kernel {
                 if summary_text.trim().is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(summary_text))
+                    Ok(Some(Self::rendered_prompt_context_item(summary_text)))
                 }
             }
             ContextSource::TranscriptTail => {
@@ -19486,16 +19635,13 @@ impl Kernel {
                 .await
                 .map_err(internal)?;
                 let sections = render_turns_for_prompt(&turns, session.history_policy);
-                if sections.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(sections.join("\n\n")))
-                }
+                Ok(render_recent_transcript_tail_context(sections, max_bytes))
             }
             ContextSource::CurrentUserInput => Ok(Self::render_current_user_input_context(
                 item,
                 user_text.unwrap_or_default(),
-            )),
+            )
+            .map(Self::rendered_prompt_context_item)),
         }
     }
 
