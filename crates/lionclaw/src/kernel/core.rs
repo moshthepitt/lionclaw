@@ -1017,13 +1017,10 @@ impl Kernel {
             )
             .await?;
 
-        let rendered = render_attached_runtime_context_file(runtime_id, &build.sections);
-        for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
-            write_runtime_state_file(runtime_state_root, file_name, rendered.as_bytes().to_vec())
-                .await?;
-        }
         self.append_prompt_context_audit(session.session_id, build.audit)
             .await?;
+        let rendered = render_attached_runtime_context_file(runtime_id, &build.sections);
+        write_attached_runtime_context_files(runtime_state_root, &rendered).await?;
         Ok(())
     }
 
@@ -7097,6 +7094,30 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn attached_runtime_context_file_write_cleans_partial_files() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        fs::create_dir(&runtime_state_root).expect("runtime state root");
+        fs::create_dir(runtime_state_root.join(AGENTS_FILE))
+            .expect("directory blocks native AGENTS context file");
+
+        let err = write_attached_runtime_context_files(&runtime_state_root, "context\n")
+            .await
+            .expect_err("native AGENTS directory should fail context materialization");
+
+        assert!(
+            err.to_string()
+                .contains("failed to write runtime state file"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
+            "partial generated context should be cleaned after native AGENTS write failure"
+        );
+        assert!(runtime_state_root.join(AGENTS_FILE).is_dir());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn attached_runtime_prelaunch_state_rejects_symlinked_root() {
@@ -7675,6 +7696,7 @@ mod tests {
 
     struct PromptContextFixture {
         _temp_dir: TempDir,
+        db_path: PathBuf,
         kernel: Kernel,
         workspace_root: PathBuf,
         plan: EffectiveExecutionPlan,
@@ -7701,8 +7723,9 @@ mod tests {
                 .expect("write prompt context poison file");
         }
 
+        let db_path = temp_dir.path().join("lionclaw.db");
         let kernel = Kernel::new_with_options(
-            &temp_dir.path().join("lionclaw.db"),
+            &db_path,
             KernelOptions {
                 workspace_root: Some(workspace_root.clone()),
                 ..KernelOptions::default()
@@ -7731,6 +7754,7 @@ mod tests {
 
         PromptContextFixture {
             _temp_dir: temp_dir,
+            db_path,
             kernel,
             workspace_root,
             plan: test_execution_plan("mock"),
@@ -8311,6 +8335,68 @@ mod tests {
         assert!(details.contains("safe_workspace_rules"));
         assert!(details.contains("trust_tier_untrusted"));
         assert_prompt_context_audit_excludes_prompt_body(&details);
+    }
+
+    #[tokio::test]
+    async fn attached_tui_context_audit_failure_writes_no_context_files() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let runtime_state_root = fixture
+            .workspace_root
+            .parent()
+            .expect("fixture root")
+            .join("runtime-state");
+        tokio::fs::create_dir(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        let mut plan = fixture.plan.clone();
+        plan.mounts.push(MountSpec {
+            source: runtime_state_root.clone(),
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+
+        let db_url = format!("sqlite://{}", fixture.db_path.display());
+        let pool = sqlx::SqlitePool::connect(&db_url)
+            .await
+            .expect("open sqlite pool");
+        sqlx::query(
+            "CREATE TRIGGER fail_prompt_context_audit \
+             BEFORE INSERT ON audit_events \
+             WHEN NEW.event_type = 'prompt.context.built' \
+             BEGIN \
+                 SELECT RAISE(FAIL, 'prompt context audit rejected'); \
+             END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install prompt context audit failure trigger");
+
+        let err = fixture
+            .kernel
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .await
+            .expect_err(
+                "prompt context audit failure should block attached context materialization",
+            );
+
+        assert!(
+            err.to_string().contains("failed to append audit event"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !runtime_state_root.join(GENERATED_AGENTS_FILE).exists(),
+            "generated attached context must not be written before a durable audit"
+        );
+        assert!(
+            !runtime_state_root.join(AGENTS_FILE).exists(),
+            "native AGENTS context must not be written before a durable audit"
+        );
     }
 
     #[cfg(unix)]
@@ -14034,6 +14120,35 @@ fn render_attached_runtime_context_file(runtime_id: &str, sections: &[String]) -
         "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n\n<!-- LIONCLAW:START -->\n{}\n<!-- LIONCLAW:END -->\n",
         sections.join("\n\n")
     )
+}
+
+async fn write_attached_runtime_context_files(
+    runtime_state_root: &Path,
+    rendered: &str,
+) -> Result<(), KernelError> {
+    for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
+        if let Err(err) =
+            write_runtime_state_file(runtime_state_root, file_name, rendered.as_bytes().to_vec())
+                .await
+        {
+            remove_attached_runtime_context_files_best_effort(runtime_state_root).await;
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+async fn remove_attached_runtime_context_files_best_effort(runtime_state_root: &Path) {
+    for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
+        if let Err(err) = remove_runtime_state_file(runtime_state_root, file_name).await {
+            warn!(
+                ?err,
+                file_name,
+                runtime_state_root = %runtime_state_root.display(),
+                "failed to remove partially materialized attached runtime context file"
+            );
+        }
+    }
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
