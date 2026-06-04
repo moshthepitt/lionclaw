@@ -608,7 +608,7 @@ async fn failed_runtime_control_close_failure_preserves_control_error() {
 }
 
 #[tokio::test]
-async fn runtime_control_route_audit_failure_closes_started_runtime_and_fails_turn() {
+async fn runtime_control_route_audit_failure_fails_turn_before_runtime_start() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
     let starts = Arc::new(AtomicUsize::new(0));
@@ -660,7 +660,11 @@ async fn runtime_control_route_audit_failure_closes_started_runtime_and_fails_tu
         err.to_string().contains("failed to append audit event"),
         "unexpected error: {err:?}"
     );
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        0,
+        "route audit failure should happen before runtime session start"
+    );
     assert_eq!(
         controls.load(Ordering::SeqCst),
         0,
@@ -668,8 +672,8 @@ async fn runtime_control_route_audit_failure_closes_started_runtime_and_fails_tu
     );
     assert_eq!(
         closes.load(Ordering::SeqCst),
-        1,
-        "started runtime session should be closed before returning the audit failure"
+        0,
+        "there should be no runtime session to close when route audit fails before start"
     );
 
     let history = kernel

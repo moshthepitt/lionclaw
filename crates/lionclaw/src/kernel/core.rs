@@ -14635,14 +14635,13 @@ struct ProgramPromptEnvelopes {
     fresh_prompt: Option<String>,
 }
 
-struct StartedRuntimePreExecutionFailure<'a> {
+struct StartedRuntimePreTurnFailure<'a> {
     adapter: Arc<dyn RuntimeAdapter>,
     runtime_id: &'a str,
     session: &'a super::sessions::Session,
     persisted_turn: &'a SessionTurnRecord,
     execution_plan: &'a EffectiveExecutionPlan,
     handle: &'a RuntimeSessionHandle,
-    close_context: RuntimeSessionCloseContext,
     error: &'a KernelError,
     channel_stream_finalizer: ChannelStreamFinalizer<'a>,
 }
@@ -15010,18 +15009,41 @@ impl Kernel {
         })
     }
 
-    async fn fail_started_runtime_before_execution(
+    async fn append_runtime_control_route_audit(
         &self,
-        failure: StartedRuntimePreExecutionFailure<'_>,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        origin: RuntimeControlOrigin,
+        control: &RuntimeControlCommand,
     ) -> Result<(), KernelError> {
-        let StartedRuntimePreExecutionFailure {
+        self.audit
+            .append(
+                "runtime.control.route",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "turn_id": turn_id,
+                    "runtime_id": runtime_id,
+                    "origin": origin.as_str(),
+                    "command_name": control.command_name.clone(),
+                }),
+            )
+            .await
+            .map_err(internal)
+    }
+
+    async fn fail_started_runtime_before_turn(
+        &self,
+        failure: StartedRuntimePreTurnFailure<'_>,
+    ) -> Result<(), KernelError> {
+        let StartedRuntimePreTurnFailure {
             adapter,
             runtime_id,
             session,
             persisted_turn,
             execution_plan,
             handle,
-            close_context,
             error,
             channel_stream_finalizer,
         } = failure;
@@ -15033,7 +15055,7 @@ impl Kernel {
                 runtime_id,
                 session.session_id,
                 handle,
-                close_context,
+                RuntimeSessionCloseContext::Turn,
             )
             .await
         {
@@ -15041,7 +15063,7 @@ impl Kernel {
                 ?close_err,
                 runtime_id,
                 session_id = %session.session_id,
-                "failed to close runtime session after pre-execution failure"
+                "failed to close runtime session after pre-turn failure"
             );
         }
 
@@ -15236,6 +15258,33 @@ impl Kernel {
                 .map_err(internal)?,
         };
 
+        if let Some(control) = runtime_control.as_ref() {
+            if let Err(err) = self
+                .append_runtime_control_route_audit(
+                    session.session_id,
+                    persisted_turn.turn_id,
+                    &runtime_id,
+                    runtime_control_origin,
+                    control,
+                )
+                .await
+            {
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    FailedSessionTurnCompletion {
+                        assistant_text: String::new(),
+                        error_code: "runtime.error".to_string(),
+                        error_text: err.to_string(),
+                        stream_error_emitted: false,
+                    },
+                    channel_stream_finalizer,
+                )
+                .await?;
+                return Err(err);
+            }
+        }
+
         let runtime_state_root = Self::runtime_state_root(&execution_plan).map(Path::to_path_buf);
         let runtime_session_ready = match runtime_state_root
             .as_deref()
@@ -15326,14 +15375,13 @@ impl Kernel {
         {
             Ok(envelopes) => envelopes,
             Err(err) => {
-                self.fail_started_runtime_before_execution(StartedRuntimePreExecutionFailure {
+                self.fail_started_runtime_before_turn(StartedRuntimePreTurnFailure {
                     adapter: Arc::clone(&adapter),
                     runtime_id: &runtime_id,
                     session,
                     persisted_turn: &persisted_turn,
                     execution_plan: &execution_plan,
                     handle: &handle,
-                    close_context: RuntimeSessionCloseContext::Turn,
                     error: &err,
                     channel_stream_finalizer,
                 })
@@ -15711,37 +15759,6 @@ impl Kernel {
             emit_done: emit_channel_stream_done,
         };
         let turn_id = persisted_turn.turn_id;
-
-        if let Err(err) = self
-            .audit
-            .append(
-                "runtime.control.route",
-                Some(session.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "turn_id": turn_id,
-                    "runtime_id": runtime_id.clone(),
-                    "origin": runtime_control_origin.as_str(),
-                    "command_name": control.command_name.clone(),
-                }),
-            )
-            .await
-            .map_err(internal)
-        {
-            self.fail_started_runtime_before_execution(StartedRuntimePreExecutionFailure {
-                adapter: Arc::clone(&adapter),
-                runtime_id: &runtime_id,
-                session,
-                persisted_turn: &persisted_turn,
-                execution_plan: &execution_plan,
-                handle: &handle,
-                close_context: RuntimeSessionCloseContext::Control,
-                error: &err,
-                channel_stream_finalizer,
-            })
-            .await?;
-            return Err(err);
-        }
 
         let control_result = self
             .execute_runtime_control(RuntimeControlTurnExecution {
