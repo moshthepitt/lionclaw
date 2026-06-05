@@ -546,27 +546,26 @@ fn runtime_session_shape_key(
     preset: &ExecutionPreset,
     escape_classes: &BTreeSet<EscapeClass>,
 ) -> String {
-    let mut escape_classes = escape_classes
-        .iter()
-        .map(|escape_class| escape_class.as_str())
-        .collect::<Vec<_>>();
-    escape_classes.sort_unstable();
-    let escape_classes = if escape_classes.is_empty() {
-        "none".to_string()
-    } else {
-        escape_classes.join("+")
-    };
-    format!(
-        "workspace-{}__network-{}__secrets-{}__escapes-{}",
+    let base_key = format!(
+        "workspace-{}__network-{}__secrets-{}",
         preset.workspace_access.as_str(),
         preset.network_mode.as_str(),
         if preset.mount_runtime_secrets {
             "on"
         } else {
             "off"
-        },
-        escape_classes
-    )
+        }
+    );
+    if escape_classes.is_empty() {
+        return base_key;
+    }
+
+    let mut escape_classes = escape_classes
+        .iter()
+        .map(|escape_class| escape_class.as_str())
+        .collect::<Vec<_>>();
+    escape_classes.sort_unstable();
+    format!("{base_key}__escapes-{}", escape_classes.join("+"))
 }
 
 fn configured_mount_protections(
@@ -848,7 +847,7 @@ mod tests {
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off__escapes-none")
+                .join("workspace-read-write__network-on__secrets-off")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
         assert!(
@@ -867,7 +866,7 @@ mod tests {
                 .join(&project_key)
                 .join(RUNTIME_NATIVE_HOMES_DIR)
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off__escapes-none")
+                .join("workspace-read-write__network-on__secrets-off")
                 .join(RUNTIME_NATIVE_HOME_DIR)
         );
         assert_eq!(plan.mounts[2].target, "/runtime/home");
@@ -1013,7 +1012,7 @@ mod tests {
         assert!(plain_plan.mounts[2]
             .source
             .to_string_lossy()
-            .contains("__escapes-none"));
+            .ends_with("workspace-read-write__network-on__secrets-off/home"));
         assert!(channel_send_plan.mounts[2]
             .source
             .to_string_lossy()
