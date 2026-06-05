@@ -160,6 +160,7 @@ pub(crate) enum MemoryProjectionInvalidReason {
     ProjectorIdEmpty,
     ProjectorIdMismatch,
     TooManyItems,
+    TooManyBytes,
     EmptyText,
     MissingProvenance,
     UnsupportedProvenance,
@@ -171,6 +172,7 @@ impl MemoryProjectionInvalidReason {
             Self::ProjectorIdEmpty => "projector_id_empty",
             Self::ProjectorIdMismatch => "projector_id_mismatch",
             Self::TooManyItems => "too_many_items",
+            Self::TooManyBytes => "too_many_bytes",
             Self::EmptyText => "empty_text",
             Self::MissingProvenance => "missing_provenance",
             Self::UnsupportedProvenance => "unsupported_provenance",
@@ -209,6 +211,9 @@ pub(crate) fn validate_memory_projection(
             return Err(MemoryProjectionInvalidReason::UnsupportedProvenance);
         }
         projected_bytes = projected_bytes.saturating_add(item.text.len());
+        if projected_bytes > request.max_bytes {
+            return Err(MemoryProjectionInvalidReason::TooManyBytes);
+        }
     }
 
     Ok(ValidMemoryProjection {
@@ -296,6 +301,19 @@ mod tests {
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("too many items are invalid");
         assert_eq!(err.as_str(), "too_many_items");
+    }
+
+    #[test]
+    fn validation_rejects_too_many_bytes() {
+        let request = MemoryProjectionRequest {
+            max_bytes: 5,
+            ..request_with_session_turn_source()
+        };
+        let projection = projection_with_items("test", vec![memory_candidate("too large")]);
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("over-budget memory text is invalid");
+        assert_eq!(err.as_str(), "too_many_bytes");
     }
 
     #[test]

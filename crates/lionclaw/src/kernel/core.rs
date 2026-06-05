@@ -8627,12 +8627,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_memory_projector_output_omits_whole_memory_section() {
+        let oversized = format!("{MEMORY_PROJECTOR_MAIN_ONLY}\n{}", "x".repeat(5 * 1024));
+        let (projector, _requests) =
+            TestMemoryProjector::with_items(vec![memory_candidate(oversized)]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(!rendered.contains(MEMORY_PROJECTOR_MAIN_ONLY), "{rendered}");
+        assert!(!rendered.contains("## Memory"), "{rendered}");
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "projector_invalid_output"
+        }));
+        assert!(audit_json.contains("\"status\":\"projector_invalid_output\""));
+        assert!(audit_json.contains("\"reason\":\"too_many_bytes\""));
+        assert!(!audit_json.contains(MEMORY_PROJECTOR_MAIN_ONLY));
+    }
+
+    #[tokio::test]
     async fn memory_projector_output_is_capped_by_prompt_context_budget() {
         let mut memory = format!("{MEMORY_PROJECTOR_MAIN_ONLY}\n");
-        for index in 0..120 {
-            memory.push_str(&format!(
-                "memory filler line {index:03} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
-            ));
+        for _ in 0..900 {
+            memory.push_str("x\n");
         }
         memory.push_str(MEMORY_AFTER_CAP);
         let (projector, _requests) =
@@ -20274,11 +20302,9 @@ impl Kernel {
                         )
                         .with_counts(
                             projection.items.len(),
-                            projection
-                                .items
-                                .iter()
-                                .map(|candidate| candidate.text.len())
-                                .sum(),
+                            projection.items.iter().fold(0usize, |total, candidate| {
+                                total.saturating_add(candidate.text.len())
+                            }),
                         )
                         .with_reason(reason.as_str()),
                     ),
