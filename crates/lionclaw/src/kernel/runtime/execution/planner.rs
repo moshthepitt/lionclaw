@@ -175,6 +175,7 @@ struct BuildMountsRequest<'a> {
     runtime_id: &'a str,
     preset: &'a ExecutionPreset,
     runtime_profile: &'a RuntimeExecutionProfile,
+    effective_escape_classes: &'a BTreeSet<EscapeClass>,
     skill_mounts: &'a [MountSpec],
     extra_mounts: &'a [MountSpec],
     purpose: ExecutionPlanPurpose,
@@ -239,11 +240,14 @@ impl ExecutionPlanner {
         )?;
         let (preset_name, preset) =
             self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
+        let escape_classes =
+            escape_classes_for_purpose(request.purpose, preset.escape_classes.clone());
         let mounts = self.build_mounts(BuildMountsRequest {
             session_id: request.session_id,
             runtime_id: &request.runtime_id,
             preset: &preset,
             runtime_profile: &runtime_profile,
+            effective_escape_classes: &escape_classes,
             skill_mounts: &request.skill_mounts,
             extra_mounts: &request.extra_mounts,
             purpose: request.purpose,
@@ -285,7 +289,7 @@ impl ExecutionPlanner {
             hard_timeout: execution_context.hard_timeout,
             mounts,
             mount_runtime_secrets: preset.mount_runtime_secrets,
-            escape_classes: escape_classes_for_purpose(request.purpose, preset.escape_classes),
+            escape_classes,
             limits,
         })
     }
@@ -350,7 +354,8 @@ impl ExecutionPlanner {
             self.workspace_name.as_ref(),
             request.session_id,
         ) {
-            let shape_key = runtime_session_shape_key(request.preset);
+            let shape_key =
+                runtime_session_shape_key(request.preset, request.effective_escape_classes);
             mounts.push(MountSpec {
                 source: runtime_session_state_dir_from_parts(
                     runtime_root,
@@ -537,16 +542,30 @@ fn validate_runtime_extra_mounts(mounts: &[MountSpec]) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
+fn runtime_session_shape_key(
+    preset: &ExecutionPreset,
+    escape_classes: &BTreeSet<EscapeClass>,
+) -> String {
+    let mut escape_classes = escape_classes
+        .iter()
+        .map(|escape_class| escape_class.as_str())
+        .collect::<Vec<_>>();
+    escape_classes.sort_unstable();
+    let escape_classes = if escape_classes.is_empty() {
+        "none".to_string()
+    } else {
+        escape_classes.join("+")
+    };
     format!(
-        "workspace-{}__network-{}__secrets-{}",
+        "workspace-{}__network-{}__secrets-{}__escapes-{}",
         preset.workspace_access.as_str(),
         preset.network_mode.as_str(),
         if preset.mount_runtime_secrets {
             "on"
         } else {
             "off"
-        }
+        },
+        escape_classes
     )
 }
 
@@ -829,7 +848,7 @@ mod tests {
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off")
+                .join("workspace-read-write__network-on__secrets-off__escapes-none")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
         assert!(
@@ -848,7 +867,7 @@ mod tests {
                 .join(&project_key)
                 .join(RUNTIME_NATIVE_HOMES_DIR)
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off")
+                .join("workspace-read-write__network-on__secrets-off__escapes-none")
                 .join(RUNTIME_NATIVE_HOME_DIR)
         );
         assert_eq!(plan.mounts[2].target, "/runtime/home");
@@ -917,6 +936,88 @@ mod tests {
             .expect("second plan");
         assert_ne!(plan.mounts[1].source, second_plan.mounts[1].source);
         assert_eq!(plan.mounts[2].source, second_plan.mounts[2].source);
+    }
+
+    #[test]
+    fn planner_partitions_runtime_home_by_effective_escape_classes() {
+        let sandbox = tempdir().expect("temp dir");
+        let workspace_root = sandbox.path().join("project");
+        let runtime_root = sandbox.path().join("home/runtime");
+        let session_id = Uuid::nil();
+        let presets = [
+            (
+                "plain".to_string(),
+                ExecutionPreset {
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    network_mode: NetworkMode::On,
+                    mount_runtime_secrets: false,
+                    escape_classes: BTreeSet::new(),
+                },
+            ),
+            (
+                "channel-send".to_string(),
+                ExecutionPreset {
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    network_mode: NetworkMode::On,
+                    mount_runtime_secrets: false,
+                    escape_classes: BTreeSet::from([EscapeClass::ChannelSend]),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets,
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(workspace_root.clone()),
+            project_workspace_root: Some(workspace_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plain_plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(session_id),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: Some("plain".to_string()),
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plain plan");
+        let channel_send_plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(session_id),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: Some("channel-send".to_string()),
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("channel-send plan");
+
+        assert_ne!(
+            plain_plan.mounts[2].source,
+            channel_send_plan.mounts[2].source
+        );
+        assert!(plain_plan.mounts[2]
+            .source
+            .to_string_lossy()
+            .contains("__escapes-none"));
+        assert!(channel_send_plan.mounts[2]
+            .source
+            .to_string_lossy()
+            .contains("__escapes-channel-send"));
     }
 
     #[test]

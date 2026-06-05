@@ -581,7 +581,8 @@ mounted assets. `/runtime` is session-scoped LionClaw control state.
 work root, OCI compatibility identity, and execution security shape. That lets
 Codex, OpenCode, and future runtimes keep native config, databases, histories,
 and caches across LionClaw sessions without sharing them across different
-projects or materially different secret/network/workspace capability shapes.
+projects or materially different secret/network/workspace/escape capability
+shapes.
 
 Interactive program-backed turns launch a fresh confined process for each
 request. They receive the current LionClaw session's `/runtime` control state

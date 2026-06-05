@@ -2498,16 +2498,12 @@ fn codex_generated_image_path(
 ) -> Option<PathBuf> {
     let path = Path::new(raw);
     if path.is_absolute() {
-        if let Some(host_path) =
-            runtime_context.and_then(|context| context.host_path_for_runtime_path(path))
-        {
-            return Some(host_path);
+        if let Some(context) = runtime_context {
+            return context.host_path_for_runtime_path(path);
         }
-    }
-    if let Ok(container_relative) = path.strip_prefix("/runtime") {
-        return runtime_state_child_path(runtime_state_root, container_relative);
-    }
-    if path.is_absolute() {
+        if let Ok(container_relative) = path.strip_prefix("/runtime") {
+            return runtime_state_child_path(runtime_state_root, container_relative);
+        }
         return None;
     }
     runtime_state_child_path(runtime_state_root, path)
@@ -5403,6 +5399,44 @@ mod tests {
             ),
             Some(PathBuf::from(
                 "/host/runtime-home/.codex/generated_images/thr_1/ig_1.png"
+            ))
+        );
+    }
+
+    #[test]
+    fn codex_generated_image_path_respects_blocked_runtime_projection() {
+        let runtime_state_root = PathBuf::from("/host/runtime-state");
+        let context = RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: Some(runtime_state_root.clone()),
+            runtime_path_projections: vec![
+                RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
+                    .expect("runtime projection"),
+                RuntimePathProjection::exact(
+                    "/runtime/lionclaw/channel-send.sock",
+                    "/tmp/channel-send.sock",
+                )
+                .expect("channel send socket projection"),
+            ],
+        };
+
+        assert_eq!(
+            super::codex_generated_image_path(
+                "/runtime/lionclaw/channel-send.sock/hidden.png",
+                &runtime_state_root,
+                Some(&context),
+            ),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path(
+                "/runtime/lionclaw/channel-send.sock/hidden.png",
+                &runtime_state_root,
+                None,
+            ),
+            Some(PathBuf::from(
+                "/host/runtime-state/lionclaw/channel-send.sock/hidden.png"
             ))
         );
     }

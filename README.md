@@ -95,7 +95,8 @@ generated memory/continuity context, and audit trail. LionClaw writes that
 context into session-scoped runtime control state as both `AGENTS.generated.md`
 and the runtime-standard `AGENTS.md`. The runtime's native private home is
 mounted separately at `/runtime/home` and persists across LionClaw sessions for
-the same project, runtime, compatibility identity, and security shape. For
+the same project, runtime, compatibility identity, and execution security shape
+including workspace access, network mode, secret mounts, and escape classes. For
 Codex, LionClaw uses the outer container as the sandbox boundary and starts the
 inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
 config overrides mark the container workspace as trusted and disable update
