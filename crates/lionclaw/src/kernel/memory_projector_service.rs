@@ -396,6 +396,24 @@ mod tests {
         }
     }
 
+    fn restart_script_with_first_response(first_response: &str) -> String {
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+starts="$LIONCLAW_SKILL_STATE_DIR/starts"
+count=0
+if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
+printf 'start\n' >> "$starts"
+IFS= read -r _line || exit 0
+if [ "$count" = "0" ]; then
+  printf '%s\n' '__FIRST_RESPONSE__'
+else
+  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+fi
+"#
+        .replace("__FIRST_RESPONSE__", first_response)
+    }
+
     fn request() -> MemoryProjectionRequest {
         MemoryProjectionRequest {
             session_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid"),
@@ -461,6 +479,66 @@ done
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config = write_projector_script(
             temp_dir.path(),
+            &restart_script_with_first_response("not-json"),
+        );
+        let projector = SkillMemoryProjector::new(config.clone());
+
+        let err = projector
+            .project(request())
+            .await
+            .expect_err("malformed response should fail");
+        assert!(err.to_string().contains("decode response"));
+
+        let second = projector
+            .project(request())
+            .await
+            .expect("second response should restart");
+        assert!(second.items.is_empty());
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+            "start\nstart\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fatal_decode_errors_retire_process_and_later_restart() {
+        for first_response in [
+            r#"{"projector_id":"memory-core"}"#,
+            r#"{"projector_id":"memory-core","items":[{"kind":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
+            r#"{"projector_id":"memory-core","items":[{"kind":"stable_fact","text":"remembered"}]}"#,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let config = write_projector_script(
+                temp_dir.path(),
+                &restart_script_with_first_response(first_response),
+            );
+            let projector = SkillMemoryProjector::new(config.clone());
+
+            let err = projector
+                .project(request())
+                .await
+                .expect_err("fatal decode error should fail");
+            assert!(err.to_string().contains("decode response"));
+
+            let second = projector
+                .project(request())
+                .await
+                .expect("second response should restart");
+            assert!(second.items.is_empty());
+            assert_eq!(
+                fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+                "start\nstart\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_eof_retires_process_and_later_restarts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
@@ -470,10 +548,9 @@ if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
 IFS= read -r _line || exit 0
 if [ "$count" = "0" ]; then
-  printf 'not-json\n'
-else
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  exit 0
 fi
+printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
 "#,
         );
         let projector = SkillMemoryProjector::new(config.clone());
@@ -481,8 +558,8 @@ fi
         let err = projector
             .project(request())
             .await
-            .expect_err("malformed response should fail");
-        assert!(err.to_string().contains("decode response"));
+            .expect_err("EOF should fail");
+        assert!(err.to_string().contains("stdout closed"));
 
         let second = projector
             .project(request())
@@ -597,5 +674,50 @@ printf 'not-json\n'
             .expect_err("malformed response should fail");
 
         assert!(err.to_string().contains("decode response"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_projection_calls_are_serialized() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
+  if [ ! -f "$LIONCLAW_SKILL_STATE_DIR/first-response-sent" ]; then
+    if IFS= read -r -t 0.2 queued; then
+      printf '%s\n' "$queued" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
+      printf 'overlap\n' > "$LIONCLAW_SKILL_STATE_DIR/overlap"
+      printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+      printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+      touch "$LIONCLAW_SKILL_STATE_DIR/first-response-sent"
+      continue
+    fi
+    touch "$LIONCLAW_SKILL_STATE_DIR/first-response-sent"
+  fi
+  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+done
+"#,
+        );
+        let projector = SkillMemoryProjector::new(config.clone());
+
+        let results = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(projector.project(request()), projector.project(request()))
+        })
+        .await
+        .expect("concurrent projection calls should finish");
+
+        results.0.expect("first response");
+        results.1.expect("second response");
+        assert!(
+            !config.state_dir.join("overlap").exists(),
+            "second request reached projector before first response completed"
+        );
+        let requests =
+            fs::read_to_string(config.state_dir.join("requests.jsonl")).expect("requests");
+        assert_eq!(requests.lines().count(), 2);
     }
 }
