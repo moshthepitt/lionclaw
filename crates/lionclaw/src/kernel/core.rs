@@ -129,19 +129,18 @@ use super::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         execute_captured, execute_streaming, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        runtime_native_home_mount_source, runtime_state_mount_source, safe_relative_path,
-        skill_mount_target, spawn_interactive, EffectiveExecutionPlan, EscapeClass,
-        ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
-        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
-        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
-        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
-        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
+        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
+        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
+        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection,
+        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
@@ -212,12 +211,34 @@ struct RuntimeChannelSendContext {
     turn_id: Uuid,
     runtime_id: String,
     runtime_state_root: PathBuf,
+    runtime_native_home_root: Option<PathBuf>,
+    runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
 }
 
 impl RuntimeChannelSendContext {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    fn artifact_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.runtime_state_root.clone()];
+        if let Some(runtime_native_home_root) = &self.runtime_native_home_root {
+            if runtime_native_home_root != &self.runtime_state_root {
+                roots.push(runtime_native_home_root.clone());
+            }
+        }
+        roots
+    }
+
+    fn host_path_for_runtime_path(&self, runtime_path: impl AsRef<Path>) -> Option<PathBuf> {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::None,
+            environment: Vec::new(),
+            runtime_state_root: Some(self.runtime_state_root.clone()),
+            runtime_path_projections: self.runtime_path_projections.clone(),
+        }
+        .host_path_for_runtime_path(runtime_path)
     }
 }
 
@@ -594,8 +615,18 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
 fn runtime_execution_context(
     plan: &EffectiveExecutionPlan,
 ) -> anyhow::Result<RuntimeExecutionContext> {
-    let runtime_path_projections = plan
-        .mounts
+    Ok(RuntimeExecutionContext {
+        network_mode: plan.network_mode,
+        environment: plan.environment.clone(),
+        runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
+        runtime_path_projections: runtime_path_projections_for_plan(plan)?,
+    })
+}
+
+fn runtime_path_projections_for_plan(
+    plan: &EffectiveExecutionPlan,
+) -> anyhow::Result<Vec<RuntimePathProjection>> {
+    plan.mounts
         .iter()
         .filter(|mount| {
             matches!(
@@ -613,14 +644,7 @@ fn runtime_execution_context(
                 RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
             }
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    Ok(RuntimeExecutionContext {
-        network_mode: plan.network_mode,
-        environment: plan.environment.clone(),
-        runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
-        runtime_path_projections,
-    })
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 #[async_trait::async_trait]
@@ -12916,8 +12940,7 @@ fn runtime_channel_send_artifacts(
         .iter()
         .enumerate()
         .map(|(index, attachment)| {
-            let path =
-                runtime_channel_send_host_path(&context.runtime_state_root, &attachment.path)?;
+            let path = runtime_channel_send_host_path(context, &attachment.path)?;
             Ok(RuntimeArtifact {
                 artifact_id: format!("runtime-channel-send-{}", index + 1),
                 path,
@@ -12942,17 +12965,23 @@ async fn validate_runtime_channel_send_artifacts(
     context: &RuntimeChannelSendContext,
     artifacts: &[RuntimeArtifact],
 ) -> Result<(), RuntimeChannelSendProblem> {
-    let runtime_state_root = tokio::fs::canonicalize(&context.runtime_state_root)
-        .await
-        .map_err(|err| {
-            RuntimeChannelSendProblem::new(
-                "internal_error",
-                format!(
-                    "runtime state root '{}' is not readable: {err}",
-                    context.runtime_state_root.display()
-                ),
-            )
-        })?;
+    let mut artifact_roots = Vec::new();
+    for artifact_root in context.artifact_roots() {
+        let artifact_root = tokio::fs::canonicalize(&artifact_root)
+            .await
+            .map_err(|err| {
+                RuntimeChannelSendProblem::new(
+                    "internal_error",
+                    format!(
+                        "runtime artifact root '{}' is not readable: {err}",
+                        artifact_root.display()
+                    ),
+                )
+            })?;
+        if !artifact_roots.iter().any(|root| root == &artifact_root) {
+            artifact_roots.push(artifact_root);
+        }
+    }
     for artifact in artifacts {
         let metadata = tokio::fs::symlink_metadata(&artifact.path)
             .await
@@ -12982,7 +13011,10 @@ async fn validate_runtime_channel_send_artifacts(
                     ),
                 )
             })?;
-        if !canonical_artifact.starts_with(&runtime_state_root) {
+        if !artifact_roots
+            .iter()
+            .any(|artifact_root| canonical_artifact.starts_with(artifact_root))
+        {
             return Err(RuntimeChannelSendProblem::new(
                 "invalid_attachment",
                 "attachment path must stay under /runtime",
@@ -12993,7 +13025,7 @@ async fn validate_runtime_channel_send_artifacts(
 }
 
 fn runtime_channel_send_host_path(
-    runtime_state_root: &Path,
+    context: &RuntimeChannelSendContext,
     raw_path: &str,
 ) -> Result<PathBuf, RuntimeChannelSendProblem> {
     let path = raw_path.trim();
@@ -13003,25 +13035,36 @@ fn runtime_channel_send_host_path(
             "attachment path is required",
         ));
     }
-    let relative = path.strip_prefix("/runtime/").ok_or_else(|| {
-        RuntimeChannelSendProblem::new(
-            "invalid_attachment",
-            "attachment path must be under /runtime",
-        )
-    })?;
-    let Some(normalized) = safe_relative_path(relative) else {
+    let runtime_path = Path::new(path);
+    if !runtime_path.starts_with(RUNTIME_MOUNT_TARGET) {
         return Err(RuntimeChannelSendProblem::new(
             "invalid_attachment",
-            "attachment path must stay under /runtime",
+            "attachment path must be under /runtime",
         ));
-    };
-    if normalized.as_os_str().is_empty() {
+    }
+    let host_path = context
+        .host_path_for_runtime_path(runtime_path)
+        .ok_or_else(|| {
+            RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must stay under /runtime",
+            )
+        })?;
+    if host_path == context.runtime_state_root {
         return Err(RuntimeChannelSendProblem::new(
             "invalid_attachment",
             "attachment path must name a file under /runtime",
         ));
     }
-    Ok(runtime_state_root.join(normalized))
+    if let Some(runtime_native_home_root) = &context.runtime_native_home_root {
+        if host_path == *runtime_native_home_root {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must name a file under /runtime",
+            ));
+        }
+    }
+    Ok(host_path)
 }
 
 fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
@@ -15630,12 +15673,17 @@ impl Kernel {
                 )
                 .await;
         };
+        let runtime_path_projections = runtime_path_projections_for_plan(plan)
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         self.start_runtime_channel_send_bridge(
             RuntimeChannelSendContext {
                 session_id,
                 turn_id,
                 runtime_id: runtime_id.to_string(),
                 runtime_state_root,
+                runtime_native_home_root: Self::runtime_native_home_root(plan)
+                    .map(Path::to_path_buf),
+                runtime_path_projections,
                 active: Arc::new(AtomicBool::new(true)),
             },
             plan,
@@ -16787,10 +16835,11 @@ impl Kernel {
                 .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
                 .await;
         }
+        let artifact_roots = context.artifact_roots();
         let mut attachments = match self
-            .prepare_runtime_artifact_attachments_beneath(
+            .prepare_runtime_artifact_attachments_from_roots(
                 context.turn_id,
-                &context.runtime_state_root,
+                &artifact_roots,
                 &runtime_artifacts,
             )
             .await
@@ -17077,17 +17126,6 @@ impl Kernel {
                 .await;
         }
         self.prepare_runtime_artifact_attachments(turn_id, artifacts)
-            .await
-    }
-
-    async fn prepare_runtime_artifact_attachments_beneath(
-        &self,
-        turn_id: Uuid,
-        artifact_root: &Path,
-        artifacts: &[RuntimeArtifact],
-    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
-        let artifact_roots = vec![artifact_root.to_path_buf()];
-        self.prepare_runtime_artifact_attachments_from_roots(turn_id, &artifact_roots, artifacts)
             .await
     }
 

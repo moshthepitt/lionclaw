@@ -48,6 +48,7 @@ type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 enum ProbeFileSetup {
     None,
     Attachment,
+    RuntimeHomeAttachment,
     InvalidAttachments,
 }
 
@@ -276,6 +277,81 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             "channel.send socket root is private"
         );
     }
+}
+
+#[tokio::test]
+async fn program_backed_runtime_channel_send_accepts_runtime_home_attachment() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-home").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let socket_paths = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "send-persistent-sketch",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "See attached persistent sketch.",
+            "format_hint": "markdown",
+            "attachments": [{
+                "path": "/runtime/home/artifacts/persistent-sketch.txt",
+                "filename": "persistent-sketch.txt",
+                "mime_type": "text/plain"
+            }]
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![request],
+                responses.clone(),
+                socket_paths,
+                ProbeFileSetup::RuntimeHomeAttachment,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-home").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send persistent home attachment".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    let attachments = &outbox.deliveries[0].content.attachments;
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0].filename.as_deref(),
+        Some("persistent-sketch.txt")
+    );
+    let copied = PathBuf::from(&attachments[0].path);
+    let copied_bytes = tokio::fs::read(&copied)
+        .await
+        .expect("read copied runtime home attachment");
+    assert_eq!(copied_bytes, b"persistent sketch bytes");
 }
 
 #[tokio::test]
@@ -1480,7 +1556,7 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
                 .lock()
                 .expect("socket paths lock")
                 .push(host_socket);
-            prepare_probe_files(&runtime_root, *file_setup).await?;
+            prepare_probe_files(context, &runtime_root, *file_setup).await?;
             for request in requests {
                 let response = send_channel_send_request(context, request.clone()).await?;
                 responses.lock().expect("responses lock").push(response);
@@ -1589,7 +1665,11 @@ async fn connect_channel_send_socket(host_socket: &Path) -> Result<UnixStream> {
         .with_context(|| format!("connect {}", host_socket.display()))
 }
 
-async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Result<()> {
+async fn prepare_probe_files(
+    context: &RuntimeExecutionContext,
+    runtime_root: &Path,
+    setup: ProbeFileSetup,
+) -> Result<()> {
     match setup {
         ProbeFileSetup::None => Ok(()),
         ProbeFileSetup::Attachment => {
@@ -1601,6 +1681,20 @@ async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Resu
             tokio::fs::write(&artifact, b"sketch bytes")
                 .await
                 .context("write artifact")?;
+            Ok(())
+        }
+        ProbeFileSetup::RuntimeHomeAttachment => {
+            let artifact = host_path_for_runtime_path(
+                context,
+                "/runtime/home/artifacts/persistent-sketch.txt",
+            )?;
+            let artifact_parent = artifact.parent().context("artifact parent missing")?;
+            tokio::fs::create_dir_all(artifact_parent)
+                .await
+                .context("create runtime home artifact parent")?;
+            tokio::fs::write(&artifact, b"persistent sketch bytes")
+                .await
+                .context("write runtime home artifact")?;
             Ok(())
         }
         ProbeFileSetup::InvalidAttachments => {
