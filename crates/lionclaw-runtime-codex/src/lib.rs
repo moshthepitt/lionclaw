@@ -2506,7 +2506,14 @@ fn codex_generated_image_path(
         }
         return None;
     }
-    runtime_state_child_path(runtime_state_root, path)
+    let safe_path = safe_relative_path(path)?;
+    if safe_path.as_os_str().is_empty() {
+        return None;
+    }
+    if let Some(context) = runtime_context {
+        return context.host_path_for_runtime_path(Path::new("/runtime").join(&safe_path));
+    }
+    Some(runtime_state_root.join(safe_path))
 }
 
 fn runtime_state_child_path(runtime_state_root: &Path, relative_path: &Path) -> Option<PathBuf> {
@@ -3107,6 +3114,23 @@ mod tests {
         .expect("write runtime ready marker");
         RuntimeSessionReady::from_runtime_state_root(runtime_state_root)
             .expect("runtime ready marker should be valid")
+    }
+
+    fn runtime_home_projection_context(
+        runtime_state_root: PathBuf,
+        runtime_home_root: PathBuf,
+    ) -> RuntimeExecutionContext {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: Some(runtime_state_root.clone()),
+            runtime_path_projections: vec![
+                RuntimePathProjection::directory("/runtime", runtime_state_root)
+                    .expect("runtime projection"),
+                RuntimePathProjection::directory("/runtime/home", runtime_home_root)
+                    .expect("runtime home projection"),
+            ],
+        }
     }
 
     #[derive(Clone)]
@@ -5271,17 +5295,8 @@ mod tests {
             .join(".codex")
             .join("generated_images")
             .join("thr_1");
-        let runtime_context = RuntimeExecutionContext {
-            network_mode: NetworkMode::On,
-            environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_path_projections: vec![
-                RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
-                    .expect("runtime projection"),
-                RuntimePathProjection::directory("/runtime/home", runtime_home_root)
-                    .expect("runtime home projection"),
-            ],
-        };
+        let runtime_context =
+            runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root);
 
         assert_image_generation_event_emits_runtime_artifact_at(
             json!({
@@ -5302,6 +5317,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_app_server_image_generation_relative_saved_path_maps_runtime_home_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let generated_dir = runtime_home_root
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1");
+        let runtime_context =
+            runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root);
+
+        assert_image_generation_event_emits_runtime_artifact_at(
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "ig_1",
+                    "status": "generating",
+                    "saved_path": "home/.codex/generated_images/thr_1/ig_1.png",
+                    "result": "base64 omitted"
+                }
+            }),
+            runtime_state_root,
+            generated_dir,
+            Some(runtime_context),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn codex_app_server_image_generation_default_path_maps_runtime_home_projection() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -5310,17 +5355,8 @@ mod tests {
             .join(".codex")
             .join("generated_images")
             .join("thr_1");
-        let runtime_context = RuntimeExecutionContext {
-            network_mode: NetworkMode::On,
-            environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_path_projections: vec![
-                RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
-                    .expect("runtime projection"),
-                RuntimePathProjection::directory("/runtime/home", runtime_home_root)
-                    .expect("runtime home projection"),
-            ],
-        };
+        let runtime_context =
+            runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root);
 
         assert_image_generation_event_emits_runtime_artifact_at(
             json!({
@@ -5379,21 +5415,22 @@ mod tests {
     fn codex_generated_image_path_uses_runtime_home_projection() {
         let runtime_state_root = PathBuf::from("/host/runtime-state");
         let runtime_home_root = PathBuf::from("/host/runtime-home");
-        let context = RuntimeExecutionContext {
-            network_mode: NetworkMode::On,
-            environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_path_projections: vec![
-                RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
-                    .expect("runtime projection"),
-                RuntimePathProjection::directory("/runtime/home", runtime_home_root.clone())
-                    .expect("runtime home projection"),
-            ],
-        };
+        let context =
+            runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root);
 
         assert_eq!(
             super::codex_generated_image_path(
                 "/runtime/home/.codex/generated_images/thr_1/ig_1.png",
+                &runtime_state_root,
+                Some(&context),
+            ),
+            Some(PathBuf::from(
+                "/host/runtime-home/.codex/generated_images/thr_1/ig_1.png"
+            ))
+        );
+        assert_eq!(
+            super::codex_generated_image_path(
+                "home/.codex/generated_images/thr_1/ig_1.png",
                 &runtime_state_root,
                 Some(&context),
             ),
@@ -5431,6 +5468,14 @@ mod tests {
         );
         assert_eq!(
             super::codex_generated_image_path(
+                "lionclaw/channel-send.sock/hidden.png",
+                &runtime_state_root,
+                Some(&context),
+            ),
+            None
+        );
+        assert_eq!(
+            super::codex_generated_image_path(
                 "/runtime/lionclaw/channel-send.sock/hidden.png",
                 &runtime_state_root,
                 None,
@@ -5445,17 +5490,8 @@ mod tests {
     fn codex_default_generated_image_path_uses_runtime_home_projection() {
         let runtime_state_root = PathBuf::from("/host/runtime-state");
         let runtime_home_root = PathBuf::from("/host/runtime-home");
-        let context = RuntimeExecutionContext {
-            network_mode: NetworkMode::On,
-            environment: Vec::new(),
-            runtime_state_root: Some(runtime_state_root.clone()),
-            runtime_path_projections: vec![
-                RuntimePathProjection::directory("/runtime", runtime_state_root.clone())
-                    .expect("runtime projection"),
-                RuntimePathProjection::directory("/runtime/home", runtime_home_root.clone())
-                    .expect("runtime home projection"),
-            ],
-        };
+        let context =
+            runtime_home_projection_context(runtime_state_root.clone(), runtime_home_root.clone());
 
         assert_eq!(
             super::codex_default_generated_image_path(
