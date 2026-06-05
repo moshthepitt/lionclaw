@@ -912,7 +912,8 @@ pub async fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             } else {
-                let continue_last_session = should_continue_run_session(&args, false);
+                let continue_last_session =
+                    should_continue_run_session(&args, stdin_is_terminal && stdout_is_terminal);
                 Box::pin(run_local(RunLocalInvocation {
                     home: &target.instance_home,
                     project_root: target.project_root.as_deref(),
@@ -3190,6 +3191,21 @@ mod tests {
         assert!(!should_continue_run_session(&default_args, false));
         assert!(should_continue_run_session(&continue_args, false));
         assert!(!should_continue_run_session(&new_session_args, true));
+    }
+
+    #[test]
+    fn terminal_plain_mode_is_interactive_for_resume_defaults() {
+        let args = RunArgs {
+            plain: true,
+            runtime_tui: false,
+            continue_last_session: false,
+            new_session: false,
+            timeout: None,
+            runtime: None,
+        };
+
+        assert!(should_continue_run_session(&args, true));
+        assert!(!should_continue_run_session(&args, false));
     }
 
     #[test]
