@@ -976,7 +976,7 @@ The assistant home workspace contains:
 `MEMORY.md` remains a visible continuity record and search surface, but it is
 not a magic runtime prompt input. LionClaw does not remember by stuffing files
 into prompts. The kernel records what happened, lets controlled memory
-projectors derive candidate memory from explicit kernel-owned sources, and
+projectors derive candidate memory from exact kernel-selected source refs, and
 admits those candidates only through audited prompt context policy.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.

@@ -7002,7 +7002,7 @@ mod tests {
     use crate::kernel::continuity::title_file_name;
     use crate::kernel::memory_projection::{
         MemoryCandidate, MemoryCandidateKind, MemoryProjection, MemoryProjectionError,
-        MemoryProjectionRequest, MemoryProvenance, MemoryProvenanceSource,
+        MemoryProjectionRequest, MemoryProvenance, MemoryProvenanceSource, MemorySourceRef,
     };
     use crate::kernel::runtime::{
         RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
@@ -8401,6 +8401,7 @@ mod tests {
             SessionHistoryPolicy::Interactive,
         )
         .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
 
         let build =
             build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
@@ -8435,6 +8436,19 @@ mod tests {
         assert!(requests[0].max_items > 0);
         assert!(requests[0].max_bytes > 0);
         assert_eq!(requests[0].sources.len(), 1);
+        match &requests[0].sources[0] {
+            MemorySourceRef::SessionTurnRange {
+                sequence_nos,
+                limit,
+                ..
+            } => {
+                assert_eq!(*limit, 12);
+                assert_eq!(sequence_nos, &[1]);
+            }
+            MemorySourceRef::CompactionSummary { .. } => {
+                panic!("expected session turn source")
+            }
+        }
     }
 
     #[tokio::test]
@@ -8521,6 +8535,7 @@ mod tests {
             SessionHistoryPolicy::Interactive,
         )
         .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
 
         let build =
             build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
@@ -8556,6 +8571,7 @@ mod tests {
             SessionHistoryPolicy::Conservative,
         )
         .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
 
         let build =
             build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
@@ -9272,6 +9288,7 @@ mod tests {
             SessionHistoryPolicy::Interactive,
         )
         .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
         let runtime_state_root = fixture
             .workspace_root
             .parent()
@@ -20124,11 +20141,7 @@ impl Kernel {
         max_bytes: usize,
     ) -> Result<PromptContextRenderResult, KernelError> {
         let sources = self
-            .memory_projection_sources(
-                session.session_id,
-                history_before_sequence_no,
-                transcript_tail_limit,
-            )
+            .memory_projection_sources(session, history_before_sequence_no, transcript_tail_limit)
             .await?;
         let request = MemoryProjectionRequest {
             session_id: session.session_id,
@@ -20227,17 +20240,27 @@ impl Kernel {
 
     async fn memory_projection_sources(
         &self,
-        session_id: Uuid,
+        session: &super::sessions::Session,
         history_before_sequence_no: Option<u64>,
         transcript_tail_limit: usize,
     ) -> Result<Vec<MemorySourceRef>, KernelError> {
+        let turns = load_repaired_turns_before_sequence(
+            &self.session_turns,
+            session.session_id,
+            history_before_sequence_no,
+            transcript_tail_limit,
+            TranscriptMode::Prompt(session.history_policy),
+        )
+        .await
+        .map_err(internal)?;
         let mut sources = vec![MemorySourceRef::SessionTurnRange {
             before_sequence_no: history_before_sequence_no,
             limit: transcript_tail_limit,
+            sequence_nos: turns.into_iter().map(|turn| turn.sequence_no).collect(),
         }];
         if let Some(record) = self
             .session_compactions
-            .latest(session_id)
+            .latest(session.session_id)
             .await
             .map_err(internal)?
         {

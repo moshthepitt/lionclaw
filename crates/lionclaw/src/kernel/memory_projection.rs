@@ -57,6 +57,7 @@ pub(crate) enum MemorySourceRef {
     SessionTurnRange {
         before_sequence_no: Option<u64>,
         limit: usize,
+        sequence_nos: Vec<u64>,
     },
     CompactionSummary {
         through_sequence_no: u64,
@@ -232,13 +233,13 @@ fn provenance_supported(provenance: &MemoryProvenance, sources: &[MemorySourceRe
             };
             sources.iter().any(|source| match source {
                 MemorySourceRef::SessionTurnRange {
-                    before_sequence_no,
                     limit,
+                    sequence_nos,
+                    ..
                 } => {
                     *limit > 0
-                        && before_sequence_no
-                            .map(|before_sequence_no| sequence_no < before_sequence_no)
-                            .unwrap_or(true)
+                        && sequence_nos.len() <= *limit
+                        && sequence_nos.contains(&sequence_no)
                 }
                 MemorySourceRef::CompactionSummary { .. } => false,
             })
@@ -356,6 +357,22 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_session_turn_not_selected_by_source_range() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![session_turn_provenance(5)],
+                ..memory_candidate("remember this")
+            }],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("session turn outside the selected source records is invalid");
+        assert_eq!(err.as_str(), "unsupported_provenance");
+    }
+
+    #[test]
     fn validation_rejects_missing_provenance_sequence() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
@@ -443,7 +460,7 @@ mod tests {
         MemoryCandidate {
             kind: MemoryCandidateKind::StableFact,
             text: text.into(),
-            provenance: vec![session_turn_provenance(1)],
+            provenance: vec![session_turn_provenance(7)],
         }
     }
 
@@ -458,6 +475,7 @@ mod tests {
             sources: vec![MemorySourceRef::SessionTurnRange {
                 before_sequence_no: Some(10),
                 limit: 4,
+                sequence_nos: vec![6, 7, 8, 9],
             }],
         }
     }
