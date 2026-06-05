@@ -15603,6 +15603,7 @@ impl Kernel {
         context: RuntimeChannelSendContext,
         plan: &mut EffectiveExecutionPlan,
     ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
+        let mut context = context;
         if let Err(err) =
             ensure_safe_child_directory(&context.runtime_state_root, &[CHANNEL_SEND_SOCKET_DIR])
                 .await
@@ -15633,6 +15634,19 @@ impl Kernel {
             CHANNEL_SEND_SOCKET_ENV.to_string(),
             CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
         ));
+
+        context.runtime_path_projections = match runtime_path_projections_for_plan(plan) {
+            Ok(projections) => projections,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(
+                        &context,
+                        "runtime_path_projections",
+                        KernelError::Runtime(err.to_string()),
+                    )
+                    .await;
+            }
+        };
 
         let kernel = self.clone();
         let active = Arc::clone(&context.active);
@@ -15673,8 +15687,6 @@ impl Kernel {
                 )
                 .await;
         };
-        let runtime_path_projections = runtime_path_projections_for_plan(plan)
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
         self.start_runtime_channel_send_bridge(
             RuntimeChannelSendContext {
                 session_id,
@@ -15683,7 +15695,7 @@ impl Kernel {
                 runtime_state_root,
                 runtime_native_home_root: Self::runtime_native_home_root(plan)
                     .map(Path::to_path_buf),
-                runtime_path_projections,
+                runtime_path_projections: Vec::new(),
                 active: Arc::new(AtomicBool::new(true)),
             },
             plan,

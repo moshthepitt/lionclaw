@@ -759,6 +759,18 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
                             }]
                         }
                     }),
+                    json!({
+                        "idempotency_key": "attachment-hidden-socket-file",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/lionclaw/channel-send.sock"
+                            }]
+                        }
+                    }),
                 ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
@@ -785,6 +797,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         "invalid_format",
         "empty_content",
         "unknown_channel",
+        "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
@@ -1698,6 +1711,17 @@ async fn prepare_probe_files(
             Ok(())
         }
         ProbeFileSetup::InvalidAttachments => {
+            let stale_socket_file = runtime_root.join("lionclaw/channel-send.sock");
+            let stale_socket_parent = stale_socket_file
+                .parent()
+                .context("stale socket parent missing")?;
+            tokio::fs::create_dir_all(stale_socket_parent)
+                .await
+                .context("create stale socket parent")?;
+            tokio::fs::write(&stale_socket_file, b"hidden stale socket target")
+                .await
+                .context("write stale socket target")?;
+
             let outside = runtime_root
                 .parent()
                 .context("runtime root parent missing")?
