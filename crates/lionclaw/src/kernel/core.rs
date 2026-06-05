@@ -9310,6 +9310,22 @@ mod tests {
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(first_session_id))
             .await
             .expect("prepare first attached launch");
+        let runtime_home_root = Kernel::runtime_native_home_root(&first_launch.request.plan)
+            .expect("runtime home root");
+        let runtime_home_lock_root = runtime_home_root.parent().expect("runtime home lock root");
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "shared runtime-home launch lock must not live inside the mounted native home"
+        );
+        assert!(
+            runtime_home_lock_root.join(RUNTIME_TUI_LOCK_FILE).is_file(),
+            "shared runtime-home launch lock should live next to the native home"
+        );
+        fs::write(
+            runtime_home_root.join(RUNTIME_TUI_LOCK_FILE),
+            b"runtime-owned file",
+        )
+        .expect("runtime can mutate similarly-named home file");
         let (second_kernel, _second_exports) =
             kernel_with_counting_terminal_runtime(&temp_dir).await;
         let second_session_id = second_kernel
@@ -17548,14 +17564,20 @@ impl Kernel {
         create_owner_private_directory_all(self.runtime_root.as_deref(), &runtime_state_root)
             .await?;
         let runtime_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let runtime_home_lock_root = runtime_home_root
+            .as_deref()
+            .and_then(|runtime_home_root| runtime_home_root.parent().map(Path::to_path_buf));
         if let Some(runtime_home_root) = &runtime_home_root {
             create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_root)
                 .await?;
         }
         let mut lock_roots = vec![runtime_state_root];
-        if let Some(runtime_home_root) = runtime_home_root {
-            if !lock_roots.iter().any(|root| root == &runtime_home_root) {
-                lock_roots.push(runtime_home_root);
+        if let Some(runtime_home_lock_root) = runtime_home_lock_root {
+            if !lock_roots
+                .iter()
+                .any(|root| root == &runtime_home_lock_root)
+            {
+                lock_roots.push(runtime_home_lock_root);
             }
         }
         tokio::task::spawn_blocking(move || {
