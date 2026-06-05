@@ -12,3 +12,5 @@ lionclaw.db-wal
 /.codex
 /.lionclaw/
 /.worktrees/
+# roborev snapshots
+/.roborev/
