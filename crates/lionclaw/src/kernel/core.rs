@@ -15263,20 +15263,18 @@ fn merge_runtime_native_home_entry_blocking(
                     source_metadata.permissions(),
                 );
             }
-            return std::fs::rename(source_path, destination_path).map_err(|err| {
+            std::fs::rename(source_path, destination_path).map_err(|err| {
                 KernelError::Runtime(format!(
                     "failed to migrate legacy runtime native home entry '{}' to '{}': {err}",
                     source_path.display(),
                     destination_path.display()
                 ))
-            });
+            })
         }
-        Err(err) => {
-            return Err(KernelError::Runtime(format!(
-                "failed to stat runtime native home entry '{}': {err}",
-                destination_path.display()
-            )))
-        }
+        Err(err) => Err(KernelError::Runtime(format!(
+            "failed to stat runtime native home entry '{}': {err}",
+            destination_path.display()
+        ))),
         Ok(destination_metadata) => {
             if source_metadata.file_type().is_symlink()
                 || destination_metadata.file_type().is_symlink()
@@ -15288,13 +15286,13 @@ fn merge_runtime_native_home_entry_blocking(
                     destination_path,
                 ));
             }
-            return merge_runtime_native_home_directory_entry_blocking(
+            merge_runtime_native_home_directory_entry_blocking(
                 source_path,
                 destination_path,
                 relative_path,
                 &source_metadata,
                 destination_metadata.permissions(),
-            );
+            )
         }
     }
 }
@@ -15349,8 +15347,20 @@ fn merge_runtime_native_home_directory_entry_blocking(
             Ok(())
         }
         Err(err) => {
-            let _ = restore_source_result;
-            let _ = restore_destination_result;
+            if let Err(restore_err) = restore_source_result {
+                warn!(
+                    ?restore_err,
+                    path = %source_path.display(),
+                    "failed to restore runtime native home source permissions after migration error"
+                );
+            }
+            if let Err(restore_err) = restore_destination_result {
+                warn!(
+                    ?restore_err,
+                    path = %destination_path.display(),
+                    "failed to restore runtime native home destination permissions after migration error"
+                );
+            }
             Err(err)
         }
     }
