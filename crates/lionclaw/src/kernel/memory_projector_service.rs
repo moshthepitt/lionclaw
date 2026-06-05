@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
 };
 
 #[cfg(unix)]
@@ -21,8 +21,8 @@ use rustix::process::{kill_process_group, Pid, Signal};
 use crate::applied::{AppliedMemoryProjector, AppliedState};
 
 use super::memory_projection::{
-    validate_memory_projection, MemoryProjection, MemoryProjectionError, MemoryProjectionRequest,
-    MemoryProjector, NoopMemoryProjector,
+    validate_memory_projection, MemoryProjection, MemoryProjectionError, MemoryProjectionErrorKind,
+    MemoryProjectionRequest, MemoryProjector, NoopMemoryProjector,
 };
 
 pub(crate) const MEMORY_PROJECTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -101,8 +101,12 @@ impl SkillMemoryProjector {
             process.write_request(&request_json).await?;
             process.read_response().await?
         };
-        let projection = serde_json::from_str::<MemoryProjection>(&response)
-            .map_err(|err| MemoryProjectionError::failed(format!("decode response: {err}")))?;
+        let projection = serde_json::from_str::<MemoryProjection>(&response).map_err(|err| {
+            MemoryProjectionError::invalid_output(
+                "decode_response",
+                format!("decode response: {err}"),
+            )
+        })?;
         if validate_memory_projection(&request, &self.config.projector_id, &projection).is_err() {
             Self::retire_process(process).await;
         }
@@ -148,7 +152,7 @@ impl SkillMemoryProjector {
         Ok(ResidentMemoryProjectorProcess {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: spawn_stdout_reader(stdout),
             stderr: Some(spawn_bounded_stderr_reader(stderr)),
             #[cfg(unix)]
             process_group,
@@ -199,7 +203,7 @@ impl MemoryProjector for SkillMemoryProjector {
 struct ResidentMemoryProjectorProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ProjectorStdoutReader,
     stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
     #[cfg(unix)]
     process_group: Option<Pid>,
@@ -207,6 +211,7 @@ struct ResidentMemoryProjectorProcess {
 
 impl ResidentMemoryProjectorProcess {
     async fn write_request(&mut self, request_json: &str) -> Result<(), MemoryProjectionError> {
+        self.reject_unsolicited_stdout(UnsolicitedStdoutPhase::BeforeRequest)?;
         self.stdin
             .write_all(request_json.as_bytes())
             .await
@@ -221,21 +226,41 @@ impl ResidentMemoryProjectorProcess {
     }
 
     async fn read_response(&mut self) -> Result<String, MemoryProjectionError> {
-        let line = read_capped_line(&mut self.stdout, MAX_PROJECTOR_RESPONSE_LINE_BYTES).await?;
-        let Some(line) = line else {
-            return Err(MemoryProjectionError::failed(
-                "memory projector stdout closed",
-            ));
-        };
-        String::from_utf8(line)
-            .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
-            .map_err(|err| MemoryProjectionError::failed(format!("response was not UTF-8: {err}")))
+        let response = self.stdout.recv().await.ok_or_else(|| {
+            MemoryProjectionError::failed("memory projector stdout reader stopped")
+        })??;
+        tokio::task::yield_now().await;
+        self.reject_unsolicited_stdout(UnsolicitedStdoutPhase::AfterResponse)?;
+        Ok(response)
+    }
+
+    fn reject_unsolicited_stdout(
+        &mut self,
+        phase: UnsolicitedStdoutPhase,
+    ) -> Result<(), MemoryProjectionError> {
+        match self.stdout.try_recv() {
+            Ok(Ok(_line)) => Err(MemoryProjectionError::invalid_output(
+                "unexpected_stdout",
+                "memory projector wrote stdout outside the request/response contract",
+            )),
+            Ok(Err(err))
+                if phase == UnsolicitedStdoutPhase::AfterResponse
+                    && err.kind() == MemoryProjectionErrorKind::ProjectorFailed =>
+            {
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(MemoryProjectionError::failed(
+                "memory projector stdout reader stopped",
+            )),
+        }
     }
 
     async fn retire(mut self) {
         self.terminate();
         let _wait_result = self.child.wait().await;
-        self.abort_stderr_reader();
+        self.abort_output_readers();
         if let Some(stderr) = self.stderr.take() {
             let _stderr_result = stderr.await;
         }
@@ -246,7 +271,8 @@ impl ResidentMemoryProjectorProcess {
         let _kill_result = self.child.start_kill();
     }
 
-    fn abort_stderr_reader(&mut self) {
+    fn abort_output_readers(&mut self) {
+        self.stdout.abort();
         if let Some(stderr) = &self.stderr {
             stderr.abort();
         }
@@ -263,10 +289,16 @@ impl ResidentMemoryProjectorProcess {
     fn terminate_process_group(&mut self) {}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsolicitedStdoutPhase {
+    BeforeRequest,
+    AfterResponse,
+}
+
 impl Drop for ResidentMemoryProjectorProcess {
     fn drop(&mut self) {
         self.terminate();
-        self.abort_stderr_reader();
+        self.abort_output_readers();
     }
 }
 
@@ -291,6 +323,64 @@ fn child_process_group(child: &Child) -> Option<Pid> {
         .and_then(Pid::from_raw)
 }
 
+struct ProjectorStdoutReader {
+    lines: mpsc::Receiver<Result<String, MemoryProjectionError>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProjectorStdoutReader {
+    async fn recv(&mut self) -> Option<Result<String, MemoryProjectionError>> {
+        self.lines.recv().await
+    }
+
+    fn try_recv(
+        &mut self,
+    ) -> Result<Result<String, MemoryProjectionError>, mpsc::error::TryRecvError> {
+        self.lines.try_recv()
+    }
+
+    fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+fn spawn_stdout_reader(stdout: ChildStdout) -> ProjectorStdoutReader {
+    let (sender, lines) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let result = read_projector_response_line(&mut reader).await;
+            let terminal = result.is_err();
+            if sender.send(result).await.is_err() {
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+    });
+    ProjectorStdoutReader { lines, task }
+}
+
+async fn read_projector_response_line(
+    reader: &mut BufReader<ChildStdout>,
+) -> Result<String, MemoryProjectionError> {
+    let line = read_capped_line(reader, MAX_PROJECTOR_RESPONSE_LINE_BYTES).await?;
+    let Some(line) = line else {
+        return Err(MemoryProjectionError::failed(
+            "memory projector stdout closed",
+        ));
+    };
+    String::from_utf8(line)
+        .map(|line| line.trim_end_matches(['\r', '\n']).to_string())
+        .map_err(|err| {
+            MemoryProjectionError::invalid_output(
+                "response_not_utf8",
+                format!("response was not UTF-8: {err}"),
+            )
+        })
+}
+
 async fn read_capped_line(
     reader: &mut BufReader<ChildStdout>,
     max_bytes: usize,
@@ -305,14 +395,16 @@ async fn read_capped_line(
             if line.is_empty() {
                 return Ok(None);
             }
-            return Err(MemoryProjectionError::failed(
+            return Err(MemoryProjectionError::invalid_output(
+                "response_without_newline",
                 "memory projector response ended without newline",
             ));
         }
         if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
             let take = newline_index + 1;
             if line.len().saturating_add(take) > max_bytes {
-                return Err(MemoryProjectionError::failed(
+                return Err(MemoryProjectionError::invalid_output(
+                    "response_too_large",
                     "memory projector response exceeded byte limit",
                 ));
             }
@@ -321,7 +413,8 @@ async fn read_capped_line(
             return Ok(Some(line));
         }
         if line.len().saturating_add(available.len()) > max_bytes {
-            return Err(MemoryProjectionError::failed(
+            return Err(MemoryProjectionError::invalid_output(
+                "response_too_large",
                 "memory projector response exceeded byte limit",
             ));
         }
@@ -534,6 +627,45 @@ done
         assert_eq!(first_request["trust_tier"], "main");
         assert_eq!(first_request["history_policy"], "interactive");
         assert_eq!(first_request["sources"][0]["kind"], "session_turn_range");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extra_stdout_line_retires_process_before_later_request() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+starts="$LIONCLAW_SKILL_STATE_DIR/starts"
+count=0
+if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
+printf 'start\n' >> "$starts"
+IFS= read -r _line || exit 0
+printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+if [ "$count" = "0" ]; then
+  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+fi
+"#,
+        );
+        let projector = SkillMemoryProjector::new(config.clone());
+
+        let err = projector
+            .project(request())
+            .await
+            .expect_err("extra stdout response should fail the request");
+
+        assert!(err.to_string().contains("outside the request/response"));
+        let second = projector
+            .project(request())
+            .await
+            .expect("second response should restart");
+        assert!(second.items.is_empty());
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+            "start\nstart\n"
+        );
     }
 
     #[cfg(unix)]

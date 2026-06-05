@@ -129,7 +129,15 @@ pub(crate) enum MemoryProvenanceSource {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryProjectionError {
+    kind: MemoryProjectionErrorKind,
+    audit_reason: &'static str,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryProjectionErrorKind {
+    ProjectorFailed,
+    InvalidOutput,
 }
 
 impl MemoryProjectionError {
@@ -139,8 +147,33 @@ impl MemoryProjectionError {
     )]
     pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self {
+            kind: MemoryProjectionErrorKind::ProjectorFailed,
+            audit_reason: "projector_failed",
             message: message.into(),
         }
+    }
+
+    pub(crate) fn invalid_output(audit_reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind: MemoryProjectionErrorKind::InvalidOutput,
+            audit_reason,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn audit_status(&self) -> &'static str {
+        match self.kind {
+            MemoryProjectionErrorKind::ProjectorFailed => "projector_failed",
+            MemoryProjectionErrorKind::InvalidOutput => "projector_invalid_output",
+        }
+    }
+
+    pub(crate) fn audit_reason(&self) -> &'static str {
+        self.audit_reason
+    }
+
+    pub(crate) fn kind(&self) -> MemoryProjectionErrorKind {
+        self.kind
     }
 }
 
