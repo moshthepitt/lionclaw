@@ -8039,7 +8039,7 @@ mod tests {
         tokio::fs::write(legacy_secret_dir.join("config"), b"Host *\n")
             .await
             .expect("write legacy ssh config");
-        std::fs::set_permissions(&legacy_secret_dir, std::fs::Permissions::from_mode(0o700))
+        std::fs::set_permissions(&legacy_secret_dir, std::fs::Permissions::from_mode(0o500))
             .expect("chmod legacy secret dir");
         let mut plan = test_execution_plan("codex");
         plan.mounts = vec![
@@ -8062,7 +8062,7 @@ mod tests {
 
         let migrated_metadata =
             std::fs::metadata(runtime_home_root.join(".ssh")).expect("stat migrated secret dir");
-        assert_eq!(migrated_metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(migrated_metadata.permissions().mode() & 0o777, 0o500);
         assert_eq!(
             tokio::fs::read_to_string(runtime_home_root.join(".ssh/config"))
                 .await
@@ -14727,13 +14727,10 @@ fn merge_runtime_native_home_entry_blocking(
             if source_metadata.is_dir() {
                 match std::fs::create_dir(destination_path) {
                     Ok(()) => {
-                        std::fs::set_permissions(destination_path, source_metadata.permissions())
-                            .map_err(|err| {
-                                KernelError::Runtime(format!(
-                            "failed to set runtime native home directory permissions '{}': {err}",
-                            destination_path.display()
-                        ))
-                            })?
+                        set_runtime_native_home_directory_permissions_blocking(
+                            destination_path,
+                            runtime_native_home_directory_merge_permissions(&source_metadata),
+                        )?;
                     }
                     Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                         let destination_metadata = std::fs::symlink_metadata(destination_path)
@@ -14751,6 +14748,13 @@ fn merge_runtime_native_home_entry_blocking(
                                 destination_path,
                             ));
                         }
+                        return merge_runtime_native_home_directory_entry_blocking(
+                            source_path,
+                            destination_path,
+                            relative_path,
+                            &source_metadata,
+                            destination_metadata.permissions(),
+                        );
                     }
                     Err(err) => {
                         return Err(KernelError::Runtime(format!(
@@ -14758,11 +14762,13 @@ fn merge_runtime_native_home_entry_blocking(
                             destination_path.display()
                         )))
                     }
-                }
-                return merge_runtime_native_home_directory_contents_unchecked_blocking(
+                };
+                return merge_runtime_native_home_directory_entry_blocking(
                     source_path,
                     destination_path,
                     relative_path,
+                    &source_metadata,
+                    source_metadata.permissions(),
                 );
             }
             return std::fs::rename(source_path, destination_path).map_err(|err| {
@@ -14790,14 +14796,117 @@ fn merge_runtime_native_home_entry_blocking(
                     destination_path,
                 ));
             }
+            return merge_runtime_native_home_directory_entry_blocking(
+                source_path,
+                destination_path,
+                relative_path,
+                &source_metadata,
+                destination_metadata.permissions(),
+            );
         }
     }
+}
 
-    merge_runtime_native_home_directory_contents_unchecked_blocking(
+fn merge_runtime_native_home_directory_entry_blocking(
+    source_path: &Path,
+    destination_path: &Path,
+    relative_path: &Path,
+    source_metadata: &std::fs::Metadata,
+    destination_final_permissions: std::fs::Permissions,
+) -> Result<(), KernelError> {
+    let source_final_permissions = source_metadata.permissions();
+    set_runtime_native_home_directory_permissions_blocking(
+        source_path,
+        runtime_native_home_directory_merge_permissions(source_metadata),
+    )?;
+    set_runtime_native_home_directory_permissions_blocking(
+        destination_path,
+        runtime_native_home_permissions_with_owner_write(destination_final_permissions.clone()),
+    )?;
+
+    let merge_result = merge_runtime_native_home_directory_contents_unchecked_blocking(
         source_path,
         destination_path,
         relative_path,
-    )
+    );
+    let restore_source_result =
+        restore_runtime_native_home_directory_permissions_if_exists_blocking(
+            source_path,
+            source_final_permissions,
+        );
+    let restore_destination_result = set_runtime_native_home_directory_permissions_blocking(
+        destination_path,
+        destination_final_permissions,
+    );
+
+    match merge_result {
+        Ok(()) => {
+            restore_source_result?;
+            restore_destination_result?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = restore_source_result;
+            let _ = restore_destination_result;
+            Err(err)
+        }
+    }
+}
+
+fn runtime_native_home_directory_merge_permissions(
+    source_metadata: &std::fs::Metadata,
+) -> std::fs::Permissions {
+    runtime_native_home_permissions_with_owner_write(source_metadata.permissions())
+}
+
+fn runtime_native_home_permissions_with_owner_write(
+    mut permissions: std::fs::Permissions,
+) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        permissions.set_mode(permissions.mode() | 0o700);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    permissions
+}
+
+fn restore_runtime_native_home_directory_permissions_if_exists_blocking(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<(), KernelError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(KernelError::Runtime(format!(
+                    "runtime native home directory '{}' is not a regular directory",
+                    path.display()
+                )));
+            }
+            set_runtime_native_home_directory_permissions_blocking(path, permissions)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(KernelError::Runtime(format!(
+            "failed to stat runtime native home directory '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn set_runtime_native_home_directory_permissions_blocking(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<(), KernelError> {
+    std::fs::set_permissions(path, permissions).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to set runtime native home directory permissions '{}': {err}",
+            path.display()
+        ))
+    })
 }
 
 fn source_runtime_native_home_entry_is_managed_skill_symlink(
