@@ -143,7 +143,7 @@ use super::{
         RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
-        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -8154,6 +8154,78 @@ mod tests {
             .exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_ignores_legacy_managed_skill_projection_symlinks() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let legacy_skill_link = legacy_home_root.join(".codex/skills/loopback");
+        let destination_skill_link = runtime_home_root.join(".codex/skills/loopback");
+        tokio::fs::create_dir_all(legacy_skill_link.parent().expect("legacy skill parent"))
+            .await
+            .expect("create legacy skill projection");
+        tokio::fs::create_dir_all(
+            destination_skill_link
+                .parent()
+                .expect("destination skill parent"),
+        )
+        .await
+        .expect("create destination skill projection");
+        tokio::fs::write(&legacy_config, b"model = \"gpt-5\"\n")
+            .await
+            .expect("write legacy config");
+        std::os::unix::fs::symlink("/lionclaw/skills/loopback", &legacy_skill_link)
+            .expect("legacy managed skill symlink");
+        std::os::unix::fs::symlink("/lionclaw/skills/loopback", &destination_skill_link)
+            .expect("destination managed skill symlink");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: temp_dir.path().join("skills/loopback"),
+                target: "/lionclaw/skills/loopback".to_string(),
+                access: MountAccess::ReadOnly,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            !legacy_home_root.exists(),
+            "legacy runtime home should be merged after dropping managed projections"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".codex/config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_link(&destination_skill_link)
+                .await
+                .expect("read destination skill link"),
+            PathBuf::from("/lionclaw/skills/loopback")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn materialize_runtime_plan_serializes_legacy_runtime_home_migration() {
         let temp_dir = tempdir().expect("temp dir");
@@ -13863,13 +13935,23 @@ fn merge_runtime_native_home_directory_contents_blocking(
     source_root: &Path,
     destination_root: &Path,
 ) -> Result<(), KernelError> {
-    preflight_runtime_native_home_directory_merge_blocking(source_root, destination_root)?;
-    merge_runtime_native_home_directory_contents_unchecked_blocking(source_root, destination_root)
+    let relative_root = Path::new("");
+    preflight_runtime_native_home_directory_merge_blocking(
+        source_root,
+        destination_root,
+        relative_root,
+    )?;
+    merge_runtime_native_home_directory_contents_unchecked_blocking(
+        source_root,
+        destination_root,
+        relative_root,
+    )
 }
 
 fn preflight_runtime_native_home_directory_merge_blocking(
     source_root: &Path,
     destination_root: &Path,
+    relative_root: &Path,
 ) -> Result<(), KernelError> {
     if runtime_native_home_directory_metadata_blocking(source_root, "legacy runtime native home")?
         .is_none()
@@ -13901,7 +13983,12 @@ fn preflight_runtime_native_home_directory_merge_blocking(
         })?;
         let source_path = entry.path();
         let destination_path = destination_root.join(entry.file_name());
-        preflight_runtime_native_home_entry_merge_blocking(&source_path, &destination_path)?;
+        let relative_path = relative_root.join(entry.file_name());
+        preflight_runtime_native_home_entry_merge_blocking(
+            &source_path,
+            &destination_path,
+            &relative_path,
+        )?;
     }
     Ok(())
 }
@@ -13909,6 +13996,7 @@ fn preflight_runtime_native_home_directory_merge_blocking(
 fn preflight_runtime_native_home_entry_merge_blocking(
     source_path: &Path,
     destination_path: &Path,
+    relative_path: &Path,
 ) -> Result<(), KernelError> {
     let source_metadata = match std::fs::symlink_metadata(source_path) {
         Ok(metadata) => metadata,
@@ -13920,6 +14008,10 @@ fn preflight_runtime_native_home_entry_merge_blocking(
             )))
         }
     };
+
+    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+        return Ok(());
+    }
 
     let destination_metadata = match std::fs::symlink_metadata(destination_path) {
         Ok(metadata) => metadata,
@@ -13943,12 +14035,17 @@ fn preflight_runtime_native_home_entry_merge_blocking(
         ));
     }
 
-    preflight_runtime_native_home_directory_merge_blocking(source_path, destination_path)
+    preflight_runtime_native_home_directory_merge_blocking(
+        source_path,
+        destination_path,
+        relative_path,
+    )
 }
 
 fn merge_runtime_native_home_directory_contents_unchecked_blocking(
     source_root: &Path,
     destination_root: &Path,
+    relative_root: &Path,
 ) -> Result<(), KernelError> {
     if runtime_native_home_directory_metadata_blocking(source_root, "legacy runtime native home")?
         .is_none()
@@ -13980,7 +14077,8 @@ fn merge_runtime_native_home_directory_contents_unchecked_blocking(
         })?;
         let source_path = entry.path();
         let destination_path = destination_root.join(entry.file_name());
-        merge_runtime_native_home_entry_blocking(&source_path, &destination_path)?;
+        let relative_path = relative_root.join(entry.file_name());
+        merge_runtime_native_home_entry_blocking(&source_path, &destination_path, &relative_path)?;
     }
 
     match std::fs::remove_dir(source_root) {
@@ -13996,6 +14094,7 @@ fn merge_runtime_native_home_directory_contents_unchecked_blocking(
 fn merge_runtime_native_home_entry_blocking(
     source_path: &Path,
     destination_path: &Path,
+    relative_path: &Path,
 ) -> Result<(), KernelError> {
     let source_metadata = match std::fs::symlink_metadata(source_path) {
         Ok(metadata) => metadata,
@@ -14007,6 +14106,15 @@ fn merge_runtime_native_home_entry_blocking(
             )))
         }
     };
+
+    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+        return std::fs::remove_file(source_path).map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to remove migrated runtime skill projection '{}': {err}",
+                source_path.display()
+            ))
+        });
+    }
 
     match std::fs::symlink_metadata(destination_path) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -14038,7 +14146,54 @@ fn merge_runtime_native_home_entry_blocking(
         }
     }
 
-    merge_runtime_native_home_directory_contents_unchecked_blocking(source_path, destination_path)
+    merge_runtime_native_home_directory_contents_unchecked_blocking(
+        source_path,
+        destination_path,
+        relative_path,
+    )
+}
+
+fn source_runtime_native_home_entry_is_managed_skill_symlink(
+    relative_path: &Path,
+    source_path: &Path,
+) -> Result<bool, KernelError> {
+    if !runtime_native_home_entry_is_skill_projection_leaf(relative_path) {
+        return Ok(false);
+    }
+    let metadata = match std::fs::symlink_metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat legacy runtime skill projection '{}': {err}",
+                source_path.display()
+            )))
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let target = std::fs::read_link(source_path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to read legacy runtime skill projection '{}': {err}",
+            source_path.display()
+        ))
+    })?;
+    Ok(target.starts_with(SKILLS_MOUNT_TARGET_ROOT))
+}
+
+fn runtime_native_home_entry_is_skill_projection_leaf(relative_path: &Path) -> bool {
+    let components = relative_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    matches!(
+        components.as_slice(),
+        [".codex", "skills", _] | [".config", "opencode", "skills", _]
+    )
 }
 
 fn runtime_native_home_migration_conflict(
