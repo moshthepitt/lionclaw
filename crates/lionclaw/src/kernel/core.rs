@@ -7988,6 +7988,9 @@ mod tests {
         tokio::fs::write(&legacy_config, b"model = \"gpt-5\"\n")
             .await
             .expect("write legacy config");
+        tokio::fs::write(legacy_home_root.join(RUNTIME_TUI_LOCK_FILE), b"old lock\n")
+            .await
+            .expect("write legacy TUI lock");
         let mut plan = test_execution_plan("codex");
         plan.mounts = vec![
             MountSpec {
@@ -8016,6 +8019,10 @@ mod tests {
                 .await
                 .expect("read migrated config"),
             "model = \"gpt-5\"\n"
+        );
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "legacy TUI lock should not migrate into the native home"
         );
     }
 
@@ -8173,6 +8180,102 @@ mod tests {
             "model = \"gpt-4\"\n"
         );
         assert!(current_state_root.exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_runtime_plan_drops_legacy_runtime_home_tui_locks() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let project_root = temp_dir.path().join("workspace");
+        let runtime_id = "codex";
+        let workspace = "main";
+        let compatibility_key = "compat";
+        let shape_key = "shape";
+        let first_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let second_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let current_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let runtime_home_root = home.runtime_native_home_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            compatibility_key,
+            shape_key,
+        );
+        for legacy_home_root in [
+            first_prior_state_root.join(RUNTIME_NATIVE_HOME_DIR),
+            second_prior_state_root.join(RUNTIME_NATIVE_HOME_DIR),
+            current_state_root.join(RUNTIME_NATIVE_HOME_DIR),
+        ] {
+            tokio::fs::create_dir_all(&legacy_home_root)
+                .await
+                .expect("create legacy home");
+            tokio::fs::write(legacy_home_root.join(RUNTIME_TUI_LOCK_FILE), b"old lock\n")
+                .await
+                .expect("write legacy TUI lock");
+        }
+        tokio::fs::create_dir_all(&runtime_home_root)
+            .await
+            .expect("create runtime home");
+        tokio::fs::write(
+            runtime_home_root.join(RUNTIME_TUI_LOCK_FILE),
+            b"old destination lock\n",
+        )
+        .await
+        .expect("write stale destination TUI lock");
+        let mut plan = test_execution_plan(runtime_id);
+        plan.mounts = vec![
+            MountSpec {
+                source: current_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan(runtime_id, "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(!first_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .exists());
+        assert!(!second_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .exists());
+        assert!(!current_state_root.join(RUNTIME_NATIVE_HOME_DIR).exists());
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "stale TUI locks should not remain in the mounted native home"
+        );
     }
 
     #[tokio::test]
@@ -8443,7 +8546,10 @@ mod tests {
                 .expect("read destination auth"),
             "{\"token\":\"runtime\"}\n"
         );
-        assert!(runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).is_file());
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "legacy TUI lock should be discarded from the native home"
+        );
     }
 
     #[tokio::test]
@@ -14337,6 +14443,7 @@ fn migrate_legacy_runtime_native_homes_blocking(
     {
         create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
     }
+    remove_runtime_native_home_stale_root_lock_blocking(runtime_home_root)?;
 
     for legacy_home_root in existing_legacy_home_roots {
         let Some(legacy_metadata) = runtime_native_home_directory_metadata_blocking(
@@ -14478,6 +14585,34 @@ fn runtime_native_home_directory_metadata_blocking(
     }
 }
 
+fn remove_runtime_native_home_stale_root_lock_blocking(
+    runtime_home_root: &Path,
+) -> Result<(), KernelError> {
+    let lock_path = runtime_home_root.join(RUNTIME_TUI_LOCK_FILE);
+    let metadata = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat stale runtime native home lock '{}': {err}",
+                lock_path.display()
+            )))
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(KernelError::Conflict(format!(
+            "stale runtime native home lock path '{}' is a directory",
+            lock_path.display()
+        )));
+    }
+    std::fs::remove_file(&lock_path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to remove stale runtime native home lock '{}': {err}",
+            lock_path.display()
+        ))
+    })
+}
+
 fn preflight_legacy_runtime_native_home_migrations_blocking(
     legacy_home_roots: &[PathBuf],
     runtime_home_root: &Path,
@@ -14556,7 +14691,11 @@ fn preflight_legacy_runtime_native_home_source_entry_union_blocking(
         }
     };
 
-    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+    if source_runtime_native_home_entry_is_disposable_lionclaw_state(
+        relative_path,
+        source_path,
+        &source_metadata,
+    )? {
         return Ok(());
     }
 
@@ -14652,7 +14791,11 @@ fn preflight_runtime_native_home_entry_merge_blocking(
         }
     };
 
-    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+    if source_runtime_native_home_entry_is_disposable_lionclaw_state(
+        relative_path,
+        source_path,
+        &source_metadata,
+    )? {
         return Ok(());
     }
 
@@ -14750,10 +14893,14 @@ fn merge_runtime_native_home_entry_blocking(
         }
     };
 
-    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+    if source_runtime_native_home_entry_is_disposable_lionclaw_state(
+        relative_path,
+        source_path,
+        &source_metadata,
+    )? {
         return std::fs::remove_file(source_path).map_err(|err| {
             KernelError::Runtime(format!(
-                "failed to remove migrated runtime skill projection '{}': {err}",
+                "failed to remove migrated LionClaw runtime native home state '{}': {err}",
                 source_path.display()
             ))
         });
@@ -14955,6 +15102,25 @@ fn set_runtime_native_home_directory_permissions_blocking(
             path.display()
         ))
     })
+}
+
+fn source_runtime_native_home_entry_is_disposable_lionclaw_state(
+    relative_path: &Path,
+    source_path: &Path,
+    source_metadata: &std::fs::Metadata,
+) -> Result<bool, KernelError> {
+    if runtime_native_home_entry_is_root_tui_lock_file(relative_path) && !source_metadata.is_dir() {
+        return Ok(true);
+    }
+    source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)
+}
+
+fn runtime_native_home_entry_is_root_tui_lock_file(relative_path: &Path) -> bool {
+    let mut components = relative_path.components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(value)) if value == OsStr::new(RUNTIME_TUI_LOCK_FILE)
+    ) && components.next().is_none()
 }
 
 fn source_runtime_native_home_entry_is_managed_skill_symlink(
