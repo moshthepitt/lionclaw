@@ -8079,6 +8079,107 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_preserves_migrated_runtime_home_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        tokio::fs::create_dir_all(&legacy_home_root)
+            .await
+            .expect("create legacy home");
+        tokio::fs::write(legacy_home_root.join("config.toml"), b"model = \"gpt-5\"\n")
+            .await
+            .expect("write legacy config");
+        std::fs::set_permissions(&legacy_home_root, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod legacy home root");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let metadata = std::fs::metadata(&runtime_home_root).expect("stat runtime home root");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join("config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_plan_reset_migrates_legacy_home_before_removing_session_state() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        tokio::fs::create_dir_all(&legacy_home_root)
+            .await
+            .expect("create legacy home");
+        tokio::fs::write(legacy_home_root.join("config.toml"), b"model = \"gpt-5\"\n")
+            .await
+            .expect("write legacy config");
+        tokio::fs::write(
+            runtime_state_root.join("turn-state.json"),
+            b"session scoped\n",
+        )
+        .await
+        .expect("write session state");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .reset_runtime_plan_state(&plan)
+            .await
+            .expect("reset runtime plan state");
+
+        assert!(
+            !runtime_state_root.exists(),
+            "retry reset should remove session-scoped runtime state"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join("config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+    }
+
     #[tokio::test]
     async fn materialize_runtime_plan_migrates_matching_legacy_home_from_prior_session() {
         let temp_dir = tempdir().expect("temp dir");
@@ -12623,6 +12724,21 @@ async fn create_owner_private_directory_all(
     create_owner_private_directory_all_impl(root, path).await
 }
 
+async fn ensure_runtime_native_home_mount_source(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<(), KernelError> {
+    if tokio::fs::try_exists(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to inspect runtime native home directory '{}': {err}",
+            path.display()
+        ))
+    })? {
+        return ensure_existing_directory_is_safe(path).await;
+    }
+    create_owner_private_directory_all(root, path).await
+}
+
 #[cfg(unix)]
 async fn create_owner_private_directory_all_impl(
     root: Option<&Path>,
@@ -14513,27 +14629,30 @@ fn migrate_legacy_runtime_native_homes_blocking(
         runtime_home_root,
     )?;
 
-    let runtime_home_metadata = match runtime_native_home_directory_metadata_blocking(
-        runtime_home_root,
-        "runtime native home",
-    )? {
-        Some(metadata) => metadata,
-        None => {
-            create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
-            runtime_native_home_directory_metadata_blocking(
-                runtime_home_root,
-                "runtime native home",
-            )?
-            .ok_or_else(|| {
-                KernelError::Runtime(format!(
-                    "runtime native home '{}' was not created before migrating legacy homes",
-                    runtime_home_root.display()
-                ))
-            })?
-        }
-    };
+    let (runtime_home_metadata, runtime_home_created) =
+        match runtime_native_home_directory_metadata_blocking(
+            runtime_home_root,
+            "runtime native home",
+        )? {
+            Some(metadata) => (metadata, false),
+            None => {
+                create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
+                let metadata = runtime_native_home_directory_metadata_blocking(
+                    runtime_home_root,
+                    "runtime native home",
+                )?
+                .ok_or_else(|| {
+                    KernelError::Runtime(format!(
+                        "runtime native home '{}' was not created before migrating legacy homes",
+                        runtime_home_root.display()
+                    ))
+                })?;
+                (metadata, true)
+            }
+        };
     remove_runtime_native_home_stale_root_lock_blocking(runtime_home_root, &runtime_home_metadata)?;
 
+    let mut destination_has_native_contents = !runtime_home_created;
     for legacy_home_root in existing_legacy_home_roots {
         let Some(legacy_metadata) = runtime_native_home_directory_metadata_blocking(
             &legacy_home_root,
@@ -14553,13 +14672,19 @@ fn migrate_legacy_runtime_native_homes_blocking(
                 legacy_home_root.display()
             ))
         })?;
+        let destination_final_permissions = if destination_has_native_contents {
+            runtime_home_metadata.permissions()
+        } else {
+            legacy_metadata.permissions()
+        };
         merge_runtime_native_home_directory_entry_blocking(
             &legacy_home_root,
             runtime_home_root,
             Path::new(""),
             &legacy_metadata,
-            runtime_home_metadata.permissions(),
+            destination_final_permissions,
         )?;
+        destination_has_native_contents = true;
     }
 
     Ok(true)
@@ -17709,10 +17834,16 @@ impl Kernel {
         for mount in &plan.mounts {
             if matches!(
                 mount.target.as_str(),
-                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET | DRAFTS_MOUNT_TARGET
+                RUNTIME_MOUNT_TARGET | DRAFTS_MOUNT_TARGET
             ) {
                 create_owner_private_directory_all(self.runtime_root.as_deref(), &mount.source)
                     .await?;
+            } else if mount.target == RUNTIME_HOME_MOUNT_TARGET {
+                ensure_runtime_native_home_mount_source(
+                    self.runtime_root.as_deref(),
+                    &mount.source,
+                )
+                .await?;
             }
         }
 
@@ -17747,12 +17878,11 @@ impl Kernel {
         })?;
         create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_parent)
             .await?;
-        let runtime_home_root_for_ensure = runtime_home_root.to_path_buf();
         let runtime_root = self.runtime_root.clone();
         let runtime_state_root = runtime_state_root.to_path_buf();
         let runtime_home_parent = runtime_home_parent.to_path_buf();
         let runtime_home_root = runtime_home_root.to_path_buf();
-        let runtime_home_exists = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _migration_lock =
                 acquire_runtime_native_home_migration_lock_blocking(&runtime_home_parent)?;
             migrate_legacy_runtime_native_homes_blocking(
@@ -17763,9 +17893,6 @@ impl Kernel {
         })
         .await
         .map_err(|err| internal(err.into()))??;
-        if runtime_home_exists {
-            ensure_owner_private_directory(&runtime_home_root_for_ensure).await?;
-        }
         Ok(())
     }
 
@@ -17828,6 +17955,7 @@ impl Kernel {
         &self,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
+        self.migrate_legacy_runtime_native_home(plan).await?;
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return Ok(());
         };
