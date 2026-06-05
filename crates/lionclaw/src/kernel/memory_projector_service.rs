@@ -276,6 +276,7 @@ fn configure_projector_process_group(command: &mut Command) {
 
 #[cfg(unix)]
 fn configure_projector_process_group_for_platform(command: &mut Command) {
+    // This is the v1 cleanup boundary; projector helpers must not detach from it.
     command.process_group(0);
 }
 
