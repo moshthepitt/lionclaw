@@ -50,7 +50,7 @@ impl AppliedState {
         let skills = materialize_applied_skills(
             &inputs.skills_root,
             inputs.skills,
-            &inputs.channel_skill_aliases,
+            &inputs.host_only_skill_aliases,
         )?;
         let memory_projector = resolve_applied_memory_projector(home, config, &skills)?;
         Ok(Self::from_parts(skills, inputs.channels, memory_projector))
@@ -113,6 +113,11 @@ impl AppliedState {
             .channels
             .iter()
             .map(|channel| channel.skill_alias.as_str())
+            .chain(
+                self.memory_projector
+                    .as_ref()
+                    .map(|projector| projector.skill_alias.as_str()),
+            )
             .collect::<BTreeSet<_>>();
         self.skills
             .iter()
@@ -175,7 +180,7 @@ struct AppliedStateInputs {
     skills_root: PathBuf,
     skills: Vec<AppliedSkill>,
     channels: Vec<AppliedChannel>,
-    channel_skill_aliases: BTreeSet<String>,
+    host_only_skill_aliases: BTreeSet<String>,
 }
 
 fn read_applied_state_inputs(
@@ -188,10 +193,11 @@ fn read_applied_state_inputs(
     let mut skill_aliases = BTreeSet::new();
     let mut skill_ids = BTreeSet::new();
     let mut channel_ids = BTreeSet::new();
-    let channel_skill_aliases = config
+    let host_only_skill_aliases = config
         .channels
         .iter()
         .map(|channel| channel.skill.clone())
+        .chain(config.memory.projector_skill.clone())
         .collect::<BTreeSet<_>>();
     let mut entries = fs::read_dir(&skills_root)
         .with_context(|| format!("failed to read directory {}", skills_root.display()))?
@@ -237,7 +243,7 @@ fn read_applied_state_inputs(
         let skill = AppliedSkill::from_installed(
             &skills_root,
             entry.path(),
-            channel_skill_aliases.contains(alias.as_str()),
+            host_only_skill_aliases.contains(alias.as_str()),
         )?;
         if !skill_ids.insert(skill.skill_id.clone()) {
             return Err(anyhow!(
@@ -271,7 +277,7 @@ fn read_applied_state_inputs(
         skills_root,
         skills,
         channels,
-        channel_skill_aliases,
+        host_only_skill_aliases,
     })
 }
 
@@ -355,7 +361,7 @@ fn applied_state_fingerprint(
 fn materialize_applied_skills(
     skills_root: &Path,
     skills: Vec<AppliedSkill>,
-    channel_skill_aliases: &BTreeSet<String>,
+    host_only_skill_aliases: &BTreeSet<String>,
 ) -> Result<Vec<AppliedSkill>> {
     if skills.is_empty() {
         return Ok(skills);
@@ -378,7 +384,7 @@ fn materialize_applied_skills(
             let loaded = AppliedSkill::from_installed(
                 &applied_root,
                 applied_root.join(&skill.alias),
-                channel_skill_aliases.contains(skill.alias.as_str()),
+                host_only_skill_aliases.contains(skill.alias.as_str()),
             )?;
             validate_materialized_skill(&expected_skills, &loaded)?;
             Ok(loaded)
@@ -1003,6 +1009,21 @@ mod tests {
         skill
     }
 
+    fn write_runtime_skill_facet(
+        skill: &Path,
+        alias: &str,
+        description: &str,
+    ) -> std::path::PathBuf {
+        let facet = skill.join("runtime").join(alias);
+        fs::create_dir_all(&facet).expect("runtime facet dir");
+        fs::write(
+            facet.join("SKILL.md"),
+            format!("---\nname: {alias}\ndescription: {description}\n---\n"),
+        )
+        .expect("runtime facet skill md");
+        facet
+    }
+
     async fn configure_memory_projector(home: &LionClawHome, alias: &str) {
         let mut config = crate::operator::config::OperatorConfig::load(home)
             .await
@@ -1082,6 +1103,41 @@ mod tests {
             .skill_root
             .starts_with(home.skills_dir().join(".applied")));
         assert_eq!(projector.state_dir, home.skill_state_dir("memory-core"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_visible_skills_exclude_configured_memory_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        write_memory_projector_skill(&home, "memory-core");
+        configure_memory_projector(&home, "memory-core").await;
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+
+        assert!(applied.runtime_visible_skills().is_empty());
+        assert!(applied.attached_runtime_visible_skills().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_visible_skills_project_memory_projector_runtime_facet_only() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let skill = write_memory_projector_skill(&home, "memory-core");
+        write_runtime_skill_facet(&skill, "memory-core", "memory runtime facet");
+        configure_memory_projector(&home, "memory-core").await;
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+        let runtime_skills = applied.runtime_visible_skills();
+
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].alias, "memory-core");
+        assert_eq!(runtime_skills[0].description, "memory runtime facet");
+        assert!(runtime_skills[0]
+            .snapshot_path
+            .ends_with("runtime/memory-core"));
+        assert!(applied.attached_runtime_visible_skills().is_empty());
     }
 
     #[tokio::test]
