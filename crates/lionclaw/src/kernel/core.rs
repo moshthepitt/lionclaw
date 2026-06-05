@@ -71,7 +71,7 @@ use crate::{
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, LionClawHome, RUNTIME_NATIVE_HOME_DIR, RUNTIME_PROJECTS_DIR,
-        RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
+        RUNTIME_SESSIONS_DIR, RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
     },
     project_inventory::{
         ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
@@ -8020,6 +8020,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialize_runtime_plan_migrates_matching_legacy_home_from_prior_session() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let project_root = temp_dir.path().join("workspace");
+        let runtime_id = "codex";
+        let workspace = "main";
+        let compatibility_key = "compat";
+        let shape_key = "shape";
+        let prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let current_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let other_shape_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            "shape-other",
+        );
+        let runtime_home_root = home.runtime_native_home_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            compatibility_key,
+            shape_key,
+        );
+        let prior_config = prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/config.toml");
+        let other_shape_config = other_shape_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/config.toml");
+        tokio::fs::create_dir_all(prior_config.parent().expect("prior config parent"))
+            .await
+            .expect("create prior legacy home");
+        tokio::fs::write(&prior_config, b"model = \"gpt-5\"\n")
+            .await
+            .expect("write prior config");
+        tokio::fs::create_dir_all(
+            other_shape_config
+                .parent()
+                .expect("other shape config parent"),
+        )
+        .await
+        .expect("create other shape legacy home");
+        tokio::fs::write(&other_shape_config, b"model = \"gpt-4\"\n")
+            .await
+            .expect("write other shape config");
+        let mut plan = test_execution_plan(runtime_id);
+        plan.mounts = vec![
+            MountSpec {
+                source: current_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan(runtime_id, "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            !prior_state_root.join(RUNTIME_NATIVE_HOME_DIR).exists(),
+            "prior matching legacy runtime home should be migrated"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".codex/config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&other_shape_config)
+                .await
+                .expect("read other shape config"),
+            "model = \"gpt-4\"\n"
+        );
+        assert!(current_state_root.exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_runtime_plan_reports_conflicting_prior_legacy_homes_without_moving_data() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let project_root = temp_dir.path().join("workspace");
+        let runtime_id = "codex";
+        let workspace = "main";
+        let compatibility_key = "compat";
+        let shape_key = "shape";
+        let first_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let second_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let current_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let runtime_home_root = home.runtime_native_home_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            compatibility_key,
+            shape_key,
+        );
+        let first_config = first_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/config.toml");
+        let second_config = second_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/config.toml");
+        tokio::fs::create_dir_all(first_config.parent().expect("first config parent"))
+            .await
+            .expect("create first prior legacy home");
+        tokio::fs::create_dir_all(second_config.parent().expect("second config parent"))
+            .await
+            .expect("create second prior legacy home");
+        tokio::fs::write(&first_config, b"model = \"gpt-5\"\n")
+            .await
+            .expect("write first prior config");
+        tokio::fs::write(&second_config, b"model = \"gpt-4\"\n")
+            .await
+            .expect("write second prior config");
+        let mut plan = test_execution_plan(runtime_id);
+        plan.mounts = vec![
+            MountSpec {
+                source: current_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let err = kernel
+            .materialize_runtime_plan(runtime_id, "codex", &plan)
+            .await
+            .expect_err("conflicting prior legacy homes should not be merged");
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("cannot migrate legacy runtime native home entry")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&first_config)
+                .await
+                .expect("read first prior config"),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&second_config)
+                .await
+                .expect("read second prior config"),
+            "model = \"gpt-4\"\n"
+        );
+        assert!(!runtime_home_root.join(".codex/config.toml").exists());
+    }
+
+    #[tokio::test]
     async fn materialize_runtime_plan_merges_legacy_runtime_home_into_existing_destination() {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
@@ -13919,58 +14121,142 @@ fn acquire_runtime_native_home_migration_lock_blocking(
     Ok(RuntimeNativeHomeMigrationLock { _file: file })
 }
 
-fn migrate_legacy_runtime_native_home_blocking(
-    legacy_home_root: &Path,
+fn migrate_legacy_runtime_native_homes_blocking(
+    runtime_root: Option<&Path>,
+    runtime_state_root: &Path,
     runtime_home_root: &Path,
 ) -> Result<bool, KernelError> {
-    let Some(_) = runtime_native_home_directory_metadata_blocking(
-        legacy_home_root,
-        "legacy runtime native home",
-    )?
-    else {
+    let legacy_home_roots = legacy_runtime_native_home_roots_blocking(runtime_state_root)?;
+    let mut existing_legacy_home_roots = Vec::new();
+    for legacy_home_root in legacy_home_roots {
+        if legacy_home_root == runtime_home_root {
+            continue;
+        }
+        if runtime_native_home_directory_metadata_blocking(
+            &legacy_home_root,
+            "legacy runtime native home",
+        )?
+        .is_some()
+        {
+            existing_legacy_home_roots.push(legacy_home_root);
+        }
+    }
+
+    if existing_legacy_home_roots.is_empty() {
         return runtime_native_home_directory_metadata_blocking(
             runtime_home_root,
             "runtime native home",
         )
         .map(|metadata| metadata.is_some());
-    };
+    }
+
+    preflight_legacy_runtime_native_home_migrations_blocking(
+        &existing_legacy_home_roots,
+        runtime_home_root,
+    )?;
 
     if runtime_native_home_directory_metadata_blocking(runtime_home_root, "runtime native home")?
         .is_none()
     {
-        match std::fs::rename(legacy_home_root, runtime_home_root) {
-            Ok(()) => return Ok(true),
-            Err(err) => {
-                if runtime_native_home_directory_metadata_blocking(
-                    legacy_home_root,
-                    "legacy runtime native home",
-                )?
-                .is_none()
-                {
-                    return runtime_native_home_directory_metadata_blocking(
-                        runtime_home_root,
-                        "runtime native home",
-                    )
-                    .map(|metadata| metadata.is_some());
-                }
-                if runtime_native_home_directory_metadata_blocking(
-                    runtime_home_root,
-                    "runtime native home",
-                )?
-                .is_none()
-                {
-                    return Err(KernelError::Runtime(format!(
-                        "failed to migrate legacy runtime native home '{}' to '{}': {err}",
-                        legacy_home_root.display(),
-                        runtime_home_root.display()
-                    )));
-                }
-            }
-        }
+        create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
     }
 
-    merge_runtime_native_home_directory_contents_blocking(legacy_home_root, runtime_home_root)?;
+    for legacy_home_root in existing_legacy_home_roots {
+        merge_runtime_native_home_directory_contents_unchecked_blocking(
+            &legacy_home_root,
+            runtime_home_root,
+            Path::new(""),
+        )?;
+    }
+
     Ok(true)
+}
+
+fn legacy_runtime_native_home_roots_blocking(
+    runtime_state_root: &Path,
+) -> Result<Vec<PathBuf>, KernelError> {
+    let current_legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+    let Some(shape_key) = runtime_state_root.file_name().map(OsString::from) else {
+        return Ok(vec![current_legacy_home_root]);
+    };
+    let Some(compatibility_dir) = runtime_state_root.parent() else {
+        return Ok(vec![current_legacy_home_root]);
+    };
+    let Some(compatibility_key) = compatibility_dir.file_name().map(OsString::from) else {
+        return Ok(vec![current_legacy_home_root]);
+    };
+    let Some(session_dir) = compatibility_dir.parent() else {
+        return Ok(vec![current_legacy_home_root]);
+    };
+    let Some(sessions_root) = session_dir.parent() else {
+        return Ok(vec![current_legacy_home_root]);
+    };
+    if sessions_root.file_name() != Some(OsStr::new(RUNTIME_SESSIONS_DIR)) {
+        return Ok(vec![current_legacy_home_root]);
+    }
+    if !runtime_native_home_scan_regular_directory_exists_blocking(
+        sessions_root,
+        "runtime sessions root",
+    )? {
+        return Ok(vec![current_legacy_home_root]);
+    }
+
+    let mut roots = Vec::new();
+    let entries = std::fs::read_dir(sessions_root).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to read runtime sessions root '{}': {err}",
+            sessions_root.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to read runtime sessions root '{}': {err}",
+                sessions_root.display()
+            ))
+        })?;
+        let session_dir = entry.path();
+        if !runtime_native_home_scan_regular_directory_exists_blocking(
+            &session_dir,
+            "runtime session directory",
+        )? {
+            continue;
+        }
+        let compatibility_dir = session_dir.join(&compatibility_key);
+        if !runtime_native_home_scan_regular_directory_exists_blocking(
+            &compatibility_dir,
+            "runtime compatibility directory",
+        )? {
+            continue;
+        }
+        let shape_dir = compatibility_dir.join(&shape_key);
+        if !runtime_native_home_scan_regular_directory_exists_blocking(
+            &shape_dir,
+            "runtime shape directory",
+        )? {
+            continue;
+        }
+        roots.push(shape_dir.join(RUNTIME_NATIVE_HOME_DIR));
+    }
+
+    roots.push(current_legacy_home_root);
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn runtime_native_home_scan_regular_directory_exists_blocking(
+    path: &Path,
+    label: &str,
+) -> Result<bool, KernelError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(!metadata.file_type().is_symlink() && metadata.is_dir()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(KernelError::Runtime(format!(
+            "failed to stat {label} '{}': {err}",
+            path.display()
+        ))),
+    }
 }
 
 fn runtime_native_home_directory_metadata_blocking(
@@ -13995,20 +14281,116 @@ fn runtime_native_home_directory_metadata_blocking(
     }
 }
 
-fn merge_runtime_native_home_directory_contents_blocking(
-    source_root: &Path,
-    destination_root: &Path,
+fn preflight_legacy_runtime_native_home_migrations_blocking(
+    legacy_home_roots: &[PathBuf],
+    runtime_home_root: &Path,
 ) -> Result<(), KernelError> {
-    let relative_root = Path::new("");
-    preflight_runtime_native_home_directory_merge_blocking(
-        source_root,
-        destination_root,
-        relative_root,
-    )?;
-    merge_runtime_native_home_directory_contents_unchecked_blocking(
-        source_root,
-        destination_root,
-        relative_root,
+    if runtime_native_home_directory_metadata_blocking(runtime_home_root, "runtime native home")?
+        .is_some()
+    {
+        for legacy_home_root in legacy_home_roots {
+            preflight_runtime_native_home_directory_merge_blocking(
+                legacy_home_root,
+                runtime_home_root,
+                Path::new(""),
+            )?;
+        }
+    }
+
+    let mut seen_entries = BTreeMap::new();
+    for legacy_home_root in legacy_home_roots {
+        preflight_legacy_runtime_native_home_source_union_blocking(
+            legacy_home_root,
+            Path::new(""),
+            &mut seen_entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_legacy_runtime_native_home_source_union_blocking(
+    source_root: &Path,
+    relative_root: &Path,
+    seen_entries: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), KernelError> {
+    if runtime_native_home_directory_metadata_blocking(source_root, "legacy runtime native home")?
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(source_root).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to read legacy runtime native home '{}': {err}",
+            source_root.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to read legacy runtime native home '{}': {err}",
+                source_root.display()
+            ))
+        })?;
+        let source_path = entry.path();
+        let relative_path = relative_root.join(entry.file_name());
+        preflight_legacy_runtime_native_home_source_entry_union_blocking(
+            &source_path,
+            &relative_path,
+            seen_entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_legacy_runtime_native_home_source_entry_union_blocking(
+    source_path: &Path,
+    relative_path: &Path,
+    seen_entries: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<(), KernelError> {
+    let source_metadata = match std::fs::symlink_metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat legacy runtime native home entry '{}': {err}",
+                source_path.display()
+            )))
+        }
+    };
+
+    if source_runtime_native_home_entry_is_managed_skill_symlink(relative_path, source_path)? {
+        return Ok(());
+    }
+
+    if let Some(previous_path) = seen_entries.get(relative_path) {
+        let previous_metadata = std::fs::symlink_metadata(previous_path).map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to stat legacy runtime native home entry '{}': {err}",
+                previous_path.display()
+            ))
+        })?;
+        if source_metadata.file_type().is_symlink()
+            || previous_metadata.file_type().is_symlink()
+            || !source_metadata.is_dir()
+            || !previous_metadata.is_dir()
+        {
+            return Err(runtime_native_home_migration_conflict(
+                source_path,
+                previous_path,
+            ));
+        }
+    } else {
+        seen_entries.insert(relative_path.to_path_buf(), source_path.to_path_buf());
+    }
+
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Ok(());
+    }
+    preflight_legacy_runtime_native_home_source_union_blocking(
+        source_path,
+        relative_path,
+        seen_entries,
     )
 }
 
@@ -16714,26 +17096,9 @@ impl Kernel {
         let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
-        if legacy_home_root == runtime_home_root {
+        let current_legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        if current_legacy_home_root == runtime_home_root {
             return Ok(());
-        }
-
-        let legacy_metadata = match tokio::fs::symlink_metadata(&legacy_home_root).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(KernelError::Runtime(format!(
-                    "failed to stat legacy runtime native home '{}': {err}",
-                    legacy_home_root.display()
-                )))
-            }
-        };
-        if legacy_metadata.file_type().is_symlink() || !legacy_metadata.is_dir() {
-            return Err(KernelError::Runtime(format!(
-                "legacy runtime native home '{}' is not a regular directory",
-                legacy_home_root.display()
-            )));
         }
 
         let runtime_home_parent = runtime_home_root.parent().ok_or_else(|| {
@@ -16745,12 +17110,18 @@ impl Kernel {
         create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_parent)
             .await?;
         let runtime_home_root_for_ensure = runtime_home_root.to_path_buf();
+        let runtime_root = self.runtime_root.clone();
+        let runtime_state_root = runtime_state_root.to_path_buf();
         let runtime_home_parent = runtime_home_parent.to_path_buf();
         let runtime_home_root = runtime_home_root.to_path_buf();
         let runtime_home_exists = tokio::task::spawn_blocking(move || {
             let _migration_lock =
                 acquire_runtime_native_home_migration_lock_blocking(&runtime_home_parent)?;
-            migrate_legacy_runtime_native_home_blocking(&legacy_home_root, &runtime_home_root)
+            migrate_legacy_runtime_native_homes_blocking(
+                runtime_root.as_deref(),
+                &runtime_state_root,
+                &runtime_home_root,
+            )
         })
         .await
         .map_err(|err| internal(err.into()))??;
