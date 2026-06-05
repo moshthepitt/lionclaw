@@ -21,6 +21,9 @@ use crate::{
     },
     operator::{
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        skill_metadata::{
+            load_memory_projector_metadata, resolve_skill_entrypoint, SkillEntrypointSymlinkPolicy,
+        },
         snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
     },
     project_inventory::ProjectInstanceRuntimeContext,
@@ -33,6 +36,7 @@ pub struct AppliedState {
     skills_by_id: BTreeMap<String, AppliedSkill>,
     skills_by_alias: BTreeMap<String, AppliedSkill>,
     channels_by_id: BTreeMap<String, AppliedChannel>,
+    memory_projector: Option<AppliedMemoryProjector>,
 }
 
 impl AppliedState {
@@ -48,7 +52,8 @@ impl AppliedState {
             inputs.skills,
             &inputs.channel_skill_aliases,
         )?;
-        Ok(Self::from_parts(skills, inputs.channels))
+        let memory_projector = resolve_applied_memory_projector(home, config, &skills)?;
+        Ok(Self::from_parts(skills, inputs.channels, memory_projector))
     }
 
     pub(crate) fn from_home_read_only(
@@ -56,7 +61,12 @@ impl AppliedState {
         config: &OperatorConfig,
     ) -> Result<Self> {
         let inputs = read_applied_state_inputs(home, config)?;
-        Ok(Self::from_parts(inputs.skills, inputs.channels))
+        let memory_projector = resolve_applied_memory_projector(home, config, &inputs.skills)?;
+        Ok(Self::from_parts(
+            inputs.skills,
+            inputs.channels,
+            memory_projector,
+        ))
     }
 
     pub fn skills(&self) -> &[AppliedSkill] {
@@ -84,6 +94,10 @@ impl AppliedState {
 
     pub fn channel(&self, channel_id: &str) -> Option<&AppliedChannel> {
         self.channels_by_id.get(channel_id)
+    }
+
+    pub fn memory_projector(&self) -> Option<&AppliedMemoryProjector> {
+        self.memory_projector.as_ref()
     }
 
     pub fn runtime_visible_skills(&self) -> Vec<AppliedSkill> {
@@ -116,10 +130,14 @@ impl AppliedState {
     }
 
     pub fn fingerprint(&self) -> String {
-        applied_state_fingerprint(&self.skills, &self.channels)
+        applied_state_fingerprint(&self.skills, &self.channels, self.memory_projector.as_ref())
     }
 
-    fn from_parts(skills: Vec<AppliedSkill>, channels: Vec<AppliedChannel>) -> Self {
+    fn from_parts(
+        skills: Vec<AppliedSkill>,
+        channels: Vec<AppliedChannel>,
+        memory_projector: Option<AppliedMemoryProjector>,
+    ) -> Self {
         let skills_by_id = skills
             .iter()
             .cloned()
@@ -142,6 +160,7 @@ impl AppliedState {
             skills_by_id,
             skills_by_alias,
             channels_by_id,
+            memory_projector,
         }
     }
 }
@@ -273,9 +292,13 @@ fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel]) -> String {
+fn applied_state_fingerprint(
+    skills: &[AppliedSkill],
+    channels: &[AppliedChannel],
+    memory_projector: Option<&AppliedMemoryProjector>,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"lionclaw-applied-state-v1\0");
+    hasher.update(b"lionclaw-applied-state-v2\0");
     hasher.update(applied_skills_fingerprint(skills).as_bytes());
     hasher.update(b"\0");
 
@@ -311,6 +334,18 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
                 hasher.update(thread_ref.as_bytes());
                 hasher.update(b"\0");
             }
+        }
+    }
+    match memory_projector {
+        Some(projector) => {
+            hasher.update(b"memory_projector\0");
+            hasher.update(projector.skill_alias.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(projector.command.as_bytes());
+            hasher.update(b"\0");
+        }
+        None => {
+            hasher.update(b"memory_projector_none\0");
         }
     }
 
@@ -612,6 +647,15 @@ pub struct AppliedSkill {
     runtime_facet: Option<AppliedRuntimeSkillFacet>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMemoryProjector {
+    pub skill_alias: String,
+    pub command: String,
+    pub command_path: PathBuf,
+    pub skill_root: PathBuf,
+    pub state_dir: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 struct AppliedRuntimeSkillFacet {
     skill_id: String,
@@ -829,6 +873,41 @@ impl AppliedChannel {
     }
 }
 
+fn resolve_applied_memory_projector(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    skills: &[AppliedSkill],
+) -> Result<Option<AppliedMemoryProjector>> {
+    let Some(alias) = config.memory.projector_skill.as_deref() else {
+        return Ok(None);
+    };
+    validate_skill_alias(alias)?;
+    let skill = skills
+        .iter()
+        .find(|skill| skill.alias == alias)
+        .ok_or_else(|| {
+            anyhow!(
+                "configured memory projector references missing installed skill alias '{alias}'"
+            )
+        })?;
+    let metadata = load_memory_projector_metadata(&skill.snapshot_path)?
+        .ok_or_else(|| anyhow!("configured memory projector skill alias '{alias}' does not declare [memory_projector] metadata"))?;
+    let command_path = resolve_skill_entrypoint(
+        &skill.snapshot_path,
+        &metadata.command,
+        "memory projector command",
+        SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+    )?;
+
+    Ok(Some(AppliedMemoryProjector {
+        skill_alias: alias.to_string(),
+        command: metadata.command,
+        command_path,
+        skill_root: skill.snapshot_path.clone(),
+        state_dir: home.skill_state_dir(alias),
+    }))
+}
+
 pub fn canonical_skills_root(home: &LionClawHome) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(home.skills_dir())
         .with_context(|| format!("failed to stat {}", home.skills_dir().display()))?;
@@ -896,6 +975,34 @@ mod tests {
         LionClawHome::new(project.instance.home)
     }
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    fn write_memory_projector_skill(home: &LionClawHome, alias: &str) -> std::path::PathBuf {
+        let skill = home.skills_dir().join(alias);
+        fs::create_dir_all(skill.join("scripts")).expect("scripts dir");
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {alias}\ndescription: memory\n---\n"),
+        )
+        .expect("skill md");
+        fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&skill.join("scripts/projector"));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+        )
+        .expect("metadata");
+        skill
+    }
+
     #[tokio::test]
     async fn load_ignores_hidden_staging_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -947,6 +1054,76 @@ mod tests {
 
         assert_eq!(skill.source, skill.snapshot_path.display().to_string());
         assert!(skill.reference.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_resolves_configured_memory_projector_from_applied_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        write_memory_projector_skill(&home, "memory-core");
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.memory.projector_skill = Some("memory-core".to_string());
+        config.save(&home).await.expect("save config");
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+        let projector = applied.memory_projector().expect("projector");
+
+        assert_eq!(projector.skill_alias, "memory-core");
+        assert_eq!(projector.command, "scripts/projector");
+        assert!(projector.command_path.ends_with("scripts/projector"));
+        assert!(projector
+            .skill_root
+            .starts_with(home.skills_dir().join(".applied")));
+        assert_eq!(projector.state_dir, home.skill_state_dir("memory-core"));
+    }
+
+    #[tokio::test]
+    async fn load_rejects_missing_configured_memory_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.memory.projector_skill = Some("missing".to_string());
+        config.save(&home).await.expect("save config");
+
+        let err = AppliedState::load(&home)
+            .await
+            .expect_err("missing projector alias should fail");
+
+        assert!(
+            err.to_string().contains("missing installed skill alias"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_projector_config_changes_applied_state_fingerprint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        write_memory_projector_skill(&home, "memory-core");
+
+        let without_projector = AppliedState::load(&home)
+            .await
+            .expect("load state without projector");
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.memory.projector_skill = Some("memory-core".to_string());
+        config.save(&home).await.expect("save config");
+
+        let with_projector = AppliedState::load(&home)
+            .await
+            .expect("load state with projector");
+
+        assert_ne!(
+            without_projector.fingerprint(),
+            with_projector.fingerprint()
+        );
     }
 
     #[cfg(unix)]

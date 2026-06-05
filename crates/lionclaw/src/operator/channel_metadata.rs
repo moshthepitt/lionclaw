@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,10 +10,17 @@ use serde::Deserialize;
 use crate::{
     home::LionClawHome,
     kernel::skills::validate_skill_alias,
-    operator::{config::ChannelLaunchMode, snapshot::installed_snapshot_matches_source},
+    operator::{
+        config::ChannelLaunchMode,
+        skill_metadata::{
+            canonical_skill_dir, resolve_skill_entrypoint, skill_metadata_declares_channel,
+            validate_skill_entrypoint_path, SkillEntrypointSymlinkPolicy, SKILL_METADATA_FILE,
+        },
+        snapshot::installed_snapshot_matches_source,
+    },
 };
 
-pub const CHANNEL_METADATA_FILE: &str = "lionclaw.toml";
+pub const CHANNEL_METADATA_FILE: &str = SKILL_METADATA_FILE;
 pub const DEFAULT_CHANNEL_WORKER: &str = "scripts/worker";
 const RESERVED_CHANNEL_ENV_PREFIX: &str = "LIONCLAW_";
 
@@ -392,6 +399,9 @@ fn discover_installed_channel_skill(
         if !skill_dir.join(CHANNEL_METADATA_FILE).exists() {
             continue;
         }
+        if !skill_metadata_declares_channel(&skill_dir)? {
+            continue;
+        }
         let skill_dir = fs::canonicalize(&skill_dir)
             .with_context(|| format!("failed to resolve {}", skill_dir.display()))?;
         let metadata = load_channel_metadata(&skill_dir)
@@ -465,18 +475,6 @@ pub(crate) fn installed_channel_snapshot_is_from_bundled_source(
     installed_snapshot_matches_source(snapshot_dir, bundled_skill_dir)
 }
 
-fn canonical_skill_dir(path: &Path) -> Result<PathBuf> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat skill directory {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("skill directory {} must not be a symlink", path.display());
-    }
-    if !metadata.is_dir() {
-        bail!("skill directory {} is not a directory", path.display());
-    }
-    fs::canonicalize(path).with_context(|| format!("failed to resolve {}", path.display()))
-}
-
 fn validate_channel_worker(skill_dir: &Path, worker: &str) -> Result<PathBuf> {
     resolve_channel_entrypoint(skill_dir, worker, "channel worker")
 }
@@ -509,61 +507,16 @@ fn resolve_channel_entrypoint(
     relative_path: &str,
     label: &str,
 ) -> Result<PathBuf> {
-    validate_channel_entrypoint_path(relative_path, label)?;
-    let skill_dir = canonical_skill_dir(skill_dir)?;
-    let candidate = skill_dir.join(relative_path);
-    let metadata = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "{label} entrypoint is missing under '{}'; expected '{}'",
-                skill_dir.display(),
-                relative_path
-            );
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to stat {label} {}", candidate.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        bail!("{label} {} must not be a symlink", candidate.display());
-    }
-    if !metadata.is_file() {
-        bail!("{label} {} is not a file", candidate.display());
-    }
-    if !is_executable_file(&metadata) {
-        bail!("{label} {} is not executable", candidate.display());
-    }
-    let canonical = fs::canonicalize(&candidate)
-        .with_context(|| format!("failed to resolve {}", candidate.display()))?;
-    if !canonical.starts_with(&skill_dir) {
-        bail!(
-            "{label} {} escapes skill directory {}",
-            canonical.display(),
-            skill_dir.display()
-        );
-    }
-    Ok(canonical)
+    resolve_skill_entrypoint(
+        skill_dir,
+        relative_path,
+        label,
+        SkillEntrypointSymlinkPolicy::AllowParentSymlinks,
+    )
 }
 
 fn validate_channel_entrypoint_path(relative_path: &str, label: &str) -> Result<()> {
-    if relative_path.is_empty() {
-        bail!("{label} path is required");
-    }
-    let path = Path::new(relative_path);
-    if path.is_absolute() {
-        bail!("{label} path '{relative_path}' must be relative to the skill directory");
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        bail!("{label} path '{relative_path}' must stay inside the skill directory");
-    }
-    Ok(())
+    validate_skill_entrypoint_path(relative_path, label)
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -599,21 +552,6 @@ fn source_bundled_channel_skill_dir(skill_dir_name: &str) -> PathBuf {
 
 fn bundled_channel_skill_name(channel_id: &str) -> String {
     format!("channel-{channel_id}")
-}
-
-fn is_executable_file(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        true
-    }
 }
 
 #[cfg(test)]
@@ -978,6 +916,34 @@ mod tests {
             discovered.skill_dir,
             fs::canonicalize(home.skills_dir().join("telegram")).expect("installed path")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_memory_only_installed_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.skills_dir()).expect("skills");
+        let memory = temp_dir.path().join("memory-core");
+        fs::create_dir_all(memory.join("scripts")).expect("scripts");
+        fs::write(
+            memory.join("SKILL.md"),
+            "---\nname: memory-core\ndescription: memory\n---\n",
+        )
+        .expect("skill");
+        fs::write(memory.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&memory.join("scripts/projector"));
+        fs::write(
+            memory.join("lionclaw.toml"),
+            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+        )
+        .expect("metadata");
+        copy_snapshot_tree(&memory, &home.skills_dir().join("memory-core")).expect("install");
+
+        let err = discover_channel_skill(&home, "memory-core")
+            .expect_err("memory-only skill should not be discovered as a channel");
+
+        assert!(err.to_string().contains("was not found"));
     }
 
     #[cfg(unix)]
