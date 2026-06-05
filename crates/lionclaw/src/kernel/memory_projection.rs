@@ -210,10 +210,11 @@ pub(crate) fn validate_memory_projection(
         {
             return Err(MemoryProjectionInvalidReason::UnsupportedProvenance);
         }
-        projected_bytes = projected_bytes.saturating_add(item.text.len());
-        if projected_bytes > request.max_bytes {
+        let item_bytes = item.text.len();
+        if item_bytes > request.max_bytes.saturating_sub(projected_bytes) {
             return Err(MemoryProjectionInvalidReason::TooManyBytes);
         }
+        projected_bytes += item_bytes;
     }
 
     Ok(ValidMemoryProjection {
