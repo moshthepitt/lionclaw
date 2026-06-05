@@ -634,7 +634,9 @@ IFS= read -r line || exit 0
 request_id=${line#*\"request_id\":\"}
 request_id=${request_id%%\"*}
 if [ "$count" = "0" ]; then
-  printf '%s\n' '__FIRST_RESPONSE__'
+  first_response='__FIRST_RESPONSE__'
+  first_response=${first_response//__REQUEST_ID__/$request_id}
+  printf '%s\n' "$first_response"
 else
   printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 fi
@@ -827,9 +829,9 @@ done
     #[tokio::test]
     async fn fatal_decode_errors_retire_process_and_later_restart() {
         for first_response in [
-            r#"{"projector_id":"memory-core"}"#,
-            r#"{"projector_id":"memory-core","items":[{"kind":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
-            r#"{"projector_id":"memory-core","items":[{"kind":"stable_fact","text":"remembered"}]}"#,
+            r#"{"request_id":"__REQUEST_ID__","projector_id":"memory-core"}"#,
+            r#"{"request_id":"__REQUEST_ID__","projector_id":"memory-core","items":[{"kind":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
+            r#"{"request_id":"__REQUEST_ID__","projector_id":"memory-core","items":[{"kind":"stable_fact","text":"remembered"}]}"#,
         ] {
             let temp_dir = tempfile::tempdir().expect("temp dir");
             let config = write_projector_script(
