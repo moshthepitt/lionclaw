@@ -262,16 +262,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_rejects_empty_projector_id() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items("", vec![memory_candidate("remember this")]);
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("empty projector id is invalid");
+        assert_eq!(err.as_str(), "projector_id_empty");
+    }
+
+    #[test]
+    fn validation_rejects_projector_id_mismatch() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items("other", vec![memory_candidate("remember this")]);
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("projector id mismatch is invalid");
+        assert_eq!(err.as_str(), "projector_id_mismatch");
+    }
+
+    #[test]
+    fn validation_rejects_too_many_items() {
+        let request = MemoryProjectionRequest {
+            max_items: 1,
+            ..request_with_session_turn_source()
+        };
+        let projection = projection_with_items(
+            "test",
+            vec![memory_candidate("first"), memory_candidate("second")],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("too many items are invalid");
+        assert_eq!(err.as_str(), "too_many_items");
+    }
+
+    #[test]
     fn validation_rejects_empty_candidate_text() {
         let request = request_with_session_turn_source();
-        let projection = MemoryProjection {
-            projector_id: "test".to_string(),
-            items: vec![MemoryCandidate {
-                kind: MemoryCandidateKind::StableFact,
-                text: " ".to_string(),
-                provenance: vec![session_turn_provenance(1)],
-            }],
-        };
+        let projection = projection_with_items("test", vec![memory_candidate(" ")]);
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("empty memory text is invalid");
@@ -281,14 +310,13 @@ mod tests {
     #[test]
     fn validation_rejects_missing_provenance() {
         let request = request_with_session_turn_source();
-        let projection = MemoryProjection {
-            projector_id: "test".to_string(),
-            items: vec![MemoryCandidate {
-                kind: MemoryCandidateKind::StableFact,
-                text: "remember this".to_string(),
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
                 provenance: Vec::new(),
+                ..memory_candidate("remember this")
             }],
-        };
+        );
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("missing provenance is invalid");
@@ -298,22 +326,125 @@ mod tests {
     #[test]
     fn validation_rejects_unsupported_provenance() {
         let request = request_with_session_turn_source();
-        let projection = MemoryProjection {
-            projector_id: "test".to_string(),
-            items: vec![MemoryCandidate {
-                kind: MemoryCandidateKind::StableFact,
-                text: "remember this".to_string(),
-                provenance: vec![MemoryProvenance {
-                    source: MemoryProvenanceSource::CompactionSummary,
-                    sequence_no: Some(3),
-                    event_id: None,
-                }],
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![compaction_provenance(3)],
+                ..memory_candidate("remember this")
             }],
-        };
+        );
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("unsupported provenance is invalid");
         assert_eq!(err.as_str(), "unsupported_provenance");
+    }
+
+    #[test]
+    fn validation_rejects_session_turn_at_or_after_before_sequence() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![session_turn_provenance(10)],
+                ..memory_candidate("remember this")
+            }],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("session turn outside the source range is invalid");
+        assert_eq!(err.as_str(), "unsupported_provenance");
+    }
+
+    #[test]
+    fn validation_rejects_missing_provenance_sequence() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![MemoryProvenance {
+                    source: MemoryProvenanceSource::SessionTurn,
+                    sequence_no: None,
+                    event_id: None,
+                }],
+                ..memory_candidate("remember this")
+            }],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("missing provenance sequence is invalid");
+        assert_eq!(err.as_str(), "unsupported_provenance");
+    }
+
+    #[test]
+    fn validation_rejects_blank_provenance_event_id() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![MemoryProvenance {
+                    event_id: Some(" ".to_string()),
+                    ..session_turn_provenance(1)
+                }],
+                ..memory_candidate("remember this")
+            }],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("blank provenance event id is invalid");
+        assert_eq!(err.as_str(), "unsupported_provenance");
+    }
+
+    #[test]
+    fn validation_accepts_supported_session_turn_provenance() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items("test", vec![memory_candidate("remember this")]);
+
+        let valid = validate_memory_projection(&request, "test", &projection)
+            .expect("supported session turn provenance is valid");
+        assert_eq!(valid.projector_id, "test");
+        assert_eq!(valid.item_count, 1);
+        assert_eq!(valid.projected_bytes, "remember this".len());
+    }
+
+    #[test]
+    fn validation_accepts_supported_compaction_provenance() {
+        let request = MemoryProjectionRequest {
+            sources: vec![MemorySourceRef::CompactionSummary {
+                through_sequence_no: 7,
+            }],
+            ..request_with_session_turn_source()
+        };
+        let projection = projection_with_items(
+            "test",
+            vec![MemoryCandidate {
+                provenance: vec![compaction_provenance(7)],
+                ..memory_candidate("remember this")
+            }],
+        );
+
+        let valid = validate_memory_projection(&request, "test", &projection)
+            .expect("supported compaction provenance is valid");
+        assert_eq!(valid.projector_id, "test");
+        assert_eq!(valid.item_count, 1);
+        assert_eq!(valid.projected_bytes, "remember this".len());
+    }
+
+    fn projection_with_items(
+        projector_id: impl Into<String>,
+        items: Vec<MemoryCandidate>,
+    ) -> MemoryProjection {
+        MemoryProjection {
+            projector_id: projector_id.into(),
+            items,
+        }
+    }
+
+    fn memory_candidate(text: impl Into<String>) -> MemoryCandidate {
+        MemoryCandidate {
+            kind: MemoryCandidateKind::StableFact,
+            text: text.into(),
+            provenance: vec![session_turn_provenance(1)],
+        }
     }
 
     fn request_with_session_turn_source() -> MemoryProjectionRequest {
@@ -334,6 +465,14 @@ mod tests {
     fn session_turn_provenance(sequence_no: u64) -> MemoryProvenance {
         MemoryProvenance {
             source: MemoryProvenanceSource::SessionTurn,
+            sequence_no: Some(sequence_no),
+            event_id: None,
+        }
+    }
+
+    fn compaction_provenance(sequence_no: u64) -> MemoryProvenance {
+        MemoryProvenance {
+            source: MemoryProvenanceSource::CompactionSummary,
             sequence_no: Some(sequence_no),
             event_id: None,
         }
