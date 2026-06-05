@@ -213,7 +213,7 @@ struct RuntimeChannelSendContext {
     runtime_id: String,
     runtime_state_root: PathBuf,
     runtime_native_home_root: Option<PathBuf>,
-    runtime_native_home_artifact_roots: Vec<PathBuf>,
+    runtime_native_home_artifact_dirs: Vec<RuntimeNativeHomeArtifactDir>,
     runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
 }
@@ -225,7 +225,12 @@ impl RuntimeChannelSendContext {
 
     fn artifact_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.runtime_state_root.clone()];
-        roots.extend(self.runtime_native_home_artifact_roots.iter().cloned());
+        if let Some(runtime_native_home_root) = &self.runtime_native_home_root {
+            roots.extend(runtime_native_home_artifact_roots(
+                runtime_native_home_root,
+                &self.runtime_native_home_artifact_dirs,
+            ));
+        }
         roots
     }
 
@@ -16194,12 +16199,8 @@ impl Kernel {
                 .await;
         };
         let runtime_native_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
-        let runtime_native_home_artifact_roots = if let Some(runtime_native_home_root) =
-            runtime_native_home_root.as_deref()
-        {
-            let native_home_artifact_dirs =
-                Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?;
-            runtime_native_home_artifact_roots(runtime_native_home_root, &native_home_artifact_dirs)
+        let runtime_native_home_artifact_dirs = if runtime_native_home_root.is_some() {
+            Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?
         } else {
             Vec::new()
         };
@@ -16210,7 +16211,7 @@ impl Kernel {
                 runtime_id: runtime_id.to_string(),
                 runtime_state_root,
                 runtime_native_home_root,
-                runtime_native_home_artifact_roots,
+                runtime_native_home_artifact_dirs,
                 runtime_path_projections: Vec::new(),
                 active: Arc::new(AtomicBool::new(true)),
             },
