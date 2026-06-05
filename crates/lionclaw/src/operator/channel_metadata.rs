@@ -67,6 +67,12 @@ struct ChannelMetadataFile {
     channel: ChannelMetadataSection,
     #[serde(default)]
     contact: Option<ChannelContactMetadataSection>,
+    #[allow(
+        dead_code,
+        reason = "channel metadata parsing allows memory projector metadata in the shared skill metadata file"
+    )]
+    #[serde(default)]
+    memory_projector: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,6 +636,25 @@ mod tests {
             metadata.optional_env,
             vec!["EMAIL_ADMIN_DIGEST_TO", "EMAIL_MAX_MESSAGE_BYTES"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_channel_metadata_with_memory_projector_section() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-memory", "memory");
+        fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&skill.join("scripts/projector"));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"memory\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+
+        assert_eq!(metadata.id, "memory");
+        assert_eq!(metadata.worker, "scripts/worker");
     }
 
     #[test]
