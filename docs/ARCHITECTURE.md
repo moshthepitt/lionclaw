@@ -1009,7 +1009,9 @@ directory, and receives only the fixed kernel environment needed for v1:
 ambient process-start allowlist `PATH`, `PATHEXT`, `SYSTEMROOT`, and
 `SystemRoot` when present. The state directory is host-only selected-instance
 state under `config/skill-state/<alias>` and is not mounted into the agent
-runtime.
+runtime. On Unix, the projector starts in its own process group, and retirement
+signals that group so projector-spawned subprocesses do not outlive the kernel
+instance.
 
 The v1 protocol is JSONL. The kernel writes one `MemoryProjectionRequest` JSON
 object per line to projector stdin and reads one `MemoryProjection` JSON object

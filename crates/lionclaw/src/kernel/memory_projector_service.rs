@@ -15,6 +15,9 @@ use tokio::{
     sync::Mutex,
 };
 
+#[cfg(unix)]
+use rustix::process::{kill_process_group, Pid, Signal};
+
 use crate::applied::{AppliedMemoryProjector, AppliedState};
 
 use super::memory_projection::{
@@ -120,6 +123,7 @@ impl SkillMemoryProjector {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_projector_process_group(&mut command);
         let mut child = command.spawn().map_err(|err| {
             MemoryProjectionError::failed(format!(
                 "spawn memory projector {}: {err}",
@@ -138,12 +142,16 @@ impl SkillMemoryProjector {
             .stderr
             .take()
             .ok_or_else(|| MemoryProjectionError::failed("memory projector stderr missing"))?;
+        #[cfg(unix)]
+        let process_group = child_process_group(&child);
 
         Ok(ResidentMemoryProjectorProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            stderr: spawn_bounded_stderr_reader(stderr),
+            stderr: Some(spawn_bounded_stderr_reader(stderr)),
+            #[cfg(unix)]
+            process_group,
         })
     }
 
@@ -170,7 +178,7 @@ impl MemoryProjector for SkillMemoryProjector {
             self.project_with_process(&mut process, request),
         )
         .await;
-        match result {
+        let projection_result = match result {
             Ok(Ok(projection)) => Ok(projection),
             Ok(Err(err)) => {
                 Self::retire_process(&mut process).await;
@@ -182,7 +190,9 @@ impl MemoryProjector for SkillMemoryProjector {
                     "memory projector request timed out",
                 ))
             }
-        }
+        };
+        drop(process);
+        projection_result
     }
 }
 
@@ -190,7 +200,9 @@ struct ResidentMemoryProjectorProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    stderr: tokio::task::JoinHandle<Vec<u8>>,
+    stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    #[cfg(unix)]
+    process_group: Option<Pid>,
 }
 
 impl ResidentMemoryProjectorProcess {
@@ -221,11 +233,61 @@ impl ResidentMemoryProjectorProcess {
     }
 
     async fn retire(mut self) {
-        drop(self.child.start_kill());
-        drop(self.child.wait().await);
-        self.stderr.abort();
-        drop(self.stderr.await);
+        self.terminate();
+        let _wait_result = self.child.wait().await;
+        self.abort_stderr_reader();
+        if let Some(stderr) = self.stderr.take() {
+            let _stderr_result = stderr.await;
+        }
     }
+
+    fn terminate(&mut self) {
+        self.terminate_process_group();
+        let _kill_result = self.child.start_kill();
+    }
+
+    fn abort_stderr_reader(&mut self) {
+        if let Some(stderr) = &self.stderr {
+            stderr.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminate_process_group(&mut self) {
+        if let Some(process_group) = self.process_group.take() {
+            let _group_kill_result = kill_process_group(process_group, Signal::KILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn terminate_process_group(&mut self) {}
+}
+
+impl Drop for ResidentMemoryProjectorProcess {
+    fn drop(&mut self) {
+        self.terminate();
+        self.abort_stderr_reader();
+    }
+}
+
+fn configure_projector_process_group(command: &mut Command) {
+    configure_projector_process_group_for_platform(command);
+}
+
+#[cfg(unix)]
+fn configure_projector_process_group_for_platform(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_projector_process_group_for_platform(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn child_process_group(child: &Child) -> Option<Pid> {
+    child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw)
 }
 
 async fn read_capped_line(
@@ -253,7 +315,7 @@ async fn read_capped_line(
                     "memory projector response exceeded byte limit",
                 ));
             }
-            line.extend_from_slice(&available[..take]);
+            line.extend(available.iter().take(take).copied());
             reader.consume(take);
             return Ok(Some(line));
         }
@@ -280,7 +342,7 @@ fn spawn_bounded_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHand
             let remaining = MAX_PROJECTOR_STDERR_BYTES.saturating_sub(captured.len());
             if remaining > 0 {
                 let take = cmp::min(read, remaining);
-                captured.extend_from_slice(&buffer[..take]);
+                captured.extend(buffer.iter().take(take).copied());
             }
         }
         captured
@@ -609,6 +671,68 @@ printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
         assert_eq!(
             fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
             "start\nstart\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_retires_projector_process_group() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+(sleep 0.3; printf 'alive\n' > "$LIONCLAW_SKILL_STATE_DIR/child-alive") &
+IFS= read -r _line || exit 0
+sleep 5
+"#,
+        )
+        .with_request_timeout(Duration::from_millis(50));
+        let marker = config.state_dir.join("child-alive");
+        let projector = SkillMemoryProjector::new(config);
+
+        let err = projector
+            .project(request())
+            .await
+            .expect_err("first request should time out");
+        assert!(err.to_string().contains("timed out"));
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !marker.exists(),
+            "projector background child survived timeout retirement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_retires_projector_process_group() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+(sleep 0.3; printf 'alive\n' > "$LIONCLAW_SKILL_STATE_DIR/child-alive") &
+while IFS= read -r _line; do
+  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+done
+"#,
+        );
+        let marker = config.state_dir.join("child-alive");
+        let projector = SkillMemoryProjector::new(config);
+
+        projector
+            .project(request())
+            .await
+            .expect("first response should start resident projector");
+        drop(projector);
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !marker.exists(),
+            "projector background child survived projector drop"
         );
     }
 
