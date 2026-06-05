@@ -70,7 +70,7 @@ use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        runtime_project_partition_key, LionClawHome, RUNTIME_PROJECTS_DIR,
+        runtime_project_partition_key, LionClawHome, RUNTIME_NATIVE_HOME_DIR, RUNTIME_PROJECTS_DIR,
         RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
     },
     project_inventory::{
@@ -551,7 +551,7 @@ struct PreparedAttachedRuntimeLaunch {
 }
 
 struct AttachedRuntimeLaunchLock {
-    _file: std::fs::File,
+    _files: Vec<std::fs::File>,
 }
 
 struct AttachedRuntimeTranscriptProgramExecutor {
@@ -7967,6 +7967,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialize_runtime_plan_migrates_legacy_runtime_home() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
+            .await
+            .expect("create legacy home");
+        tokio::fs::write(&legacy_config, b"model = \"gpt-5\"\n")
+            .await
+            .expect("write legacy config");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            !legacy_home_root.exists(),
+            "legacy runtime home should be moved out of session state"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".codex/config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+    }
+
+    #[tokio::test]
     async fn write_opencode_generated_config_points_to_runtime_agents_file() {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -8559,6 +8606,58 @@ mod tests {
         second_kernel
             .finish_attached_runtime_launch(
                 session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &second_launch.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish second launch");
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_launch_lock_is_shared_by_runtime_home_across_sessions() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (first_kernel, _first_exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let first_session_id = open_test_session(&first_kernel).await;
+        let first_launch = first_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(first_session_id))
+            .await
+            .expect("prepare first attached launch");
+        let (second_kernel, _second_exports) =
+            kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let second_session_id = second_kernel
+            .open_session(SessionOpenRequest {
+                channel_id: "terminal".to_string(),
+                peer_id: "tester-two".to_string(),
+                trust_tier: TrustTier::Main,
+                history_policy: None,
+            })
+            .await
+            .expect("open second session")
+            .session_id;
+
+        let err = match second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
+            .await
+        {
+            Ok(_) => panic!("concurrent attached launch sharing native home should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("already running")
+        ));
+
+        drop(first_launch);
+        let second_launch = second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
+            .await
+            .expect("prepare attached launch after native home lock release");
+        second_kernel
+            .finish_attached_runtime_launch(
+                second_session_id,
                 TEST_TERMINAL_RUNTIME_ID,
                 &second_launch.request.plan,
                 Some(0),
@@ -13445,7 +13544,25 @@ fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str)
     Uuid::new_v5(&Uuid::NAMESPACE_OID, material.as_bytes())
 }
 
+#[cfg(test)]
 fn acquire_attached_runtime_launch_lock_blocking(
+    runtime_state_root: &Path,
+) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    acquire_attached_runtime_launch_locks_blocking(vec![runtime_state_root.to_path_buf()])
+}
+
+fn acquire_attached_runtime_launch_locks_blocking(
+    lock_roots: Vec<PathBuf>,
+) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    let mut files = Vec::with_capacity(lock_roots.len());
+    for lock_root in lock_roots {
+        let lock = acquire_attached_runtime_launch_lock_file_blocking(&lock_root)?;
+        files.extend(lock._files);
+    }
+    Ok(AttachedRuntimeLaunchLock { _files: files })
+}
+
+fn acquire_attached_runtime_launch_lock_file_blocking(
     runtime_state_root: &Path,
 ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
     use rustix::fs::{openat, Mode, OFlags};
@@ -13489,9 +13606,9 @@ fn acquire_attached_runtime_launch_lock_blocking(
     }
 
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(AttachedRuntimeLaunchLock { _file: file }),
+        Ok(()) => Ok(AttachedRuntimeLaunchLock { _files: vec![file] }),
         Err(err) if runtime_tui_lock_is_held(err) => Err(KernelError::Conflict(
-            "runtime TUI is already running for this LionClaw session".to_string(),
+            "runtime TUI is already running for this LionClaw session or runtime home".to_string(),
         )),
         Err(err) => Err(KernelError::Runtime(format!(
             "failed to lock runtime TUI path '{}': {err}",
@@ -15839,6 +15956,7 @@ impl Kernel {
         runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
+        self.migrate_legacy_runtime_native_home(plan).await?;
         for mount in &plan.mounts {
             if matches!(
                 mount.target.as_str(),
@@ -15855,6 +15973,77 @@ impl Kernel {
         project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
             .await
             .map_err(internal)
+    }
+
+    async fn migrate_legacy_runtime_native_home(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(());
+        };
+        let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
+            return Ok(());
+        };
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        if legacy_home_root == runtime_home_root {
+            return Ok(());
+        }
+
+        let legacy_metadata = match tokio::fs::symlink_metadata(&legacy_home_root).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(KernelError::Runtime(format!(
+                    "failed to stat legacy runtime native home '{}': {err}",
+                    legacy_home_root.display()
+                )))
+            }
+        };
+        if legacy_metadata.file_type().is_symlink() || !legacy_metadata.is_dir() {
+            return Err(KernelError::Runtime(format!(
+                "legacy runtime native home '{}' is not a regular directory",
+                legacy_home_root.display()
+            )));
+        }
+
+        match tokio::fs::symlink_metadata(runtime_home_root).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(KernelError::Runtime(format!(
+                        "runtime native home '{}' is not a regular directory",
+                        runtime_home_root.display()
+                    )));
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(KernelError::Runtime(format!(
+                    "failed to stat runtime native home '{}': {err}",
+                    runtime_home_root.display()
+                )))
+            }
+        }
+
+        let runtime_home_parent = runtime_home_root.parent().ok_or_else(|| {
+            KernelError::Runtime(format!(
+                "runtime native home '{}' has no parent directory",
+                runtime_home_root.display()
+            ))
+        })?;
+        create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_parent)
+            .await?;
+        tokio::fs::rename(&legacy_home_root, runtime_home_root)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "failed to migrate legacy runtime native home '{}' to '{}': {err}",
+                    legacy_home_root.display(),
+                    runtime_home_root.display()
+                ))
+            })?;
+        ensure_owner_private_directory(runtime_home_root).await
     }
 
     async fn materialize_cached_runtime_context(
@@ -15927,11 +16116,23 @@ impl Kernel {
         &self,
         plan: &EffectiveExecutionPlan,
     ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+        self.migrate_legacy_runtime_native_home(plan).await?;
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
         create_owner_private_directory_all(self.runtime_root.as_deref(), &runtime_state_root)
             .await?;
+        let runtime_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        if let Some(runtime_home_root) = &runtime_home_root {
+            create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_root)
+                .await?;
+        }
+        let mut lock_roots = vec![runtime_state_root];
+        if let Some(runtime_home_root) = runtime_home_root {
+            if !lock_roots.iter().any(|root| root == &runtime_home_root) {
+                lock_roots.push(runtime_home_root);
+            }
+        }
         tokio::task::spawn_blocking(move || {
-            acquire_attached_runtime_launch_lock_blocking(&runtime_state_root)
+            acquire_attached_runtime_launch_locks_blocking(lock_roots)
         })
         .await
         .map_err(|err| internal(err.into()))?
