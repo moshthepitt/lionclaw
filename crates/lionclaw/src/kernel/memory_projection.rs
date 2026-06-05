@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::contracts::{SessionHistoryPolicy, TrustTier};
@@ -41,7 +42,7 @@ impl MemoryProjector for NoopMemoryProjector {
     dead_code,
     reason = "projector implementations consume request metadata; the production noop projector intentionally ignores it"
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryProjectionRequest {
     pub session_id: Uuid,
     pub runtime_id: String,
@@ -52,7 +53,8 @@ pub(crate) struct MemoryProjectionRequest {
     pub sources: Vec<MemorySourceRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum MemorySourceRef {
     SessionTurnRange {
         before_sequence_no: Option<u64>,
@@ -64,13 +66,13 @@ pub(crate) enum MemorySourceRef {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryProjection {
     pub projector_id: String,
     pub items: Vec<MemoryCandidate>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryCandidate {
     pub kind: MemoryCandidateKind,
     pub text: String,
@@ -81,7 +83,8 @@ pub(crate) struct MemoryCandidate {
     dead_code,
     reason = "candidate taxonomy is the stable memory boundary; the production noop projector emits no candidates yet"
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryCandidateKind {
     StableFact,
     Preference,
@@ -106,7 +109,7 @@ impl MemoryCandidateKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryProvenance {
     pub source: MemoryProvenanceSource,
     pub sequence_no: Option<u64>,
@@ -117,7 +120,8 @@ pub(crate) struct MemoryProvenance {
     dead_code,
     reason = "provenance source variants are part of the projector contract before useful projectors exist"
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum MemoryProvenanceSource {
     SessionTurn,
     CompactionSummary,
@@ -463,6 +467,37 @@ mod tests {
         assert_eq!(valid.projector_id, "test");
         assert_eq!(valid.item_count, 1);
         assert_eq!(valid.projected_bytes, "remember this".len());
+    }
+
+    #[test]
+    fn request_serializes_as_jsonl_protocol_shape() {
+        let request = request_with_session_turn_source();
+
+        let encoded = serde_json::to_value(&request).expect("serialize request");
+
+        assert_eq!(encoded["runtime_id"], "mock");
+        assert_eq!(encoded["trust_tier"], "main");
+        assert_eq!(encoded["history_policy"], "interactive");
+        assert_eq!(encoded["sources"][0]["kind"], "session_turn_range");
+        assert_eq!(
+            encoded["sources"][0]["sequence_nos"],
+            serde_json::json!([6, 7, 8, 9])
+        );
+    }
+
+    #[test]
+    fn response_deserializes_jsonl_protocol_shape() {
+        let decoded: MemoryProjection = serde_json::from_str(
+            r#"{"projector_id":"memory-core","items":[{"kind":"stable_fact","text":"User prefers concise summaries.","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}],"ignored":true}"#,
+        )
+        .expect("decode response");
+
+        assert_eq!(decoded.projector_id, "memory-core");
+        assert_eq!(decoded.items[0].kind, MemoryCandidateKind::StableFact);
+        assert_eq!(
+            decoded.items[0].provenance[0].source,
+            MemoryProvenanceSource::SessionTurn
+        );
     }
 
     fn projection_with_items(

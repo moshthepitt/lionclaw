@@ -125,8 +125,9 @@ use super::{
     },
     memory_projection::{
         validate_memory_projection, MemoryCandidate, MemoryProjectionRequest, MemoryProjector,
-        MemorySourceRef, NoopMemoryProjector, MEMORY_PROJECTION_MAX_ITEMS,
+        MemorySourceRef, MEMORY_PROJECTION_MAX_ITEMS,
     },
+    memory_projector_service::memory_projector_for_applied_state,
     policy::{Capability, PolicyStore, Scope},
     prompt_context::{
         cap_utf8_at_line_boundary, context_item_specs, ContextItemId, ContextItemSpec,
@@ -830,6 +831,7 @@ impl Kernel {
         let session_scope =
             runtime_project_partition_key(options.project_workspace_root.as_deref());
 
+        let memory_projector = memory_projector_for_applied_state(&options.applied_state);
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
             session_turns: SessionTurnStore::new(pool.clone()),
@@ -860,7 +862,7 @@ impl Kernel {
             project_instance_runtime: options.project_instance_runtime,
             applied_state: options.applied_state,
             continuity,
-            memory_projector: Arc::new(NoopMemoryProjector),
+            memory_projector,
             hidden_compaction_turn_timeout,
         };
 
