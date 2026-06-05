@@ -89,20 +89,35 @@ impl SkillMemoryProjector {
     ) -> Result<MemoryProjection, MemoryProjectionError> {
         let request_json = serde_json::to_string(&request)
             .map_err(|err| MemoryProjectionError::failed(format!("encode request: {err}")))?;
-        self.ensure_ready_process(process).await?;
-        let read = {
-            let Some(process) = process.as_mut() else {
-                return Err(MemoryProjectionError::failed(
-                    "memory projector process was not available before request",
-                ));
+        let mut retried_cached_process_failure = false;
+        let response = loop {
+            let origin = self.ensure_ready_process(process).await?;
+            let read = {
+                let Some(process) = process.as_mut() else {
+                    return Err(MemoryProjectionError::failed(
+                        "memory projector process was not available before request",
+                    ));
+                };
+                process.exchange_request(&request_json).await
             };
-            process.write_request(&request_json).await?;
-            process.read_response().await?
+            let read = match read {
+                Ok(read) => read,
+                Err(err)
+                    if origin == ReadyProcessOrigin::Cached
+                        && !retried_cached_process_failure
+                        && err.kind() == MemoryProjectionErrorKind::ProjectorFailed =>
+                {
+                    Self::retire_process(process).await;
+                    retried_cached_process_failure = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if read.status == ResidentProcessStatus::Stale {
+                Self::retire_process(process).await;
+            }
+            break read.response;
         };
-        if read.status == ResidentProcessStatus::Stale {
-            Self::retire_process(process).await;
-        }
-        let response = read.response;
         let projection = serde_json::from_str::<MemoryProjection>(&response).map_err(|err| {
             MemoryProjectionError::invalid_output(
                 "decode_response",
@@ -118,7 +133,8 @@ impl SkillMemoryProjector {
     async fn ensure_ready_process(
         &self,
         process: &mut Option<ResidentMemoryProjectorProcess>,
-    ) -> Result<(), MemoryProjectionError> {
+    ) -> Result<ReadyProcessOrigin, MemoryProjectionError> {
+        let had_cached_process = process.is_some();
         let mut restarted_stale_process = false;
         loop {
             if process.is_none() {
@@ -133,7 +149,11 @@ impl SkillMemoryProjector {
                 process.inspect_stdout()?
             };
             if status == ResidentProcessStatus::Ready {
-                return Ok(());
+                return Ok(if had_cached_process && !restarted_stale_process {
+                    ReadyProcessOrigin::Cached
+                } else {
+                    ReadyProcessOrigin::Spawned
+                });
             }
             if restarted_stale_process {
                 return Err(MemoryProjectionError::failed(
@@ -242,6 +262,14 @@ struct ResidentMemoryProjectorProcess {
 }
 
 impl ResidentMemoryProjectorProcess {
+    async fn exchange_request(
+        &mut self,
+        request_json: &str,
+    ) -> Result<ProjectorRead, MemoryProjectionError> {
+        self.write_request(request_json).await?;
+        self.read_response().await
+    }
+
     async fn write_request(&mut self, request_json: &str) -> Result<(), MemoryProjectionError> {
         self.stdin
             .write_all(request_json.as_bytes())
@@ -316,6 +344,12 @@ impl ResidentMemoryProjectorProcess {
 enum ResidentProcessStatus {
     Ready,
     Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyProcessOrigin {
+    Cached,
+    Spawned,
 }
 
 struct ProjectorRead {
@@ -811,6 +845,7 @@ printf 'start\n' >> "$starts"
 IFS= read -r _line || exit 0
 printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
 if [ "$count" = "0" ]; then
+  sleep 0.05
   exit 0
 fi
 "#,
@@ -821,7 +856,6 @@ fi
             .project(request())
             .await
             .expect("first response should succeed");
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let second = projector
             .project(request())
