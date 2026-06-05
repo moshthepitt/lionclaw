@@ -129,8 +129,9 @@ use super::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         execute_captured, execute_streaming, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        safe_relative_path, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
-        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        runtime_native_home_mount_source, runtime_state_mount_source, safe_relative_path,
+        skill_mount_target, spawn_interactive, EffectiveExecutionPlan, EscapeClass,
+        ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
         ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
         MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
         RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
@@ -142,7 +143,8 @@ use super::{
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
         RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -593,10 +595,16 @@ fn runtime_execution_context(
         .mounts
         .iter()
         .filter(|mount| {
-            mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
+            matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET
+            ) || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
         })
         .map(|mount| {
-            if mount.target == "/runtime" {
+            if matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET
+            ) {
                 RuntimePathProjection::directory(mount.target.clone(), mount.source.clone())
             } else {
                 RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
@@ -7879,6 +7887,7 @@ mod tests {
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
         let mut plan = test_execution_plan("work-codex");
         plan.mounts = vec![
             MountSpec {
@@ -7889,6 +7898,11 @@ mod tests {
             MountSpec {
                 source: runtime_state_root.clone(),
                 target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
                 access: MountAccess::ReadWrite,
             },
             MountSpec {
@@ -7903,7 +7917,8 @@ mod tests {
             .await
             .expect("materialize runtime plan");
 
-        let link = runtime_state_root.join("home/.codex/skills/loopback");
+        assert!(runtime_state_root.exists());
+        let link = runtime_home_root.join(".codex/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
@@ -15381,10 +15396,11 @@ impl Kernel {
     }
 
     fn runtime_state_root(plan: &EffectiveExecutionPlan) -> Option<&Path> {
-        plan.mounts
-            .iter()
-            .find(|mount| mount.target == "/runtime")
-            .map(|mount| mount.source.as_path())
+        runtime_state_mount_source(&plan.mounts)
+    }
+
+    fn runtime_native_home_root(plan: &EffectiveExecutionPlan) -> Option<&Path> {
+        runtime_native_home_mount_source(&plan.mounts)
     }
 
     fn require_runtime_tui_state_root(plan: &EffectiveExecutionPlan) -> Result<&Path, KernelError> {
@@ -15713,16 +15729,19 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
-            if matches!(mount.target.as_str(), "/runtime" | "/drafts") {
+            if matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET | DRAFTS_MOUNT_TARGET
+            ) {
                 create_owner_private_directory_all(self.runtime_root.as_deref(), &mount.source)
                     .await?;
             }
         }
 
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+        let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_kind, runtime_state_root, &plan.mounts)
+        project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
             .await
             .map_err(internal)
     }

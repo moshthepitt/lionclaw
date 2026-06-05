@@ -9,7 +9,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::home::runtime_profile_partition_key;
-use crate::home::{runtime_project_drafts_dir_from_parts, runtime_session_state_dir_from_parts};
+use crate::home::{
+    runtime_native_home_dir_from_parts, runtime_project_drafts_dir_from_parts,
+    runtime_session_state_dir_from_parts,
+};
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
 use crate::kernel::skills::validate_skill_alias;
 
@@ -21,15 +24,13 @@ use super::{
     plan::{
         ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionPreset, MountAccess,
         MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
-        SKILLS_MOUNT_TARGET_ROOT,
+        DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+        SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
     },
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
 pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
-const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
-const RUNTIME_MOUNT_TARGET: &str = "/runtime";
-const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -249,6 +250,7 @@ impl ExecutionPlanner {
         })?;
         let has_workspace_mount = has_mount_target(&mounts, WORKSPACE_MOUNT_TARGET);
         let has_runtime_mount = has_mount_target(&mounts, RUNTIME_MOUNT_TARGET);
+        let has_runtime_home_mount = has_mount_target(&mounts, RUNTIME_HOME_MOUNT_TARGET);
         let has_drafts_mount = has_mount_target(&mounts, DRAFTS_MOUNT_TARGET);
         let has_skills_mount = mounts
             .iter()
@@ -263,6 +265,7 @@ impl ExecutionPlanner {
             execution_context.environment,
             has_workspace_mount,
             has_runtime_mount,
+            has_runtime_home_mount,
             has_drafts_mount,
             has_skills_mount,
         );
@@ -347,6 +350,7 @@ impl ExecutionPlanner {
             self.workspace_name.as_ref(),
             request.session_id,
         ) {
+            let shape_key = runtime_session_shape_key(request.preset);
             mounts.push(MountSpec {
                 source: runtime_session_state_dir_from_parts(
                     runtime_root,
@@ -355,9 +359,21 @@ impl ExecutionPlanner {
                     self.project_workspace_root.as_deref(),
                     session_id,
                     &request.runtime_profile.compatibility_key,
-                    &runtime_session_shape_key(request.preset),
+                    &shape_key,
                 ),
                 target: RUNTIME_MOUNT_TARGET.to_string(),
+                access: MountAccess::ReadWrite,
+            });
+            mounts.push(MountSpec {
+                source: runtime_native_home_dir_from_parts(
+                    runtime_root,
+                    request.runtime_id,
+                    workspace_name,
+                    self.project_workspace_root.as_deref(),
+                    &request.runtime_profile.compatibility_key,
+                    &shape_key,
+                ),
+                target: RUNTIME_HOME_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
             });
             mounts.push(MountSpec {
@@ -498,9 +514,13 @@ fn validate_runtime_extra_mounts(mounts: &[MountSpec]) -> Result<(), String> {
                 mount.target
             ));
         }
-        if ["/workspace", "/runtime", "/drafts"]
-            .iter()
-            .any(|reserved| mount_target_is_or_under(&mount.target, reserved))
+        if [
+            WORKSPACE_MOUNT_TARGET,
+            RUNTIME_MOUNT_TARGET,
+            DRAFTS_MOUNT_TARGET,
+        ]
+        .iter()
+        .any(|reserved| mount_target_is_or_under(&mount.target, reserved))
         {
             return Err(format!(
                 "runtime extra mount target '{}' conflicts with a core runtime mount",
@@ -597,6 +617,7 @@ fn build_runtime_environment(
     mut environment: Vec<(String, String)>,
     has_workspace_mount: bool,
     has_runtime_mount: bool,
+    has_runtime_home_mount: bool,
     has_drafts_mount: bool,
     has_skills_mount: bool,
 ) -> Vec<(String, String)> {
@@ -608,8 +629,8 @@ fn build_runtime_environment(
         );
     }
 
-    if has_runtime_mount {
-        let runtime_home = format!("{RUNTIME_MOUNT_TARGET}/home");
+    if has_runtime_home_mount {
+        let runtime_home = RUNTIME_HOME_MOUNT_TARGET.to_string();
         set_environment_value(&mut environment, "HOME", runtime_home.clone());
         set_environment_value(
             &mut environment,
@@ -631,6 +652,9 @@ fn build_runtime_environment(
             "XDG_STATE_HOME",
             format!("{runtime_home}/.local/state"),
         );
+    }
+
+    if has_runtime_mount {
         set_environment_value(
             &mut environment,
             "LIONCLAW_RUNTIME_DIR",
@@ -687,7 +711,10 @@ mod tests {
         ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
         RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
     };
-    use crate::home::{runtime_project_partition_key, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR};
+    use crate::home::{
+        runtime_project_partition_key, RUNTIME_NATIVE_HOMES_DIR, RUNTIME_NATIVE_HOME_DIR,
+        RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
+    };
     use crate::kernel::runtime::{
         ConfinementConfig, EscapeClass, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, WorkspaceAccess,
@@ -805,8 +832,35 @@ mod tests {
                 .join("workspace-read-write__network-on__secrets-off")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
+        assert!(
+            plan.mounts[1]
+                .source
+                .to_string_lossy()
+                .contains(&format!("{RUNTIME_SESSIONS_DIR}/{session_id}")),
+            "/runtime source should be scoped by LionClaw session id"
+        );
         assert_eq!(
             plan.mounts[2].source,
+            runtime_root
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(&project_key)
+                .join(RUNTIME_NATIVE_HOMES_DIR)
+                .join("runtime-codex-v1")
+                .join("workspace-read-write__network-on__secrets-off")
+                .join(RUNTIME_NATIVE_HOME_DIR)
+        );
+        assert_eq!(plan.mounts[2].target, "/runtime/home");
+        assert!(
+            !plan.mounts[2]
+                .source
+                .to_string_lossy()
+                .contains(RUNTIME_SESSIONS_DIR),
+            "/runtime/home source must not be scoped by LionClaw session id"
+        );
+        assert_eq!(
+            plan.mounts[3].source,
             runtime_root
                 .join("codex")
                 .join("main")
@@ -814,8 +868,8 @@ mod tests {
                 .join(project_key)
                 .join("drafts")
         );
-        assert_eq!(plan.mounts[2].target, "/drafts");
-        assert_eq!(plan.mounts[3], extra_mount);
+        assert_eq!(plan.mounts[3].target, "/drafts");
+        assert_eq!(plan.mounts[4], extra_mount);
         assert_eq!(
             plan.environment,
             vec![
@@ -845,6 +899,24 @@ mod tests {
                 ("TMPDIR".to_string(), "/tmp".to_string()),
             ]
         );
+
+        let second_session_id =
+            Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("uuid");
+        let second_plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(second_session_id),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("second plan");
+        assert_ne!(plan.mounts[1].source, second_plan.mounts[1].source);
+        assert_eq!(plan.mounts[2].source, second_plan.mounts[2].source);
     }
 
     #[test]
@@ -857,6 +929,7 @@ mod tests {
                 ("USER_DEFINED".to_string(), "kept".to_string()),
             ],
             false,
+            true,
             true,
             false,
             false,
@@ -1637,10 +1710,24 @@ mod tests {
             .iter()
             .find(|mount| mount.target == "/runtime")
             .expect("secreted runtime mount");
+        let plain_runtime_home = plain
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/home")
+            .expect("plain runtime home mount");
+        let secreted_runtime_home = secreted
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime/home")
+            .expect("secreted runtime home mount");
 
         assert_ne!(
             plain_runtime_root.source, secreted_runtime_root.source,
             "runtime state roots should partition by secret-mount policy"
+        );
+        assert_ne!(
+            plain_runtime_home.source, secreted_runtime_home.source,
+            "runtime native homes should partition by secret-mount policy"
         );
     }
 

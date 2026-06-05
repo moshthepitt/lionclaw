@@ -1,13 +1,37 @@
-use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
 pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
 
+pub const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
+pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
+pub const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
+pub const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
 
 pub fn skill_mount_target(alias: &str) -> String {
     format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
+}
+
+pub fn mount_source_for_target<'a>(mounts: &'a [MountSpec], target: &str) -> Option<&'a Path> {
+    mounts
+        .iter()
+        .find(|mount| mount.target == target)
+        .map(|mount| mount.source.as_path())
+}
+
+pub fn runtime_state_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
+    mount_source_for_target(mounts, RUNTIME_MOUNT_TARGET)
+}
+
+pub fn runtime_native_home_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
+    mount_source_for_target(mounts, RUNTIME_HOME_MOUNT_TARGET)
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.

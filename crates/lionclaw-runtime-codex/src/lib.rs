@@ -64,6 +64,8 @@ use lionclaw_runtime_api::{
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
+const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
+const CODEX_TRUSTED_LEVEL: &str = "trusted";
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -873,9 +875,12 @@ fn codex_record_app_server_thread_transcript(
 }
 
 fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+    let mut args = codex_runtime_config_override_args();
+    args.push("app-server".to_string());
+
     RuntimeProgramSpec {
         executable: config.executable.clone(),
-        args: vec!["app-server".to_string()],
+        args,
         environment: Vec::new(),
         stdin: String::new(),
         auth: Some(RuntimeAuthKind::Codex),
@@ -891,9 +896,8 @@ fn build_codex_terminal_program(
         "danger-full-access".to_string(),
         "--ask-for-approval".to_string(),
         "never".to_string(),
-        "-c".to_string(),
-        format!("model_instructions_file=\"{LIONCLAW_RUNTIME_CONTEXT_PATH}\""),
     ];
+    args.extend(codex_terminal_config_override_args());
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -910,6 +914,26 @@ fn build_codex_terminal_program(
         stdin: String::new(),
         auth: Some(RuntimeAuthKind::Codex),
     }
+}
+
+fn codex_terminal_config_override_args() -> Vec<String> {
+    let mut args = codex_runtime_config_override_args();
+    args.push("-c".to_string());
+    args.push(format!(
+        "model_instructions_file=\"{LIONCLAW_RUNTIME_CONTEXT_PATH}\""
+    ));
+    args
+}
+
+fn codex_runtime_config_override_args() -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "check_for_update_on_startup=false".to_string(),
+        "-c".to_string(),
+        format!(
+            "projects.\"{CODEX_RUNTIME_WORKSPACE_PATH}\".trust_level=\"{CODEX_TRUSTED_LEVEL}\""
+        ),
+    ]
 }
 
 fn codex_thread_list_params(cursor: Option<&str>) -> Value {
@@ -3324,6 +3348,10 @@ mod tests {
                 "--ask-for-approval".to_string(),
                 "never".to_string(),
                 "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+                "-c".to_string(),
+                "projects.\"/workspace\".trust_level=\"trusted\"".to_string(),
+                "-c".to_string(),
                 "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
                 "--model".to_string(),
                 "gpt-5.5".to_string(),
@@ -3361,6 +3389,10 @@ mod tests {
                 "danger-full-access".to_string(),
                 "--ask-for-approval".to_string(),
                 "never".to_string(),
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+                "-c".to_string(),
+                "projects.\"/workspace\".trust_level=\"trusted\"".to_string(),
                 "-c".to_string(),
                 "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
                 "--model".to_string(),
@@ -4537,7 +4569,16 @@ mod tests {
         });
 
         assert_eq!(program.executable, "codex");
-        assert_eq!(program.args, vec!["app-server".to_string()]);
+        assert_eq!(
+            program.args,
+            vec![
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+                "-c".to_string(),
+                "projects.\"/workspace\".trust_level=\"trusted\"".to_string(),
+                "app-server".to_string(),
+            ]
+        );
         assert_eq!(program.stdin, "");
         assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
     }

@@ -8,16 +8,17 @@ pub mod execution;
 mod skill_projection;
 
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
-pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
+pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime_home};
 pub use execution::{
-    execute_attached, execute_captured, execute_streaming,
-    resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
-    validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
+    execute_attached, execute_captured, execute_streaming, runtime_native_home_mount_source,
+    runtime_state_mount_source, resolve_oci_image_compatibility_identity, skill_mount_target,
+    spawn_interactive, validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
     EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionPlanPurpose,
     ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
     ExecutionRequest, ExecutionSession, MountAccess, MountSpec, OciConfinementConfig,
     OciExecutionBackend, RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeSecretsMount,
     WorkspaceAccess, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
+    DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     SKILLS_MOUNT_TARGET_ROOT,
 };
 pub use lionclaw_runtime_api::*;

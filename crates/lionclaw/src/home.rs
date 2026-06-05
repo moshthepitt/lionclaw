@@ -12,6 +12,8 @@ pub use lionclaw_runtime_api::{runtime_session_ready_marker_exists, RUNTIME_SESS
 pub const DEFAULT_WORKSPACE: &str = "main";
 pub const RUNTIME_PROJECTS_DIR: &str = "projects";
 pub const RUNTIME_SESSIONS_DIR: &str = "sessions";
+pub const RUNTIME_NATIVE_HOMES_DIR: &str = "native-homes";
+pub const RUNTIME_NATIVE_HOME_DIR: &str = "home";
 pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
 pub const RUNTIME_TUI_STATE_MARKER: &str = ".lionclaw-runtime-tui-state";
 
@@ -149,6 +151,24 @@ impl LionClawHome {
             workspace,
             Some(project_root),
             session_id,
+            compatibility_key,
+            shape_key,
+        )
+    }
+
+    pub fn runtime_native_home_dir(
+        &self,
+        runtime_id: &str,
+        workspace: &str,
+        project_root: &Path,
+        compatibility_key: &str,
+        shape_key: &str,
+    ) -> PathBuf {
+        runtime_native_home_dir_from_parts(
+            &self.runtime_dir(),
+            runtime_id,
+            workspace,
+            Some(project_root),
             compatibility_key,
             shape_key,
         )
@@ -293,6 +313,21 @@ pub fn runtime_session_state_dir_from_parts(
         .join(shape_key)
 }
 
+pub fn runtime_native_home_dir_from_parts(
+    runtime_root: &Path,
+    runtime_id: &str,
+    workspace: &str,
+    project_root: Option<&Path>,
+    compatibility_key: &str,
+    shape_key: &str,
+) -> PathBuf {
+    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
+        .join(RUNTIME_NATIVE_HOMES_DIR)
+        .join(compatibility_key)
+        .join(shape_key)
+        .join(RUNTIME_NATIVE_HOME_DIR)
+}
+
 fn hashed_partition_key(prefix: &str, source: &[u8]) -> String {
     let digest = Sha256::digest(source);
     format!("{prefix}-{}", &hex::encode(digest)[..12])
@@ -377,7 +412,8 @@ mod tests {
     use super::{
         runtime_profile_partition_key, runtime_project_partition_key,
         runtime_session_ready_marker_exists, LionClawHome, DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR,
-        RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR, RUNTIME_SESSION_READY_MARKER,
+        RUNTIME_NATIVE_HOMES_DIR, RUNTIME_NATIVE_HOME_DIR, RUNTIME_PROJECTS_DIR,
+        RUNTIME_SESSIONS_DIR, RUNTIME_SESSION_READY_MARKER,
     };
     use uuid::Uuid;
 
@@ -443,11 +479,29 @@ mod tests {
                 .join("codex")
                 .join("main")
                 .join(RUNTIME_PROJECTS_DIR)
-                .join(project_key)
+                .join(&project_key)
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
+                .join(&compatibility_key)
+                .join("workspace-read-write__network-on__secrets-off")
+        );
+        assert_eq!(
+            home.runtime_native_home_dir(
+                "codex",
+                DEFAULT_WORKSPACE,
+                project_root,
+                &compatibility_key,
+                "workspace-read-write__network-on__secrets-off"
+            ),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime")
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(project_key)
+                .join(RUNTIME_NATIVE_HOMES_DIR)
                 .join(compatibility_key)
                 .join("workspace-read-write__network-on__secrets-off")
+                .join(RUNTIME_NATIVE_HOME_DIR)
         );
     }
 
