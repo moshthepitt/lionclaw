@@ -978,6 +978,64 @@ not a magic runtime prompt input. LionClaw does not remember by stuffing files
 into prompts. The kernel records what happened, lets controlled memory
 projectors derive candidate memory from exact kernel-selected source refs, and
 admits those candidates only through audited prompt context policy.
+
+Memory projector selection is explicit operator config:
+
+```toml
+[memory]
+projector_skill = "memory-core"
+```
+
+When unset, the kernel uses the noop memory projector. Installing a skill with
+memory metadata does not auto-activate it. A selected skill declares the host
+projector command in its `lionclaw.toml`:
+
+```toml
+version = 1
+
+[memory_projector]
+command = "scripts/projector"
+```
+
+The selected skill alias is the projector id. Skill metadata does not duplicate
+that identity. The command is a relative executable path under the selected
+skill root. Absolute paths, parent traversal, missing files, non-executable
+files, symlink files, and symlink parent components below the skill root are
+rejected before the applied state is accepted.
+
+A configured memory projector is a resident host process owned by the kernel
+instance and the loaded applied state. It starts lazily on the first eligible
+Main-session memory projection, runs with the skill root as its working
+directory, and receives only the fixed kernel environment needed for v1:
+`LIONCLAW_MEMORY_PROJECTOR_ID` and `LIONCLAW_SKILL_STATE_DIR`, plus the small
+ambient process-start allowlist `PATH`, `PATHEXT`, `SYSTEMROOT`, and
+`SystemRoot` when present. The state directory is host-only selected-instance
+state under `config/skill-state/<alias>` and is not mounted into the agent
+runtime. On Unix, the projector starts in its own process group, and retirement
+signals that group. The v1 lifecycle contract covers the projector and helper
+subprocesses that remain in that inherited group; projector commands must not
+daemonize, call `setsid` or `setpgid` to detach helpers, or leave unmanaged
+background work behind.
+
+The v1 protocol is JSONL. The kernel writes one `MemoryProjectionRequest` JSON
+object per line to projector stdin and reads one `MemoryProjection` JSON object
+per line from stdout. Each request carries a fresh `request_id`, and each
+response must echo the same id. There is no `protocol_version` field in v1.
+Unknown response fields are ignored. Only one request is in flight at a time.
+The request timeout is a kernel constant, not skill config. Crash, EOF,
+malformed JSON, missing required fields, unknown enum values, wrong request id,
+wrong projector id, invalid provenance, empty text, oversized output, and timeout
+all omit the Memory section safely. Timeouts audit as `projector_timeout`;
+other projector process failures audit as `projector_failed`. Fatal protocol
+failures and timeouts retire the resident process before a later projection can
+start, so a late response cannot satisfy a future request.
+
+Projector output is candidate context only. `PromptContextPolicy` remains the
+final owner of trust-tier exclusion, byte caps, rendering, whole-section
+omission on invalid output, and prompt-context audit metadata. Audit records
+projector metadata and status counts, never memory body text. Projector stdout
+is the protocol stream; stderr may be drained only as bounded operational
+diagnostics and must not enter prompt text or prompt-context audit body fields.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.
 Daily notes, artifacts, proposals, and open loops are visible Markdown records,

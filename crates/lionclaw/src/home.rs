@@ -72,6 +72,10 @@ impl LionClawHome {
         self.channel_env_dir().join(format!("{channel_id}.env"))
     }
 
+    pub fn skill_state_dir(&self, alias: &str) -> PathBuf {
+        self.config_dir().join("skill-state").join(alias)
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
     }
@@ -376,6 +380,10 @@ mod tests {
         assert_eq!(
             home.runtime_secrets_env_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-secrets.env")
+        );
+        assert_eq!(
+            home.skill_state_dir("memory-core"),
+            std::path::PathBuf::from("/tmp/lionclaw-home/config/skill-state/memory-core")
         );
         assert_eq!(
             home.home_id_path(),
