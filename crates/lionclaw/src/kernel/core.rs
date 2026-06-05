@@ -8030,9 +8030,8 @@ mod tests {
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let legacy_secret_dir = runtime_state_root
-            .join(RUNTIME_NATIVE_HOME_DIR)
-            .join(".ssh");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        let legacy_secret_dir = legacy_home_root.join(".ssh");
         tokio::fs::create_dir_all(&legacy_secret_dir)
             .await
             .expect("create legacy secret dir");
@@ -8041,6 +8040,8 @@ mod tests {
             .expect("write legacy ssh config");
         std::fs::set_permissions(&legacy_secret_dir, std::fs::Permissions::from_mode(0o500))
             .expect("chmod legacy secret dir");
+        std::fs::set_permissions(&legacy_home_root, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod legacy home root");
         let mut plan = test_execution_plan("codex");
         plan.mounts = vec![
             MountSpec {
@@ -14322,10 +14323,30 @@ fn migrate_legacy_runtime_native_homes_blocking(
     }
 
     for legacy_home_root in existing_legacy_home_roots {
-        merge_runtime_native_home_directory_contents_unchecked_blocking(
+        let Some(legacy_metadata) = runtime_native_home_directory_metadata_blocking(
+            &legacy_home_root,
+            "legacy runtime native home",
+        )?
+        else {
+            continue;
+        };
+        let runtime_home_metadata = runtime_native_home_directory_metadata_blocking(
+            runtime_home_root,
+            "runtime native home",
+        )?
+        .ok_or_else(|| {
+            KernelError::Runtime(format!(
+                "runtime native home '{}' was not created before merging legacy home '{}'",
+                runtime_home_root.display(),
+                legacy_home_root.display()
+            ))
+        })?;
+        merge_runtime_native_home_directory_entry_blocking(
             &legacy_home_root,
             runtime_home_root,
             Path::new(""),
+            &legacy_metadata,
+            runtime_home_metadata.permissions(),
         )?;
     }
 
@@ -14816,13 +14837,24 @@ fn merge_runtime_native_home_directory_entry_blocking(
 ) -> Result<(), KernelError> {
     let source_final_permissions = source_metadata.permissions();
     set_runtime_native_home_directory_permissions_blocking(
-        source_path,
-        runtime_native_home_directory_merge_permissions(source_metadata),
-    )?;
-    set_runtime_native_home_directory_permissions_blocking(
         destination_path,
         runtime_native_home_permissions_with_owner_write(destination_final_permissions.clone()),
     )?;
+    if let Err(err) = set_runtime_native_home_directory_permissions_blocking(
+        source_path,
+        runtime_native_home_directory_merge_permissions(source_metadata),
+    ) {
+        let restore_destination_result = set_runtime_native_home_directory_permissions_blocking(
+            destination_path,
+            destination_final_permissions,
+        );
+        if let Err(restore_err) = restore_destination_result {
+            return Err(KernelError::Runtime(format!(
+                "{err}; additionally failed to restore runtime native home directory permissions: {restore_err}"
+            )));
+        }
+        return Err(err);
+    }
 
     let merge_result = merge_runtime_native_home_directory_contents_unchecked_blocking(
         source_path,
