@@ -942,15 +942,7 @@ async fn channel_outbox_pull_can_scope_to_conversation() {
 async fn channel_turn_with_runtime_artifact_enqueues_outbox_attachment_without_text() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "telegram", "channel-outbox-artifact-skill").await;
-    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
-    tokio::fs::create_dir_all(&artifact_source_dir)
-        .await
-        .expect("create artifact source dir");
-    let artifact_source = artifact_source_dir.join("generated-image.png");
-    tokio::fs::write(&artifact_source, b"png bytes")
-        .await
-        .expect("write artifact source");
-    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
+    let kernel = runtime_state_artifact_kernel(&env).await;
 
     create_pending_pairing(
         &kernel,
@@ -1091,34 +1083,21 @@ async fn channel_turn_with_runtime_artifact_cleans_prepared_attachment_on_later_
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "telegram", "channel-outbox-artifact-cleanup-skill").await;
 
-    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
-    tokio::fs::create_dir_all(&artifact_source_dir)
-        .await
-        .expect("create artifact source dir");
-    let valid_artifact_source = artifact_source_dir.join("first-image.png");
-    tokio::fs::write(&valid_artifact_source, b"first png bytes")
-        .await
-        .expect("write valid artifact source");
-
     let outside_artifact_source = env.temp_dir().join("outside-runtime.png");
     tokio::fs::write(&outside_artifact_source, b"outside png bytes")
         .await
         .expect("write outside artifact source");
 
-    let kernel = artifact_sequence_kernel(
+    let kernel = runtime_state_artifact_sequence_kernel(
         &env,
-        vec![
-            image_runtime_artifact(
-                "artifact:image:valid",
-                valid_artifact_source.clone(),
-                "first-image.png",
-            ),
-            image_runtime_artifact(
-                "artifact:image:escape",
-                outside_artifact_source,
-                "outside-runtime.png",
-            ),
-        ],
+        "artifact:image:valid",
+        "first-image.png",
+        b"first png bytes",
+        vec![image_runtime_artifact(
+            "artifact:image:escape",
+            outside_artifact_source,
+            "outside-runtime.png",
+        )],
     )
     .await;
 
@@ -9327,8 +9306,57 @@ impl RuntimeAdapter for SlowAnswerAdapter {
     }
 }
 
+async fn runtime_state_artifact_kernel(env: &TestHome) -> Kernel {
+    runtime_state_artifact_sequence_kernel(
+        env,
+        "artifact:image:1",
+        "generated-image.png",
+        b"png bytes",
+        Vec::new(),
+    )
+    .await
+}
+
+async fn runtime_state_artifact_sequence_kernel(
+    env: &TestHome,
+    artifact_id: &str,
+    filename: &str,
+    contents: &[u8],
+    trailing_artifacts: Vec<RuntimeArtifact>,
+) -> Kernel {
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("artifact-only".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "artifact-only",
+            std::sync::Arc::new(RuntimeStateArtifactAdapter {
+                runtime_state_root: tokio::sync::Mutex::new(None),
+                artifact_id: artifact_id.to_string(),
+                filename: filename.to_string(),
+                contents: contents.to_vec(),
+                trailing_artifacts,
+            }),
+        )
+        .await;
+    kernel
+}
+
 struct ArtifactOnlyAdapter {
     artifacts: Vec<RuntimeArtifact>,
+}
+
+struct RuntimeStateArtifactAdapter {
+    runtime_state_root: tokio::sync::Mutex<Option<std::path::PathBuf>>,
+    artifact_id: String,
+    filename: String,
+    contents: Vec<u8>,
+    trailing_artifacts: Vec<RuntimeArtifact>,
 }
 
 struct ProgramBackedRuntimeStateEscapeArtifactAdapter;
@@ -9521,6 +9549,81 @@ impl RuntimeAdapter for ArtifactOnlyAdapter {
                     artifact: artifact.clone(),
                 })
                 .expect("send artifact");
+        }
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for RuntimeStateArtifactAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "artifact-only".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        *self.runtime_state_root.lock().await = input.runtime_state_root;
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("artifact-only:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        let runtime_state_root = self
+            .runtime_state_root
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("runtime state root missing"))?;
+        let artifact_dir = runtime_state_root.join("generated-test-artifacts");
+        tokio::fs::create_dir_all(&artifact_dir).await?;
+        let artifact_path = artifact_dir.join(&self.filename);
+        tokio::fs::write(&artifact_path, &self.contents).await?;
+        event_tx
+            .send(RuntimeEvent::Artifact {
+                artifact: image_runtime_artifact(&self.artifact_id, artifact_path, &self.filename),
+            })
+            .expect("send artifact");
+        for artifact in &self.trailing_artifacts {
+            event_tx
+                .send(RuntimeEvent::Artifact {
+                    artifact: artifact.clone(),
+                })
+                .expect("send trailing artifact");
         }
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),

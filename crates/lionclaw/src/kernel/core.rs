@@ -8116,6 +8116,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_runtime_artifacts_reject_native_home_auth_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_state_root = runtime_root.join("state");
+        let runtime_home_root = runtime_root.join("native-home");
+        let codex_home = runtime_home_root.join(".codex");
+        tokio::fs::create_dir_all(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let auth_file = codex_home.join("auth.json");
+        tokio::fs::write(&auth_file, b"{\"tokens\":\"secret\"}")
+            .await
+            .expect("write native auth file");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root,
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let err = kernel
+            .prepare_runtime_artifact_attachments_for_turn(
+                Uuid::nil(),
+                RuntimeTurnMode::Direct,
+                &plan,
+                &[RuntimeArtifact {
+                    artifact_id: "artifact:auth".to_string(),
+                    path: auth_file,
+                    filename: Some("auth.json".to_string()),
+                    mime_type: Some("application/json".to_string()),
+                }],
+            )
+            .await
+            .expect_err("native-home auth files must not be exportable artifacts");
+
+        assert!(
+            err.to_string().contains("outside the runtime root"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_runtime_artifacts_allow_native_home_generated_images() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_state_root = runtime_root.join("state");
+        let runtime_home_root = runtime_root.join("native-home");
+        let generated_images = runtime_home_root.join(".codex").join("generated_images");
+        tokio::fs::create_dir_all(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        tokio::fs::create_dir_all(&generated_images)
+            .await
+            .expect("create generated images");
+        let image_file = generated_images.join("image.png");
+        tokio::fs::write(&image_file, b"png bytes")
+            .await
+            .expect("write generated image");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root,
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let attachments = kernel
+            .prepare_runtime_artifact_attachments_for_turn(
+                Uuid::nil(),
+                RuntimeTurnMode::Direct,
+                &plan,
+                &[RuntimeArtifact {
+                    artifact_id: "artifact:image".to_string(),
+                    path: image_file,
+                    filename: Some("image.png".to_string()),
+                    mime_type: Some("image/png".to_string()),
+                }],
+            )
+            .await
+            .expect("generated images should be exportable artifacts");
+
+        assert_eq!(attachments.attachments.len(), 1);
+        let copied = PathBuf::from(&attachments.attachments[0].path);
+        assert!(copied.starts_with(runtime_root));
+        assert_eq!(
+            tokio::fs::read(copied).await.expect("read copied image"),
+            b"png bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn write_opencode_generated_config_points_to_runtime_agents_file() {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
@@ -17439,17 +17566,7 @@ impl Kernel {
         if artifacts.is_empty() {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
-        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
-            let runtime_state_root = Self::runtime_state_root(execution_plan).ok_or_else(|| {
-                KernelError::Runtime(
-                    "runtime state root is required to publish program-backed runtime artifacts"
-                        .to_string(),
-                )
-            })?;
-            let mut artifact_roots = vec![runtime_state_root.to_path_buf()];
-            if let Some(runtime_home_root) = Self::runtime_native_home_root(execution_plan) {
-                artifact_roots.extend(runtime_native_home_artifact_roots(runtime_home_root));
-            }
+        if let Some(artifact_roots) = Self::runtime_artifact_roots_for_plan(execution_plan) {
             return self
                 .prepare_runtime_artifact_attachments_from_roots(
                     turn_id,
@@ -17458,8 +17575,23 @@ impl Kernel {
                 )
                 .await;
         }
+        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
+            return Err(KernelError::Runtime(
+                "runtime state root is required to publish program-backed runtime artifacts"
+                    .to_string(),
+            ));
+        }
         self.prepare_runtime_artifact_attachments(turn_id, artifacts)
             .await
+    }
+
+    fn runtime_artifact_roots_for_plan(plan: &EffectiveExecutionPlan) -> Option<Vec<PathBuf>> {
+        let runtime_state_root = Self::runtime_state_root(plan)?;
+        let mut artifact_roots = vec![runtime_state_root.to_path_buf()];
+        if let Some(runtime_home_root) = Self::runtime_native_home_root(plan) {
+            artifact_roots.extend(runtime_native_home_artifact_roots(runtime_home_root));
+        }
+        Some(artifact_roots)
     }
 
     async fn prepare_runtime_artifact_attachments_from_roots(
