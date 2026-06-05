@@ -102,11 +102,12 @@ config overrides mark the container workspace as trusted and disable update
 checks without rewriting the runtime-owned Codex config. Completed Codex and
 OpenCode native UI turns are reconciled from durable runtime state into
 LionClaw session history on exit. OpenCode uses the persistent HOME/XDG roots
-under `/runtime/home` and starts with its auto-update prompt disabled, so
-runtime updates stay under LionClaw's runtime image path. If a prior native
-launch did not finish cleanly, LionClaw reconciles before the next launch;
-prior LionClaw session history is then included in the generated runtime
-context.
+under `/runtime/home`; LionClaw points `OPENCODE_CONFIG` at a generated
+session-scoped config file that loads `/runtime/AGENTS.md`, and disables the
+auto-update prompt so runtime updates stay under LionClaw's runtime image path.
+If a prior native launch did not finish cleanly, LionClaw reconciles before the
+next launch; prior LionClaw session history is then included in the generated
+runtime context.
 LionClaw does not scrape terminal output.
 Because this is the runtime's own TUI, there is no LionClaw command layer
 inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable

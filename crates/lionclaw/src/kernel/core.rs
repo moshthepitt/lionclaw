@@ -520,6 +520,9 @@ const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const RUNTIME_STATE_DIR_MODE: u32 = 0o700;
 const RUNTIME_STATE_FILE_MODE: u32 = 0o600;
+const OPENCODE_RUNTIME_KIND: &str = "opencode";
+const OPENCODE_GENERATED_CONFIG_FILE: &str = "opencode.generated.json";
+const OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH: &str = "/runtime/AGENTS.md";
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
@@ -955,8 +958,13 @@ impl Kernel {
             )
             .await;
         }
-        self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
-            .await?;
+        self.materialize_attached_runtime_context(
+            session_id,
+            &runtime_id,
+            &runtime_kind,
+            &execution_plan,
+        )
+        .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
         let runtime_session_ready =
@@ -1006,6 +1014,7 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
+        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?;
@@ -1030,6 +1039,9 @@ impl Kernel {
         for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
             write_runtime_state_file(runtime_state_root, file_name, rendered.as_bytes().to_vec())
                 .await?;
+        }
+        if runtime_kind == OPENCODE_RUNTIME_KIND {
+            write_opencode_generated_config(runtime_state_root).await?;
         }
         Ok(())
     }
@@ -7925,6 +7937,33 @@ mod tests {
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
         );
+        assert!(!runtime_state_root
+            .join(OPENCODE_GENERATED_CONFIG_FILE)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn write_opencode_generated_config_points_to_runtime_agents_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        create_owner_private_directory_all(None, &runtime_state_root)
+            .await
+            .expect("create runtime state root");
+
+        write_opencode_generated_config(&runtime_state_root)
+            .await
+            .expect("write generated opencode config");
+
+        let generated =
+            tokio::fs::read_to_string(runtime_state_root.join(OPENCODE_GENERATED_CONFIG_FILE))
+                .await
+                .expect("read generated opencode config");
+        let generated: serde_json::Value =
+            serde_json::from_str(&generated).expect("parse generated opencode config");
+        assert_eq!(
+            generated["instructions"],
+            json!([OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH])
+        );
     }
 
     #[cfg(unix)]
@@ -13164,6 +13203,15 @@ fn write_runtime_state_file_blocking(
             runtime_state_root.display()
         ))
     })
+}
+
+async fn write_opencode_generated_config(runtime_state_root: &Path) -> Result<(), KernelError> {
+    let contents = serde_json::to_vec_pretty(&json!({
+        "$schema": "https://opencode.ai/config.json",
+        "instructions": [OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH],
+    }))
+    .map_err(|err| internal(err.into()))?;
+    write_runtime_state_file(runtime_state_root, OPENCODE_GENERATED_CONFIG_FILE, contents).await
 }
 
 async fn read_runtime_state_file(

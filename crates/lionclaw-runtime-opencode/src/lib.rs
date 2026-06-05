@@ -56,6 +56,7 @@ use lionclaw_runtime_api::{
 };
 
 const OPENCODE_SESSION_ID_STATE_FILE: &str = ".lionclaw-opencode-session-id";
+const OPENCODE_RUNTIME_CONFIG_PATH: &str = "/runtime/opencode.generated.json";
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -306,7 +307,7 @@ fn build_opencode_terminal_program(
     RuntimeProgramSpec {
         executable: config.executable.clone(),
         args,
-        environment: opencode_runtime_environment(),
+        environment: opencode_terminal_environment(),
         stdin: String::new(),
         auth: None,
     }
@@ -342,6 +343,15 @@ fn build_opencode_export_program(
 
 fn opencode_runtime_environment() -> Vec<(String, String)> {
     vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())]
+}
+
+fn opencode_terminal_environment() -> Vec<(String, String)> {
+    let mut environment = opencode_runtime_environment();
+    environment.push((
+        "OPENCODE_CONFIG".to_string(),
+        OPENCODE_RUNTIME_CONFIG_PATH.to_string(),
+    ));
+    environment
 }
 
 fn opencode_transcript_export_environment() -> Vec<(String, String)> {
@@ -1238,8 +1248,9 @@ mod tests {
     };
 
     use super::{
-        opencode_runtime_environment, parse_opencode_session_list, parse_opencode_stdout,
-        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, OPENCODE_SESSION_ID_STATE_FILE,
+        opencode_runtime_environment, opencode_terminal_environment, parse_opencode_session_list,
+        parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
+        OPENCODE_SESSION_ID_STATE_FILE,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::{json, Value};
@@ -1725,7 +1736,7 @@ mod tests {
                 "builder".to_string(),
             ]
         );
-        assert_eq!(program.environment, opencode_runtime_environment());
+        assert_eq!(program.environment, opencode_terminal_environment());
         assert!(program.stdin.is_empty());
         assert!(program.auth.is_none());
     }

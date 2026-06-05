@@ -253,11 +253,13 @@ own workspace prompt inside the container while keeping runtime updates under
 LionClaw's runtime image/update path. Those overrides do not rewrite
 `/runtime/home/.codex/config.toml`, and the host Codex home is not mutated.
 
-For OpenCode, LionClaw lets HOME/XDG point at `/runtime/home` and sets
-`OPENCODE_DISABLE_AUTOUPDATE=1`. OpenCode's native instruction loader then
-reads `/runtime/AGENTS.md` as global runtime instructions while project-level
-`.opencode` and `AGENTS.md` files remain project-owned. Runtime updates stay
-under LionClaw's runtime image/update path.
+For OpenCode native TUI launches, LionClaw lets HOME/XDG point at
+`/runtime/home`, sets `OPENCODE_DISABLE_AUTOUPDATE=1`, and points
+`OPENCODE_CONFIG` at `/runtime/opencode.generated.json`. That session-scoped
+config file loads `/runtime/AGENTS.md` as global runtime instructions while
+project-level `.opencode` and `AGENTS.md` files remain project-owned. Program
+turns carry LionClaw context through the normal prompt envelope. Runtime updates
+stay under LionClaw's runtime image/update path.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex continuity is a
