@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,7 +14,7 @@ use crate::{
         config::ChannelLaunchMode,
         skill_metadata::{
             canonical_skill_dir, resolve_skill_entrypoint, skill_metadata_declares_channel,
-            validate_skill_entrypoint_path, SkillEntrypointSymlinkPolicy, SKILL_METADATA_FILE,
+            SkillEntrypointSymlinkPolicy, SKILL_METADATA_FILE,
         },
         snapshot::installed_snapshot_matches_source,
     },
@@ -513,16 +513,42 @@ fn resolve_channel_entrypoint(
     relative_path: &str,
     label: &str,
 ) -> Result<PathBuf> {
+    let normalized = normalize_channel_entrypoint_path(relative_path, label)?;
+    let normalized = normalized.to_string_lossy();
     resolve_skill_entrypoint(
         skill_dir,
-        relative_path,
+        normalized.as_ref(),
         label,
         SkillEntrypointSymlinkPolicy::AllowParentSymlinks,
     )
 }
 
 fn validate_channel_entrypoint_path(relative_path: &str, label: &str) -> Result<()> {
-    validate_skill_entrypoint_path(relative_path, label)
+    normalize_channel_entrypoint_path(relative_path, label).map(|_| ())
+}
+
+fn normalize_channel_entrypoint_path(relative_path: &str, label: &str) -> Result<PathBuf> {
+    if relative_path.is_empty() {
+        bail!("{label} path is required");
+    }
+    let path = Path::new(relative_path);
+    if path.is_absolute() {
+        bail!("{label} path '{relative_path}' must be relative to the skill directory");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("{label} path '{relative_path}' must stay inside the skill directory");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("{label} path is required");
+    }
+    Ok(normalized)
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -616,6 +642,22 @@ mod tests {
         assert_eq!(metadata.worker, "scripts/worker");
         assert_eq!(metadata.env, vec!["TELEGRAM_BOT_TOKEN"]);
         assert!(metadata.optional_env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_channel_worker_paths_with_current_directory_components() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-telegram", "telegram");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"telegram\"\nlaunch = \"background\"\nworker = \"./scripts/./worker\"\n",
+        )
+        .expect("metadata");
+
+        let metadata = load_channel_metadata(&skill).expect("metadata");
+
+        assert_eq!(metadata.worker, "./scripts/./worker");
     }
 
     #[cfg(unix)]
@@ -722,6 +764,32 @@ mod tests {
             .setup
             .expect("setup");
 
+        assert_eq!(
+            resolve_channel_setup_command_entrypoint(&skill, &setup).expect("entrypoint"),
+            fs::canonicalize(skill.join("bin/setup")).expect("canonical setup")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_setup_command_paths_with_current_directory_components() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-email", "email");
+        fs::create_dir_all(skill.join("bin")).expect("bin dir");
+        fs::write(skill.join("bin/setup"), "#!/usr/bin/env bash\n").expect("setup");
+        make_executable(&skill.join("bin/setup"));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"email\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[channel.setup]\ncommand = \"./bin/./setup\"\n",
+        )
+        .expect("metadata");
+
+        let setup = load_channel_metadata(&skill)
+            .expect("metadata")
+            .setup
+            .expect("setup");
+
+        assert_eq!(setup.command, "./bin/./setup");
         assert_eq!(
             resolve_channel_setup_command_entrypoint(&skill, &setup).expect("entrypoint"),
             fs::canonicalize(skill.join("bin/setup")).expect("canonical setup")
