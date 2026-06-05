@@ -1005,9 +1005,11 @@ A configured memory projector is a resident host process owned by the kernel
 instance and the loaded applied state. It starts lazily on the first eligible
 Main-session memory projection, runs with the skill root as its working
 directory, and receives only the fixed kernel environment needed for v1:
-`LIONCLAW_MEMORY_PROJECTOR_ID` and `LIONCLAW_SKILL_STATE_DIR`. The state
-directory is host-only selected-instance state under `config/skill-state/<alias>`
-and is not mounted into the agent runtime.
+`LIONCLAW_MEMORY_PROJECTOR_ID` and `LIONCLAW_SKILL_STATE_DIR`, plus the small
+ambient process-start allowlist `PATH`, `PATHEXT`, `SYSTEMROOT`, and
+`SystemRoot` when present. The state directory is host-only selected-instance
+state under `config/skill-state/<alias>` and is not mounted into the agent
+runtime.
 
 The v1 protocol is JSONL. The kernel writes one `MemoryProjectionRequest` JSON
 object per line to projector stdin and reads one `MemoryProjection` JSON object
