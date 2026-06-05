@@ -8221,6 +8221,114 @@ mod tests {
         assert!(!runtime_home_root.join(".codex/config.toml").exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_filters_managed_skill_links_before_merging_prior_homes() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let project_root = temp_dir.path().join("workspace");
+        let runtime_id = "codex";
+        let workspace = "main";
+        let compatibility_key = "compat";
+        let shape_key = "shape";
+        let first_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let second_prior_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let current_state_root = home.runtime_session_state_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            Uuid::new_v4(),
+            compatibility_key,
+            shape_key,
+        );
+        let runtime_home_root = home.runtime_native_home_dir(
+            runtime_id,
+            workspace,
+            &project_root,
+            compatibility_key,
+            shape_key,
+        );
+        let managed_skill_link = first_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/skills/loopback");
+        let native_skill_entry = second_prior_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".codex/skills/loopback");
+        tokio::fs::create_dir_all(
+            managed_skill_link
+                .parent()
+                .expect("managed skill link parent"),
+        )
+        .await
+        .expect("create managed skill projection parent");
+        tokio::fs::create_dir_all(
+            native_skill_entry
+                .parent()
+                .expect("native skill entry parent"),
+        )
+        .await
+        .expect("create native skill entry parent");
+        std::os::unix::fs::symlink("/lionclaw/skills/loopback", &managed_skill_link)
+            .expect("create managed skill projection");
+        tokio::fs::write(&native_skill_entry, b"native skill data\n")
+            .await
+            .expect("write native skill entry");
+        let mut plan = test_execution_plan(runtime_id);
+        plan.mounts = vec![
+            MountSpec {
+                source: current_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan(runtime_id, "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            !first_prior_state_root
+                .join(RUNTIME_NATIVE_HOME_DIR)
+                .exists(),
+            "first prior home should be removed after dropping the managed projection"
+        );
+        assert!(
+            !second_prior_state_root
+                .join(RUNTIME_NATIVE_HOME_DIR)
+                .exists(),
+            "second prior home should be merged"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".codex/skills/loopback"))
+                .await
+                .expect("read migrated native skill entry"),
+            "native skill data\n"
+        );
+    }
+
     #[tokio::test]
     async fn materialize_runtime_plan_merges_legacy_runtime_home_into_existing_destination() {
         let temp_dir = tempdir().expect("temp dir");
@@ -14564,6 +14672,39 @@ fn merge_runtime_native_home_entry_blocking(
 
     match std::fs::symlink_metadata(destination_path) {
         Err(err) if err.kind() == ErrorKind::NotFound => {
+            if source_metadata.is_dir() {
+                match std::fs::create_dir(destination_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                        let destination_metadata = std::fs::symlink_metadata(destination_path)
+                            .map_err(|err| {
+                                KernelError::Runtime(format!(
+                                    "failed to stat runtime native home entry '{}': {err}",
+                                    destination_path.display()
+                                ))
+                            })?;
+                        if destination_metadata.file_type().is_symlink()
+                            || !destination_metadata.is_dir()
+                        {
+                            return Err(runtime_native_home_migration_conflict(
+                                source_path,
+                                destination_path,
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        return Err(KernelError::Runtime(format!(
+                            "failed to create runtime native home directory '{}': {err}",
+                            destination_path.display()
+                        )))
+                    }
+                }
+                return merge_runtime_native_home_directory_contents_unchecked_blocking(
+                    source_path,
+                    destination_path,
+                    relative_path,
+                );
+            }
             return std::fs::rename(source_path, destination_path).map_err(|err| {
                 KernelError::Runtime(format!(
                     "failed to migrate legacy runtime native home entry '{}' to '{}': {err}",
