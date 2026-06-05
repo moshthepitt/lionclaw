@@ -87,20 +87,22 @@ impl SkillMemoryProjector {
         process: &mut Option<ResidentMemoryProjectorProcess>,
         request: MemoryProjectionRequest,
     ) -> Result<MemoryProjection, MemoryProjectionError> {
-        if process.is_none() {
-            *process = Some(self.spawn_process().await?);
-        }
-        let response = {
+        let request_json = serde_json::to_string(&request)
+            .map_err(|err| MemoryProjectionError::failed(format!("encode request: {err}")))?;
+        self.ensure_ready_process(process).await?;
+        let read = {
             let Some(process) = process.as_mut() else {
                 return Err(MemoryProjectionError::failed(
-                    "memory projector process was not available after spawn",
+                    "memory projector process was not available before request",
                 ));
             };
-            let request_json = serde_json::to_string(&request)
-                .map_err(|err| MemoryProjectionError::failed(format!("encode request: {err}")))?;
             process.write_request(&request_json).await?;
             process.read_response().await?
         };
+        if read.status == ResidentProcessStatus::Stale {
+            Self::retire_process(process).await;
+        }
+        let response = read.response;
         let projection = serde_json::from_str::<MemoryProjection>(&response).map_err(|err| {
             MemoryProjectionError::invalid_output(
                 "decode_response",
@@ -111,6 +113,36 @@ impl SkillMemoryProjector {
             Self::retire_process(process).await;
         }
         Ok(projection)
+    }
+
+    async fn ensure_ready_process(
+        &self,
+        process: &mut Option<ResidentMemoryProjectorProcess>,
+    ) -> Result<(), MemoryProjectionError> {
+        let mut restarted_stale_process = false;
+        loop {
+            if process.is_none() {
+                *process = Some(self.spawn_process().await?);
+            }
+            let status = {
+                let Some(process) = process.as_mut() else {
+                    return Err(MemoryProjectionError::failed(
+                        "memory projector process was not available after spawn",
+                    ));
+                };
+                process.inspect_stdout()?
+            };
+            if status == ResidentProcessStatus::Ready {
+                return Ok(());
+            }
+            if restarted_stale_process {
+                return Err(MemoryProjectionError::failed(
+                    "memory projector exited before request",
+                ));
+            }
+            Self::retire_process(process).await;
+            restarted_stale_process = true;
+        }
     }
 
     async fn spawn_process(&self) -> Result<ResidentMemoryProjectorProcess, MemoryProjectionError> {
@@ -211,7 +243,6 @@ struct ResidentMemoryProjectorProcess {
 
 impl ResidentMemoryProjectorProcess {
     async fn write_request(&mut self, request_json: &str) -> Result<(), MemoryProjectionError> {
-        self.reject_unsolicited_stdout(UnsolicitedStdoutPhase::BeforeRequest)?;
         self.stdin
             .write_all(request_json.as_bytes())
             .await
@@ -225,35 +256,27 @@ impl ResidentMemoryProjectorProcess {
             .map_err(|err| MemoryProjectionError::failed(format!("flush request: {err}")))
     }
 
-    async fn read_response(&mut self) -> Result<String, MemoryProjectionError> {
+    async fn read_response(&mut self) -> Result<ProjectorRead, MemoryProjectionError> {
         let response = self.stdout.recv().await.ok_or_else(|| {
             MemoryProjectionError::failed("memory projector stdout reader stopped")
         })??;
         tokio::task::yield_now().await;
-        self.reject_unsolicited_stdout(UnsolicitedStdoutPhase::AfterResponse)?;
-        Ok(response)
+        let status = self.inspect_stdout()?;
+        Ok(ProjectorRead { response, status })
     }
 
-    fn reject_unsolicited_stdout(
-        &mut self,
-        phase: UnsolicitedStdoutPhase,
-    ) -> Result<(), MemoryProjectionError> {
+    fn inspect_stdout(&mut self) -> Result<ResidentProcessStatus, MemoryProjectionError> {
         match self.stdout.try_recv() {
             Ok(Ok(_line)) => Err(MemoryProjectionError::invalid_output(
                 "unexpected_stdout",
                 "memory projector wrote stdout outside the request/response contract",
             )),
-            Ok(Err(err))
-                if phase == UnsolicitedStdoutPhase::AfterResponse
-                    && err.kind() == MemoryProjectionErrorKind::ProjectorFailed =>
-            {
-                Ok(())
+            Ok(Err(err)) if err.kind() == MemoryProjectionErrorKind::ProjectorFailed => {
+                Ok(ResidentProcessStatus::Stale)
             }
             Ok(Err(err)) => Err(err),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => Err(MemoryProjectionError::failed(
-                "memory projector stdout reader stopped",
-            )),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(ResidentProcessStatus::Ready),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(ResidentProcessStatus::Stale),
         }
     }
 
@@ -290,9 +313,14 @@ impl ResidentMemoryProjectorProcess {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnsolicitedStdoutPhase {
-    BeforeRequest,
-    AfterResponse,
+enum ResidentProcessStatus {
+    Ready,
+    Stale,
+}
+
+struct ProjectorRead {
+    response: String,
+    status: ResidentProcessStatus,
 }
 
 impl Drop for ResidentMemoryProjectorProcess {
@@ -760,6 +788,45 @@ printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
             .project(request())
             .await
             .expect("second response should restart");
+        assert!(second.items.is_empty());
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+            "start\nstart\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn valid_response_then_eof_restarts_before_later_request() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+starts="$LIONCLAW_SKILL_STATE_DIR/starts"
+count=0
+if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
+printf 'start\n' >> "$starts"
+IFS= read -r _line || exit 0
+printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+if [ "$count" = "0" ]; then
+  exit 0
+fi
+"#,
+        );
+        let projector = SkillMemoryProjector::new(config.clone());
+
+        projector
+            .project(request())
+            .await
+            .expect("first response should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let second = projector
+            .project(request())
+            .await
+            .expect("second response should restart before writing");
         assert!(second.items.is_empty());
         assert_eq!(
             fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
