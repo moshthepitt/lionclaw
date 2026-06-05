@@ -8278,6 +8278,81 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_drops_destination_tui_lock_from_read_only_runtime_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let destination_auth = runtime_home_root.join(".codex/auth.json");
+        tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
+            .await
+            .expect("create legacy home");
+        tokio::fs::create_dir_all(destination_auth.parent().expect("auth parent"))
+            .await
+            .expect("create runtime home");
+        tokio::fs::write(&legacy_config, b"model = \"gpt-5\"\n")
+            .await
+            .expect("write legacy config");
+        tokio::fs::write(&destination_auth, b"{\"token\":\"runtime\"}\n")
+            .await
+            .expect("write destination auth");
+        tokio::fs::write(
+            runtime_home_root.join(RUNTIME_TUI_LOCK_FILE),
+            b"old destination lock\n",
+        )
+        .await
+        .expect("write stale destination lock");
+        std::fs::set_permissions(&runtime_home_root, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod runtime home root");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            !legacy_home_root.exists(),
+            "legacy runtime home should be merged away"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".codex/config.toml"))
+                .await
+                .expect("read migrated config"),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&destination_auth)
+                .await
+                .expect("read destination auth"),
+            "{\"token\":\"runtime\"}\n"
+        );
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "stale TUI lock should be removed from a read-only native home"
+        );
+    }
+
     #[tokio::test]
     async fn materialize_runtime_plan_reports_conflicting_prior_legacy_homes_without_moving_data() {
         let temp_dir = tempdir().expect("temp dir");
@@ -14438,12 +14513,26 @@ fn migrate_legacy_runtime_native_homes_blocking(
         runtime_home_root,
     )?;
 
-    if runtime_native_home_directory_metadata_blocking(runtime_home_root, "runtime native home")?
-        .is_none()
-    {
-        create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
-    }
-    remove_runtime_native_home_stale_root_lock_blocking(runtime_home_root)?;
+    let runtime_home_metadata = match runtime_native_home_directory_metadata_blocking(
+        runtime_home_root,
+        "runtime native home",
+    )? {
+        Some(metadata) => metadata,
+        None => {
+            create_owner_private_directory_all_blocking(runtime_root, runtime_home_root)?;
+            runtime_native_home_directory_metadata_blocking(
+                runtime_home_root,
+                "runtime native home",
+            )?
+            .ok_or_else(|| {
+                KernelError::Runtime(format!(
+                    "runtime native home '{}' was not created before migrating legacy homes",
+                    runtime_home_root.display()
+                ))
+            })?
+        }
+    };
+    remove_runtime_native_home_stale_root_lock_blocking(runtime_home_root, &runtime_home_metadata)?;
 
     for legacy_home_root in existing_legacy_home_roots {
         let Some(legacy_metadata) = runtime_native_home_directory_metadata_blocking(
@@ -14586,6 +14675,31 @@ fn runtime_native_home_directory_metadata_blocking(
 }
 
 fn remove_runtime_native_home_stale_root_lock_blocking(
+    runtime_home_root: &Path,
+    runtime_home_metadata: &std::fs::Metadata,
+) -> Result<(), KernelError> {
+    let final_permissions = runtime_home_metadata.permissions();
+    set_runtime_native_home_directory_permissions_blocking(
+        runtime_home_root,
+        runtime_native_home_permissions_with_owner_write(final_permissions.clone()),
+    )?;
+    let remove_result =
+        remove_runtime_native_home_stale_root_lock_unchecked_blocking(runtime_home_root);
+    let restore_result = set_runtime_native_home_directory_permissions_blocking(
+        runtime_home_root,
+        final_permissions,
+    );
+
+    match (remove_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(err)) | (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(restore_err)) => Err(KernelError::Runtime(format!(
+            "{err}; additionally failed to restore runtime native home directory permissions: {restore_err}"
+        ))),
+    }
+}
+
+fn remove_runtime_native_home_stale_root_lock_unchecked_blocking(
     runtime_home_root: &Path,
 ) -> Result<(), KernelError> {
     let lock_path = runtime_home_root.join(RUNTIME_TUI_LOCK_FILE);
