@@ -32,9 +32,9 @@ use lionclaw::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeCapabilityResult,
-            RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramTurnExecution,
-            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-            RuntimeTurnResult,
+            RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+            RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
         },
         ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelError,
         KernelOptions,
@@ -9363,7 +9363,7 @@ struct ProgramBackedRuntimeStateEscapeArtifactAdapter;
 struct ProgramBackedRuntimeHomeArtifactAdapter;
 
 const PROGRAM_BACKED_RUNTIME_HOME_ARTIFACT_PATH: &str =
-    "/runtime/home/.codex/generated_images/thread/generated-image.png";
+    "/runtime/home/generated-artifacts/images/thread/generated-image.png";
 
 #[async_trait]
 impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
@@ -9455,6 +9455,14 @@ impl RuntimeAdapter for ProgramBackedRuntimeHomeArtifactAdapter {
 
     fn turn_mode(&self) -> RuntimeTurnMode {
         RuntimeTurnMode::ProgramBacked
+    }
+
+    fn native_home_artifact_dirs(
+        &self,
+    ) -> Result<Vec<RuntimeNativeHomeArtifactDir>, anyhow::Error> {
+        Ok(vec![RuntimeNativeHomeArtifactDir::new(
+            "generated-artifacts/images",
+        )?])
     }
 
     async fn session_start(

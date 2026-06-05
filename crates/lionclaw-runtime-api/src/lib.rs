@@ -1035,6 +1035,33 @@ pub struct RuntimeArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNativeHomeArtifactDir {
+    relative_path: PathBuf,
+}
+
+impl RuntimeNativeHomeArtifactDir {
+    pub fn new(relative_path: impl AsRef<Path>) -> Result<Self> {
+        let raw_path = relative_path.as_ref();
+        let relative_path = safe_relative_path(raw_path).ok_or_else(|| {
+            anyhow!(
+                "native-home artifact directory '{}' must be relative and stay within the native home",
+                raw_path.display()
+            )
+        })?;
+        if relative_path.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "native-home artifact directory must not be the native home root"
+            ));
+        }
+        Ok(Self { relative_path })
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeFileChangeStatus {
     Editing,
     Edited,
@@ -1122,6 +1149,9 @@ pub trait RuntimeAdapter: Send + Sync {
     }
     fn turn_mode(&self) -> RuntimeTurnMode {
         RuntimeTurnMode::Direct
+    }
+    fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
+        Ok(Vec::new())
     }
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
     async fn turn(
@@ -1527,10 +1557,11 @@ mod tests {
     use super::{
         execute_program_backed_turn, load_ready_state_value, safe_relative_path, ExecutionOutput,
         NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane, RuntimePathProjection,
-        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
+        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1903,6 +1934,17 @@ mod tests {
         assert_eq!(safe_relative_path("."), Some(PathBuf::new()));
         assert_eq!(safe_relative_path("../outside"), None);
         assert_eq!(safe_relative_path("/absolute"), None);
+    }
+
+    #[test]
+    fn native_home_artifact_dir_accepts_only_non_empty_relative_paths() {
+        let dir = RuntimeNativeHomeArtifactDir::new("artifacts/./images")
+            .expect("relative artifact dir should be accepted");
+        assert_eq!(dir.relative_path(), PathBuf::from("artifacts/images"));
+
+        assert!(RuntimeNativeHomeArtifactDir::new(".").is_err());
+        assert!(RuntimeNativeHomeArtifactDir::new("../outside").is_err());
+        assert!(RuntimeNativeHomeArtifactDir::new("/runtime/home/images").is_err());
     }
 
     #[tokio::test]

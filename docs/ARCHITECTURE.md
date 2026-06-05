@@ -411,14 +411,14 @@ The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
 configured channel route, provider-neutral content, and an idempotency key.
 Attachment content is not sent over the socket; the request names files under
-`/runtime` control state or an explicitly allowed generated-artifact directory
-under the persistent native home, such as `/runtime/home/.codex/generated_images`.
-The persistent native home itself is not an attachment root because it can hold
-runtime auth, config, databases, caches, and history. The kernel reuses the
-existing runtime-artifact copy and outbox attachment path. Attachment paths are
-interpreted relative to the current runtime path projections; parent-directory
-and symlink escapes are rejected. Attachment-only sends are valid; text-only
-sends must carry non-empty text.
+`/runtime` control state or a generated-artifact directory declared by the
+runtime adapter under the persistent native home. The persistent native home
+itself is not an attachment root because it can hold runtime auth, config,
+databases, caches, and history. The kernel reuses the existing runtime-artifact
+copy and outbox attachment path. Attachment paths are interpreted relative to
+the current runtime path projections; parent-directory and symlink escapes are
+rejected. Attachment-only sends are valid; text-only sends must carry non-empty
+text.
 
 The bridge is transport only. The kernel validates the current session and turn
 from its own execution context, checks the active channel binding, normalizes

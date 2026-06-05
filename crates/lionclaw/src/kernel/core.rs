@@ -136,11 +136,12 @@ use super::{
         RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
         RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection,
-        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
@@ -212,6 +213,7 @@ struct RuntimeChannelSendContext {
     runtime_id: String,
     runtime_state_root: PathBuf,
     runtime_native_home_root: Option<PathBuf>,
+    runtime_native_home_artifact_roots: Vec<PathBuf>,
     runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
 }
@@ -223,11 +225,7 @@ impl RuntimeChannelSendContext {
 
     fn artifact_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.runtime_state_root.clone()];
-        if let Some(runtime_native_home_root) = &self.runtime_native_home_root {
-            if runtime_native_home_root != &self.runtime_state_root {
-                roots.extend(runtime_native_home_artifact_roots(runtime_native_home_root));
-            }
-        }
+        roots.extend(self.runtime_native_home_artifact_roots.iter().cloned());
         roots
     }
 
@@ -242,22 +240,33 @@ impl RuntimeChannelSendContext {
     }
 }
 
-fn runtime_native_home_artifact_roots(runtime_native_home_root: &Path) -> Vec<PathBuf> {
-    [runtime_native_home_child_dir_without_symlinks(
-        runtime_native_home_root,
-        &[".codex", "generated_images"],
-    )]
-    .into_iter()
-    .flatten()
-    .collect()
+fn runtime_native_home_artifact_roots(
+    runtime_native_home_root: &Path,
+    artifact_dirs: &[RuntimeNativeHomeArtifactDir],
+) -> Vec<PathBuf> {
+    artifact_dirs
+        .iter()
+        .filter_map(|artifact_dir| {
+            runtime_native_home_child_dir_without_symlinks(
+                runtime_native_home_root,
+                artifact_dir.relative_path(),
+            )
+        })
+        .collect()
 }
 
 fn runtime_native_home_child_dir_without_symlinks(
     runtime_native_home_root: &Path,
-    components: &[&str],
+    relative_path: &Path,
 ) -> Option<PathBuf> {
+    if relative_path.as_os_str().is_empty() {
+        return None;
+    }
     let mut path = runtime_native_home_root.to_path_buf();
-    for component in components {
+    for component in relative_path.components() {
+        let Component::Normal(component) = component else {
+            return None;
+        };
         path.push(component);
         let metadata = std::fs::symlink_metadata(&path).ok()?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -7293,6 +7302,62 @@ mod tests {
         }
     }
 
+    const TEST_NATIVE_HOME_ARTIFACT_DIR: &str = "generated-artifacts/images";
+
+    fn test_native_home_artifact_dirs() -> Vec<RuntimeNativeHomeArtifactDir> {
+        RuntimeNativeHomeArtifactDir::new(TEST_NATIVE_HOME_ARTIFACT_DIR)
+            .map(|dir| vec![dir])
+            .expect("test native-home artifact dir is valid")
+    }
+
+    struct NativeHomeArtifactRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for NativeHomeArtifactRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: "native-home-artifacts".to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        fn native_home_artifact_dirs(&self) -> anyhow::Result<Vec<RuntimeNativeHomeArtifactDir>> {
+            Ok(test_native_home_artifact_dirs())
+        }
+
+        async fn session_start(
+            &self,
+            input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("native-home-artifacts:{}", input.session_id),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _event_tx: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
 
     struct CountingTerminalRuntimeAdapter {
@@ -8078,39 +8143,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_home_artifact_roots_reject_symlinked_generated_image_dir() {
+    fn native_home_artifact_roots_reject_symlinked_declared_dir() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempdir().expect("temp dir");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let codex_home = runtime_home_root.join(".codex");
+        let artifact_parent = runtime_home_root.join("generated-artifacts");
         let generated_target = temp_dir.path().join("elsewhere");
-        std::fs::create_dir_all(&codex_home).expect("create codex home");
+        std::fs::create_dir_all(&artifact_parent).expect("create artifact parent");
         std::fs::create_dir_all(&generated_target).expect("create target");
-        symlink(&generated_target, codex_home.join("generated_images"))
-            .expect("symlink generated images");
+        symlink(&generated_target, artifact_parent.join("images"))
+            .expect("symlink declared artifact dir");
 
         assert!(
-            runtime_native_home_artifact_roots(&runtime_home_root).is_empty(),
+            runtime_native_home_artifact_roots(
+                &runtime_home_root,
+                &test_native_home_artifact_dirs()
+            )
+            .is_empty(),
             "native-home artifact roots must not follow symlinked directories"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn native_home_artifact_roots_reject_symlinked_codex_dir() {
+    fn native_home_artifact_roots_reject_symlinked_declared_parent_dir() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempdir().expect("temp dir");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let codex_target = temp_dir.path().join("elsewhere").join(".codex");
+        let artifact_parent_target = temp_dir
+            .path()
+            .join("elsewhere")
+            .join("generated-artifacts");
         std::fs::create_dir_all(&runtime_home_root).expect("create runtime home root");
-        std::fs::create_dir_all(codex_target.join("generated_images"))
-            .expect("create generated image target");
-        symlink(&codex_target, runtime_home_root.join(".codex")).expect("symlink codex home");
+        std::fs::create_dir_all(artifact_parent_target.join("images"))
+            .expect("create generated artifact target");
+        symlink(
+            &artifact_parent_target,
+            runtime_home_root.join("generated-artifacts"),
+        )
+        .expect("symlink artifact parent");
 
         assert!(
-            runtime_native_home_artifact_roots(&runtime_home_root).is_empty(),
+            runtime_native_home_artifact_roots(
+                &runtime_home_root,
+                &test_native_home_artifact_dirs()
+            )
+            .is_empty(),
             "native-home artifact roots must not follow symlinked parent directories"
         );
     }
@@ -8121,14 +8201,14 @@ mod tests {
         let runtime_root = temp_dir.path().join("runtime");
         let runtime_state_root = runtime_root.join("state");
         let runtime_home_root = runtime_root.join("native-home");
-        let codex_home = runtime_home_root.join(".codex");
+        let native_config_dir = runtime_home_root.join("native-config");
         tokio::fs::create_dir_all(&runtime_state_root)
             .await
             .expect("create runtime state root");
-        tokio::fs::create_dir_all(&codex_home)
+        tokio::fs::create_dir_all(&native_config_dir)
             .await
-            .expect("create codex home");
-        let auth_file = codex_home.join("auth.json");
+            .expect("create native config dir");
+        let auth_file = native_config_dir.join("auth.json");
         tokio::fs::write(&auth_file, b"{\"tokens\":\"secret\"}")
             .await
             .expect("write native auth file");
@@ -8142,7 +8222,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let mut plan = test_execution_plan("codex");
+        let mut plan = test_execution_plan("native-home-artifacts");
         plan.mounts = vec![
             MountSpec {
                 source: runtime_state_root,
@@ -8158,6 +8238,7 @@ mod tests {
 
         let err = kernel
             .prepare_runtime_artifact_attachments_for_turn(
+                &NativeHomeArtifactRuntimeAdapter,
                 Uuid::nil(),
                 RuntimeTurnMode::Direct,
                 &plan,
@@ -8178,22 +8259,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_runtime_artifacts_allow_native_home_generated_images() {
+    async fn direct_runtime_artifacts_allow_declared_native_home_artifact_dir() {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_root = temp_dir.path().join("runtime");
         let runtime_state_root = runtime_root.join("state");
         let runtime_home_root = runtime_root.join("native-home");
-        let generated_images = runtime_home_root.join(".codex").join("generated_images");
+        let generated_artifacts = runtime_home_root.join(TEST_NATIVE_HOME_ARTIFACT_DIR);
         tokio::fs::create_dir_all(&runtime_state_root)
             .await
             .expect("create runtime state root");
-        tokio::fs::create_dir_all(&generated_images)
+        tokio::fs::create_dir_all(&generated_artifacts)
             .await
-            .expect("create generated images");
-        let image_file = generated_images.join("image.png");
+            .expect("create generated artifacts");
+        let image_file = generated_artifacts.join("image.png");
         tokio::fs::write(&image_file, b"png bytes")
             .await
-            .expect("write generated image");
+            .expect("write generated artifact");
 
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
@@ -8204,7 +8285,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let mut plan = test_execution_plan("codex");
+        let mut plan = test_execution_plan("native-home-artifacts");
         plan.mounts = vec![
             MountSpec {
                 source: runtime_state_root,
@@ -8220,6 +8301,7 @@ mod tests {
 
         let attachments = kernel
             .prepare_runtime_artifact_attachments_for_turn(
+                &NativeHomeArtifactRuntimeAdapter,
                 Uuid::nil(),
                 RuntimeTurnMode::Direct,
                 &plan,
@@ -8231,7 +8313,7 @@ mod tests {
                 }],
             )
             .await
-            .expect("generated images should be exportable artifacts");
+            .expect("declared native-home artifacts should be exportable");
 
         assert_eq!(attachments.attachments.len(), 1);
         let copied = PathBuf::from(&attachments.attachments[0].path);
@@ -15329,6 +15411,7 @@ impl Kernel {
         let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
             match self
                 .prepare_runtime_artifact_attachments_for_turn(
+                    adapter.as_ref(),
                     turn_id,
                     runtime_turn_mode,
                     &execution_plan,
@@ -16083,6 +16166,7 @@ impl Kernel {
 
     async fn maybe_start_runtime_channel_send_bridge(
         &self,
+        adapter: &dyn RuntimeAdapter,
         session_id: Uuid,
         turn_id: Uuid,
         runtime_id: &str,
@@ -16109,14 +16193,24 @@ impl Kernel {
                 )
                 .await;
         };
+        let runtime_native_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let runtime_native_home_artifact_roots = if let Some(runtime_native_home_root) =
+            runtime_native_home_root.as_deref()
+        {
+            let native_home_artifact_dirs =
+                Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?;
+            runtime_native_home_artifact_roots(runtime_native_home_root, &native_home_artifact_dirs)
+        } else {
+            Vec::new()
+        };
         self.start_runtime_channel_send_bridge(
             RuntimeChannelSendContext {
                 session_id,
                 turn_id,
                 runtime_id: runtime_id.to_string(),
                 runtime_state_root,
-                runtime_native_home_root: Self::runtime_native_home_root(plan)
-                    .map(Path::to_path_buf),
+                runtime_native_home_root,
+                runtime_native_home_artifact_roots,
                 runtime_path_projections: Vec::new(),
                 active: Arc::new(AtomicBool::new(true)),
             },
@@ -17558,6 +17652,7 @@ impl Kernel {
 
     async fn prepare_runtime_artifact_attachments_for_turn(
         &self,
+        adapter: &dyn RuntimeAdapter,
         turn_id: Uuid,
         runtime_turn_mode: RuntimeTurnMode,
         execution_plan: &EffectiveExecutionPlan,
@@ -17566,7 +17661,9 @@ impl Kernel {
         if artifacts.is_empty() {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
-        if let Some(artifact_roots) = Self::runtime_artifact_roots_for_plan(execution_plan) {
+        if let Some(artifact_roots) =
+            Self::runtime_artifact_roots_for_plan(adapter, execution_plan)?
+        {
             return self
                 .prepare_runtime_artifact_attachments_from_roots(
                     turn_id,
@@ -17585,13 +17682,34 @@ impl Kernel {
             .await
     }
 
-    fn runtime_artifact_roots_for_plan(plan: &EffectiveExecutionPlan) -> Option<Vec<PathBuf>> {
-        let runtime_state_root = Self::runtime_state_root(plan)?;
+    fn runtime_declared_native_home_artifact_dirs(
+        adapter: &dyn RuntimeAdapter,
+        runtime_id: &str,
+    ) -> Result<Vec<RuntimeNativeHomeArtifactDir>, KernelError> {
+        adapter.native_home_artifact_dirs().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime '{runtime_id}' declared invalid native-home artifact directory: {err}"
+            ))
+        })
+    }
+
+    fn runtime_artifact_roots_for_plan(
+        adapter: &dyn RuntimeAdapter,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<Option<Vec<PathBuf>>, KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(None);
+        };
         let mut artifact_roots = vec![runtime_state_root.to_path_buf()];
         if let Some(runtime_home_root) = Self::runtime_native_home_root(plan) {
-            artifact_roots.extend(runtime_native_home_artifact_roots(runtime_home_root));
+            let native_home_artifact_dirs =
+                Self::runtime_declared_native_home_artifact_dirs(adapter, &plan.runtime_id)?;
+            artifact_roots.extend(runtime_native_home_artifact_roots(
+                runtime_home_root,
+                &native_home_artifact_dirs,
+            ));
         }
-        Some(artifact_roots)
+        Ok(Some(artifact_roots))
     }
 
     async fn prepare_runtime_artifact_attachments_from_roots(
@@ -18669,6 +18787,7 @@ impl Kernel {
         let runtime_turn_mode = adapter.turn_mode();
         let _channel_send_bridge = self
             .maybe_start_runtime_channel_send_bridge(
+                adapter.as_ref(),
                 session_id,
                 turn_id,
                 runtime_id,

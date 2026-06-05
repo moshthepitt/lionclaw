@@ -52,18 +52,19 @@ use lionclaw_runtime_api::{
     ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact,
     RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome,
     RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange,
-    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
-    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnMode, RuntimeTurnResult, TerminalTranscriptCandidate, TerminalTranscriptTarget,
-    TerminalTranscriptTimestampPrecision,
+    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
+    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
+const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
 const CODEX_GENERATED_IMAGES_RUNTIME_DIR: &str = "/runtime/home/.codex/generated_images";
 const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
 const CODEX_TRUSTED_LEVEL: &str = "trusted";
@@ -736,6 +737,12 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     fn turn_mode(&self) -> RuntimeTurnMode {
         RuntimeTurnMode::ProgramBacked
+    }
+
+    fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
+        Ok(vec![RuntimeNativeHomeArtifactDir::new(
+            CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
+        )?])
     }
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
