@@ -5,8 +5,6 @@ use crate::{
     workspace::{AGENTS_FILE, IDENTITY_FILE, SOUL_FILE, USER_FILE},
 };
 
-use super::continuity::MEMORY_FILE;
-
 pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 1;
 pub(crate) const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
@@ -140,6 +138,7 @@ pub(crate) enum ContextSource {
     Generated(&'static str),
     WorkspaceFile(&'static str),
     ContinuityFile(&'static str),
+    MemoryProjection,
     CompactionSummary,
     TranscriptTail,
     CurrentUserInput,
@@ -151,6 +150,7 @@ impl ContextSource {
             Self::Generated(name) => format!("generated:{name}"),
             Self::WorkspaceFile(file_name) => format!("workspace_file:{file_name}"),
             Self::ContinuityFile(file_name) => format!("continuity_file:{file_name}"),
+            Self::MemoryProjection => "memory_projection".to_string(),
             Self::CompactionSummary => "compaction_summary".to_string(),
             Self::TranscriptTail => "transcript_tail".to_string(),
             Self::CurrentUserInput => "current_user_input".to_string(),
@@ -416,9 +416,9 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
         },
         ContextItemSpec {
             id: ContextItemId::MemoryContext,
-            title: MEMORY_FILE,
+            title: "Memory",
             class: ContextClass::Memory,
-            source: ContextSource::ContinuityFile(MEMORY_FILE),
+            source: ContextSource::MemoryProjection,
             required: false,
         },
         ContextItemSpec {
@@ -597,6 +597,68 @@ pub(crate) struct PromptContextCap {
     pub original_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptContextMemoryProjectionAudit {
+    pub status: &'static str,
+    pub projector_id: Option<String>,
+    pub item_count: usize,
+    pub source_count: usize,
+    pub requested_max_items: usize,
+    pub requested_max_bytes: usize,
+    pub projected_bytes: usize,
+    pub included_bytes: usize,
+    pub original_bytes: usize,
+    pub was_capped: bool,
+    pub reason: Option<&'static str>,
+}
+
+impl PromptContextMemoryProjectionAudit {
+    pub(crate) fn new(
+        status: &'static str,
+        projector_id: Option<String>,
+        source_count: usize,
+        requested_max_items: usize,
+        requested_max_bytes: usize,
+    ) -> Self {
+        Self {
+            status,
+            projector_id,
+            item_count: 0,
+            source_count,
+            requested_max_items,
+            requested_max_bytes,
+            projected_bytes: 0,
+            included_bytes: 0,
+            original_bytes: 0,
+            was_capped: false,
+            reason: None,
+        }
+    }
+
+    pub(crate) fn with_counts(mut self, item_count: usize, projected_bytes: usize) -> Self {
+        self.item_count = item_count;
+        self.projected_bytes = projected_bytes;
+        self
+    }
+
+    pub(crate) fn with_rendered_bytes(
+        mut self,
+        included_bytes: usize,
+        original_bytes: usize,
+        was_capped: bool,
+    ) -> Self {
+        self.included_bytes = included_bytes;
+        self.original_bytes = original_bytes;
+        self.was_capped = was_capped;
+        self
+    }
+
+    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PromptContextAudit {
     pub runtime_id: String,
@@ -607,6 +669,7 @@ pub(crate) struct PromptContextAudit {
     pub included: Vec<PromptContextIncluded>,
     pub excluded: Vec<PromptContextExcluded>,
     pub capped: Vec<PromptContextCap>,
+    pub memory_projection: Option<PromptContextMemoryProjectionAudit>,
     pub total_included_bytes: usize,
 }
 
@@ -621,6 +684,7 @@ impl PromptContextAudit {
             included: Vec::new(),
             excluded: Vec::new(),
             capped: Vec::new(),
+            memory_projection: None,
             total_included_bytes: 0,
         }
     }
@@ -656,6 +720,13 @@ impl PromptContextAudit {
         });
     }
 
+    pub(crate) fn record_memory_projection(
+        &mut self,
+        projection: PromptContextMemoryProjectionAudit,
+    ) {
+        self.memory_projection = Some(projection);
+    }
+
     pub(crate) fn to_details_json(&self) -> Value {
         json!({
             "runtime_id": self.runtime_id,
@@ -666,6 +737,7 @@ impl PromptContextAudit {
             "included": self.included.iter().map(included_json).collect::<Vec<_>>(),
             "excluded": self.excluded.iter().map(excluded_json).collect::<Vec<_>>(),
             "capped": self.capped.iter().map(cap_json).collect::<Vec<_>>(),
+            "memory_projection": self.memory_projection.as_ref().map(memory_projection_json),
             "total_included_bytes": self.total_included_bytes,
         })
     }
@@ -697,6 +769,23 @@ fn cap_json(item: &PromptContextCap) -> Value {
         "source": item.source.as_str(),
         "included_bytes": item.included_bytes,
         "original_bytes": item.original_bytes,
+    })
+}
+
+fn memory_projection_json(item: &PromptContextMemoryProjectionAudit) -> Value {
+    json!({
+        "status": item.status,
+        "projector_id": item.projector_id,
+        "item_count": item.item_count,
+        "source_count": item.source_count,
+        "requested_max_items": item.requested_max_items,
+        "requested_max_bytes": item.requested_max_bytes,
+        "projected_bytes": item.projected_bytes,
+        "included_bytes": item.included_bytes,
+        "original_bytes": item.original_bytes,
+        "was_capped": item.was_capped,
+        "cap_status": if item.was_capped { "capped" } else { "uncapped" },
+        "reason": item.reason,
     })
 }
 
@@ -1137,7 +1226,7 @@ mod tests {
             }
             ContextItemId::MemoryContext => {
                 assert_eq!(item.class, ContextClass::Memory);
-                assert_eq!(item.source, ContextSource::ContinuityFile(MEMORY_FILE));
+                assert_eq!(item.source, ContextSource::MemoryProjection);
                 assert!(!item.required);
             }
             ContextItemId::ActiveContinuity => {

@@ -915,28 +915,9 @@ impl ContinuityLayout {
 }
 
 impl ContinuityLayout {
-    pub async fn read_memory_prompt_section(&self) -> Result<Option<String>> {
-        let fs = self.fs().await?;
-        fs.read_to_string_if_exists(&self.memory_rel_path())
-    }
-
     pub async fn read_active_prompt_section(&self) -> Result<Option<String>> {
         let fs = self.fs().await?;
         fs.read_to_string_if_exists(&self.active_rel_path())
-    }
-
-    #[deprecated(
-        note = "runtime prompt construction must use policy-selected targeted continuity reads"
-    )]
-    pub async fn read_prompt_sections(&self) -> Result<Vec<(String, String)>> {
-        let mut sections = Vec::new();
-        if let Some(content) = self.read_memory_prompt_section().await? {
-            sections.push((MEMORY_FILE.to_string(), content));
-        }
-        if let Some(content) = self.read_active_prompt_section().await? {
-            sections.push(("continuity/ACTIVE.md".to_string(), content));
-        }
-        Ok(sections)
     }
 
     async fn sort_relative_paths_by_modified_desc(
@@ -1292,11 +1273,7 @@ mod tests {
         assert!(layout.continuity_dir().join("artifacts").exists());
         assert!(layout.continuity_dir().join("proposals/memory").exists());
 
-        let memory = layout
-            .read_memory_prompt_section()
-            .await
-            .expect("read memory")
-            .expect("memory section");
+        let memory = std::fs::read_to_string(layout.memory_path()).expect("read memory");
         assert!(memory.contains("# Memory"));
         let active = layout
             .read_active_prompt_section()
@@ -2272,29 +2249,6 @@ mod tests {
 
         let err = layout
             .read_active_prompt_section()
-            .await
-            .expect_err("symlinked active should fail");
-        let message = err.to_string();
-        assert!(message.contains("failed to open") || message.contains("not a regular file"));
-    }
-
-    #[allow(deprecated)]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn compatibility_prompt_sections_surface_non_missing_read_failures() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempdir().expect("temp dir");
-        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
-        layout.ensure_base_layout().await.expect("bootstrap");
-
-        let outside = temp_dir.path().join("outside-active.md");
-        std::fs::write(&outside, "outside\n").expect("write outside file");
-        std::fs::remove_file(layout.active_path()).expect("remove active");
-        symlink(&outside, layout.active_path()).expect("symlink active");
-
-        let err = layout
-            .read_prompt_sections()
             .await
             .expect_err("symlinked active should fail");
         let message = err.to_string();

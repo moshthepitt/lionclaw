@@ -26,6 +26,8 @@ pub struct OperatorConfig {
     pub runtimes: BTreeMap<String, RuntimeProfileConfig>,
     #[serde(default)]
     pub channels: Vec<ManagedChannelConfig>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 impl OperatorConfig {
@@ -211,6 +213,7 @@ impl OperatorConfig {
                 Some((id, runtime))
             })
             .collect();
+        self.memory.normalize();
         self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
             channel.id = channel.id.trim().to_string();
@@ -291,6 +294,22 @@ pub struct OperatorDefaults {
     pub runtime: Option<String>,
     #[serde(default)]
     pub preset: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_skill: Option<String>,
+}
+
+impl MemoryConfig {
+    fn normalize(&mut self) {
+        self.projector_skill = self
+            .projector_skill
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +839,29 @@ mod tests {
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
         assert!(config.presets.is_empty());
+        assert!(config.memory.projector_skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_projector_skill_is_trimmed_and_optional() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        tokio::fs::create_dir_all(home.config_dir())
+            .await
+            .expect("config dir");
+        tokio::fs::write(
+            home.config_path(),
+            "[memory]\nprojector_skill = \" memory-core \"\n",
+        )
+        .await
+        .expect("write config");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+
+        assert_eq!(
+            config.memory.projector_skill.as_deref(),
+            Some("memory-core")
+        );
     }
 
     #[tokio::test]

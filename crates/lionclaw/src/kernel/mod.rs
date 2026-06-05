@@ -13,6 +13,8 @@ pub mod drafts;
 pub mod error;
 pub mod input_routing;
 pub mod jobs;
+pub(crate) mod memory_projection;
+pub(crate) mod memory_projector_service;
 pub mod policy;
 pub mod prompt_context;
 pub mod runtime;
