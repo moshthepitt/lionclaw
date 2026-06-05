@@ -1277,6 +1277,96 @@ async fn channel_turn_with_program_backed_runtime_artifact_rejects_runtime_state
 }
 
 #[tokio::test]
+async fn channel_turn_with_program_backed_runtime_home_artifact_enqueues_outbox_attachment() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(
+        &env,
+        "telegram",
+        "channel-outbox-program-home-artifact-skill",
+    )
+    .await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("program-home-artifact".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "program-home-artifact",
+            std::sync::Arc::new(ProgramBackedRuntimeHomeArtifactAdapter),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:program-home-artifact",
+        "program-home-artifact-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:program-home-artifact").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "program-home-artifact-request",
+            "telegram:user:program-home-artifact",
+            "telegram:user:program-home-artifact",
+            None,
+            "generate a runtime home image",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue program runtime home artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(
+        &kernel,
+        "telegram",
+        "program-home-artifact-stream",
+        |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id)
+                    && event.kind == StreamEventKindDto::Status
+                    && event.code.as_deref() == Some("runtime.artifact")
+            }) && events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        },
+    )
+    .await;
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "program-home-artifact-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull program runtime home artifact outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    let content = &outbox.deliveries[0].content;
+    assert_eq!(content.text, "");
+    assert_eq!(content.attachments.len(), 1);
+    let attachment = &content.attachments[0];
+    assert_eq!(attachment.attachment_id, "artifact:image:program-home");
+    assert_eq!(attachment.filename.as_deref(), Some("generated-image.png"));
+    assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+    let copied = std::path::PathBuf::from(&attachment.path);
+    assert!(copied.starts_with(env.home().runtime_dir()));
+    assert_eq!(
+        tokio::fs::read(&copied)
+            .await
+            .expect("read copied runtime home artifact"),
+        b"runtime home png bytes"
+    );
+}
+
+#[tokio::test]
 async fn channel_turn_with_runtime_artifact_rejects_symlink_escape_source() {
     use std::os::unix::fs::symlink;
 
@@ -9242,6 +9332,10 @@ struct ArtifactOnlyAdapter {
 }
 
 struct ProgramBackedRuntimeStateEscapeArtifactAdapter;
+struct ProgramBackedRuntimeHomeArtifactAdapter;
+
+const PROGRAM_BACKED_RUNTIME_HOME_ARTIFACT_PATH: &str =
+    "/runtime/home/.codex/generated_images/thread/generated-image.png";
 
 #[async_trait]
 impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
@@ -9289,6 +9383,81 @@ impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
             .send(RuntimeEvent::Artifact {
                 artifact: image_runtime_artifact(
                     "artifact:image:program-escape",
+                    artifact_path,
+                    "generated-image.png",
+                ),
+            })
+            .expect("send artifact");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ProgramBackedRuntimeHomeArtifactAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "program-home-artifact".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    fn turn_mode(&self) -> RuntimeTurnMode {
+        RuntimeTurnMode::ProgramBacked
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("program-home-artifact:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn program_backed_turn(
+        &self,
+        execution: RuntimeProgramTurnExecution,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        let artifact_path = execution
+            .context
+            .host_path_for_runtime_path(PROGRAM_BACKED_RUNTIME_HOME_ARTIFACT_PATH)
+            .ok_or_else(|| anyhow::anyhow!("runtime home projection missing"))?;
+        let artifact_parent = artifact_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("artifact parent missing"))?;
+        tokio::fs::create_dir_all(artifact_parent).await?;
+        tokio::fs::write(&artifact_path, b"runtime home png bytes").await?;
+
+        event_tx
+            .send(RuntimeEvent::Artifact {
+                artifact: image_runtime_artifact(
+                    "artifact:image:program-home",
                     artifact_path,
                     "generated-image.png",
                 ),

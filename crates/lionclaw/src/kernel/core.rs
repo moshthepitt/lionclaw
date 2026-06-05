@@ -10371,10 +10371,10 @@ async fn copy_file_to_unique_child(
     )))
 }
 
-fn runtime_artifact_relative_path(
-    artifact_root: &Path,
+fn runtime_artifact_relative_path<'a>(
+    artifact_roots: &'a [PathBuf],
     artifact: &RuntimeArtifact,
-) -> Result<PathBuf, KernelError> {
+) -> Result<(&'a Path, PathBuf), KernelError> {
     let metadata = std::fs::symlink_metadata(&artifact.path).map_err(|err| {
         KernelError::Runtime(format!(
             "runtime artifact '{}' is not readable: {err}",
@@ -10393,41 +10393,44 @@ fn runtime_artifact_relative_path(
             artifact.path.display()
         ))
     })?;
-    let relative = canonical_artifact
-        .strip_prefix(artifact_root)
-        .map_err(|_| {
-            KernelError::Runtime(format!(
-                "runtime artifact '{}' is outside the runtime root",
-                artifact.path.display()
-            ))
-        })?;
-    let mut normalized = PathBuf::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(KernelError::Runtime(format!(
-                    "runtime artifact '{}' is outside the runtime root",
-                    artifact.path.display()
-                )));
+
+    for artifact_root in artifact_roots {
+        let Ok(relative) = canonical_artifact.strip_prefix(artifact_root) else {
+            continue;
+        };
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(KernelError::Runtime(format!(
+                        "runtime artifact '{}' is outside the runtime root",
+                        artifact.path.display()
+                    )));
+                }
             }
         }
+        if normalized.as_os_str().is_empty() {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is not a regular file",
+                artifact.path.display()
+            )));
+        }
+        return Ok((artifact_root.as_path(), normalized));
     }
-    if normalized.as_os_str().is_empty() {
-        return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is not a regular file",
-            artifact.path.display()
-        )));
-    }
-    Ok(normalized)
+
+    Err(KernelError::Runtime(format!(
+        "runtime artifact '{}' is outside the runtime root",
+        artifact.path.display()
+    )))
 }
 
 fn open_runtime_artifact_source(
-    artifact_root: &Path,
+    artifact_roots: &[PathBuf],
     artifact: &RuntimeArtifact,
 ) -> Result<std::fs::File, KernelError> {
-    let relative = runtime_artifact_relative_path(artifact_root, artifact)?;
+    let (artifact_root, relative) = runtime_artifact_relative_path(artifact_roots, artifact)?;
     open_regular_file_beneath_root(artifact_root, &relative, &artifact.path, "runtime artifact")
 }
 
@@ -17039,7 +17042,8 @@ impl Kernel {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
         let runtime_root = self.canonical_runtime_root().await?;
-        self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
+        let artifact_roots = vec![runtime_root];
+        self.prepare_runtime_artifact_attachments_from_roots(turn_id, &artifact_roots, artifacts)
             .await
     }
 
@@ -17060,10 +17064,14 @@ impl Kernel {
                         .to_string(),
                 )
             })?;
+            let mut artifact_roots = vec![runtime_state_root.to_path_buf()];
+            if let Some(runtime_home_root) = Self::runtime_native_home_root(execution_plan) {
+                artifact_roots.push(runtime_home_root.to_path_buf());
+            }
             return self
-                .prepare_runtime_artifact_attachments_beneath(
+                .prepare_runtime_artifact_attachments_from_roots(
                     turn_id,
-                    runtime_state_root,
+                    &artifact_roots,
                     artifacts,
                 )
                 .await;
@@ -17078,6 +17086,17 @@ impl Kernel {
         artifact_root: &Path,
         artifacts: &[RuntimeArtifact],
     ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
+        let artifact_roots = vec![artifact_root.to_path_buf()];
+        self.prepare_runtime_artifact_attachments_from_roots(turn_id, &artifact_roots, artifacts)
+            .await
+    }
+
+    async fn prepare_runtime_artifact_attachments_from_roots(
+        &self,
+        turn_id: Uuid,
+        artifact_roots: &[PathBuf],
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
         if artifacts.is_empty() {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
@@ -17087,20 +17106,34 @@ impl Kernel {
             )));
         }
         let runtime_root_canonical = self.canonical_runtime_root().await?;
-        let artifact_root_canonical =
-            tokio::fs::canonicalize(artifact_root)
-                .await
-                .map_err(|err| {
-                    KernelError::Runtime(format!(
-                        "runtime artifact root '{}' is not readable: {err}",
-                        artifact_root.display()
-                    ))
-                })?;
-        if !artifact_root_canonical.starts_with(&runtime_root_canonical) {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact root '{}' is outside the runtime root",
-                artifact_root.display()
-            )));
+        let mut artifact_roots_canonical = Vec::with_capacity(artifact_roots.len());
+        for artifact_root in artifact_roots {
+            let artifact_root_canonical =
+                tokio::fs::canonicalize(artifact_root)
+                    .await
+                    .map_err(|err| {
+                        KernelError::Runtime(format!(
+                            "runtime artifact root '{}' is not readable: {err}",
+                            artifact_root.display()
+                        ))
+                    })?;
+            if !artifact_root_canonical.starts_with(&runtime_root_canonical) {
+                return Err(KernelError::Runtime(format!(
+                    "runtime artifact root '{}' is outside the runtime root",
+                    artifact_root.display()
+                )));
+            }
+            if !artifact_roots_canonical
+                .iter()
+                .any(|existing| existing == &artifact_root_canonical)
+            {
+                artifact_roots_canonical.push(artifact_root_canonical);
+            }
+        }
+        if artifact_roots_canonical.is_empty() {
+            return Err(KernelError::Runtime(
+                "runtime artifact root is required to publish runtime artifacts".to_string(),
+            ));
         }
         let turn_id = turn_id.to_string();
         let delivery_root = ensure_safe_child_directory(
@@ -17116,7 +17149,7 @@ impl Kernel {
         for artifact in artifacts {
             let attachment = self
                 .copy_runtime_artifact_for_delivery(
-                    &artifact_root_canonical,
+                    &artifact_roots_canonical,
                     &delivery_root,
                     artifact,
                 )
@@ -17128,11 +17161,11 @@ impl Kernel {
 
     async fn copy_runtime_artifact_for_delivery(
         &self,
-        artifact_root: &Path,
+        artifact_roots: &[PathBuf],
         delivery_root: &Path,
         artifact: &RuntimeArtifact,
     ) -> Result<ChannelDeliveryAttachment, KernelError> {
-        let source = open_runtime_artifact_source(artifact_root, artifact)?;
+        let source = open_runtime_artifact_source(artifact_roots, artifact)?;
         let metadata = source.metadata().map_err(|err| {
             KernelError::Runtime(format!(
                 "runtime artifact '{}' is not readable: {err}",
