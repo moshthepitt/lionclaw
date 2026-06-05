@@ -149,15 +149,15 @@ Expected:
 Check the selected runtime's native terminal UI:
 
 ```bash
-printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_MEMORY_OK\n' >> \
-  .lionclaw/instances/main/workspaces/main/MEMORY.md
+printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_CONTEXT_OK\n' >> \
+  .lionclaw/instances/main/workspaces/main/AGENTS.md
 "$LIONCLAW_BIN" run --runtime-tui
 ```
 
 Prompt inside the native runtime UI:
 
 ```text
-Reply with exactly the LionClaw native runtime TUI memory sentinel from your instructions.
+Reply with exactly the LionClaw native runtime TUI sentinel from your instructions.
 ```
 
 Expected:
@@ -168,7 +168,7 @@ Expected:
   workspace-trust prompt
 - OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
   without showing an auto-update prompt
-- the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
+- the answer is `LIONCLAW_NATIVE_TUI_CONTEXT_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
 - completed Codex and OpenCode native UI turns are present in LionClaw session

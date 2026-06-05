@@ -111,7 +111,7 @@ use super::{
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
-        ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft, MEMORY_FILE,
+        ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
     },
     continuity_index::ContinuityIndexStore,
     db::Db,
@@ -123,11 +123,15 @@ use super::{
         SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
         SchedulerJobRunStatus, SchedulerJobTriggerKind,
     },
+    memory_projection::{
+        validate_memory_projection, MemoryCandidate, MemoryProjectionRequest, MemoryProjector,
+        MemorySourceRef, NoopMemoryProjector, MEMORY_PROJECTION_MAX_ITEMS,
+    },
     policy::{Capability, PolicyStore, Scope},
     prompt_context::{
         cap_utf8_at_line_boundary, context_item_specs, ContextItemId, ContextItemSpec,
-        ContextSource, PromptContextAudit, PromptContextBuild, PromptContextMode,
-        PromptContextPolicy, ACTIVE_CONTEXT_FILE,
+        ContextSource, PromptContextAudit, PromptContextBuild, PromptContextMemoryProjectionAudit,
+        PromptContextMode, PromptContextPolicy, ACTIVE_CONTEXT_FILE,
     },
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
@@ -690,6 +694,7 @@ pub struct Kernel {
     project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     applied_state: AppliedState,
     continuity: Option<ContinuityLayout>,
+    memory_projector: Arc<dyn MemoryProjector>,
     hidden_compaction_turn_timeout: Duration,
 }
 
@@ -855,6 +860,7 @@ impl Kernel {
             project_instance_runtime: options.project_instance_runtime,
             applied_state: options.applied_state,
             continuity,
+            memory_projector: Arc::new(NoopMemoryProjector),
             hidden_compaction_turn_timeout,
         };
 
@@ -6994,6 +7000,10 @@ mod tests {
 
     use super::*;
     use crate::kernel::continuity::title_file_name;
+    use crate::kernel::memory_projection::{
+        MemoryCandidate, MemoryCandidateKind, MemoryProjection, MemoryProjectionError,
+        MemoryProjectionRequest, MemoryProvenance, MemoryProvenanceSource,
+    };
     use crate::kernel::runtime::{
         RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
     };
@@ -7020,7 +7030,7 @@ mod tests {
         let rendered = render_attached_runtime_context_file(
             "codex",
             &[
-                "## MEMORY.md\n\nremember this".to_string(),
+                "## Memory\n\nremember this".to_string(),
                 "## Prior Turn 1\n\n### User\n\nhello".to_string(),
             ],
         );
@@ -7028,7 +7038,7 @@ mod tests {
         assert!(rendered.starts_with("# LionClaw Generated Agent Context"));
         assert!(rendered.contains("runtime 'codex'"));
         assert!(rendered.contains("<!-- LIONCLAW:START -->"));
-        assert!(rendered.contains("## MEMORY.md\n\nremember this"));
+        assert!(rendered.contains("## Memory\n\nremember this"));
         assert!(rendered.contains("## Prior Turn 1\n\n### User\n\nhello"));
         assert!(rendered.ends_with("<!-- LIONCLAW:END -->\n"));
     }
@@ -7867,6 +7877,10 @@ mod tests {
     const ACTIVE_AFTER_CAP: &str = "ACTIVE_CONTEXT_AFTER_CAP_SHOULD_NOT_REACH_UNTRUSTED";
     const STYLE_PROFILE_LEGACY: &str = "STYLE_PROFILE_LEGACY_SHOULD_NOT_REACH_UNTRUSTED";
     const AGENTS_MAIN_ONLY: &str = "AGENTS_MAIN_ONLY_OPERATOR_RULE";
+    const MEMORY_PROJECTOR_MAIN_ONLY: &str = "MEMORY_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR";
+    const MEMORY_PROJECTOR_UNTRUSTED: &str = "MEMORY_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR";
+    const INVALID_MEMORY: &str = "INVALID_MEMORY_SHOULD_NOT_PARTIALLY_RENDER";
+    const MEMORY_AFTER_CAP: &str = "MEMORY_AFTER_CAP_SHOULD_NOT_RENDER";
 
     struct PromptContextFixture {
         _temp_dir: TempDir,
@@ -7874,6 +7888,79 @@ mod tests {
         kernel: Kernel,
         workspace_root: PathBuf,
         plan: EffectiveExecutionPlan,
+    }
+
+    #[derive(Clone)]
+    struct TestMemoryProjector {
+        projector_id: &'static str,
+        output: TestMemoryProjectorOutput,
+        requests: Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>,
+    }
+
+    #[derive(Clone)]
+    enum TestMemoryProjectorOutput {
+        Items(Vec<MemoryCandidate>),
+        Invalid(Vec<MemoryCandidate>),
+        Error,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryProjector for TestMemoryProjector {
+        fn projector_id(&self) -> &str {
+            self.projector_id
+        }
+
+        async fn project(
+            &self,
+            request: MemoryProjectionRequest,
+        ) -> Result<MemoryProjection, MemoryProjectionError> {
+            self.requests
+                .lock()
+                .expect("memory projector request lock")
+                .push(request);
+            match &self.output {
+                TestMemoryProjectorOutput::Items(items)
+                | TestMemoryProjectorOutput::Invalid(items) => Ok(MemoryProjection {
+                    projector_id: self.projector_id.to_string(),
+                    items: items.clone(),
+                }),
+                TestMemoryProjectorOutput::Error => {
+                    Err(MemoryProjectionError::failed("test projector failed"))
+                }
+            }
+        }
+    }
+
+    impl TestMemoryProjector {
+        fn with_items(
+            items: Vec<MemoryCandidate>,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
+            Self::with_output(TestMemoryProjectorOutput::Items(items))
+        }
+
+        fn with_invalid(
+            items: Vec<MemoryCandidate>,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
+            Self::with_output(TestMemoryProjectorOutput::Invalid(items))
+        }
+
+        fn with_error() -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
+            Self::with_output(TestMemoryProjectorOutput::Error)
+        }
+
+        fn with_output(
+            output: TestMemoryProjectorOutput,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    projector_id: "test_memory_projector",
+                    output,
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
     }
 
     async fn prompt_context_fixture() -> PromptContextFixture {
@@ -7932,6 +8019,26 @@ mod tests {
             kernel,
             workspace_root,
             plan: test_execution_plan("mock"),
+        }
+    }
+
+    async fn prompt_context_fixture_with_memory_projector(
+        projector: impl MemoryProjector + 'static,
+    ) -> PromptContextFixture {
+        let mut fixture = prompt_context_fixture().await;
+        fixture.kernel.memory_projector = Arc::new(projector);
+        fixture
+    }
+
+    fn memory_candidate(text: impl Into<String>) -> MemoryCandidate {
+        MemoryCandidate {
+            kind: MemoryCandidateKind::StableFact,
+            text: text.into(),
+            provenance: vec![MemoryProvenance {
+                source: MemoryProvenanceSource::SessionTurn,
+                sequence_no: Some(1),
+                event_id: None,
+            }],
         }
     }
 
@@ -8066,6 +8173,10 @@ mod tests {
             BROAD_MEMORY,
             ACTIVE_ALLOWED,
             ACTIVE_AFTER_CAP,
+            MEMORY_PROJECTOR_MAIN_ONLY,
+            MEMORY_PROJECTOR_UNTRUSTED,
+            INVALID_MEMORY,
+            MEMORY_AFTER_CAP,
         ] {
             assert!(
                 !audit_json.contains(poison),
@@ -8259,7 +8370,10 @@ mod tests {
         assert!(rendered.contains(AGENTS_MAIN_ONLY));
         assert!(rendered.contains(STYLE_PROFILE_LEGACY));
         assert!(rendered.contains(SECRET_USER_FACT));
-        assert!(rendered.contains(BROAD_MEMORY));
+        assert!(
+            !rendered.contains(BROAD_MEMORY),
+            "legacy MEMORY.md must not bypass the memory projector boundary:\n{rendered}"
+        );
         assert!(
             rendered.contains(ACTIVE_ALLOWED),
             "{rendered}\n\nAUDIT: {}",
@@ -8270,12 +8384,196 @@ mod tests {
             .included
             .iter()
             .any(|item| item.id == ContextItemId::UserContext));
-        assert!(build
-            .audit
-            .included
-            .iter()
-            .any(|item| item.id == ContextItemId::MemoryContext));
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "projector_returned_no_items"
+        }));
         assert_prompt_context_audit_excludes_prompt_body(&prompt_context_audit_json(&build));
+    }
+
+    #[tokio::test]
+    async fn program_prompt_main_renders_memory_projector_output_through_memory_context() {
+        let (projector, requests) =
+            TestMemoryProjector::with_items(vec![memory_candidate(MEMORY_PROJECTOR_MAIN_ONLY)]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains("## Memory"), "{rendered}");
+        assert!(rendered.contains(MEMORY_PROJECTOR_MAIN_ONLY), "{rendered}");
+        assert!(!rendered.contains(BROAD_MEMORY), "{rendered}");
+        assert!(build.audit.included.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext
+                && item.source == ContextSource::MemoryProjection
+                && item.class.as_str() == "memory"
+        }));
+        assert!(audit_json.contains("\"projector_id\":\"test_memory_projector\""));
+        assert!(audit_json.contains("\"item_count\":1"));
+        assert!(audit_json.contains("\"source_count\":1"));
+        assert!(audit_json.contains("\"status\":\"included\""));
+        assert!(!audit_json.contains(MEMORY_PROJECTOR_MAIN_ONLY));
+        assert!(!audit_json.contains(BROAD_MEMORY));
+
+        let requests = requests.lock().expect("memory projector request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].session_id, session.session_id);
+        assert_eq!(requests[0].runtime_id, "mock");
+        assert_eq!(requests[0].trust_tier.as_str(), "main");
+        assert_eq!(
+            requests[0].history_policy,
+            SessionHistoryPolicy::Interactive
+        );
+        assert!(requests[0].max_items > 0);
+        assert!(requests[0].max_bytes > 0);
+        assert_eq!(requests[0].sources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn program_prompt_untrusted_does_not_call_memory_projector() {
+        let (projector, requests) =
+            TestMemoryProjector::with_items(vec![memory_candidate(MEMORY_PROJECTOR_UNTRUSTED)]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(!rendered.contains(MEMORY_PROJECTOR_UNTRUSTED), "{rendered}");
+        assert!(requests
+            .lock()
+            .expect("memory projector request lock")
+            .is_empty());
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "trust_tier_untrusted"
+        }));
+        assert!(audit_json.contains("\"status\":\"policy_excluded\""));
+        assert!(audit_json.contains("\"reason\":\"trust_tier_untrusted\""));
+        assert!(!audit_json.contains(MEMORY_PROJECTOR_UNTRUSTED));
+    }
+
+    #[tokio::test]
+    async fn memory_projector_failure_omits_memory_without_failing_prompt_build() {
+        let (projector, requests) = TestMemoryProjector::with_error();
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(!rendered.contains("## Memory"), "{rendered}");
+        assert_eq!(
+            requests
+                .lock()
+                .expect("memory projector request lock")
+                .len(),
+            1
+        );
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "projector_failed"
+        }));
+        assert!(audit_json.contains("\"status\":\"projector_failed\""));
+        assert!(audit_json.contains("\"reason\":\"projector_failed\""));
+    }
+
+    #[tokio::test]
+    async fn invalid_memory_projector_output_omits_whole_memory_section() {
+        let (projector, _requests) = TestMemoryProjector::with_invalid(vec![
+            memory_candidate(INVALID_MEMORY),
+            MemoryCandidate {
+                kind: MemoryCandidateKind::Preference,
+                text: " ".to_string(),
+                provenance: vec![MemoryProvenance {
+                    source: MemoryProvenanceSource::SessionTurn,
+                    sequence_no: Some(1),
+                    event_id: None,
+                }],
+            },
+        ]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(!rendered.contains(INVALID_MEMORY), "{rendered}");
+        assert!(!rendered.contains("## Memory"), "{rendered}");
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "projector_invalid_output"
+        }));
+        assert!(audit_json.contains("\"status\":\"projector_invalid_output\""));
+        assert!(audit_json.contains("\"reason\":\"empty_text\""));
+        assert!(!audit_json.contains(INVALID_MEMORY));
+    }
+
+    #[tokio::test]
+    async fn memory_projector_output_is_capped_by_prompt_context_budget() {
+        let mut memory = format!("{MEMORY_PROJECTOR_MAIN_ONLY}\n");
+        for index in 0..120 {
+            memory.push_str(&format!(
+                "memory filler line {index:03} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+            ));
+        }
+        memory.push_str(MEMORY_AFTER_CAP);
+        let (projector, _requests) =
+            TestMemoryProjector::with_items(vec![memory_candidate(memory)]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Conservative,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains(MEMORY_PROJECTOR_MAIN_ONLY), "{rendered}");
+        assert!(!rendered.contains(MEMORY_AFTER_CAP), "{rendered}");
+        assert!(build.audit.capped.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext
+                && item.source == ContextSource::MemoryProjection
+                && item.original_bytes > item.included_bytes
+        }));
+        assert!(audit_json.contains("\"status\":\"included\""));
+        assert!(audit_json.contains("\"cap_status\":\"capped\""));
+        assert!(!audit_json.contains(MEMORY_PROJECTOR_MAIN_ONLY));
+        assert!(!audit_json.contains(MEMORY_AFTER_CAP));
     }
 
     #[tokio::test]
@@ -8961,6 +9259,73 @@ mod tests {
         assert!(details.contains("safe_workspace_rules"));
         assert!(details.contains("trust_tier_untrusted"));
         assert_prompt_context_audit_excludes_prompt_body(&details);
+    }
+
+    #[tokio::test]
+    async fn attached_tui_main_context_uses_memory_projector_not_legacy_file() {
+        let (projector, requests) =
+            TestMemoryProjector::with_items(vec![memory_candidate(MEMORY_PROJECTOR_MAIN_ONLY)]);
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let runtime_state_root = fixture
+            .workspace_root
+            .parent()
+            .expect("fixture root")
+            .join("runtime-state");
+        tokio::fs::create_dir(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        let mut plan = fixture.plan.clone();
+        plan.mounts.push(MountSpec {
+            source: runtime_state_root.clone(),
+            target: "/runtime".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+
+        fixture
+            .kernel
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .await
+            .expect("materialize attached context");
+
+        let generated = tokio::fs::read_to_string(runtime_state_root.join(GENERATED_AGENTS_FILE))
+            .await
+            .expect("read generated context");
+        assert!(
+            generated.contains(MEMORY_PROJECTOR_MAIN_ONLY),
+            "{generated}"
+        );
+        assert!(!generated.contains(BROAD_MEMORY), "{generated}");
+        assert_eq!(
+            requests
+                .lock()
+                .expect("memory projector request lock")
+                .len(),
+            1
+        );
+
+        let events = fixture
+            .kernel
+            .query_audit(
+                Some(session.session_id),
+                Some("prompt.context.built".to_string()),
+                None,
+                Some(5),
+            )
+            .await
+            .expect("query attached audit")
+            .events;
+        assert_eq!(events.len(), 1);
+        let details = events[0].details.to_string();
+        assert!(details.contains("\"status\":\"included\""));
+        assert!(details.contains("\"projector_id\":\"test_memory_projector\""));
+        assert!(!details.contains(MEMORY_PROJECTOR_MAIN_ONLY));
+        assert!(!details.contains(BROAD_MEMORY));
     }
 
     #[tokio::test]
@@ -15437,11 +15802,21 @@ struct ProgramPromptEnvelopes {
 struct RenderedPromptContextItem {
     content: String,
     original_bytes: usize,
+    memory_projection: Option<PromptContextMemoryProjectionAudit>,
+}
+
+enum PromptContextRenderResult {
+    Rendered(RenderedPromptContextItem),
+    Omitted {
+        reason: &'static str,
+        memory_projection: Option<PromptContextMemoryProjectionAudit>,
+    },
 }
 
 struct PromptContextRenderInput<'a> {
     item: &'a ContextItemSpec,
     session: &'a super::sessions::Session,
+    runtime_id: &'a str,
     execution_plan: &'a EffectiveExecutionPlan,
     user_text: Option<&'a str>,
     history_before_sequence_no: Option<u64>,
@@ -15468,6 +15843,7 @@ fn render_recent_transcript_tail_context(
         return Some(RenderedPromptContextItem {
             content: original_content,
             original_bytes,
+            memory_projection: None,
         });
     }
 
@@ -15496,7 +15872,19 @@ fn render_recent_transcript_tail_context(
     Some(RenderedPromptContextItem {
         content,
         original_bytes,
+        memory_projection: None,
     })
+}
+
+fn render_memory_candidates(item: &ContextItemSpec, candidates: &[MemoryCandidate]) -> String {
+    let mut section = format!("## {}", item.title);
+    for candidate in candidates {
+        section.push_str("\n\n- ");
+        section.push_str(candidate.kind.title());
+        section.push_str(": ");
+        section.push_str(candidate.text.trim());
+    }
+    section
 }
 
 struct StartedRuntimePreTurnFailure<'a> {
@@ -19461,6 +19849,18 @@ impl Kernel {
 
         for item in context_item_specs(mode) {
             if let Err(decision) = policy.allows(&item) {
+                if item.id == ContextItemId::MemoryContext {
+                    audit.record_memory_projection(
+                        PromptContextMemoryProjectionAudit::new(
+                            "policy_excluded",
+                            None,
+                            0,
+                            MEMORY_PROJECTION_MAX_ITEMS,
+                            0,
+                        )
+                        .with_reason(decision.reason),
+                    );
+                }
                 audit.exclude(&item, decision.reason);
                 continue;
             }
@@ -19473,26 +19873,36 @@ impl Kernel {
                 )));
             }
 
-            let Some(rendered) = self
+            let render_result = self
                 .render_prompt_context_item(PromptContextRenderInput {
                     item: &item,
                     session,
+                    runtime_id,
                     execution_plan,
                     user_text,
                     history_before_sequence_no,
                     transcript_tail_limit: policy.transcript_tail_limit,
                     max_bytes,
                 })
-                .await?
-            else {
-                if item.required {
-                    return Err(KernelError::Internal(format!(
-                        "required prompt context item '{}' was missing",
-                        item.id.as_str()
-                    )));
+                .await?;
+            let rendered = match render_result {
+                PromptContextRenderResult::Rendered(rendered) => rendered,
+                PromptContextRenderResult::Omitted {
+                    reason,
+                    memory_projection,
+                } => {
+                    if let Some(memory_projection) = memory_projection {
+                        audit.record_memory_projection(memory_projection);
+                    }
+                    if item.required {
+                        return Err(KernelError::Internal(format!(
+                            "required prompt context item '{}' was omitted: {reason}",
+                            item.id.as_str()
+                        )));
+                    }
+                    audit.exclude(&item, reason);
+                    continue;
                 }
-                audit.exclude(&item, "missing_optional");
-                continue;
             };
 
             let mut capped = cap_utf8_at_line_boundary(rendered.content.trim(), max_bytes);
@@ -19511,6 +19921,17 @@ impl Kernel {
                     )));
                 }
                 audit.exclude(&item, "over_budget_excluded");
+                if let Some(memory_projection) = rendered.memory_projection.clone() {
+                    audit.record_memory_projection(
+                        memory_projection
+                            .with_rendered_bytes(
+                                capped.included_bytes,
+                                capped.original_bytes,
+                                capped.was_capped,
+                            )
+                            .with_reason("over_budget_excluded"),
+                    );
+                }
                 continue;
             }
             if capped.content.trim().is_empty() {
@@ -19521,10 +19942,28 @@ impl Kernel {
                     )));
                 }
                 audit.exclude(&item, "missing_optional");
+                if let Some(memory_projection) = rendered.memory_projection.clone() {
+                    audit.record_memory_projection(
+                        memory_projection
+                            .with_rendered_bytes(
+                                capped.included_bytes,
+                                capped.original_bytes,
+                                capped.was_capped,
+                            )
+                            .with_reason("missing_optional"),
+                    );
+                }
                 continue;
             }
 
             audit.include(&item, &capped);
+            if let Some(memory_projection) = rendered.memory_projection {
+                audit.record_memory_projection(memory_projection.with_rendered_bytes(
+                    capped.included_bytes,
+                    capped.original_bytes,
+                    capped.was_capped,
+                ));
+            }
             sections.push(capped.content);
         }
 
@@ -19535,16 +19974,18 @@ impl Kernel {
         RenderedPromptContextItem {
             original_bytes: content.trim().len(),
             content,
+            memory_projection: None,
         }
     }
 
     async fn render_prompt_context_item(
         &self,
         input: PromptContextRenderInput<'_>,
-    ) -> Result<Option<RenderedPromptContextItem>, KernelError> {
+    ) -> Result<PromptContextRenderResult, KernelError> {
         let PromptContextRenderInput {
             item,
             session,
+            runtime_id,
             execution_plan,
             user_text,
             history_before_sequence_no,
@@ -19552,40 +19993,50 @@ impl Kernel {
             max_bytes,
         } = input;
         match item.source {
-            ContextSource::Generated(_) => Ok(self
-                .render_generated_prompt_context_item(item, session, execution_plan)
-                .map(Self::rendered_prompt_context_item)),
+            ContextSource::Generated(_) => Ok(Self::render_result_from_optional(
+                self.render_generated_prompt_context_item(item, session, execution_plan)
+                    .map(Self::rendered_prompt_context_item),
+            )),
             ContextSource::WorkspaceFile(file_name) => {
                 let Some(workspace_root) = &self.workspace_root else {
-                    return Ok(None);
+                    return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 };
                 if !tokio::fs::try_exists(workspace_root)
                     .await
                     .map_err(|err| internal(err.into()))?
                 {
-                    return Ok(None);
+                    return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 }
                 let Some(content) = read_workspace_section(workspace_root, file_name)
                     .await
                     .map_err(internal)?
                 else {
-                    return Ok(None);
+                    return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 };
-                Ok(Some(Self::rendered_prompt_context_item(format!(
-                    "## {}\n\n{}",
-                    item.title,
-                    content.trim()
-                ))))
+                Ok(PromptContextRenderResult::Rendered(
+                    Self::rendered_prompt_context_item(format!(
+                        "## {}\n\n{}",
+                        item.title,
+                        content.trim()
+                    )),
+                ))
+            }
+            ContextSource::MemoryProjection => {
+                self.render_memory_projection_context(
+                    item,
+                    session,
+                    runtime_id,
+                    history_before_sequence_no,
+                    transcript_tail_limit,
+                    max_bytes,
+                )
+                .await
             }
             ContextSource::ContinuityFile(file_name) => {
                 let Some(layout) = &self.continuity else {
-                    return Ok(None);
+                    return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 };
                 let content = match file_name {
-                    MEMORY_FILE => layout
-                        .read_memory_prompt_section()
-                        .await
-                        .map_err(internal)?,
                     ACTIVE_CONTEXT_FILE => layout
                         .read_active_prompt_section()
                         .await
@@ -19596,13 +20047,13 @@ impl Kernel {
                         )));
                     }
                 };
-                Ok(content.map(|content| {
+                Ok(Self::render_result_from_optional(content.map(|content| {
                     Self::rendered_prompt_context_item(format!(
                         "## {}\n\n{}",
                         item.title,
                         content.trim()
                     ))
-                }))
+                })))
             }
             ContextSource::CompactionSummary => {
                 let Some(record) = self
@@ -19611,7 +20062,7 @@ impl Kernel {
                     .await
                     .map_err(internal)?
                 else {
-                    return Ok(None);
+                    return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 };
                 let summary_text = render_compaction_summary(
                     record.start_sequence_no,
@@ -19619,9 +20070,11 @@ impl Kernel {
                     &record.summary_state,
                 );
                 if summary_text.trim().is_empty() {
-                    Ok(None)
+                    Ok(Self::omitted_prompt_context_item("missing_optional"))
                 } else {
-                    Ok(Some(Self::rendered_prompt_context_item(summary_text)))
+                    Ok(PromptContextRenderResult::Rendered(
+                        Self::rendered_prompt_context_item(summary_text),
+                    ))
                 }
             }
             ContextSource::TranscriptTail => {
@@ -19635,14 +20088,164 @@ impl Kernel {
                 .await
                 .map_err(internal)?;
                 let sections = render_turns_for_prompt(&turns, session.history_policy);
-                Ok(render_recent_transcript_tail_context(sections, max_bytes))
+                Ok(Self::render_result_from_optional(
+                    render_recent_transcript_tail_context(sections, max_bytes),
+                ))
             }
-            ContextSource::CurrentUserInput => Ok(Self::render_current_user_input_context(
-                item,
-                user_text.unwrap_or_default(),
-            )
-            .map(Self::rendered_prompt_context_item)),
+            ContextSource::CurrentUserInput => Ok(Self::render_result_from_optional(
+                Self::render_current_user_input_context(item, user_text.unwrap_or_default())
+                    .map(Self::rendered_prompt_context_item),
+            )),
         }
+    }
+
+    fn render_result_from_optional(
+        rendered: Option<RenderedPromptContextItem>,
+    ) -> PromptContextRenderResult {
+        rendered
+            .map(PromptContextRenderResult::Rendered)
+            .unwrap_or_else(|| Self::omitted_prompt_context_item("missing_optional"))
+    }
+
+    fn omitted_prompt_context_item(reason: &'static str) -> PromptContextRenderResult {
+        PromptContextRenderResult::Omitted {
+            reason,
+            memory_projection: None,
+        }
+    }
+
+    async fn render_memory_projection_context(
+        &self,
+        item: &ContextItemSpec,
+        session: &super::sessions::Session,
+        runtime_id: &str,
+        history_before_sequence_no: Option<u64>,
+        transcript_tail_limit: usize,
+        max_bytes: usize,
+    ) -> Result<PromptContextRenderResult, KernelError> {
+        let sources = self
+            .memory_projection_sources(
+                session.session_id,
+                history_before_sequence_no,
+                transcript_tail_limit,
+            )
+            .await?;
+        let request = MemoryProjectionRequest {
+            session_id: session.session_id,
+            runtime_id: runtime_id.to_string(),
+            trust_tier: session.trust_tier.clone(),
+            history_policy: session.history_policy,
+            max_items: MEMORY_PROJECTION_MAX_ITEMS,
+            max_bytes,
+            sources,
+        };
+        let source_count = request.sources.len();
+        let projector_id = self.memory_projector.projector_id().trim().to_string();
+        let audited_projector_id = (!projector_id.is_empty()).then_some(projector_id.clone());
+
+        let projection = match self.memory_projector.project(request.clone()).await {
+            Ok(projection) => projection,
+            Err(_err) => {
+                return Ok(PromptContextRenderResult::Omitted {
+                    reason: "projector_failed",
+                    memory_projection: Some(
+                        PromptContextMemoryProjectionAudit::new(
+                            "projector_failed",
+                            audited_projector_id,
+                            source_count,
+                            request.max_items,
+                            request.max_bytes,
+                        )
+                        .with_reason("projector_failed"),
+                    ),
+                });
+            }
+        };
+
+        let validation = match validate_memory_projection(&request, &projector_id, &projection) {
+            Ok(validation) => validation,
+            Err(reason) => {
+                return Ok(PromptContextRenderResult::Omitted {
+                    reason: "projector_invalid_output",
+                    memory_projection: Some(
+                        PromptContextMemoryProjectionAudit::new(
+                            "projector_invalid_output",
+                            audited_projector_id,
+                            source_count,
+                            request.max_items,
+                            request.max_bytes,
+                        )
+                        .with_counts(
+                            projection.items.len(),
+                            projection
+                                .items
+                                .iter()
+                                .map(|candidate| candidate.text.len())
+                                .sum(),
+                        )
+                        .with_reason(reason.as_str()),
+                    ),
+                });
+            }
+        };
+
+        if projection.items.is_empty() {
+            return Ok(PromptContextRenderResult::Omitted {
+                reason: "projector_returned_no_items",
+                memory_projection: Some(
+                    PromptContextMemoryProjectionAudit::new(
+                        "projector_returned_no_items",
+                        Some(validation.projector_id),
+                        source_count,
+                        request.max_items,
+                        request.max_bytes,
+                    )
+                    .with_counts(validation.item_count, validation.projected_bytes)
+                    .with_reason("projector_returned_no_items"),
+                ),
+            });
+        }
+
+        let content = render_memory_candidates(item, &projection.items);
+        Ok(PromptContextRenderResult::Rendered(
+            RenderedPromptContextItem {
+                original_bytes: content.trim().len(),
+                content,
+                memory_projection: Some(
+                    PromptContextMemoryProjectionAudit::new(
+                        "included",
+                        Some(validation.projector_id),
+                        source_count,
+                        request.max_items,
+                        request.max_bytes,
+                    )
+                    .with_counts(validation.item_count, validation.projected_bytes),
+                ),
+            },
+        ))
+    }
+
+    async fn memory_projection_sources(
+        &self,
+        session_id: Uuid,
+        history_before_sequence_no: Option<u64>,
+        transcript_tail_limit: usize,
+    ) -> Result<Vec<MemorySourceRef>, KernelError> {
+        let mut sources = vec![MemorySourceRef::SessionTurnRange {
+            before_sequence_no: history_before_sequence_no,
+            limit: transcript_tail_limit,
+        }];
+        if let Some(record) = self
+            .session_compactions
+            .latest(session_id)
+            .await
+            .map_err(internal)?
+        {
+            sources.push(MemorySourceRef::CompactionSummary {
+                through_sequence_no: record.through_sequence_no,
+            });
+        }
+        Ok(sources)
     }
 
     fn render_current_user_input_context(

@@ -83,7 +83,7 @@ fn managed_title_file_name(title: &str) -> String {
 }
 
 #[tokio::test]
-async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
+async fn prompt_loads_assistant_active_continuity_and_fs_read_uses_project_root() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
         .await
@@ -180,7 +180,7 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
         .expect("turn succeeds");
 
     let prompt = prompts.lock().expect("prompt lock")[0].clone();
-    assert!(prompt.contains("assistant durable memory"));
+    assert!(!prompt.contains("assistant durable memory"));
     assert!(prompt.contains("Assistant Open Loop"));
     assert!(!prompt.contains("project-only-memory"));
     assert!(!prompt.contains("project-only-active"));

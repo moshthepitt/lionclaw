@@ -93,6 +93,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.prompt_context`: session-aware prompt context policy, section capping, and audit metadata for runtime-visible context.
+- `kernel.memory_projection`: candidate-only memory projection boundary from kernel-owned records into prompt-context policy.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
 - `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
@@ -972,8 +973,11 @@ The assistant home workspace contains:
 - `continuity/artifacts/...`
 - `continuity/proposals/memory/...`
 
-`MEMORY.md` is human-curated in v1 and can be selected as the `Memory` context
-class for Main sessions under budget. Untrusted sessions do not receive it.
+`MEMORY.md` remains a visible continuity record and search surface, but it is
+not a magic runtime prompt input. LionClaw does not remember by stuffing files
+into prompts. The kernel records what happened, lets controlled memory
+projectors derive candidate memory from explicit kernel-owned sources, and
+admits those candidates only through audited prompt context policy.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.
 Daily notes, artifacts, proposals, and open loops are visible Markdown records,
