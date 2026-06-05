@@ -8092,6 +8092,7 @@ mod tests {
         let runtime_home_root = temp_dir.path().join("runtime-home");
         let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
         let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let legacy_extra = legacy_home_root.join("missing-in-destination.txt");
         let destination_config = runtime_home_root.join(".codex/config.toml");
         tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
             .await
@@ -8106,6 +8107,9 @@ mod tests {
         tokio::fs::write(&legacy_config, b"model = \"gpt-5\"\n")
             .await
             .expect("write legacy config");
+        tokio::fs::write(&legacy_extra, b"must remain legacy on conflict\n")
+            .await
+            .expect("write legacy extra");
         tokio::fs::write(&destination_config, b"model = \"gpt-4\"\n")
             .await
             .expect("write destination config");
@@ -8139,6 +8143,15 @@ mod tests {
                 .expect("read destination config"),
             "model = \"gpt-4\"\n"
         );
+        assert_eq!(
+            tokio::fs::read_to_string(&legacy_extra)
+                .await
+                .expect("read legacy extra"),
+            "must remain legacy on conflict\n"
+        );
+        assert!(!runtime_home_root
+            .join("missing-in-destination.txt")
+            .exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13850,6 +13863,93 @@ fn merge_runtime_native_home_directory_contents_blocking(
     source_root: &Path,
     destination_root: &Path,
 ) -> Result<(), KernelError> {
+    preflight_runtime_native_home_directory_merge_blocking(source_root, destination_root)?;
+    merge_runtime_native_home_directory_contents_unchecked_blocking(source_root, destination_root)
+}
+
+fn preflight_runtime_native_home_directory_merge_blocking(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), KernelError> {
+    if runtime_native_home_directory_metadata_blocking(source_root, "legacy runtime native home")?
+        .is_none()
+    {
+        return Ok(());
+    }
+    if runtime_native_home_directory_metadata_blocking(destination_root, "runtime native home")?
+        .is_none()
+    {
+        return Err(KernelError::Runtime(format!(
+            "runtime native home '{}' was not created before merging legacy home '{}'",
+            destination_root.display(),
+            source_root.display()
+        )));
+    }
+
+    let entries = std::fs::read_dir(source_root).map_err(|err| {
+        KernelError::Runtime(format!(
+            "failed to read legacy runtime native home '{}': {err}",
+            source_root.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            KernelError::Runtime(format!(
+                "failed to read legacy runtime native home '{}': {err}",
+                source_root.display()
+            ))
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination_root.join(entry.file_name());
+        preflight_runtime_native_home_entry_merge_blocking(&source_path, &destination_path)?;
+    }
+    Ok(())
+}
+
+fn preflight_runtime_native_home_entry_merge_blocking(
+    source_path: &Path,
+    destination_path: &Path,
+) -> Result<(), KernelError> {
+    let source_metadata = match std::fs::symlink_metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat legacy runtime native home entry '{}': {err}",
+                source_path.display()
+            )))
+        }
+    };
+
+    let destination_metadata = match std::fs::symlink_metadata(destination_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(KernelError::Runtime(format!(
+                "failed to stat runtime native home entry '{}': {err}",
+                destination_path.display()
+            )))
+        }
+    };
+
+    if source_metadata.file_type().is_symlink()
+        || destination_metadata.file_type().is_symlink()
+        || !source_metadata.is_dir()
+        || !destination_metadata.is_dir()
+    {
+        return Err(runtime_native_home_migration_conflict(
+            source_path,
+            destination_path,
+        ));
+    }
+
+    preflight_runtime_native_home_directory_merge_blocking(source_path, destination_path)
+}
+
+fn merge_runtime_native_home_directory_contents_unchecked_blocking(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), KernelError> {
     if runtime_native_home_directory_metadata_blocking(source_root, "legacy runtime native home")?
         .is_none()
     {
@@ -13938,7 +14038,7 @@ fn merge_runtime_native_home_entry_blocking(
         }
     }
 
-    merge_runtime_native_home_directory_contents_blocking(source_path, destination_path)
+    merge_runtime_native_home_directory_contents_unchecked_blocking(source_path, destination_path)
 }
 
 fn runtime_native_home_migration_conflict(
