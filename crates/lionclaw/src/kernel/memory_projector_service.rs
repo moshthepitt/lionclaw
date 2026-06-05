@@ -223,6 +223,7 @@ impl ResidentMemoryProjectorProcess {
     async fn retire(mut self) {
         drop(self.child.start_kill());
         drop(self.child.wait().await);
+        self.stderr.abort();
         drop(self.stderr.await);
     }
 }
@@ -572,5 +573,29 @@ fi
             fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
             "start\nstart\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_does_not_wait_for_inherited_stderr_handles() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+(sleep 5 >&2) &
+IFS= read -r _line || exit 0
+printf 'not-json\n'
+"#,
+        );
+        let projector = SkillMemoryProjector::new(config);
+
+        let err = tokio::time::timeout(Duration::from_millis(300), projector.project(request()))
+            .await
+            .expect("retirement should not wait for background stderr handles")
+            .expect_err("malformed response should fail");
+
+        assert!(err.to_string().contains("decode response"));
     }
 }
