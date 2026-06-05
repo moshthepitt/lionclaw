@@ -8128,6 +8128,45 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_clears_shared_runtime_home_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        tokio::fs::create_dir_all(&runtime_home_root)
+            .await
+            .expect("create runtime home root");
+        std::fs::set_permissions(&runtime_home_root, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod runtime home root");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let metadata = std::fs::metadata(&runtime_home_root).expect("stat runtime home root");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
     #[tokio::test]
     async fn runtime_plan_reset_migrates_legacy_home_before_removing_session_state() {
         let temp_dir = tempdir().expect("temp dir");
@@ -12728,15 +12767,44 @@ async fn ensure_runtime_native_home_mount_source(
     root: Option<&Path>,
     path: &Path,
 ) -> Result<(), KernelError> {
-    if tokio::fs::try_exists(path).await.map_err(|err| {
-        KernelError::Internal(format!(
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => ensure_existing_runtime_native_home_is_safe(path, metadata).await,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            create_owner_private_directory_all(root, path).await
+        }
+        Err(err) => Err(KernelError::Internal(format!(
             "failed to inspect runtime native home directory '{}': {err}",
             path.display()
-        ))
-    })? {
-        return ensure_existing_directory_is_safe(path).await;
+        ))),
     }
-    create_owner_private_directory_all(root, path).await
+}
+
+async fn ensure_existing_runtime_native_home_is_safe(
+    path: &Path,
+    metadata: std::fs::Metadata,
+) -> Result<(), KernelError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KernelError::Conflict(format!(
+            "runtime storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    }
+    set_runtime_native_home_private_permissions(path, metadata.permissions()).await
+}
+
+async fn set_runtime_native_home_private_permissions(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<(), KernelError> {
+    let permissions = runtime_native_home_private_permissions(permissions);
+    tokio::fs::set_permissions(path, permissions)
+        .await
+        .map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to make runtime native home directory '{}' private: {err}",
+                path.display()
+            ))
+        })
 }
 
 #[cfg(unix)]
@@ -14673,9 +14741,9 @@ fn migrate_legacy_runtime_native_homes_blocking(
             ))
         })?;
         let destination_final_permissions = if destination_has_native_contents {
-            runtime_home_metadata.permissions()
+            runtime_native_home_private_permissions(runtime_home_metadata.permissions())
         } else {
-            legacy_metadata.permissions()
+            runtime_native_home_private_permissions(legacy_metadata.permissions())
         };
         merge_runtime_native_home_directory_entry_blocking(
             &legacy_home_root,
@@ -14803,7 +14871,8 @@ fn remove_runtime_native_home_stale_root_lock_blocking(
     runtime_home_root: &Path,
     runtime_home_metadata: &std::fs::Metadata,
 ) -> Result<(), KernelError> {
-    let final_permissions = runtime_home_metadata.permissions();
+    let final_permissions =
+        runtime_native_home_private_permissions(runtime_home_metadata.permissions());
     set_runtime_native_home_directory_permissions_blocking(
         runtime_home_root,
         runtime_native_home_permissions_with_owner_write(final_permissions.clone()),
@@ -15305,6 +15374,18 @@ fn runtime_native_home_permissions_with_owner_write(
     #[cfg(not(unix))]
     {
         permissions.set_readonly(false);
+    }
+    permissions
+}
+
+fn runtime_native_home_private_permissions(
+    mut permissions: std::fs::Permissions,
+) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        permissions.set_mode(permissions.mode() & 0o700);
     }
     permissions
 }
@@ -17882,7 +17963,8 @@ impl Kernel {
         let runtime_state_root = runtime_state_root.to_path_buf();
         let runtime_home_parent = runtime_home_parent.to_path_buf();
         let runtime_home_root = runtime_home_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let runtime_home_root_for_ensure = runtime_home_root.clone();
+        let runtime_home_exists = tokio::task::spawn_blocking(move || {
             let _migration_lock =
                 acquire_runtime_native_home_migration_lock_blocking(&runtime_home_parent)?;
             migrate_legacy_runtime_native_homes_blocking(
@@ -17893,6 +17975,13 @@ impl Kernel {
         })
         .await
         .map_err(|err| internal(err.into()))??;
+        if runtime_home_exists {
+            ensure_runtime_native_home_mount_source(
+                self.runtime_root.as_deref(),
+                &runtime_home_root_for_ensure,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -17976,8 +18065,11 @@ impl Kernel {
             .as_deref()
             .and_then(|runtime_home_root| runtime_home_root.parent().map(Path::to_path_buf));
         if let Some(runtime_home_root) = &runtime_home_root {
-            create_owner_private_directory_all(self.runtime_root.as_deref(), runtime_home_root)
-                .await?;
+            ensure_runtime_native_home_mount_source(
+                self.runtime_root.as_deref(),
+                runtime_home_root,
+            )
+            .await?;
         }
         let mut lock_roots = vec![runtime_state_root];
         if let Some(runtime_home_lock_root) = runtime_home_lock_root {
