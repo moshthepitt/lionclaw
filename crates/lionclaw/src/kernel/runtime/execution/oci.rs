@@ -75,12 +75,13 @@ const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // LionClaw bind-mounts local workspace and runtime state into confined OCI
 // containers. On SELinux hosts those mounts are unreadable by default unless
-// Podman relabels them for the container context, so we make private relabeling
-// part of the canonical volume contract instead of special-casing individual
-// mounts like /runtime.
-const READ_ONLY_BIND_MOUNT_OPTIONS: &str = "ro,Z";
-const READ_WRITE_BIND_MOUNT_OPTIONS: &str = "rw,Z";
+// Podman relabels them for the container context. Session-scoped LionClaw
+// control mounts stay private; persistent/shared mounts use shared relabeling
+// so concurrent containers cannot steal labels from each other.
 const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
+const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
+const DRAFTS_MOUNT_TARGET: &str = "/drafts";
+const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
 const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
 const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700,notmpcopyup";
 
@@ -787,12 +788,32 @@ fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
     requested.strip_prefix(source).ok().map(Path::to_path_buf)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindMountRelabel {
+    Private,
+    Shared,
+}
+
+impl BindMountRelabel {
+    fn volume_option(self) -> &'static str {
+        match self {
+            Self::Private => "Z",
+            Self::Shared => "z",
+        }
+    }
+
+    fn mount_option(self) -> &'static str {
+        match self {
+            Self::Private => "relabel=private",
+            Self::Shared => "relabel=shared",
+        }
+    }
+}
+
 fn format_volume_spec(source: &str, mount: &MountSpec) -> String {
-    let access = match mount.access {
-        MountAccess::ReadOnly => READ_ONLY_BIND_MOUNT_OPTIONS,
-        MountAccess::ReadWrite => READ_WRITE_BIND_MOUNT_OPTIONS,
-    };
-    format!("{source}:{}:{access}", mount.target)
+    let access = bind_mount_volume_access_option(mount.access);
+    let relabel = bind_mount_relabel(mount).volume_option();
+    format!("{source}:{}:{access},{relabel}", mount.target)
 }
 
 fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
@@ -809,11 +830,44 @@ fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
 }
 
 fn format_mount_spec(source: &str, mount: &MountSpec) -> String {
-    let access = match mount.access {
-        MountAccess::ReadOnly => "readonly,relabel=private",
-        MountAccess::ReadWrite => "rw,relabel=private",
-    };
-    format!("type=bind,src={source},target={},{}", mount.target, access)
+    let access = bind_mount_mount_access_option(mount.access);
+    let relabel = bind_mount_relabel(mount).mount_option();
+    format!(
+        "type=bind,src={source},target={},{access},{relabel}",
+        mount.target
+    )
+}
+
+fn bind_mount_volume_access_option(access: MountAccess) -> &'static str {
+    match access {
+        MountAccess::ReadOnly => "ro",
+        MountAccess::ReadWrite => "rw",
+    }
+}
+
+fn bind_mount_mount_access_option(access: MountAccess) -> &'static str {
+    match access {
+        MountAccess::ReadOnly => "readonly",
+        MountAccess::ReadWrite => "rw",
+    }
+}
+
+fn bind_mount_relabel(mount: &MountSpec) -> BindMountRelabel {
+    if mount.target == WORKSPACE_MOUNT_TARGET
+        || mount_target_is_or_under(&mount.target, RUNTIME_HOME_MOUNT_TARGET)
+        || mount.target == DRAFTS_MOUNT_TARGET
+        || mount_target_is_or_under(&mount.target, SKILLS_MOUNT_TARGET_ROOT)
+    {
+        return BindMountRelabel::Shared;
+    }
+    BindMountRelabel::Private
+}
+
+fn mount_target_is_or_under(target: &str, root: &str) -> bool {
+    target == root
+        || target
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(unix)]
@@ -994,7 +1048,7 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/workspace:/workspace:rw,Z".to_string(),
+                "/host/workspace:/workspace:rw,z".to_string(),
             ]
         }));
         assert!(invocation.args.windows(2).any(|pair| {
@@ -1006,7 +1060,13 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/runtime/codex/dev/drafts:/drafts:rw,Z".to_string(),
+                "/host/runtime/codex/native-home:/runtime/home:rw,z".to_string(),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--volume".to_string(),
+                "/host/runtime/codex/dev/drafts:/drafts:rw,z".to_string(),
             ]
         }));
         assert!(invocation
@@ -1080,6 +1140,48 @@ mod tests {
 
         assert!(!captured.args.iter().any(|arg| arg == "--tty"));
         assert!(attached.args.iter().any(|arg| arg == "--tty"));
+    }
+
+    #[test]
+    fn oci_backend_relabels_session_mounts_private_and_persistent_mounts_shared() {
+        for target in [
+            "/runtime",
+            "/runtime/lionclaw/channel-send.sock",
+            "/attachments/provider",
+            "/lionclaw/project",
+            "/refs",
+            "/mnt/cache",
+        ] {
+            let mount = MountSpec {
+                source: "/host/session".into(),
+                target: target.to_string(),
+                access: MountAccess::ReadWrite,
+            };
+
+            assert_eq!(
+                super::bind_mount_relabel(&mount),
+                super::BindMountRelabel::Private
+            );
+        }
+
+        for target in [
+            "/runtime/home",
+            "/runtime/home/.codex",
+            "/workspace",
+            "/drafts",
+            "/lionclaw/skills/loopback",
+        ] {
+            let mount = MountSpec {
+                source: "/host/shared".into(),
+                target: target.to_string(),
+                access: MountAccess::ReadWrite,
+            };
+
+            assert_eq!(
+                super::bind_mount_relabel(&mount),
+                super::BindMountRelabel::Shared
+            );
+        }
     }
 
     #[test]
@@ -1584,6 +1686,11 @@ esac
                 MountSpec {
                     source: "/host/runtime/codex/dev".into(),
                     target: "/runtime".to_string(),
+                    access: MountAccess::ReadWrite,
+                },
+                MountSpec {
+                    source: "/host/runtime/codex/native-home".into(),
+                    target: "/runtime/home".to_string(),
                     access: MountAccess::ReadWrite,
                 },
                 MountSpec {
