@@ -180,9 +180,11 @@ Expected:
   transcript-export pass
 - after an unclean LionClaw exit, relaunching the native UI reconciles durable
   runtime transcript state without duplicating already imported turns
-- a second `run --runtime-tui --continue-last-session` targeting the same
-  active native UI reports a conflict instead of attaching to the same runtime
-  state concurrently
+- interactive `run` and `run --runtime-tui` resume the latest LionClaw session
+  by default; `--new-session` starts fresh LionClaw control state while keeping
+  runtime-native config and history under `/runtime/home`
+- a second `run --runtime-tui` targeting the same active native UI reports a
+  conflict instead of attaching to the same runtime state concurrently
 
 Use these prompts:
 
