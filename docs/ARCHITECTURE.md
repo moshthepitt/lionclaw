@@ -991,6 +991,8 @@ memory metadata does not auto-activate it. A selected skill declares the host
 projector command in its `lionclaw.toml`:
 
 ```toml
+version = 1
+
 [memory_projector]
 command = "scripts/projector"
 ```
