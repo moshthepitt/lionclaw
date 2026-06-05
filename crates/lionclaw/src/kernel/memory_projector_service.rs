@@ -22,7 +22,7 @@ use crate::applied::{AppliedMemoryProjector, AppliedState};
 
 use super::memory_projection::{
     validate_memory_projection, MemoryProjection, MemoryProjectionError, MemoryProjectionErrorKind,
-    MemoryProjectionRequest, MemoryProjector, NoopMemoryProjector,
+    MemoryProjectionInvalidReason, MemoryProjectionRequest, MemoryProjector, NoopMemoryProjector,
 };
 
 pub(crate) const MEMORY_PROJECTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -124,8 +124,16 @@ impl SkillMemoryProjector {
                 format!("decode response: {err}"),
             )
         })?;
-        if validate_memory_projection(&request, &self.config.projector_id, &projection).is_err() {
+        if let Err(reason) =
+            validate_memory_projection(&request, &self.config.projector_id, &projection)
+        {
             Self::retire_process(process).await;
+            if reason == MemoryProjectionInvalidReason::RequestIdMismatch {
+                return Err(MemoryProjectionError::invalid_output(
+                    reason.as_str(),
+                    "memory projector response request id did not match the request",
+                ));
+            }
         }
         Ok(projection)
     }
@@ -622,11 +630,13 @@ starts="$LIONCLAW_SKILL_STATE_DIR/starts"
 count=0
 if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
-IFS= read -r _line || exit 0
+IFS= read -r line || exit 0
+request_id=${line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
 if [ "$count" = "0" ]; then
   printf '%s\n' '__FIRST_RESPONSE__'
 else
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 fi
 "#
         .replace("__FIRST_RESPONSE__", first_response)
@@ -634,6 +644,7 @@ fi
 
     fn request() -> MemoryProjectionRequest {
         MemoryProjectionRequest {
+            request_id: Uuid::new_v4(),
             session_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid"),
             runtime_id: "mock".to_string(),
             trust_tier: TrustTier::Main,
@@ -661,7 +672,9 @@ printf 'start\n' >> "$LIONCLAW_SKILL_STATE_DIR/starts"
 printf '%s\n' "$LIONCLAW_MEMORY_PROJECTOR_ID" > "$LIONCLAW_SKILL_STATE_DIR/projector_id"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
-  printf '{"projector_id":"%s","items":[{"kind":"stable_fact","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         );
@@ -704,10 +717,12 @@ starts="$LIONCLAW_SKILL_STATE_DIR/starts"
 count=0
 if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
-IFS= read -r _line || exit 0
-printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+IFS= read -r line || exit 0
+request_id=${line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
+printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 if [ "$count" = "0" ]; then
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 fi
 "#,
         );
@@ -727,6 +742,57 @@ fi
         assert_eq!(
             fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
             "start\nstart\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_extra_stdout_line_cannot_satisfy_later_request() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+starts="$LIONCLAW_SKILL_STATE_DIR/starts"
+requests="$LIONCLAW_SKILL_STATE_DIR/requests"
+printf 'start\n' >> "$starts"
+count=0
+while IFS= read -r _line; do
+  count=$((count + 1))
+  printf 'request\n' >> "$requests"
+  request_id=${_line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  if [ "$count" = "1" ]; then
+    stale_request_id="$request_id"
+    printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
+    (sleep 0.02; printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"stale delayed output","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$stale_request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID") &
+  else
+    sleep 0.1
+    printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  fi
+done
+"#,
+        );
+        let projector = SkillMemoryProjector::new(config.clone());
+
+        projector
+            .project(request())
+            .await
+            .expect("first response should succeed");
+        let second = projector
+            .project(request())
+            .await
+            .expect_err("delayed extra stdout must fail the next request");
+
+        assert!(second.to_string().contains("request id"));
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+            "start\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("requests")).expect("requests"),
+            "request\nrequest\n"
         );
     }
 
@@ -807,7 +873,9 @@ IFS= read -r _line || exit 0
 if [ "$count" = "0" ]; then
   exit 0
 fi
-printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+request_id=${_line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
+printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 "#,
         );
         let projector = SkillMemoryProjector::new(config.clone());
@@ -842,8 +910,10 @@ starts="$LIONCLAW_SKILL_STATE_DIR/starts"
 count=0
 if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
-IFS= read -r _line || exit 0
-printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+IFS= read -r line || exit 0
+request_id=${line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
+printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 if [ "$count" = "0" ]; then
   sleep 0.05
   exit 0
@@ -881,11 +951,13 @@ starts="$LIONCLAW_SKILL_STATE_DIR/starts"
 count=0
 if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
-IFS= read -r _line || exit 0
+IFS= read -r line || exit 0
+request_id=${line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
 if [ "$count" = "0" ]; then
   sleep 1
 fi
-printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 "#,
         )
         .with_request_timeout(Duration::from_millis(50));
@@ -949,8 +1021,10 @@ sleep 5
 set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
 (sleep 0.3; printf 'alive\n' > "$LIONCLAW_SKILL_STATE_DIR/child-alive") &
-while IFS= read -r _line; do
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+while IFS= read -r line; do
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         );
@@ -983,11 +1057,13 @@ starts="$LIONCLAW_SKILL_STATE_DIR/starts"
 count=0
 if [ -f "$starts" ]; then count=$(wc -l < "$starts"); fi
 printf 'start\n' >> "$starts"
-IFS= read -r _line || exit 0
+IFS= read -r line || exit 0
+request_id=${line#*\"request_id\":\"}
+request_id=${request_id%%\"*}
 if [ "$count" = "0" ]; then
-  printf '{"projector_id":"wrong","items":[]}\n'
+  printf '{"request_id":"%s","projector_id":"wrong","items":[]}\n' "$request_id"
 else
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 fi
 "#,
         );
@@ -1045,18 +1121,22 @@ set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
   if [ ! -f "$LIONCLAW_SKILL_STATE_DIR/first-response-sent" ]; then
     if IFS= read -r -t 0.2 queued; then
       printf '%s\n' "$queued" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
+      queued_request_id=${queued#*\"request_id\":\"}
+      queued_request_id=${queued_request_id%%\"*}
       printf 'overlap\n' > "$LIONCLAW_SKILL_STATE_DIR/overlap"
-      printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
-      printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+      printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
+      printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$queued_request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
       touch "$LIONCLAW_SKILL_STATE_DIR/first-response-sent"
       continue
     fi
     touch "$LIONCLAW_SKILL_STATE_DIR/first-response-sent"
   fi
-  printf '{"projector_id":"%s","items":[]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         );

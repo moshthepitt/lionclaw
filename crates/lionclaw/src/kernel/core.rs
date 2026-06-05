@@ -7922,6 +7922,7 @@ mod tests {
             &self,
             request: MemoryProjectionRequest,
         ) -> Result<MemoryProjection, MemoryProjectionError> {
+            let request_id = request.request_id;
             self.requests
                 .lock()
                 .expect("memory projector request lock")
@@ -7929,6 +7930,7 @@ mod tests {
             match &self.output {
                 TestMemoryProjectorOutput::Items(items)
                 | TestMemoryProjectorOutput::Invalid(items) => Ok(MemoryProjection {
+                    request_id,
                     projector_id: self.projector_id.to_string(),
                     items: items.clone(),
                 }),
@@ -8538,7 +8540,9 @@ mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
 printf 'start\n' >> "$LIONCLAW_SKILL_STATE_DIR/starts"
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
-  printf '{"projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         )
@@ -8592,8 +8596,10 @@ done
 set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
 printf 'start\n' >> "$LIONCLAW_SKILL_STATE_DIR/starts"
-while IFS= read -r _line; do
-  printf '{"projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+while IFS= read -r line; do
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         )
@@ -8630,8 +8636,10 @@ done
 set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
 printf 'CONFIGURED_MEMORY_PROJECTOR_STDERR_POISON_SHOULD_NOT_APPEAR\n' >&2
-while IFS= read -r _line; do
-  printf '{"projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$LIONCLAW_MEMORY_PROJECTOR_ID"
+while IFS= read -r line; do
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_MEMORY_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_MEMORY_PROJECTOR_ID"
 done
 "#,
         )
@@ -20501,6 +20509,7 @@ impl Kernel {
             .memory_projection_sources(session, history_before_sequence_no, transcript_tail_limit)
             .await?;
         let request = MemoryProjectionRequest {
+            request_id: uuid::Uuid::new_v4(),
             session_id: session.session_id,
             runtime_id: runtime_id.to_string(),
             trust_tier: session.trust_tier.clone(),

@@ -29,9 +29,10 @@ impl MemoryProjector for NoopMemoryProjector {
 
     async fn project(
         &self,
-        _request: MemoryProjectionRequest,
+        request: MemoryProjectionRequest,
     ) -> Result<MemoryProjection, MemoryProjectionError> {
         Ok(MemoryProjection {
+            request_id: request.request_id,
             projector_id: self.projector_id().to_string(),
             items: Vec::new(),
         })
@@ -44,6 +45,7 @@ impl MemoryProjector for NoopMemoryProjector {
 )]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryProjectionRequest {
+    pub request_id: Uuid,
     pub session_id: Uuid,
     pub runtime_id: String,
     pub trust_tier: TrustTier,
@@ -68,6 +70,7 @@ pub(crate) enum MemorySourceRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MemoryProjection {
+    pub request_id: Uuid,
     pub projector_id: String,
     pub items: Vec<MemoryCandidate>,
 }
@@ -194,6 +197,7 @@ pub(crate) struct ValidMemoryProjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryProjectionInvalidReason {
+    RequestIdMismatch,
     ProjectorIdEmpty,
     ProjectorIdMismatch,
     TooManyItems,
@@ -206,6 +210,7 @@ pub(crate) enum MemoryProjectionInvalidReason {
 impl MemoryProjectionInvalidReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::RequestIdMismatch => "request_id_mismatch",
             Self::ProjectorIdEmpty => "projector_id_empty",
             Self::ProjectorIdMismatch => "projector_id_mismatch",
             Self::TooManyItems => "too_many_items",
@@ -222,6 +227,9 @@ pub(crate) fn validate_memory_projection(
     expected_projector_id: &str,
     projection: &MemoryProjection,
 ) -> Result<ValidMemoryProjection, MemoryProjectionInvalidReason> {
+    if projection.request_id != request.request_id {
+        return Err(MemoryProjectionInvalidReason::RequestIdMismatch);
+    }
     if projection.projector_id.trim().is_empty() {
         return Err(MemoryProjectionInvalidReason::ProjectorIdEmpty);
     }
@@ -306,9 +314,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_rejects_request_id_mismatch() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            Uuid::new_v4(),
+            "test",
+            vec![memory_candidate("remember this")],
+        );
+
+        let err = validate_memory_projection(&request, "test", &projection)
+            .expect_err("request id mismatch is invalid");
+        assert_eq!(err.as_str(), "request_id_mismatch");
+    }
+
+    #[test]
     fn validation_rejects_empty_projector_id() {
         let request = request_with_session_turn_source();
-        let projection = projection_with_items("", vec![memory_candidate("remember this")]);
+        let projection = projection_with_items(
+            request.request_id,
+            "",
+            vec![memory_candidate("remember this")],
+        );
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("empty projector id is invalid");
@@ -318,7 +344,11 @@ mod tests {
     #[test]
     fn validation_rejects_projector_id_mismatch() {
         let request = request_with_session_turn_source();
-        let projection = projection_with_items("other", vec![memory_candidate("remember this")]);
+        let projection = projection_with_items(
+            request.request_id,
+            "other",
+            vec![memory_candidate("remember this")],
+        );
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("projector id mismatch is invalid");
@@ -332,6 +362,7 @@ mod tests {
             ..request_with_session_turn_source()
         };
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![memory_candidate("first"), memory_candidate("second")],
         );
@@ -347,7 +378,11 @@ mod tests {
             max_bytes: 5,
             ..request_with_session_turn_source()
         };
-        let projection = projection_with_items("test", vec![memory_candidate("too large")]);
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![memory_candidate("too large")],
+        );
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("over-budget memory text is invalid");
@@ -357,7 +392,8 @@ mod tests {
     #[test]
     fn validation_rejects_empty_candidate_text() {
         let request = request_with_session_turn_source();
-        let projection = projection_with_items("test", vec![memory_candidate(" ")]);
+        let projection =
+            projection_with_items(request.request_id, "test", vec![memory_candidate(" ")]);
 
         let err = validate_memory_projection(&request, "test", &projection)
             .expect_err("empty memory text is invalid");
@@ -368,6 +404,7 @@ mod tests {
     fn validation_rejects_missing_provenance() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: Vec::new(),
@@ -384,6 +421,7 @@ mod tests {
     fn validation_rejects_unsupported_provenance() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![compaction_provenance(3)],
@@ -400,6 +438,7 @@ mod tests {
     fn validation_rejects_session_turn_at_or_after_before_sequence() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![session_turn_provenance(10)],
@@ -416,6 +455,7 @@ mod tests {
     fn validation_rejects_session_turn_not_selected_by_source_range() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![session_turn_provenance(5)],
@@ -432,6 +472,7 @@ mod tests {
     fn validation_rejects_missing_provenance_sequence() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![MemoryProvenance {
@@ -452,6 +493,7 @@ mod tests {
     fn validation_rejects_blank_provenance_event_id() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![MemoryProvenance {
@@ -470,7 +512,11 @@ mod tests {
     #[test]
     fn validation_accepts_supported_session_turn_provenance() {
         let request = request_with_session_turn_source();
-        let projection = projection_with_items("test", vec![memory_candidate("remember this")]);
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![memory_candidate("remember this")],
+        );
 
         let valid = validate_memory_projection(&request, "test", &projection)
             .expect("supported session turn provenance is valid");
@@ -488,6 +534,7 @@ mod tests {
             ..request_with_session_turn_source()
         };
         let projection = projection_with_items(
+            request.request_id,
             "test",
             vec![MemoryCandidate {
                 provenance: vec![compaction_provenance(7)],
@@ -508,6 +555,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&request).expect("serialize request");
 
+        assert_eq!(encoded["request_id"], request.request_id.to_string());
         assert_eq!(encoded["runtime_id"], "mock");
         assert_eq!(encoded["trust_tier"], "main");
         assert_eq!(encoded["history_policy"], "interactive");
@@ -521,10 +569,14 @@ mod tests {
     #[test]
     fn response_deserializes_jsonl_protocol_shape() {
         let decoded: MemoryProjection = serde_json::from_str(
-            r#"{"projector_id":"memory-core","items":[{"kind":"stable_fact","text":"User prefers concise summaries.","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}],"ignored":true}"#,
+            r#"{"request_id":"11111111-1111-1111-1111-111111111111","projector_id":"memory-core","items":[{"kind":"stable_fact","text":"User prefers concise summaries.","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}],"ignored":true}"#,
         )
         .expect("decode response");
 
+        assert_eq!(
+            decoded.request_id,
+            Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid")
+        );
         assert_eq!(decoded.projector_id, "memory-core");
         assert_eq!(decoded.items[0].kind, MemoryCandidateKind::StableFact);
         assert_eq!(
@@ -534,10 +586,12 @@ mod tests {
     }
 
     fn projection_with_items(
+        request_id: Uuid,
         projector_id: impl Into<String>,
         items: Vec<MemoryCandidate>,
     ) -> MemoryProjection {
         MemoryProjection {
+            request_id,
             projector_id: projector_id.into(),
             items,
         }
@@ -553,6 +607,7 @@ mod tests {
 
     fn request_with_session_turn_source() -> MemoryProjectionRequest {
         MemoryProjectionRequest {
+            request_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             runtime_id: "mock".to_string(),
             trust_tier: TrustTier::Main,

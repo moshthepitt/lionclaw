@@ -1019,14 +1019,15 @@ background work behind.
 
 The v1 protocol is JSONL. The kernel writes one `MemoryProjectionRequest` JSON
 object per line to projector stdin and reads one `MemoryProjection` JSON object
-per line from stdout. There is no `protocol_version` field in v1. Unknown
-response fields are ignored. Only one request is in flight at a time. The
-request timeout is a kernel constant, not skill config. Crash, EOF, malformed
-JSON, missing required fields, unknown enum values, wrong projector id, invalid
-provenance, empty text, oversized output, and timeout all omit the Memory
-section safely. Fatal protocol failures and timeouts retire the resident process
-before a later projection can start, so a late response cannot satisfy a future
-request.
+per line from stdout. Each request carries a fresh `request_id`, and each
+response must echo the same id. There is no `protocol_version` field in v1.
+Unknown response fields are ignored. Only one request is in flight at a time.
+The request timeout is a kernel constant, not skill config. Crash, EOF,
+malformed JSON, missing required fields, unknown enum values, wrong request id,
+wrong projector id, invalid provenance, empty text, oversized output, and timeout
+all omit the Memory section safely. Fatal protocol failures and timeouts retire
+the resident process before a later projection can start, so a late response
+cannot satisfy a future request.
 
 Projector output is candidate context only. `PromptContextPolicy` remains the
 final owner of trust-tier exclusion, byte caps, rendering, whole-section
