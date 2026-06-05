@@ -12,8 +12,8 @@ pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_run
 pub use execution::{
     execute_attached, execute_captured, execute_streaming,
     resolve_oci_image_compatibility_identity, runtime_native_home_mount_source,
-    runtime_state_mount_source, skill_mount_target, spawn_interactive,
-    validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
+    runtime_skill_mount_target_alias, runtime_state_mount_source, skill_mount_target,
+    spawn_interactive, validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
     EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionPlanPurpose,
     ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
     ExecutionRequest, ExecutionSession, MountAccess, MountSpec, OciConfinementConfig,

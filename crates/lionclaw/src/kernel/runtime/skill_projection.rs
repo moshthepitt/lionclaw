@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::fs;
 
-use super::{MountSpec, SKILLS_MOUNT_TARGET_ROOT};
-use crate::kernel::skills::validate_skill_alias;
+use super::{runtime_skill_mount_target_alias, MountSpec, SKILLS_MOUNT_TARGET_ROOT};
 
 pub async fn project_runtime_skills(
     runtime_kind: &str,
@@ -124,16 +123,20 @@ fn desired_skill_symlinks(mounts: &[MountSpec]) -> Result<BTreeMap<String, Strin
     let mut desired = BTreeMap::new();
 
     for mount in mounts {
-        let Some(alias) = mount
+        if !mount
             .target
             .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-        else {
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
             continue;
-        };
+        }
 
-        validate_skill_alias(alias)
-            .with_context(|| format!("invalid runtime skill mount target '{}'", mount.target))?;
+        let Some(alias) = runtime_skill_mount_target_alias(&mount.target) else {
+            anyhow::bail!(
+                "invalid runtime skill mount target '{}' must be under {SKILLS_MOUNT_TARGET_ROOT}/<alias>",
+                mount.target
+            );
+        };
         desired.insert(alias.to_string(), mount.target.clone());
     }
 
@@ -235,7 +238,9 @@ async fn managed_skill_symlink(path: &Path) -> Result<bool> {
     let target = fs::read_link(path)
         .await
         .with_context(|| format!("failed to read link {}", path.display()))?;
-    Ok(target.starts_with(SKILLS_MOUNT_TARGET_ROOT))
+    Ok(target
+        .to_str()
+        .is_some_and(|target| runtime_skill_mount_target_alias(target).is_some()))
 }
 
 async fn remove_symlink(path: &Path) -> Result<()> {
@@ -359,6 +364,35 @@ mod tests {
         assert!(!tokio::fs::try_exists(stale_root.join("old"))
             .await
             .expect("check stale link"));
+    }
+
+    #[tokio::test]
+    async fn preserves_skill_symlinks_with_escaping_targets_as_unmanaged() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let stale_root = runtime_home.join(".codex/skills");
+        let escaping_link = stale_root.join("old");
+        tokio::fs::create_dir_all(&stale_root)
+            .await
+            .expect("create stale root");
+        tokio::task::spawn_blocking({
+            let escaping_link = escaping_link.clone();
+            move || std::os::unix::fs::symlink("/lionclaw/skills/../custom", escaping_link)
+        })
+        .await
+        .expect("join escaping link")
+        .expect("create escaping link");
+
+        project_runtime_skills("codex", &runtime_home, &[])
+            .await
+            .expect("project empty skill set");
+
+        assert_eq!(
+            tokio::fs::read_link(&escaping_link)
+                .await
+                .expect("read escaping link"),
+            PathBuf::from("/lionclaw/skills/../custom")
+        );
     }
 
     #[tokio::test]

@@ -14,7 +14,6 @@ use crate::home::{
     runtime_session_state_dir_from_parts,
 };
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
-use crate::kernel::skills::validate_skill_alias;
 
 use super::{
     mount_validation::{
@@ -22,10 +21,10 @@ use super::{
         validate_configured_mounts, MountSourceProtection,
     },
     plan::{
-        ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionPreset, MountAccess,
-        MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
-        DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
-        SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
+        runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
+        ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
+        RuntimeAuthKind, WorkspaceAccess, DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET,
+        RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
     },
 };
 
@@ -487,10 +486,7 @@ fn is_skills_mount_target(target: &str) -> bool {
 }
 
 fn is_runtime_skill_mount_target(target: &str) -> bool {
-    target
-        .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
-        .and_then(|suffix| suffix.strip_prefix('/'))
-        .is_some_and(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
+    runtime_skill_mount_target_alias(target).is_some()
 }
 
 fn validate_runtime_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {

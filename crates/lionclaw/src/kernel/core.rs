@@ -129,21 +129,22 @@ use super::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         execute_captured, execute_streaming, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
-        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
-        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection,
-        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        runtime_native_home_mount_source, runtime_skill_mount_target_alias,
+        runtime_state_mount_source, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
-        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -8226,6 +8227,69 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_rejects_legacy_escaping_skill_projection_symlink_collision() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(RUNTIME_NATIVE_HOME_DIR);
+        let legacy_skill_link = legacy_home_root.join(".codex/skills/loopback");
+        let destination_skill_link = runtime_home_root.join(".codex/skills/loopback");
+        tokio::fs::create_dir_all(legacy_skill_link.parent().expect("legacy skill parent"))
+            .await
+            .expect("create legacy skill projection");
+        tokio::fs::create_dir_all(
+            destination_skill_link
+                .parent()
+                .expect("destination skill parent"),
+        )
+        .await
+        .expect("create destination skill projection");
+        std::os::unix::fs::symlink("/lionclaw/skills/../custom", &legacy_skill_link)
+            .expect("legacy escaping skill symlink");
+        std::os::unix::fs::symlink("/lionclaw/skills/loopback", &destination_skill_link)
+            .expect("destination managed skill symlink");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root,
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let err = kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect_err("escaping legacy skill symlink should conflict");
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("cannot migrate legacy runtime native home entry")
+        ));
+        assert_eq!(
+            tokio::fs::read_link(&legacy_skill_link)
+                .await
+                .expect("read legacy skill link"),
+            PathBuf::from("/lionclaw/skills/../custom")
+        );
+        assert_eq!(
+            tokio::fs::read_link(&destination_skill_link)
+                .await
+                .expect("read destination skill link"),
+            PathBuf::from("/lionclaw/skills/loopback")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn materialize_runtime_plan_serializes_legacy_runtime_home_migration() {
         let temp_dir = tempdir().expect("temp dir");
@@ -14179,7 +14243,9 @@ fn source_runtime_native_home_entry_is_managed_skill_symlink(
             source_path.display()
         ))
     })?;
-    Ok(target.starts_with(SKILLS_MOUNT_TARGET_ROOT))
+    Ok(target
+        .to_str()
+        .is_some_and(|target| runtime_skill_mount_target_alias(target).is_some()))
 }
 
 fn runtime_native_home_entry_is_skill_projection_leaf(relative_path: &Path) -> bool {
