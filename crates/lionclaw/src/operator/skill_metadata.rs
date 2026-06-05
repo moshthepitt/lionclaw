@@ -258,16 +258,20 @@ mod tests {
         skill
     }
 
+    fn write_memory_projector_metadata(skill: &std::path::Path, command: &str) {
+        fs::write(
+            skill.join("lionclaw.toml"),
+            format!("version = 1\n\n[memory_projector]\ncommand = \"{command}\"\n"),
+        )
+        .expect("metadata");
+    }
+
     #[cfg(unix)]
     #[test]
     fn parses_memory_projector_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        fs::write(
-            skill.join("lionclaw.toml"),
-            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
-        )
-        .expect("metadata");
+        write_memory_projector_metadata(&skill, "scripts/projector");
 
         let metadata = load_memory_projector_metadata(&skill)
             .expect("metadata")
@@ -281,13 +285,95 @@ mod tests {
     fn memory_only_metadata_does_not_declare_channel() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        fs::write(
-            skill.join("lionclaw.toml"),
-            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
-        )
-        .expect("metadata");
+        write_memory_projector_metadata(&skill, "scripts/projector");
 
         assert!(!skill_metadata_declares_channel(&skill).expect("declares channel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_memory_projector_absolute_command_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        write_memory_projector_metadata(&skill, "/bin/echo");
+
+        let err = load_memory_projector_metadata(&skill)
+            .expect_err("absolute memory projector command should fail");
+
+        assert!(err.to_string().contains("must be relative"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_memory_projector_parent_traversal_command_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        write_memory_projector_metadata(&skill, "../projector");
+
+        let err = load_memory_projector_metadata(&skill)
+            .expect_err("parent traversal memory projector command should fail");
+
+        assert!(err.to_string().contains("must stay inside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_missing_memory_projector_command() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+
+        let err = resolve_skill_entrypoint(
+            &skill,
+            "scripts/missing",
+            "memory projector command",
+            SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+        )
+        .expect_err("missing projector command should fail");
+
+        assert!(err.to_string().contains("is missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_executable_memory_projector_command() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        let command = skill.join("scripts/not-executable");
+        fs::write(&command, "#!/usr/bin/env bash\n").expect("projector");
+
+        let err = resolve_skill_entrypoint(
+            &skill,
+            "scripts/not-executable",
+            "memory projector command",
+            SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+        )
+        .expect_err("non-executable projector command should fail");
+
+        assert!(err.to_string().contains("not executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_memory_projector_command() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        let target = skill.join("scripts/real-projector");
+        fs::write(&target, "#!/usr/bin/env bash\n").expect("real projector");
+        make_executable(&target);
+        fs::remove_file(skill.join("scripts/projector")).expect("remove projector");
+        symlink(&target, skill.join("scripts/projector")).expect("projector symlink");
+
+        let err = resolve_skill_entrypoint(
+            &skill,
+            "scripts/projector",
+            "memory projector command",
+            SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+        )
+        .expect_err("symlinked projector command should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
     }
 
     #[cfg(unix)]

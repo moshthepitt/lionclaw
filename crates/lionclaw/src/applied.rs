@@ -1003,6 +1003,14 @@ mod tests {
         skill
     }
 
+    async fn configure_memory_projector(home: &LionClawHome, alias: &str) {
+        let mut config = crate::operator::config::OperatorConfig::load(home)
+            .await
+            .expect("load config");
+        config.memory.projector_skill = Some(alias.to_string());
+        config.save(home).await.expect("save config");
+    }
+
     #[tokio::test]
     async fn load_ignores_hidden_staging_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1062,11 +1070,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
         write_memory_projector_skill(&home, "memory-core");
-        let mut config = crate::operator::config::OperatorConfig::load(&home)
-            .await
-            .expect("load config");
-        config.memory.projector_skill = Some("memory-core".to_string());
-        config.save(&home).await.expect("save config");
+        configure_memory_projector(&home, "memory-core").await;
 
         let applied = AppliedState::load(&home).await.expect("load state");
         let projector = applied.memory_projector().expect("projector");
@@ -1084,11 +1088,7 @@ mod tests {
     async fn load_rejects_missing_configured_memory_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        let mut config = crate::operator::config::OperatorConfig::load(&home)
-            .await
-            .expect("load config");
-        config.memory.projector_skill = Some("missing".to_string());
-        config.save(&home).await.expect("save config");
+        configure_memory_projector(&home, "missing").await;
 
         let err = AppliedState::load(&home)
             .await
@@ -1096,6 +1096,22 @@ mod tests {
 
         assert!(
             err.to_string().contains("missing installed skill alias"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_configured_memory_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        configure_memory_projector(&home, "../memory-core").await;
+
+        let err = AppliedState::load(&home)
+            .await
+            .expect_err("invalid projector alias should fail");
+
+        assert!(
+            err.to_string().contains("skill alias"),
             "unexpected error: {err:#}"
         );
     }
@@ -1110,11 +1126,7 @@ mod tests {
         let without_projector = AppliedState::load(&home)
             .await
             .expect("load state without projector");
-        let mut config = crate::operator::config::OperatorConfig::load(&home)
-            .await
-            .expect("load config");
-        config.memory.projector_skill = Some("memory-core".to_string());
-        config.save(&home).await.expect("save config");
+        configure_memory_projector(&home, "memory-core").await;
 
         let with_projector = AppliedState::load(&home)
             .await
@@ -1123,6 +1135,63 @@ mod tests {
         assert_ne!(
             without_projector.fingerprint(),
             with_projector.fingerprint()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_projector_content_changes_applied_state_fingerprint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let skill = write_memory_projector_skill(&home, "memory-core");
+        configure_memory_projector(&home, "memory-core").await;
+
+        let first = AppliedState::load(&home)
+            .await
+            .expect("load first applied state");
+        fs::write(
+            skill.join("scripts/projector"),
+            "#!/usr/bin/env bash\nprintf changed\n",
+        )
+        .expect("update projector");
+        make_executable(&skill.join("scripts/projector"));
+        let second = AppliedState::load(&home)
+            .await
+            .expect("load second applied state");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_projector_metadata_changes_applied_state_fingerprint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let skill = write_memory_projector_skill(&home, "memory-core");
+        configure_memory_projector(&home, "memory-core").await;
+
+        let first = AppliedState::load(&home)
+            .await
+            .expect("load first applied state");
+        fs::write(
+            skill.join("scripts/projector-v2"),
+            "#!/usr/bin/env bash\nprintf changed\n",
+        )
+        .expect("write second projector");
+        make_executable(&skill.join("scripts/projector-v2"));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector-v2\"\n",
+        )
+        .expect("metadata");
+        let second = AppliedState::load(&home)
+            .await
+            .expect("load second applied state");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        assert_eq!(
+            second.memory_projector().expect("projector").command,
+            "scripts/projector-v2"
         );
     }
 
