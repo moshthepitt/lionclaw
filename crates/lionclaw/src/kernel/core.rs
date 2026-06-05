@@ -8019,6 +8019,58 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_preserves_legacy_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_secret_dir = runtime_state_root
+            .join(RUNTIME_NATIVE_HOME_DIR)
+            .join(".ssh");
+        tokio::fs::create_dir_all(&legacy_secret_dir)
+            .await
+            .expect("create legacy secret dir");
+        tokio::fs::write(legacy_secret_dir.join("config"), b"Host *\n")
+            .await
+            .expect("write legacy ssh config");
+        std::fs::set_permissions(&legacy_secret_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod legacy secret dir");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let migrated_metadata =
+            std::fs::metadata(runtime_home_root.join(".ssh")).expect("stat migrated secret dir");
+        assert_eq!(migrated_metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            tokio::fs::read_to_string(runtime_home_root.join(".ssh/config"))
+                .await
+                .expect("read migrated ssh config"),
+            "Host *\n"
+        );
+    }
+
     #[tokio::test]
     async fn materialize_runtime_plan_migrates_matching_legacy_home_from_prior_session() {
         let temp_dir = tempdir().expect("temp dir");
@@ -14674,7 +14726,15 @@ fn merge_runtime_native_home_entry_blocking(
         Err(err) if err.kind() == ErrorKind::NotFound => {
             if source_metadata.is_dir() {
                 match std::fs::create_dir(destination_path) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        std::fs::set_permissions(destination_path, source_metadata.permissions())
+                            .map_err(|err| {
+                                KernelError::Runtime(format!(
+                            "failed to set runtime native home directory permissions '{}': {err}",
+                            destination_path.display()
+                        ))
+                            })?
+                    }
                     Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                         let destination_metadata = std::fs::symlink_metadata(destination_path)
                             .map_err(|err| {
