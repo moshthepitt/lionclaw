@@ -280,7 +280,7 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
 }
 
 #[tokio::test]
-async fn program_backed_runtime_channel_send_accepts_runtime_home_attachment() {
+async fn program_backed_runtime_channel_send_rejects_arbitrary_runtime_home_attachment() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-home").await;
     let kernel = kernel_with_channel_send_preset(&env, true).await;
@@ -327,7 +327,14 @@ async fn program_backed_runtime_channel_send_accepts_runtime_home_attachment() {
 
     let responses = responses.lock().expect("responses lock").clone();
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[0]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("allowed runtime artifact directory")));
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
@@ -340,18 +347,7 @@ async fn program_backed_runtime_channel_send_accepts_runtime_home_attachment() {
         })
         .await
         .expect("pull outbox");
-    assert_eq!(outbox.deliveries.len(), 1);
-    let attachments = &outbox.deliveries[0].content.attachments;
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(
-        attachments[0].filename.as_deref(),
-        Some("persistent-sketch.txt")
-    );
-    let copied = PathBuf::from(&attachments[0].path);
-    let copied_bytes = tokio::fs::read(&copied)
-        .await
-        .expect("read copied runtime home attachment");
-    assert_eq!(copied_bytes, b"persistent sketch bytes");
+    assert!(outbox.deliveries.is_empty());
 }
 
 #[tokio::test]

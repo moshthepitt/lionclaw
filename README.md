@@ -187,6 +187,11 @@ Confined runtime layout:
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets
 - `/mnt/<target>`: optional operator-configured extra directories
 
+`/runtime/home` can contain runtime auth, config, databases, caches, and
+history. LionClaw does not treat the whole native home as an artifact or
+`channel.send` attachment root; only runtime control state and explicit
+generated-artifact directories are exportable.
+
 Network policy is intentionally coarse today: `on` or `none`. `on` uses the
 Podman network namespace, not host networking.
 
