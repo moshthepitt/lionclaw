@@ -141,6 +141,7 @@ pub(crate) struct MemoryProjectionError {
 pub(crate) enum MemoryProjectionErrorKind {
     ProjectorFailed,
     InvalidOutput,
+    Timeout,
 }
 
 impl MemoryProjectionError {
@@ -152,6 +153,14 @@ impl MemoryProjectionError {
         Self {
             kind: MemoryProjectionErrorKind::ProjectorFailed,
             audit_reason: "projector_failed",
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            kind: MemoryProjectionErrorKind::Timeout,
+            audit_reason: "projector_timeout",
             message: message.into(),
         }
     }
@@ -168,6 +177,7 @@ impl MemoryProjectionError {
         match self.kind {
             MemoryProjectionErrorKind::ProjectorFailed => "projector_failed",
             MemoryProjectionErrorKind::InvalidOutput => "projector_invalid_output",
+            MemoryProjectionErrorKind::Timeout => "projector_timeout",
         }
     }
 

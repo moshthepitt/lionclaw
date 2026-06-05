@@ -1025,9 +1025,10 @@ Unknown response fields are ignored. Only one request is in flight at a time.
 The request timeout is a kernel constant, not skill config. Crash, EOF,
 malformed JSON, missing required fields, unknown enum values, wrong request id,
 wrong projector id, invalid provenance, empty text, oversized output, and timeout
-all omit the Memory section safely. Fatal protocol failures and timeouts retire
-the resident process before a later projection can start, so a late response
-cannot satisfy a future request.
+all omit the Memory section safely. Timeouts audit as `projector_timeout`;
+other projector process failures audit as `projector_failed`. Fatal protocol
+failures and timeouts retire the resident process before a later projection can
+start, so a late response cannot satisfy a future request.
 
 Projector output is candidate context only. `PromptContextPolicy` remains the
 final owner of trust-tier exclusion, byte caps, rendering, whole-section

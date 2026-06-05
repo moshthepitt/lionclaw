@@ -250,7 +250,7 @@ impl MemoryProjector for SkillMemoryProjector {
             }
             Err(_) => {
                 Self::retire_process(&mut process).await;
-                Err(MemoryProjectionError::failed(
+                Err(MemoryProjectionError::timeout(
                     "memory projector request timed out",
                 ))
             }
@@ -593,7 +593,9 @@ mod tests {
     use super::{SkillMemoryProjector, SkillMemoryProjectorConfig};
     use crate::{
         contracts::{SessionHistoryPolicy, TrustTier},
-        kernel::memory_projection::{MemoryProjectionRequest, MemoryProjector, MemorySourceRef},
+        kernel::memory_projection::{
+            MemoryProjectionErrorKind, MemoryProjectionRequest, MemoryProjector, MemorySourceRef,
+        },
     };
 
     #[cfg(unix)]
@@ -969,6 +971,9 @@ printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LI
             .project(request())
             .await
             .expect_err("first request should time out");
+        assert_eq!(err.kind(), MemoryProjectionErrorKind::Timeout);
+        assert_eq!(err.audit_status(), "projector_timeout");
+        assert_eq!(err.audit_reason(), "projector_timeout");
         assert!(err.to_string().contains("timed out"));
 
         let second = projector
@@ -1004,6 +1009,9 @@ sleep 5
             .project(request())
             .await
             .expect_err("first request should time out");
+        assert_eq!(err.kind(), MemoryProjectionErrorKind::Timeout);
+        assert_eq!(err.audit_status(), "projector_timeout");
+        assert_eq!(err.audit_reason(), "projector_timeout");
         assert!(err.to_string().contains("timed out"));
 
         tokio::time::sleep(Duration::from_millis(600)).await;

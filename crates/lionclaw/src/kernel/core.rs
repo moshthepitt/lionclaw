@@ -7910,6 +7910,7 @@ mod tests {
         Items(Vec<MemoryCandidate>),
         Invalid(Vec<MemoryCandidate>),
         Error,
+        Timeout,
     }
 
     #[async_trait::async_trait]
@@ -7937,6 +7938,9 @@ mod tests {
                 TestMemoryProjectorOutput::Error => {
                     Err(MemoryProjectionError::failed("test projector failed"))
                 }
+                TestMemoryProjectorOutput::Timeout => {
+                    Err(MemoryProjectionError::timeout("test projector timed out"))
+                }
             }
         }
     }
@@ -7956,6 +7960,10 @@ mod tests {
 
         fn with_error() -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
             Self::with_output(TestMemoryProjectorOutput::Error)
+        }
+
+        fn with_timeout() -> (Self, Arc<std::sync::Mutex<Vec<MemoryProjectionRequest>>>) {
+            Self::with_output(TestMemoryProjectorOutput::Timeout)
         }
 
         fn with_output(
@@ -8838,6 +8846,38 @@ done
         }));
         assert!(audit_json.contains("\"status\":\"projector_failed\""));
         assert!(audit_json.contains("\"reason\":\"projector_failed\""));
+    }
+
+    #[tokio::test]
+    async fn memory_projector_timeout_omits_memory_and_audits_timeout() {
+        let (projector, requests) = TestMemoryProjector::with_timeout();
+        let fixture = prompt_context_fixture_with_memory_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(!rendered.contains("## Memory"), "{rendered}");
+        assert_eq!(
+            requests
+                .lock()
+                .expect("memory projector request lock")
+                .len(),
+            1
+        );
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext && item.reason == "projector_timeout"
+        }));
+        assert!(audit_json.contains("\"status\":\"projector_timeout\""));
+        assert!(audit_json.contains("\"reason\":\"projector_timeout\""));
     }
 
     #[tokio::test]
