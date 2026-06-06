@@ -20,10 +20,7 @@ use lionclaw_durable_fs::write_file_atomically;
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
-const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
 const CODEX_AUTH_LOCK_FILE_NAME: &str = ".lionclaw-auth.lock";
-const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
-const CODEX_TRUSTED_LEVEL: &str = "trusted";
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::seconds(120);
@@ -169,24 +166,17 @@ pub async fn ensure_codex_host_auth_ready(codex_home_override: Option<&Path>) ->
         .map(|_| ())
 }
 
-pub async fn sync_codex_home_into_runtime(
-    runtime_state_root: &Path,
+pub async fn sync_codex_home_into_runtime_home(
+    runtime_home_root: &Path,
     codex_home_override: Option<&Path>,
 ) -> Result<()> {
     let ready = load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await?;
-    ensure_runtime_codex_directory(runtime_state_root).await?;
+    ensure_runtime_codex_directory(runtime_home_root).await?;
     write_runtime_codex_file(
-        runtime_state_root,
+        runtime_home_root,
         CODEX_AUTH_FILE_NAME,
         serde_json::to_vec_pretty(&ready.auth).context("failed to encode synced Codex auth")?,
         private_file_permissions(),
-    )
-    .await?;
-    write_runtime_codex_file(
-        runtime_state_root,
-        CODEX_CONFIG_FILE_NAME,
-        runtime_codex_config_contents(),
-        runtime_config_file_permissions(),
     )
     .await?;
     Ok(())
@@ -231,13 +221,6 @@ fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
         "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
         store.auth_path.display()
     )
-}
-
-fn runtime_codex_config_contents() -> Vec<u8> {
-    format!(
-        "check_for_update_on_startup = false\n\n[projects.\"{CODEX_RUNTIME_WORKSPACE_PATH}\"]\ntrust_level = \"{CODEX_TRUSTED_LEVEL}\"\n"
-    )
-    .into_bytes()
 }
 
 fn codex_auth_needs_refresh(
@@ -488,22 +471,18 @@ async fn harden_private_file_permissions(
 }
 
 #[cfg(unix)]
-async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()> {
-    let runtime_state_root = runtime_state_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        ensure_runtime_codex_directory_blocking(&runtime_state_root)
-    })
-    .await
-    .context("failed to join runtime Codex directory task")?
+async fn ensure_runtime_codex_directory(runtime_home_root: &Path) -> Result<()> {
+    let runtime_home_root = runtime_home_root.to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_runtime_codex_directory_blocking(&runtime_home_root))
+        .await
+        .context("failed to join runtime Codex directory task")?
 }
 
 #[cfg(unix)]
-fn ensure_runtime_codex_directory_blocking(runtime_state_root: &Path) -> Result<()> {
-    let root = open_runtime_state_root(runtime_state_root)?;
-    let home_path = runtime_state_root.join("home");
-    let home = ensure_runtime_codex_child_dir(&root, "home", &home_path)?;
-    let codex_home_path = runtime_codex_home_path(runtime_state_root);
-    let _codex_home = ensure_runtime_codex_child_dir(&home, ".codex", &codex_home_path)?;
+fn ensure_runtime_codex_directory_blocking(runtime_home_root: &Path) -> Result<()> {
+    let root = open_runtime_home_root(runtime_home_root)?;
+    let codex_home_path = runtime_codex_home_path(runtime_home_root);
+    let _codex_home = ensure_runtime_codex_child_dir(&root, ".codex", &codex_home_path)?;
     Ok(())
 }
 
@@ -535,38 +514,25 @@ fn ensure_runtime_codex_child_dir(parent: &File, name: &str, display_path: &Path
 }
 
 #[cfg(unix)]
-fn open_runtime_state_root(runtime_state_root: &Path) -> Result<File> {
+fn open_runtime_home_root(runtime_home_root: &Path) -> Result<File> {
     use rustix::fs::{open, Mode, OFlags};
 
     let root = open(
-        runtime_state_root,
+        runtime_home_root,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .with_context(|| format!("failed to open {}", runtime_state_root.display()))?;
+    .with_context(|| format!("failed to open {}", runtime_home_root.display()))?;
     Ok(File::from(root))
 }
 
 #[cfg(unix)]
-fn open_runtime_codex_home(runtime_state_root: &Path) -> Result<File> {
+fn open_runtime_codex_home(runtime_home_root: &Path) -> Result<File> {
     use rustix::fs::{openat, Mode, OFlags};
 
-    let root = open_runtime_state_root(runtime_state_root)?;
-    let home = openat(
-        &root,
-        "home",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| {
-        format!(
-            "failed to open {}",
-            runtime_state_root.join("home").display()
-        )
-    })?;
-    let home = File::from(home);
+    let root = open_runtime_home_root(runtime_home_root)?;
     let codex_home = openat(
-        &home,
+        &root,
         ".codex",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
@@ -574,15 +540,15 @@ fn open_runtime_codex_home(runtime_state_root: &Path) -> Result<File> {
     .with_context(|| {
         format!(
             "failed to open {}",
-            runtime_codex_home_path(runtime_state_root).display()
+            runtime_codex_home_path(runtime_home_root).display()
         )
     })?;
     Ok(File::from(codex_home))
 }
 
 #[cfg(not(unix))]
-async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()> {
-    let path = runtime_codex_home_path(runtime_state_root);
+async fn ensure_runtime_codex_directory(runtime_home_root: &Path) -> Result<()> {
+    let path = runtime_codex_home_path(runtime_home_root);
     tokio::fs::create_dir_all(&path)
         .await
         .with_context(|| format!("failed to create {}", path.display()))?;
@@ -591,15 +557,15 @@ async fn ensure_runtime_codex_directory(runtime_state_root: &Path) -> Result<()>
 
 #[cfg(unix)]
 async fn write_runtime_codex_file(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     file_name: &str,
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    let runtime_state_root = runtime_state_root.to_path_buf();
+    let runtime_home_root = runtime_home_root.to_path_buf();
     let file_name = file_name.to_string();
     tokio::task::spawn_blocking(move || {
-        write_runtime_codex_file_blocking(&runtime_state_root, &file_name, contents, permissions)
+        write_runtime_codex_file_blocking(&runtime_home_root, &file_name, contents, permissions)
     })
     .await
     .context("failed to join runtime Codex file write task")?
@@ -607,14 +573,14 @@ async fn write_runtime_codex_file(
 
 #[cfg(unix)]
 fn write_runtime_codex_file_blocking(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     file_name: &str,
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
     let target_name = runtime_codex_file_name(file_name)?;
-    let runtime_codex_home = open_runtime_codex_home(runtime_state_root)?;
-    let runtime_codex_home_path = runtime_codex_home_path(runtime_state_root);
+    let runtime_codex_home = open_runtime_codex_home(runtime_home_root)?;
+    let runtime_codex_home_path = runtime_codex_home_path(runtime_home_root);
     write_file_atomically(
         &runtime_codex_home,
         &runtime_codex_home_path,
@@ -641,12 +607,12 @@ fn runtime_codex_file_name(file_name: &str) -> Result<OsString> {
 
 #[cfg(not(unix))]
 async fn write_runtime_codex_file(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     file_name: &str,
     contents: Vec<u8>,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    let runtime_codex_home = runtime_codex_home_path(runtime_state_root);
+    let runtime_codex_home = runtime_codex_home_path(runtime_home_root);
     let path = runtime_codex_home.join(file_name);
     let temp_path = runtime_codex_home.join(format!(
         ".lionclaw-runtime-codex-{}.tmp",
@@ -662,8 +628,8 @@ async fn write_runtime_codex_file(
         .with_context(|| format!("failed to chmod {}", path.display()))
 }
 
-fn runtime_codex_home_path(runtime_state_root: &Path) -> PathBuf {
-    runtime_state_root.join("home").join(".codex")
+fn runtime_codex_home_path(runtime_home_root: &Path) -> PathBuf {
+    runtime_home_root.join(".codex")
 }
 
 #[cfg(unix)]
@@ -678,18 +644,6 @@ fn private_file_permissions() -> std::fs::Permissions {
     std::fs::metadata(".")
         .map(|metadata| metadata.permissions())
         .unwrap_or_else(|_| std::fs::Permissions::readonly())
-}
-
-#[cfg(unix)]
-fn runtime_config_file_permissions() -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::Permissions::from_mode(0o644)
-}
-
-#[cfg(not(unix))]
-fn runtime_config_file_permissions() -> std::fs::Permissions {
-    private_file_permissions()
 }
 
 #[cfg(test)]
@@ -723,16 +677,6 @@ mod tests {
         )
         .await
         .expect("write auth file");
-    }
-
-    async fn write_runtime_file(path: &Path, contents: &str) {
-        let parent = path.parent().expect("runtime file parent");
-        tokio::fs::create_dir_all(parent)
-            .await
-            .expect("create runtime parent");
-        tokio::fs::write(path, contents)
-            .await
-            .expect("write runtime file");
     }
 
     #[tokio::test]
@@ -1099,12 +1043,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn syncs_host_auth_and_materializes_runtime_config() {
+    async fn syncs_host_auth_without_rewriting_runtime_config() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
-        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_home = temp_dir.path().join("runtime-home");
         write_auth_file(
             &codex_home,
             json!({
@@ -1113,7 +1057,7 @@ mod tests {
         )
         .await;
         tokio::fs::write(
-            codex_home.join(CODEX_CONFIG_FILE_NAME),
+            codex_home.join("config.toml"),
             br#"
 model = "gpt-5.4"
 
@@ -1123,37 +1067,32 @@ command = "/host/tool"
         )
         .await
         .expect("write config");
-        tokio::fs::create_dir(&runtime_root)
+        let runtime_codex_home = runtime_home.join(".codex");
+        tokio::fs::create_dir_all(&runtime_codex_home)
             .await
-            .expect("runtime root");
+            .expect("runtime Codex home");
+        tokio::fs::write(
+            runtime_codex_home.join("config.toml"),
+            "model = \"gpt-5.5\"\n",
+        )
+        .await
+        .expect("write runtime config");
 
-        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
             .await
             .expect("sync runtime home");
 
-        let runtime_codex_home = runtime_root.join("home").join(".codex");
         let copied_auth = tokio::fs::read_to_string(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
             .await
             .expect("read copied auth");
-        let copied_config =
-            tokio::fs::read_to_string(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
-                .await
-                .expect("read copied config");
+        let preserved_config = tokio::fs::read_to_string(runtime_codex_home.join("config.toml"))
+            .await
+            .expect("read preserved config");
         assert!(copied_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
-        assert!(copied_config.contains("check_for_update_on_startup = false"));
-        assert!(copied_config.contains("[projects.\"/workspace\"]"));
-        assert!(copied_config.contains("trust_level = \"trusted\""));
-        assert!(!copied_config.contains("gpt-5.4"));
-        assert!(!copied_config.contains("host-only"));
-        assert!(!copied_config.contains("/host/tool"));
+        assert_eq!(preserved_config, "model = \"gpt-5.5\"\n");
 
         let auth_mode = std::fs::metadata(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
             .expect("runtime auth metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let config_mode = std::fs::metadata(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
-            .expect("runtime config metadata")
             .permissions()
             .mode()
             & 0o777;
@@ -1162,76 +1101,31 @@ command = "/host/tool"
             .permissions()
             .mode()
             & 0o777;
-        let home_mode = std::fs::metadata(runtime_root.join("home"))
-            .expect("runtime home metadata")
-            .permissions()
-            .mode()
-            & 0o777;
         assert_eq!(auth_mode, 0o600);
-        assert_eq!(config_mode, 0o644);
-        assert_eq!(home_mode, 0o755);
         assert_eq!(dir_mode, 0o755);
 
-        tokio::fs::remove_file(codex_home.join(CODEX_CONFIG_FILE_NAME))
+        tokio::fs::remove_file(runtime_codex_home.join("config.toml"))
             .await
-            .expect("remove host config");
-        write_runtime_file(
-            &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
-            "stale = true\n",
-        )
-        .await;
+            .expect("remove runtime config");
 
-        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
             .await
             .expect("resync runtime home");
-        let regenerated_config =
-            tokio::fs::read_to_string(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
-                .await
-                .expect("read regenerated config");
-        assert!(!regenerated_config.contains("stale = true"));
-        assert!(regenerated_config.contains("[projects.\"/workspace\"]"));
-        assert!(regenerated_config.contains("trust_level = \"trusted\""));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runtime_codex_sync_rejects_symlinked_runtime_root() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let codex_home = temp_dir.path().join(".codex");
-        let outside_runtime = temp_dir.path().join("outside-runtime");
-        let runtime_root = temp_dir.path().join("runtime");
-        write_auth_file(
-            &codex_home,
-            json!({
-                "OPENAI_API_KEY": "sk-test"
-            }),
-        )
-        .await;
-        std::fs::create_dir(&outside_runtime).expect("outside runtime");
-        symlink(&outside_runtime, &runtime_root).expect("runtime root symlink");
-
-        let err = sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
-            .await
-            .expect_err("symlinked runtime root should fail");
-
-        assert!(err.to_string().contains("failed to open"));
         assert!(
-            !outside_runtime.join("home").exists(),
-            "runtime sync must not create files through a symlinked runtime root"
+            !runtime_codex_home.join("config.toml").exists(),
+            "Codex sync must not create user-owned runtime config"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_codex_sync_replaces_symlinked_config_without_following() {
+    async fn runtime_codex_sync_rejects_symlinked_runtime_home() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
-        let runtime_root = temp_dir.path().join("runtime");
-        let outside_config = temp_dir.path().join("outside-config.toml");
+        let outside_runtime_home = temp_dir.path().join("outside-runtime-home");
+        let runtime_home = temp_dir.path().join("runtime-home");
         write_auth_file(
             &codex_home,
             json!({
@@ -1239,42 +1133,58 @@ command = "/host/tool"
             }),
         )
         .await;
-        std::fs::create_dir_all(runtime_root.join("home/.codex")).expect("runtime codex home");
-        std::fs::write(&outside_config, "outside = true\n").expect("outside config");
-        symlink(
-            &outside_config,
-            runtime_root
-                .join("home/.codex")
-                .join(CODEX_CONFIG_FILE_NAME),
-        )
-        .expect("runtime config symlink");
+        std::fs::create_dir(&outside_runtime_home).expect("outside runtime home");
+        symlink(&outside_runtime_home, &runtime_home).expect("runtime home symlink");
 
-        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+        let err = sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
+            .await
+            .expect_err("symlinked runtime home should fail");
+
+        assert!(err.to_string().contains("failed to open"));
+        assert!(
+            !outside_runtime_home.join(".codex").exists(),
+            "runtime sync must not create files through a symlinked runtime home"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_codex_sync_replaces_symlinked_auth_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let outside_auth = temp_dir.path().join("outside-auth.json");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        std::fs::create_dir_all(runtime_home.join(".codex")).expect("runtime codex home");
+        std::fs::write(&outside_auth, "{\"outside\":true}\n").expect("outside auth");
+        symlink(
+            &outside_auth,
+            runtime_home.join(".codex").join(CODEX_AUTH_FILE_NAME),
+        )
+        .expect("runtime auth symlink");
+
+        sync_codex_home_into_runtime_home(&runtime_home, Some(&codex_home))
             .await
             .expect("sync runtime home");
 
         assert_eq!(
-            std::fs::read_to_string(&outside_config).expect("outside config"),
-            "outside = true\n"
+            std::fs::read_to_string(&outside_auth).expect("outside auth"),
+            "{\"outside\":true}\n"
         );
-        let runtime_config = runtime_root
-            .join("home/.codex")
-            .join(CODEX_CONFIG_FILE_NAME);
-        let metadata = std::fs::symlink_metadata(&runtime_config).expect("runtime config metadata");
+        let runtime_auth = runtime_home.join(".codex").join(CODEX_AUTH_FILE_NAME);
+        let metadata = std::fs::symlink_metadata(&runtime_auth).expect("runtime auth metadata");
         assert!(metadata.is_file());
         assert!(!metadata.file_type().is_symlink());
-        assert!(std::fs::read_to_string(&runtime_config)
-            .expect("runtime config")
-            .contains("trust_level = \"trusted\""));
-    }
-
-    #[test]
-    fn runtime_codex_config_is_lionclaw_owned() {
-        let config = runtime_codex_config_contents();
-        let config = String::from_utf8(config).expect("config utf8");
-
-        assert!(config.contains("check_for_update_on_startup = false"));
-        assert!(config.contains("[projects.\"/workspace\"]"));
-        assert!(config.contains("trust_level = \"trusted\""));
+        assert!(std::fs::read_to_string(&runtime_auth)
+            .expect("runtime auth")
+            .contains("\"OPENAI_API_KEY\": \"sk-test\""));
     }
 }

@@ -4,9 +4,9 @@ use anyhow::{anyhow, bail, Result};
 
 use super::{
     backend::ExecutionRequest,
-    plan::{NetworkMode, RuntimeAuthKind},
+    plan::{runtime_native_home_mount_source, MountSpec, NetworkMode, RuntimeAuthKind},
 };
-use crate::kernel::runtime::sync_codex_home_into_runtime;
+use crate::kernel::runtime::sync_codex_home_into_runtime_home;
 
 const CONTAINER_CODEX_HOME: &str = "/runtime/home/.codex";
 
@@ -25,13 +25,13 @@ async fn prepare_codex_runtime_auth(request: &ExecutionRequest) -> Result<Vec<(S
         );
     }
 
-    let runtime_state_root = runtime_state_root(&request.plan.mounts).ok_or_else(|| {
+    let runtime_home_root = runtime_home_root(&request.plan.mounts).ok_or_else(|| {
         anyhow!(
-            "runtime '{}' requires a /runtime mount when Codex runtime auth is enabled",
+            "runtime '{}' requires a /runtime/home mount when Codex runtime auth is enabled",
             request.plan.runtime_id
         )
     })?;
-    sync_codex_home_into_runtime(runtime_state_root, request.codex_home_override.as_deref())
+    sync_codex_home_into_runtime_home(runtime_home_root, request.codex_home_override.as_deref())
         .await?;
 
     Ok(vec![(
@@ -40,11 +40,8 @@ async fn prepare_codex_runtime_auth(request: &ExecutionRequest) -> Result<Vec<(S
     )])
 }
 
-fn runtime_state_root(mounts: &[super::plan::MountSpec]) -> Option<&Path> {
-    mounts
-        .iter()
-        .find(|mount| mount.target == "/runtime")
-        .map(|mount| mount.source.as_path())
+fn runtime_home_root(mounts: &[MountSpec]) -> Option<&Path> {
+    runtime_native_home_mount_source(mounts)
 }
 
 #[cfg(test)]
@@ -67,11 +64,18 @@ mod tests {
                 environment: Vec::new(),
                 idle_timeout: std::time::Duration::from_secs(30),
                 hard_timeout: std::time::Duration::from_secs(90),
-                mounts: vec![MountSpec {
-                    source: "/tmp/lionclaw-runtime-auth-test".into(),
-                    target: "/runtime".to_string(),
-                    access: MountAccess::ReadWrite,
-                }],
+                mounts: vec![
+                    MountSpec {
+                        source: "/tmp/lionclaw-runtime-auth-test".into(),
+                        target: "/runtime".to_string(),
+                        access: MountAccess::ReadWrite,
+                    },
+                    MountSpec {
+                        source: "/tmp/lionclaw-runtime-auth-test-home".into(),
+                        target: "/runtime/home".to_string(),
+                        access: MountAccess::ReadWrite,
+                    },
+                ],
                 mount_runtime_secrets: false,
                 escape_classes: Default::default(),
                 limits: ExecutionLimits::default(),
@@ -89,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_root_prefers_runtime_mount() {
+    fn runtime_home_root_prefers_runtime_home_mount() {
         let mounts = [
             MountSpec {
                 source: "/tmp/workspace".into(),
@@ -101,10 +105,15 @@ mod tests {
                 target: "/runtime".to_string(),
                 access: MountAccess::ReadWrite,
             },
+            MountSpec {
+                source: "/tmp/runtime-home".into(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
         ];
-        let runtime_root = runtime_state_root(&mounts).expect("runtime root");
+        let runtime_root = runtime_home_root(&mounts).expect("runtime home root");
 
-        assert_eq!(runtime_root, Path::new("/tmp/runtime"));
+        assert_eq!(runtime_root, Path::new("/tmp/runtime-home"));
     }
 
     #[tokio::test]

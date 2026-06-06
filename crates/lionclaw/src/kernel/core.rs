@@ -138,20 +138,22 @@ use super::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
         execute_captured, execute_streaming, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        safe_relative_path, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
-        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
-        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
-        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
-        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
-        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
+        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
+        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
+        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
         RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
         RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -219,12 +221,113 @@ struct RuntimeChannelSendContext {
     turn_id: Uuid,
     runtime_id: String,
     runtime_state_root: PathBuf,
+    runtime_native_home_root: Option<PathBuf>,
+    runtime_native_home_artifact_dirs: Vec<RuntimeNativeHomeArtifactDir>,
+    runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeArtifactRoot {
+    Directory(PathBuf),
+    NativeHomeDeclared {
+        native_home_root: PathBuf,
+        artifact_dir: RuntimeNativeHomeArtifactDir,
+    },
+}
+
+impl RuntimeArtifactRoot {
+    fn directory(path: impl Into<PathBuf>) -> Self {
+        Self::Directory(path.into())
+    }
+
+    fn native_home_declared(
+        native_home_root: impl Into<PathBuf>,
+        artifact_dir: RuntimeNativeHomeArtifactDir,
+    ) -> Self {
+        Self::NativeHomeDeclared {
+            native_home_root: native_home_root.into(),
+            artifact_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimePathAccessProblem {
+    OutsideRoot,
+    NotRegularFile,
+    NotReadable,
+}
+
+#[derive(Debug)]
+struct RuntimePathAccessError {
+    problem: RuntimePathAccessProblem,
+    message: String,
+}
+
+impl RuntimePathAccessError {
+    fn outside_root(label: &str, display_path: &Path) -> Self {
+        Self {
+            problem: RuntimePathAccessProblem::OutsideRoot,
+            message: format!(
+                "{label} '{}' is outside the runtime root",
+                display_path.display()
+            ),
+        }
+    }
+
+    fn not_regular_file(label: &str, display_path: &Path) -> Self {
+        Self {
+            problem: RuntimePathAccessProblem::NotRegularFile,
+            message: format!("{label} '{}' is not a regular file", display_path.display()),
+        }
+    }
+
+    fn not_readable(label: &str, display_path: &Path, err: impl fmt::Display) -> Self {
+        Self {
+            problem: RuntimePathAccessProblem::NotReadable,
+            message: format!(
+                "{label} '{}' is not readable: {err}",
+                display_path.display()
+            ),
+        }
+    }
+
+    fn into_kernel_error(self) -> KernelError {
+        KernelError::Runtime(self.message)
+    }
 }
 
 impl RuntimeChannelSendContext {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    fn artifact_roots(&self) -> Vec<RuntimeArtifactRoot> {
+        let mut roots = vec![RuntimeArtifactRoot::directory(
+            self.runtime_state_root.clone(),
+        )];
+        if let Some(runtime_native_home_root) = &self.runtime_native_home_root {
+            roots.extend(self.runtime_native_home_artifact_dirs.iter().cloned().map(
+                |artifact_dir| {
+                    RuntimeArtifactRoot::native_home_declared(
+                        runtime_native_home_root.clone(),
+                        artifact_dir,
+                    )
+                },
+            ));
+        }
+        roots
+    }
+
+    fn host_path_for_runtime_path(&self, runtime_path: impl AsRef<Path>) -> Option<PathBuf> {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::None,
+            environment: Vec::new(),
+            runtime_state_root: Some(self.runtime_state_root.clone()),
+            runtime_path_projections: self.runtime_path_projections.clone(),
+        }
+        .host_path_for_runtime_path(runtime_path)
     }
 }
 
@@ -527,6 +630,9 @@ const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const RUNTIME_STATE_DIR_MODE: u32 = 0o700;
 const RUNTIME_STATE_FILE_MODE: u32 = 0o600;
+const OPENCODE_RUNTIME_KIND: &str = "opencode";
+const OPENCODE_GENERATED_CONFIG_FILE: &str = "opencode.generated.json";
+const OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH: &str = "/runtime/AGENTS.md";
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
@@ -534,7 +640,7 @@ struct PreparedAttachedRuntimeLaunch {
 }
 
 struct AttachedRuntimeLaunchLock {
-    _file: std::fs::File,
+    _files: Vec<std::fs::File>,
 }
 
 struct AttachedRuntimeTranscriptProgramExecutor {
@@ -598,27 +704,36 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
 fn runtime_execution_context(
     plan: &EffectiveExecutionPlan,
 ) -> anyhow::Result<RuntimeExecutionContext> {
-    let runtime_path_projections = plan
-        .mounts
+    Ok(RuntimeExecutionContext {
+        network_mode: plan.network_mode,
+        environment: plan.environment.clone(),
+        runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
+        runtime_path_projections: runtime_path_projections_for_plan(plan)?,
+    })
+}
+
+fn runtime_path_projections_for_plan(
+    plan: &EffectiveExecutionPlan,
+) -> anyhow::Result<Vec<RuntimePathProjection>> {
+    plan.mounts
         .iter()
         .filter(|mount| {
-            mount.target == "/runtime" || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
+            matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET
+            ) || mount.target == CHANNEL_SEND_SOCKET_CONTAINER_PATH
         })
         .map(|mount| {
-            if mount.target == "/runtime" {
+            if matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | RUNTIME_HOME_MOUNT_TARGET
+            ) {
                 RuntimePathProjection::directory(mount.target.clone(), mount.source.clone())
             } else {
                 RuntimePathProjection::exact(mount.target.clone(), mount.source.clone())
             }
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    Ok(RuntimeExecutionContext {
-        network_mode: plan.network_mode,
-        environment: plan.environment.clone(),
-        runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
-        runtime_path_projections,
-    })
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 #[async_trait::async_trait]
@@ -959,8 +1074,13 @@ impl Kernel {
             )
             .await;
         }
-        self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
-            .await?;
+        self.materialize_attached_runtime_context(
+            session_id,
+            &runtime_id,
+            &runtime_kind,
+            &execution_plan,
+        )
+        .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
         let runtime_session_ready =
@@ -1010,6 +1130,7 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
+        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?;
@@ -1033,6 +1154,9 @@ impl Kernel {
         {
             remove_attached_runtime_context_files_best_effort(runtime_state_root).await;
             return Err(err);
+        }
+        if runtime_kind == OPENCODE_RUNTIME_KIND {
+            write_opencode_generated_config(runtime_state_root).await?;
         }
         Ok(())
     }
@@ -7263,6 +7387,62 @@ mod tests {
         }
     }
 
+    const TEST_NATIVE_HOME_ARTIFACT_DIR: &str = "generated-artifacts/images";
+
+    fn test_native_home_artifact_dirs() -> Vec<RuntimeNativeHomeArtifactDir> {
+        RuntimeNativeHomeArtifactDir::new(TEST_NATIVE_HOME_ARTIFACT_DIR)
+            .map(|dir| vec![dir])
+            .expect("test native-home artifact dir is valid")
+    }
+
+    struct NativeHomeArtifactRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for NativeHomeArtifactRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: "native-home-artifacts".to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        fn native_home_artifact_dirs(&self) -> anyhow::Result<Vec<RuntimeNativeHomeArtifactDir>> {
+            Ok(test_native_home_artifact_dirs())
+        }
+
+        async fn session_start(
+            &self,
+            input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("native-home-artifacts:{}", input.session_id),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _event_tx: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
@@ -9630,7 +9810,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -9700,7 +9880,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -9781,7 +9961,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
             .await
             .expect_err(
                 "prompt context audit failure should block attached context materialization",
@@ -9830,7 +10010,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
             .await
             .expect_err("attached context file failure should abort materialization");
 
@@ -10078,6 +10258,7 @@ done
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
         let mut plan = test_execution_plan("work-codex");
         plan.mounts = vec![
             MountSpec {
@@ -10088,6 +10269,11 @@ done
             MountSpec {
                 source: runtime_state_root.clone(),
                 target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
                 access: MountAccess::ReadWrite,
             },
             MountSpec {
@@ -10102,12 +10288,336 @@ done
             .await
             .expect("materialize runtime plan");
 
-        let link = runtime_state_root.join("home/.codex/skills/loopback");
+        assert!(runtime_state_root.exists());
+        let link = runtime_home_root.join(".codex/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
+        );
+        assert!(!runtime_state_root
+            .join(OPENCODE_GENERATED_CONFIG_FILE)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_runtime_plan_ignores_legacy_session_home() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let legacy_home_root = runtime_state_root.join(crate::home::RUNTIME_NATIVE_HOME_DIR);
+        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
+            .await
+            .expect("create legacy home");
+        tokio::fs::write(&legacy_config, b"model = \"legacy\"\n")
+            .await
+            .expect("write legacy config");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root.clone(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(
+            legacy_config.exists(),
+            "old session-scoped homes are not migrated in this version"
+        );
+        assert!(runtime_home_root.exists());
+        assert!(
+            !runtime_home_root.join(".codex/config.toml").exists(),
+            "persistent native home should start from its own storage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_runtime_plan_makes_existing_runtime_home_writable_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        tokio::fs::create_dir_all(&runtime_home_root)
+            .await
+            .expect("create runtime home root");
+        std::fs::set_permissions(&runtime_home_root, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod runtime home root");
+        let mut plan = test_execution_plan("codex");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root.clone(),
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        kernel
+            .materialize_runtime_plan("codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let metadata = std::fs::metadata(&runtime_home_root).expect("stat runtime home root");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_runtime_artifacts_reject_retargeted_declared_native_home_dir_after_root_check()
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_home_root = runtime_root.join("native-home");
+        let generated_artifacts = runtime_home_root.join(TEST_NATIVE_HOME_ARTIFACT_DIR);
+        let native_config_dir = runtime_home_root.join("native-config");
+        let delivery_root = runtime_root.join("delivery");
+        tokio::fs::create_dir_all(&generated_artifacts)
+            .await
+            .expect("create generated artifact dir");
+        tokio::fs::create_dir_all(&delivery_root)
+            .await
+            .expect("create delivery root");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let artifact_dir = test_native_home_artifact_dirs()
+            .pop()
+            .expect("test artifact dir");
+        let artifact_roots = vec![RuntimeArtifactRoot::native_home_declared(
+            runtime_home_root.clone(),
+            artifact_dir,
+        )];
+        let runtime_root_canonical =
+            std::fs::canonicalize(&runtime_root).expect("canonical runtime root");
+        let checked_roots =
+            Kernel::checked_runtime_artifact_roots(&artifact_roots, &runtime_root_canonical)
+                .await
+                .expect("check artifact roots");
+
+        tokio::fs::remove_dir_all(&generated_artifacts)
+            .await
+            .expect("remove generated artifact dir");
+        tokio::fs::create_dir_all(&native_config_dir)
+            .await
+            .expect("create native config dir");
+        let secret_file = native_config_dir.join("secret.txt");
+        tokio::fs::write(&secret_file, b"secret")
+            .await
+            .expect("write native config secret");
+        symlink(&native_config_dir, &generated_artifacts)
+            .expect("retarget declared artifact dir to native config");
+
+        let artifact = RuntimeArtifact {
+            artifact_id: "artifact:secret".to_string(),
+            path: generated_artifacts.join("secret.txt"),
+            filename: Some("secret.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+        };
+        let err = kernel
+            .copy_runtime_artifact_for_delivery(&checked_roots, &delivery_root, &artifact)
+            .await
+            .expect_err("copy must reject retargeted declared native-home artifact dirs");
+
+        assert!(
+            err.to_string().contains("not readable"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            tokio::fs::read_dir(&delivery_root)
+                .await
+                .expect("read delivery root")
+                .next_entry()
+                .await
+                .expect("read delivery entry")
+                .is_none(),
+            "copy must fail before creating a delivery attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_runtime_artifacts_reject_native_home_auth_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_state_root = runtime_root.join("state");
+        let runtime_home_root = runtime_root.join("native-home");
+        let native_config_dir = runtime_home_root.join("native-config");
+        tokio::fs::create_dir_all(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        tokio::fs::create_dir_all(&native_config_dir)
+            .await
+            .expect("create native config dir");
+        let auth_file = native_config_dir.join("auth.json");
+        tokio::fs::write(&auth_file, b"{\"tokens\":\"secret\"}")
+            .await
+            .expect("write native auth file");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("native-home-artifacts");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root,
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let err = kernel
+            .prepare_runtime_artifact_attachments_for_turn(
+                &NativeHomeArtifactRuntimeAdapter,
+                Uuid::nil(),
+                RuntimeTurnMode::Direct,
+                &plan,
+                &[RuntimeArtifact {
+                    artifact_id: "artifact:auth".to_string(),
+                    path: auth_file,
+                    filename: Some("auth.json".to_string()),
+                    mime_type: Some("application/json".to_string()),
+                }],
+            )
+            .await
+            .expect_err("native-home auth files must not be exportable artifacts");
+
+        assert!(
+            err.to_string().contains("outside the runtime root"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_runtime_artifacts_allow_declared_native_home_artifact_dir() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_state_root = runtime_root.join("state");
+        let runtime_home_root = runtime_root.join("native-home");
+        let generated_artifacts = runtime_home_root.join(TEST_NATIVE_HOME_ARTIFACT_DIR);
+        tokio::fs::create_dir_all(&runtime_state_root)
+            .await
+            .expect("create runtime state root");
+        tokio::fs::create_dir_all(&generated_artifacts)
+            .await
+            .expect("create generated artifacts");
+        let image_file = generated_artifacts.join("image.png");
+        tokio::fs::write(&image_file, b"png bytes")
+            .await
+            .expect("write generated artifact");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_root: Some(runtime_root.clone()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let mut plan = test_execution_plan("native-home-artifacts");
+        plan.mounts = vec![
+            MountSpec {
+                source: runtime_state_root,
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: runtime_home_root,
+                target: "/runtime/home".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let attachments = kernel
+            .prepare_runtime_artifact_attachments_for_turn(
+                &NativeHomeArtifactRuntimeAdapter,
+                Uuid::nil(),
+                RuntimeTurnMode::Direct,
+                &plan,
+                &[RuntimeArtifact {
+                    artifact_id: "artifact:image".to_string(),
+                    path: image_file,
+                    filename: Some("image.png".to_string()),
+                    mime_type: Some("image/png".to_string()),
+                }],
+            )
+            .await
+            .expect("declared native-home artifacts should be exportable");
+
+        assert_eq!(attachments.attachments.len(), 1);
+        let copied = PathBuf::from(&attachments.attachments[0].path);
+        assert!(copied.starts_with(runtime_root));
+        assert_eq!(
+            tokio::fs::read(copied).await.expect("read copied image"),
+            b"png bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_opencode_generated_config_points_to_runtime_agents_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        create_owner_private_directory_all(None, &runtime_state_root)
+            .await
+            .expect("create runtime state root");
+
+        write_opencode_generated_config(&runtime_state_root)
+            .await
+            .expect("write generated opencode config");
+
+        let generated =
+            tokio::fs::read_to_string(runtime_state_root.join(OPENCODE_GENERATED_CONFIG_FILE))
+                .await
+                .expect("read generated opencode config");
+        let generated: serde_json::Value =
+            serde_json::from_str(&generated).expect("parse generated opencode config");
+        assert_eq!(
+            generated["instructions"],
+            json!([OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH])
         );
     }
 
@@ -10679,6 +11189,74 @@ done
         second_kernel
             .finish_attached_runtime_launch(
                 session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &second_launch.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish second launch");
+    }
+
+    #[tokio::test]
+    async fn attached_runtime_launch_lock_is_shared_by_runtime_home_across_sessions() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (first_kernel, _first_exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let first_session_id = open_test_session(&first_kernel).await;
+        let first_launch = first_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(first_session_id))
+            .await
+            .expect("prepare first attached launch");
+        let runtime_home_root = Kernel::runtime_native_home_root(&first_launch.request.plan)
+            .expect("runtime home root");
+        let runtime_home_lock_root = runtime_home_root.parent().expect("runtime home lock root");
+        assert!(
+            !runtime_home_root.join(RUNTIME_TUI_LOCK_FILE).exists(),
+            "shared runtime-home launch lock must not live inside the mounted native home"
+        );
+        assert!(
+            runtime_home_lock_root.join(RUNTIME_TUI_LOCK_FILE).is_file(),
+            "shared runtime-home launch lock should live next to the native home"
+        );
+        fs::write(
+            runtime_home_root.join(RUNTIME_TUI_LOCK_FILE),
+            b"runtime-owned file",
+        )
+        .expect("runtime can mutate similarly-named home file");
+        let (second_kernel, _second_exports) =
+            kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let second_session_id = second_kernel
+            .open_session(SessionOpenRequest {
+                channel_id: "terminal".to_string(),
+                peer_id: "tester-two".to_string(),
+                trust_tier: TrustTier::Main,
+                history_policy: None,
+            })
+            .await
+            .expect("open second session")
+            .session_id;
+
+        let err = match second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
+            .await
+        {
+            Ok(_) => panic!("concurrent attached launch sharing native home should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            KernelError::Conflict(message) if message.contains("already running")
+        ));
+
+        drop(first_launch);
+        let second_launch = second_kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
+            .await
+            .expect("prepare attached launch after native home lock release");
+        second_kernel
+            .finish_attached_runtime_launch(
+                second_session_id,
                 TEST_TERMINAL_RUNTIME_ID,
                 &second_launch.request.plan,
                 Some(0),
@@ -12515,64 +13093,109 @@ async fn copy_file_to_unique_child(
     )))
 }
 
-fn runtime_artifact_relative_path(
+fn runtime_artifact_relative_path_for_canonical_root(
     artifact_root: &Path,
     artifact: &RuntimeArtifact,
-) -> Result<PathBuf, KernelError> {
+) -> Result<Option<PathBuf>, RuntimePathAccessError> {
     let metadata = std::fs::symlink_metadata(&artifact.path).map_err(|err| {
-        KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
-            artifact.path.display()
-        ))
+        RuntimePathAccessError::not_readable("runtime artifact", &artifact.path, err)
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is not a regular file",
-            artifact.path.display()
-        )));
+        return Err(RuntimePathAccessError::not_regular_file(
+            "runtime artifact",
+            &artifact.path,
+        ));
     }
     let canonical_artifact = std::fs::canonicalize(&artifact.path).map_err(|err| {
-        KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
-            artifact.path.display()
-        ))
+        RuntimePathAccessError::not_readable("runtime artifact", &artifact.path, err)
     })?;
-    let relative = canonical_artifact
-        .strip_prefix(artifact_root)
-        .map_err(|_| {
-            KernelError::Runtime(format!(
-                "runtime artifact '{}' is outside the runtime root",
-                artifact.path.display()
-            ))
-        })?;
+
+    let Ok(relative) = canonical_artifact.strip_prefix(artifact_root) else {
+        return Ok(None);
+    };
+    let normalized = normalize_runtime_artifact_relative_path(relative, &artifact.path)?;
+    Ok(Some(normalized))
+}
+
+fn runtime_artifact_raw_relative_path(root: &Path, artifact_path: &Path) -> Option<PathBuf> {
+    let relative = artifact_path.strip_prefix(root).ok()?;
+    normalize_runtime_artifact_relative_path(relative, artifact_path).ok()
+}
+
+fn normalize_runtime_artifact_relative_path(
+    relative: &Path,
+    display_path: &Path,
+) -> Result<PathBuf, RuntimePathAccessError> {
     let mut normalized = PathBuf::new();
     for component in relative.components() {
         match component {
             Component::Normal(value) => normalized.push(value),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(KernelError::Runtime(format!(
-                    "runtime artifact '{}' is outside the runtime root",
-                    artifact.path.display()
-                )));
+                return Err(RuntimePathAccessError::outside_root(
+                    "runtime artifact",
+                    display_path,
+                ));
             }
         }
     }
     if normalized.as_os_str().is_empty() {
-        return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is not a regular file",
-            artifact.path.display()
-        )));
+        return Err(RuntimePathAccessError::not_regular_file(
+            "runtime artifact",
+            display_path,
+        ));
     }
     Ok(normalized)
 }
 
-fn open_runtime_artifact_source(
-    artifact_root: &Path,
+fn open_runtime_artifact_source_from_root(
+    artifact_root: &RuntimeArtifactRoot,
     artifact: &RuntimeArtifact,
-) -> Result<std::fs::File, KernelError> {
-    let relative = runtime_artifact_relative_path(artifact_root, artifact)?;
-    open_regular_file_beneath_root(artifact_root, &relative, &artifact.path, "runtime artifact")
+) -> Result<Option<std::fs::File>, RuntimePathAccessError> {
+    match artifact_root {
+        RuntimeArtifactRoot::Directory(root) => {
+            let Some(relative) = runtime_artifact_relative_path_for_canonical_root(root, artifact)?
+            else {
+                return Ok(None);
+            };
+            open_regular_file_beneath_root(root, &relative, &artifact.path, "runtime artifact")
+                .map(Some)
+        }
+        RuntimeArtifactRoot::NativeHomeDeclared {
+            native_home_root,
+            artifact_dir,
+        } => {
+            let declared_root = native_home_root.join(artifact_dir.relative_path());
+            let Some(file_relative) =
+                runtime_artifact_raw_relative_path(&declared_root, &artifact.path)
+            else {
+                return Ok(None);
+            };
+            let relative = artifact_dir.relative_path().join(file_relative);
+            open_regular_file_beneath_root(
+                native_home_root,
+                &relative,
+                &artifact.path,
+                "runtime artifact",
+            )
+            .map(Some)
+        }
+    }
+}
+
+fn open_runtime_artifact_source(
+    artifact_roots: &[RuntimeArtifactRoot],
+    artifact: &RuntimeArtifact,
+) -> Result<std::fs::File, RuntimePathAccessError> {
+    for artifact_root in artifact_roots {
+        if let Some(file) = open_runtime_artifact_source_from_root(artifact_root, artifact)? {
+            return Ok(file);
+        }
+    }
+    Err(RuntimePathAccessError::outside_root(
+        "runtime artifact",
+        &artifact.path,
+    ))
 }
 
 #[cfg(unix)]
@@ -12581,7 +13204,7 @@ fn open_regular_file_beneath_root(
     relative: &Path,
     display_path: &Path,
     label: &str,
-) -> Result<std::fs::File, KernelError> {
+) -> Result<std::fs::File, RuntimePathAccessError> {
     use rustix::fs::{open, openat, Mode, OFlags};
 
     let mut dir = open(
@@ -12589,20 +13212,15 @@ fn open_regular_file_beneath_root(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|err| {
-        KernelError::Runtime(format!(
-            "{label} root '{}' is not readable: {err}",
-            root.display()
-        ))
+    .map_err(|err| RuntimePathAccessError {
+        problem: RuntimePathAccessProblem::NotReadable,
+        message: format!("{label} root '{}' is not readable: {err}", root.display()),
     })?;
 
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
-            return Err(KernelError::Runtime(format!(
-                "{label} '{}' is outside the runtime root",
-                display_path.display()
-            )));
+            return Err(RuntimePathAccessError::outside_root(label, display_path));
         };
         let name = Path::new(name);
         if components.peek().is_some() {
@@ -12612,12 +13230,7 @@ fn open_regular_file_beneath_root(
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "{label} '{}' is not readable: {err}",
-                    display_path.display()
-                ))
-            })?;
+            .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
             dir = next_dir;
             continue;
         }
@@ -12628,32 +13241,24 @@ fn open_regular_file_beneath_root(
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(|err| {
-            KernelError::Runtime(format!(
-                "{label} '{}' is not readable: {err}",
-                display_path.display()
-            ))
-        })?;
+        .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
         let file = std::fs::File::from(file);
-        let metadata = file.metadata().map_err(|err| {
-            KernelError::Runtime(format!(
-                "{label} '{}' is not readable: {err}",
-                display_path.display()
-            ))
-        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
         if !metadata.is_file() {
-            return Err(KernelError::Runtime(format!(
-                "{label} '{}' is not a regular file",
-                display_path.display()
-            )));
+            return Err(RuntimePathAccessError::not_regular_file(
+                label,
+                display_path,
+            ));
         }
         return Ok(file);
     }
 
-    Err(KernelError::Runtime(format!(
-        "{label} '{}' is not a regular file",
-        display_path.display()
-    )))
+    Err(RuntimePathAccessError::not_regular_file(
+        label,
+        display_path,
+    ))
 }
 
 #[cfg(not(unix))]
@@ -12662,37 +13267,23 @@ fn open_regular_file_beneath_root(
     relative: &Path,
     display_path: &Path,
     label: &str,
-) -> Result<std::fs::File, KernelError> {
+) -> Result<std::fs::File, RuntimePathAccessError> {
     let path = root.join(relative);
-    let file = std::fs::File::open(&path).map_err(|err| {
-        KernelError::Runtime(format!(
-            "{label} '{}' is not readable: {err}",
-            display_path.display()
-        ))
-    })?;
-    let metadata = file.metadata().map_err(|err| {
-        KernelError::Runtime(format!(
-            "{label} '{}' is not readable: {err}",
-            display_path.display()
-        ))
-    })?;
+    let file = std::fs::File::open(&path)
+        .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
     if !metadata.is_file() {
-        return Err(KernelError::Runtime(format!(
-            "{label} '{}' is not a regular file",
-            display_path.display()
-        )));
+        return Err(RuntimePathAccessError::not_regular_file(
+            label,
+            display_path,
+        ));
     }
-    let canonical = std::fs::canonicalize(&path).map_err(|err| {
-        KernelError::Runtime(format!(
-            "{label} '{}' is not readable: {err}",
-            display_path.display()
-        ))
-    })?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|err| RuntimePathAccessError::not_readable(label, display_path, err))?;
     if !canonical.starts_with(root) {
-        return Err(KernelError::Runtime(format!(
-            "{label} '{}' is outside the runtime root",
-            display_path.display()
-        )));
+        return Err(RuntimePathAccessError::outside_root(label, display_path));
     }
     Ok(file)
 }
@@ -13739,6 +14330,50 @@ async fn create_owner_private_directory_all(
     path: &Path,
 ) -> Result<(), KernelError> {
     create_owner_private_directory_all_impl(root, path).await
+}
+
+async fn ensure_runtime_native_home_mount_source(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<(), KernelError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => ensure_existing_runtime_native_home_is_safe(path, metadata).await,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            create_owner_private_directory_all(root, path).await
+        }
+        Err(err) => Err(KernelError::Internal(format!(
+            "failed to inspect runtime native home directory '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+async fn ensure_existing_runtime_native_home_is_safe(
+    path: &Path,
+    metadata: std::fs::Metadata,
+) -> Result<(), KernelError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KernelError::Conflict(format!(
+            "runtime storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    }
+    set_runtime_native_home_private_permissions(path, metadata.permissions()).await
+}
+
+async fn set_runtime_native_home_private_permissions(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<(), KernelError> {
+    let permissions = runtime_native_home_private_permissions(permissions);
+    tokio::fs::set_permissions(path, permissions)
+        .await
+        .map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to make runtime native home directory '{}' private: {err}",
+                path.display()
+            ))
+        })
 }
 
 #[cfg(unix)]
@@ -15040,8 +15675,7 @@ fn runtime_channel_send_artifacts(
         .iter()
         .enumerate()
         .map(|(index, attachment)| {
-            let path =
-                runtime_channel_send_host_path(&context.runtime_state_root, &attachment.path)?;
+            let path = runtime_channel_send_host_path(context, &attachment.path)?;
             Ok(RuntimeArtifact {
                 artifact_id: format!("runtime-channel-send-{}", index + 1),
                 path,
@@ -15066,58 +15700,37 @@ async fn validate_runtime_channel_send_artifacts(
     context: &RuntimeChannelSendContext,
     artifacts: &[RuntimeArtifact],
 ) -> Result<(), RuntimeChannelSendProblem> {
-    let runtime_state_root = tokio::fs::canonicalize(&context.runtime_state_root)
-        .await
-        .map_err(|err| {
-            RuntimeChannelSendProblem::new(
-                "internal_error",
-                format!(
-                    "runtime state root '{}' is not readable: {err}",
-                    context.runtime_state_root.display()
-                ),
-            )
-        })?;
+    let artifact_roots = context.artifact_roots();
     for artifact in artifacts {
-        let metadata = tokio::fs::symlink_metadata(&artifact.path)
-            .await
-            .map_err(|err| {
-                RuntimeChannelSendProblem::new(
-                    "invalid_attachment",
-                    format!(
-                        "attachment path '{}' is not readable: {err}",
-                        artifact.path.display()
-                    ),
-                )
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(RuntimeChannelSendProblem::new(
-                "invalid_attachment",
-                "attachment path must name a regular file under /runtime",
-            ));
-        }
-        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
-            .await
-            .map_err(|err| {
-                RuntimeChannelSendProblem::new(
-                    "invalid_attachment",
-                    format!(
-                        "attachment path '{}' is not readable: {err}",
-                        artifact.path.display()
-                    ),
-                )
-            })?;
-        if !canonical_artifact.starts_with(&runtime_state_root) {
-            return Err(RuntimeChannelSendProblem::new(
-                "invalid_attachment",
-                "attachment path must stay under /runtime",
-            ));
-        }
+        drop(
+            open_runtime_artifact_source(&artifact_roots, artifact)
+                .map_err(runtime_channel_send_attachment_problem)?,
+        );
     }
     Ok(())
 }
 
+fn runtime_channel_send_attachment_problem(
+    err: RuntimePathAccessError,
+) -> RuntimeChannelSendProblem {
+    match err.problem {
+        RuntimePathAccessProblem::OutsideRoot => RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must stay under an allowed runtime artifact directory",
+        ),
+        RuntimePathAccessProblem::NotRegularFile => RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must name a regular file under an allowed runtime artifact directory",
+        ),
+        RuntimePathAccessProblem::NotReadable => RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must name a readable regular file under an allowed runtime artifact directory",
+        ),
+    }
+}
+
 fn runtime_channel_send_host_path(
-    runtime_state_root: &Path,
+    context: &RuntimeChannelSendContext,
     raw_path: &str,
 ) -> Result<PathBuf, RuntimeChannelSendProblem> {
     let path = raw_path.trim();
@@ -15127,25 +15740,36 @@ fn runtime_channel_send_host_path(
             "attachment path is required",
         ));
     }
-    let relative = path.strip_prefix("/runtime/").ok_or_else(|| {
-        RuntimeChannelSendProblem::new(
-            "invalid_attachment",
-            "attachment path must be under /runtime",
-        )
-    })?;
-    let Some(normalized) = safe_relative_path(relative) else {
+    let runtime_path = Path::new(path);
+    if !runtime_path.starts_with(RUNTIME_MOUNT_TARGET) {
         return Err(RuntimeChannelSendProblem::new(
             "invalid_attachment",
-            "attachment path must stay under /runtime",
+            "attachment path must be under /runtime",
         ));
-    };
-    if normalized.as_os_str().is_empty() {
+    }
+    let host_path = context
+        .host_path_for_runtime_path(runtime_path)
+        .ok_or_else(|| {
+            RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must stay under /runtime",
+            )
+        })?;
+    if host_path == context.runtime_state_root {
         return Err(RuntimeChannelSendProblem::new(
             "invalid_attachment",
             "attachment path must name a file under /runtime",
         ));
     }
-    Ok(runtime_state_root.join(normalized))
+    if let Some(runtime_native_home_root) = &context.runtime_native_home_root {
+        if host_path == *runtime_native_home_root {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must name a file under /runtime",
+            ));
+        }
+    }
+    Ok(host_path)
 }
 
 fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
@@ -15330,6 +15954,15 @@ fn write_runtime_state_file_blocking(
             runtime_state_root.display()
         ))
     })
+}
+
+async fn write_opencode_generated_config(runtime_state_root: &Path) -> Result<(), KernelError> {
+    let contents = serde_json::to_vec_pretty(&json!({
+        "$schema": "https://opencode.ai/config.json",
+        "instructions": [OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH],
+    }))
+    .map_err(|err| internal(err.into()))?;
+    write_runtime_state_file(runtime_state_root, OPENCODE_GENERATED_CONFIG_FILE, contents).await
 }
 
 async fn read_runtime_state_file(
@@ -15517,7 +16150,41 @@ fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str)
     Uuid::new_v5(&Uuid::NAMESPACE_OID, material.as_bytes())
 }
 
+fn runtime_native_home_private_permissions(
+    mut permissions: std::fs::Permissions,
+) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        permissions.set_mode(0o700);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    permissions
+}
+
+#[cfg(test)]
 fn acquire_attached_runtime_launch_lock_blocking(
+    runtime_state_root: &Path,
+) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    acquire_attached_runtime_launch_locks_blocking(vec![runtime_state_root.to_path_buf()])
+}
+
+fn acquire_attached_runtime_launch_locks_blocking(
+    lock_roots: Vec<PathBuf>,
+) -> Result<AttachedRuntimeLaunchLock, KernelError> {
+    let mut files = Vec::with_capacity(lock_roots.len());
+    for lock_root in lock_roots {
+        let lock = acquire_attached_runtime_launch_lock_file_blocking(&lock_root)?;
+        files.extend(lock._files);
+    }
+    Ok(AttachedRuntimeLaunchLock { _files: files })
+}
+
+fn acquire_attached_runtime_launch_lock_file_blocking(
     runtime_state_root: &Path,
 ) -> Result<AttachedRuntimeLaunchLock, KernelError> {
     use rustix::fs::{openat, Mode, OFlags};
@@ -15561,9 +16228,9 @@ fn acquire_attached_runtime_launch_lock_blocking(
     }
 
     match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(AttachedRuntimeLaunchLock { _file: file }),
+        Ok(()) => Ok(AttachedRuntimeLaunchLock { _files: vec![file] }),
         Err(err) if runtime_tui_lock_is_held(err) => Err(KernelError::Conflict(
-            "runtime TUI is already running for this LionClaw session".to_string(),
+            "runtime TUI is already running for this LionClaw session or runtime home".to_string(),
         )),
         Err(err) => Err(KernelError::Runtime(format!(
             "failed to lock runtime TUI path '{}': {err}",
@@ -17336,6 +18003,7 @@ impl Kernel {
         let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
             match self
                 .prepare_runtime_artifact_attachments_for_turn(
+                    adapter.as_ref(),
                     turn_id,
                     runtime_turn_mode,
                     &execution_plan,
@@ -17904,10 +18572,11 @@ impl Kernel {
     }
 
     fn runtime_state_root(plan: &EffectiveExecutionPlan) -> Option<&Path> {
-        plan.mounts
-            .iter()
-            .find(|mount| mount.target == "/runtime")
-            .map(|mount| mount.source.as_path())
+        runtime_state_mount_source(&plan.mounts)
+    }
+
+    fn runtime_native_home_root(plan: &EffectiveExecutionPlan) -> Option<&Path> {
+        runtime_native_home_mount_source(&plan.mounts)
     }
 
     fn require_runtime_tui_state_root(plan: &EffectiveExecutionPlan) -> Result<&Path, KernelError> {
@@ -18016,6 +18685,7 @@ impl Kernel {
         context: RuntimeChannelSendContext,
         plan: &mut EffectiveExecutionPlan,
     ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
+        let mut context = context;
         if let Err(err) =
             ensure_safe_child_directory(&context.runtime_state_root, &[CHANNEL_SEND_SOCKET_DIR])
                 .await
@@ -18047,6 +18717,19 @@ impl Kernel {
             CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
         ));
 
+        context.runtime_path_projections = match runtime_path_projections_for_plan(plan) {
+            Ok(projections) => projections,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(
+                        &context,
+                        "runtime_path_projections",
+                        KernelError::Runtime(err.to_string()),
+                    )
+                    .await;
+            }
+        };
+
         let kernel = self.clone();
         let active = Arc::clone(&context.active);
         let task = tokio::spawn(run_runtime_channel_send_bridge(kernel, context, listener));
@@ -18060,6 +18743,7 @@ impl Kernel {
 
     async fn maybe_start_runtime_channel_send_bridge(
         &self,
+        adapter: &dyn RuntimeAdapter,
         session_id: Uuid,
         turn_id: Uuid,
         runtime_id: &str,
@@ -18086,12 +18770,21 @@ impl Kernel {
                 )
                 .await;
         };
+        let runtime_native_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let runtime_native_home_artifact_dirs = if runtime_native_home_root.is_some() {
+            Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?
+        } else {
+            Vec::new()
+        };
         self.start_runtime_channel_send_bridge(
             RuntimeChannelSendContext {
                 session_id,
                 turn_id,
                 runtime_id: runtime_id.to_string(),
                 runtime_state_root,
+                runtime_native_home_root,
+                runtime_native_home_artifact_dirs,
+                runtime_path_projections: Vec::new(),
                 active: Arc::new(AtomicBool::new(true)),
             },
             plan,
@@ -18233,16 +18926,25 @@ impl Kernel {
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
-            if matches!(mount.target.as_str(), "/runtime" | "/drafts") {
+            if matches!(
+                mount.target.as_str(),
+                RUNTIME_MOUNT_TARGET | DRAFTS_MOUNT_TARGET
+            ) {
                 create_owner_private_directory_all(self.runtime_root.as_deref(), &mount.source)
                     .await?;
+            } else if mount.target == RUNTIME_HOME_MOUNT_TARGET {
+                ensure_runtime_native_home_mount_source(
+                    self.runtime_root.as_deref(),
+                    &mount.source,
+                )
+                .await?;
             }
         }
 
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+        let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_kind, runtime_state_root, &plan.mounts)
+        project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
             .await
             .map_err(internal)
     }
@@ -18265,8 +18967,28 @@ impl Kernel {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
         create_owner_private_directory_all(self.runtime_root.as_deref(), &runtime_state_root)
             .await?;
+        let runtime_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let runtime_home_lock_root = runtime_home_root
+            .as_deref()
+            .and_then(|runtime_home_root| runtime_home_root.parent().map(Path::to_path_buf));
+        if let Some(runtime_home_root) = &runtime_home_root {
+            ensure_runtime_native_home_mount_source(
+                self.runtime_root.as_deref(),
+                runtime_home_root,
+            )
+            .await?;
+        }
+        let mut lock_roots = vec![runtime_state_root];
+        if let Some(runtime_home_lock_root) = runtime_home_lock_root {
+            if !lock_roots
+                .iter()
+                .any(|root| root == &runtime_home_lock_root)
+            {
+                lock_roots.push(runtime_home_lock_root);
+            }
+        }
         tokio::task::spawn_blocking(move || {
-            acquire_attached_runtime_launch_lock_blocking(&runtime_state_root)
+            acquire_attached_runtime_launch_locks_blocking(lock_roots)
         })
         .await
         .map_err(|err| internal(err.into()))?
@@ -19182,10 +19904,11 @@ impl Kernel {
                 .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
                 .await;
         }
+        let artifact_roots = context.artifact_roots();
         let mut attachments = match self
-            .prepare_runtime_artifact_attachments_beneath(
+            .prepare_runtime_artifact_attachments_from_roots(
                 context.turn_id,
-                &context.runtime_state_root,
+                &artifact_roots,
                 &runtime_artifacts,
             )
             .await
@@ -19437,12 +20160,14 @@ impl Kernel {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
         let runtime_root = self.canonical_runtime_root().await?;
-        self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
+        let artifact_roots = vec![RuntimeArtifactRoot::directory(runtime_root)];
+        self.prepare_runtime_artifact_attachments_from_roots(turn_id, &artifact_roots, artifacts)
             .await
     }
 
     async fn prepare_runtime_artifact_attachments_for_turn(
         &self,
+        adapter: &dyn RuntimeAdapter,
         turn_id: Uuid,
         runtime_turn_mode: RuntimeTurnMode,
         execution_plan: &EffectiveExecutionPlan,
@@ -19451,29 +20176,60 @@ impl Kernel {
         if artifacts.is_empty() {
             return Ok(PreparedChannelDeliveryAttachments::default());
         }
-        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
-            let runtime_state_root = Self::runtime_state_root(execution_plan).ok_or_else(|| {
-                KernelError::Runtime(
-                    "runtime state root is required to publish program-backed runtime artifacts"
-                        .to_string(),
-                )
-            })?;
+        if let Some(artifact_roots) =
+            Self::runtime_artifact_roots_for_plan(adapter, execution_plan)?
+        {
             return self
-                .prepare_runtime_artifact_attachments_beneath(
+                .prepare_runtime_artifact_attachments_from_roots(
                     turn_id,
-                    runtime_state_root,
+                    &artifact_roots,
                     artifacts,
                 )
                 .await;
+        }
+        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
+            return Err(KernelError::Runtime(
+                "runtime state root is required to publish program-backed runtime artifacts"
+                    .to_string(),
+            ));
         }
         self.prepare_runtime_artifact_attachments(turn_id, artifacts)
             .await
     }
 
-    async fn prepare_runtime_artifact_attachments_beneath(
+    fn runtime_declared_native_home_artifact_dirs(
+        adapter: &dyn RuntimeAdapter,
+        runtime_id: &str,
+    ) -> Result<Vec<RuntimeNativeHomeArtifactDir>, KernelError> {
+        adapter.native_home_artifact_dirs().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime '{runtime_id}' declared invalid native-home artifact directory: {err}"
+            ))
+        })
+    }
+
+    fn runtime_artifact_roots_for_plan(
+        adapter: &dyn RuntimeAdapter,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<Option<Vec<RuntimeArtifactRoot>>, KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(None);
+        };
+        let mut artifact_roots = vec![RuntimeArtifactRoot::directory(runtime_state_root)];
+        if let Some(runtime_home_root) = Self::runtime_native_home_root(plan) {
+            let native_home_artifact_dirs =
+                Self::runtime_declared_native_home_artifact_dirs(adapter, &plan.runtime_id)?;
+            artifact_roots.extend(native_home_artifact_dirs.into_iter().map(|artifact_dir| {
+                RuntimeArtifactRoot::native_home_declared(runtime_home_root, artifact_dir)
+            }));
+        }
+        Ok(Some(artifact_roots))
+    }
+
+    async fn prepare_runtime_artifact_attachments_from_roots(
         &self,
         turn_id: Uuid,
-        artifact_root: &Path,
+        artifact_roots: &[RuntimeArtifactRoot],
         artifacts: &[RuntimeArtifact],
     ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
         if artifacts.is_empty() {
@@ -19485,20 +20241,13 @@ impl Kernel {
             )));
         }
         let runtime_root_canonical = self.canonical_runtime_root().await?;
-        let artifact_root_canonical =
-            tokio::fs::canonicalize(artifact_root)
-                .await
-                .map_err(|err| {
-                    KernelError::Runtime(format!(
-                        "runtime artifact root '{}' is not readable: {err}",
-                        artifact_root.display()
-                    ))
-                })?;
-        if !artifact_root_canonical.starts_with(&runtime_root_canonical) {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact root '{}' is outside the runtime root",
-                artifact_root.display()
-            )));
+        let artifact_roots =
+            Self::checked_runtime_artifact_roots(artifact_roots, runtime_root_canonical.as_path())
+                .await?;
+        if artifact_roots.is_empty() {
+            return Err(KernelError::Runtime(
+                "runtime artifact root is required to publish runtime artifacts".to_string(),
+            ));
         }
         let turn_id = turn_id.to_string();
         let delivery_root = ensure_safe_child_directory(
@@ -19513,24 +20262,78 @@ impl Kernel {
         };
         for artifact in artifacts {
             let attachment = self
-                .copy_runtime_artifact_for_delivery(
-                    &artifact_root_canonical,
-                    &delivery_root,
-                    artifact,
-                )
+                .copy_runtime_artifact_for_delivery(&artifact_roots, &delivery_root, artifact)
                 .await?;
             attachments.push(attachment);
         }
         Ok(attachments)
     }
 
+    async fn checked_runtime_artifact_roots(
+        artifact_roots: &[RuntimeArtifactRoot],
+        runtime_root_canonical: &Path,
+    ) -> Result<Vec<RuntimeArtifactRoot>, KernelError> {
+        let mut checked = Vec::with_capacity(artifact_roots.len());
+        for artifact_root in artifact_roots {
+            match artifact_root {
+                RuntimeArtifactRoot::Directory(path) => {
+                    let canonical = tokio::fs::canonicalize(path).await.map_err(|err| {
+                        KernelError::Runtime(format!(
+                            "runtime artifact root '{}' is not readable: {err}",
+                            path.display()
+                        ))
+                    })?;
+                    if !canonical.starts_with(runtime_root_canonical) {
+                        return Err(KernelError::Runtime(format!(
+                            "runtime artifact root '{}' is outside the runtime root",
+                            path.display()
+                        )));
+                    }
+                    let checked_root = RuntimeArtifactRoot::directory(canonical);
+                    if !checked.iter().any(|existing| existing == &checked_root) {
+                        checked.push(checked_root);
+                    }
+                }
+                RuntimeArtifactRoot::NativeHomeDeclared {
+                    native_home_root,
+                    artifact_dir,
+                } => {
+                    let canonical =
+                        tokio::fs::canonicalize(native_home_root)
+                            .await
+                            .map_err(|err| {
+                                KernelError::Runtime(format!(
+                                    "runtime native home '{}' is not readable: {err}",
+                                    native_home_root.display()
+                                ))
+                            })?;
+                    if !canonical.starts_with(runtime_root_canonical) {
+                        return Err(KernelError::Runtime(format!(
+                            "runtime native home '{}' is outside the runtime root",
+                            native_home_root.display()
+                        )));
+                    }
+                    let checked_root = RuntimeArtifactRoot::native_home_declared(
+                        native_home_root.clone(),
+                        artifact_dir.clone(),
+                    );
+                    if !checked.iter().any(|existing| existing == &checked_root) {
+                        checked.push(checked_root);
+                    }
+                }
+            }
+        }
+        Ok(checked)
+    }
+
     async fn copy_runtime_artifact_for_delivery(
         &self,
-        artifact_root: &Path,
+        artifact_roots: &[RuntimeArtifactRoot],
         delivery_root: &Path,
         artifact: &RuntimeArtifact,
     ) -> Result<ChannelDeliveryAttachment, KernelError> {
-        let source = open_runtime_artifact_source(artifact_root, artifact)?;
+        let source = open_runtime_artifact_source(artifact_roots, artifact)
+            .map_err(RuntimePathAccessError::into_kernel_error)?;
         let metadata = source.metadata().map_err(|err| {
             KernelError::Runtime(format!(
                 "runtime artifact '{}' is not readable: {err}",
@@ -20951,6 +21754,7 @@ impl Kernel {
         let runtime_turn_mode = adapter.turn_mode();
         let _channel_send_bridge = self
             .maybe_start_runtime_channel_send_bridge(
+                adapter.as_ref(),
                 session_id,
                 turn_id,
                 runtime_id,
