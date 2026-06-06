@@ -1,13 +1,46 @@
-use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
+use crate::kernel::skills::validate_skill_alias;
+
 pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
 
+pub const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
+pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
+pub const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
+pub const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
 
 pub fn skill_mount_target(alias: &str) -> String {
     format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
+}
+
+pub fn runtime_skill_mount_target_alias(target: &str) -> Option<&str> {
+    target
+        .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .filter(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
+}
+
+pub fn mount_source_for_target<'a>(mounts: &'a [MountSpec], target: &str) -> Option<&'a Path> {
+    mounts
+        .iter()
+        .find(|mount| mount.target == target)
+        .map(|mount| mount.source.as_path())
+}
+
+pub fn runtime_state_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
+    mount_source_for_target(mounts, RUNTIME_MOUNT_TARGET)
+}
+
+pub fn runtime_native_home_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
+    mount_source_for_target(mounts, RUNTIME_HOME_MOUNT_TARGET)
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.
@@ -220,7 +253,38 @@ impl fmt::Debug for EffectiveExecutionPlan {
 mod tests {
     use serde_json::json;
 
-    use super::{ConfinementConfig, EscapeClass, ExecutionPreset, NetworkMode, WorkspaceAccess};
+    use super::{
+        runtime_skill_mount_target_alias, ConfinementConfig, EscapeClass, ExecutionPreset,
+        NetworkMode, WorkspaceAccess,
+    };
+
+    #[test]
+    fn runtime_skill_mount_target_alias_accepts_only_exact_valid_alias_targets() {
+        assert_eq!(
+            runtime_skill_mount_target_alias("/lionclaw/skills/loopback"),
+            Some("loopback")
+        );
+        assert_eq!(
+            runtime_skill_mount_target_alias("/lionclaw/skills/channel.terminal_1"),
+            Some("channel.terminal_1")
+        );
+
+        for target in [
+            "/lionclaw/skills",
+            "/lionclaw/skills/",
+            "/lionclaw/skills/../custom",
+            "/lionclaw/skills/loopback/extra",
+            "/lionclaw/skills/.hidden",
+            "/lionclaw/skillsfoo",
+            "/other/skills/loopback",
+        ] {
+            assert_eq!(
+                runtime_skill_mount_target_alias(target),
+                None,
+                "{target} should not be a managed runtime skill target"
+            );
+        }
+    }
 
     #[test]
     fn execution_preset_round_trips_without_embedded_name() {

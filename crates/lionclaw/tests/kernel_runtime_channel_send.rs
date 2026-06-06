@@ -19,9 +19,9 @@ use lionclaw::{
         runtime::{
             EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo,
             RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
-            RuntimeEventSender, RuntimeExecutionContext, RuntimeProgramTurnExecution,
-            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-            RuntimeTurnResult, WorkspaceAccess,
+            RuntimeEventSender, RuntimeExecutionContext, RuntimeNativeHomeArtifactDir,
+            RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
         },
         Kernel, KernelOptions,
     },
@@ -48,6 +48,9 @@ type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 enum ProbeFileSetup {
     None,
     Attachment,
+    RuntimeHomeAttachment,
+    DeclaredRuntimeHomeAttachment,
+    RetargetDeclaredRuntimeHomeAttachment,
     InvalidAttachments,
 }
 
@@ -276,6 +279,186 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             "channel.send socket root is private"
         );
     }
+}
+
+#[tokio::test]
+async fn program_backed_runtime_channel_send_rejects_arbitrary_runtime_home_attachment() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-home").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let socket_paths = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "send-persistent-sketch",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "See attached persistent sketch.",
+            "format_hint": "markdown",
+            "attachments": [{
+                "path": "/runtime/home/artifacts/persistent-sketch.txt",
+                "filename": "persistent-sketch.txt",
+                "mime_type": "text/plain"
+            }]
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![request],
+                responses.clone(),
+                socket_paths,
+                ProbeFileSetup::RuntimeHomeAttachment,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-home").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send persistent home attachment".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[0]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("allowed runtime artifact directory")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn program_backed_runtime_channel_send_rejects_retargeted_declared_runtime_home_attachment() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-retargeted-home").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let setup_responses = Arc::new(Mutex::new(Vec::new()));
+    let setup_socket_paths = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(
+                ChannelSendProbeRuntime::send_requests(
+                    Vec::new(),
+                    setup_responses.clone(),
+                    setup_socket_paths,
+                    ProbeFileSetup::DeclaredRuntimeHomeAttachment,
+                )
+                .with_native_home_artifact_dir("generated-artifacts/images"),
+            ),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-retargeted-home").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "prepare declared runtime home artifact directory".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("setup turn should complete");
+    assert!(
+        setup_responses
+            .lock()
+            .expect("setup responses lock")
+            .is_empty(),
+        "setup turn should not send channel messages"
+    );
+
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "send-retargeted-secret",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "See attached retargeted secret.",
+            "format_hint": "markdown",
+            "attachments": [{
+                "path": "/runtime/home/generated-artifacts/images/secret.txt",
+                "filename": "secret.txt",
+                "mime_type": "text/plain"
+            }]
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(
+                ChannelSendProbeRuntime::send_requests(
+                    vec![request],
+                    responses.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                    ProbeFileSetup::RetargetDeclaredRuntimeHomeAttachment,
+                )
+                .with_native_home_artifact_dir("generated-artifacts/images"),
+            ),
+        )
+        .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send retargeted runtime home attachment".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[0]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("allowed runtime artifact directory")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(outbox.deliveries.is_empty());
 }
 
 #[tokio::test]
@@ -683,6 +866,18 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
                             }]
                         }
                     }),
+                    json!({
+                        "idempotency_key": "attachment-hidden-socket-file",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/lionclaw/channel-send.sock"
+                            }]
+                        }
+                    }),
                 ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
@@ -709,6 +904,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         "invalid_format",
         "empty_content",
         "unknown_channel",
+        "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
@@ -1262,6 +1458,7 @@ enum RuntimeAction {
 
 struct ChannelSendProbeRuntime {
     action: RuntimeAction,
+    native_home_artifact_dirs: Vec<RuntimeNativeHomeArtifactDir>,
 }
 
 struct DirectSocketProbeRuntime {
@@ -1270,10 +1467,23 @@ struct DirectSocketProbeRuntime {
 }
 
 impl ChannelSendProbeRuntime {
-    fn record_environment(observed: RecordedEnvironments) -> Self {
+    fn new(action: RuntimeAction) -> Self {
         Self {
-            action: RuntimeAction::RecordEnvironment { observed },
+            action,
+            native_home_artifact_dirs: Vec::new(),
         }
+    }
+
+    fn with_native_home_artifact_dir(mut self, relative_path: &str) -> Self {
+        self.native_home_artifact_dirs.push(
+            RuntimeNativeHomeArtifactDir::new(relative_path)
+                .expect("test native-home artifact dir is valid"),
+        );
+        self
+    }
+
+    fn record_environment(observed: RecordedEnvironments) -> Self {
+        Self::new(RuntimeAction::RecordEnvironment { observed })
     }
 
     fn send_requests(
@@ -1282,56 +1492,42 @@ impl ChannelSendProbeRuntime {
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
         file_setup: ProbeFileSetup,
     ) -> Self {
-        Self {
-            action: RuntimeAction::SendRequests {
-                requests,
-                responses,
-                socket_paths,
-                file_setup,
-            },
-        }
+        Self::new(RuntimeAction::SendRequests {
+            requests,
+            responses,
+            socket_paths,
+            file_setup,
+        })
     }
 
     fn send_raw_requests(requests: Vec<Vec<u8>>, responses: Arc<Mutex<Vec<Value>>>) -> Self {
-        Self {
-            action: RuntimeAction::SendRawRequests {
-                requests,
-                responses,
-            },
-        }
+        Self::new(RuntimeAction::SendRawRequests {
+            requests,
+            responses,
+        })
     }
 
     fn sleep_after_start(socket_paths: Arc<Mutex<Vec<PathBuf>>>, duration: Duration) -> Self {
-        Self {
-            action: RuntimeAction::Sleep {
-                socket_paths,
-                duration,
-            },
-        }
+        Self::new(RuntimeAction::Sleep {
+            socket_paths,
+            duration,
+        })
     }
 
     fn hold_open_connection(held_stream: Arc<Mutex<Option<UnixStream>>>) -> Self {
-        Self {
-            action: RuntimeAction::HoldOpenConnection { held_stream },
-        }
+        Self::new(RuntimeAction::HoldOpenConnection { held_stream })
     }
 
     fn open_many_connections(responses: Arc<Mutex<Vec<Value>>>) -> Self {
-        Self {
-            action: RuntimeAction::OpenManyConnections { responses },
-        }
+        Self::new(RuntimeAction::OpenManyConnections { responses })
     }
 
     fn open_many_connections_and_drop_rejected() -> Self {
-        Self {
-            action: RuntimeAction::OpenManyConnectionsAndDropRejected,
-        }
+        Self::new(RuntimeAction::OpenManyConnectionsAndDropRejected)
     }
 
     fn send_and_drop_connection(request: Value) -> Self {
-        Self {
-            action: RuntimeAction::SendAndDropConnection { request },
-        }
+        Self::new(RuntimeAction::SendAndDropConnection { request })
     }
 }
 
@@ -1347,6 +1543,10 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
 
     fn turn_mode(&self) -> RuntimeTurnMode {
         RuntimeTurnMode::ProgramBacked
+    }
+
+    fn native_home_artifact_dirs(&self) -> Result<Vec<RuntimeNativeHomeArtifactDir>> {
+        Ok(self.native_home_artifact_dirs.clone())
     }
 
     async fn session_start(
@@ -1480,7 +1680,7 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
                 .lock()
                 .expect("socket paths lock")
                 .push(host_socket);
-            prepare_probe_files(&runtime_root, *file_setup).await?;
+            prepare_probe_files(context, &runtime_root, *file_setup).await?;
             for request in requests {
                 let response = send_channel_send_request(context, request.clone()).await?;
                 responses.lock().expect("responses lock").push(response);
@@ -1589,7 +1789,11 @@ async fn connect_channel_send_socket(host_socket: &Path) -> Result<UnixStream> {
         .with_context(|| format!("connect {}", host_socket.display()))
 }
 
-async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Result<()> {
+async fn prepare_probe_files(
+    context: &RuntimeExecutionContext,
+    runtime_root: &Path,
+    setup: ProbeFileSetup,
+) -> Result<()> {
     match setup {
         ProbeFileSetup::None => Ok(()),
         ProbeFileSetup::Attachment => {
@@ -1603,7 +1807,72 @@ async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Resu
                 .context("write artifact")?;
             Ok(())
         }
+        ProbeFileSetup::RuntimeHomeAttachment => {
+            let artifact = host_path_for_runtime_path(
+                context,
+                "/runtime/home/artifacts/persistent-sketch.txt",
+            )?;
+            let artifact_parent = artifact.parent().context("artifact parent missing")?;
+            tokio::fs::create_dir_all(artifact_parent)
+                .await
+                .context("create runtime home artifact parent")?;
+            tokio::fs::write(&artifact, b"persistent sketch bytes")
+                .await
+                .context("write runtime home artifact")?;
+            Ok(())
+        }
+        ProbeFileSetup::DeclaredRuntimeHomeAttachment => {
+            let artifact = host_path_for_runtime_path(
+                context,
+                "/runtime/home/generated-artifacts/images/preexisting.txt",
+            )?;
+            let artifact_parent = artifact.parent().context("artifact parent missing")?;
+            tokio::fs::create_dir_all(artifact_parent)
+                .await
+                .context("create declared runtime home artifact parent")?;
+            tokio::fs::write(&artifact, b"preexisting artifact bytes")
+                .await
+                .context("write declared runtime home artifact")?;
+            Ok(())
+        }
+        ProbeFileSetup::RetargetDeclaredRuntimeHomeAttachment => {
+            let declared_dir =
+                host_path_for_runtime_path(context, "/runtime/home/generated-artifacts/images")?;
+            if declared_dir.exists() {
+                tokio::fs::remove_dir_all(&declared_dir)
+                    .await
+                    .context("remove declared runtime home artifact dir")?;
+            }
+            let native_config_dir =
+                host_path_for_runtime_path(context, "/runtime/home/native-config")?;
+            tokio::fs::create_dir_all(&native_config_dir)
+                .await
+                .context("create native config dir")?;
+            tokio::fs::write(native_config_dir.join("secret.txt"), b"native secret bytes")
+                .await
+                .context("write native config secret")?;
+            let declared_parent = declared_dir
+                .parent()
+                .context("declared artifact parent missing")?;
+            tokio::fs::create_dir_all(declared_parent)
+                .await
+                .context("create declared artifact parent")?;
+            std::os::unix::fs::symlink(&native_config_dir, &declared_dir)
+                .context("retarget declared artifact dir")?;
+            Ok(())
+        }
         ProbeFileSetup::InvalidAttachments => {
+            let stale_socket_file = runtime_root.join("lionclaw/channel-send.sock");
+            let stale_socket_parent = stale_socket_file
+                .parent()
+                .context("stale socket parent missing")?;
+            tokio::fs::create_dir_all(stale_socket_parent)
+                .await
+                .context("create stale socket parent")?;
+            tokio::fs::write(&stale_socket_file, b"hidden stale socket target")
+                .await
+                .context("write stale socket target")?;
+
             let outside = runtime_root
                 .parent()
                 .context("runtime root parent missing")?

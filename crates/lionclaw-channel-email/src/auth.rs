@@ -366,8 +366,9 @@ mod tests {
         let helper = temp_dir.path().join("token-helper");
         write_token_helper(&helper, "#!/bin/sh\nprintf 'access-token-123\\n'\n");
 
-        let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
-            .expect("token command");
+        let command =
+            TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &token_helper_command(&helper))
+                .expect("token command");
 
         assert_eq!(
             command.access_token().await.expect("access token"),
@@ -392,8 +393,9 @@ mod tests {
              printf 'access-token-123\\n'\n",
         );
 
-        let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
-            .expect("token command");
+        let command =
+            TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &token_helper_command(&helper))
+                .expect("token command");
 
         assert_eq!(
             command.access_token().await.expect("access token"),
@@ -413,8 +415,9 @@ mod tests {
              exit 17\n",
         );
 
-        let command = TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &helper.display().to_string())
-            .expect("token command");
+        let command =
+            TokenCommand::parse("EMAIL_XOAUTH2_TOKEN_CMD", &token_helper_command(&helper))
+                .expect("token command");
         let err = command
             .access_token()
             .await
@@ -451,17 +454,14 @@ error=invalid_grant&refresh_token=secret-refresh-token client_secret:"secret-cli
 
     #[cfg(unix)]
     fn write_token_helper(path: &Path, content: &str) {
-        use std::{io::Write as _, os::unix::fs::PermissionsExt};
+        std::fs::write(path, content).expect("write helper");
+    }
 
-        let temp_path = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temp_path).expect("create helper temp");
-        file.write_all(content.as_bytes())
-            .expect("write helper temp");
-        file.sync_all().expect("sync helper temp");
-        drop(file);
-        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod helper");
-        std::fs::rename(&temp_path, path).expect("publish helper");
+    #[cfg(unix)]
+    fn token_helper_command(path: &Path) -> String {
+        let quoted_path = shlex::try_quote(path.to_str().expect("helper path should be UTF-8"))
+            .expect("quote helper path");
+        format!("/bin/sh {quoted_path}")
     }
 
     struct EnvRestore {

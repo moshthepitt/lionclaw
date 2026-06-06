@@ -64,8 +64,9 @@ mediate every private step inside those harnesses.
 Instead, LionClaw constrains the runtime launch:
 
 - selected work root mounted at `/workspace`
-- runtime-private state mounted at `/runtime`
-- draft/output area mounted at `/drafts`
+- session-scoped LionClaw runtime control state mounted at `/runtime`
+- persistent runtime-native private home mounted at `/runtime/home`
+- project-scoped draft/output area mounted at `/drafts`
 - applied non-channel skills mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
@@ -226,8 +227,9 @@ Flow:
 1. The operator CLI resolves the normal LionClaw project, runtime, and durable
    interactive session.
 2. The kernel materializes the confined runtime layout, runtime-visible skills,
-   and a fresh attached-session context directly into runtime-private state as
-   both `AGENTS.generated.md` and the runtime-standard `AGENTS.md`.
+   and a fresh attached-session context directly into session-scoped runtime
+   control state as both `AGENTS.generated.md` and the runtime-standard
+   `AGENTS.md`.
 3. The runtime adapter supplies a terminal program through
    `build_terminal_program()`.
 4. The execution planner compiles the same mounted workspace, staged auth,
@@ -244,28 +246,32 @@ audit trail are the active boundary. Codex also receives
 `/runtime/AGENTS.generated.md` as its model instructions file, so LionClaw
 memory, active context, prior LionClaw session history, skills, and project
 continuity are included without shadowing `/workspace/AGENTS.md`.
-LionClaw also materializes the runtime-private Codex config with
+LionClaw also passes launch-time Codex config overrides for
 `[projects."/workspace"] trust_level = "trusted"` and
 `check_for_update_on_startup = false`, matching the result of approving Codex's
 own workspace prompt inside the container while keeping runtime updates under
-LionClaw's runtime image/update path. The host Codex home is not mutated.
+LionClaw's runtime image/update path. Those overrides do not rewrite
+`/runtime/home/.codex/config.toml`, and the host Codex home is not mutated.
 
-For OpenCode, LionClaw points `OPENCODE_CONFIG_DIR` at `/runtime` and sets
-`OPENCODE_DISABLE_AUTOUPDATE=1`. OpenCode's native instruction loader then
-reads `/runtime/AGENTS.md` as global runtime instructions while project-level
-`.opencode` and `AGENTS.md` files remain project-owned. Runtime updates stay
-under LionClaw's runtime image/update path.
+For OpenCode native TUI launches, LionClaw lets HOME/XDG point at
+`/runtime/home`, sets `OPENCODE_DISABLE_AUTOUPDATE=1`, and points
+`OPENCODE_CONFIG` at `/runtime/opencode.generated.json`. That session-scoped
+config file loads `/runtime/AGENTS.md` as global runtime instructions while
+project-level `.opencode` and `AGENTS.md` files remain project-owned. Program
+turns carry LionClaw context through the normal prompt envelope. Runtime updates
+stay under LionClaw's runtime image/update path.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex continuity is a
-LionClaw-owned link to one Codex CLI thread id stored in runtime-private state.
+LionClaw-owned link to one Codex CLI thread id stored in session-scoped runtime
+control state.
 Native TUI launches resume with `codex resume <threadID>` only when that link
 also has LionClaw's ready marker from a proven resumable reconciliation.
 Before launching an attached native TUI, LionClaw records a launch timestamp in
-runtime-private state. After exit, adapters keep the saved continuation link
-authoritative unless the runtime's public session/thread list shows a different
-newest target updated during that launch; when no link exists, the newest public
-target starts the link.
+session-scoped runtime control state. After exit, adapters keep the saved
+continuation link authoritative unless the runtime's public session/thread list
+shows a different newest target updated during that launch; when no link
+exists, the newest public target starts the link.
 After native TUI exit, Codex exports completed turns through Codex's app-server
 `thread/list` and paged `thread/turns/list` protocol inside the same runtime
 boundary, enumerating newest history first, recording the chosen CLI thread as
@@ -275,11 +281,11 @@ listing cannot produce a current thread, and sorting before canonical import.
 Codex threads that the app-server reports as not yet materialized before the
 first user message reconcile as empty, non-resumable continuation sources.
 OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
-stored in runtime-private state. Program-backed OpenCode turns learn that id
-from OpenCode's machine-readable `sessionID` events and then resume with
-`opencode run --session <sessionID>`. Native TUI launches resume with
-`opencode --session <sessionID>` only when that link also has LionClaw's ready
-marker from a proven resumable reconciliation.
+stored in session-scoped runtime control state. Program-backed OpenCode turns
+learn that id from OpenCode's machine-readable `sessionID` events and then
+resume with `opencode run --session <sessionID>`. Native TUI launches resume
+with `opencode --session <sessionID>` only when that link also has LionClaw's
+ready marker from a proven resumable reconciliation.
 After native TUI exit, LionClaw uses OpenCode's `session list --format json`
 only to identify whether the runtime moved to a newer root session during the
 launch, choosing by exported update timestamp instead of relying on list order.
@@ -405,10 +411,14 @@ The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
 configured channel route, provider-neutral content, and an idempotency key.
 Attachment content is not sent over the socket; the request names files under
-`/runtime`, and the kernel reuses the existing runtime-artifact copy and outbox
-attachment path. Attachment paths are interpreted relative to the current
-runtime state root; parent-directory and symlink escapes are rejected.
-Attachment-only sends are valid; text-only sends must carry non-empty text.
+`/runtime` control state or a generated-artifact directory declared by the
+runtime adapter under the persistent native home. The persistent native home
+itself is not an attachment root because it can hold runtime auth, config,
+databases, caches, and history. The kernel reuses the existing runtime-artifact
+copy and outbox attachment path. Attachment paths are interpreted relative to
+the current runtime path projections; parent-directory and symlink escapes are
+rejected. Attachment-only sends are valid; text-only sends must carry non-empty
+text.
 
 The bridge is transport only. The kernel validates the current session and turn
 from its own execution context, checks the active channel binding, normalizes
@@ -440,8 +450,9 @@ conflict error.
 The everyday runtime layout is mount-first:
 
 - `/workspace`: selected work root with preset-controlled read-only or read-write access
-- `/runtime`: runtime-private writable state root
-- `/drafts`: runtime-private draft/output area
+- `/runtime`: session-scoped LionClaw runtime control state
+- `/runtime/home`: persistent runtime-native private home
+- `/drafts`: project-scoped draft/output area
 - `/lionclaw/project/instances.json`: generated read-only project instance
   inventory for project-backed program-backed runtime launches
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets mounted read-only
@@ -567,15 +578,19 @@ panes instead of being appended as transcript lines.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, XDG config/cache/data/state roots under `/runtime/home`,
-`LIONCLAW_DRAFTS_DIR=/drafts`, and `LIONCLAW_SKILLS_DIR=/lionclaw/skills`
-when runtime-visible skills have mounted assets, so engine-specific caches,
-data, and config stay out of assistant continuity.
+`LIONCLAW_RUNTIME_DIR=/runtime`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have
+mounted assets. `/runtime` is session-scoped LionClaw control state.
+`/runtime/home` is a separate persistent runtime-native home keyed by runtime,
+work root, OCI compatibility identity, and execution security shape. That lets
+Codex, OpenCode, and future runtimes keep native config, databases, histories,
+and caches across LionClaw sessions without sharing them across different
+projects or materially different secret/network/workspace/escape capability
+shapes.
 
 Interactive program-backed turns launch a fresh confined process for each
-request, but the mounted `/runtime` state root is scoped to the LionClaw
-session, work root, and execution security shape. That lets the harness
-resume its own conversation state across turns without sharing private runtime
-state across different projects or secret/network shapes.
+request. They receive the current LionClaw session's `/runtime` control state
+and the matching persistent `/runtime/home` native home.
 
 LionClaw keeps the canonical transcript itself. Fresh harness sessions get
 replayed transcript history in the prompt envelope; resumed harness sessions
@@ -610,11 +625,12 @@ and the runtime secret file to `0600` on Unix before loading it.
 Host-only runtime auth comes from the host runtime itself. Before a confined
 Codex turn, LionClaw reads the host Codex auth store, normally
 `~/.codex/auth.json`, refreshes that host auth when needed, then stages
-session-local `auth.json` under `/runtime/home/.codex` before launch. LionClaw
-also writes a small runtime-owned Codex `config.toml` there with the trusted
-`/workspace` project entry and update checks disabled. Host Codex config,
-plugins, apps, MCP servers, and paths are not imported into the confined
-runtime. The real host Codex home is never mounted into the runtime container.
+persistent runtime-local `auth.json` under `/runtime/home/.codex` before
+launch. LionClaw does not write or replace `/runtime/home/.codex/config.toml`;
+required Codex launch constraints such as trusted `/workspace` and disabled
+update checks are passed as CLI config overrides. Host Codex config, plugins,
+apps, MCP servers, and paths are not imported into the confined runtime. The
+real host Codex home is never mounted into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
 `lionclaw up` persists that same override into the managed daemon environment

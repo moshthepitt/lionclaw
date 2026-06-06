@@ -166,8 +166,9 @@ Expected:
   boundary
 - Codex shows `/workspace` as the directory and no inner Codex sandbox or
   workspace-trust prompt
-- OpenCode loads the generated LionClaw context from `/runtime/AGENTS.md`
-  without showing an auto-update prompt
+- OpenCode native UI loads the generated LionClaw context through the
+  generated config that points at `/runtime/AGENTS.md`, without showing an
+  auto-update prompt
 - the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
@@ -180,9 +181,11 @@ Expected:
   transcript-export pass
 - after an unclean LionClaw exit, relaunching the native UI reconciles durable
   runtime transcript state without duplicating already imported turns
-- a second `run --runtime-tui --continue-last-session` targeting the same
-  active native UI reports a conflict instead of attaching to the same runtime
-  state concurrently
+- interactive `run` and `run --runtime-tui` resume the latest LionClaw session
+  by default; `--new-session` starts fresh LionClaw control state while keeping
+  runtime-native config and history under `/runtime/home`
+- a second `run --runtime-tui` targeting the same active native UI reports a
+  conflict instead of attaching to the same runtime state concurrently
 
 Use these prompts:
 

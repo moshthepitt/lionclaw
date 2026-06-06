@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::fs;
 
-use super::{MountSpec, SKILLS_MOUNT_TARGET_ROOT};
-use crate::kernel::skills::validate_skill_alias;
+use super::{runtime_skill_mount_target_alias, MountSpec, SKILLS_MOUNT_TARGET_ROOT};
 
 pub async fn project_runtime_skills(
     runtime_kind: &str,
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     mounts: &[MountSpec],
 ) -> Result<()> {
     let Some(native_relative_root) = native_runtime_skills_relative_root(runtime_kind) else {
@@ -19,48 +18,48 @@ pub async fn project_runtime_skills(
     let desired = desired_skill_symlinks(mounts)?;
     if desired.is_empty() {
         let Some(native_root) =
-            existing_safe_runtime_dir(runtime_state_root, native_relative_root).await?
+            existing_safe_runtime_dir(runtime_home_root, native_relative_root).await?
         else {
             return Ok(());
         };
         return reconcile_skill_symlinks(&native_root, &desired).await;
     }
 
-    let native_root = ensure_safe_runtime_dir(runtime_state_root, native_relative_root).await?;
+    let native_root = ensure_safe_runtime_dir(runtime_home_root, native_relative_root).await?;
 
     reconcile_skill_symlinks(&native_root, &desired).await
 }
 
 fn native_runtime_skills_relative_root(runtime_kind: &str) -> Option<&'static [&'static str]> {
     match runtime_kind {
-        "codex" => Some(&["home", ".codex", "skills"]),
-        "opencode" => Some(&["home", ".config", "opencode", "skills"]),
+        "codex" => Some(&[".codex", "skills"]),
+        "opencode" => Some(&[".config", "opencode", "skills"]),
         _ => None,
     }
 }
 
 async fn existing_safe_runtime_dir(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     relative_components: &[&str],
 ) -> Result<Option<PathBuf>> {
-    ensure_safe_directory_state(runtime_state_root, relative_components, false).await
+    ensure_safe_directory_state(runtime_home_root, relative_components, false).await
 }
 
 async fn ensure_safe_runtime_dir(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     relative_components: &[&str],
 ) -> Result<PathBuf> {
-    ensure_safe_directory_state(runtime_state_root, relative_components, true)
+    ensure_safe_directory_state(runtime_home_root, relative_components, true)
         .await?
         .ok_or_else(|| anyhow::anyhow!("runtime skill root disappeared during preparation"))
 }
 
 async fn ensure_safe_directory_state(
-    runtime_state_root: &Path,
+    runtime_home_root: &Path,
     relative_components: &[&str],
     create_missing: bool,
 ) -> Result<Option<PathBuf>> {
-    let mut current = runtime_state_root.to_path_buf();
+    let mut current = runtime_home_root.to_path_buf();
     if !ensure_safe_directory(&current, create_missing).await? {
         return Ok(None);
     }
@@ -124,16 +123,20 @@ fn desired_skill_symlinks(mounts: &[MountSpec]) -> Result<BTreeMap<String, Strin
     let mut desired = BTreeMap::new();
 
     for mount in mounts {
-        let Some(alias) = mount
+        if !mount
             .target
             .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
-            .and_then(|suffix| suffix.strip_prefix('/'))
-        else {
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
             continue;
-        };
+        }
 
-        validate_skill_alias(alias)
-            .with_context(|| format!("invalid runtime skill mount target '{}'", mount.target))?;
+        let Some(alias) = runtime_skill_mount_target_alias(&mount.target) else {
+            anyhow::bail!(
+                "invalid runtime skill mount target '{}' must be under {SKILLS_MOUNT_TARGET_ROOT}/<alias>",
+                mount.target
+            );
+        };
         desired.insert(alias.to_string(), mount.target.clone());
     }
 
@@ -235,7 +238,9 @@ async fn managed_skill_symlink(path: &Path) -> Result<bool> {
     let target = fs::read_link(path)
         .await
         .with_context(|| format!("failed to read link {}", path.display()))?;
-    Ok(target.starts_with(SKILLS_MOUNT_TARGET_ROOT))
+    Ok(target
+        .to_str()
+        .is_some_and(|target| runtime_skill_mount_target_alias(target).is_some()))
 }
 
 async fn remove_symlink(path: &Path) -> Result<()> {
@@ -281,18 +286,18 @@ mod tests {
     #[tokio::test]
     async fn projects_runtime_skills_into_codex_home() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_home = temp_dir.path().join("runtime-home");
         let mounts = vec![MountSpec {
             source: temp_dir.path().join("skills/loopback"),
             target: "/lionclaw/skills/loopback".to_string(),
             access: MountAccess::ReadOnly,
         }];
 
-        project_runtime_skills("codex", &runtime_root, &mounts)
+        project_runtime_skills("codex", &runtime_home, &mounts)
             .await
             .expect("project codex skills");
 
-        let link = runtime_root.join("home/.codex/skills/loopback");
+        let link = runtime_home.join(".codex/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link).await.expect("read link"),
             PathBuf::from("/lionclaw/skills/loopback")
@@ -302,8 +307,8 @@ mod tests {
     #[tokio::test]
     async fn removes_stale_runtime_skill_symlinks() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
-        let stale_root = runtime_root.join("home/.config/opencode/skills");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let stale_root = runtime_home.join(".config/opencode/skills");
         tokio::fs::create_dir_all(&stale_root)
             .await
             .expect("create stale root");
@@ -321,7 +326,7 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        project_runtime_skills("opencode", &runtime_root, &mounts)
+        project_runtime_skills("opencode", &runtime_home, &mounts)
             .await
             .expect("project opencode skills");
 
@@ -339,8 +344,8 @@ mod tests {
     #[tokio::test]
     async fn removes_stale_runtime_skill_symlinks_when_no_skills_remain() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
-        let stale_root = runtime_root.join("home/.codex/skills");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let stale_root = runtime_home.join(".codex/skills");
         tokio::fs::create_dir_all(&stale_root)
             .await
             .expect("create stale root");
@@ -352,7 +357,7 @@ mod tests {
         .expect("join stale link")
         .expect("create stale link");
 
-        project_runtime_skills("codex", &runtime_root, &[])
+        project_runtime_skills("codex", &runtime_home, &[])
             .await
             .expect("project empty skill set");
 
@@ -362,10 +367,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_skill_symlinks_with_escaping_targets_as_unmanaged() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let stale_root = runtime_home.join(".codex/skills");
+        let escaping_link = stale_root.join("old");
+        tokio::fs::create_dir_all(&stale_root)
+            .await
+            .expect("create stale root");
+        tokio::task::spawn_blocking({
+            let escaping_link = escaping_link.clone();
+            move || std::os::unix::fs::symlink("/lionclaw/skills/../custom", escaping_link)
+        })
+        .await
+        .expect("join escaping link")
+        .expect("create escaping link");
+
+        project_runtime_skills("codex", &runtime_home, &[])
+            .await
+            .expect("project empty skill set");
+
+        assert_eq!(
+            tokio::fs::read_link(&escaping_link)
+                .await
+                .expect("read escaping link"),
+            PathBuf::from("/lionclaw/skills/../custom")
+        );
+    }
+
+    #[tokio::test]
     async fn preserves_unmanaged_runtime_skill_entries() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
-        let native_root = runtime_root.join("home/.codex/skills");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let native_root = runtime_home.join(".codex/skills");
         tokio::fs::create_dir_all(native_root.join("native"))
             .await
             .expect("create native dir");
@@ -377,7 +411,7 @@ mod tests {
         .expect("join stale link")
         .expect("create stale link");
 
-        project_runtime_skills("codex", &runtime_root, &[])
+        project_runtime_skills("codex", &runtime_home, &[])
             .await
             .expect("project empty skill set");
 
@@ -392,8 +426,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_alias_collision_with_unmanaged_runtime_entry() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
-        let native_root = runtime_root.join("home/.codex/skills");
+        let runtime_home = temp_dir.path().join("runtime-home");
+        let native_root = runtime_home.join(".codex/skills");
         tokio::fs::create_dir_all(native_root.join("loopback"))
             .await
             .expect("create native dir");
@@ -403,7 +437,7 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        let err = project_runtime_skills("codex", &runtime_root, &mounts)
+        let err = project_runtime_skills("codex", &runtime_home, &mounts)
             .await
             .expect_err("unmanaged alias collision should fail");
 
@@ -416,22 +450,22 @@ mod tests {
     #[tokio::test]
     async fn rejects_symlinked_runtime_path_components() {
         let temp_dir = tempdir().expect("temp dir");
-        let runtime_root = temp_dir.path().join("runtime");
+        let runtime_home = temp_dir.path().join("runtime-home");
         let outside_root = temp_dir.path().join("outside-home");
-        tokio::fs::create_dir_all(&runtime_root)
+        tokio::fs::create_dir_all(&runtime_home)
             .await
-            .expect("create runtime root");
+            .expect("create runtime home");
         tokio::fs::create_dir_all(&outside_root)
             .await
             .expect("create outside root");
         tokio::task::spawn_blocking({
-            let home_link = runtime_root.join("home");
+            let codex_link = runtime_home.join(".codex");
             let outside_root = outside_root.clone();
-            move || std::os::unix::fs::symlink(outside_root, home_link)
+            move || std::os::unix::fs::symlink(outside_root, codex_link)
         })
         .await
-        .expect("join home symlink")
-        .expect("create home symlink");
+        .expect("join codex symlink")
+        .expect("create codex symlink");
 
         let mounts = vec![MountSpec {
             source: temp_dir.path().join("skills/loopback"),
@@ -439,17 +473,17 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        let err = project_runtime_skills("codex", &runtime_root, &mounts)
+        let err = project_runtime_skills("codex", &runtime_home, &mounts)
             .await
-            .expect_err("reject symlinked home");
+            .expect_err("reject symlinked Codex home");
         assert!(
             err.to_string().contains("refuses symlinked path component"),
             "unexpected error: {err:#}"
         );
         assert!(
-            !tokio::fs::try_exists(outside_root.join(".codex"))
+            !tokio::fs::try_exists(outside_root.join("skills"))
                 .await
-                .expect("check outside codex dir"),
+                .expect("check outside skill dir"),
             "projection must not follow runtime-owned symlinks"
         );
     }

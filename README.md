@@ -92,18 +92,22 @@ lionclaw run --runtime-tui
 
 That path still goes through LionClaw's runtime plan, mounts, staged auth,
 generated memory/continuity context, and audit trail. LionClaw writes that
-context into the runtime-private state as both `AGENTS.generated.md` and the
-runtime-standard `AGENTS.md`. For Codex, LionClaw uses the outer container as
-the sandbox boundary and starts the inner Codex UI without Codex's own
-sandbox/approval layer; the runtime-private Codex config marks the container
-workspace as trusted so project-local Codex config and hooks behave like an
-approved native Codex launch without importing or mutating the host Codex
-config. Completed Codex and OpenCode native UI turns are reconciled from
-durable runtime state into LionClaw session history on exit. OpenCode receives
-its runtime config under `/runtime` and starts with its auto-update prompt
-disabled, so runtime updates stay under LionClaw's runtime image path. If a
-prior native launch did not finish cleanly, LionClaw reconciles before the next
-launch; prior LionClaw session history is then included in the generated
+context into session-scoped runtime control state as both `AGENTS.generated.md`
+and the runtime-standard `AGENTS.md`. The runtime's native private home is
+mounted separately at `/runtime/home` and persists across LionClaw sessions for
+the same project, runtime, compatibility identity, and execution security shape
+including workspace access, network mode, secret mounts, and escape classes. For
+Codex, LionClaw uses the outer container as the sandbox boundary and starts the
+inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
+config overrides mark the container workspace as trusted and disable update
+checks without rewriting the runtime-owned Codex config. Completed Codex and
+OpenCode native UI turns are reconciled from durable runtime state into
+LionClaw session history on exit. OpenCode uses the persistent HOME/XDG roots
+under `/runtime/home`; LionClaw points `OPENCODE_CONFIG` at a generated
+session-scoped config file that loads `/runtime/AGENTS.md`, and disables the
+auto-update prompt so runtime updates stay under LionClaw's runtime image path.
+If a prior native launch did not finish cleanly, LionClaw reconciles before the
+next launch; prior LionClaw session history is then included in the generated
 runtime context.
 LionClaw does not scrape terminal output.
 Because this is the runtime's own TUI, there is no LionClaw command layer
@@ -140,7 +144,9 @@ lionclaw run
 In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
 for the line-oriented interactive path, or `lionclaw run --runtime-tui` to
 attach directly to the selected runtime's own terminal UI inside the LionClaw
-boundary.
+boundary. Interactive terminal launches resume the latest LionClaw session by
+default; pass `--new-session` to start a fresh LionClaw session while keeping
+the persistent runtime-native home.
 
 Inside the console, `Tab` and `Shift+Tab` move between Run and controls.
 `Ctrl+O` focuses controls, `Left` and `Right` cycle project, runtime, boundary,
@@ -173,12 +179,18 @@ files needed for the confined launch.
 Confined runtime layout:
 
 - `/workspace`: selected work root
-- `/runtime`: runtime-private writable state
-- `/drafts`: runtime-private draft/output area
+- `/runtime`: session-scoped LionClaw runtime control state
+- `/runtime/home`: persistent runtime-native private home
+- `/drafts`: project-scoped draft/output area
 - `/lionclaw/project/instances.json`: read-only project instance inventory,
   present for project-backed program runtimes
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets
 - `/mnt/<target>`: optional operator-configured extra directories
+
+`/runtime/home` can contain runtime auth, config, databases, caches, and
+history. LionClaw does not treat the whole native home as an artifact or
+`channel.send` attachment root; only runtime control state and explicit
+generated-artifact directories are exportable.
 
 Network policy is intentionally coarse today: `on` or `none`. `on` uses the
 Podman network namespace, not host networking.

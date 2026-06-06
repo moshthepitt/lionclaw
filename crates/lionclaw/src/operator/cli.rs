@@ -163,8 +163,14 @@ struct RunArgs {
         help = "Attach directly to the selected runtime's own terminal UI"
     )]
     runtime_tui: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "new_session")]
     continue_last_session: bool,
+    #[arg(
+        long,
+        conflicts_with = "continue_last_session",
+        help = "Start a fresh LionClaw session instead of resuming the latest interactive session"
+    )]
+    new_session: bool,
     #[arg(
         long,
         conflicts_with = "runtime_tui",
@@ -877,28 +883,28 @@ pub async fn run() -> Result<ExitCode> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_turn_timeout);
+            let stdin_is_terminal = std::io::stdin().is_terminal();
+            let stdout_is_terminal = std::io::stdout().is_terminal();
             if args.runtime_tui {
-                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                if !stdin_is_terminal || !stdout_is_terminal {
                     bail!("run --runtime-tui requires terminal stdin and stdout");
                 }
+                let continue_last_session = should_continue_run_session(&args, true);
                 run_runtime_tui(RunRuntimeTuiInvocation {
                     home: &target.instance_home,
                     work_root: target.require_work_root()?,
                     instance_name: target.instance_name.as_deref(),
                     project_instance_runtime: target.project_instance_runtime_context()?,
                     requested_runtime: args.runtime,
-                    continue_last_session: args.continue_last_session,
+                    continue_last_session,
                 })
                 .await?;
-            } else if should_use_run_tui(
-                &args,
-                std::io::stdin().is_terminal(),
-                std::io::stdout().is_terminal(),
-            ) {
+            } else if should_use_run_tui(&args, stdin_is_terminal, stdout_is_terminal) {
+                let continue_last_session = should_continue_run_session(&args, true);
                 let outcome = run_console(RunConsoleInvocation {
                     target,
                     requested_runtime: args.runtime,
-                    continue_last_session: args.continue_last_session,
+                    continue_last_session,
                     timeout_override,
                 })
                 .await?;
@@ -906,6 +912,8 @@ pub async fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             } else {
+                let continue_last_session =
+                    should_continue_run_session(&args, stdin_is_terminal && stdout_is_terminal);
                 Box::pin(run_local(RunLocalInvocation {
                     home: &target.instance_home,
                     project_root: target.project_root.as_deref(),
@@ -913,7 +921,7 @@ pub async fn run() -> Result<ExitCode> {
                     instance_name: target.instance_name.as_deref(),
                     project_instance_runtime: target.project_instance_runtime_context()?,
                     requested_runtime: args.runtime,
-                    continue_last_session: args.continue_last_session,
+                    continue_last_session,
                     timeout_override,
                 }))
                 .await?;
@@ -1765,6 +1773,13 @@ pub async fn run() -> Result<ExitCode> {
 
 fn should_use_run_tui(args: &RunArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
     !args.plain && !args.runtime_tui && stdin_is_terminal && stdout_is_terminal
+}
+
+fn should_continue_run_session(args: &RunArgs, interactive_tui: bool) -> bool {
+    if args.new_session {
+        return false;
+    }
+    args.continue_last_session || interactive_tui
 }
 
 fn empty_project_for_tui_launch_blocker(selection: &TargetSelection) -> Option<PathBuf> {
@@ -2963,6 +2978,7 @@ mod tests {
                     plain: false,
                     runtime_tui: false,
                     continue_last_session: false,
+                    new_session: false,
                     timeout: None,
                     runtime: None,
                 }),
@@ -3088,6 +3104,7 @@ mod tests {
             plain: false,
             runtime_tui: false,
             continue_last_session: false,
+            new_session: false,
             timeout: None,
             runtime: None,
         });
@@ -3115,6 +3132,7 @@ mod tests {
             plain: false,
             runtime_tui: false,
             continue_last_session: false,
+            new_session: false,
             timeout: None,
             runtime: None,
         };
@@ -3122,6 +3140,7 @@ mod tests {
             plain: true,
             runtime_tui: false,
             continue_last_session: false,
+            new_session: false,
             timeout: None,
             runtime: None,
         };
@@ -3129,6 +3148,7 @@ mod tests {
             plain: false,
             runtime_tui: true,
             continue_last_session: false,
+            new_session: false,
             timeout: None,
             runtime: None,
         };
@@ -3141,12 +3161,72 @@ mod tests {
     }
 
     #[test]
+    fn run_resume_defaults_follow_interactive_mode() {
+        let default_args = RunArgs {
+            plain: false,
+            runtime_tui: false,
+            continue_last_session: false,
+            new_session: false,
+            timeout: None,
+            runtime: None,
+        };
+        let continue_args = RunArgs {
+            plain: false,
+            runtime_tui: false,
+            continue_last_session: true,
+            new_session: false,
+            timeout: None,
+            runtime: None,
+        };
+        let new_session_args = RunArgs {
+            plain: false,
+            runtime_tui: false,
+            continue_last_session: false,
+            new_session: true,
+            timeout: None,
+            runtime: None,
+        };
+
+        assert!(should_continue_run_session(&default_args, true));
+        assert!(!should_continue_run_session(&default_args, false));
+        assert!(should_continue_run_session(&continue_args, false));
+        assert!(!should_continue_run_session(&new_session_args, true));
+    }
+
+    #[test]
+    fn terminal_plain_mode_is_interactive_for_resume_defaults() {
+        let args = RunArgs {
+            plain: true,
+            runtime_tui: false,
+            continue_last_session: false,
+            new_session: false,
+            timeout: None,
+            runtime: None,
+        };
+
+        assert!(should_continue_run_session(&args, true));
+        assert!(!should_continue_run_session(&args, false));
+    }
+
+    #[test]
     fn run_runtime_tui_parse_conflicts_with_plain_mode() {
         assert!(Cli::try_parse_from(["lionclaw", "run", "--runtime-tui"]).is_ok());
         assert!(Cli::try_parse_from(["lionclaw", "run", "--plain", "--runtime-tui"]).is_err());
         assert!(
             Cli::try_parse_from(["lionclaw", "run", "--runtime-tui", "--timeout", "30s"]).is_err()
         );
+    }
+
+    #[test]
+    fn run_new_session_parse_conflicts_with_continue_last_session() {
+        assert!(Cli::try_parse_from(["lionclaw", "run", "--new-session"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "run",
+            "--new-session",
+            "--continue-last-session",
+        ])
+        .is_err());
     }
 
     #[test]
