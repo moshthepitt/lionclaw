@@ -2,10 +2,11 @@ use serde_json::{json, Value};
 
 use crate::{
     contracts::{SessionHistoryPolicy, TrustTier},
+    kernel::private_context_projection::ProjectedContextClass,
     workspace::AGENTS_FILE,
 };
 
-pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 3;
+pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 4;
 pub(crate) const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
 const GENERATED_KERNEL_POLICY: &str = "kernel_policy";
@@ -25,6 +26,10 @@ const MAIN_CONSERVATIVE_TRANSCRIPT_BUDGET: usize = 6_144;
 const UNTRUSTED_INTERACTIVE_TRANSCRIPT_BUDGET: usize = 4_096;
 const UNTRUSTED_CONSERVATIVE_TRANSCRIPT_BUDGET: usize = 2_048;
 const AGENTS_MAIN_BUDGET: usize = 4096;
+const ASSISTANT_PROFILE_MAIN_INTERACTIVE_BUDGET: usize = 1024;
+const ASSISTANT_PROFILE_MAIN_CONSERVATIVE_BUDGET: usize = 512;
+const USER_PROFILE_MAIN_INTERACTIVE_BUDGET: usize = 2048;
+const USER_PROFILE_MAIN_CONSERVATIVE_BUDGET: usize = 1024;
 const MEMORY_MAIN_INTERACTIVE_BUDGET: usize = 4096;
 const MEMORY_MAIN_CONSERVATIVE_BUDGET: usize = 2048;
 const ACTIVE_MAIN_BUDGET: usize = 2048;
@@ -36,6 +41,7 @@ const HANDOFF_UNTRUSTED_INTERACTIVE_BUDGET: usize = 1024;
 const HANDOFF_UNTRUSTED_CONSERVATIVE_BUDGET: usize = 512;
 const GENERATED_NOTE_BUDGET: usize = 4096;
 const CURRENT_INPUT_BUDGET: usize = 64 * 1024;
+pub(crate) const PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptContextMode {
@@ -60,6 +66,8 @@ impl PromptContextMode {
 pub(crate) enum ContextClass {
     Kernel,
     WorkspaceRules,
+    AssistantProfile,
+    UserProfile,
     Memory,
     ActiveContinuity,
     SessionHandoff,
@@ -73,6 +81,8 @@ impl ContextClass {
         match self {
             Self::Kernel => "kernel",
             Self::WorkspaceRules => "workspace_rules",
+            Self::AssistantProfile => "assistant_profile",
+            Self::UserProfile => "user_profile",
             Self::Memory => "memory",
             Self::ActiveContinuity => "active_continuity",
             Self::SessionHandoff => "session_handoff",
@@ -88,6 +98,8 @@ pub(crate) enum ContextItemId {
     KernelPolicy,
     WorkspaceRules,
     SafeWorkspaceRules,
+    AssistantProfile,
+    UserProfile,
     MemoryContext,
     ActiveContinuity,
     SessionHandoff,
@@ -105,6 +117,8 @@ impl ContextItemId {
             Self::KernelPolicy => "kernel_policy",
             Self::WorkspaceRules => "workspace_rules",
             Self::SafeWorkspaceRules => "safe_workspace_rules",
+            Self::AssistantProfile => "assistant_profile",
+            Self::UserProfile => "user_profile",
             Self::MemoryContext => "memory_context",
             Self::ActiveContinuity => "active_continuity",
             Self::SessionHandoff => "session_handoff",
@@ -114,6 +128,15 @@ impl ContextItemId {
             Self::DraftOutputsNote => "draft_outputs_note",
             Self::RuntimeSecretsNote => "runtime_secrets_note",
             Self::UserInput => "user_input",
+        }
+    }
+
+    pub(crate) fn projected_class(self) -> Option<ProjectedContextClass> {
+        match self {
+            Self::AssistantProfile => Some(ProjectedContextClass::AssistantProfile),
+            Self::UserProfile => Some(ProjectedContextClass::UserProfile),
+            Self::MemoryContext => Some(ProjectedContextClass::Memory),
+            _ => None,
         }
     }
 }
@@ -266,6 +289,27 @@ impl PromptContextPolicy {
             (
                 TrustTier::Main,
                 SessionHistoryPolicy::Interactive,
+                ContextItemId::AssistantProfile,
+                _,
+            ) => ASSISTANT_PROFILE_MAIN_INTERACTIVE_BUDGET,
+            (
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+                ContextItemId::AssistantProfile,
+                _,
+            ) => ASSISTANT_PROFILE_MAIN_CONSERVATIVE_BUDGET,
+            (TrustTier::Main, SessionHistoryPolicy::Interactive, ContextItemId::UserProfile, _) => {
+                USER_PROFILE_MAIN_INTERACTIVE_BUDGET
+            }
+            (
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+                ContextItemId::UserProfile,
+                _,
+            ) => USER_PROFILE_MAIN_CONSERVATIVE_BUDGET,
+            (
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
                 ContextItemId::MemoryContext,
                 _,
             ) => MEMORY_MAIN_INTERACTIVE_BUDGET,
@@ -355,6 +399,20 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
             class: ContextClass::WorkspaceRules,
             source: ContextSource::Generated(GENERATED_SAFE_WORKSPACE_RULES),
             required: true,
+        },
+        ContextItemSpec {
+            id: ContextItemId::AssistantProfile,
+            title: "Assistant Profile",
+            class: ContextClass::AssistantProfile,
+            source: ContextSource::PrivateContextProjection,
+            required: false,
+        },
+        ContextItemSpec {
+            id: ContextItemId::UserProfile,
+            title: "User Profile",
+            class: ContextClass::UserProfile,
+            source: ContextSource::PrivateContextProjection,
+            required: false,
         },
         ContextItemSpec {
             id: ContextItemId::MemoryContext,
@@ -543,55 +601,77 @@ pub(crate) struct PromptContextCap {
 pub(crate) struct PromptContextPrivateContextProjectionAudit {
     pub status: &'static str,
     pub projector_id: Option<String>,
-    pub item_count: usize,
+    pub project_scope: String,
     pub source_count: usize,
+    pub current_input_included_bytes: usize,
+    pub current_input_original_bytes: usize,
+    pub current_input_was_capped: bool,
+    pub classes: Vec<PromptContextPrivateContextProjectionClassAudit>,
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptContextPrivateContextProjectionClassAudit {
+    pub class: ProjectedContextClass,
+    pub item_count: usize,
     pub requested_max_items: usize,
     pub requested_max_bytes: usize,
     pub projected_bytes: usize,
+    pub accepted_bytes: usize,
     pub included_bytes: usize,
     pub original_bytes: usize,
     pub was_capped: bool,
-    pub reason: Option<&'static str>,
 }
 
 impl PromptContextPrivateContextProjectionAudit {
     pub(crate) fn new(
         status: &'static str,
         projector_id: Option<String>,
+        project_scope: impl Into<String>,
         source_count: usize,
-        requested_max_items: usize,
-        requested_max_bytes: usize,
+        classes: Vec<PromptContextPrivateContextProjectionClassAudit>,
     ) -> Self {
         Self {
             status,
             projector_id,
-            item_count: 0,
+            project_scope: project_scope.into(),
             source_count,
-            requested_max_items,
-            requested_max_bytes,
-            projected_bytes: 0,
-            included_bytes: 0,
-            original_bytes: 0,
-            was_capped: false,
+            current_input_included_bytes: 0,
+            current_input_original_bytes: 0,
+            current_input_was_capped: false,
+            classes,
             reason: None,
         }
     }
 
-    pub(crate) fn with_counts(mut self, item_count: usize, projected_bytes: usize) -> Self {
-        self.item_count = item_count;
-        self.projected_bytes = projected_bytes;
-        self
-    }
-
-    pub(crate) fn with_rendered_bytes(
+    pub(crate) fn with_current_input(
         mut self,
         included_bytes: usize,
         original_bytes: usize,
         was_capped: bool,
     ) -> Self {
-        self.included_bytes = included_bytes;
-        self.original_bytes = original_bytes;
-        self.was_capped = was_capped;
+        self.current_input_included_bytes = included_bytes;
+        self.current_input_original_bytes = original_bytes;
+        self.current_input_was_capped = was_capped;
+        self
+    }
+
+    pub(crate) fn with_rendered_bytes(
+        mut self,
+        class: ProjectedContextClass,
+        included_bytes: usize,
+        original_bytes: usize,
+        was_capped: bool,
+    ) -> Self {
+        if let Some(summary) = self
+            .classes
+            .iter_mut()
+            .find(|summary| summary.class == class)
+        {
+            summary.included_bytes = included_bytes;
+            summary.original_bytes = original_bytes;
+            summary.was_capped |= was_capped;
+        }
         self
     }
 
@@ -718,16 +798,30 @@ fn private_context_projection_json(item: &PromptContextPrivateContextProjectionA
     json!({
         "status": item.status,
         "projector_id": item.projector_id,
-        "item_count": item.item_count,
+        "project_scope": item.project_scope,
         "source_count": item.source_count,
+        "current_input_included_bytes": item.current_input_included_bytes,
+        "current_input_original_bytes": item.current_input_original_bytes,
+        "current_input_was_capped": item.current_input_was_capped,
+        "classes": item.classes.iter().map(private_context_projection_class_json).collect::<Vec<_>>(),
+        "reason": item.reason,
+    })
+}
+
+fn private_context_projection_class_json(
+    item: &PromptContextPrivateContextProjectionClassAudit,
+) -> Value {
+    json!({
+        "class": item.class.as_str(),
+        "item_count": item.item_count,
         "requested_max_items": item.requested_max_items,
         "requested_max_bytes": item.requested_max_bytes,
         "projected_bytes": item.projected_bytes,
+        "accepted_bytes": item.accepted_bytes,
         "included_bytes": item.included_bytes,
         "original_bytes": item.original_bytes,
         "was_capped": item.was_capped,
         "cap_status": if item.was_capped { "capped" } else { "uncapped" },
-        "reason": item.reason,
     })
 }
 
@@ -875,12 +969,25 @@ mod tests {
             "codex",
         );
         assert_eq!(policy.transcript_tail_limit, 12);
-        let memory = context_item_specs(PromptContextMode::ProgramPrimary)
-            .into_iter()
-            .find(|item| item.id == ContextItemId::MemoryContext)
-            .expect("memory context item");
-        assert!(policy.allows(&memory).is_ok());
-        assert_eq!(policy.max_bytes(&memory), MEMORY_MAIN_INTERACTIVE_BUDGET);
+        let items = context_item_specs(PromptContextMode::ProgramPrimary);
+        for (id, budget) in [
+            (
+                ContextItemId::AssistantProfile,
+                ASSISTANT_PROFILE_MAIN_INTERACTIVE_BUDGET,
+            ),
+            (
+                ContextItemId::UserProfile,
+                USER_PROFILE_MAIN_INTERACTIVE_BUDGET,
+            ),
+            (ContextItemId::MemoryContext, MEMORY_MAIN_INTERACTIVE_BUDGET),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("missing {}", id.as_str()));
+            assert!(policy.allows(item).is_ok());
+            assert_eq!(policy.max_bytes(item), budget);
+        }
     }
 
     #[test]
@@ -897,12 +1004,19 @@ mod tests {
             PromptContextMode::ProgramPrimary,
             "codex",
         );
-        let memory = context_item_specs(PromptContextMode::ProgramPrimary)
-            .into_iter()
-            .find(|item| item.id == ContextItemId::MemoryContext)
-            .expect("memory context item");
+        let items = context_item_specs(PromptContextMode::ProgramPrimary);
         assert!(conservative.transcript_tail_limit < interactive.transcript_tail_limit);
-        assert!(conservative.max_bytes(&memory) < interactive.max_bytes(&memory));
+        for id in [
+            ContextItemId::AssistantProfile,
+            ContextItemId::UserProfile,
+            ContextItemId::MemoryContext,
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("missing {}", id.as_str()));
+            assert!(conservative.max_bytes(item) < interactive.max_bytes(item));
+        }
     }
 
     #[test]
@@ -914,7 +1028,12 @@ mod tests {
             "codex",
         );
         let items = context_item_specs(PromptContextMode::ProgramPrimary);
-        for id in [ContextItemId::WorkspaceRules, ContextItemId::MemoryContext] {
+        for id in [
+            ContextItemId::WorkspaceRules,
+            ContextItemId::AssistantProfile,
+            ContextItemId::UserProfile,
+            ContextItemId::MemoryContext,
+        ] {
             let item = items
                 .iter()
                 .find(|item| item.id == id)
@@ -1160,6 +1279,16 @@ mod tests {
                     ContextSource::Generated(GENERATED_SAFE_WORKSPACE_RULES)
                 );
                 assert!(item.required);
+            }
+            ContextItemId::AssistantProfile => {
+                assert_eq!(item.class, ContextClass::AssistantProfile);
+                assert_eq!(item.source, ContextSource::PrivateContextProjection);
+                assert!(!item.required);
+            }
+            ContextItemId::UserProfile => {
+                assert_eq!(item.class, ContextClass::UserProfile);
+                assert_eq!(item.source, ContextSource::PrivateContextProjection);
+                assert!(!item.required);
             }
             ContextItemId::MemoryContext => {
                 assert_eq!(item.class, ContextClass::Memory);

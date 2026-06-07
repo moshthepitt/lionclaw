@@ -94,7 +94,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.prompt_context`: session-aware prompt context policy, section capping, and audit metadata for runtime-visible context.
-- `kernel.private_context_projection`: candidate-only private context projection boundary from kernel-owned records into prompt-context policy.
+- `kernel.private_context_projection`: classed private context projection boundary from kernel-owned records into prompt-context policy.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
 - `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
@@ -711,9 +711,12 @@ names, classes, sources, reasons, byte counts, and the prompt context policy
 version. Policy version 2 removes the legacy direct private workspace prompt
 file slots from selection and audit decisions. Policy version 3 renames the
 projector audit field and source from memory projection to private context
-projection. It does not store prompt body content or content hashes. Current
-user input is also budgeted; LionClaw rejects over-budget input instead of
-silently truncating operator intent.
+projection. Policy version 4 makes private context projection class-scoped,
+adding assistant profile, user profile, and memory classes with per-class
+budget audit plus capped current-input metadata for projector requests. It
+does not store prompt body content or content hashes. Current user input is
+also budgeted; LionClaw rejects over-budget input instead of silently
+truncating operator intent.
 
 ### Daemon Metadata
 
@@ -995,8 +998,9 @@ The assistant home workspace contains:
 `MEMORY.md` remains a visible continuity record and search surface, but it is
 not a magic runtime prompt input. LionClaw does not remember by stuffing files
 into prompts. The kernel records what happened, lets controlled private context
-projectors derive candidate memory from exact kernel-selected source refs, and
-admits those candidates only through audited prompt context policy.
+projectors derive classed private context from exact kernel-selected source
+refs, and admits those projected items only through audited prompt context
+policy.
 
 Private context projector selection is explicit operator config:
 
@@ -1036,25 +1040,34 @@ subprocesses that remain in that inherited group; projector commands must not
 daemonize, call `setsid` or `setpgid` to detach helpers, or leave unmanaged
 background work behind.
 
-The v1 protocol is JSONL. The kernel writes one `PrivateContextProjectionRequest` JSON
-object per line to projector stdin and reads one `PrivateContextProjection` JSON object
-per line from stdout. Each request carries a fresh `request_id`, and each
-response must echo the same id. There is no `protocol_version` field in v1.
-Unknown response fields are ignored. Only one request is in flight at a time.
-The request timeout is a kernel constant, not skill config. Crash, EOF,
-malformed JSON, missing required fields, unknown enum values, wrong request id,
-wrong projector id, invalid provenance, empty text, oversized output, and timeout
-all omit the Memory section safely. Timeouts audit as `projector_timeout`;
-other projector process failures audit as `projector_failed`. Fatal protocol
-failures and timeouts retire the resident process before a later projection can
-start, so a late response cannot satisfy a future request.
+The v1 protocol is JSONL. The kernel writes one
+`PrivateContextProjectionRequest` JSON object per line to projector stdin and
+reads one `PrivateContextProjection` JSON object per line from stdout. Each
+request carries a fresh `request_id`, `project_scope`, runtime/session policy,
+kernel-selected source refs, optional capped `current_input`, and explicit
+`requested_classes` budgets for `assistant_profile`, `user_profile`, and
+`memory`. Each response must echo the same id and tag every returned item with
+one requested class. There is no `protocol_version` field in v1. Unknown
+response fields are ignored. Only one request is in flight at a time. The
+request timeout is a kernel constant, not skill config.
 
-Projector output is candidate context only. `PromptContextPolicy` remains the
+Crash, EOF, malformed JSON, missing required fields, unknown enum values, wrong
+request id, wrong projector id, unrequested classes, invalid provenance, empty
+text, and timeout omit projected private context safely. Projected output that
+exceeds a requested class budget is deterministically capped or dropped within
+that class instead of invalidating the whole response. Timeouts audit as
+`projector_timeout`; other projector process failures audit as
+`projector_failed`. Fatal protocol failures and timeouts retire the resident
+process before a later projection can start, so a late response cannot satisfy
+a future request.
+
+Projector output is projected context only. `PromptContextPolicy` remains the
 final owner of trust-tier exclusion, byte caps, rendering, whole-section
 omission on invalid output, and prompt-context audit metadata. Audit records
-projector metadata and status counts, never memory body text. Projector stdout
-is the protocol stream; stderr may be drained only as bounded operational
-diagnostics and must not enter prompt text or prompt-context audit body fields.
+projector metadata, requested class budgets, source counts, current-input byte
+counts, and cap status, never projected body text. Projector stdout is the
+protocol stream; stderr may be drained only as bounded operational diagnostics
+and must not enter prompt text or prompt-context audit body fields.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.
 Daily notes, artifacts, proposals, and open loops are visible Markdown records,

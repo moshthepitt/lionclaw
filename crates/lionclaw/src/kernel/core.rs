@@ -125,15 +125,18 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     private_context_projection::{
-        validate_private_context_projection, PrivateContextProjectionRequest,
-        PrivateContextProjector, PrivateContextSourceRef, ProjectedContextItem,
+        validate_private_context_projection, PrivateContextClassBudget, PrivateContextCurrentInput,
+        PrivateContextProjectionRequest, PrivateContextProjector, PrivateContextSourceRef,
+        ProjectedContextClass, ProjectedContextItem, ValidPrivateContextClassProjection,
         PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
     },
     private_context_projector_service::private_context_projector_for_applied_state,
     prompt_context::{
         cap_utf8_at_line_boundary, context_item_specs, ContextItemId, ContextItemSpec,
         ContextSource, PromptContextAudit, PromptContextBuild, PromptContextMode,
-        PromptContextPolicy, PromptContextPrivateContextProjectionAudit, ACTIVE_CONTEXT_FILE,
+        PromptContextPolicy, PromptContextPrivateContextProjectionAudit,
+        PromptContextPrivateContextProjectionClassAudit, ACTIVE_CONTEXT_FILE,
+        PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET,
     },
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
@@ -8064,6 +8067,9 @@ mod tests {
     const AGENTS_MAIN_ONLY: &str = "AGENTS_MAIN_ONLY_OPERATOR_RULE";
     const PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY: &str =
         "PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR";
+    const PRIVATE_CONTEXT_ASSISTANT_PROFILE: &str =
+        "PRIVATE_CONTEXT_ASSISTANT_PROFILE_SHOULD_APPEAR";
+    const PRIVATE_CONTEXT_USER_PROFILE: &str = "PRIVATE_CONTEXT_USER_PROFILE_SHOULD_APPEAR";
     const PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED: &str =
         "PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR";
     const CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY: &str =
@@ -8316,8 +8322,12 @@ mod tests {
         (fixture, state_dir)
     }
 
-    fn memory_candidate(text: impl Into<String>) -> ProjectedContextItem {
+    fn projected_context_item(
+        class: ProjectedContextClass,
+        text: impl Into<String>,
+    ) -> ProjectedContextItem {
         ProjectedContextItem {
+            class,
             kind: ProjectedContextItemKind::StableFact,
             text: text.into(),
             provenance: vec![ProjectedContextProvenance {
@@ -8326,6 +8336,10 @@ mod tests {
                 event_id: None,
             }],
         }
+    }
+
+    fn memory_candidate(text: impl Into<String>) -> ProjectedContextItem {
+        projected_context_item(ProjectedContextClass::Memory, text)
     }
 
     async fn open_prompt_context_session(
@@ -8459,6 +8473,8 @@ mod tests {
             BROAD_MEMORY,
             ACTIVE_ALLOWED,
             ACTIVE_AFTER_CAP,
+            PRIVATE_CONTEXT_ASSISTANT_PROFILE,
+            PRIVATE_CONTEXT_USER_PROFILE,
             PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
             PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED,
             CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
@@ -8675,11 +8691,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_prompt_main_renders_private_context_projector_output_through_memory_context() {
-        let (projector, requests) =
-            TestPrivateContextProjector::with_items(vec![memory_candidate(
-                PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
-            )]);
+    async fn program_prompt_main_renders_private_context_projector_classes() {
+        let (projector, requests) = TestPrivateContextProjector::with_items(vec![
+            projected_context_item(
+                ProjectedContextClass::AssistantProfile,
+                PRIVATE_CONTEXT_ASSISTANT_PROFILE,
+            ),
+            projected_context_item(
+                ProjectedContextClass::UserProfile,
+                PRIVATE_CONTEXT_USER_PROFILE,
+            ),
+            memory_candidate(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY),
+        ]);
         let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
         let session = open_prompt_context_session(
             &fixture.kernel,
@@ -8689,28 +8712,63 @@ mod tests {
         .await;
         record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
 
-        let build =
-            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
-                .await;
+        let user_text = "CURRENT_INPUT_FOR_PRIVATE_CONTEXT_PROJECTOR";
+        let build = build_test_prompt_context(
+            &fixture,
+            &session,
+            PromptContextMode::ProgramPrimary,
+            user_text,
+        )
+        .await;
         let rendered = rendered_prompt(&build);
         let audit_json = prompt_context_audit_json(&build);
 
+        assert!(rendered.contains("## Assistant Profile"), "{rendered}");
+        assert!(rendered.contains("## User Profile"), "{rendered}");
         assert!(rendered.contains("## Memory"), "{rendered}");
+        assert!(
+            rendered.contains(PRIVATE_CONTEXT_ASSISTANT_PROFILE),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(PRIVATE_CONTEXT_USER_PROFILE),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY),
             "{rendered}"
         );
+        assert_prompt_contains_in_order(&rendered, "## Assistant Profile", "## User Profile");
+        assert_prompt_contains_in_order(&rendered, "## User Profile", "## Memory");
+        assert_prompt_contains_in_order(&rendered, "## Memory", "## User Input");
         assert!(!rendered.contains(BROAD_MEMORY), "{rendered}");
+        assert!(build.audit.included.iter().any(|item| {
+            item.id == ContextItemId::AssistantProfile
+                && item.source == ContextSource::PrivateContextProjection
+                && item.class.as_str() == "assistant_profile"
+        }));
+        assert!(build.audit.included.iter().any(|item| {
+            item.id == ContextItemId::UserProfile
+                && item.source == ContextSource::PrivateContextProjection
+                && item.class.as_str() == "user_profile"
+        }));
         assert!(build.audit.included.iter().any(|item| {
             item.id == ContextItemId::MemoryContext
                 && item.source == ContextSource::PrivateContextProjection
                 && item.class.as_str() == "memory"
         }));
         assert!(audit_json.contains("\"projector_id\":\"test_private_context_projector\""));
-        assert!(audit_json.contains("\"item_count\":1"));
+        assert!(audit_json.contains("\"project_scope\""));
+        assert!(audit_json.contains("\"class\":\"assistant_profile\""));
+        assert!(audit_json.contains("\"class\":\"user_profile\""));
+        assert!(audit_json.contains("\"class\":\"memory\""));
         assert!(audit_json.contains("\"source_count\":1"));
+        assert!(audit_json.contains("\"current_input_included_bytes\""));
         assert!(audit_json.contains("\"status\":\"included\""));
+        assert!(!audit_json.contains(PRIVATE_CONTEXT_ASSISTANT_PROFILE));
+        assert!(!audit_json.contains(PRIVATE_CONTEXT_USER_PROFILE));
         assert!(!audit_json.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY));
+        assert!(!audit_json.contains(user_text));
         assert!(!audit_json.contains(BROAD_MEMORY));
 
         let requests = requests
@@ -8718,14 +8776,37 @@ mod tests {
             .expect("private context projector request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].session_id, session.session_id);
+        assert_eq!(requests[0].project_scope, fixture.kernel.session_scope());
         assert_eq!(requests[0].runtime_id, "mock");
         assert_eq!(requests[0].trust_tier.as_str(), "main");
         assert_eq!(
             requests[0].history_policy,
             SessionHistoryPolicy::Interactive
         );
-        assert!(requests[0].max_items > 0);
-        assert!(requests[0].max_bytes > 0);
+        assert_eq!(requests[0].requested_classes.len(), 3);
+        assert!(requests[0].requested_classes.iter().any(|class| {
+            class.class == ProjectedContextClass::AssistantProfile
+                && class.max_items > 0
+                && class.max_bytes > 0
+        }));
+        assert!(requests[0].requested_classes.iter().any(|class| {
+            class.class == ProjectedContextClass::UserProfile
+                && class.max_items > 0
+                && class.max_bytes > 0
+        }));
+        assert!(requests[0].requested_classes.iter().any(|class| {
+            class.class == ProjectedContextClass::Memory
+                && class.max_items > 0
+                && class.max_bytes > 0
+        }));
+        let current_input = requests[0]
+            .current_input
+            .as_ref()
+            .expect("private context request current input");
+        assert_eq!(current_input.text, user_text);
+        assert_eq!(current_input.included_bytes, user_text.len());
+        assert_eq!(current_input.original_bytes, user_text.len());
+        assert!(!current_input.was_capped);
         assert_eq!(requests[0].sources.len(), 1);
         match &requests[0].sources[0] {
             PrivateContextSourceRef::SessionTurnRange {
@@ -8742,6 +8823,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn private_context_projector_request_caps_current_input() {
+        let (projector, requests) =
+            TestPrivateContextProjector::with_items(vec![memory_candidate(
+                PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
+            )]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let tail = "CURRENT_INPUT_TAIL_SHOULD_NOT_REACH_PROJECTOR";
+        let user_text = format!(
+            "{}\n{tail}",
+            "x".repeat(PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET + 128)
+        );
+        let build = build_test_prompt_context(
+            &fixture,
+            &session,
+            PromptContextMode::ProgramPrimary,
+            &user_text,
+        )
+        .await;
+        let audit_json = prompt_context_audit_json(&build);
+
+        let requests = requests
+            .lock()
+            .expect("private context projector request lock");
+        assert_eq!(requests.len(), 1);
+        let current_input = requests[0]
+            .current_input
+            .as_ref()
+            .expect("private context request current input");
+        assert!(current_input.was_capped);
+        assert!(current_input.included_bytes <= PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET);
+        assert_eq!(current_input.original_bytes, user_text.trim().len());
+        assert!(!current_input.text.contains(tail));
+        assert!(audit_json.contains("\"current_input_was_capped\":true"));
+        assert!(!audit_json.contains(tail));
+    }
+
+    #[tokio::test]
+    async fn over_budget_current_input_fails_before_private_context_projector_call() {
+        let (projector, requests) =
+            TestPrivateContextProjector::with_items(vec![memory_candidate(
+                PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
+            )]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let user_text = "x"
+            .repeat(current_input_budget(&session, PromptContextMode::ProgramPrimary, "mock") + 1);
+
+        let err = fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &fixture.plan,
+                PromptContextMode::ProgramPrimary,
+                Some(&user_text),
+                None,
+            )
+            .await
+            .expect_err("over-budget current input should fail before projector call");
+
+        assert!(matches!(
+            err,
+            KernelError::BadRequest(message)
+                if message.contains("user_text exceeds prompt context budget")
+        ));
+        assert!(requests
+            .lock()
+            .expect("private context projector request lock")
+            .is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn configured_private_context_projector_skill_renders_memory_context() {
@@ -8754,7 +8920,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -8811,7 +8977,7 @@ printf 'start\n' >> "$LIONCLAW_SKILL_STATE_DIR/starts"
 while IFS= read -r line; do
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -8851,7 +9017,7 @@ printf 'CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_STDERR_POISON_SHOULD_NOT_APPEAR\n' 
 while IFS= read -r line; do
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -9021,8 +9187,8 @@ done
         assert!(build.audit.excluded.iter().any(|item| {
             item.id == ContextItemId::MemoryContext && item.reason == "trust_tier_untrusted"
         }));
-        assert!(audit_json.contains("\"status\":\"policy_excluded\""));
-        assert!(audit_json.contains("\"reason\":\"trust_tier_untrusted\""));
+        assert!(audit_json.contains("\"private_context_projection\":null"));
+        assert!(!audit_json.contains("\"status\":\"policy_excluded\""));
         assert!(!audit_json.contains(PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED));
     }
 
@@ -9095,6 +9261,7 @@ done
         let (projector, _requests) = TestPrivateContextProjector::with_invalid(vec![
             memory_candidate(INVALID_MEMORY),
             ProjectedContextItem {
+                class: ProjectedContextClass::Memory,
                 kind: ProjectedContextItemKind::Preference,
                 text: " ".to_string(),
                 provenance: vec![ProjectedContextProvenance {
@@ -9130,7 +9297,7 @@ done
     }
 
     #[tokio::test]
-    async fn oversized_private_context_projector_output_omits_whole_memory_section() {
+    async fn oversized_private_context_projector_output_is_capped_by_class_budget() {
         let oversized = format!(
             "{PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY}\n{}",
             "x".repeat(5 * 1024)
@@ -9153,15 +9320,18 @@ done
         let audit_json = prompt_context_audit_json(&build);
 
         assert!(
-            !rendered.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY),
+            rendered.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY),
             "{rendered}"
         );
-        assert!(!rendered.contains("## Memory"), "{rendered}");
-        assert!(build.audit.excluded.iter().any(|item| {
-            item.id == ContextItemId::MemoryContext && item.reason == "projector_invalid_output"
-        }));
-        assert!(audit_json.contains("\"status\":\"projector_invalid_output\""));
-        assert!(audit_json.contains("\"reason\":\"too_many_bytes\""));
+        assert!(rendered.contains("## Memory"), "{rendered}");
+        assert!(!build
+            .audit
+            .excluded
+            .iter()
+            .any(|item| item.id == ContextItemId::MemoryContext));
+        assert!(audit_json.contains("\"status\":\"included\""));
+        assert!(audit_json.contains("\"class\":\"memory\""));
+        assert!(audit_json.contains("\"cap_status\":\"capped\""));
         assert!(!audit_json.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY));
     }
 
@@ -16912,29 +17082,39 @@ struct ProgramPromptEnvelopes {
     fresh_prompt: Option<String>,
 }
 
+struct PrivateContextProjectionCache {
+    items: Vec<ProjectedContextItem>,
+    audit: PromptContextPrivateContextProjectionAudit,
+}
+
+impl PrivateContextProjectionCache {
+    fn items_for(&self, class: ProjectedContextClass) -> Vec<&ProjectedContextItem> {
+        self.items
+            .iter()
+            .filter(|item| item.class == class)
+            .collect()
+    }
+}
+
 struct RenderedPromptContextItem {
     content: String,
     original_bytes: usize,
-    private_context_projection: Option<PromptContextPrivateContextProjectionAudit>,
 }
 
 enum PromptContextRenderResult {
     Rendered(RenderedPromptContextItem),
-    Omitted {
-        reason: &'static str,
-        private_context_projection: Option<PromptContextPrivateContextProjectionAudit>,
-    },
+    Omitted { reason: &'static str },
 }
 
 struct PromptContextRenderInput<'a> {
     item: &'a ContextItemSpec,
     session: &'a super::sessions::Session,
-    runtime_id: &'a str,
     execution_plan: &'a EffectiveExecutionPlan,
     user_text: Option<&'a str>,
     history_before_sequence_no: Option<u64>,
     transcript_tail_limit: usize,
     max_bytes: usize,
+    private_context_projection: Option<&'a PrivateContextProjectionCache>,
 }
 
 fn render_recent_transcript_tail_context(
@@ -16956,7 +17136,6 @@ fn render_recent_transcript_tail_context(
         return Some(RenderedPromptContextItem {
             content: original_content,
             original_bytes,
-            private_context_projection: None,
         });
     }
 
@@ -16985,22 +17164,24 @@ fn render_recent_transcript_tail_context(
     Some(RenderedPromptContextItem {
         content,
         original_bytes,
-        private_context_projection: None,
     })
 }
 
-fn render_memory_candidates(item: &ContextItemSpec, candidates: &[ProjectedContextItem]) -> String {
+fn render_projected_context_items(
+    item: &ContextItemSpec,
+    candidates: &[&ProjectedContextItem],
+) -> String {
     let mut section = format!("## {}", item.title);
     for candidate in candidates {
         section.push_str("\n\n- ");
         section.push_str(candidate.kind.title());
         section.push(':');
-        push_contained_memory_text(&mut section, &candidate.text);
+        push_contained_projected_context_text(&mut section, &candidate.text);
     }
     section
 }
 
-fn push_contained_memory_text(section: &mut String, text: &str) {
+fn push_contained_projected_context_text(section: &mut String, text: &str) {
     let normalized = text.trim().replace("\r\n", "\n").replace('\r', "\n");
     for line in normalized.lines() {
         section.push_str("\n  >");
@@ -17009,6 +17190,59 @@ fn push_contained_memory_text(section: &mut String, text: &str) {
             section.push_str(line.trim_end());
         }
     }
+}
+
+fn private_context_current_input(user_text: Option<&str>) -> Option<PrivateContextCurrentInput> {
+    let content = user_text?.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let capped = cap_utf8_at_line_boundary(content, PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET);
+    Some(PrivateContextCurrentInput {
+        text: capped.content,
+        included_bytes: capped.included_bytes,
+        original_bytes: capped.original_bytes,
+        was_capped: capped.was_capped,
+    })
+}
+
+fn private_context_class_audits_from_request(
+    request: &PrivateContextProjectionRequest,
+) -> Vec<PromptContextPrivateContextProjectionClassAudit> {
+    request
+        .requested_classes
+        .iter()
+        .map(|budget| PromptContextPrivateContextProjectionClassAudit {
+            class: budget.class,
+            item_count: 0,
+            requested_max_items: budget.max_items,
+            requested_max_bytes: budget.max_bytes,
+            projected_bytes: 0,
+            accepted_bytes: 0,
+            included_bytes: 0,
+            original_bytes: 0,
+            was_capped: false,
+        })
+        .collect()
+}
+
+fn private_context_class_audits_from_validation(
+    classes: &[ValidPrivateContextClassProjection],
+) -> Vec<PromptContextPrivateContextProjectionClassAudit> {
+    classes
+        .iter()
+        .map(|class| PromptContextPrivateContextProjectionClassAudit {
+            class: class.class,
+            item_count: class.accepted_item_count,
+            requested_max_items: class.requested_max_items,
+            requested_max_bytes: class.requested_max_bytes,
+            projected_bytes: class.projected_bytes,
+            accepted_bytes: class.accepted_bytes,
+            included_bytes: 0,
+            original_bytes: 0,
+            was_capped: class.was_capped,
+        })
+        .collect()
 }
 
 struct StartedRuntimePreTurnFailure<'a> {
@@ -17396,14 +17630,31 @@ impl Kernel {
             mode,
             "validation",
         );
-        let item = context_item_specs(mode)
-            .into_iter()
+        let items = context_item_specs(mode);
+        Self::validate_prompt_context_current_input_budget(&policy, &items, user_text)
+    }
+
+    fn validate_prompt_context_current_input_budget(
+        policy: &PromptContextPolicy,
+        items: &[ContextItemSpec],
+        user_text: &str,
+    ) -> Result<(), KernelError> {
+        let Some(item) = items
+            .iter()
             .find(|item| item.id == ContextItemId::UserInput)
-            .ok_or_else(|| {
-                KernelError::Internal("prompt context policy has no current input item".to_string())
-            })?;
-        let max_bytes = policy.max_bytes(&item);
-        let Some(rendered) = Self::render_current_user_input_context(&item, user_text) else {
+        else {
+            return Ok(());
+        };
+        if policy.allows(item).is_err() {
+            return Ok(());
+        }
+        let max_bytes = policy.max_bytes(item);
+        if max_bytes == 0 {
+            return Err(KernelError::Internal(
+                "allowed prompt context user input item has no byte budget".to_string(),
+            ));
+        }
+        let Some(rendered) = Self::render_current_user_input_context(item, user_text) else {
             return Err(KernelError::BadRequest("user_text is required".to_string()));
         };
         if cap_utf8_at_line_boundary(&rendered, max_bytes).was_capped {
@@ -21106,21 +21357,26 @@ impl Kernel {
         );
         let mut audit = PromptContextAudit::new(&policy);
         let mut sections = Vec::new();
+        let items = context_item_specs(mode);
+        if let Some(user_text) = user_text {
+            Self::validate_prompt_context_current_input_budget(&policy, &items, user_text)?;
+        }
+        let private_context_projection = self
+            .prepare_private_context_projection(
+                &items,
+                &policy,
+                session,
+                runtime_id,
+                user_text,
+                history_before_sequence_no,
+            )
+            .await?;
+        if let Some(private_context_projection) = &private_context_projection {
+            audit.record_private_context_projection(private_context_projection.audit.clone());
+        }
 
-        for item in context_item_specs(mode) {
+        for item in items {
             if let Err(decision) = policy.allows(&item) {
-                if item.id == ContextItemId::MemoryContext {
-                    audit.record_private_context_projection(
-                        PromptContextPrivateContextProjectionAudit::new(
-                            "policy_excluded",
-                            None,
-                            0,
-                            PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
-                            0,
-                        )
-                        .with_reason(decision.reason),
-                    );
-                }
                 audit.exclude(&item, decision.reason);
                 continue;
             }
@@ -21137,23 +21393,17 @@ impl Kernel {
                 .render_prompt_context_item(PromptContextRenderInput {
                     item: &item,
                     session,
-                    runtime_id,
                     execution_plan,
                     user_text,
                     history_before_sequence_no,
                     transcript_tail_limit: policy.transcript_tail_limit,
                     max_bytes,
+                    private_context_projection: private_context_projection.as_ref(),
                 })
                 .await?;
             let rendered = match render_result {
                 PromptContextRenderResult::Rendered(rendered) => rendered,
-                PromptContextRenderResult::Omitted {
-                    reason,
-                    private_context_projection,
-                } => {
-                    if let Some(private_context_projection) = private_context_projection {
-                        audit.record_private_context_projection(private_context_projection);
-                    }
+                PromptContextRenderResult::Omitted { reason } => {
                     if item.required {
                         return Err(KernelError::Internal(format!(
                             "required prompt context item '{}' was omitted: {reason}",
@@ -21181,19 +21431,7 @@ impl Kernel {
                     )));
                 }
                 audit.exclude(&item, "over_budget_excluded");
-                if let Some(private_context_projection) =
-                    rendered.private_context_projection.clone()
-                {
-                    audit.record_private_context_projection(
-                        private_context_projection
-                            .with_rendered_bytes(
-                                capped.included_bytes,
-                                capped.original_bytes,
-                                capped.was_capped,
-                            )
-                            .with_reason("over_budget_excluded"),
-                    );
-                }
+                Self::record_projected_context_render_bytes(&mut audit, &item, &capped);
                 continue;
             }
             if capped.content.trim().is_empty() {
@@ -21204,43 +21442,40 @@ impl Kernel {
                     )));
                 }
                 audit.exclude(&item, "missing_optional");
-                if let Some(private_context_projection) =
-                    rendered.private_context_projection.clone()
-                {
-                    audit.record_private_context_projection(
-                        private_context_projection
-                            .with_rendered_bytes(
-                                capped.included_bytes,
-                                capped.original_bytes,
-                                capped.was_capped,
-                            )
-                            .with_reason("missing_optional"),
-                    );
-                }
+                Self::record_projected_context_render_bytes(&mut audit, &item, &capped);
                 continue;
             }
 
             audit.include(&item, &capped);
-            if let Some(private_context_projection) = rendered.private_context_projection {
-                audit.record_private_context_projection(
-                    private_context_projection.with_rendered_bytes(
-                        capped.included_bytes,
-                        capped.original_bytes,
-                        capped.was_capped,
-                    ),
-                );
-            }
+            Self::record_projected_context_render_bytes(&mut audit, &item, &capped);
             sections.push(capped.content);
         }
 
         Ok(PromptContextBuild { sections, audit })
     }
 
+    fn record_projected_context_render_bytes(
+        audit: &mut PromptContextAudit,
+        item: &ContextItemSpec,
+        capped: &crate::kernel::prompt_context::CappedSection,
+    ) {
+        let Some(projected_class) = item.id.projected_class() else {
+            return;
+        };
+        if let Some(projection) = audit.private_context_projection.take() {
+            audit.record_private_context_projection(projection.with_rendered_bytes(
+                projected_class,
+                capped.included_bytes,
+                capped.original_bytes,
+                capped.was_capped,
+            ));
+        }
+    }
+
     fn rendered_prompt_context_item(content: String) -> RenderedPromptContextItem {
         RenderedPromptContextItem {
             original_bytes: content.trim().len(),
             content,
-            private_context_projection: None,
         }
     }
 
@@ -21251,12 +21486,12 @@ impl Kernel {
         let PromptContextRenderInput {
             item,
             session,
-            runtime_id,
             execution_plan,
             user_text,
             history_before_sequence_no,
             transcript_tail_limit,
             max_bytes,
+            private_context_projection,
         } = input;
         match item.source {
             ContextSource::Generated(_) => Ok(Self::render_result_from_optional(
@@ -21287,17 +21522,9 @@ impl Kernel {
                     )),
                 ))
             }
-            ContextSource::PrivateContextProjection => {
-                self.render_private_context_projection_context(
-                    item,
-                    session,
-                    runtime_id,
-                    history_before_sequence_no,
-                    transcript_tail_limit,
-                    max_bytes,
-                )
-                .await
-            }
+            ContextSource::PrivateContextProjection => Ok(
+                Self::render_private_context_projection_context(item, private_context_projection),
+            ),
             ContextSource::ContinuityFile(file_name) => {
                 let Some(layout) = &self.continuity else {
                     return Ok(Self::omitted_prompt_context_item("missing_optional"));
@@ -21374,39 +21601,69 @@ impl Kernel {
     }
 
     fn omitted_prompt_context_item(reason: &'static str) -> PromptContextRenderResult {
-        PromptContextRenderResult::Omitted {
-            reason,
-            private_context_projection: None,
-        }
+        PromptContextRenderResult::Omitted { reason }
     }
 
-    async fn render_private_context_projection_context(
+    async fn prepare_private_context_projection(
         &self,
-        item: &ContextItemSpec,
+        items: &[ContextItemSpec],
+        policy: &PromptContextPolicy,
         session: &super::sessions::Session,
         runtime_id: &str,
+        user_text: Option<&str>,
         history_before_sequence_no: Option<u64>,
-        transcript_tail_limit: usize,
-        max_bytes: usize,
-    ) -> Result<PromptContextRenderResult, KernelError> {
+    ) -> Result<Option<PrivateContextProjectionCache>, KernelError> {
+        let requested_classes = items
+            .iter()
+            .filter(|item| matches!(item.source, ContextSource::PrivateContextProjection))
+            .filter(|item| policy.allows(item).is_ok())
+            .filter_map(|item| {
+                item.id
+                    .projected_class()
+                    .map(|class| PrivateContextClassBudget {
+                        class,
+                        max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
+                        max_bytes: policy.max_bytes(item),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if requested_classes.is_empty() {
+            return Ok(None);
+        }
+
         let sources = self
             .private_context_projection_sources(
                 session,
                 history_before_sequence_no,
-                transcript_tail_limit,
+                policy.transcript_tail_limit,
             )
             .await?;
+        let current_input = private_context_current_input(user_text);
         let request = PrivateContextProjectionRequest {
             request_id: uuid::Uuid::new_v4(),
             session_id: session.session_id,
+            project_scope: self.session_scope.clone(),
             runtime_id: runtime_id.to_string(),
             trust_tier: session.trust_tier.clone(),
             history_policy: session.history_policy,
-            max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
-            max_bytes,
+            requested_classes,
+            current_input: current_input.clone(),
             sources,
         };
         let source_count = request.sources.len();
+        let class_audits = private_context_class_audits_from_request(&request);
+        let current_input_included_bytes = current_input
+            .as_ref()
+            .map(|input| input.included_bytes)
+            .unwrap_or(0);
+        let current_input_original_bytes = current_input
+            .as_ref()
+            .map(|input| input.original_bytes)
+            .unwrap_or(0);
+        let current_input_was_capped = current_input
+            .as_ref()
+            .map(|input| input.was_capped)
+            .unwrap_or(false);
         let projector_id = self
             .private_context_projector
             .projector_id()
@@ -21422,19 +21679,22 @@ impl Kernel {
             Ok(projection) => projection,
             Err(err) => {
                 let status = err.audit_status();
-                return Ok(PromptContextRenderResult::Omitted {
-                    reason: status,
-                    private_context_projection: Some(
-                        PromptContextPrivateContextProjectionAudit::new(
-                            status,
-                            audited_projector_id,
-                            source_count,
-                            request.max_items,
-                            request.max_bytes,
-                        )
-                        .with_reason(err.audit_reason()),
-                    ),
-                });
+                return Ok(Some(PrivateContextProjectionCache {
+                    items: Vec::new(),
+                    audit: PromptContextPrivateContextProjectionAudit::new(
+                        status,
+                        audited_projector_id,
+                        request.project_scope.clone(),
+                        source_count,
+                        class_audits,
+                    )
+                    .with_current_input(
+                        current_input_included_bytes,
+                        current_input_original_bytes,
+                        current_input_was_capped,
+                    )
+                    .with_reason(err.audit_reason()),
+                }));
             }
         };
 
@@ -21442,62 +21702,76 @@ impl Kernel {
             match validate_private_context_projection(&request, &projector_id, &projection) {
                 Ok(validation) => validation,
                 Err(reason) => {
-                    return Ok(PromptContextRenderResult::Omitted {
-                        reason: "projector_invalid_output",
-                        private_context_projection: Some(
-                            PromptContextPrivateContextProjectionAudit::new(
-                                "projector_invalid_output",
-                                audited_projector_id,
-                                source_count,
-                                request.max_items,
-                                request.max_bytes,
-                            )
-                            .with_counts(
-                                projection.items.len(),
-                                projection.items.iter().fold(0usize, |total, candidate| {
-                                    total.saturating_add(candidate.text.len())
-                                }),
-                            )
-                            .with_reason(reason.as_str()),
-                        ),
-                    });
+                    return Ok(Some(PrivateContextProjectionCache {
+                        items: Vec::new(),
+                        audit: PromptContextPrivateContextProjectionAudit::new(
+                            "projector_invalid_output",
+                            audited_projector_id,
+                            request.project_scope.clone(),
+                            source_count,
+                            class_audits,
+                        )
+                        .with_current_input(
+                            current_input_included_bytes,
+                            current_input_original_bytes,
+                            current_input_was_capped,
+                        )
+                        .with_reason(reason.as_str()),
+                    }));
                 }
             };
 
-        if projection.items.is_empty() {
-            return Ok(PromptContextRenderResult::Omitted {
-                reason: "projector_returned_no_items",
-                private_context_projection: Some(
-                    PromptContextPrivateContextProjectionAudit::new(
-                        "projector_returned_no_items",
-                        Some(validation.projector_id),
-                        source_count,
-                        request.max_items,
-                        request.max_bytes,
-                    )
-                    .with_counts(validation.item_count, validation.projected_bytes)
-                    .with_reason("projector_returned_no_items"),
-                ),
-            });
+        let accepted_items = validation.items;
+        let status = if accepted_items.is_empty() {
+            "projector_returned_no_items"
+        } else {
+            "included"
+        };
+        let mut audit = PromptContextPrivateContextProjectionAudit::new(
+            status,
+            Some(validation.projector_id),
+            request.project_scope,
+            source_count,
+            private_context_class_audits_from_validation(&validation.classes),
+        )
+        .with_current_input(
+            current_input_included_bytes,
+            current_input_original_bytes,
+            current_input_was_capped,
+        );
+        if accepted_items.is_empty() {
+            audit = audit.with_reason("projector_returned_no_items");
         }
 
-        let content = render_memory_candidates(item, &projection.items);
-        Ok(PromptContextRenderResult::Rendered(
-            RenderedPromptContextItem {
-                original_bytes: content.trim().len(),
-                content,
-                private_context_projection: Some(
-                    PromptContextPrivateContextProjectionAudit::new(
-                        "included",
-                        Some(validation.projector_id),
-                        source_count,
-                        request.max_items,
-                        request.max_bytes,
-                    )
-                    .with_counts(validation.item_count, validation.projected_bytes),
-                ),
-            },
-        ))
+        Ok(Some(PrivateContextProjectionCache {
+            items: accepted_items,
+            audit,
+        }))
+    }
+
+    fn render_private_context_projection_context(
+        item: &ContextItemSpec,
+        projection: Option<&PrivateContextProjectionCache>,
+    ) -> PromptContextRenderResult {
+        let Some(projected_class) = item.id.projected_class() else {
+            return Self::omitted_prompt_context_item("missing_optional");
+        };
+        let Some(projection) = projection else {
+            return Self::omitted_prompt_context_item("missing_optional");
+        };
+        if projection.audit.status != "included" {
+            return Self::omitted_prompt_context_item(projection.audit.status);
+        }
+        let items = projection.items_for(projected_class);
+        if items.is_empty() {
+            return Self::omitted_prompt_context_item("projector_returned_no_items");
+        }
+
+        let content = render_projected_context_items(item, &items);
+        PromptContextRenderResult::Rendered(RenderedPromptContextItem {
+            original_bytes: content.trim().len(),
+            content,
+        })
     }
 
     async fn private_context_projection_sources(
