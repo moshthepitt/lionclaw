@@ -5,7 +5,7 @@ use crate::{
     workspace::AGENTS_FILE,
 };
 
-pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 2;
+pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 3;
 pub(crate) const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
 const GENERATED_KERNEL_POLICY: &str = "kernel_policy";
@@ -1115,6 +1115,9 @@ mod tests {
         let raw = serde_json::to_string(&details).expect("serialize audit");
         assert!(raw.contains("\"memory_context\""));
         assert!(raw.contains("\"memory\""));
+        assert!(raw.contains("\"private_context_projection\""));
+        assert!(raw.contains("\"source\":\"private_context_projection\""));
+        assert!(!raw.contains("memory_projection"));
         assert!(!raw.contains("SECRET_MEMORY_FACT_SHOULD_NOT_APPEAR"));
     }
 
