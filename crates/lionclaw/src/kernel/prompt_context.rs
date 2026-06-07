@@ -5,7 +5,7 @@ use crate::{
     workspace::AGENTS_FILE,
 };
 
-pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 1;
+pub(crate) const PROMPT_CONTEXT_POLICY_VERSION: u32 = 2;
 pub(crate) const ACTIVE_CONTEXT_FILE: &str = "continuity/ACTIVE.md";
 
 const GENERATED_KERNEL_POLICY: &str = "kernel_policy";
@@ -1111,6 +1111,7 @@ mod tests {
             },
         );
         let details = audit.to_details_json();
+        assert_eq!(details["policy_version"], PROMPT_CONTEXT_POLICY_VERSION);
         let raw = serde_json::to_string(&details).expect("serialize audit");
         assert!(raw.contains("\"memory_context\""));
         assert!(raw.contains("\"memory\""));

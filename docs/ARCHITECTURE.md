@@ -707,9 +707,11 @@ with the CLI.
 
 Prompt context selection emits `prompt.context.built` audit events. The payload
 records session policy, runtime id, context mode, included/excluded/capped item
-names, classes, sources, reasons, and byte counts. It does not store prompt
-body content or content hashes. Current user input is also budgeted; LionClaw
-rejects over-budget input instead of silently truncating operator intent.
+names, classes, sources, reasons, byte counts, and the prompt context policy
+version. Policy version 2 removes the legacy direct private workspace prompt
+file slots from selection and audit decisions. It does not store prompt body
+content or content hashes. Current user input is also budgeted; LionClaw rejects
+over-budget input instead of silently truncating operator intent.
 
 ### Daemon Metadata
 
