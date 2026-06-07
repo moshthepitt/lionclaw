@@ -1380,7 +1380,11 @@ mod tests {
 
         assert_eq!(state.config.daemon.workspace, "main");
         assert!(home.home_id_path().exists());
-        assert!(home.workspace_dir("main").join("SOUL.md").exists());
+        let workspace = home.workspace_dir("main");
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(!workspace.join("IDENTITY.md").exists());
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("USER.md").exists());
     }
 
     #[tokio::test]

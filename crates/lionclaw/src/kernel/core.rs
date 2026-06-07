@@ -8620,7 +8620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_prompt_main_includes_policy_selected_private_context() {
+    async fn program_prompt_main_ignores_legacy_private_files() {
         let fixture = prompt_context_fixture().await;
         let session = open_prompt_context_session(
             &fixture.kernel,
@@ -8635,8 +8635,8 @@ mod tests {
         let rendered = rendered_prompt(&build);
 
         assert!(rendered.contains(AGENTS_MAIN_ONLY));
-        assert!(rendered.contains(STYLE_PROFILE_LEGACY));
-        assert!(rendered.contains(SECRET_USER_FACT));
+        assert!(!rendered.contains(STYLE_PROFILE_LEGACY));
+        assert!(!rendered.contains(SECRET_USER_FACT));
         assert!(
             !rendered.contains(BROAD_MEMORY),
             "legacy MEMORY.md must not bypass the memory projector boundary:\n{rendered}"
@@ -8646,11 +8646,6 @@ mod tests {
             "{rendered}\n\nAUDIT: {}",
             prompt_context_audit_json(&build)
         );
-        assert!(build
-            .audit
-            .included
-            .iter()
-            .any(|item| item.id == ContextItemId::UserContext));
         assert!(build.audit.excluded.iter().any(|item| {
             item.id == ContextItemId::MemoryContext && item.reason == "projector_returned_no_items"
         }));
@@ -9237,13 +9232,7 @@ done
         assert!(!rendered.contains(STYLE_PROFILE_LEGACY));
         assert!(!rendered.contains(SECRET_USER_FACT));
         assert!(!rendered.contains(BROAD_MEMORY));
-        for id in [
-            ContextItemId::WorkspaceRules,
-            ContextItemId::Identity,
-            ContextItemId::StyleProfile,
-            ContextItemId::UserContext,
-            ContextItemId::MemoryContext,
-        ] {
+        for id in [ContextItemId::WorkspaceRules, ContextItemId::MemoryContext] {
             assert!(build
                 .audit
                 .excluded
@@ -10048,15 +10037,15 @@ done
         crate::workspace::bootstrap_workspace(&workspace_root)
             .await
             .expect("bootstrap workspace");
-        let outside_user = temp_dir.path().join("outside-user.md");
-        fs::write(&outside_user, "outside user context\n").expect("write outside user");
-        fs::remove_file(workspace_root.join(crate::workspace::USER_FILE))
-            .expect("remove generated user file");
+        let outside_agents = temp_dir.path().join("outside-agents.md");
+        fs::write(&outside_agents, "outside workspace rules\n").expect("write outside agents");
+        fs::remove_file(workspace_root.join(crate::workspace::AGENTS_FILE))
+            .expect("remove generated agents file");
         std::os::unix::fs::symlink(
-            &outside_user,
-            workspace_root.join(crate::workspace::USER_FILE),
+            &outside_agents,
+            workspace_root.join(crate::workspace::AGENTS_FILE),
         )
-        .expect("symlink user file");
+        .expect("symlink agents file");
 
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
