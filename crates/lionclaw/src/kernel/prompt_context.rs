@@ -123,7 +123,7 @@ pub(crate) enum ContextSource {
     Generated(&'static str),
     WorkspaceFile(&'static str),
     ContinuityFile(&'static str),
-    MemoryProjection,
+    PrivateContextProjection,
     CompactionSummary,
     TranscriptTail,
     CurrentUserInput,
@@ -135,7 +135,7 @@ impl ContextSource {
             Self::Generated(name) => format!("generated:{name}"),
             Self::WorkspaceFile(file_name) => format!("workspace_file:{file_name}"),
             Self::ContinuityFile(file_name) => format!("continuity_file:{file_name}"),
-            Self::MemoryProjection => "memory_projection".to_string(),
+            Self::PrivateContextProjection => "private_context_projection".to_string(),
             Self::CompactionSummary => "compaction_summary".to_string(),
             Self::TranscriptTail => "transcript_tail".to_string(),
             Self::CurrentUserInput => "current_user_input".to_string(),
@@ -360,7 +360,7 @@ pub(crate) fn context_item_specs(mode: PromptContextMode) -> Vec<ContextItemSpec
             id: ContextItemId::MemoryContext,
             title: "Memory",
             class: ContextClass::Memory,
-            source: ContextSource::MemoryProjection,
+            source: ContextSource::PrivateContextProjection,
             required: false,
         },
         ContextItemSpec {
@@ -540,7 +540,7 @@ pub(crate) struct PromptContextCap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptContextMemoryProjectionAudit {
+pub(crate) struct PromptContextPrivateContextProjectionAudit {
     pub status: &'static str,
     pub projector_id: Option<String>,
     pub item_count: usize,
@@ -554,7 +554,7 @@ pub(crate) struct PromptContextMemoryProjectionAudit {
     pub reason: Option<&'static str>,
 }
 
-impl PromptContextMemoryProjectionAudit {
+impl PromptContextPrivateContextProjectionAudit {
     pub(crate) fn new(
         status: &'static str,
         projector_id: Option<String>,
@@ -611,7 +611,7 @@ pub(crate) struct PromptContextAudit {
     pub included: Vec<PromptContextIncluded>,
     pub excluded: Vec<PromptContextExcluded>,
     pub capped: Vec<PromptContextCap>,
-    pub memory_projection: Option<PromptContextMemoryProjectionAudit>,
+    pub private_context_projection: Option<PromptContextPrivateContextProjectionAudit>,
     pub total_included_bytes: usize,
 }
 
@@ -626,7 +626,7 @@ impl PromptContextAudit {
             included: Vec::new(),
             excluded: Vec::new(),
             capped: Vec::new(),
-            memory_projection: None,
+            private_context_projection: None,
             total_included_bytes: 0,
         }
     }
@@ -662,11 +662,11 @@ impl PromptContextAudit {
         });
     }
 
-    pub(crate) fn record_memory_projection(
+    pub(crate) fn record_private_context_projection(
         &mut self,
-        projection: PromptContextMemoryProjectionAudit,
+        projection: PromptContextPrivateContextProjectionAudit,
     ) {
-        self.memory_projection = Some(projection);
+        self.private_context_projection = Some(projection);
     }
 
     pub(crate) fn to_details_json(&self) -> Value {
@@ -679,7 +679,7 @@ impl PromptContextAudit {
             "included": self.included.iter().map(included_json).collect::<Vec<_>>(),
             "excluded": self.excluded.iter().map(excluded_json).collect::<Vec<_>>(),
             "capped": self.capped.iter().map(cap_json).collect::<Vec<_>>(),
-            "memory_projection": self.memory_projection.as_ref().map(memory_projection_json),
+            "private_context_projection": self.private_context_projection.as_ref().map(private_context_projection_json),
             "total_included_bytes": self.total_included_bytes,
         })
     }
@@ -714,7 +714,7 @@ fn cap_json(item: &PromptContextCap) -> Value {
     })
 }
 
-fn memory_projection_json(item: &PromptContextMemoryProjectionAudit) -> Value {
+fn private_context_projection_json(item: &PromptContextPrivateContextProjectionAudit) -> Value {
     json!({
         "status": item.status,
         "projector_id": item.projector_id,
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn main_interactive_policy_allows_memory_projection() {
+    fn main_interactive_policy_allows_private_context_projection() {
         let policy = PromptContextPolicy::new(
             TrustTier::Main,
             SessionHistoryPolicy::Interactive,
@@ -1160,7 +1160,7 @@ mod tests {
             }
             ContextItemId::MemoryContext => {
                 assert_eq!(item.class, ContextClass::Memory);
-                assert_eq!(item.source, ContextSource::MemoryProjection);
+                assert_eq!(item.source, ContextSource::PrivateContextProjection);
                 assert!(!item.required);
             }
             ContextItemId::ActiveContinuity => {

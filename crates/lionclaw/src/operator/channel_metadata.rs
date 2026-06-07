@@ -69,10 +69,10 @@ struct ChannelMetadataFile {
     contact: Option<ChannelContactMetadataSection>,
     #[allow(
         dead_code,
-        reason = "channel metadata parsing allows memory projector metadata in the shared skill metadata file"
+        reason = "channel metadata parsing allows private context projector metadata in the shared skill metadata file"
     )]
     #[serde(default)]
-    memory_projector: Option<toml::Value>,
+    private_context_projector: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -682,20 +682,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parses_channel_metadata_with_memory_projector_section() {
+    fn parses_channel_metadata_with_private_context_projector_section() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let skill = write_channel_skill(temp_dir.path(), "channel-memory", "memory");
+        let skill = write_channel_skill(
+            temp_dir.path(),
+            "channel-private-context",
+            "private-context",
+        );
         fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
         make_executable(&skill.join("scripts/projector"));
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\n\n[channel]\nid = \"memory\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+            "version = 1\n\n[channel]\nid = \"private-context\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n",
         )
         .expect("metadata");
 
         let metadata = load_channel_metadata(&skill).expect("metadata");
 
-        assert_eq!(metadata.id, "memory");
+        assert_eq!(metadata.id, "private-context");
         assert_eq!(metadata.worker, "scripts/worker");
     }
 
@@ -1013,28 +1017,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discovery_skips_memory_only_installed_metadata() {
+    fn discovery_skips_private_context_only_installed_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
         fs::create_dir_all(home.skills_dir()).expect("skills");
-        let memory = temp_dir.path().join("memory-core");
-        fs::create_dir_all(memory.join("scripts")).expect("scripts");
+        let private_context = temp_dir.path().join("private-context-core");
+        fs::create_dir_all(private_context.join("scripts")).expect("scripts");
         fs::write(
-            memory.join("SKILL.md"),
-            "---\nname: memory-core\ndescription: memory\n---\n",
+            private_context.join("SKILL.md"),
+            "---\nname: private-context-core\ndescription: private context\n---\n",
         )
         .expect("skill");
-        fs::write(memory.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
-        make_executable(&memory.join("scripts/projector"));
         fs::write(
-            memory.join("lionclaw.toml"),
-            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+            private_context.join("scripts/projector"),
+            "#!/usr/bin/env bash\n",
+        )
+        .expect("projector");
+        make_executable(&private_context.join("scripts/projector"));
+        fs::write(
+            private_context.join("lionclaw.toml"),
+            "version = 1\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n",
         )
         .expect("metadata");
-        copy_snapshot_tree(&memory, &home.skills_dir().join("memory-core")).expect("install");
+        copy_snapshot_tree(
+            &private_context,
+            &home.skills_dir().join("private-context-core"),
+        )
+        .expect("install");
 
-        let err = discover_channel_skill(&home, "memory-core")
-            .expect_err("memory-only skill should not be discovered as a channel");
+        let err = discover_channel_skill(&home, "private-context-core")
+            .expect_err("private-context-only skill should not be discovered as a channel");
 
         assert!(err.to_string().contains("was not found"));
     }

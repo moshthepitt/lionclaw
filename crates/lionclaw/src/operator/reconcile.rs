@@ -40,7 +40,8 @@ use crate::{
             validate_runtime_launch_prerequisites_for_work_root,
         },
         skill_metadata::{
-            load_memory_projector_metadata, resolve_skill_entrypoint, SkillEntrypointSymlinkPolicy,
+            load_private_context_projector_metadata, resolve_skill_entrypoint,
+            SkillEntrypointSymlinkPolicy,
         },
         snapshot::{install_snapshot_with_overlays, resolve_local_source},
         target::{
@@ -104,10 +105,10 @@ fn validate_configured_skill_replacement(
             )
         })?;
     }
-    if is_configured_memory_projector_skill(config, alias) {
-        resolve_memory_projector_entrypoint(source_path).with_context(|| {
+    if is_configured_private_context_projector_skill(config, alias) {
+        resolve_private_context_projector_entrypoint(source_path).with_context(|| {
             format!(
-                "skill alias '{alias}' backs the configured memory projector and must keep valid [memory_projector] metadata"
+                "skill alias '{alias}' backs the configured private context projector and must keep valid [private_context_projector] metadata"
             )
         })?;
     }
@@ -129,9 +130,9 @@ pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
             channel.id
         ));
     }
-    if is_configured_memory_projector_skill(&config, alias) {
+    if is_configured_private_context_projector_skill(&config, alias) {
         return Err(anyhow!(
-            "skill alias '{alias}' is in use as the configured memory projector; clear [memory].projector_skill first"
+            "skill alias '{alias}' is in use as the configured private context projector; clear [private_context].projector_skill first"
         ));
     }
 
@@ -170,21 +171,21 @@ pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
     }
 }
 
-fn is_configured_memory_projector_skill(config: &OperatorConfig, alias: &str) -> bool {
-    config.memory.projector_skill.as_deref() == Some(alias)
+fn is_configured_private_context_projector_skill(config: &OperatorConfig, alias: &str) -> bool {
+    config.private_context.projector_skill.as_deref() == Some(alias)
 }
 
-fn resolve_memory_projector_entrypoint(skill_dir: &Path) -> Result<PathBuf> {
-    let metadata = load_memory_projector_metadata(skill_dir)?.ok_or_else(|| {
+fn resolve_private_context_projector_entrypoint(skill_dir: &Path) -> Result<PathBuf> {
+    let metadata = load_private_context_projector_metadata(skill_dir)?.ok_or_else(|| {
         anyhow!(
-            "configured memory projector skill '{}' does not declare [memory_projector] metadata",
+            "configured private context projector skill '{}' does not declare [private_context_projector] metadata",
             skill_dir.display()
         )
     })?;
     resolve_skill_entrypoint(
         skill_dir,
         &metadata.command,
-        "memory projector command",
+        "private context projector command",
         SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
     )
 }
@@ -1291,27 +1292,27 @@ mod tests {
         .expect("channel metadata");
     }
 
-    fn write_memory_projector_metadata(skill_source: &Path, command: &str) {
+    fn write_private_context_projector_metadata(skill_source: &Path, command: &str) {
         fs::write(
             skill_source.join("lionclaw.toml"),
-            format!("version = 1\n\n[memory_projector]\ncommand = \"{command}\"\n"),
+            format!("version = 1\n\n[private_context_projector]\ncommand = \"{command}\"\n"),
         )
-        .expect("memory projector metadata");
+        .expect("private context projector metadata");
     }
 
-    fn write_memory_projector_source(root: &Path, name: &str) -> PathBuf {
-        let skill_source = write_skill_source(root, name, "memory projector", false);
+    fn write_private_context_projector_source(root: &Path, name: &str) -> PathBuf {
+        let skill_source = write_skill_source(root, name, "private context projector", false);
         let projector = skill_source.join("scripts/projector");
         fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
         fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
         make_executable(&projector);
-        write_memory_projector_metadata(&skill_source, "scripts/projector");
+        write_private_context_projector_metadata(&skill_source, "scripts/projector");
         skill_source
     }
 
-    async fn configure_memory_projector(home: &LionClawHome, alias: &str) {
+    async fn configure_private_context_projector(home: &LionClawHome, alias: &str) {
         let mut config = OperatorConfig::load(home).await.expect("load config");
-        config.memory.projector_skill = Some(alias.to_string());
+        config.private_context.projector_skill = Some(alias.to_string());
         config.save(home).await.expect("save config");
     }
 
@@ -1671,27 +1672,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_skill_rejects_configured_memory_projector_alias() {
+    async fn remove_skill_rejects_configured_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
-        let skill_source = write_memory_projector_source(temp_dir.path(), "memory-core");
+        let skill_source =
+            write_private_context_projector_source(temp_dir.path(), "private-context-core");
 
         add_skill(
             &home,
-            "memory-core".to_string(),
+            "private-context-core".to_string(),
             skill_source.to_string_lossy().to_string(),
             "local".to_string(),
         )
         .await
-        .expect("install memory projector skill");
-        configure_memory_projector(&home, "memory-core").await;
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
 
-        let err = super::remove_skill(&home, "memory-core")
+        let err = super::remove_skill(&home, "private-context-core")
             .await
-            .expect_err("configured memory projector alias should fail");
+            .expect_err("configured private context projector alias should fail");
 
-        assert!(err.to_string().contains("configured memory projector"));
-        assert!(home.skills_dir().join("memory-core").is_dir());
+        assert!(err
+            .to_string()
+            .contains("configured private context projector"));
+        assert!(home.skills_dir().join("private-context-core").is_dir());
     }
 
     #[tokio::test]
@@ -2063,25 +2067,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_skill_preserves_metadata_requirements_for_memory_projector_alias() {
+    async fn add_skill_preserves_metadata_requirements_for_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
-        let good_skill = write_memory_projector_source(temp_dir.path(), "memory-core-original");
-        let bad_skill = write_skill_source(temp_dir.path(), "memory-core-broken", "memory", false);
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
 
         add_skill(
             &home,
-            "memory-core".to_string(),
+            "private-context-core".to_string(),
             good_skill.to_string_lossy().to_string(),
             "local".to_string(),
         )
         .await
-        .expect("install memory projector skill");
-        configure_memory_projector(&home, "memory-core").await;
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let err = add_skill(
             &home,
-            "memory-core".to_string(),
+            "private-context-core".to_string(),
             bad_skill.to_string_lossy().to_string(),
             "local".to_string(),
         )
@@ -2090,38 +2102,46 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("must keep valid [memory_projector] metadata"));
+            .contains("must keep valid [private_context_projector] metadata"));
         let state = load_operator_state(&home)
             .await
-            .expect("existing memory projector should remain loadable");
-        assert!(state.applied_state.memory_projector().is_some());
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_projector().is_some());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn add_skill_preserves_command_requirements_for_memory_projector_alias() {
+    async fn add_skill_preserves_command_requirements_for_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
-        let good_skill = write_memory_projector_source(temp_dir.path(), "memory-core-original");
-        let bad_skill = write_skill_source(temp_dir.path(), "memory-core-broken", "memory", false);
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
         let projector = bad_skill.join("scripts/projector");
         fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
         fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
-        write_memory_projector_metadata(&bad_skill, "scripts/projector");
+        write_private_context_projector_metadata(&bad_skill, "scripts/projector");
 
         add_skill(
             &home,
-            "memory-core".to_string(),
+            "private-context-core".to_string(),
             good_skill.to_string_lossy().to_string(),
             "local".to_string(),
         )
         .await
-        .expect("install memory projector skill");
-        configure_memory_projector(&home, "memory-core").await;
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let err = add_skill(
             &home,
-            "memory-core".to_string(),
+            "private-context-core".to_string(),
             bad_skill.to_string_lossy().to_string(),
             "local".to_string(),
         )
@@ -2129,12 +2149,12 @@ mod tests {
         .expect_err("non-executable replacement should fail");
 
         let err = format!("{err:#}");
-        assert!(err.contains("memory projector command"));
+        assert!(err.contains("private context projector command"));
         assert!(err.contains("not executable"));
         let state = load_operator_state(&home)
             .await
-            .expect("existing memory projector should remain loadable");
-        assert!(state.applied_state.memory_projector().is_some());
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_projector().is_some());
     }
 
     #[tokio::test]

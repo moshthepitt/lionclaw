@@ -94,7 +94,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.prompt_context`: session-aware prompt context policy, section capping, and audit metadata for runtime-visible context.
-- `kernel.memory_projection`: candidate-only memory projection boundary from kernel-owned records into prompt-context policy.
+- `kernel.private_context_projection`: candidate-only private context projection boundary from kernel-owned records into prompt-context policy.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
 - `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
@@ -992,25 +992,25 @@ The assistant home workspace contains:
 
 `MEMORY.md` remains a visible continuity record and search surface, but it is
 not a magic runtime prompt input. LionClaw does not remember by stuffing files
-into prompts. The kernel records what happened, lets controlled memory
+into prompts. The kernel records what happened, lets controlled private context
 projectors derive candidate memory from exact kernel-selected source refs, and
 admits those candidates only through audited prompt context policy.
 
-Memory projector selection is explicit operator config:
+Private context projector selection is explicit operator config:
 
 ```toml
-[memory]
-projector_skill = "memory-core"
+[private_context]
+projector_skill = "private-context-core"
 ```
 
-When unset, the kernel uses the noop memory projector. Installing a skill with
-memory metadata does not auto-activate it. A selected skill declares the host
+When unset, the kernel uses the noop private context projector. Installing a skill with
+private context metadata does not auto-activate it. A selected skill declares the host
 projector command in its `lionclaw.toml`:
 
 ```toml
 version = 1
 
-[memory_projector]
+[private_context_projector]
 command = "scripts/projector"
 ```
 
@@ -1020,11 +1020,11 @@ skill root. Absolute paths, parent traversal, missing files, non-executable
 files, symlink files, and symlink parent components below the skill root are
 rejected before the applied state is accepted.
 
-A configured memory projector is a resident host process owned by the kernel
+A configured private context projector is a resident host process owned by the kernel
 instance and the loaded applied state. It starts lazily on the first eligible
-Main-session memory projection, runs with the skill root as its working
+Main-session private context projection, runs with the skill root as its working
 directory, and receives only the fixed kernel environment needed for v1:
-`LIONCLAW_MEMORY_PROJECTOR_ID` and `LIONCLAW_SKILL_STATE_DIR`, plus the small
+`LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID` and `LIONCLAW_SKILL_STATE_DIR`, plus the small
 ambient process-start allowlist `PATH`, `PATHEXT`, `SYSTEMROOT`, and
 `SystemRoot` when present. The state directory is host-only selected-instance
 state under `config/skill-state/<alias>` and is not mounted into the agent
@@ -1034,8 +1034,8 @@ subprocesses that remain in that inherited group; projector commands must not
 daemonize, call `setsid` or `setpgid` to detach helpers, or leave unmanaged
 background work behind.
 
-The v1 protocol is JSONL. The kernel writes one `MemoryProjectionRequest` JSON
-object per line to projector stdin and reads one `MemoryProjection` JSON object
+The v1 protocol is JSONL. The kernel writes one `PrivateContextProjectionRequest` JSON
+object per line to projector stdin and reads one `PrivateContextProjection` JSON object
 per line from stdout. Each request carries a fresh `request_id`, and each
 response must echo the same id. There is no `protocol_version` field in v1.
 Unknown response fields are ignored. Only one request is in flight at a time.
