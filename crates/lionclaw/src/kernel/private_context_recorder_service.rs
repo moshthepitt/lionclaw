@@ -454,6 +454,16 @@ mod tests {
     };
 
     #[cfg(unix)]
+    const RECORDER_LOCK_CHILD_TEST: &str =
+        "kernel::private_context_recorder_service::tests::recorder_state_lock_child_process";
+    #[cfg(unix)]
+    const RECORDER_LOCK_COMMAND_ENV: &str = "LIONCLAW_TEST_RECORDER_COMMAND";
+    #[cfg(unix)]
+    const RECORDER_LOCK_SKILL_ROOT_ENV: &str = "LIONCLAW_TEST_RECORDER_SKILL_ROOT";
+    #[cfg(unix)]
+    const RECORDER_LOCK_STATE_DIR_ENV: &str = "LIONCLAW_TEST_RECORDER_STATE_DIR";
+
+    #[cfg(unix)]
     fn make_executable(path: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -552,6 +562,109 @@ mod tests {
 
         assert!(lock_path.starts_with(temp_dir.path()));
         assert!(!lock_path.starts_with(&state_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_state_lock_uses_file_lock_across_processes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+test_root="$(dirname "$LIONCLAW_SKILL_STATE_DIR")"
+cat >/dev/null
+if mkdir "$test_root/active"; then
+  trap 'rmdir "$test_root/active"' EXIT
+else
+  printf overlap > "$test_root/overlap"
+  exit 11
+fi
+find "$LIONCLAW_SKILL_STATE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+rmdir "$LIONCLAW_SKILL_STATE_DIR" 2>/dev/null || true
+sleep 0.5
+"#,
+        );
+        let test_binary = std::env::current_exe().expect("test binary");
+        let first = spawn_recorder_lock_child(&test_binary, &config);
+        assert!(
+            wait_for_path(temp_dir.path().join("active")),
+            "first recorder child did not enter the critical section"
+        );
+        let second = spawn_recorder_lock_child(&test_binary, &config);
+
+        let first_output = first.wait_with_output().expect("first child output");
+        let second_output = second.wait_with_output().expect("second child output");
+
+        assert_child_success("first", &first_output);
+        assert_child_success("second", &second_output);
+        assert!(!temp_dir.path().join("overlap").exists());
+    }
+
+    #[cfg(unix)]
+    #[ignore = "spawned by recorder_state_lock_uses_file_lock_across_processes"]
+    #[tokio::test]
+    async fn recorder_state_lock_child_process() {
+        let Some(config) = recorder_lock_child_config_from_env() else {
+            return;
+        };
+        let recorder = SkillPrivateContextRecorder::new(config);
+
+        let outcome = recorder.record(request()).await;
+
+        assert_eq!(outcome.status, PrivateContextRecordStatus::Completed);
+    }
+
+    #[cfg(unix)]
+    fn spawn_recorder_lock_child(
+        test_binary: &std::path::Path,
+        config: &SkillPrivateContextRecorderConfig,
+    ) -> std::process::Child {
+        std::process::Command::new(test_binary)
+            .arg(RECORDER_LOCK_CHILD_TEST)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(RECORDER_LOCK_COMMAND_ENV, &config.command_path)
+            .env(RECORDER_LOCK_SKILL_ROOT_ENV, &config.skill_root)
+            .env(RECORDER_LOCK_STATE_DIR_ENV, &config.state_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn recorder lock child")
+    }
+
+    #[cfg(unix)]
+    fn recorder_lock_child_config_from_env() -> Option<SkillPrivateContextRecorderConfig> {
+        Some(SkillPrivateContextRecorderConfig {
+            recorder_id: "private-context-core".to_string(),
+            command_path: std::path::PathBuf::from(std::env::var_os(RECORDER_LOCK_COMMAND_ENV)?),
+            skill_root: std::path::PathBuf::from(std::env::var_os(RECORDER_LOCK_SKILL_ROOT_ENV)?),
+            state_dir: std::path::PathBuf::from(std::env::var_os(RECORDER_LOCK_STATE_DIR_ENV)?),
+            timeout: PRIVATE_CONTEXT_RECORDER_TIMEOUT,
+        })
+    }
+
+    #[cfg(unix)]
+    fn wait_for_path(path: std::path::PathBuf) -> bool {
+        for _ in 0..100 {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn assert_child_success(name: &str, output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "{name} child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]
