@@ -161,7 +161,7 @@ use super::{
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
-    session_compactions::SessionCompactionStore,
+    session_compactions::{SessionCompactionRecord, SessionCompactionStore},
     session_transcript::{
         build_compaction_prompt, load_repaired_turns, load_repaired_turns_before_sequence,
         merge_compaction_summary_state, merge_compaction_summary_updates,
@@ -8821,6 +8821,118 @@ mod tests {
                 panic!("expected session turn source")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_context_compaction_summary_respects_history_cutoff() {
+        let fixture = prompt_context_fixture().await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let too_new_goal = "COMPACTION_AFTER_CUTOFF_SHOULD_NOT_APPEAR";
+        fixture
+            .kernel
+            .session_compactions
+            .insert(
+                session.session_id,
+                1,
+                5,
+                "unused stored summary text".to_string(),
+                &CompactionSummaryState {
+                    goal: Some(too_new_goal.to_string()),
+                    ..CompactionSummaryState::default()
+                },
+            )
+            .await
+            .expect("insert compaction");
+
+        let unbounded = build_test_prompt_context(
+            &fixture,
+            &session,
+            PromptContextMode::ProgramPrimary,
+            "current user",
+        )
+        .await;
+        assert!(rendered_prompt(&unbounded).contains(too_new_goal));
+
+        let bounded = fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &fixture.plan,
+                PromptContextMode::ProgramPrimary,
+                Some("queued user"),
+                Some(5),
+            )
+            .await
+            .expect("build bounded prompt context");
+        let rendered = rendered_prompt(&bounded);
+
+        assert!(!rendered.contains(too_new_goal), "{rendered}");
+        assert!(bounded.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::SessionHandoff && item.reason == "missing_optional"
+        }));
+    }
+
+    #[tokio::test]
+    async fn private_context_projector_sources_respect_history_cutoff() {
+        let (projector, requests) =
+            TestPrivateContextProjector::with_items(vec![memory_candidate(
+                PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
+            )]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+        fixture
+            .kernel
+            .session_compactions
+            .insert(
+                session.session_id,
+                1,
+                5,
+                "unused stored summary text".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert compaction");
+
+        fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &fixture.plan,
+                PromptContextMode::ProgramPrimary,
+                Some("queued user"),
+                Some(5),
+            )
+            .await
+            .expect("build bounded prompt context");
+
+        let requests = requests
+            .lock()
+            .expect("private context projector request lock");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].sources.iter().all(|source| {
+            !matches!(source, PrivateContextSourceRef::CompactionSummary { .. })
+        }));
+        assert!(requests[0].sources.iter().any(|source| matches!(
+            source,
+            PrivateContextSourceRef::SessionTurnRange {
+                before_sequence_no: Some(5),
+                sequence_nos,
+                ..
+            } if sequence_nos == &[1]
+        )));
     }
 
     #[tokio::test]
@@ -21756,10 +21868,11 @@ impl Kernel {
             }
             ContextSource::CompactionSummary => {
                 let Some(record) = self
-                    .session_compactions
-                    .latest(session.session_id)
-                    .await
-                    .map_err(internal)?
+                    .prompt_context_compaction_record(
+                        session.session_id,
+                        history_before_sequence_no,
+                    )
+                    .await?
                 else {
                     return Ok(Self::omitted_prompt_context_item("missing_optional"));
                 };
@@ -21979,6 +22092,25 @@ impl Kernel {
             .unwrap_or_else(|| Self::omitted_prompt_context_item("over_budget_excluded"))
     }
 
+    async fn prompt_context_compaction_record(
+        &self,
+        session_id: Uuid,
+        history_before_sequence_no: Option<u64>,
+    ) -> Result<Option<SessionCompactionRecord>, KernelError> {
+        match history_before_sequence_no {
+            Some(before_sequence_no) => self
+                .session_compactions
+                .latest_before_sequence(session_id, before_sequence_no)
+                .await
+                .map_err(internal),
+            None => self
+                .session_compactions
+                .latest(session_id)
+                .await
+                .map_err(internal),
+        }
+    }
+
     async fn private_context_projection_sources(
         &self,
         session: &super::sessions::Session,
@@ -22000,10 +22132,8 @@ impl Kernel {
             sequence_nos: turns.into_iter().map(|turn| turn.sequence_no).collect(),
         }];
         if let Some(record) = self
-            .session_compactions
-            .latest(session.session_id)
-            .await
-            .map_err(internal)?
+            .prompt_context_compaction_record(session.session_id, history_before_sequence_no)
+            .await?
         {
             sources.push(PrivateContextSourceRef::CompactionSummary {
                 through_sequence_no: record.through_sequence_no,
