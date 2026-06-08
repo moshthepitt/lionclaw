@@ -170,6 +170,9 @@ impl PrivateContextRecorder for SkillPrivateContextRecorder {
             Ok(Err(_)) => return failed_outcome("state_lock", started_at),
             Err(_) => return PrivateContextRecordOutcome::timed_out(elapsed_ms(started_at)),
         };
+        if remaining_timeout(started_at, self.config.timeout).is_none() {
+            return PrivateContextRecordOutcome::timed_out(elapsed_ms(started_at));
+        }
         let mut process = match OneShotPrivateContextRecorderProcess::spawn(&self.config).await {
             Ok(process) => process,
             Err(_) => return failed_outcome("spawn_failed", started_at),
@@ -456,7 +459,9 @@ fn failed_outcome(reason: &'static str, started_at: Instant) -> PrivateContextRe
 }
 
 fn remaining_timeout(started_at: Instant, timeout: Duration) -> Option<Duration> {
-    timeout.checked_sub(started_at.elapsed())
+    timeout
+        .checked_sub(started_at.elapsed())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
@@ -689,6 +694,28 @@ cat >/dev/null
 
         drop(held_lock);
         assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_does_not_spawn_without_remaining_timeout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let spawned_marker = temp_dir.path().join("spawned");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+touch "$(dirname "$LIONCLAW_SKILL_STATE_DIR")/spawned"
+cat >/dev/null
+"#,
+        )
+        .with_timeout(Duration::ZERO);
+        let recorder = SkillPrivateContextRecorder::new(config);
+
+        let outcome = recorder.record(request()).await;
+
+        assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
+        assert!(!spawned_marker.exists());
     }
 
     #[cfg(unix)]
