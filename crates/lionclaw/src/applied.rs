@@ -22,7 +22,8 @@ use crate::{
     operator::{
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         skill_metadata::{
-            load_memory_projector_metadata, resolve_skill_entrypoint, SkillEntrypointSymlinkPolicy,
+            load_private_context_projector_metadata, resolve_skill_entrypoint,
+            SkillEntrypointSymlinkPolicy,
         },
         snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
     },
@@ -36,7 +37,7 @@ pub struct AppliedState {
     skills_by_id: BTreeMap<String, AppliedSkill>,
     skills_by_alias: BTreeMap<String, AppliedSkill>,
     channels_by_id: BTreeMap<String, AppliedChannel>,
-    memory_projector: Option<AppliedMemoryProjector>,
+    private_context_projector: Option<AppliedPrivateContextProjector>,
 }
 
 impl AppliedState {
@@ -52,8 +53,13 @@ impl AppliedState {
             inputs.skills,
             &inputs.host_only_skill_aliases,
         )?;
-        let memory_projector = resolve_applied_memory_projector(home, config, &skills)?;
-        Ok(Self::from_parts(skills, inputs.channels, memory_projector))
+        let private_context_projector =
+            resolve_applied_private_context_projector(home, config, &skills)?;
+        Ok(Self::from_parts(
+            skills,
+            inputs.channels,
+            private_context_projector,
+        ))
     }
 
     pub(crate) fn from_home_read_only(
@@ -61,11 +67,12 @@ impl AppliedState {
         config: &OperatorConfig,
     ) -> Result<Self> {
         let inputs = read_applied_state_inputs(home, config)?;
-        let memory_projector = resolve_applied_memory_projector(home, config, &inputs.skills)?;
+        let private_context_projector =
+            resolve_applied_private_context_projector(home, config, &inputs.skills)?;
         Ok(Self::from_parts(
             inputs.skills,
             inputs.channels,
-            memory_projector,
+            private_context_projector,
         ))
     }
 
@@ -96,8 +103,8 @@ impl AppliedState {
         self.channels_by_id.get(channel_id)
     }
 
-    pub fn memory_projector(&self) -> Option<&AppliedMemoryProjector> {
-        self.memory_projector.as_ref()
+    pub fn private_context_projector(&self) -> Option<&AppliedPrivateContextProjector> {
+        self.private_context_projector.as_ref()
     }
 
     pub fn runtime_visible_skills(&self) -> Vec<AppliedSkill> {
@@ -114,7 +121,7 @@ impl AppliedState {
             .iter()
             .map(|channel| channel.skill_alias.as_str())
             .chain(
-                self.memory_projector
+                self.private_context_projector
                     .as_ref()
                     .map(|projector| projector.skill_alias.as_str()),
             )
@@ -135,13 +142,17 @@ impl AppliedState {
     }
 
     pub fn fingerprint(&self) -> String {
-        applied_state_fingerprint(&self.skills, &self.channels, self.memory_projector.as_ref())
+        applied_state_fingerprint(
+            &self.skills,
+            &self.channels,
+            self.private_context_projector.as_ref(),
+        )
     }
 
     fn from_parts(
         skills: Vec<AppliedSkill>,
         channels: Vec<AppliedChannel>,
-        memory_projector: Option<AppliedMemoryProjector>,
+        private_context_projector: Option<AppliedPrivateContextProjector>,
     ) -> Self {
         let skills_by_id = skills
             .iter()
@@ -165,7 +176,7 @@ impl AppliedState {
             skills_by_id,
             skills_by_alias,
             channels_by_id,
-            memory_projector,
+            private_context_projector,
         }
     }
 }
@@ -197,7 +208,7 @@ fn read_applied_state_inputs(
         .channels
         .iter()
         .map(|channel| channel.skill.clone())
-        .chain(config.memory.projector_skill.clone())
+        .chain(config.private_context.projector_skill.clone())
         .collect::<BTreeSet<_>>();
     let mut entries = fs::read_dir(&skills_root)
         .with_context(|| format!("failed to read directory {}", skills_root.display()))?
@@ -301,7 +312,7 @@ fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {
 fn applied_state_fingerprint(
     skills: &[AppliedSkill],
     channels: &[AppliedChannel],
-    memory_projector: Option<&AppliedMemoryProjector>,
+    private_context_projector: Option<&AppliedPrivateContextProjector>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"lionclaw-applied-state-v2\0");
@@ -342,16 +353,16 @@ fn applied_state_fingerprint(
             }
         }
     }
-    match memory_projector {
+    match private_context_projector {
         Some(projector) => {
-            hasher.update(b"memory_projector\0");
+            hasher.update(b"private_context_projector\0");
             hasher.update(projector.skill_alias.as_bytes());
             hasher.update(b"\0");
             hasher.update(projector.command.as_bytes());
             hasher.update(b"\0");
         }
         None => {
-            hasher.update(b"memory_projector_none\0");
+            hasher.update(b"private_context_projector_none\0");
         }
     }
 
@@ -654,7 +665,7 @@ pub struct AppliedSkill {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedMemoryProjector {
+pub struct AppliedPrivateContextProjector {
     pub skill_alias: String,
     pub command: String,
     pub command_path: PathBuf,
@@ -879,12 +890,12 @@ impl AppliedChannel {
     }
 }
 
-fn resolve_applied_memory_projector(
+fn resolve_applied_private_context_projector(
     home: &LionClawHome,
     config: &OperatorConfig,
     skills: &[AppliedSkill],
-) -> Result<Option<AppliedMemoryProjector>> {
-    let Some(alias) = config.memory.projector_skill.as_deref() else {
+) -> Result<Option<AppliedPrivateContextProjector>> {
+    let Some(alias) = config.private_context.projector_skill.as_deref() else {
         return Ok(None);
     };
     validate_skill_alias(alias)?;
@@ -893,19 +904,19 @@ fn resolve_applied_memory_projector(
         .find(|skill| skill.alias == alias)
         .ok_or_else(|| {
             anyhow!(
-                "configured memory projector references missing installed skill alias '{alias}'"
+                "configured private context projector references missing installed skill alias '{alias}'"
             )
         })?;
-    let metadata = load_memory_projector_metadata(&skill.snapshot_path)?
-        .ok_or_else(|| anyhow!("configured memory projector skill alias '{alias}' does not declare [memory_projector] metadata"))?;
+    let metadata = load_private_context_projector_metadata(&skill.snapshot_path)?
+        .ok_or_else(|| anyhow!("configured private context projector skill alias '{alias}' does not declare [private_context_projector] metadata"))?;
     let command_path = resolve_skill_entrypoint(
         &skill.snapshot_path,
         &metadata.command,
-        "memory projector command",
+        "private context projector command",
         SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
     )?;
 
-    Ok(Some(AppliedMemoryProjector {
+    Ok(Some(AppliedPrivateContextProjector {
         skill_alias: alias.to_string(),
         command: metadata.command,
         command_path,
@@ -991,19 +1002,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_memory_projector_skill(home: &LionClawHome, alias: &str) -> std::path::PathBuf {
+    fn write_private_context_projector_skill(
+        home: &LionClawHome,
+        alias: &str,
+    ) -> std::path::PathBuf {
         let skill = home.skills_dir().join(alias);
         fs::create_dir_all(skill.join("scripts")).expect("scripts dir");
         fs::write(
             skill.join("SKILL.md"),
-            format!("---\nname: {alias}\ndescription: memory\n---\n"),
+            format!("---\nname: {alias}\ndescription: private context\n---\n"),
         )
         .expect("skill md");
         fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
         make_executable(&skill.join("scripts/projector"));
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+            "version = 1\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n",
         )
         .expect("metadata");
         skill
@@ -1024,11 +1038,11 @@ mod tests {
         facet
     }
 
-    async fn configure_memory_projector(home: &LionClawHome, alias: &str) {
+    async fn configure_private_context_projector(home: &LionClawHome, alias: &str) {
         let mut config = crate::operator::config::OperatorConfig::load(home)
             .await
             .expect("load config");
-        config.memory.projector_skill = Some(alias.to_string());
+        config.private_context.projector_skill = Some(alias.to_string());
         config.save(home).await.expect("save config");
     }
 
@@ -1087,31 +1101,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn load_resolves_configured_memory_projector_from_applied_snapshot() {
+    async fn load_resolves_configured_private_context_projector_from_applied_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        write_memory_projector_skill(&home, "memory-core");
-        configure_memory_projector(&home, "memory-core").await;
+        write_private_context_projector_skill(&home, "private-context-core");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let applied = AppliedState::load(&home).await.expect("load state");
-        let projector = applied.memory_projector().expect("projector");
+        let projector = applied.private_context_projector().expect("projector");
 
-        assert_eq!(projector.skill_alias, "memory-core");
+        assert_eq!(projector.skill_alias, "private-context-core");
         assert_eq!(projector.command, "scripts/projector");
         assert!(projector.command_path.ends_with("scripts/projector"));
         assert!(projector
             .skill_root
             .starts_with(home.skills_dir().join(".applied")));
-        assert_eq!(projector.state_dir, home.skill_state_dir("memory-core"));
+        assert_eq!(
+            projector.state_dir,
+            home.skill_state_dir("private-context-core")
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_visible_skills_exclude_configured_memory_projector_alias() {
+    async fn runtime_visible_skills_exclude_configured_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        write_memory_projector_skill(&home, "memory-core");
-        configure_memory_projector(&home, "memory-core").await;
+        write_private_context_projector_skill(&home, "private-context-core");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let applied = AppliedState::load(&home).await.expect("load state");
 
@@ -1121,30 +1138,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_visible_skills_project_memory_projector_runtime_facet_only() {
+    async fn runtime_visible_skills_project_private_context_projector_runtime_facet_only() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        let skill = write_memory_projector_skill(&home, "memory-core");
-        write_runtime_skill_facet(&skill, "memory-core", "memory runtime facet");
-        configure_memory_projector(&home, "memory-core").await;
+        let skill = write_private_context_projector_skill(&home, "private-context-core");
+        write_runtime_skill_facet(
+            &skill,
+            "private-context-core",
+            "private context runtime facet",
+        );
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let applied = AppliedState::load(&home).await.expect("load state");
         let runtime_skills = applied.runtime_visible_skills();
 
         assert_eq!(runtime_skills.len(), 1);
-        assert_eq!(runtime_skills[0].alias, "memory-core");
-        assert_eq!(runtime_skills[0].description, "memory runtime facet");
+        assert_eq!(runtime_skills[0].alias, "private-context-core");
+        assert_eq!(
+            runtime_skills[0].description,
+            "private context runtime facet"
+        );
         assert!(runtime_skills[0]
             .snapshot_path
-            .ends_with("runtime/memory-core"));
+            .ends_with("runtime/private-context-core"));
         assert!(applied.attached_runtime_visible_skills().is_empty());
     }
 
     #[tokio::test]
-    async fn load_rejects_missing_configured_memory_projector_alias() {
+    async fn load_rejects_missing_configured_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        configure_memory_projector(&home, "missing").await;
+        configure_private_context_projector(&home, "missing").await;
 
         let err = AppliedState::load(&home)
             .await
@@ -1157,10 +1181,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_rejects_invalid_configured_memory_projector_alias() {
+    async fn load_rejects_invalid_configured_private_context_projector_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        configure_memory_projector(&home, "../memory-core").await;
+        configure_private_context_projector(&home, "../private-context-core").await;
 
         let err = AppliedState::load(&home)
             .await
@@ -1174,15 +1198,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn memory_projector_config_changes_applied_state_fingerprint() {
+    async fn private_context_projector_config_changes_applied_state_fingerprint() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        write_memory_projector_skill(&home, "memory-core");
+        write_private_context_projector_skill(&home, "private-context-core");
 
         let without_projector = AppliedState::load(&home)
             .await
             .expect("load state without projector");
-        configure_memory_projector(&home, "memory-core").await;
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let with_projector = AppliedState::load(&home)
             .await
@@ -1196,11 +1220,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn memory_projector_content_changes_applied_state_fingerprint() {
+    async fn private_context_projector_content_changes_applied_state_fingerprint() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        let skill = write_memory_projector_skill(&home, "memory-core");
-        configure_memory_projector(&home, "memory-core").await;
+        let skill = write_private_context_projector_skill(&home, "private-context-core");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let first = AppliedState::load(&home)
             .await
@@ -1220,11 +1244,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn memory_projector_metadata_changes_applied_state_fingerprint() {
+    async fn private_context_projector_metadata_changes_applied_state_fingerprint() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_home(temp_dir.path());
-        let skill = write_memory_projector_skill(&home, "memory-core");
-        configure_memory_projector(&home, "memory-core").await;
+        let skill = write_private_context_projector_skill(&home, "private-context-core");
+        configure_private_context_projector(&home, "private-context-core").await;
 
         let first = AppliedState::load(&home)
             .await
@@ -1237,7 +1261,7 @@ mod tests {
         make_executable(&skill.join("scripts/projector-v2"));
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector-v2\"\n",
+            "version = 1\n\n[private_context_projector]\ncommand = \"scripts/projector-v2\"\n",
         )
         .expect("metadata");
         let second = AppliedState::load(&home)
@@ -1246,7 +1270,10 @@ mod tests {
 
         assert_ne!(first.fingerprint(), second.fingerprint());
         assert_eq!(
-            second.memory_projector().expect("projector").command,
+            second
+                .private_context_projector()
+                .expect("projector")
+                .command,
             "scripts/projector-v2"
         );
     }

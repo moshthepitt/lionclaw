@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const SKILL_METADATA_FILE: &str = "lionclaw.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryProjectorMetadata {
+pub struct PrivateContextProjectorMetadata {
     pub command: String,
 }
 
@@ -21,45 +21,47 @@ pub enum SkillEntrypointSymlinkPolicy {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MemoryMetadataFile {
+struct PrivateContextMetadataFile {
     version: u32,
     #[allow(
         dead_code,
-        reason = "memory metadata parsing allows channel-owned sections in the shared skill metadata file"
+        reason = "private context metadata parsing allows channel-owned sections in the shared skill metadata file"
     )]
     #[serde(default)]
     channel: Option<toml::Value>,
     #[allow(
         dead_code,
-        reason = "memory metadata parsing allows channel contact metadata in the shared skill metadata file"
+        reason = "private context metadata parsing allows channel contact metadata in the shared skill metadata file"
     )]
     #[serde(default)]
     contact: Option<toml::Value>,
     #[serde(default)]
-    memory_projector: Option<MemoryProjectorMetadataSection>,
+    private_context_projector: Option<PrivateContextProjectorMetadataSection>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MemoryProjectorMetadataSection {
+struct PrivateContextProjectorMetadataSection {
     command: String,
 }
 
-pub fn load_memory_projector_metadata(skill_dir: &Path) -> Result<Option<MemoryProjectorMetadata>> {
+pub fn load_private_context_projector_metadata(
+    skill_dir: &Path,
+) -> Result<Option<PrivateContextProjectorMetadata>> {
     let skill_dir = canonical_skill_dir(skill_dir)?;
     let path = skill_dir.join(SKILL_METADATA_FILE);
     let Some(content) = read_optional_skill_metadata(&path)? else {
         return Ok(None);
     };
-    let parsed: MemoryMetadataFile = toml::from_str(&content)
+    let parsed: PrivateContextMetadataFile = toml::from_str(&content)
         .map_err(|err| anyhow!("failed to parse {}: {err}", path.display()))?;
     validate_metadata_version(parsed.version, &path)?;
-    let Some(section) = parsed.memory_projector else {
+    let Some(section) = parsed.private_context_projector else {
         return Ok(None);
     };
     let command = section.command.trim().to_string();
-    validate_skill_entrypoint_path(&command, "memory projector command")?;
-    Ok(Some(MemoryProjectorMetadata { command }))
+    validate_skill_entrypoint_path(&command, "private context projector command")?;
+    Ok(Some(PrivateContextProjectorMetadata { command }))
 }
 
 pub fn skill_metadata_declares_channel(skill_dir: &Path) -> Result<bool> {
@@ -231,8 +233,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_memory_projector_metadata, resolve_skill_entrypoint, skill_metadata_declares_channel,
-        SkillEntrypointSymlinkPolicy,
+        load_private_context_projector_metadata, resolve_skill_entrypoint,
+        skill_metadata_declares_channel, SkillEntrypointSymlinkPolicy,
     };
 
     #[cfg(unix)]
@@ -246,11 +248,11 @@ mod tests {
 
     #[cfg(unix)]
     fn write_skill(root: &std::path::Path) -> std::path::PathBuf {
-        let skill = root.join("memory-core");
+        let skill = root.join("private-context-core");
         fs::create_dir_all(skill.join("scripts")).expect("scripts");
         fs::write(
             skill.join("SKILL.md"),
-            "---\nname: memory-core\ndescription: memory\n---\n",
+            "---\nname: private-context-core\ndescription: private context\n---\n",
         )
         .expect("skill");
         fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
@@ -258,74 +260,91 @@ mod tests {
         skill
     }
 
-    fn write_memory_projector_metadata(skill: &std::path::Path, command: &str) {
+    fn write_private_context_projector_metadata(skill: &std::path::Path, command: &str) {
         fs::write(
             skill.join("lionclaw.toml"),
-            format!("version = 1\n\n[memory_projector]\ncommand = \"{command}\"\n"),
+            format!("version = 1\n\n[private_context_projector]\ncommand = \"{command}\"\n"),
         )
         .expect("metadata");
     }
 
     #[cfg(unix)]
     #[test]
-    fn parses_memory_projector_metadata() {
+    fn parses_private_context_projector_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        write_memory_projector_metadata(&skill, "scripts/projector");
+        write_private_context_projector_metadata(&skill, "scripts/projector");
 
-        let metadata = load_memory_projector_metadata(&skill)
+        let metadata = load_private_context_projector_metadata(&skill)
             .expect("metadata")
-            .expect("memory metadata");
+            .expect("private context metadata");
 
         assert_eq!(metadata.command, "scripts/projector");
     }
 
     #[cfg(unix)]
     #[test]
-    fn memory_only_metadata_does_not_declare_channel() {
+    fn rejects_legacy_memory_projector_metadata_section() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        write_memory_projector_metadata(&skill, "scripts/projector");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[memory_projector]\ncommand = \"scripts/projector\"\n",
+        )
+        .expect("metadata");
+
+        let err = load_private_context_projector_metadata(&skill)
+            .expect_err("legacy memory projector metadata should be rejected");
+
+        assert!(err.to_string().contains("memory_projector"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_context_only_metadata_does_not_declare_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        write_private_context_projector_metadata(&skill, "scripts/projector");
 
         assert!(!skill_metadata_declares_channel(&skill).expect("declares channel"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_memory_projector_absolute_command_path() {
+    fn rejects_private_context_projector_absolute_command_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        write_memory_projector_metadata(&skill, "/bin/echo");
+        write_private_context_projector_metadata(&skill, "/bin/echo");
 
-        let err = load_memory_projector_metadata(&skill)
-            .expect_err("absolute memory projector command should fail");
+        let err = load_private_context_projector_metadata(&skill)
+            .expect_err("absolute private context projector command should fail");
 
         assert!(err.to_string().contains("must be relative"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_memory_projector_parent_traversal_command_path() {
+    fn rejects_private_context_projector_parent_traversal_command_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
-        write_memory_projector_metadata(&skill, "../projector");
+        write_private_context_projector_metadata(&skill, "../projector");
 
-        let err = load_memory_projector_metadata(&skill)
-            .expect_err("parent traversal memory projector command should fail");
+        let err = load_private_context_projector_metadata(&skill)
+            .expect_err("parent traversal private context projector command should fail");
 
         assert!(err.to_string().contains("must stay inside"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_missing_memory_projector_command() {
+    fn rejects_missing_private_context_projector_command() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
 
         let err = resolve_skill_entrypoint(
             &skill,
             "scripts/missing",
-            "memory projector command",
+            "private context projector command",
             SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
         )
         .expect_err("missing projector command should fail");
@@ -335,7 +354,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_non_executable_memory_projector_command() {
+    fn rejects_non_executable_private_context_projector_command() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_skill(temp_dir.path());
         let command = skill.join("scripts/not-executable");
@@ -344,7 +363,7 @@ mod tests {
         let err = resolve_skill_entrypoint(
             &skill,
             "scripts/not-executable",
-            "memory projector command",
+            "private context projector command",
             SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
         )
         .expect_err("non-executable projector command should fail");
@@ -354,7 +373,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlinked_memory_projector_command() {
+    fn rejects_symlinked_private_context_projector_command() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -368,7 +387,7 @@ mod tests {
         let err = resolve_skill_entrypoint(
             &skill,
             "scripts/projector",
-            "memory projector command",
+            "private context projector command",
             SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
         )
         .expect_err("symlinked projector command should fail");
@@ -378,7 +397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_memory_projector_parent_symlink() {
+    fn rejects_private_context_projector_parent_symlink() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -393,7 +412,7 @@ mod tests {
         let err = resolve_skill_entrypoint(
             &skill,
             "scripts/projector",
-            "memory projector command",
+            "private context projector command",
             SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
         )
         .expect_err("parent symlink should fail");

@@ -701,7 +701,11 @@ mod tests {
         assert!(output.contains("you> "));
         assert!(output.contains("lionclaw> hello from repl"));
         assert!(output.contains("hello from repl"));
-        assert!(home.workspace_dir("main").join("SOUL.md").exists());
+        let workspace = home.workspace_dir("main");
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(!workspace.join("IDENTITY.md").exists());
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("USER.md").exists());
 
         let pool = Db::connect_file(&home.db_path())
             .await

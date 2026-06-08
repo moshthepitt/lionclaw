@@ -27,7 +27,7 @@ pub struct OperatorConfig {
     #[serde(default)]
     pub channels: Vec<ManagedChannelConfig>,
     #[serde(default)]
-    pub memory: MemoryConfig,
+    pub private_context: PrivateContextConfig,
 }
 
 impl OperatorConfig {
@@ -213,7 +213,7 @@ impl OperatorConfig {
                 Some((id, runtime))
             })
             .collect();
-        self.memory.normalize();
+        self.private_context.normalize();
         self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
             channel.id = channel.id.trim().to_string();
@@ -297,12 +297,12 @@ pub struct OperatorDefaults {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemoryConfig {
+pub struct PrivateContextConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projector_skill: Option<String>,
 }
 
-impl MemoryConfig {
+impl PrivateContextConfig {
     fn normalize(&mut self) {
         self.projector_skill = self
             .projector_skill
@@ -839,11 +839,11 @@ mod tests {
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
         assert!(config.presets.is_empty());
-        assert!(config.memory.projector_skill.is_none());
+        assert!(config.private_context.projector_skill.is_none());
     }
 
     #[tokio::test]
-    async fn memory_projector_skill_is_trimmed_and_optional() {
+    async fn private_context_projector_skill_is_trimmed_and_optional() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         tokio::fs::create_dir_all(home.config_dir())
@@ -851,7 +851,7 @@ mod tests {
             .expect("config dir");
         tokio::fs::write(
             home.config_path(),
-            "[memory]\nprojector_skill = \" memory-core \"\n",
+            "[private_context]\nprojector_skill = \" private-context-core \"\n",
         )
         .await
         .expect("write config");
@@ -859,9 +859,28 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
 
         assert_eq!(
-            config.memory.projector_skill.as_deref(),
-            Some("memory-core")
+            config.private_context.projector_skill.as_deref(),
+            Some("private-context-core")
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_projector_config_does_not_activate_projector() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        tokio::fs::create_dir_all(home.config_dir())
+            .await
+            .expect("config dir");
+        tokio::fs::write(
+            home.config_path(),
+            "[memory]\nprojector_skill = \"private-context-core\"\n",
+        )
+        .await
+        .expect("write config");
+
+        let config = OperatorConfig::load(&home).await.expect("load config");
+
+        assert!(config.private_context.projector_skill.is_none());
     }
 
     #[tokio::test]

@@ -193,7 +193,7 @@ async fn prompt_loads_assistant_active_continuity_and_fs_read_uses_project_root(
 }
 
 #[tokio::test]
-async fn prompt_loading_rejects_symlinked_identity_files() {
+async fn prompt_loading_rejects_symlinked_workspace_rules() {
     use std::os::unix::fs::symlink;
 
     let env = TestEnv::new();
@@ -201,10 +201,10 @@ async fn prompt_loading_rejects_symlinked_identity_files() {
         .await
         .expect("bootstrap workspace");
 
-    let outside = env.temp_dir.path().join("outside-soul.md");
-    std::fs::write(&outside, "# Outside Soul\n").expect("write outside file");
-    std::fs::remove_file(env.workspace_root().join("SOUL.md")).expect("remove soul file");
-    symlink(&outside, env.workspace_root().join("SOUL.md")).expect("symlink soul file");
+    let outside = env.temp_dir.path().join("outside-agents.md");
+    std::fs::write(&outside, "# Outside Agents\n").expect("write outside file");
+    std::fs::remove_file(env.workspace_root().join("AGENTS.md")).expect("remove agents file");
+    symlink(&outside, env.workspace_root().join("AGENTS.md")).expect("symlink agents file");
 
     install_and_bind_channel(&env, "loopback").await;
     let kernel = env

@@ -42,14 +42,35 @@ impl SessionCompactionStore {
     }
 
     pub async fn latest(&self, session_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
+        self.latest_matching(session_id, None).await
+    }
+
+    pub async fn latest_before_sequence(
+        &self,
+        session_id: Uuid,
+        before_sequence_no: u64,
+    ) -> Result<Option<SessionCompactionRecord>> {
+        self.latest_matching(
+            session_id,
+            Some(i64::try_from(before_sequence_no).context("before_sequence_no is too large")?),
+        )
+        .await
+    }
+
+    async fn latest_matching(
+        &self,
+        session_id: Uuid,
+        before_sequence_no: Option<i64>,
+    ) -> Result<Option<SessionCompactionRecord>> {
         let row = sqlx::query(
             "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
              FROM session_compactions \
-             WHERE session_id = ?1 \
+             WHERE session_id = ?1 AND (?2 IS NULL OR through_sequence_no < ?2) \
              ORDER BY through_sequence_no DESC, compaction_id DESC \
              LIMIT 1",
         )
         .bind(session_id.to_string())
+        .bind(before_sequence_no)
         .fetch_optional(&self.pool)
         .await
         .context("failed to query latest session compaction record")?;
@@ -330,5 +351,47 @@ mod tests {
         assert_eq!(latest.compaction_id, second.compaction_id);
         assert_eq!(latest.summary_text, "second");
         assert_eq!(latest.summary_state, second_state);
+    }
+
+    #[tokio::test]
+    async fn latest_before_sequence_uses_strict_cutoff() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let store = SessionCompactionStore::new(db.pool());
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+
+        let record = store
+            .insert(
+                session_id,
+                1,
+                5,
+                "bounded".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert compaction");
+
+        assert_eq!(
+            store
+                .latest_before_sequence(session_id, 6)
+                .await
+                .expect("latest before later cutoff")
+                .expect("record")
+                .compaction_id,
+            record.compaction_id
+        );
+        assert!(store
+            .latest_before_sequence(session_id, 5)
+            .await
+            .expect("latest at strict cutoff")
+            .is_none());
+        assert!(store
+            .latest_before_sequence(other_session_id, 6)
+            .await
+            .expect("other session")
+            .is_none());
     }
 }
