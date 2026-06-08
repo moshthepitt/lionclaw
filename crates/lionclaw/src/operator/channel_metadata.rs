@@ -69,10 +69,16 @@ struct ChannelMetadataFile {
     contact: Option<ChannelContactMetadataSection>,
     #[allow(
         dead_code,
-        reason = "channel metadata parsing allows private context projector metadata in the shared skill metadata file"
+        reason = "channel metadata parsing allows private context metadata in the shared skill metadata file"
     )]
     #[serde(default)]
     private_context_projector: Option<toml::Value>,
+    #[allow(
+        dead_code,
+        reason = "channel metadata parsing allows private context metadata in the shared skill metadata file"
+    )]
+    #[serde(default)]
+    private_context_recorder: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -682,7 +688,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parses_channel_metadata_with_private_context_projector_section() {
+    fn parses_channel_metadata_with_private_context_sections() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let skill = write_channel_skill(
             temp_dir.path(),
@@ -691,9 +697,11 @@ mod tests {
         );
         fs::write(skill.join("scripts/projector"), "#!/usr/bin/env bash\n").expect("projector");
         make_executable(&skill.join("scripts/projector"));
+        fs::write(skill.join("scripts/recorder"), "#!/usr/bin/env bash\n").expect("recorder");
+        make_executable(&skill.join("scripts/recorder"));
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\n\n[channel]\nid = \"private-context\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n",
+            "version = 1\n\n[channel]\nid = \"private-context\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n\n[private_context_recorder]\ncommand = \"scripts/recorder\"\n",
         )
         .expect("metadata");
 
