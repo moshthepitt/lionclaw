@@ -187,7 +187,10 @@ pub(crate) fn validate_text_chars(label: &str, value: &str) -> Result<()> {
 
 fn looks_like_windows_absolute_path(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    matches!(
+        (bytes.first(), bytes.get(1)),
+        (Some(first), Some(b':')) if first.is_ascii_alphabetic()
+    )
 }
 
 pub(crate) fn cap_utf8(text: &str, max_bytes: usize) -> String {

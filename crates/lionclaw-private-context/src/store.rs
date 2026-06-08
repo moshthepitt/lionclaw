@@ -528,7 +528,8 @@ impl PrivateContextStore {
         scope: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<ContextItem>> {
-        let limit = i64::try_from(validate_limit(limit)?).expect("validated list limit fits i64");
+        let limit = i64::try_from(validate_limit(limit)?)
+            .context("validated list limit did not fit i64")?;
         let rows = if let Some(scope) = scope {
             let scope = validate_scope(scope)?;
             sqlx::query(
@@ -568,7 +569,8 @@ impl PrivateContextStore {
         limit: Option<usize>,
     ) -> Result<Vec<ContextItem>> {
         let query = validate_query(query)?;
-        let limit = i64::try_from(validate_limit(limit)?).expect("validated list limit fits i64");
+        let limit = i64::try_from(validate_limit(limit)?)
+            .context("validated list limit did not fit i64")?;
         let Some(fts_query) = fts_query_from_text(&query) else {
             return Ok(Vec::new());
         };
@@ -1028,7 +1030,8 @@ async fn query_items_for_scopes(
     scopes: &[String],
 ) -> Result<Vec<SqliteRow>> {
     validate_profile_projection_class(class)?;
-    if scopes.len() == 2 {
+    let first = required_scope(scopes, 0)?;
+    if let Some(second) = scopes.get(1) {
         sqlx::query(
             r#"
             SELECT *
@@ -1037,8 +1040,8 @@ async fn query_items_for_scopes(
             "#,
         )
         .bind(class.as_str())
-        .bind(&scopes[0])
-        .bind(&scopes[1])
+        .bind(first)
+        .bind(second)
         .fetch_all(pool)
         .await
         .map_err(Into::into)
@@ -1051,7 +1054,7 @@ async fn query_items_for_scopes(
             "#,
         )
         .bind(class.as_str())
-        .bind(&scopes[0])
+        .bind(first)
         .fetch_all(pool)
         .await
         .map_err(Into::into)
@@ -1065,7 +1068,8 @@ async fn query_memory_projection(
     max_items: usize,
 ) -> Result<Vec<SqliteRow>> {
     let limit = i64::try_from(max_items.max(1)).unwrap_or(i64::MAX);
-    if scopes.len() == 2 {
+    let first = required_scope(scopes, 0)?;
+    if let Some(second) = scopes.get(1) {
         sqlx::query(
             r#"
             SELECT ci.*
@@ -1085,9 +1089,9 @@ async fn query_memory_projection(
             "#,
         )
         .bind(fts_query)
-        .bind(&scopes[0])
-        .bind(&scopes[1])
-        .bind(&scopes[0])
+        .bind(first)
+        .bind(second)
+        .bind(first)
         .bind(limit)
         .fetch_all(pool)
         .await
@@ -1111,12 +1115,19 @@ async fn query_memory_projection(
             "#,
         )
         .bind(fts_query)
-        .bind(&scopes[0])
+        .bind(first)
         .bind(limit)
         .fetch_all(pool)
         .await
         .map_err(Into::into)
     }
+}
+
+fn required_scope(scopes: &[String], index: usize) -> Result<&str> {
+    scopes
+        .get(index)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("projection scope list was unexpectedly empty"))
 }
 
 fn rows_to_items(rows: Vec<SqliteRow>) -> Result<Vec<ContextItem>> {
