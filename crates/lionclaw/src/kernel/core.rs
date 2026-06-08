@@ -8869,6 +8869,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_context_projector_omits_current_input_when_prompt_mode_omits_it() {
+        let (projector, requests) =
+            TestPrivateContextProjector::with_items(vec![memory_candidate(
+                PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY,
+            )]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let user_text = "ATTACHED_CURRENT_INPUT_SHOULD_NOT_REACH_PROJECTOR";
+        let build = fixture
+            .kernel
+            .build_prompt_context(
+                &session,
+                "mock",
+                &fixture.plan,
+                PromptContextMode::AttachedNativeTui,
+                Some(user_text),
+                None,
+            )
+            .await
+            .expect("build attached prompt context");
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(
+            rendered.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(user_text), "{rendered}");
+        assert!(!audit_json.contains(user_text));
+
+        let requests = requests
+            .lock()
+            .expect("private context projector request lock");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].current_input.is_none());
+    }
+
+    #[tokio::test]
     async fn over_budget_current_input_fails_before_private_context_projector_call() {
         let (projector, requests) =
             TestPrivateContextProjector::with_items(vec![memory_candidate(
@@ -17206,6 +17251,22 @@ fn private_context_current_input(user_text: Option<&str>) -> Option<PrivateConte
     })
 }
 
+fn private_context_current_input_for_policy(
+    items: &[ContextItemSpec],
+    policy: &PromptContextPolicy,
+    user_text: Option<&str>,
+) -> Option<PrivateContextCurrentInput> {
+    items
+        .iter()
+        .any(|item| {
+            item.id == ContextItemId::UserInput
+                && matches!(item.source, ContextSource::CurrentUserInput)
+                && policy.allows(item).is_ok()
+        })
+        .then(|| private_context_current_input(user_text))
+        .flatten()
+}
+
 fn private_context_class_audits_from_request(
     request: &PrivateContextProjectionRequest,
 ) -> Vec<PromptContextPrivateContextProjectionClassAudit> {
@@ -21638,7 +21699,7 @@ impl Kernel {
                 policy.transcript_tail_limit,
             )
             .await?;
-        let current_input = private_context_current_input(user_text);
+        let current_input = private_context_current_input_for_policy(items, policy, user_text);
         let request = PrivateContextProjectionRequest {
             request_id: uuid::Uuid::new_v4(),
             session_id: session.session_id,
