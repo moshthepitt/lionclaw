@@ -1102,9 +1102,11 @@ turn has been durably finalized and `sessions.record_turn(...)` has committed,
 the kernel may invoke the recorder for Main, Interactive sessions on the
 `program_turn`, `attached_native_tui_turn`, and `channel_turn` surfaces. Failed,
 timed-out, cancelled, interrupted, Untrusted, Conservative-history, and empty
-transcript turns do not send a recorder request; when a recorder is configured,
-they produce only metadata skip audit. Recorder failures never fail the user
-turn.
+transcript turns finalized through those surfaces do not send a recorder request;
+when a recorder is configured, they produce only metadata skip audit. Bootstrap
+restart reconciliation remains a separate kernel recovery path audited through
+`session.turn.reconciled`, not `private_context.record`. Recorder failures never
+fail the user turn.
 
 The recorder runs with the skill root as working directory, stdin piped, stdout
 and stderr piped, and the same small ambient process-start allowlist used for the
