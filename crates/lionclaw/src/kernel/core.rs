@@ -8200,6 +8200,24 @@ mod tests {
         .expect("kernel init")
     }
 
+    async fn kernel_with_loopback_channel(temp_dir: &TempDir) -> Kernel {
+        let project = crate::operator::target::init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
+        let channel_skill =
+            write_installed_skill(&home, "loopback-skill", "loopback channel skill").await;
+        make_executable(&channel_skill.join("scripts/worker"));
+        crate::operator::reconcile::add_channel(
+            &home,
+            "loopback".to_string(),
+            "loopback-skill".to_string(),
+            crate::operator::config::ChannelLaunchMode::Interactive,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+        kernel_with_home(&home).await
+    }
+
     async fn write_installed_skill(home: &LionClawHome, alias: &str, description: &str) -> PathBuf {
         let skill_dir = home.skills_dir().join(alias);
         tokio::fs::create_dir_all(skill_dir.join("scripts"))
@@ -9146,6 +9164,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_program_turn_audits_private_context_skip_without_request() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (mut kernel, _runtime_calls) = kernel_with_pre_turn_failure_runtime(&temp_dir).await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: "failed program recorder request".to_string(),
+                runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect_err("program turn should fail");
+
+        assert!(
+            requests
+                .lock()
+                .expect("private context recorder requests")
+                .is_empty(),
+            "failed turns must not call the recorder"
+        );
+        let audit = private_context_record_audit(&kernel, session.session_id).await;
+        assert_eq!(audit["surface"], "program_turn");
+        assert_eq!(audit["eligibility"], "skipped");
+        assert_eq!(audit["status"], "skipped");
+        assert_eq!(audit["reason"], "not_completed");
+    }
+
+    #[tokio::test]
     async fn attached_native_tui_import_invokes_private_context_recorder() {
         let temp_dir = tempdir().expect("temp dir");
         let (mut kernel, _exports) = kernel_with_counting_terminal_runtime_and_transcript(
@@ -9203,21 +9263,7 @@ mod tests {
     #[tokio::test]
     async fn channel_turn_invokes_private_context_recorder_with_channel_surface() {
         let temp_dir = tempdir().expect("temp dir");
-        let project = crate::operator::target::init_project(temp_dir.path()).expect("init project");
-        let home = LionClawHome::new(project.instance.home);
-        let channel_skill =
-            write_installed_skill(&home, "loopback-skill", "loopback channel skill").await;
-        make_executable(&channel_skill.join("scripts/worker"));
-        crate::operator::reconcile::add_channel(
-            &home,
-            "loopback".to_string(),
-            "loopback-skill".to_string(),
-            crate::operator::config::ChannelLaunchMode::Interactive,
-            Vec::new(),
-        )
-        .await
-        .expect("add channel");
-        let mut kernel = kernel_with_home(&home).await;
+        let mut kernel = kernel_with_loopback_channel(&temp_dir).await;
         let prompts = Arc::new(Mutex::new(Vec::new()));
         kernel
             .register_runtime_adapter(
@@ -9282,6 +9328,80 @@ mod tests {
             PrivateContextRecordSurface::ChannelTurn
         );
         assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
+    }
+
+    #[tokio::test]
+    async fn failed_channel_turn_audits_private_context_skip_without_request() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = kernel_with_loopback_channel(&temp_dir).await;
+        let counters = RuntimeCallCounters::new();
+        kernel
+            .register_runtime_adapter(
+                TEST_PRE_TURN_FAILURE_RUNTIME_ID,
+                Arc::new(ClosingDirectRuntimeAdapter {
+                    starts: Arc::clone(&counters.starts),
+                    turns: Arc::clone(&counters.turns),
+                    closes: Arc::clone(&counters.closes),
+                }),
+            )
+            .await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session = kernel
+            .sessions
+            .open(
+                "loopback".to_string(),
+                "channel:loopback:direct:failed-recorder".to_string(),
+                kernel.session_scope().to_string(),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open channel session");
+        let session_id = session.session_id;
+
+        kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id: Uuid::new_v4(),
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "failed channel recorder request".to_string(),
+                    prompt_user_text: "failed channel recorder request".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect_err("channel turn should fail");
+
+        assert!(
+            requests
+                .lock()
+                .expect("private context recorder requests")
+                .is_empty(),
+            "failed channel turns must not call the recorder"
+        );
+        let audit = private_context_record_audit(&kernel, session_id).await;
+        assert_eq!(audit["surface"], "channel_turn");
+        assert_eq!(audit["eligibility"], "skipped");
+        assert_eq!(audit["status"], "skipped");
+        assert_eq!(audit["reason"], "not_completed");
     }
 
     #[test]
@@ -19989,14 +20109,24 @@ impl Kernel {
             error_text: Some(error_text.clone()),
         };
 
-        self.session_turns
+        let completed_turn = self
+            .session_turns
             .complete_turn(persisted_turn.turn_id, completion.clone())
             .await
-            .map_err(internal)?;
-        self.sessions
-            .record_turn(session.session_id)
-            .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Internal("failed session turn was not found".to_string())
+            })?;
+        self.post_commit_session_turn(
+            session,
+            &completed_turn,
+            if channel_stream_finalizer.stream_context.is_some() {
+                PrivateContextRecordSurface::ChannelTurn
+            } else {
+                PrivateContextRecordSurface::ProgramTurn
+            },
+        )
+        .await?;
         self.maybe_compact_session_transcript_best_effort(session)
             .await;
         if let Err(err) = self
@@ -22542,7 +22672,8 @@ impl Kernel {
             ) && status != ChannelTurnStatus::Completed
             {
                 let session_status = channel_terminal_session_status(status);
-                self.session_turns
+                let completed_turn = self
+                    .session_turns
                     .complete_turn(
                         turn.turn_id,
                         SessionTurnCompletion {
@@ -22553,11 +22684,28 @@ impl Kernel {
                         },
                     )
                     .await
-                    .map_err(internal)?;
-                self.sessions
-                    .record_turn(turn.session_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        KernelError::Internal("terminalized session turn was not found".to_string())
+                    })?;
+                if let Some(session) = self
+                    .sessions
+                    .get_scoped(turn.session_id, self.session_scope())
                     .await
-                    .map_err(internal)?;
+                    .map_err(internal)?
+                {
+                    self.post_commit_session_turn(
+                        &session,
+                        &completed_turn,
+                        PrivateContextRecordSurface::ChannelTurn,
+                    )
+                    .await?;
+                } else {
+                    self.sessions
+                        .record_turn(turn.session_id)
+                        .await
+                        .map_err(internal)?;
+                }
             }
         }
 
