@@ -1,5 +1,12 @@
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
+use rustix::fs::{flock, FlockOperation};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
@@ -20,6 +27,7 @@ use super::{
 
 pub(crate) const PRIVATE_CONTEXT_RECORDER_TIMEOUT: Duration = Duration::from_secs(2);
 const PRIVATE_CONTEXT_RECORDER_STDOUT_MAX_BYTES: usize = 4096;
+const PRIVATE_CONTEXT_RECORDER_LOCK_FILE: &str = ".lionclaw-private-context-recorder.lock";
 
 #[derive(Clone)]
 pub(crate) struct PrivateContextRecorderService {
@@ -147,6 +155,11 @@ impl PrivateContextRecorder for SkillPrivateContextRecorder {
             Ok(value) => value,
             Err(_) => return failed_outcome("encode_request", started_at),
         };
+        let _state_lock =
+            match acquire_private_context_recorder_state_lock(&self.config.state_dir).await {
+                Ok(lock) => lock,
+                Err(_) => return failed_outcome("state_lock", started_at),
+            };
         let mut process = match OneShotPrivateContextRecorderProcess::spawn(&self.config).await {
             Ok(process) => process,
             Err(_) => return failed_outcome("spawn_failed", started_at),
@@ -263,6 +276,46 @@ type RecorderProcessWait = Result<RecorderProcessOutput, ()>;
 struct RecorderProcessOutput {
     exit_status: Option<i32>,
     stdout: Vec<u8>,
+}
+
+struct PrivateContextRecorderStateLock {
+    _file: fs::File,
+}
+
+async fn acquire_private_context_recorder_state_lock(
+    state_dir: &Path,
+) -> Result<PrivateContextRecorderStateLock, ()> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        acquire_private_context_recorder_state_lock_blocking(&state_dir)
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+fn acquire_private_context_recorder_state_lock_blocking(
+    state_dir: &Path,
+) -> Result<PrivateContextRecorderStateLock, ()> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    ensure_private_context_state_dir(state_dir).map_err(|_| ())?;
+    let state_root = fs::File::open(state_dir).map_err(|_| ())?;
+    if !state_root.metadata().map_err(|_| ())?.is_dir() {
+        return Err(());
+    }
+    let lock = openat(
+        &state_root,
+        PRIVATE_CONTEXT_RECORDER_LOCK_FILE,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|_| ())?;
+    let lock = fs::File::from(lock);
+    if !lock.metadata().map_err(|_| ())?.is_file() {
+        return Err(());
+    }
+    flock(&lock, FlockOperation::LockExclusive).map_err(|_| ())?;
+    Ok(PrivateContextRecorderStateLock { _file: lock })
 }
 
 async fn take_output(reader: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
@@ -424,6 +477,36 @@ mod tests {
         }
 
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_state_lock_serializes_independent_recorder_instances() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+cat >/dev/null
+if mkdir "$LIONCLAW_SKILL_STATE_DIR/active"; then
+  trap 'rmdir "$LIONCLAW_SKILL_STATE_DIR/active"' EXIT
+else
+  printf overlap > "$LIONCLAW_SKILL_STATE_DIR/overlap"
+  exit 11
+fi
+sleep 0.1
+"#,
+        );
+        let first = SkillPrivateContextRecorder::new(config.clone());
+        let second = SkillPrivateContextRecorder::new(config.clone());
+
+        let (first_outcome, second_outcome) =
+            tokio::join!(first.record(request()), second.record(request()));
+
+        assert_eq!(first_outcome.status, PrivateContextRecordStatus::Completed);
+        assert_eq!(second_outcome.status, PrivateContextRecordStatus::Completed);
+        assert!(!config.state_dir.join("overlap").exists());
     }
 
     #[cfg(unix)]
