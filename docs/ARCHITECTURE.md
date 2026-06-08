@@ -1043,30 +1043,41 @@ background work behind.
 The v1 protocol is JSONL. The kernel writes one
 `PrivateContextProjectionRequest` JSON object per line to projector stdin and
 reads one `PrivateContextProjection` JSON object per line from stdout. Each
-request carries a fresh `request_id`, `project_scope`, runtime/session policy,
-kernel-selected source refs, optional capped `current_input` when the prompt
-mode selects current user input, and explicit `requested_classes` budgets for
-`assistant_profile`, `user_profile`, and `memory`. Each response must echo the
-same id and tag every returned item with one requested class. There is no
-`protocol_version` field in v1. Unknown response fields are ignored. Only one
-request is in flight at a time. The request timeout is a kernel constant, not
-skill config.
+request carries a fresh `request_id`, runtime/session policy, the prompt
+`surface`, optional audit-safe `project_scope`, kernel-selected source refs,
+optional capped `current_input` text when the prompt mode selects current user
+input, and explicit `budgets` for `assistant_profile`, `user_profile`, and
+`memory`. Each response must echo the same id and tag every returned item with a
+class, text, and provenance. Items do not carry core-visible memory/profile
+taxonomy beyond their class. There is no `protocol_version` field in v1. Unknown
+response fields are ignored. Only one request is in flight at a time. The
+request timeout is a kernel constant, not skill config.
+
+Provenance may reference selected session turns, selected compaction summaries,
+or skill-owned projector records. `ProjectorRecord` provenance must include the
+configured projector id, a record id, and optionally a revision. Record ids and
+revisions are audit handles only: 1..128 bytes, visible ASCII, no whitespace, no
+control characters, and no `/` or `\` path separators. They must not contain
+projected body text, and the kernel never opens the projector's storage.
 
 Crash, EOF, malformed JSON, missing required fields, unknown enum values, wrong
-request id, wrong projector id, unrequested classes, invalid provenance, empty
-text, and timeout omit projected private context safely. Projected output that
-exceeds a requested class budget is deterministically capped or dropped within
-that class instead of invalidating the whole response. Timeouts audit as
-`projector_timeout`; other projector process failures audit as
-`projector_failed`. Fatal protocol failures and timeouts retire the resident
-process before a later projection can start, so a late response cannot satisfy
-a future request.
+request id, wrong projector id, and timeout omit all projected private context
+safely. Class-level semantic failures omit only that class: known but
+unrequested class, empty text, missing provenance, unsupported provenance, or
+invalid `ProjectorRecord` handle. Projected output that exceeds a requested
+class budget is deterministically capped or dropped within that class instead
+of invalidating the whole response. Timeouts audit as `projector_timeout`; other
+projector process failures audit as `projector_failed`. Fatal protocol failures
+and timeouts retire the resident process before a later projection can start, so
+a late response cannot satisfy a future request.
 
 Projector output is projected context only. `PromptContextPolicy` remains the
 final owner of trust-tier exclusion, byte caps, rendering, whole-section
-omission on invalid output, and prompt-context audit metadata. Audit records
-projector metadata, requested class budgets, source counts, current-input byte
-counts, and cap status, never projected body text. Projector stdout is the
+omission on protocol-invalid output, and prompt-context audit metadata. Audit
+records projector metadata, requested class budgets, source counts,
+current-input byte counts, class status/reason, `byte_budget_capped`,
+`item_count_capped`, and dropped item counts, never projected body text.
+Projector stdout is the
 protocol stream; stderr may be drained only as bounded operational diagnostics
 and must not enter prompt text or prompt-context audit body fields. Final
 Markdown wrapping is part of the prompt section cap; capped projected sections

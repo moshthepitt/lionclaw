@@ -628,10 +628,11 @@ mod tests {
     use crate::{
         contracts::{SessionHistoryPolicy, TrustTier},
         kernel::private_context_projection::{
-            PrivateContextClassBudget, PrivateContextProjectionErrorKind,
-            PrivateContextProjectionRequest, PrivateContextProjector, PrivateContextSourceRef,
+            PrivateContextProjectionErrorKind, PrivateContextProjectionRequest,
+            PrivateContextProjector, PrivateContextSourceRef, ProjectedContextBudget,
             ProjectedContextClass,
         },
+        kernel::prompt_context::PromptContextMode,
     };
 
     #[cfg(unix)]
@@ -689,16 +690,17 @@ fi
         PrivateContextProjectionRequest {
             request_id: Uuid::new_v4(),
             session_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid"),
-            project_scope: "project:test".to_string(),
             runtime_id: "mock".to_string(),
             trust_tier: TrustTier::Main,
             history_policy: SessionHistoryPolicy::Interactive,
-            requested_classes: vec![PrivateContextClassBudget {
+            surface: PromptContextMode::ProgramPrimary,
+            project_scope: Some("project:test".to_string()),
+            current_input: None,
+            budgets: vec![ProjectedContextBudget {
                 class: ProjectedContextClass::Memory,
                 max_items: 16,
                 max_bytes: 1024,
             }],
-            current_input: None,
             sources: vec![PrivateContextSourceRef::SessionTurnRange {
                 before_sequence_no: Some(10),
                 limit: 4,
@@ -722,7 +724,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         );
@@ -814,7 +816,7 @@ while IFS= read -r _line; do
   if [ "$count" = "1" ]; then
     stale_request_id="$request_id"
     printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
-    (sleep 0.02; printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"stale delayed output","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$stale_request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID") &
+    (sleep 0.02; printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","text":"stale delayed output","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}\n' "$stale_request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID") &
   else
     sleep 0.1
     printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
@@ -876,8 +878,8 @@ done
     async fn fatal_decode_errors_retire_process_and_later_restart() {
         for first_response in [
             r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core"}"#,
-            r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"kind":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
-            r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"class":"memory","kind":"stable_fact","text":"remembered"}]}"#,
+            r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"class":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
+            r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"class":"memory","text":"remembered"}]}"#,
         ] {
             let temp_dir = tempfile::tempdir().expect("temp dir");
             let config = write_projector_script(

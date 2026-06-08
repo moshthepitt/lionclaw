@@ -125,8 +125,8 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     private_context_projection::{
-        validate_private_context_projection, PrivateContextClassBudget, PrivateContextCurrentInput,
-        PrivateContextProjectionRequest, PrivateContextProjector, PrivateContextSourceRef,
+        validate_private_context_projection, PrivateContextProjectionRequest,
+        PrivateContextProjector, PrivateContextSourceRef, ProjectedContextBudget,
         ProjectedContextClass, ProjectedContextItem, ValidPrivateContextClassProjection,
         PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
     },
@@ -7133,8 +7133,8 @@ mod tests {
     use crate::kernel::continuity::title_file_name;
     use crate::kernel::private_context_projection::{
         PrivateContextProjection, PrivateContextProjectionError, PrivateContextProjectionRequest,
-        PrivateContextSourceRef, ProjectedContextItem, ProjectedContextItemKind,
-        ProjectedContextProvenance, ProjectedContextProvenanceSource,
+        PrivateContextSourceRef, ProjectedContextItem, ProjectedContextProvenance,
+        ProjectedContextProvenanceSource,
     };
     use crate::kernel::runtime::{
         RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
@@ -8328,12 +8328,14 @@ mod tests {
     ) -> ProjectedContextItem {
         ProjectedContextItem {
             class,
-            kind: ProjectedContextItemKind::StableFact,
             text: text.into(),
             provenance: vec![ProjectedContextProvenance {
                 source: ProjectedContextProvenanceSource::SessionTurn,
                 sequence_no: Some(1),
                 event_id: None,
+                projector_id: None,
+                record_id: None,
+                revision: None,
             }],
         }
     }
@@ -8776,25 +8778,29 @@ mod tests {
             .expect("private context projector request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].session_id, session.session_id);
-        assert_eq!(requests[0].project_scope, fixture.kernel.session_scope());
+        assert_eq!(
+            requests[0].project_scope.as_deref(),
+            Some(fixture.kernel.session_scope())
+        );
         assert_eq!(requests[0].runtime_id, "mock");
         assert_eq!(requests[0].trust_tier.as_str(), "main");
         assert_eq!(
             requests[0].history_policy,
             SessionHistoryPolicy::Interactive
         );
-        assert_eq!(requests[0].requested_classes.len(), 3);
-        assert!(requests[0].requested_classes.iter().any(|class| {
+        assert_eq!(requests[0].surface, PromptContextMode::ProgramPrimary);
+        assert_eq!(requests[0].budgets.len(), 3);
+        assert!(requests[0].budgets.iter().any(|class| {
             class.class == ProjectedContextClass::AssistantProfile
                 && class.max_items > 0
                 && class.max_bytes > 0
         }));
-        assert!(requests[0].requested_classes.iter().any(|class| {
+        assert!(requests[0].budgets.iter().any(|class| {
             class.class == ProjectedContextClass::UserProfile
                 && class.max_items > 0
                 && class.max_bytes > 0
         }));
-        assert!(requests[0].requested_classes.iter().any(|class| {
+        assert!(requests[0].budgets.iter().any(|class| {
             class.class == ProjectedContextClass::Memory
                 && class.max_items > 0
                 && class.max_bytes > 0
@@ -8803,10 +8809,7 @@ mod tests {
             .current_input
             .as_ref()
             .expect("private context request current input");
-        assert_eq!(current_input.text, user_text);
-        assert_eq!(current_input.included_bytes, user_text.len());
-        assert_eq!(current_input.original_bytes, user_text.len());
-        assert!(!current_input.was_capped);
+        assert_eq!(current_input, user_text);
         assert_eq!(requests[0].sources.len(), 1);
         match &requests[0].sources[0] {
             PrivateContextSourceRef::SessionTurnRange {
@@ -8972,10 +8975,8 @@ mod tests {
             .current_input
             .as_ref()
             .expect("private context request current input");
-        assert!(current_input.was_capped);
-        assert!(current_input.included_bytes <= PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET);
-        assert_eq!(current_input.original_bytes, user_text.trim().len());
-        assert!(!current_input.text.contains(tail));
+        assert!(current_input.len() <= PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET);
+        assert!(!current_input.contains(tail));
         assert!(audit_json.contains("\"current_input_was_capped\":true"));
         assert!(!audit_json.contains(tail));
     }
@@ -9077,7 +9078,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LIONCLAW_SKILL_STATE_DIR/requests.jsonl"
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -9134,7 +9135,7 @@ printf 'start\n' >> "$LIONCLAW_SKILL_STATE_DIR/starts"
 while IFS= read -r line; do
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_UNTRUSTED_SHOULD_NOT_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -9174,7 +9175,7 @@ printf 'CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_STDERR_POISON_SHOULD_NOT_APPEAR\n' 
 while IFS= read -r line; do
   request_id=${line#*\"request_id\":\"}
   request_id=${request_id%%\"*}
-  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","kind":"stable_fact","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"memory","text":"CONFIGURED_PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1,"event_id":null}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 done
 "#,
         )
@@ -9419,12 +9420,14 @@ done
             memory_candidate(INVALID_MEMORY),
             ProjectedContextItem {
                 class: ProjectedContextClass::Memory,
-                kind: ProjectedContextItemKind::Preference,
                 text: " ".to_string(),
                 provenance: vec![ProjectedContextProvenance {
                     source: ProjectedContextProvenanceSource::SessionTurn,
                     sequence_no: Some(1),
                     event_id: None,
+                    projector_id: None,
+                    record_id: None,
+                    revision: None,
                 }],
             },
         ]);
@@ -9446,11 +9449,83 @@ done
         assert!(!rendered.contains(INVALID_MEMORY), "{rendered}");
         assert!(!rendered.contains("## Memory"), "{rendered}");
         assert!(build.audit.excluded.iter().any(|item| {
-            item.id == ContextItemId::MemoryContext && item.reason == "projector_invalid_output"
+            item.id == ContextItemId::MemoryContext && item.reason == "empty_text"
         }));
-        assert!(audit_json.contains("\"status\":\"projector_invalid_output\""));
+        assert!(audit_json.contains("\"status\":\"included\""));
         assert!(audit_json.contains("\"reason\":\"empty_text\""));
         assert!(!audit_json.contains(INVALID_MEMORY));
+    }
+
+    #[tokio::test]
+    async fn invalid_private_context_projector_class_does_not_drop_valid_classes() {
+        let assistant_text = "ASSISTANT_PROFILE_VALID_CLASS_SHOULD_RENDER";
+        let user_text = "USER_PROFILE_INVALID_CLASS_SHOULD_NOT_RENDER";
+        let memory_text = "MEMORY_VALID_CLASS_SHOULD_RENDER";
+        let (projector, _requests) = TestPrivateContextProjector::with_invalid(vec![
+            projected_context_item(ProjectedContextClass::AssistantProfile, assistant_text),
+            ProjectedContextItem {
+                class: ProjectedContextClass::UserProfile,
+                text: user_text.to_string(),
+                provenance: Vec::new(),
+            },
+            memory_candidate(memory_text),
+        ]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains(assistant_text), "{rendered}");
+        assert!(rendered.contains(memory_text), "{rendered}");
+        assert!(!rendered.contains("## User Profile"), "{rendered}");
+        assert!(!rendered.contains(user_text), "{rendered}");
+        assert!(build.audit.excluded.iter().any(|item| {
+            item.id == ContextItemId::UserProfile && item.reason == "missing_provenance"
+        }));
+        assert!(audit_json.contains("\"class\":\"user_profile\""));
+        assert!(audit_json.contains("\"reason\":\"missing_provenance\""));
+        assert!(!audit_json.contains(user_text));
+    }
+
+    #[tokio::test]
+    async fn private_context_projector_item_count_pressure_is_audited_without_body() {
+        let mut items = (0..PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS)
+            .map(|index| memory_candidate(format!("kept memory {index:02}")))
+            .collect::<Vec<_>>();
+        let dropped = "DROPPED_MEMORY_ITEM_SHOULD_NOT_RENDER_OR_AUDIT";
+        items.push(memory_candidate(dropped));
+        let (projector, _requests) = TestPrivateContextProjector::with_items(items);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains("kept memory 00"), "{rendered}");
+        assert!(rendered.contains("kept memory 15"), "{rendered}");
+        assert!(!rendered.contains(dropped), "{rendered}");
+        assert!(audit_json.contains("\"item_count_capped\":true"));
+        assert!(audit_json.contains("\"dropped_item_count\":1"));
+        assert!(!audit_json.contains(dropped));
     }
 
     #[tokio::test]
@@ -9488,7 +9563,7 @@ done
             .any(|item| item.id == ContextItemId::MemoryContext));
         assert!(audit_json.contains("\"status\":\"included\""));
         assert!(audit_json.contains("\"class\":\"memory\""));
-        assert!(audit_json.contains("\"cap_status\":\"capped\""));
+        assert!(audit_json.contains("\"byte_budget_capped\":true"));
         assert!(!audit_json.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY));
     }
 
@@ -9527,7 +9602,7 @@ done
                 && item.original_bytes > item.included_bytes
         }));
         assert!(audit_json.contains("\"status\":\"included\""));
-        assert!(audit_json.contains("\"cap_status\":\"capped\""));
+        assert!(audit_json.contains("\"byte_budget_capped\":true"));
         assert!(!audit_json.contains(PRIVATE_CONTEXT_PROJECTOR_MAIN_ONLY));
         assert!(!audit_json.contains(MEMORY_AFTER_CAP));
     }
@@ -9552,7 +9627,6 @@ done
         let audit_json = prompt_context_audit_json(&build);
 
         assert!(rendered.contains("## Memory"), "{rendered}");
-        assert!(rendered.contains("- Stable fact:"), "{rendered}");
         assert!(rendered.contains("\n  > m"), "{rendered}");
         assert!(!build
             .audit
@@ -9566,7 +9640,7 @@ done
         }));
         assert!(audit_json.contains("\"status\":\"included\""));
         assert!(audit_json.contains("\"class\":\"memory\""));
-        assert!(audit_json.contains("\"cap_status\":\"capped\""));
+        assert!(audit_json.contains("\"byte_budget_capped\":true"));
     }
 
     #[tokio::test]
@@ -17281,6 +17355,13 @@ struct PrivateContextProjectionCache {
     audit: PromptContextPrivateContextProjectionAudit,
 }
 
+struct PrivateContextCurrentInput {
+    text: String,
+    included_bytes: usize,
+    original_bytes: usize,
+    was_capped: bool,
+}
+
 impl PrivateContextProjectionCache {
     fn items_for(&self, class: ProjectedContextClass) -> Vec<&ProjectedContextItem> {
         self.items
@@ -17400,7 +17481,7 @@ fn render_budgeted_projected_context_items(
 }
 
 fn render_projected_context_item(candidate: &ProjectedContextItem) -> String {
-    let mut chunk = projected_context_item_header(candidate);
+    let mut chunk = String::from("\n");
     push_contained_projected_context_text(&mut chunk, &candidate.text);
     chunk
 }
@@ -17409,7 +17490,7 @@ fn render_projected_context_item_with_budget(
     candidate: &ProjectedContextItem,
     max_bytes: usize,
 ) -> Option<String> {
-    let mut chunk = projected_context_item_header(candidate);
+    let mut chunk = String::from("\n");
     (chunk.len() < max_bytes
         && push_contained_projected_context_text_with_budget(
             &mut chunk,
@@ -17417,10 +17498,6 @@ fn render_projected_context_item_with_budget(
             max_bytes,
         ))
     .then_some(chunk)
-}
-
-fn projected_context_item_header(candidate: &ProjectedContextItem) -> String {
-    format!("\n\n- {}:", candidate.kind.title())
 }
 
 fn push_contained_projected_context_text(section: &mut String, text: &str) {
@@ -17524,7 +17601,7 @@ fn private_context_class_audits_from_request(
     request: &PrivateContextProjectionRequest,
 ) -> Vec<PromptContextPrivateContextProjectionClassAudit> {
     request
-        .requested_classes
+        .budgets
         .iter()
         .map(|budget| PromptContextPrivateContextProjectionClassAudit {
             class: budget.class,
@@ -17536,6 +17613,11 @@ fn private_context_class_audits_from_request(
             included_bytes: 0,
             original_bytes: 0,
             was_capped: false,
+            byte_budget_capped: false,
+            item_count_capped: false,
+            dropped_item_count: 0,
+            status: "projector_returned_no_items",
+            reason: None,
         })
         .collect()
 }
@@ -17555,6 +17637,11 @@ fn private_context_class_audits_from_validation(
             included_bytes: 0,
             original_bytes: 0,
             was_capped: class.was_capped,
+            byte_budget_capped: class.byte_budget_capped,
+            item_count_capped: class.item_count_capped,
+            dropped_item_count: class.dropped_item_count,
+            status: class.status,
+            reason: class.reason.map(|reason| reason.as_str()),
         })
         .collect()
 }
@@ -21932,21 +22019,21 @@ impl Kernel {
         user_text: Option<&str>,
         history_before_sequence_no: Option<u64>,
     ) -> Result<Option<PrivateContextProjectionCache>, KernelError> {
-        let requested_classes = items
+        let budgets = items
             .iter()
             .filter(|item| matches!(item.source, ContextSource::PrivateContextProjection))
             .filter(|item| policy.allows(item).is_ok())
             .filter_map(|item| {
                 item.id
                     .projected_class()
-                    .map(|class| PrivateContextClassBudget {
+                    .map(|class| ProjectedContextBudget {
                         class,
                         max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
                         max_bytes: policy.max_bytes(item),
                     })
             })
             .collect::<Vec<_>>();
-        if requested_classes.is_empty() {
+        if budgets.is_empty() {
             return Ok(None);
         }
 
@@ -21961,12 +22048,13 @@ impl Kernel {
         let request = PrivateContextProjectionRequest {
             request_id: uuid::Uuid::new_v4(),
             session_id: session.session_id,
-            project_scope: self.session_scope.clone(),
             runtime_id: runtime_id.to_string(),
             trust_tier: session.trust_tier.clone(),
             history_policy: session.history_policy,
-            requested_classes,
-            current_input: current_input.clone(),
+            surface: policy.mode,
+            project_scope: Some(self.session_scope.clone()),
+            current_input: current_input.as_ref().map(|input| input.text.clone()),
+            budgets,
             sources,
         };
         let source_count = request.sources.len();
@@ -22041,7 +22129,12 @@ impl Kernel {
             };
 
         let accepted_items = validation.items;
-        let status = if accepted_items.is_empty() {
+        let status = if accepted_items.is_empty()
+            && validation
+                .classes
+                .iter()
+                .all(|class| class.status == "projector_returned_no_items")
+        {
             "projector_returned_no_items"
         } else {
             "included"
@@ -22058,7 +22151,7 @@ impl Kernel {
             current_input_original_bytes,
             current_input_was_capped,
         );
-        if accepted_items.is_empty() {
+        if status == "projector_returned_no_items" {
             audit = audit.with_reason("projector_returned_no_items");
         }
 
@@ -22084,7 +22177,14 @@ impl Kernel {
         }
         let items = projection.items_for(projected_class);
         if items.is_empty() {
-            return Self::omitted_prompt_context_item("projector_returned_no_items");
+            let reason = projection
+                .audit
+                .classes
+                .iter()
+                .find(|class| class.class == projected_class)
+                .and_then(|class| class.reason.or(Some(class.status)))
+                .unwrap_or("projector_returned_no_items");
+            return Self::omitted_prompt_context_item(reason);
         }
 
         render_budgeted_projected_context_items(item, &items, max_bytes)

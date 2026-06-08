@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -43,7 +44,8 @@ const GENERATED_NOTE_BUDGET: usize = 4096;
 const CURRENT_INPUT_BUDGET: usize = 64 * 1024;
 pub(crate) const PRIVATE_CONTEXT_CURRENT_INPUT_BUDGET: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PromptContextMode {
     ProgramPrimary,
     ProgramResumePrimary,
@@ -601,7 +603,7 @@ pub(crate) struct PromptContextCap {
 pub(crate) struct PromptContextPrivateContextProjectionAudit {
     pub status: &'static str,
     pub projector_id: Option<String>,
-    pub project_scope: String,
+    pub project_scope: Option<String>,
     pub source_count: usize,
     pub current_input_included_bytes: usize,
     pub current_input_original_bytes: usize,
@@ -621,20 +623,25 @@ pub(crate) struct PromptContextPrivateContextProjectionClassAudit {
     pub included_bytes: usize,
     pub original_bytes: usize,
     pub was_capped: bool,
+    pub byte_budget_capped: bool,
+    pub item_count_capped: bool,
+    pub dropped_item_count: usize,
+    pub status: &'static str,
+    pub reason: Option<&'static str>,
 }
 
 impl PromptContextPrivateContextProjectionAudit {
     pub(crate) fn new(
         status: &'static str,
         projector_id: Option<String>,
-        project_scope: impl Into<String>,
+        project_scope: Option<String>,
         source_count: usize,
         classes: Vec<PromptContextPrivateContextProjectionClassAudit>,
     ) -> Self {
         Self {
             status,
             projector_id,
-            project_scope: project_scope.into(),
+            project_scope,
             source_count,
             current_input_included_bytes: 0,
             current_input_original_bytes: 0,
@@ -671,6 +678,7 @@ impl PromptContextPrivateContextProjectionAudit {
             summary.included_bytes = included_bytes;
             summary.original_bytes = original_bytes;
             summary.was_capped |= was_capped;
+            summary.byte_budget_capped |= was_capped;
         }
         self
     }
@@ -821,7 +829,11 @@ fn private_context_projection_class_json(
         "included_bytes": item.included_bytes,
         "original_bytes": item.original_bytes,
         "was_capped": item.was_capped,
-        "cap_status": if item.was_capped { "capped" } else { "uncapped" },
+        "byte_budget_capped": item.byte_budget_capped,
+        "item_count_capped": item.item_count_capped,
+        "dropped_item_count": item.dropped_item_count,
+        "status": item.status,
+        "reason": item.reason,
     })
 }
 

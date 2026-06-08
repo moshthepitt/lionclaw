@@ -3,7 +3,10 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::contracts::{SessionHistoryPolicy, TrustTier};
+use crate::{
+    contracts::{SessionHistoryPolicy, TrustTier},
+    kernel::prompt_context::PromptContextMode,
+};
 
 pub(crate) const NOOP_PRIVATE_CONTEXT_PROJECTOR_ID: &str = "noop_private_context_projector";
 pub(crate) const PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS: usize = 16;
@@ -47,28 +50,21 @@ impl PrivateContextProjector for NoopPrivateContextProjector {
 pub(crate) struct PrivateContextProjectionRequest {
     pub request_id: Uuid,
     pub session_id: Uuid,
-    pub project_scope: String,
     pub runtime_id: String,
     pub trust_tier: TrustTier,
     pub history_policy: SessionHistoryPolicy,
-    pub requested_classes: Vec<PrivateContextClassBudget>,
-    pub current_input: Option<PrivateContextCurrentInput>,
+    pub surface: PromptContextMode,
+    pub project_scope: Option<String>,
+    pub current_input: Option<String>,
+    pub budgets: Vec<ProjectedContextBudget>,
     pub sources: Vec<PrivateContextSourceRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PrivateContextClassBudget {
+pub(crate) struct ProjectedContextBudget {
     pub class: ProjectedContextClass,
     pub max_items: usize,
     pub max_bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PrivateContextCurrentInput {
-    pub text: String,
-    pub included_bytes: usize,
-    pub original_bytes: usize,
-    pub was_capped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +90,6 @@ pub(crate) struct PrivateContextProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProjectedContextItem {
     pub class: ProjectedContextClass,
-    pub kind: ProjectedContextItemKind,
     pub text: String,
     pub provenance: Vec<ProjectedContextProvenance>,
 }
@@ -115,34 +110,14 @@ impl ProjectedContextClass {
             Self::Memory => "memory",
         }
     }
-}
 
-#[allow(
-    dead_code,
-    reason = "projected item taxonomy is the stable private context boundary; the production noop projector emits no items yet"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ProjectedContextItemKind {
-    StableFact,
-    Preference,
-    ActiveThread,
-    Decision,
-    Correction,
-    Reminder,
-    Other,
-}
+    pub(crate) const ALL: [Self; 3] = [Self::AssistantProfile, Self::UserProfile, Self::Memory];
 
-impl ProjectedContextItemKind {
-    pub(crate) fn title(self) -> &'static str {
+    fn sort_index(self) -> usize {
         match self {
-            Self::StableFact => "Stable fact",
-            Self::Preference => "Preference",
-            Self::ActiveThread => "Active thread",
-            Self::Decision => "Decision",
-            Self::Correction => "Correction",
-            Self::Reminder => "Reminder",
-            Self::Other => "Other",
+            Self::AssistantProfile => 0,
+            Self::UserProfile => 1,
+            Self::Memory => 2,
         }
     }
 }
@@ -150,8 +125,16 @@ impl ProjectedContextItemKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProjectedContextProvenance {
     pub source: ProjectedContextProvenanceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence_no: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[allow(
@@ -163,6 +146,7 @@ pub(crate) struct ProjectedContextProvenance {
 pub(crate) enum ProjectedContextProvenanceSource {
     SessionTurn,
     CompactionSummary,
+    ProjectorRecord,
 }
 
 #[derive(Debug, Clone)]
@@ -247,9 +231,14 @@ pub(crate) struct ValidPrivateContextClassProjection {
     pub requested_max_bytes: usize,
     pub projected_item_count: usize,
     pub accepted_item_count: usize,
+    pub dropped_item_count: usize,
     pub projected_bytes: usize,
     pub accepted_bytes: usize,
     pub was_capped: bool,
+    pub byte_budget_capped: bool,
+    pub item_count_capped: bool,
+    pub status: &'static str,
+    pub reason: Option<PrivateContextProjectionInvalidReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +250,7 @@ pub(crate) enum PrivateContextProjectionInvalidReason {
     EmptyText,
     MissingProvenance,
     UnsupportedProvenance,
+    InvalidProjectorRecord,
 }
 
 impl PrivateContextProjectionInvalidReason {
@@ -273,6 +263,7 @@ impl PrivateContextProjectionInvalidReason {
             Self::EmptyText => "empty_text",
             Self::MissingProvenance => "missing_provenance",
             Self::UnsupportedProvenance => "unsupported_provenance",
+            Self::InvalidProjectorRecord => "invalid_projector_record",
         }
     }
 }
@@ -291,67 +282,38 @@ pub(crate) fn validate_private_context_projection(
     if projection.projector_id != expected_projector_id {
         return Err(PrivateContextProjectionInvalidReason::ProjectorIdMismatch);
     }
+
     let mut classes = request
-        .requested_classes
+        .budgets
         .iter()
-        .map(|budget| ValidPrivateContextClassProjection {
-            class: budget.class,
-            requested_max_items: budget.max_items,
-            requested_max_bytes: budget.max_bytes,
-            projected_item_count: 0,
-            accepted_item_count: 0,
-            projected_bytes: 0,
-            accepted_bytes: 0,
-            was_capped: false,
-        })
+        .map(class_projection_from_budget)
         .collect::<Vec<_>>();
     let mut accepted_items = Vec::new();
-    for item in &projection.items {
-        let Some(class) = classes.iter_mut().find(|class| class.class == item.class) else {
-            return Err(PrivateContextProjectionInvalidReason::UnrequestedClass);
-        };
-        if item.text.trim().is_empty() {
-            return Err(PrivateContextProjectionInvalidReason::EmptyText);
-        }
-        if item.provenance.is_empty() {
-            return Err(PrivateContextProjectionInvalidReason::MissingProvenance);
-        }
-        if !item
-            .provenance
+
+    for class in ProjectedContextClass::ALL {
+        let projected_items = projection
+            .items
             .iter()
-            .all(|provenance| provenance_supported(provenance, &request.sources))
-        {
-            return Err(PrivateContextProjectionInvalidReason::UnsupportedProvenance);
-        }
-        let item_bytes = item.text.len();
-        class.projected_item_count = class.projected_item_count.saturating_add(1);
-        class.projected_bytes = class.projected_bytes.saturating_add(item_bytes);
-
-        if class.accepted_item_count >= class.requested_max_items {
-            class.was_capped = true;
-            continue;
-        }
-        let remaining_bytes = class
-            .requested_max_bytes
-            .saturating_sub(class.accepted_bytes);
-        if remaining_bytes == 0 {
-            class.was_capped = true;
+            .filter(|item| item.class == class)
+            .collect::<Vec<_>>();
+        if projected_items.is_empty() {
             continue;
         }
 
-        let mut accepted = item.clone();
-        if accepted.text.len() > remaining_bytes {
-            accepted.text = cap_utf8(&accepted.text, remaining_bytes);
-            class.was_capped = true;
-        }
-        if accepted.text.trim().is_empty() {
-            class.was_capped = true;
+        let Some(summary) = classes.iter_mut().find(|summary| summary.class == class) else {
+            classes.push(unrequested_class_projection(class, &projected_items));
             continue;
-        }
-        class.accepted_item_count = class.accepted_item_count.saturating_add(1);
-        class.accepted_bytes = class.accepted_bytes.saturating_add(accepted.text.len());
-        accepted_items.push(accepted);
+        };
+
+        validate_requested_class_projection(
+            summary,
+            &projected_items,
+            expected_projector_id,
+            &request.sources,
+            &mut accepted_items,
+        );
     }
+    classes.sort_by_key(|class| class.class.sort_index());
 
     Ok(ValidPrivateContextProjection {
         projector_id: projection.projector_id.clone(),
@@ -371,8 +333,144 @@ fn cap_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
+fn class_projection_from_budget(
+    budget: &ProjectedContextBudget,
+) -> ValidPrivateContextClassProjection {
+    ValidPrivateContextClassProjection {
+        class: budget.class,
+        requested_max_items: budget.max_items,
+        requested_max_bytes: budget.max_bytes,
+        projected_item_count: 0,
+        accepted_item_count: 0,
+        dropped_item_count: 0,
+        projected_bytes: 0,
+        accepted_bytes: 0,
+        was_capped: false,
+        byte_budget_capped: false,
+        item_count_capped: false,
+        status: "projector_returned_no_items",
+        reason: None,
+    }
+}
+
+fn unrequested_class_projection(
+    class: ProjectedContextClass,
+    items: &[&ProjectedContextItem],
+) -> ValidPrivateContextClassProjection {
+    ValidPrivateContextClassProjection {
+        class,
+        requested_max_items: 0,
+        requested_max_bytes: 0,
+        projected_item_count: items.len(),
+        accepted_item_count: 0,
+        dropped_item_count: items.len(),
+        projected_bytes: items
+            .iter()
+            .fold(0usize, |total, item| total.saturating_add(item.text.len())),
+        accepted_bytes: 0,
+        was_capped: false,
+        byte_budget_capped: false,
+        item_count_capped: false,
+        status: "omitted",
+        reason: Some(PrivateContextProjectionInvalidReason::UnrequestedClass),
+    }
+}
+
+fn validate_requested_class_projection(
+    summary: &mut ValidPrivateContextClassProjection,
+    items: &[&ProjectedContextItem],
+    expected_projector_id: &str,
+    sources: &[PrivateContextSourceRef],
+    accepted_items: &mut Vec<ProjectedContextItem>,
+) {
+    summary.projected_item_count = items.len();
+    summary.projected_bytes = items
+        .iter()
+        .fold(0usize, |total, item| total.saturating_add(item.text.len()));
+
+    if let Some(reason) = items
+        .iter()
+        .find_map(|item| semantic_invalid_reason(item, expected_projector_id, sources))
+    {
+        summary.status = "omitted";
+        summary.reason = Some(reason);
+        summary.dropped_item_count = items.len();
+        return;
+    }
+
+    for item in items {
+        if summary.accepted_item_count >= summary.requested_max_items {
+            summary.item_count_capped = true;
+            summary.was_capped = true;
+            summary.dropped_item_count = summary.dropped_item_count.saturating_add(1);
+            continue;
+        }
+
+        let remaining_bytes = summary
+            .requested_max_bytes
+            .saturating_sub(summary.accepted_bytes);
+        if remaining_bytes == 0 {
+            summary.byte_budget_capped = true;
+            summary.was_capped = true;
+            summary.dropped_item_count = summary.dropped_item_count.saturating_add(1);
+            continue;
+        }
+
+        let mut accepted = (*item).clone();
+        if accepted.text.len() > remaining_bytes {
+            accepted.text = cap_utf8(&accepted.text, remaining_bytes);
+            summary.byte_budget_capped = true;
+            summary.was_capped = true;
+        }
+        if accepted.text.trim().is_empty() {
+            summary.byte_budget_capped = true;
+            summary.was_capped = true;
+            summary.dropped_item_count = summary.dropped_item_count.saturating_add(1);
+            continue;
+        }
+
+        summary.accepted_item_count = summary.accepted_item_count.saturating_add(1);
+        summary.accepted_bytes = summary.accepted_bytes.saturating_add(accepted.text.len());
+        accepted_items.push(accepted);
+    }
+
+    if summary.accepted_item_count > 0 {
+        summary.status = "included";
+    } else if summary.projected_item_count > 0 && summary.byte_budget_capped {
+        summary.status = "byte_budget_capped";
+    }
+}
+
+fn semantic_invalid_reason(
+    item: &ProjectedContextItem,
+    expected_projector_id: &str,
+    sources: &[PrivateContextSourceRef],
+) -> Option<PrivateContextProjectionInvalidReason> {
+    if item.text.trim().is_empty() {
+        return Some(PrivateContextProjectionInvalidReason::EmptyText);
+    }
+    if item.provenance.is_empty() {
+        return Some(PrivateContextProjectionInvalidReason::MissingProvenance);
+    }
+    for provenance in &item.provenance {
+        if !provenance_supported(provenance, expected_projector_id, sources) {
+            return Some(match provenance.source {
+                ProjectedContextProvenanceSource::ProjectorRecord => {
+                    PrivateContextProjectionInvalidReason::InvalidProjectorRecord
+                }
+                ProjectedContextProvenanceSource::SessionTurn
+                | ProjectedContextProvenanceSource::CompactionSummary => {
+                    PrivateContextProjectionInvalidReason::UnsupportedProvenance
+                }
+            });
+        }
+    }
+    None
+}
+
 fn provenance_supported(
     provenance: &ProjectedContextProvenance,
+    expected_projector_id: &str,
     sources: &[PrivateContextSourceRef],
 ) -> bool {
     if provenance
@@ -411,7 +509,29 @@ fn provenance_supported(
                 PrivateContextSourceRef::SessionTurnRange { .. } => false,
             })
         }
+        ProjectedContextProvenanceSource::ProjectorRecord => {
+            provenance
+                .projector_id
+                .as_deref()
+                .is_some_and(|projector_id| projector_id == expected_projector_id)
+                && provenance
+                    .record_id
+                    .as_deref()
+                    .is_some_and(valid_projector_record_handle)
+                && provenance
+                    .revision
+                    .as_deref()
+                    .is_none_or(valid_projector_record_handle)
+        }
     }
+}
+
+fn valid_projector_record_handle(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_graphic() && !byte.is_ascii_whitespace() && byte != b'/' && byte != b'\\'
+        })
 }
 
 #[cfg(test)]
@@ -463,7 +583,7 @@ mod tests {
     #[test]
     fn validation_caps_items_by_class_budget() {
         let request = PrivateContextProjectionRequest {
-            requested_classes: vec![PrivateContextClassBudget {
+            budgets: vec![ProjectedContextBudget {
                 class: ProjectedContextClass::Memory,
                 max_items: 1,
                 max_bytes: 1024,
@@ -486,12 +606,14 @@ mod tests {
         assert_eq!(valid.classes[0].projected_item_count, 2);
         assert_eq!(valid.classes[0].accepted_item_count, 1);
         assert!(valid.classes[0].was_capped);
+        assert!(valid.classes[0].item_count_capped);
+        assert_eq!(valid.classes[0].dropped_item_count, 1);
     }
 
     #[test]
     fn validation_caps_item_text_by_class_byte_budget() {
         let request = PrivateContextProjectionRequest {
-            requested_classes: vec![PrivateContextClassBudget {
+            budgets: vec![ProjectedContextBudget {
                 class: ProjectedContextClass::Memory,
                 max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
                 max_bytes: 5,
@@ -511,10 +633,11 @@ mod tests {
         assert_eq!(valid.classes[0].projected_bytes, "too large".len());
         assert_eq!(valid.classes[0].accepted_bytes, 5);
         assert!(valid.classes[0].was_capped);
+        assert!(valid.classes[0].byte_budget_capped);
     }
 
     #[test]
-    fn validation_rejects_unrequested_class() {
+    fn validation_omits_unrequested_class_without_failing_projection() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
             request.request_id,
@@ -525,27 +648,66 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("unrequested class is invalid");
-        assert_eq!(err.as_str(), "unrequested_class");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("unrequested class is class-scoped");
+        assert!(valid.items.is_empty());
+        let user_profile = valid
+            .classes
+            .iter()
+            .find(|class| class.class == ProjectedContextClass::UserProfile)
+            .expect("user profile audit");
+        assert_eq!(user_profile.status, "omitted");
+        assert_eq!(
+            user_profile.reason.map(|reason| reason.as_str()),
+            Some("unrequested_class")
+        );
     }
 
     #[test]
-    fn validation_rejects_empty_candidate_text() {
-        let request = request_with_session_turn_source();
+    fn validation_omits_only_semantically_invalid_class() {
+        let request = request_with_all_class_budgets();
         let projection = projection_with_items(
             request.request_id,
             "test",
-            vec![projected_context_item(" ")],
+            vec![
+                ProjectedContextItem {
+                    class: ProjectedContextClass::AssistantProfile,
+                    ..projected_context_item("assistant ok")
+                },
+                ProjectedContextItem {
+                    class: ProjectedContextClass::UserProfile,
+                    ..projected_context_item(" ")
+                },
+                ProjectedContextItem {
+                    class: ProjectedContextClass::Memory,
+                    ..projected_context_item("memory ok")
+                },
+            ],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("empty memory text is invalid");
-        assert_eq!(err.as_str(), "empty_text");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("semantic failure is class-scoped");
+        assert_eq!(valid.items.len(), 2);
+        assert!(valid.items.iter().any(|item| {
+            item.class == ProjectedContextClass::AssistantProfile && item.text == "assistant ok"
+        }));
+        assert!(valid.items.iter().any(|item| {
+            item.class == ProjectedContextClass::Memory && item.text == "memory ok"
+        }));
+        let user_profile = valid
+            .classes
+            .iter()
+            .find(|class| class.class == ProjectedContextClass::UserProfile)
+            .expect("user profile audit");
+        assert_eq!(user_profile.status, "omitted");
+        assert_eq!(
+            user_profile.reason.map(|reason| reason.as_str()),
+            Some("empty_text")
+        );
     }
 
     #[test]
-    fn validation_rejects_missing_provenance() {
+    fn validation_omits_class_with_missing_provenance() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
             request.request_id,
@@ -556,13 +718,17 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("missing provenance is invalid");
-        assert_eq!(err.as_str(), "missing_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("missing provenance is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("missing_provenance")
+        );
     }
 
     #[test]
-    fn validation_rejects_unsupported_provenance() {
+    fn validation_omits_class_with_unsupported_provenance() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
             request.request_id,
@@ -573,9 +739,13 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("unsupported provenance is invalid");
-        assert_eq!(err.as_str(), "unsupported_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("unsupported provenance is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
@@ -590,9 +760,13 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("session turn outside the source range is invalid");
-        assert_eq!(err.as_str(), "unsupported_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("session turn outside source range is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
@@ -607,9 +781,13 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("session turn outside the selected source records is invalid");
-        assert_eq!(err.as_str(), "unsupported_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("session turn outside selected records is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
@@ -623,14 +801,21 @@ mod tests {
                     source: ProjectedContextProvenanceSource::SessionTurn,
                     sequence_no: None,
                     event_id: None,
+                    projector_id: None,
+                    record_id: None,
+                    revision: None,
                 }],
                 ..projected_context_item("remember this")
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("missing provenance sequence is invalid");
-        assert_eq!(err.as_str(), "unsupported_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("missing provenance sequence is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
@@ -648,9 +833,13 @@ mod tests {
             }],
         );
 
-        let err = validate_private_context_projection(&request, "test", &projection)
-            .expect_err("blank provenance event id is invalid");
-        assert_eq!(err.as_str(), "unsupported_provenance");
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("blank provenance event id is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
@@ -668,6 +857,66 @@ mod tests {
         assert_eq!(valid.items.len(), 1);
         assert_eq!(valid.classes[0].accepted_item_count, 1);
         assert_eq!(valid.classes[0].projected_bytes, "remember this".len());
+    }
+
+    #[test]
+    fn validation_accepts_supported_projector_record_provenance() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![ProjectedContextItem {
+                provenance: vec![projector_record_provenance(
+                    "test",
+                    "record-1",
+                    Some("rev_A"),
+                )],
+                ..projected_context_item("remember this")
+            }],
+        );
+
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("supported projector record provenance is valid");
+        assert_eq!(valid.items.len(), 1);
+        assert_eq!(valid.classes[0].accepted_item_count, 1);
+    }
+
+    #[test]
+    fn validation_omits_invalid_projector_record_provenance() {
+        let oversized_revision = "x".repeat(129);
+        let cases = [
+            ("other", "record-1", Some("rev-1")),
+            ("test", "", Some("rev-1")),
+            ("test", "bad/record", Some("rev-1")),
+            ("test", "record 1", Some("rev-1")),
+            ("test", "record-1", Some("")),
+            ("test", "record-1", Some("rev 1")),
+            ("test", "record-1", Some(oversized_revision.as_str())),
+        ];
+
+        for (projector_id, record_id, revision) in cases {
+            let request = request_with_session_turn_source();
+            let projection = projection_with_items(
+                request.request_id,
+                "test",
+                vec![ProjectedContextItem {
+                    provenance: vec![projector_record_provenance(
+                        projector_id,
+                        record_id,
+                        revision,
+                    )],
+                    ..projected_context_item("remember this")
+                }],
+            );
+
+            let valid = validate_private_context_projection(&request, "test", &projection)
+                .expect("invalid projector record is class-scoped");
+            assert!(valid.items.is_empty(), "{projector_id:?} {record_id:?}");
+            assert_eq!(
+                valid.classes[0].reason.map(|reason| reason.as_str()),
+                Some("invalid_projector_record")
+            );
+        }
     }
 
     #[test]
@@ -706,7 +955,8 @@ mod tests {
         assert_eq!(encoded["project_scope"], "project:test");
         assert_eq!(encoded["trust_tier"], "main");
         assert_eq!(encoded["history_policy"], "interactive");
-        assert_eq!(encoded["requested_classes"][0]["class"], "memory");
+        assert_eq!(encoded["surface"], "program_primary");
+        assert_eq!(encoded["budgets"][0]["class"], "memory");
         assert_eq!(encoded["sources"][0]["kind"], "session_turn_range");
         assert_eq!(
             encoded["sources"][0]["sequence_nos"],
@@ -717,7 +967,7 @@ mod tests {
     #[test]
     fn response_deserializes_jsonl_protocol_shape() {
         let decoded: PrivateContextProjection = serde_json::from_str(
-            r#"{"request_id":"11111111-1111-1111-1111-111111111111","projector_id":"private-context-core","items":[{"class":"memory","kind":"stable_fact","text":"User prefers concise summaries.","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}],"ignored":true}"#,
+            r#"{"request_id":"11111111-1111-1111-1111-111111111111","projector_id":"private-context-core","items":[{"class":"memory","text":"User prefers concise summaries.","provenance":[{"source":"session_turn","sequence_no":7}]}],"ignored":true}"#,
         )
         .expect("decode response");
 
@@ -726,7 +976,6 @@ mod tests {
             Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid")
         );
         assert_eq!(decoded.projector_id, "private-context-core");
-        assert_eq!(decoded.items[0].kind, ProjectedContextItemKind::StableFact);
         assert_eq!(
             decoded.items[0].provenance[0].source,
             ProjectedContextProvenanceSource::SessionTurn
@@ -748,7 +997,6 @@ mod tests {
     fn projected_context_item(text: impl Into<String>) -> ProjectedContextItem {
         ProjectedContextItem {
             class: ProjectedContextClass::Memory,
-            kind: ProjectedContextItemKind::StableFact,
             text: text.into(),
             provenance: vec![session_turn_provenance(7)],
         }
@@ -758,16 +1006,17 @@ mod tests {
         PrivateContextProjectionRequest {
             request_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
-            project_scope: "project:test".to_string(),
             runtime_id: "mock".to_string(),
             trust_tier: TrustTier::Main,
             history_policy: SessionHistoryPolicy::Interactive,
-            requested_classes: vec![PrivateContextClassBudget {
+            surface: PromptContextMode::ProgramPrimary,
+            project_scope: Some("project:test".to_string()),
+            current_input: None,
+            budgets: vec![ProjectedContextBudget {
                 class: ProjectedContextClass::Memory,
                 max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
                 max_bytes: 1024,
             }],
-            current_input: None,
             sources: vec![PrivateContextSourceRef::SessionTurnRange {
                 before_sequence_no: Some(10),
                 limit: 4,
@@ -781,6 +1030,9 @@ mod tests {
             source: ProjectedContextProvenanceSource::SessionTurn,
             sequence_no: Some(sequence_no),
             event_id: None,
+            projector_id: None,
+            record_id: None,
+            revision: None,
         }
     }
 
@@ -789,6 +1041,38 @@ mod tests {
             source: ProjectedContextProvenanceSource::CompactionSummary,
             sequence_no: Some(sequence_no),
             event_id: None,
+            projector_id: None,
+            record_id: None,
+            revision: None,
+        }
+    }
+
+    fn projector_record_provenance(
+        projector_id: &str,
+        record_id: &str,
+        revision: Option<&str>,
+    ) -> ProjectedContextProvenance {
+        ProjectedContextProvenance {
+            source: ProjectedContextProvenanceSource::ProjectorRecord,
+            sequence_no: None,
+            event_id: None,
+            projector_id: Some(projector_id.to_string()),
+            record_id: Some(record_id.to_string()),
+            revision: revision.map(str::to_string),
+        }
+    }
+
+    fn request_with_all_class_budgets() -> PrivateContextProjectionRequest {
+        PrivateContextProjectionRequest {
+            budgets: ProjectedContextClass::ALL
+                .into_iter()
+                .map(|class| ProjectedContextBudget {
+                    class,
+                    max_items: PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
+                    max_bytes: 1024,
+                })
+                .collect(),
+            ..request_with_session_turn_source()
         }
     }
 }
