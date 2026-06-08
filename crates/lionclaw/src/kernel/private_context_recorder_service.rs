@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use rustix::fs::{flock, FlockOperation};
+use rustix::{
+    fs::{flock, FlockOperation},
+    io::Errno,
+};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
@@ -30,6 +33,7 @@ use super::{
 pub(crate) const PRIVATE_CONTEXT_RECORDER_TIMEOUT: Duration = Duration::from_secs(2);
 const PRIVATE_CONTEXT_RECORDER_STDOUT_MAX_BYTES: usize = 4096;
 const PRIVATE_CONTEXT_RECORDER_LOCK_DIR: &str = ".lionclaw-private-context-recorder-locks";
+const PRIVATE_CONTEXT_RECORDER_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
 pub(crate) struct PrivateContextRecorderService {
@@ -153,17 +157,30 @@ impl PrivateContextRecorder for SkillPrivateContextRecorder {
             Ok(value) => value,
             Err(_) => return failed_outcome("encode_request", started_at),
         };
-        let _state_lock =
-            match acquire_private_context_recorder_state_lock(&self.config.state_dir).await {
-                Ok(lock) => lock,
-                Err(_) => return failed_outcome("state_lock", started_at),
-            };
+        let Some(state_lock_timeout) = remaining_timeout(started_at, self.config.timeout) else {
+            return PrivateContextRecordOutcome::timed_out(elapsed_ms(started_at));
+        };
+        let _state_lock = match tokio::time::timeout(
+            state_lock_timeout,
+            acquire_private_context_recorder_state_lock(&self.config.state_dir),
+        )
+        .await
+        {
+            Ok(Ok(lock)) => lock,
+            Ok(Err(_)) => return failed_outcome("state_lock", started_at),
+            Err(_) => return PrivateContextRecordOutcome::timed_out(elapsed_ms(started_at)),
+        };
         let mut process = match OneShotPrivateContextRecorderProcess::spawn(&self.config).await {
             Ok(process) => process,
             Err(_) => return failed_outcome("spawn_failed", started_at),
         };
+        let Some(record_timeout) = remaining_timeout(started_at, self.config.timeout) else {
+            process.terminate();
+            process.finish_after_termination().await;
+            return PrivateContextRecordOutcome::timed_out(elapsed_ms(started_at));
+        };
         let wait_result = tokio::time::timeout(
-            self.config.timeout,
+            record_timeout,
             process.write_request_and_wait(&request_json),
         )
         .await;
@@ -289,24 +306,41 @@ struct PrivateContextRecorderStateLock {
     _in_process_guard: OwnedMutexGuard<()>,
 }
 
+enum PrivateContextRecorderStateLockAttempt {
+    Acquired(fs::File),
+    Busy,
+}
+
 async fn acquire_private_context_recorder_state_lock(
     state_dir: &Path,
 ) -> Result<PrivateContextRecorderStateLock, ()> {
     let in_process_lock = private_context_recorder_in_process_lock(state_dir)?;
     let in_process_guard = in_process_lock.lock_owned().await;
     let state_dir = state_dir.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || {
-        acquire_private_context_recorder_state_lock_blocking(&state_dir)
-    })
-    .await
-    .map_err(|_| ())??;
-    Ok(PrivateContextRecorderStateLock {
-        _file: file,
-        _in_process_guard: in_process_guard,
-    })
+    loop {
+        let attempt = tokio::task::spawn_blocking({
+            let state_dir = state_dir.clone();
+            move || try_acquire_private_context_recorder_state_lock_blocking(&state_dir)
+        })
+        .await
+        .map_err(|_| ())??;
+        match attempt {
+            PrivateContextRecorderStateLockAttempt::Acquired(file) => {
+                return Ok(PrivateContextRecorderStateLock {
+                    _file: file,
+                    _in_process_guard: in_process_guard,
+                });
+            }
+            PrivateContextRecorderStateLockAttempt::Busy => {
+                tokio::time::sleep(PRIVATE_CONTEXT_RECORDER_LOCK_RETRY).await;
+            }
+        }
+    }
 }
 
-fn acquire_private_context_recorder_state_lock_blocking(state_dir: &Path) -> Result<fs::File, ()> {
+fn try_acquire_private_context_recorder_state_lock_blocking(
+    state_dir: &Path,
+) -> Result<PrivateContextRecorderStateLockAttempt, ()> {
     use rustix::fs::{openat, Mode, OFlags};
 
     ensure_private_context_state_dir(state_dir).map_err(|_| ())?;
@@ -328,8 +362,13 @@ fn acquire_private_context_recorder_state_lock_blocking(state_dir: &Path) -> Res
     if !lock.metadata().map_err(|_| ())?.is_file() {
         return Err(());
     }
-    flock(&lock, FlockOperation::LockExclusive).map_err(|_| ())?;
-    Ok(lock)
+    match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(PrivateContextRecorderStateLockAttempt::Acquired(lock)),
+        Err(err) if private_context_recorder_lock_is_held(err) => {
+            Ok(PrivateContextRecorderStateLockAttempt::Busy)
+        }
+        Err(_) => Err(()),
+    }
 }
 
 fn private_context_recorder_in_process_lock(state_dir: &Path) -> Result<Arc<Mutex<()>>, ()> {
@@ -416,12 +455,20 @@ fn failed_outcome(reason: &'static str, started_at: Instant) -> PrivateContextRe
     PrivateContextRecordOutcome::failed(reason, None, elapsed_ms(started_at))
 }
 
+fn remaining_timeout(started_at: Instant, timeout: Duration) -> Option<Duration> {
+    timeout.checked_sub(started_at.elapsed())
+}
+
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at
         .elapsed()
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn private_context_recorder_lock_is_held(err: Errno) -> bool {
+    err == Errno::WOULDBLOCK || err == Errno::AGAIN
 }
 
 #[cfg(test)]
@@ -611,6 +658,37 @@ sleep 0.5
         assert_child_success("first", &first_output);
         assert_child_success("second", &second_output);
         assert!(!temp_dir.path().join("overlap").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_state_lock_wait_counts_toward_timeout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+"#,
+        )
+        .with_timeout(Duration::from_millis(50));
+        let held_lock = match super::try_acquire_private_context_recorder_state_lock_blocking(
+            &config.state_dir,
+        )
+        .expect("hold state lock")
+        {
+            super::PrivateContextRecorderStateLockAttempt::Acquired(file) => file,
+            super::PrivateContextRecorderStateLockAttempt::Busy => {
+                panic!("state lock was unexpectedly busy")
+            }
+        };
+        let recorder = SkillPrivateContextRecorder::new(config);
+
+        let outcome = tokio::time::timeout(Duration::from_millis(500), recorder.record(request()))
+            .await
+            .expect("recorder call should honor lock timeout");
+
+        drop(held_lock);
+        assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
     }
 
     #[cfg(unix)]
