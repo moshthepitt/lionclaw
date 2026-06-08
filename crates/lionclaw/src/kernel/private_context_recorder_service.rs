@@ -311,9 +311,9 @@ enum PrivateContextRecorderStateLockAttempt {
 async fn acquire_private_context_recorder_state_lock(
     state_dir: &Path,
 ) -> Result<PrivateContextRecorderStateLock, ()> {
-    let in_process_lock = private_context_recorder_in_process_lock(state_dir)?;
+    let state_dir = canonical_private_context_recorder_state_dir(state_dir)?;
+    let in_process_lock = private_context_recorder_in_process_lock(&state_dir)?;
     let in_process_guard = in_process_lock.lock_owned().await;
-    let state_dir = state_dir.to_path_buf();
     loop {
         let attempt = tokio::task::spawn_blocking({
             let state_dir = state_dir.clone();
@@ -340,14 +340,15 @@ fn try_acquire_private_context_recorder_state_lock_blocking(
 ) -> Result<PrivateContextRecorderStateLockAttempt, ()> {
     use rustix::fs::{openat, Mode, OFlags};
 
-    ensure_private_context_state_dir(state_dir).map_err(|_| ())?;
-    let lock_dir = private_context_recorder_lock_dir(state_dir)?;
+    let state_dir = canonical_private_context_recorder_state_dir(state_dir)?;
+    ensure_private_context_state_dir(&state_dir).map_err(|_| ())?;
+    let lock_dir = private_context_recorder_lock_dir(&state_dir)?;
     ensure_private_context_state_dir(&lock_dir).map_err(|_| ())?;
     let lock_root = fs::File::open(&lock_dir).map_err(|_| ())?;
     if !lock_root.metadata().map_err(|_| ())?.is_dir() {
         return Err(());
     }
-    let lock_file_name = private_context_recorder_lock_file_name(state_dir);
+    let lock_file_name = private_context_recorder_lock_file_name(&state_dir);
     let lock = openat(
         &lock_root,
         lock_file_name.as_str(),
@@ -384,8 +385,9 @@ fn private_context_recorder_in_process_lock(state_dir: &Path) -> Result<Arc<Mute
 }
 
 fn private_context_recorder_lock_path(state_dir: &Path) -> Result<PathBuf, ()> {
-    Ok(private_context_recorder_lock_dir(state_dir)?
-        .join(private_context_recorder_lock_file_name(state_dir)))
+    let state_dir = canonical_private_context_recorder_state_dir(state_dir)?;
+    Ok(private_context_recorder_lock_dir(&state_dir)?
+        .join(private_context_recorder_lock_file_name(&state_dir)))
 }
 
 fn private_context_recorder_lock_dir(state_dir: &Path) -> Result<PathBuf, ()> {
@@ -394,6 +396,11 @@ fn private_context_recorder_lock_dir(state_dir: &Path) -> Result<PathBuf, ()> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or(())?;
     Ok(parent.join(PRIVATE_CONTEXT_RECORDER_LOCK_DIR))
+}
+
+fn canonical_private_context_recorder_state_dir(state_dir: &Path) -> Result<PathBuf, ()> {
+    ensure_private_context_state_dir(state_dir).map_err(|_| ())?;
+    fs::canonicalize(state_dir).map_err(|_| ())
 }
 
 fn private_context_recorder_lock_file_name(state_dir: &Path) -> String {
@@ -611,6 +618,34 @@ mod tests {
 
         assert!(lock_path.starts_with(temp_dir.path()));
         assert!(!lock_path.starts_with(&state_dir));
+    }
+
+    #[test]
+    fn recorder_state_lock_identity_normalizes_relative_state_dir() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let temp_dir = tempfile::tempdir_in(&cwd).expect("temp dir in cwd");
+        let absolute_state_dir = temp_dir.path().join("state");
+        let relative_state_dir = absolute_state_dir
+            .strip_prefix(&cwd)
+            .expect("relative state dir")
+            .to_path_buf();
+
+        let absolute_lock_path =
+            super::private_context_recorder_lock_path(&absolute_state_dir).expect("absolute lock");
+        let relative_lock_path =
+            super::private_context_recorder_lock_path(&relative_state_dir).expect("relative lock");
+        let absolute_in_process_lock =
+            super::private_context_recorder_in_process_lock(&absolute_state_dir)
+                .expect("absolute in-process lock");
+        let relative_in_process_lock =
+            super::private_context_recorder_in_process_lock(&relative_state_dir)
+                .expect("relative in-process lock");
+
+        assert_eq!(absolute_lock_path, relative_lock_path);
+        assert!(Arc::ptr_eq(
+            &absolute_in_process_lock,
+            &relative_in_process_lock
+        ));
     }
 
     #[cfg(unix)]
