@@ -6431,12 +6431,20 @@ impl Kernel {
         turn: &SessionTurnRecord,
         surface: PrivateContextRecordSurface,
     ) -> Result<(), KernelError> {
+        self.touch_committed_session_turn(session).await?;
+        self.record_private_context_turn_best_effort(session, turn, surface)
+            .await;
+        Ok(())
+    }
+
+    async fn touch_committed_session_turn(
+        &self,
+        session: &super::sessions::Session,
+    ) -> Result<(), KernelError> {
         self.sessions
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
-        self.record_private_context_turn_best_effort(session, turn, surface)
-            .await;
         Ok(())
     }
 
@@ -7636,6 +7644,7 @@ mod tests {
     const TEST_TERMINAL_RUNTIME_ID: &str = "counting-terminal";
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
+    const TEST_REPLY_RUNTIME_ID: &str = "reply-runtime";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -7800,6 +7809,65 @@ mod tests {
             events: RuntimeEventSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.prompts.lock().await.push(input.prompt);
+            drop(events.send(RuntimeEvent::Done));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ReplyRuntimeAdapter {
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for ReplyRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_REPLY_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("reply-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            events: RuntimeEventSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(events.send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: self.message.clone(),
+            }));
             drop(events.send(RuntimeEvent::Done));
             Ok(RuntimeTurnResult::default())
         }
@@ -8398,12 +8466,18 @@ mod tests {
         outcome: PrivateContextRecordOutcome,
         requests: TestPrivateContextRecordRequests,
         commit_probe: Option<TestPrivateContextRecordCommitProbe>,
+        delivery_probe: Option<TestPrivateContextRecordDeliveryProbe>,
     }
 
     #[derive(Clone)]
     struct TestPrivateContextRecordCommitProbe {
         sessions: SessionStore,
         session_turns: SessionTurnStore,
+    }
+
+    #[derive(Clone)]
+    struct TestPrivateContextRecordDeliveryProbe {
+        channel_outbox: ChannelOutboxStore,
     }
 
     #[async_trait::async_trait]
@@ -8432,6 +8506,17 @@ mod tests {
                 assert_eq!(stored_turn.status, SessionTurnStatus::Completed);
                 assert_eq!(stored_turn.sequence_no, request.sequence_no);
             }
+            if let Some(probe) = &self.delivery_probe {
+                let delivery = probe
+                    .channel_outbox
+                    .get_delivery_by_source("session_turn", &request.turn_id.to_string())
+                    .await
+                    .expect("probe channel delivery");
+                assert!(
+                    delivery.is_some(),
+                    "recorder ran before channel delivery was enqueued"
+                );
+            }
 
             self.requests
                 .lock()
@@ -8449,6 +8534,7 @@ mod tests {
                     outcome,
                     requests: Arc::clone(&requests),
                     commit_probe: None,
+                    delivery_probe: None,
                 },
                 requests,
             )
@@ -8458,6 +8544,13 @@ mod tests {
             self.commit_probe = Some(TestPrivateContextRecordCommitProbe {
                 sessions: kernel.sessions.clone(),
                 session_turns: kernel.session_turns.clone(),
+            });
+            self
+        }
+
+        fn with_delivery_probe(mut self, kernel: &Kernel) -> Self {
+            self.delivery_probe = Some(TestPrivateContextRecordDeliveryProbe {
+                channel_outbox: kernel.channel_outbox.clone(),
             });
             self
         }
@@ -8474,6 +8567,21 @@ mod tests {
         } else {
             recorder
         };
+        kernel.private_context_recorder = PrivateContextRecorderService::with_recorder(
+            "test_private_context_recorder",
+            Arc::new(recorder),
+        );
+        requests
+    }
+
+    fn install_test_private_context_recorder_with_delivery_probe(
+        kernel: &mut Kernel,
+        outcome: PrivateContextRecordOutcome,
+    ) -> TestPrivateContextRecordRequests {
+        let (recorder, requests) = TestPrivateContextRecorder::new(outcome);
+        let recorder = recorder
+            .with_commit_probe(kernel)
+            .with_delivery_probe(kernel);
         kernel.private_context_recorder = PrivateContextRecorderService::with_recorder(
             "test_private_context_recorder",
             Arc::new(recorder),
@@ -9260,22 +9368,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_turn_invokes_private_context_recorder_with_channel_surface() {
+    async fn channel_turn_invokes_private_context_recorder_after_delivery_enqueue() {
         let temp_dir = tempdir().expect("temp dir");
         let mut kernel = kernel_with_loopback_channel(&temp_dir).await;
-        let prompts = Arc::new(Mutex::new(Vec::new()));
         kernel
             .register_runtime_adapter(
-                TEST_CAPTURE_PROMPT_RUNTIME_ID,
-                Arc::new(CapturePromptRuntimeAdapter {
-                    prompts: Arc::clone(&prompts),
+                TEST_REPLY_RUNTIME_ID,
+                Arc::new(ReplyRuntimeAdapter {
+                    message: "channel recorder response".to_string(),
                 }),
             )
             .await;
-        let requests = install_test_private_context_recorder(
+        let requests = install_test_private_context_recorder_with_delivery_probe(
             &mut kernel,
             PrivateContextRecordOutcome::completed(1),
-            true,
         );
         let session = kernel
             .sessions
@@ -9302,7 +9408,7 @@ mod tests {
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: None,
-                    requested_runtime_id: Some(TEST_CAPTURE_PROMPT_RUNTIME_ID.to_string()),
+                    requested_runtime_id: Some(TEST_REPLY_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
@@ -9323,7 +9429,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].turn_id, turn_id);
         assert_eq!(requests[0].surface, PrivateContextRecordSurface::Channel);
-        assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
+        assert_eq!(requests[0].runtime_id, TEST_REPLY_RUNTIME_ID);
     }
 
     #[tokio::test]
@@ -19699,20 +19805,20 @@ impl Kernel {
         }
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
-        self.post_commit_session_turn(
-            session,
-            &completed_turn,
-            if channel_stream_context.is_some() {
-                PrivateContextRecordSurface::Channel
-            } else {
-                PrivateContextRecordSurface::Program
-            },
-        )
-        .await?;
+        self.touch_committed_session_turn(session).await?;
+        if channel_stream_context.is_none() {
+            self.record_private_context_turn_best_effort(
+                session,
+                &completed_turn,
+                PrivateContextRecordSurface::Program,
+            )
+            .await;
+        }
         self.mark_runtime_session_ready(&execution_plan).await;
         self.maybe_compact_session_transcript_best_effort(session)
             .await;
 
+        let mut channel_delivery_result = Ok(());
         if let Some(stream_context) = &channel_stream_context {
             if artifacts.saw_error {
                 self.audit
@@ -19734,19 +19840,31 @@ impl Kernel {
                 && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
             {
                 let mut outbox_attachments = outbox_attachments;
-                self.enqueue_channel_turn_delivery(
-                    stream_context,
-                    session.session_id,
-                    turn_id,
-                    ChannelDeliveryContent {
-                        text: artifacts.assistant_text.clone(),
-                        format_hint: "markdown".to_string(),
-                        attachments: outbox_attachments.as_slice().to_vec(),
-                    },
-                )
-                .await?;
-                outbox_attachments.mark_persisted();
+                channel_delivery_result = self
+                    .enqueue_channel_turn_delivery(
+                        stream_context,
+                        session.session_id,
+                        turn_id,
+                        ChannelDeliveryContent {
+                            text: artifacts.assistant_text.clone(),
+                            format_hint: "markdown".to_string(),
+                            attachments: outbox_attachments.as_slice().to_vec(),
+                        },
+                    )
+                    .await;
+                if channel_delivery_result.is_ok() {
+                    outbox_attachments.mark_persisted();
+                }
             }
+        }
+        channel_delivery_result?;
+        if channel_stream_context.is_some() {
+            self.record_private_context_turn_best_effort(
+                session,
+                &completed_turn,
+                PrivateContextRecordSurface::Channel,
+            )
+            .await;
         }
 
         self.audit
@@ -20000,32 +20118,42 @@ impl Kernel {
         }
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
-        self.post_commit_session_turn(
-            session,
-            &completed_turn,
-            if channel_stream_context.is_some() {
-                PrivateContextRecordSurface::Channel
-            } else {
-                PrivateContextRecordSurface::Program
-            },
-        )
-        .await?;
+        self.touch_committed_session_turn(session).await?;
+        if channel_stream_context.is_none() {
+            self.record_private_context_turn_best_effort(
+                session,
+                &completed_turn,
+                PrivateContextRecordSurface::Program,
+            )
+            .await;
+        }
         if matches!(
             &runtime_control.outcome,
             RuntimeControlOutcome::Handled { .. }
         ) {
             self.mark_runtime_session_ready(&execution_plan).await;
         }
+        let mut channel_delivery_result = Ok(());
         if status == SessionTurnStatus::Completed {
             if let Some(stream_context) = &channel_stream_context {
-                self.enqueue_channel_turn_text_delivery(
-                    stream_context,
-                    session.session_id,
-                    turn_id,
-                    &assistant_text,
-                )
-                .await?;
+                channel_delivery_result = self
+                    .enqueue_channel_turn_text_delivery(
+                        stream_context,
+                        session.session_id,
+                        turn_id,
+                        &assistant_text,
+                    )
+                    .await;
             }
+        }
+        channel_delivery_result?;
+        if channel_stream_context.is_some() {
+            self.record_private_context_turn_best_effort(
+                session,
+                &completed_turn,
+                PrivateContextRecordSurface::Channel,
+            )
+            .await;
         }
 
         self.audit
@@ -20113,16 +20241,16 @@ impl Kernel {
             .ok_or_else(|| {
                 KernelError::Internal("failed session turn was not found".to_string())
             })?;
-        self.post_commit_session_turn(
-            session,
-            &completed_turn,
-            if channel_stream_finalizer.stream_context.is_some() {
-                PrivateContextRecordSurface::Channel
-            } else {
-                PrivateContextRecordSurface::Program
-            },
-        )
-        .await?;
+        let surface = if channel_stream_finalizer.stream_context.is_some() {
+            PrivateContextRecordSurface::Channel
+        } else {
+            PrivateContextRecordSurface::Program
+        };
+        self.touch_committed_session_turn(session).await?;
+        if surface == PrivateContextRecordSurface::Program {
+            self.record_private_context_turn_best_effort(session, &completed_turn, surface)
+                .await;
+        }
         self.maybe_compact_session_transcript_best_effort(session)
             .await;
         if let Err(err) = self
@@ -20141,15 +20269,26 @@ impl Kernel {
             )
             .await;
         }
-        self.emit_channel_stream_error_if_missing(
-            channel_stream_finalizer,
-            &error_code,
-            &error_text,
-            stream_error_emitted,
-        )
-        .await?;
-        self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
-            .await?;
+        let stream_result = match self
+            .emit_channel_stream_error_if_missing(
+                channel_stream_finalizer,
+                &error_code,
+                &error_text,
+                stream_error_emitted,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        stream_result?;
+        if surface == PrivateContextRecordSurface::Channel {
+            self.record_private_context_turn_best_effort(session, &completed_turn, surface)
+                .await;
+        }
         Ok(completion)
     }
 
@@ -22546,17 +22685,30 @@ impl Kernel {
             .ok_or_else(|| {
                 KernelError::Internal("completed queued control turn was not found".to_string())
             })?;
-        self.post_commit_session_turn(
+        self.touch_committed_session_turn(session).await?;
+        let completion_result = self
+            .finish_queued_lionclaw_control_turn(turn, turn_id, &message, stream_context.clone())
+            .await;
+        completion_result?;
+        self.record_private_context_turn_best_effort(
             session,
             &completed_turn,
             PrivateContextRecordSurface::Channel,
         )
-        .await?;
+        .await;
+        Ok(())
+    }
+
+    async fn finish_queued_lionclaw_control_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        turn_id: Uuid,
+        message: &str,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
         if let Some(context) = &stream_context {
-            self.emit_turn_completed_snapshot(context, &message).await?;
-        }
-        if let Some(context) = &stream_context {
-            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, &message)
+            self.emit_turn_completed_snapshot(context, message).await?;
+            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, message)
                 .await?;
         }
         self.terminalize_queued_turn(
@@ -22565,7 +22717,7 @@ impl Kernel {
                 runtime_id: turn.runtime_id.clone(),
                 assistant_text_len: message.len(),
             },
-            stream_context.clone(),
+            stream_context,
         )
         .await?;
         Ok(())
@@ -22656,6 +22808,7 @@ impl Kernel {
             return Ok(false);
         }
 
+        let mut private_context_record = None;
         if let Some(persisted_turn) = self
             .session_turns
             .get(turn.turn_id)
@@ -22690,12 +22843,8 @@ impl Kernel {
                     .await
                     .map_err(internal)?
                 {
-                    self.post_commit_session_turn(
-                        &session,
-                        &completed_turn,
-                        PrivateContextRecordSurface::Channel,
-                    )
-                    .await?;
+                    self.touch_committed_session_turn(&session).await?;
+                    private_context_record = Some((session, completed_turn));
                 } else {
                     self.sessions
                         .record_turn(turn.session_id)
@@ -22727,6 +22876,14 @@ impl Kernel {
         }
         self.emit_runtime_event(&stream_context, &None, RuntimeEvent::Done)
             .await?;
+        if let Some((session, completed_turn)) = &private_context_record {
+            self.record_private_context_turn_best_effort(
+                session,
+                completed_turn,
+                PrivateContextRecordSurface::Channel,
+            )
+            .await;
+        }
 
         let mut details = serde_json::Map::new();
         details.insert("turn_id".to_string(), json!(turn.turn_id));
