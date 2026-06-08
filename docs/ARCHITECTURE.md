@@ -1108,8 +1108,9 @@ restart reconciliation remains a separate kernel recovery path audited through
 `session.turn.reconciled`, not `private_context.record`. Recorder failures never
 fail the user turn.
 Concurrent eligible turns are serialized per recorder state directory before
-process spawn, including across independent kernel instances, so skill-owned
-updates to `LIONCLAW_SKILL_STATE_DIR` have deterministic ordering.
+process spawn, including across independent kernel instances. The lock is held
+outside `LIONCLAW_SKILL_STATE_DIR`, so ordinary recorder cleanup of its own
+state directory cannot unlink the active lock.
 
 The recorder runs with the skill root as working directory, stdin piped, stdout
 and stderr piped, and the same small ambient process-start allowlist used for the

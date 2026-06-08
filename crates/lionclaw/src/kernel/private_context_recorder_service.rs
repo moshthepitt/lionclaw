@@ -1,16 +1,18 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
 use rustix::fs::{flock, FlockOperation};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     time::Instant,
 };
 
@@ -27,7 +29,7 @@ use super::{
 
 pub(crate) const PRIVATE_CONTEXT_RECORDER_TIMEOUT: Duration = Duration::from_secs(2);
 const PRIVATE_CONTEXT_RECORDER_STDOUT_MAX_BYTES: usize = 4096;
-const PRIVATE_CONTEXT_RECORDER_LOCK_FILE: &str = ".lionclaw-private-context-recorder.lock";
+const PRIVATE_CONTEXT_RECORDER_LOCK_DIR: &str = ".lionclaw-private-context-recorder-locks";
 
 #[derive(Clone)]
 pub(crate) struct PrivateContextRecorderService {
@@ -280,32 +282,40 @@ struct RecorderProcessOutput {
 
 struct PrivateContextRecorderStateLock {
     _file: fs::File,
+    _in_process_guard: OwnedMutexGuard<()>,
 }
 
 async fn acquire_private_context_recorder_state_lock(
     state_dir: &Path,
 ) -> Result<PrivateContextRecorderStateLock, ()> {
+    let in_process_lock = private_context_recorder_in_process_lock(state_dir)?;
+    let in_process_guard = in_process_lock.lock_owned().await;
     let state_dir = state_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let file = tokio::task::spawn_blocking(move || {
         acquire_private_context_recorder_state_lock_blocking(&state_dir)
     })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| ())??;
+    Ok(PrivateContextRecorderStateLock {
+        _file: file,
+        _in_process_guard: in_process_guard,
+    })
 }
 
-fn acquire_private_context_recorder_state_lock_blocking(
-    state_dir: &Path,
-) -> Result<PrivateContextRecorderStateLock, ()> {
+fn acquire_private_context_recorder_state_lock_blocking(state_dir: &Path) -> Result<fs::File, ()> {
     use rustix::fs::{openat, Mode, OFlags};
 
     ensure_private_context_state_dir(state_dir).map_err(|_| ())?;
-    let state_root = fs::File::open(state_dir).map_err(|_| ())?;
-    if !state_root.metadata().map_err(|_| ())?.is_dir() {
+    let lock_dir = private_context_recorder_lock_dir(state_dir)?;
+    ensure_private_context_state_dir(&lock_dir).map_err(|_| ())?;
+    let lock_root = fs::File::open(&lock_dir).map_err(|_| ())?;
+    if !lock_root.metadata().map_err(|_| ())?.is_dir() {
         return Err(());
     }
+    let lock_file_name = private_context_recorder_lock_file_name(state_dir);
     let lock = openat(
-        &state_root,
-        PRIVATE_CONTEXT_RECORDER_LOCK_FILE,
+        &lock_root,
+        lock_file_name.as_str(),
         OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     )
@@ -315,7 +325,62 @@ fn acquire_private_context_recorder_state_lock_blocking(
         return Err(());
     }
     flock(&lock, FlockOperation::LockExclusive).map_err(|_| ())?;
-    Ok(PrivateContextRecorderStateLock { _file: lock })
+    Ok(lock)
+}
+
+fn private_context_recorder_in_process_lock(state_dir: &Path) -> Result<Arc<Mutex<()>>, ()> {
+    static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+    let lock_path = private_context_recorder_lock_path(state_dir)?;
+    let mut locks = LOCKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| ())?;
+    Ok(Arc::clone(
+        locks
+            .entry(lock_path)
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    ))
+}
+
+fn private_context_recorder_lock_path(state_dir: &Path) -> Result<PathBuf, ()> {
+    Ok(private_context_recorder_lock_dir(state_dir)?
+        .join(private_context_recorder_lock_file_name(state_dir)))
+}
+
+fn private_context_recorder_lock_dir(state_dir: &Path) -> Result<PathBuf, ()> {
+    let parent = state_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(())?;
+    Ok(parent.join(PRIVATE_CONTEXT_RECORDER_LOCK_DIR))
+}
+
+fn private_context_recorder_lock_file_name(state_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lionclaw-private-context-recorder-lock-v1\0");
+    hash_path(&mut hasher, state_dir);
+    format!("{}.lock", hex::encode(hasher.finalize()))
+}
+
+fn hash_path(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        hash_bytes(hasher, path.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        let path = path.to_string_lossy();
+        hash_bytes(hasher, path.as_bytes());
+    }
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+    hasher.update(b"\0");
 }
 
 async fn take_output(reader: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
@@ -479,22 +544,35 @@ mod tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn recorder_state_lock_path_is_outside_recorder_state_dir() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp_dir.path().join("state");
+        let lock_path = super::private_context_recorder_lock_path(&state_dir).expect("lock path");
+
+        assert!(lock_path.starts_with(temp_dir.path()));
+        assert!(!lock_path.starts_with(&state_dir));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn recorder_state_lock_serializes_independent_recorder_instances() {
+    async fn recorder_state_lock_survives_recorder_state_cleanup() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let config = write_recorder_script(
             temp_dir.path(),
             r#"#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+test_root="$(dirname "$LIONCLAW_SKILL_STATE_DIR")"
 cat >/dev/null
-if mkdir "$LIONCLAW_SKILL_STATE_DIR/active"; then
-  trap 'rmdir "$LIONCLAW_SKILL_STATE_DIR/active"' EXIT
+if mkdir "$test_root/active"; then
+  trap 'rmdir "$test_root/active"' EXIT
 else
-  printf overlap > "$LIONCLAW_SKILL_STATE_DIR/overlap"
+  printf overlap > "$test_root/overlap"
   exit 11
 fi
+find "$LIONCLAW_SKILL_STATE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+rmdir "$LIONCLAW_SKILL_STATE_DIR" 2>/dev/null || true
 sleep 0.1
 "#,
         );
@@ -506,7 +584,7 @@ sleep 0.1
 
         assert_eq!(first_outcome.status, PrivateContextRecordStatus::Completed);
         assert_eq!(second_outcome.status, PrivateContextRecordStatus::Completed);
-        assert!(!config.state_dir.join("overlap").exists());
+        assert!(!temp_dir.path().join("overlap").exists());
     }
 
     #[cfg(unix)]
