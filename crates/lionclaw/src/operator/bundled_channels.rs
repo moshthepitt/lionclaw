@@ -33,7 +33,8 @@ struct BundledSkillBinary {
 }
 
 pub(crate) fn snapshot_overlays_for_source(source_path: &Path) -> Result<Vec<SnapshotOverlay>> {
-    let Some(binary) = binary_for_bundled_source(source_path)? else {
+    let current_exe = std::env::current_exe().ok();
+    let Some(binary) = binary_for_bundled_source(source_path, current_exe.as_deref())? else {
         return Ok(Vec::new());
     };
     Ok(vec![SnapshotOverlay::new(
@@ -66,11 +67,14 @@ pub(crate) fn worker_binary_path(binary_name: &str) -> Result<PathBuf> {
     ))
 }
 
-fn binary_for_bundled_source(source_path: &Path) -> Result<Option<BundledSkillBinary>> {
+fn binary_for_bundled_source(
+    source_path: &Path,
+    current_exe: Option<&Path>,
+) -> Result<Option<BundledSkillBinary>> {
     let source_path = fs::canonicalize(source_path)
         .with_context(|| format!("failed to resolve {}", source_path.display()))?;
     for binary in BUNDLED_SKILL_BINARIES {
-        let bundled = bundled_skill_dir(binary.source_dir_name);
+        let bundled = bundled_skill_dir(binary.source_dir_name, current_exe);
         if !bundled.exists() {
             continue;
         }
@@ -83,9 +87,15 @@ fn binary_for_bundled_source(source_path: &Path) -> Result<Option<BundledSkillBi
     Ok(None)
 }
 
-fn bundled_skill_dir(source_dir_name: &str) -> PathBuf {
+fn bundled_skill_dir(source_dir_name: &str, current_exe: Option<&Path>) -> PathBuf {
     if let Some(channel_id) = source_dir_name.strip_prefix("channel-") {
         return bundled_channel_skill_dir(channel_id);
+    }
+    if let Some(exe_dir) = current_exe.and_then(Path::parent) {
+        let installed = exe_dir.join("skills").join(source_dir_name);
+        if installed.exists() {
+            return installed;
+        }
     }
     source_bundled_skill_dir(source_dir_name)
 }
@@ -155,5 +165,21 @@ mod tests {
             include_str!("../../../../skills/lionclaw-private-context/scripts/context")
                 .contains(private_context.installed_path)
         );
+    }
+
+    #[test]
+    fn private_context_overlay_matches_executable_adjacent_release_layout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp_dir.path();
+        let skill_dir = install_dir.join("skills/lionclaw-private-context");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+
+        let binary = binary_for_bundled_source(&skill_dir, Some(&install_dir.join("lionclaw")))
+            .expect("resolve bundled source")
+            .expect("private context bundled binary");
+
+        assert_eq!(binary.source_dir_name, "lionclaw-private-context");
+        assert_eq!(binary.binary_name, "lionclaw-private-context");
+        assert_eq!(binary.installed_path, "bin/lionclaw-private-context");
     }
 }
