@@ -8288,6 +8288,102 @@ mod tests {
         kernel_with_home(&home).await
     }
 
+    async fn approve_loopback_direct_grant(kernel: &Kernel, sender_ref: &str) {
+        let mut tx = kernel
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .expect("begin channel grant transaction");
+        kernel
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: "loopback",
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: None,
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Direct,
+                    trust_tier: TrustTier::Main,
+                    status: ChannelGrantStatus::Approved,
+                    label: Some(sender_ref),
+                },
+            )
+            .await
+            .expect("approve direct channel grant");
+        tx.commit().await.expect("commit channel grant transaction");
+    }
+
+    struct LoopbackChannelTurnFixture<'a> {
+        session_id: Uuid,
+        session_key: &'a str,
+        turn_id: Uuid,
+        sender_ref: &'a str,
+        inbound_event_id: &'a str,
+        text: &'a str,
+        status: ChannelTurnStatus,
+    }
+
+    async fn enqueue_loopback_channel_turn(
+        kernel: &Kernel,
+        fixture: LoopbackChannelTurnFixture<'_>,
+    ) -> ChannelTurnRecord {
+        let provider_metadata = json!({});
+        let mut tx = kernel
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .expect("begin queued channel turn transaction");
+        kernel
+            .channel_state
+            .insert_inbound_event_in_tx(
+                &mut tx,
+                NewChannelInboundEvent {
+                    event_id: fixture.inbound_event_id,
+                    channel_id: "loopback",
+                    sender_ref: fixture.sender_ref,
+                    conversation_ref: fixture.sender_ref,
+                    thread_ref: None,
+                    message_ref: Some(fixture.inbound_event_id),
+                    text: Some(fixture.text),
+                    trigger: ChannelTrigger::Command,
+                    attachments: &[],
+                    reply_to_ref: None,
+                    provider_metadata: &provider_metadata,
+                    received_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("insert queued channel inbound event");
+        kernel
+            .channel_state
+            .enqueue_turn_in_tx(
+                &mut tx,
+                NewChannelTurn {
+                    turn_id: fixture.turn_id,
+                    channel_id: "loopback",
+                    session_key: fixture.session_key,
+                    session_id: fixture.session_id,
+                    inbound_event_id: fixture.inbound_event_id,
+                    runtime_id: TEST_REPLY_RUNTIME_ID,
+                    status: fixture.status,
+                },
+            )
+            .await
+            .expect("enqueue queued channel turn");
+        tx.commit()
+            .await
+            .expect("commit queued channel turn transaction");
+        kernel
+            .channel_state
+            .get_turn(fixture.turn_id)
+            .await
+            .expect("load queued channel turn")
+            .expect("queued channel turn exists")
+    }
+
     async fn write_installed_skill(home: &LionClawHome, alias: &str, description: &str) -> PathBuf {
         let skill_dir = home.skills_dir().join(alias);
         tokio::fs::create_dir_all(skill_dir.join("scripts"))
@@ -9513,33 +9609,7 @@ mod tests {
                 sender_ref: "queued-recorder".to_string(),
             },
         );
-        let mut grant_tx = kernel
-            .channel_state
-            .pool()
-            .begin()
-            .await
-            .expect("begin channel grant transaction");
-        kernel
-            .channel_state
-            .insert_or_update_grant_in_tx(
-                &mut grant_tx,
-                ChannelGrantUpsert {
-                    channel_id: "loopback",
-                    sender_ref: Some("queued-recorder"),
-                    conversation_ref: None,
-                    thread_ref: None,
-                    routing_profile: ChannelRoutingProfile::Direct,
-                    trust_tier: TrustTier::Main,
-                    status: ChannelGrantStatus::Approved,
-                    label: Some("queued recorder"),
-                },
-            )
-            .await
-            .expect("approve direct channel grant");
-        grant_tx
-            .commit()
-            .await
-            .expect("commit channel grant transaction");
+        approve_loopback_direct_grant(&kernel, "queued-recorder").await;
         let session = kernel
             .sessions
             .open(
@@ -9599,60 +9669,19 @@ mod tests {
             })
             .await
             .expect("begin queued continue turn");
-        let inbound_event_id = "queued-continue-recorder";
-        let provider_metadata = json!({});
-        let mut tx = kernel
-            .channel_state
-            .pool()
-            .begin()
-            .await
-            .expect("begin queued channel turn transaction");
-        kernel
-            .channel_state
-            .insert_inbound_event_in_tx(
-                &mut tx,
-                NewChannelInboundEvent {
-                    event_id: inbound_event_id,
-                    channel_id: "loopback",
-                    sender_ref: "queued-recorder",
-                    conversation_ref: "queued-recorder",
-                    thread_ref: None,
-                    message_ref: Some(inbound_event_id),
-                    text: Some("/lionclaw continue"),
-                    trigger: ChannelTrigger::Command,
-                    attachments: &[],
-                    reply_to_ref: None,
-                    provider_metadata: &provider_metadata,
-                    received_at: Utc::now(),
-                },
-            )
-            .await
-            .expect("insert queued channel inbound event");
-        kernel
-            .channel_state
-            .enqueue_turn_in_tx(
-                &mut tx,
-                NewChannelTurn {
-                    turn_id,
-                    channel_id: "loopback",
-                    session_key: &session_key,
-                    session_id,
-                    inbound_event_id,
-                    runtime_id: TEST_REPLY_RUNTIME_ID,
-                    status: ChannelTurnStatus::Pending,
-                },
-            )
-            .await
-            .expect("enqueue queued channel turn");
-        tx.commit()
-            .await
-            .expect("commit queued channel turn transaction");
-        let channel_turn = kernel
-            .channel_state
-            .get_turn(turn_id)
-            .await
-            .expect("load queued channel turn")
-            .expect("queued channel turn exists");
+        let channel_turn = enqueue_loopback_channel_turn(
+            &kernel,
+            LoopbackChannelTurnFixture {
+                session_id,
+                turn_id,
+                session_key: &session_key,
+                sender_ref: "queued-recorder",
+                inbound_event_id: "queued-continue-recorder",
+                text: "/lionclaw continue",
+                status: ChannelTurnStatus::Pending,
+            },
+        )
+        .await;
         let stream_context = kernel
             .channel_stream_context_for_session(session_id, "loopback", &session_key, turn_id)
             .await
@@ -9674,6 +9703,104 @@ mod tests {
         assert_eq!(requests[0].turn_id, turn_id);
         assert_eq!(requests[0].surface, PrivateContextRecordSurface::Channel);
         assert_eq!(requests[0].runtime_id, TEST_REPLY_RUNTIME_ID);
+    }
+
+    #[tokio::test]
+    async fn failed_queued_channel_terminal_does_not_record_completed_session_turn() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = kernel_with_loopback_channel(&temp_dir).await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session_key = session_key_for_scope(
+            "loopback",
+            &SessionKeyScope::Direct {
+                sender_ref: "failed-terminal-recorder".to_string(),
+            },
+        );
+        approve_loopback_direct_grant(&kernel, "failed-terminal-recorder").await;
+        let session = kernel
+            .sessions
+            .open(
+                "loopback".to_string(),
+                session_key.clone(),
+                kernel.session_scope().to_string(),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open failed-terminal channel session");
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+        kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "completed but undelivered".to_string(),
+                prompt_user_text: "completed but undelivered".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: TEST_REPLY_RUNTIME_ID.to_string(),
+            })
+            .await
+            .expect("begin completed channel turn");
+        kernel
+            .session_turns
+            .complete_turn(
+                turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "completed response that was not delivered".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("complete channel turn")
+            .expect("completed channel turn exists");
+        kernel
+            .sessions
+            .record_turn(session_id)
+            .await
+            .expect("record completed channel turn");
+        let channel_turn = enqueue_loopback_channel_turn(
+            &kernel,
+            LoopbackChannelTurnFixture {
+                session_id,
+                turn_id,
+                session_key: &session_key,
+                sender_ref: "failed-terminal-recorder",
+                inbound_event_id: "queued-failed-terminal-recorder",
+                text: "completed but undelivered",
+                status: ChannelTurnStatus::Pending,
+            },
+        )
+        .await;
+        let stream_context = kernel
+            .channel_stream_context_for_session(session_id, "loopback", &session_key, turn_id)
+            .await
+            .expect("resolve failed-terminal stream context");
+
+        kernel
+            .terminalize_queued_turn(
+                &channel_turn,
+                QueuedTurnTerminal::Failed {
+                    code: "queue.failed".to_string(),
+                    message: "channel delivery failed".to_string(),
+                },
+                stream_context,
+            )
+            .await
+            .expect("terminalize queued channel turn as failed");
+
+        let requests = requests.lock().expect("private context recorder requests");
+        assert!(
+            requests.is_empty(),
+            "failed channel terminal must not record a completed transcript"
+        );
     }
 
     #[tokio::test]
@@ -23075,17 +23202,16 @@ impl Kernel {
                         KernelError::Internal("terminalized session turn was not found".to_string())
                     })?;
                 Some((completed_turn, true))
-            } else if matches!(
-                persisted_turn.status,
-                SessionTurnStatus::Completed
-                    | SessionTurnStatus::Failed
+            } else {
+                let should_record_terminal_turn = match persisted_turn.status {
+                    SessionTurnStatus::Completed => status == ChannelTurnStatus::Completed,
+                    SessionTurnStatus::Failed
                     | SessionTurnStatus::TimedOut
                     | SessionTurnStatus::Cancelled
-                    | SessionTurnStatus::Interrupted
-            ) {
-                Some((persisted_turn, false))
-            } else {
-                None
+                    | SessionTurnStatus::Interrupted => status != ChannelTurnStatus::Completed,
+                    SessionTurnStatus::Running | SessionTurnStatus::WaitingForAttachments => false,
+                };
+                should_record_terminal_turn.then_some((persisted_turn, false))
             };
 
             if let Some((completed_turn, completed_by_terminalizer)) = completed_session_turn {
