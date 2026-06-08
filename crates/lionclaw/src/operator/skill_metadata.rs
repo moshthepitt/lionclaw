@@ -9,8 +9,14 @@ use serde::Deserialize;
 pub const SKILL_METADATA_FILE: &str = "lionclaw.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateContextProjectorMetadata {
+pub struct PrivateContextEntrypointMetadata {
     pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateContextSkillMetadata {
+    pub projector: Option<PrivateContextEntrypointMetadata>,
+    pub recorder: Option<PrivateContextEntrypointMetadata>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,32 +42,53 @@ struct PrivateContextMetadataFile {
     #[serde(default)]
     contact: Option<toml::Value>,
     #[serde(default)]
-    private_context_projector: Option<PrivateContextProjectorMetadataSection>,
+    private_context_projector: Option<PrivateContextEntrypointMetadataSection>,
+    #[serde(default)]
+    private_context_recorder: Option<PrivateContextEntrypointMetadataSection>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrivateContextProjectorMetadataSection {
+struct PrivateContextEntrypointMetadataSection {
     command: String,
 }
 
-pub fn load_private_context_projector_metadata(
+pub fn load_private_context_skill_metadata(
     skill_dir: &Path,
-) -> Result<Option<PrivateContextProjectorMetadata>> {
+) -> Result<PrivateContextSkillMetadata> {
     let skill_dir = canonical_skill_dir(skill_dir)?;
     let path = skill_dir.join(SKILL_METADATA_FILE);
     let Some(content) = read_optional_skill_metadata(&path)? else {
-        return Ok(None);
+        return Ok(PrivateContextSkillMetadata {
+            projector: None,
+            recorder: None,
+        });
     };
     let parsed: PrivateContextMetadataFile = toml::from_str(&content)
         .map_err(|err| anyhow!("failed to parse {}: {err}", path.display()))?;
     validate_metadata_version(parsed.version, &path)?;
-    let Some(section) = parsed.private_context_projector else {
+    Ok(PrivateContextSkillMetadata {
+        projector: parse_private_context_entrypoint_metadata(
+            parsed.private_context_projector,
+            "private context projector command",
+        )?,
+        recorder: parse_private_context_entrypoint_metadata(
+            parsed.private_context_recorder,
+            "private context recorder command",
+        )?,
+    })
+}
+
+fn parse_private_context_entrypoint_metadata(
+    section: Option<PrivateContextEntrypointMetadataSection>,
+    label: &str,
+) -> Result<Option<PrivateContextEntrypointMetadata>> {
+    let Some(section) = section else {
         return Ok(None);
     };
     let command = section.command.trim().to_string();
-    validate_skill_entrypoint_path(&command, "private context projector command")?;
-    Ok(Some(PrivateContextProjectorMetadata { command }))
+    validate_skill_entrypoint_path(&command, label)?;
+    Ok(Some(PrivateContextEntrypointMetadata { command }))
 }
 
 pub fn skill_metadata_declares_channel(skill_dir: &Path) -> Result<bool> {
@@ -233,7 +260,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_private_context_projector_metadata, resolve_skill_entrypoint,
+        load_private_context_skill_metadata, resolve_skill_entrypoint,
         skill_metadata_declares_channel, SkillEntrypointSymlinkPolicy,
     };
 
@@ -268,6 +295,20 @@ mod tests {
         .expect("metadata");
     }
 
+    fn write_private_context_metadata(
+        skill: &std::path::Path,
+        projector_command: &str,
+        recorder_command: &str,
+    ) {
+        fs::write(
+            skill.join("lionclaw.toml"),
+            format!(
+                "version = 1\n\n[private_context_projector]\ncommand = \"{projector_command}\"\n\n[private_context_recorder]\ncommand = \"{recorder_command}\"\n"
+            ),
+        )
+        .expect("metadata");
+    }
+
     #[cfg(unix)]
     #[test]
     fn parses_private_context_projector_metadata() {
@@ -275,11 +316,33 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "scripts/projector");
 
-        let metadata = load_private_context_projector_metadata(&skill)
+        let metadata = load_private_context_skill_metadata(&skill)
             .expect("metadata")
+            .projector
             .expect("private context metadata");
 
         assert_eq!(metadata.command, "scripts/projector");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_private_context_recorder_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        fs::write(skill.join("scripts/recorder"), "#!/usr/bin/env bash\n").expect("recorder");
+        make_executable(&skill.join("scripts/recorder"));
+        write_private_context_metadata(&skill, "scripts/projector", "scripts/recorder");
+
+        let metadata = load_private_context_skill_metadata(&skill).expect("metadata");
+
+        assert_eq!(
+            metadata.projector.expect("projector").command,
+            "scripts/projector"
+        );
+        assert_eq!(
+            metadata.recorder.expect("recorder").command,
+            "scripts/recorder"
+        );
     }
 
     #[cfg(unix)]
@@ -293,7 +356,7 @@ mod tests {
         )
         .expect("metadata");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("legacy memory projector metadata should be rejected");
 
         assert!(err.to_string().contains("memory_projector"));
@@ -316,7 +379,7 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "/bin/echo");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("absolute private context projector command should fail");
 
         assert!(err.to_string().contains("must be relative"));
@@ -329,9 +392,23 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "../projector");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("parent traversal private context projector command should fail");
 
+        assert!(err.to_string().contains("must stay inside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_private_context_recorder_parent_traversal_command_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_skill(temp_dir.path());
+        write_private_context_metadata(&skill, "scripts/projector", "../recorder");
+
+        let err = load_private_context_skill_metadata(&skill)
+            .expect_err("parent traversal private context recorder command should fail");
+
+        assert!(err.to_string().contains("private context recorder command"));
         assert!(err.to_string().contains("must stay inside"));
     }
 

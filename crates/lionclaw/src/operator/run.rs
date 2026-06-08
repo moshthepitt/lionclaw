@@ -32,7 +32,12 @@ pub(crate) async fn run_local(invocation: RunLocalInvocation<'_>) -> Result<()> 
     let stdout = std::io::stdout();
     let mut input = BufReader::new(stdin);
     let mut output = stdout;
-    run_local_with_io_and_timeouts(invocation, &mut input, &mut output).await
+    Box::pin(run_local_with_io_and_timeouts(
+        invocation,
+        &mut input,
+        &mut output,
+    ))
+    .await
 }
 
 #[cfg(test)]

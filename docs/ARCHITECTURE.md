@@ -1082,6 +1082,61 @@ protocol stream; stderr may be drained only as bounded operational diagnostics
 and must not enter prompt text or prompt-context audit body fields. Final
 Markdown wrapping is part of the prompt section cap; capped projected sections
 keep only chunks that contribute visible projected text.
+
+The same selected private-context skill may optionally declare a turn recorder:
+
+```toml
+[private_context_recorder]
+command = "scripts/recorder"
+```
+
+Recorder command validation matches projector command validation: the command is
+a relative executable path under the selected skill root, with absolute paths,
+parent traversal, symlinks, non-executable files, and symlink parent components
+rejected before applied state is accepted. If the selected private-context skill
+does not declare `[private_context_recorder]`, the recorder hook is a no-op and
+does not write audit events.
+
+The recorder is a one-shot host process, not a resident protocol. After a session
+turn has been durably finalized and `sessions.record_turn(...)` has committed,
+the kernel may invoke the recorder for Main, Interactive sessions on the
+`program_turn`, `attached_native_tui_turn`, and `channel_turn` surfaces. Failed,
+timed-out, cancelled, interrupted, Untrusted, Conservative-history, and empty
+transcript turns finalized through those surfaces do not send a recorder request;
+when a recorder is configured, they produce only metadata skip audit. Bootstrap
+restart reconciliation remains a separate kernel recovery path audited through
+`session.turn.reconciled`, not `private_context.record`. Recorder failures never
+fail the user turn.
+Concurrent eligible turns are serialized per recorder state directory before
+process spawn, including across independent kernel instances. The lock is held
+outside `LIONCLAW_SKILL_STATE_DIR`, so ordinary recorder cleanup of its own
+state directory cannot unlink the active lock.
+
+The recorder runs with the skill root as working directory, stdin piped, stdout
+and stderr piped, and the same small ambient process-start allowlist used for the
+projector. The kernel sets `LIONCLAW_PRIVATE_CONTEXT_ID` to the selected skill
+alias and `LIONCLAW_SKILL_STATE_DIR` to the host-only state directory under
+`config/skill-state/<alias>`. On Unix, the recorder starts in its own process
+group and timeout cleanup signals that inherited group; recorder commands must
+not detach helper subprocesses from it.
+
+The v1 recorder protocol is a single JSON object written to stdin followed by
+EOF. The request carries `session_id`, `turn_id`, `sequence_no`, `runtime_id`,
+`trust_tier`, `history_policy`, `surface`, optional audit-safe `project_scope`,
+and capped transcript text. User text is capped at 16 KiB and assistant text at
+32 KiB on UTF-8 character boundaries; each included role also reports included
+and original byte counts. Whitespace-only roles are omitted. There is no
+response body: stdout must be empty. Any stdout bytes are treated as
+`invalid_output`. Non-zero exit status is `failed`; timeout is `timed_out`; spawn
+or I/O failures are `failed`. The recorder timeout is two seconds. Stderr is
+drained only to prevent pipe blocking and is never audited.
+
+Recorder audit uses event type `private_context.record`. It records
+`private_context_id`, session and turn ids, `sequence_no`, `runtime_id`,
+`surface`, `project_scope`, `eligibility`, `status`, optional `reason`, optional
+`exit_status`, transcript included/original byte counts, and elapsed time. It
+never records user text, assistant text, stdout, stderr, or skill-owned record
+contents.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.
 Daily notes, artifacts, proposals, and open loops are visible Markdown records,
