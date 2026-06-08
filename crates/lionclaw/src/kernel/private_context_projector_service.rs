@@ -1,34 +1,28 @@
-use std::{
-    cmp,
-    ffi::OsString,
-    fs,
-    path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, Mutex},
 };
 
-#[cfg(unix)]
-use rustix::process::{kill_process_group, Pid, Signal};
-
 use crate::applied::{AppliedPrivateContextSkill, AppliedState};
 
-use super::private_context_projection::{
-    validate_private_context_projection, NoopPrivateContextProjector, PrivateContextProjection,
-    PrivateContextProjectionError, PrivateContextProjectionErrorKind,
-    PrivateContextProjectionInvalidReason, PrivateContextProjectionRequest,
-    PrivateContextProjector,
+use super::{
+    private_context_command::{
+        child_process_group, configure_private_context_command, ensure_private_context_state_dir,
+        spawn_bounded_output_reader, terminate_private_context_process_group,
+        PrivateContextCommandConfig, PrivateContextProcessGroup, PRIVATE_CONTEXT_STDERR_MAX_BYTES,
+    },
+    private_context_projection::{
+        validate_private_context_projection, NoopPrivateContextProjector, PrivateContextProjection,
+        PrivateContextProjectionError, PrivateContextProjectionErrorKind,
+        PrivateContextProjectionInvalidReason, PrivateContextProjectionRequest,
+        PrivateContextProjector,
+    },
 };
 
 pub(crate) const PRIVATE_CONTEXT_PROJECTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_PROJECTOR_STDERR_BYTES: usize = 4096;
 const MAX_PROJECTOR_RESPONSE_LINE_BYTES: usize = 64 * 1024;
 const PROJECTOR_STRAY_STDOUT_GRACE: Duration = Duration::from_millis(10);
 
@@ -185,24 +179,23 @@ impl SkillPrivateContextProjector {
     async fn spawn_process(
         &self,
     ) -> Result<ResidentPrivateContextProjectorProcess, PrivateContextProjectionError> {
-        ensure_private_state_dir(&self.config.state_dir).map_err(|err| {
+        ensure_private_context_state_dir(&self.config.state_dir).map_err(|err| {
             PrivateContextProjectionError::failed(format!("state directory: {err}"))
         })?;
         let mut command = Command::new(&self.config.command_path);
+        configure_private_context_command(
+            &mut command,
+            &PrivateContextCommandConfig {
+                skill_root: &self.config.skill_root,
+                state_dir: &self.config.state_dir,
+                private_context_id: &self.config.projector_id,
+                private_context_id_env: "LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID",
+            },
+        );
         command
-            .current_dir(&self.config.skill_root)
-            .kill_on_drop(true)
-            .env_clear()
-            .envs(projector_ambient_env())
-            .env(
-                "LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID",
-                &self.config.projector_id,
-            )
-            .env("LIONCLAW_SKILL_STATE_DIR", &self.config.state_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        configure_projector_process_group(&mut command);
         let mut child = command.spawn().map_err(|err| {
             PrivateContextProjectionError::failed(format!(
                 "spawn private context projector {}: {err}",
@@ -218,15 +211,16 @@ impl SkillPrivateContextProjector {
         let stderr = child.stderr.take().ok_or_else(|| {
             PrivateContextProjectionError::failed("private context projector stderr missing")
         })?;
-        #[cfg(unix)]
         let process_group = child_process_group(&child);
 
         Ok(ResidentPrivateContextProjectorProcess {
             child,
             stdin,
             stdout: spawn_stdout_reader(stdout),
-            stderr: Some(spawn_bounded_stderr_reader(stderr)),
-            #[cfg(unix)]
+            stderr: Some(spawn_bounded_output_reader(
+                stderr,
+                PRIVATE_CONTEXT_STDERR_MAX_BYTES,
+            )),
             process_group,
         })
     }
@@ -277,8 +271,7 @@ struct ResidentPrivateContextProjectorProcess {
     stdin: ChildStdin,
     stdout: ProjectorStdoutReader,
     stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
-    #[cfg(unix)]
-    process_group: Option<Pid>,
+    process_group: Option<PrivateContextProcessGroup>,
 }
 
 impl ResidentPrivateContextProjectorProcess {
@@ -365,7 +358,7 @@ impl ResidentPrivateContextProjectorProcess {
     }
 
     fn terminate(&mut self) {
-        self.terminate_process_group();
+        terminate_private_context_process_group(&mut self.process_group);
         let _kill_result = self.child.start_kill();
     }
 
@@ -375,16 +368,6 @@ impl ResidentPrivateContextProjectorProcess {
             stderr.abort();
         }
     }
-
-    #[cfg(unix)]
-    fn terminate_process_group(&mut self) {
-        if let Some(process_group) = self.process_group.take() {
-            let _group_kill_result = kill_process_group(process_group, Signal::KILL);
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn terminate_process_group(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,27 +392,6 @@ impl Drop for ResidentPrivateContextProjectorProcess {
         self.terminate();
         self.abort_output_readers();
     }
-}
-
-fn configure_projector_process_group(command: &mut Command) {
-    configure_projector_process_group_for_platform(command);
-}
-
-#[cfg(unix)]
-fn configure_projector_process_group_for_platform(command: &mut Command) {
-    // This is the v1 cleanup boundary; projector helpers must not detach from it.
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_projector_process_group_for_platform(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn child_process_group(child: &Child) -> Option<Pid> {
-    child
-        .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(Pid::from_raw)
 }
 
 struct ProjectorStdoutReader {
@@ -530,95 +492,6 @@ async fn read_capped_line(
         line.extend_from_slice(available);
         reader.consume(take);
     }
-}
-
-fn spawn_bounded_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHandle<Vec<u8>> {
-    tokio::spawn(async move {
-        let mut captured = Vec::new();
-        let mut buffer = [0u8; 1024];
-        loop {
-            let read = match stderr.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => read,
-            };
-            let remaining = MAX_PROJECTOR_STDERR_BYTES.saturating_sub(captured.len());
-            if remaining > 0 {
-                let take = cmp::min(read, remaining);
-                captured.extend(buffer.iter().take(take).copied());
-            }
-        }
-        captured
-    })
-}
-
-fn projector_ambient_env() -> Vec<(String, OsString)> {
-    let mut env = Vec::new();
-    for key in ["PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot"] {
-        if let Some(value) = std::env::var_os(key) {
-            env.push((key.to_string(), value));
-        }
-    }
-    env
-}
-
-fn ensure_private_state_dir(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => {
-                current.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                anyhow::bail!("state directory {} contains '..'", path.display());
-            }
-            Component::Normal(name) => {
-                current.push(name);
-                ensure_private_state_component(&current, current == path)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_private_state_component(path: &Path, harden_existing: bool) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                anyhow::bail!("state directory {} must not be a symlink", path.display());
-            }
-            if !metadata.is_dir() {
-                anyhow::bail!("state directory {} is not a directory", path.display());
-            }
-            if harden_existing {
-                harden_private_state_dir(path, &metadata)?;
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).with_context(|| format!("failed to create {}", path.display()))?;
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("failed to stat {}", path.display()))?;
-            harden_private_state_dir(path, &metadata)
-        }
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    }
-}
-
-#[cfg(unix)]
-fn harden_private_state_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o077 != 0 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn harden_private_state_dir(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

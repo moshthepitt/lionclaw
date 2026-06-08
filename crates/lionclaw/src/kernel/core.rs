@@ -131,6 +131,13 @@ use super::{
         PRIVATE_CONTEXT_PROJECTION_MAX_ITEMS,
     },
     private_context_projector_service::private_context_projector_for_applied_state,
+    private_context_recorder_service::{
+        private_context_recorder_for_applied_state, PrivateContextRecorderService,
+    },
+    private_context_recording::{
+        PrivateContextRecordByteCounts, PrivateContextRecordOutcome, PrivateContextRecordRequest,
+        PrivateContextRecordSurface, PrivateContextRecordTranscript,
+    },
     prompt_context::{
         cap_utf8_at_line_boundary, context_item_specs, ContextItemId, ContextItemSpec,
         ContextSource, PromptContextAudit, PromptContextBuild, PromptContextMode,
@@ -369,6 +376,14 @@ struct RuntimeChannelSendAttachment {
     filename: Option<String>,
     #[serde(default)]
     mime_type: Option<String>,
+}
+
+struct PrivateContextRecordAuditStatus {
+    eligibility: &'static str,
+    status: &'static str,
+    reason: Option<&'static str>,
+    exit_status: Option<i32>,
+    elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -815,6 +830,7 @@ pub struct Kernel {
     applied_state: AppliedState,
     continuity: Option<ContinuityLayout>,
     private_context_projector: Arc<dyn PrivateContextProjector>,
+    private_context_recorder: PrivateContextRecorderService,
     hidden_compaction_turn_timeout: Duration,
 }
 
@@ -952,6 +968,8 @@ impl Kernel {
 
         let private_context_projector =
             private_context_projector_for_applied_state(&options.applied_state);
+        let private_context_recorder =
+            private_context_recorder_for_applied_state(&options.applied_state);
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
             session_turns: SessionTurnStore::new(pool.clone()),
@@ -983,6 +1001,7 @@ impl Kernel {
             applied_state: options.applied_state,
             continuity,
             private_context_projector,
+            private_context_recorder,
             hidden_compaction_turn_timeout,
         };
 
@@ -1325,6 +1344,7 @@ impl Kernel {
         });
 
         let mut imported_count = 0usize;
+        let mut imported_session = None;
         for turn in turns {
             let Some(imported) = self
                 .insert_attached_runtime_turn(session_id, runtime_id, turn)
@@ -1333,10 +1353,18 @@ impl Kernel {
                 continue;
             };
             imported_count += 1;
-            self.sessions
-                .record_turn(imported.session_id)
-                .await
-                .map_err(internal)?;
+            if imported_session.is_none() {
+                imported_session = Some(self.get_scoped_session(session_id).await?);
+            }
+            let session = imported_session
+                .as_ref()
+                .expect("attached import session loaded after first import");
+            self.post_commit_session_turn(
+                session,
+                &imported,
+                PrivateContextRecordSurface::AttachedNativeTuiTurn,
+            )
+            .await?;
         }
         if imported_count > 0 {
             let session = self.get_scoped_session(session_id).await?;
@@ -6395,6 +6423,154 @@ impl Kernel {
         }
     }
 
+    async fn post_commit_session_turn(
+        &self,
+        session: &super::sessions::Session,
+        turn: &SessionTurnRecord,
+        surface: PrivateContextRecordSurface,
+    ) -> Result<(), KernelError> {
+        self.sessions
+            .record_turn(session.session_id)
+            .await
+            .map_err(internal)?;
+        self.record_private_context_turn_best_effort(session, turn, surface)
+            .await;
+        Ok(())
+    }
+
+    async fn record_private_context_turn_best_effort(
+        &self,
+        session: &super::sessions::Session,
+        turn: &SessionTurnRecord,
+        surface: PrivateContextRecordSurface,
+    ) {
+        let Some(private_context_id) = self
+            .private_context_recorder
+            .private_context_id()
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if !self.private_context_recorder.has_recorder() {
+            return;
+        }
+
+        let transcript = PrivateContextRecordTranscript::from_committed_text(
+            &turn.prompt_user_text,
+            &turn.assistant_text,
+        );
+        let byte_counts = transcript.included_bytes();
+
+        if let Some(reason) = self.private_context_record_skip_reason(session, turn, &transcript) {
+            self.audit_private_context_record(
+                Some(&private_context_id),
+                session,
+                turn,
+                surface,
+                &byte_counts,
+                PrivateContextRecordAuditStatus {
+                    eligibility: "skipped",
+                    status: "skipped",
+                    reason: Some(reason),
+                    exit_status: None,
+                    elapsed_ms: 0,
+                },
+            )
+            .await;
+            return;
+        }
+
+        let request = PrivateContextRecordRequest {
+            session_id: session.session_id,
+            turn_id: turn.turn_id,
+            sequence_no: turn.sequence_no,
+            runtime_id: turn.runtime_id.clone(),
+            trust_tier: session.trust_tier.clone(),
+            history_policy: session.history_policy,
+            surface,
+            project_scope: Some(self.session_scope.clone()),
+            transcript,
+        };
+        let outcome = self
+            .private_context_recorder
+            .record(request)
+            .await
+            .unwrap_or_else(|| {
+                PrivateContextRecordOutcome::failed("recorder_unavailable", None, 0)
+            });
+        self.audit_private_context_record(
+            Some(&private_context_id),
+            session,
+            turn,
+            surface,
+            &byte_counts,
+            PrivateContextRecordAuditStatus {
+                eligibility: "eligible",
+                status: outcome.status.as_str(),
+                reason: outcome.reason,
+                exit_status: outcome.exit_status,
+                elapsed_ms: outcome.elapsed_ms,
+            },
+        )
+        .await;
+    }
+
+    fn private_context_record_skip_reason(
+        &self,
+        session: &super::sessions::Session,
+        turn: &SessionTurnRecord,
+        transcript: &PrivateContextRecordTranscript,
+    ) -> Option<&'static str> {
+        if turn.status != SessionTurnStatus::Completed {
+            return Some("not_completed");
+        }
+        if !matches!(session.trust_tier, TrustTier::Main) {
+            return Some("untrusted_session");
+        }
+        if session.history_policy != SessionHistoryPolicy::Interactive {
+            return Some("conservative_history");
+        }
+        if transcript.is_empty() {
+            return Some("empty_transcript");
+        }
+        None
+    }
+
+    async fn audit_private_context_record(
+        &self,
+        private_context_id: Option<&str>,
+        session: &super::sessions::Session,
+        turn: &SessionTurnRecord,
+        surface: PrivateContextRecordSurface,
+        byte_counts: &PrivateContextRecordByteCounts,
+        status: PrivateContextRecordAuditStatus,
+    ) {
+        self.append_audit_event_best_effort(
+            "private_context.record",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "private_context_id": private_context_id,
+                "session_id": session.session_id,
+                "turn_id": turn.turn_id,
+                "sequence_no": turn.sequence_no,
+                "runtime_id": turn.runtime_id,
+                "surface": surface.as_str(),
+                "project_scope": self.session_scope,
+                "eligibility": status.eligibility,
+                "status": status.status,
+                "reason": status.reason,
+                "exit_status": status.exit_status,
+                "user_included_bytes": byte_counts.user_included_bytes,
+                "user_original_bytes": byte_counts.user_original_bytes,
+                "assistant_included_bytes": byte_counts.assistant_included_bytes,
+                "assistant_original_bytes": byte_counts.assistant_original_bytes,
+                "elapsed_ms": status.elapsed_ms,
+            }),
+        )
+        .await;
+    }
+
     async fn build_compaction_summary_state(
         &self,
         session_id: Uuid,
@@ -7136,10 +7312,16 @@ mod tests {
         PrivateContextSourceRef, ProjectedContextItem, ProjectedContextProvenance,
         ProjectedContextProvenanceSource,
     };
+    use crate::kernel::private_context_recorder_service::PrivateContextRecorder;
+    use crate::kernel::private_context_recording::{
+        PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES, PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
+    };
     use crate::kernel::runtime::{
         RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
+    use crate::kernel::session_turns::SessionTurnStore;
+    use crate::kernel::sessions::SessionStore;
     use crate::project_inventory::{
         ProjectInstanceChannelSend, ProjectInstanceInventory, ProjectInstanceInventoryEntry,
     };
@@ -8189,6 +8371,156 @@ mod tests {
         }
     }
 
+    type TestPrivateContextRecordRequests = Arc<std::sync::Mutex<Vec<PrivateContextRecordRequest>>>;
+
+    #[derive(Clone)]
+    struct TestPrivateContextRecorder {
+        outcome: PrivateContextRecordOutcome,
+        requests: TestPrivateContextRecordRequests,
+        commit_probe: Option<TestPrivateContextRecordCommitProbe>,
+    }
+
+    #[derive(Clone)]
+    struct TestPrivateContextRecordCommitProbe {
+        sessions: SessionStore,
+        session_turns: SessionTurnStore,
+    }
+
+    #[async_trait::async_trait]
+    impl PrivateContextRecorder for TestPrivateContextRecorder {
+        async fn record(
+            &self,
+            request: PrivateContextRecordRequest,
+        ) -> PrivateContextRecordOutcome {
+            if let Some(probe) = &self.commit_probe {
+                let stored_session = probe
+                    .sessions
+                    .get(request.session_id)
+                    .await
+                    .expect("probe session")
+                    .expect("probe session exists");
+                assert!(
+                    stored_session.turn_count >= request.sequence_no,
+                    "recorder ran before session record_turn committed"
+                );
+                let stored_turn = probe
+                    .session_turns
+                    .get(request.turn_id)
+                    .await
+                    .expect("probe turn")
+                    .expect("probe turn exists");
+                assert_eq!(stored_turn.status, SessionTurnStatus::Completed);
+                assert_eq!(stored_turn.sequence_no, request.sequence_no);
+            }
+
+            self.requests
+                .lock()
+                .expect("private context recorder request lock")
+                .push(request);
+            self.outcome
+        }
+    }
+
+    impl TestPrivateContextRecorder {
+        fn new(outcome: PrivateContextRecordOutcome) -> (Self, TestPrivateContextRecordRequests) {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    outcome,
+                    requests: Arc::clone(&requests),
+                    commit_probe: None,
+                },
+                requests,
+            )
+        }
+
+        fn with_commit_probe(mut self, kernel: &Kernel) -> Self {
+            self.commit_probe = Some(TestPrivateContextRecordCommitProbe {
+                sessions: kernel.sessions.clone(),
+                session_turns: kernel.session_turns.clone(),
+            });
+            self
+        }
+    }
+
+    fn install_test_private_context_recorder(
+        kernel: &mut Kernel,
+        outcome: PrivateContextRecordOutcome,
+        require_committed_turn: bool,
+    ) -> TestPrivateContextRecordRequests {
+        let (recorder, requests) = TestPrivateContextRecorder::new(outcome);
+        let recorder = if require_committed_turn {
+            recorder.with_commit_probe(kernel)
+        } else {
+            recorder
+        };
+        kernel.private_context_recorder = PrivateContextRecorderService::with_recorder(
+            "test_private_context_recorder",
+            Arc::new(recorder),
+        );
+        requests
+    }
+
+    async fn complete_test_turn_and_record_private_context(
+        kernel: &Kernel,
+        session: &crate::kernel::sessions::Session,
+        status: SessionTurnStatus,
+        user_text: &str,
+        assistant_text: &str,
+        surface: PrivateContextRecordSurface,
+    ) -> SessionTurnRecord {
+        let turn = kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id: session.session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: user_text.to_string(),
+                prompt_user_text: user_text.to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin private context record test turn");
+        let completed = kernel
+            .session_turns
+            .complete_turn(
+                turn.turn_id,
+                SessionTurnCompletion {
+                    status,
+                    assistant_text: assistant_text.to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("complete private context record test turn")
+            .expect("completed private context record test turn");
+        kernel
+            .post_commit_session_turn(session, &completed, surface)
+            .await
+            .expect("post-commit private context record test turn");
+        completed
+    }
+
+    async fn private_context_record_audit(kernel: &Kernel, session_id: Uuid) -> serde_json::Value {
+        let events = kernel
+            .query_audit(
+                Some(session_id),
+                Some("private_context.record".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .expect("query private context record audit")
+            .events;
+        events
+            .first()
+            .expect("private context record audit event")
+            .details
+            .clone()
+    }
+
     async fn prompt_context_fixture_with_options(
         temp_dir: TempDir,
         db_path: PathBuf,
@@ -8490,6 +8822,466 @@ mod tests {
                 "prompt context audit leaked prompt body text: {poison}\n{audit_json}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn private_context_recorder_records_committed_main_interactive_turn_after_session_record()
+    {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(7),
+            true,
+        );
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let user_text = format!(
+            "RECORDER_USER_POISON_{}",
+            "u".repeat(PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES + 32)
+        );
+        let assistant_text = format!(
+            "RECORDER_ASSISTANT_POISON_{}",
+            "a".repeat(PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES + 32)
+        );
+
+        let turn = complete_test_turn_and_record_private_context(
+            &kernel,
+            &session,
+            SessionTurnStatus::Completed,
+            &user_text,
+            &assistant_text,
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+
+        {
+            let requests = requests.lock().expect("private context recorder requests");
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.session_id, session.session_id);
+            assert_eq!(request.turn_id, turn.turn_id);
+            assert_eq!(request.sequence_no, turn.sequence_no);
+            assert_eq!(request.runtime_id, "mock");
+            assert!(matches!(request.trust_tier, TrustTier::Main));
+            assert_eq!(request.history_policy, SessionHistoryPolicy::Interactive);
+            assert_eq!(request.surface, PrivateContextRecordSurface::ProgramTurn);
+            assert_eq!(
+                request.project_scope.as_deref(),
+                Some(kernel.session_scope())
+            );
+            let user = request.transcript.user.as_ref().expect("user text");
+            let assistant = request
+                .transcript
+                .assistant
+                .as_ref()
+                .expect("assistant text");
+            assert!(user.text.starts_with("RECORDER_USER_POISON_"));
+            assert_eq!(
+                user.included_bytes,
+                PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES
+            );
+            assert_eq!(user.original_bytes, user_text.len());
+            assert!(assistant.text.starts_with("RECORDER_ASSISTANT_POISON_"));
+            assert_eq!(
+                assistant.included_bytes,
+                PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES
+            );
+            assert_eq!(assistant.original_bytes, assistant_text.len());
+        }
+
+        let audit = private_context_record_audit(&kernel, session.session_id).await;
+        assert_eq!(audit["private_context_id"], "test_private_context_recorder");
+        assert_eq!(audit["turn_id"], turn.turn_id.to_string());
+        assert_eq!(audit["surface"], "program_turn");
+        assert_eq!(audit["eligibility"], "eligible");
+        assert_eq!(audit["status"], "completed");
+        assert_eq!(audit["reason"], serde_json::Value::Null);
+        assert_eq!(audit["exit_status"], 0);
+        assert_eq!(
+            audit["user_included_bytes"],
+            PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES
+        );
+        assert_eq!(
+            audit["assistant_included_bytes"],
+            PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES
+        );
+        let audit_json = audit.to_string();
+        assert!(!audit_json.contains("RECORDER_USER_POISON_"));
+        assert!(!audit_json.contains("RECORDER_ASSISTANT_POISON_"));
+    }
+
+    #[tokio::test]
+    async fn private_context_recorder_skips_ineligible_turns_without_request() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(0),
+            false,
+        );
+
+        let untrusted = open_prompt_context_session(
+            &kernel,
+            TrustTier::Untrusted,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &untrusted,
+            SessionTurnStatus::Completed,
+            "untrusted user",
+            "untrusted assistant",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+        assert_eq!(
+            private_context_record_audit(&kernel, untrusted.session_id).await["reason"],
+            "untrusted_session"
+        );
+
+        let conservative = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Conservative,
+        )
+        .await;
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &conservative,
+            SessionTurnStatus::Completed,
+            "conservative user",
+            "conservative assistant",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+        assert_eq!(
+            private_context_record_audit(&kernel, conservative.session_id).await["reason"],
+            "conservative_history"
+        );
+
+        let failed = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &failed,
+            SessionTurnStatus::Failed,
+            "failed user",
+            "failed assistant",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+        assert_eq!(
+            private_context_record_audit(&kernel, failed.session_id).await["reason"],
+            "not_completed"
+        );
+
+        let empty = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &empty,
+            SessionTurnStatus::Completed,
+            " \n\t",
+            " \n\t",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+        assert_eq!(
+            private_context_record_audit(&kernel, empty.session_id).await["reason"],
+            "empty_transcript"
+        );
+
+        assert!(
+            requests
+                .lock()
+                .expect("private context recorder requests")
+                .is_empty(),
+            "ineligible turns must not call the recorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_context_recorder_noops_when_recorder_is_missing() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        kernel.private_context_recorder =
+            PrivateContextRecorderService::without_recorder("test_private_context_recorder");
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &session,
+            SessionTurnStatus::Completed,
+            "user",
+            "assistant",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+
+        let audit = kernel
+            .query_audit(
+                Some(session.session_id),
+                Some("private_context.record".to_string()),
+                None,
+                Some(1),
+            )
+            .await
+            .expect("query private context record audit");
+        assert!(
+            audit.events.is_empty(),
+            "missing recorder should be a no-op, not an audit event"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_context_recorder_failure_audit_excludes_request_body() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::invalid_output("unexpected_stdout", Some(0), 4),
+            false,
+        );
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        complete_test_turn_and_record_private_context(
+            &kernel,
+            &session,
+            SessionTurnStatus::Completed,
+            "RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_USER",
+            "RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_ASSISTANT",
+            PrivateContextRecordSurface::ProgramTurn,
+        )
+        .await;
+
+        let audit = private_context_record_audit(&kernel, session.session_id).await;
+        assert_eq!(audit["eligibility"], "eligible");
+        assert_eq!(audit["status"], "invalid_output");
+        assert_eq!(audit["reason"], "unexpected_stdout");
+        assert_eq!(audit["exit_status"], 0);
+        assert_eq!(audit["elapsed_ms"], 4);
+        let audit_json = audit.to_string();
+        assert!(!audit_json.contains("RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_USER"));
+        assert!(!audit_json.contains("RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_ASSISTANT"));
+    }
+
+    #[tokio::test]
+    async fn program_turn_invokes_private_context_recorder() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (mut kernel, _prompts) = kernel_with_capture_prompt_runtime(&temp_dir).await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let response = kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: "program recorder request".to_string(),
+                runtime_id: Some(TEST_CAPTURE_PROMPT_RUNTIME_ID.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("program turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        let requests = requests.lock().expect("private context recorder requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].turn_id, response.turn_id);
+        assert_eq!(
+            requests[0].surface,
+            PrivateContextRecordSurface::ProgramTurn
+        );
+        assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
+        assert_eq!(
+            requests[0]
+                .transcript
+                .user
+                .as_ref()
+                .expect("user text")
+                .text,
+            "program recorder request"
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_native_tui_import_invokes_private_context_recorder() {
+        let temp_dir = tempdir().expect("temp dir");
+        let (mut kernel, _exports) = kernel_with_counting_terminal_runtime_and_transcript(
+            &temp_dir,
+            vec![test_terminal_turn("native-recorder-source")],
+            true,
+        )
+        .await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let launch = kernel
+            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session.session_id))
+            .await
+            .expect("prepare attached runtime launch");
+        kernel
+            .finish_attached_runtime_launch(
+                session.session_id,
+                TEST_TERMINAL_RUNTIME_ID,
+                &launch.request.plan,
+                Some(0),
+                None,
+            )
+            .await
+            .expect("finish attached runtime launch");
+
+        let requests = requests.lock().expect("private context recorder requests");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.surface,
+            PrivateContextRecordSurface::AttachedNativeTuiTurn
+        );
+        assert_eq!(request.runtime_id, TEST_TERMINAL_RUNTIME_ID);
+        assert_eq!(
+            request
+                .transcript
+                .assistant
+                .as_ref()
+                .expect("assistant text")
+                .text,
+            "hello from native tui"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_turn_invokes_private_context_recorder_with_channel_surface() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project = crate::operator::target::init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
+        let channel_skill =
+            write_installed_skill(&home, "loopback-skill", "loopback channel skill").await;
+        make_executable(&channel_skill.join("scripts/worker"));
+        crate::operator::reconcile::add_channel(
+            &home,
+            "loopback".to_string(),
+            "loopback-skill".to_string(),
+            crate::operator::config::ChannelLaunchMode::Interactive,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+        let mut kernel = kernel_with_home(&home).await;
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        kernel
+            .register_runtime_adapter(
+                TEST_CAPTURE_PROMPT_RUNTIME_ID,
+                Arc::new(CapturePromptRuntimeAdapter {
+                    prompts: Arc::clone(&prompts),
+                }),
+            )
+            .await;
+        let requests = install_test_private_context_recorder(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+            true,
+        );
+        let session = kernel
+            .sessions
+            .open(
+                "loopback".to_string(),
+                "channel:loopback:direct:recorder".to_string(),
+                kernel.session_scope().to_string(),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open channel session");
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "channel recorder request".to_string(),
+                    prompt_user_text: "channel recorder request".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    requested_runtime_id: Some(TEST_CAPTURE_PROMPT_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("channel turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        let requests = requests.lock().expect("private context recorder requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].turn_id, turn_id);
+        assert_eq!(
+            requests[0].surface,
+            PrivateContextRecordSurface::ChannelTurn
+        );
+        assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
     }
 
     #[test]
@@ -18769,7 +19561,8 @@ impl Kernel {
         } else {
             PreparedChannelDeliveryAttachments::default()
         };
-        self.session_turns
+        let completed_turn = self
+            .session_turns
             .complete_turn(
                 turn_id,
                 SessionTurnCompletion {
@@ -18780,17 +19573,26 @@ impl Kernel {
                 },
             )
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Internal("completed session turn was not found".to_string())
+            })?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &artifacts.assistant_text)
                 .await?;
         }
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
-        self.sessions
-            .record_turn(session.session_id)
-            .await
-            .map_err(internal)?;
+        self.post_commit_session_turn(
+            session,
+            &completed_turn,
+            if channel_stream_context.is_some() {
+                PrivateContextRecordSurface::ChannelTurn
+            } else {
+                PrivateContextRecordSurface::ProgramTurn
+            },
+        )
+        .await?;
         self.mark_runtime_session_ready(&execution_plan).await;
         self.maybe_compact_session_transcript_best_effort(session)
             .await;
@@ -19060,7 +19862,8 @@ impl Kernel {
             return Err(KernelError::Runtime(message));
         }
 
-        self.session_turns
+        let completed_turn = self
+            .session_turns
             .complete_turn(
                 turn_id,
                 SessionTurnCompletion {
@@ -19071,17 +19874,26 @@ impl Kernel {
                 },
             )
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Internal("completed runtime control turn was not found".to_string())
+            })?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &assistant_text)
                 .await?;
         }
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
-        self.sessions
-            .record_turn(session.session_id)
-            .await
-            .map_err(internal)?;
+        self.post_commit_session_turn(
+            session,
+            &completed_turn,
+            if channel_stream_context.is_some() {
+                PrivateContextRecordSurface::ChannelTurn
+            } else {
+                PrivateContextRecordSurface::ProgramTurn
+            },
+        )
+        .await?;
         if matches!(
             &runtime_control.outcome,
             RuntimeControlOutcome::Handled { .. }
@@ -21515,6 +22327,7 @@ impl Kernel {
                 .await?;
                 self.complete_queued_lionclaw_control_turn(
                     turn,
+                    session,
                     prepared_turn,
                     message,
                     stream_context,
@@ -21534,6 +22347,7 @@ impl Kernel {
                 .await?;
                 self.complete_queued_lionclaw_control_turn(
                     turn,
+                    session,
                     prepared_turn,
                     message.to_string(),
                     stream_context,
@@ -21584,12 +22398,14 @@ impl Kernel {
     async fn complete_queued_lionclaw_control_turn(
         &self,
         turn: &ChannelTurnRecord,
+        session: &super::sessions::Session,
         prepared_turn: SessionTurnRecord,
         message: String,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
         let turn_id = prepared_turn.turn_id;
-        self.session_turns
+        let completed_turn = self
+            .session_turns
             .complete_turn(
                 turn_id,
                 SessionTurnCompletion {
@@ -21600,11 +22416,16 @@ impl Kernel {
                 },
             )
             .await
-            .map_err(internal)?;
-        self.sessions
-            .record_turn(turn.session_id)
-            .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Internal("completed queued control turn was not found".to_string())
+            })?;
+        self.post_commit_session_turn(
+            session,
+            &completed_turn,
+            PrivateContextRecordSurface::ChannelTurn,
+        )
+        .await?;
         if let Some(context) = &stream_context {
             self.emit_turn_completed_snapshot(context, &message).await?;
         }
