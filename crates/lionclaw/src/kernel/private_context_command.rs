@@ -110,26 +110,39 @@ fn private_context_ambient_env() -> Vec<(String, OsString)> {
 
 fn ensure_private_context_state_component(path: &Path, harden_existing: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                anyhow::bail!("state directory {} must not be a symlink", path.display());
-            }
-            if !metadata.is_dir() {
-                anyhow::bail!("state directory {} is not a directory", path.display());
-            }
-            if harden_existing {
-                harden_private_context_state_dir(path, &metadata)?;
-            }
-            Ok(())
-        }
+        Ok(metadata) => validate_private_context_state_component(path, &metadata, harden_existing),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).with_context(|| format!("failed to create {}", path.display()))?;
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create {}", path.display()));
+                }
+            }
             let metadata = fs::symlink_metadata(path)
                 .with_context(|| format!("failed to stat {}", path.display()))?;
-            harden_private_context_state_dir(path, &metadata)
+            validate_private_context_state_component(path, &metadata, true)
         }
         Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
+}
+
+fn validate_private_context_state_component(
+    path: &Path,
+    metadata: &fs::Metadata,
+    harden_existing: bool,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("state directory {} must not be a symlink", path.display());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("state directory {} is not a directory", path.display());
+    }
+    if harden_existing {
+        harden_private_context_state_dir(path, metadata)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -187,4 +200,42 @@ fn terminate_private_context_process_group_for_platform(
 fn terminate_private_context_process_group_for_platform(
     _process_group: &mut Option<PrivateContextProcessGroup>,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::ensure_private_context_state_dir;
+
+    #[test]
+    fn state_dir_creation_tolerates_concurrent_first_use() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state_dir = Arc::new(
+            temp_dir
+                .path()
+                .join("private")
+                .join("context")
+                .join("state"),
+        );
+        let barrier = Arc::new(Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let state_dir = Arc::clone(&state_dir);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_private_context_state_dir(&state_dir)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("state dir worker")
+                .expect("state dir creation");
+        }
+        assert!(state_dir.is_dir());
+    }
 }
