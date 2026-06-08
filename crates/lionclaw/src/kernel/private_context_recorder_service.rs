@@ -166,13 +166,11 @@ impl PrivateContextRecorder for SkillPrivateContextRecorder {
             Ok(process) => process,
             Err(_) => return failed_outcome("spawn_failed", started_at),
         };
-        if process.write_request(&request_json).await.is_err() {
-            process.terminate();
-            process.finish_after_termination().await;
-            return failed_outcome("io_error", started_at);
-        }
-
-        let wait_result = tokio::time::timeout(self.config.timeout, process.wait()).await;
+        let wait_result = tokio::time::timeout(
+            self.config.timeout,
+            process.write_request_and_wait(&request_json),
+        )
+        .await;
         match wait_result {
             Ok(outcome) => outcome_from_wait(outcome, started_at),
             Err(_) => {
@@ -227,6 +225,11 @@ impl OneShotPrivateContextRecorderProcess {
             )),
             process_group,
         })
+    }
+
+    async fn write_request_and_wait(&mut self, request_json: &[u8]) -> RecorderProcessWait {
+        self.write_request(request_json).await?;
+        self.wait().await
     }
 
     async fn write_request(&mut self, request_json: &[u8]) -> Result<(), ()> {
@@ -448,7 +451,8 @@ mod tests {
             private_context_recording::{
                 PrivateContextRecordOutcome, PrivateContextRecordRequest,
                 PrivateContextRecordStatus, PrivateContextRecordSurface,
-                PrivateContextRecordTranscript,
+                PrivateContextRecordTranscript, PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES,
+                PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
             },
         },
     };
@@ -504,6 +508,15 @@ mod tests {
             project_scope: Some("project:test".to_string()),
             transcript: PrivateContextRecordTranscript::from_committed_text("hello", "answer"),
         }
+    }
+
+    fn large_escaped_request() -> PrivateContextRecordRequest {
+        let mut request = request();
+        request.transcript = PrivateContextRecordTranscript::from_committed_text(
+            &"\u{1}".repeat(PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES),
+            &"\u{1}".repeat(PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES),
+        );
+        request
     }
 
     struct ConcurrentRecorder {
@@ -782,5 +795,29 @@ sleep 10
 
         assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
         assert!(!state_dir.join("leaked").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_timeout_covers_stdin_write() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+sleep 10
+"#,
+        )
+        .with_timeout(Duration::from_millis(50));
+        let recorder = SkillPrivateContextRecorder::new(config);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            recorder.record(large_escaped_request()),
+        )
+        .await
+        .expect("recorder call should honor its own timeout");
+
+        assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
     }
 }
