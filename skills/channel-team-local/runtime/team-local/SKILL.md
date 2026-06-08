@@ -30,10 +30,11 @@ configuration directly. The bundled scripts are the runtime API.
 4. Send with `scripts/send`. Keep messages concise and include enough context
    for the receiving instance to act without reading your private chain of
    thought.
-5. Read the JSON result. If top-level `"ok": false` or the command exits
-   nonzero, inspect each `deliveries[]` entry before reporting status. A
-   recipient with `"ok": true` was accepted by LionClaw; a recipient with
-   `"ok": false` was not. Explain only the failed recipients to the local user.
+5. Read the result. When `scripts/send` prints JSON with `deliveries[]`, inspect
+   each delivery before reporting status. A recipient with `"ok": true` was
+   accepted by LionClaw; a recipient with `"ok": false` was not. If the command
+   exits nonzero without JSON, report the stderr setup or validation error
+   instead of inventing recipient delivery status.
 
 ## Examples
 
@@ -83,8 +84,8 @@ scripts/send reviewer --format plain --attachment /runtime/results/report.txt --
 Attachment-only sends are valid. Empty text with no attachments is rejected.
 For multiple recipients, unresolved-recipient planning failures are all-or-none:
 `scripts/send` sends to none of them if any recipient cannot be resolved. After
-routes are resolved, delivery can partially succeed, so always read
-`deliveries[]`.
+routes are resolved, delivery can partially succeed, so use `deliveries[]` when
+the command prints a JSON result.
 
 ## Incoming Team-Local Turns
 
