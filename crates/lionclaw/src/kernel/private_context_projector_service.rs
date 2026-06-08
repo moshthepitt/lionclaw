@@ -18,7 +18,7 @@ use tokio::{
 #[cfg(unix)]
 use rustix::process::{kill_process_group, Pid, Signal};
 
-use crate::applied::{AppliedPrivateContextProjector, AppliedState};
+use crate::applied::{AppliedPrivateContextSkill, AppliedState};
 
 use super::private_context_projection::{
     validate_private_context_projection, NoopPrivateContextProjector, PrivateContextProjection,
@@ -35,8 +35,10 @@ const PROJECTOR_STRAY_STDOUT_GRACE: Duration = Duration::from_millis(10);
 pub(crate) fn private_context_projector_for_applied_state(
     applied_state: &AppliedState,
 ) -> Arc<dyn PrivateContextProjector> {
-    match applied_state.private_context_projector() {
-        Some(projector) => Arc::new(SkillPrivateContextProjector::from_applied(projector)),
+    match applied_state.private_context_skill() {
+        Some(private_context) => {
+            Arc::new(SkillPrivateContextProjector::from_applied(private_context))
+        }
         None => Arc::new(NoopPrivateContextProjector),
     }
 }
@@ -51,12 +53,12 @@ pub(crate) struct SkillPrivateContextProjectorConfig {
 }
 
 impl SkillPrivateContextProjectorConfig {
-    pub(crate) fn from_applied(projector: &AppliedPrivateContextProjector) -> Self {
+    pub(crate) fn from_applied(private_context: &AppliedPrivateContextSkill) -> Self {
         Self {
-            projector_id: projector.skill_alias.clone(),
-            command_path: projector.command_path.clone(),
-            skill_root: projector.skill_root.clone(),
-            state_dir: projector.state_dir.clone(),
+            projector_id: private_context.skill_alias.clone(),
+            command_path: private_context.projector.command_path.clone(),
+            skill_root: private_context.skill_root.clone(),
+            state_dir: private_context.state_dir.clone(),
             request_timeout: PRIVATE_CONTEXT_PROJECTOR_REQUEST_TIMEOUT,
         }
     }
@@ -74,8 +76,10 @@ pub(crate) struct SkillPrivateContextProjector {
 }
 
 impl SkillPrivateContextProjector {
-    pub(crate) fn from_applied(projector: &AppliedPrivateContextProjector) -> Self {
-        Self::new(SkillPrivateContextProjectorConfig::from_applied(projector))
+    pub(crate) fn from_applied(private_context: &AppliedPrivateContextSkill) -> Self {
+        Self::new(SkillPrivateContextProjectorConfig::from_applied(
+            private_context,
+        ))
     }
 
     pub(crate) fn new(config: SkillPrivateContextProjectorConfig) -> Self {

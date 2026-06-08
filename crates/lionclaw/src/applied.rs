@@ -22,7 +22,7 @@ use crate::{
     operator::{
         config::{ChannelContactConfig, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         skill_metadata::{
-            load_private_context_projector_metadata, resolve_skill_entrypoint,
+            load_private_context_skill_metadata, resolve_skill_entrypoint,
             SkillEntrypointSymlinkPolicy,
         },
         snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
@@ -37,7 +37,7 @@ pub struct AppliedState {
     skills_by_id: BTreeMap<String, AppliedSkill>,
     skills_by_alias: BTreeMap<String, AppliedSkill>,
     channels_by_id: BTreeMap<String, AppliedChannel>,
-    private_context_projector: Option<AppliedPrivateContextProjector>,
+    private_context_skill: Option<AppliedPrivateContextSkill>,
 }
 
 impl AppliedState {
@@ -53,12 +53,11 @@ impl AppliedState {
             inputs.skills,
             &inputs.host_only_skill_aliases,
         )?;
-        let private_context_projector =
-            resolve_applied_private_context_projector(home, config, &skills)?;
+        let private_context_skill = resolve_applied_private_context_skill(home, config, &skills)?;
         Ok(Self::from_parts(
             skills,
             inputs.channels,
-            private_context_projector,
+            private_context_skill,
         ))
     }
 
@@ -67,12 +66,12 @@ impl AppliedState {
         config: &OperatorConfig,
     ) -> Result<Self> {
         let inputs = read_applied_state_inputs(home, config)?;
-        let private_context_projector =
-            resolve_applied_private_context_projector(home, config, &inputs.skills)?;
+        let private_context_skill =
+            resolve_applied_private_context_skill(home, config, &inputs.skills)?;
         Ok(Self::from_parts(
             inputs.skills,
             inputs.channels,
-            private_context_projector,
+            private_context_skill,
         ))
     }
 
@@ -103,8 +102,8 @@ impl AppliedState {
         self.channels_by_id.get(channel_id)
     }
 
-    pub fn private_context_projector(&self) -> Option<&AppliedPrivateContextProjector> {
-        self.private_context_projector.as_ref()
+    pub fn private_context_skill(&self) -> Option<&AppliedPrivateContextSkill> {
+        self.private_context_skill.as_ref()
     }
 
     pub fn runtime_visible_skills(&self) -> Vec<AppliedSkill> {
@@ -121,9 +120,9 @@ impl AppliedState {
             .iter()
             .map(|channel| channel.skill_alias.as_str())
             .chain(
-                self.private_context_projector
+                self.private_context_skill
                     .as_ref()
-                    .map(|projector| projector.skill_alias.as_str()),
+                    .map(|skill| skill.skill_alias.as_str()),
             )
             .collect::<BTreeSet<_>>();
         self.skills
@@ -145,14 +144,14 @@ impl AppliedState {
         applied_state_fingerprint(
             &self.skills,
             &self.channels,
-            self.private_context_projector.as_ref(),
+            self.private_context_skill.as_ref(),
         )
     }
 
     fn from_parts(
         skills: Vec<AppliedSkill>,
         channels: Vec<AppliedChannel>,
-        private_context_projector: Option<AppliedPrivateContextProjector>,
+        private_context_skill: Option<AppliedPrivateContextSkill>,
     ) -> Self {
         let skills_by_id = skills
             .iter()
@@ -176,7 +175,7 @@ impl AppliedState {
             skills_by_id,
             skills_by_alias,
             channels_by_id,
-            private_context_projector,
+            private_context_skill,
         }
     }
 }
@@ -312,10 +311,10 @@ fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {
 fn applied_state_fingerprint(
     skills: &[AppliedSkill],
     channels: &[AppliedChannel],
-    private_context_projector: Option<&AppliedPrivateContextProjector>,
+    private_context_skill: Option<&AppliedPrivateContextSkill>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"lionclaw-applied-state-v2\0");
+    hasher.update(b"lionclaw-applied-state-v3\0");
     hasher.update(applied_skills_fingerprint(skills).as_bytes());
     hasher.update(b"\0");
 
@@ -353,16 +352,27 @@ fn applied_state_fingerprint(
             }
         }
     }
-    match private_context_projector {
-        Some(projector) => {
-            hasher.update(b"private_context_projector\0");
-            hasher.update(projector.skill_alias.as_bytes());
+    match private_context_skill {
+        Some(skill) => {
+            hasher.update(b"private_context_skill\0");
+            hasher.update(skill.skill_alias.as_bytes());
             hasher.update(b"\0");
-            hasher.update(projector.command.as_bytes());
+            hasher.update(b"projector\0");
+            hasher.update(skill.projector.command.as_bytes());
             hasher.update(b"\0");
+            match &skill.recorder {
+                Some(recorder) => {
+                    hasher.update(b"recorder\0");
+                    hasher.update(recorder.command.as_bytes());
+                    hasher.update(b"\0");
+                }
+                None => {
+                    hasher.update(b"recorder_none\0");
+                }
+            }
         }
         None => {
-            hasher.update(b"private_context_projector_none\0");
+            hasher.update(b"private_context_skill_none\0");
         }
     }
 
@@ -665,12 +675,18 @@ pub struct AppliedSkill {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedPrivateContextProjector {
+pub struct AppliedPrivateContextSkill {
     pub skill_alias: String,
-    pub command: String,
-    pub command_path: PathBuf,
     pub skill_root: PathBuf,
     pub state_dir: PathBuf,
+    pub projector: AppliedPrivateContextEntrypoint,
+    pub recorder: Option<AppliedPrivateContextEntrypoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedPrivateContextEntrypoint {
+    pub command: String,
+    pub command_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -890,11 +906,11 @@ impl AppliedChannel {
     }
 }
 
-fn resolve_applied_private_context_projector(
+fn resolve_applied_private_context_skill(
     home: &LionClawHome,
     config: &OperatorConfig,
     skills: &[AppliedSkill],
-) -> Result<Option<AppliedPrivateContextProjector>> {
+) -> Result<Option<AppliedPrivateContextSkill>> {
     let Some(alias) = config.private_context.projector_skill.as_deref() else {
         return Ok(None);
     };
@@ -907,22 +923,50 @@ fn resolve_applied_private_context_projector(
                 "configured private context projector references missing installed skill alias '{alias}'"
             )
         })?;
-    let metadata = load_private_context_projector_metadata(&skill.snapshot_path)?
+    let metadata = load_private_context_skill_metadata(&skill.snapshot_path)?;
+    let projector = metadata
+        .projector
         .ok_or_else(|| anyhow!("configured private context projector skill alias '{alias}' does not declare [private_context_projector] metadata"))?;
-    let command_path = resolve_skill_entrypoint(
+    let projector = resolve_private_context_entrypoint(
         &skill.snapshot_path,
-        &metadata.command,
+        projector.command,
         "private context projector command",
-        SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
     )?;
+    let recorder = metadata
+        .recorder
+        .map(|entrypoint| {
+            resolve_private_context_entrypoint(
+                &skill.snapshot_path,
+                entrypoint.command,
+                "private context recorder command",
+            )
+        })
+        .transpose()?;
 
-    Ok(Some(AppliedPrivateContextProjector {
+    Ok(Some(AppliedPrivateContextSkill {
         skill_alias: alias.to_string(),
-        command: metadata.command,
-        command_path,
         skill_root: skill.snapshot_path.clone(),
         state_dir: home.skill_state_dir(alias),
+        projector,
+        recorder,
     }))
+}
+
+fn resolve_private_context_entrypoint(
+    skill_root: &Path,
+    command: String,
+    label: &str,
+) -> Result<AppliedPrivateContextEntrypoint> {
+    let command_path = resolve_skill_entrypoint(
+        skill_root,
+        &command,
+        label,
+        SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+    )?;
+    Ok(AppliedPrivateContextEntrypoint {
+        command,
+        command_path,
+    })
 }
 
 pub fn canonical_skills_root(home: &LionClawHome) -> Result<PathBuf> {
@@ -1023,6 +1067,19 @@ mod tests {
         skill
     }
 
+    #[cfg(unix)]
+    fn add_private_context_recorder(skill: &Path, command: &str) {
+        fs::write(skill.join(command), "#!/usr/bin/env bash\n").expect("recorder");
+        make_executable(&skill.join(command));
+        fs::write(
+            skill.join("lionclaw.toml"),
+            format!(
+                "version = 1\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n\n[private_context_recorder]\ncommand = \"{command}\"\n"
+            ),
+        )
+        .expect("metadata");
+    }
+
     fn write_runtime_skill_facet(
         skill: &Path,
         alias: &str,
@@ -1108,18 +1165,46 @@ mod tests {
         configure_private_context_projector(&home, "private-context-core").await;
 
         let applied = AppliedState::load(&home).await.expect("load state");
-        let projector = applied.private_context_projector().expect("projector");
+        let private_context = applied
+            .private_context_skill()
+            .expect("private context skill");
 
-        assert_eq!(projector.skill_alias, "private-context-core");
-        assert_eq!(projector.command, "scripts/projector");
-        assert!(projector.command_path.ends_with("scripts/projector"));
-        assert!(projector
+        assert_eq!(private_context.skill_alias, "private-context-core");
+        assert_eq!(private_context.projector.command, "scripts/projector");
+        assert!(private_context
+            .projector
+            .command_path
+            .ends_with("scripts/projector"));
+        assert!(private_context
             .skill_root
             .starts_with(home.skills_dir().join(".applied")));
         assert_eq!(
-            projector.state_dir,
+            private_context.state_dir,
             home.skill_state_dir("private-context-core")
         );
+        assert!(private_context.recorder.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_resolves_configured_private_context_recorder_from_applied_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let skill = write_private_context_projector_skill(&home, "private-context-core");
+        add_private_context_recorder(&skill, "scripts/recorder");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let applied = AppliedState::load(&home).await.expect("load state");
+        let private_context = applied
+            .private_context_skill()
+            .expect("private context skill");
+        let recorder = private_context.recorder.as_ref().expect("recorder");
+
+        assert_eq!(recorder.command, "scripts/recorder");
+        assert!(recorder.command_path.ends_with("scripts/recorder"));
+        assert!(private_context
+            .skill_root
+            .starts_with(home.skills_dir().join(".applied")));
     }
 
     #[cfg(unix)]
@@ -1271,10 +1356,40 @@ mod tests {
         assert_ne!(first.fingerprint(), second.fingerprint());
         assert_eq!(
             second
-                .private_context_projector()
-                .expect("projector")
+                .private_context_skill()
+                .expect("private context skill")
+                .projector
                 .command,
             "scripts/projector-v2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_context_recorder_metadata_changes_applied_state_fingerprint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_home(temp_dir.path());
+        let skill = write_private_context_projector_skill(&home, "private-context-core");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let first = AppliedState::load(&home)
+            .await
+            .expect("load first applied state");
+        add_private_context_recorder(&skill, "scripts/recorder");
+        let second = AppliedState::load(&home)
+            .await
+            .expect("load second applied state");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        assert_eq!(
+            second
+                .private_context_skill()
+                .expect("private context skill")
+                .recorder
+                .as_ref()
+                .expect("recorder")
+                .command,
+            "scripts/recorder"
         );
     }
 

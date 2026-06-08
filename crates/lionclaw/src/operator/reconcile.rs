@@ -2106,7 +2106,7 @@ mod tests {
         let state = load_operator_state(&home)
             .await
             .expect("existing private context projector should remain loadable");
-        assert!(state.applied_state.private_context_projector().is_some());
+        assert!(state.applied_state.private_context_skill().is_some());
     }
 
     #[cfg(unix)]
@@ -2154,7 +2154,7 @@ mod tests {
         let state = load_operator_state(&home)
             .await
             .expect("existing private context projector should remain loadable");
-        assert!(state.applied_state.private_context_projector().is_some());
+        assert!(state.applied_state.private_context_skill().is_some());
     }
 
     #[tokio::test]
