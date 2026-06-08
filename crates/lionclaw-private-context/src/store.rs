@@ -72,6 +72,7 @@ pub(crate) struct ContextItemRevision {
     pub slot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    pub body: String,
     pub tags: Vec<String>,
     pub priority: i64,
     pub pinned: bool,
@@ -1175,6 +1176,7 @@ fn row_to_revision(row: SqliteRow) -> Result<ContextItemRevision> {
         scope: row.try_get("scope")?,
         slot: row.try_get("slot")?,
         title: row.try_get("title")?,
+        body: row.try_get("body")?,
         tags,
         priority: row.try_get("priority")?,
         pinned: row.try_get::<i64, _>("pinned")? != 0,
@@ -1577,7 +1579,9 @@ mod tests {
             .expect("history");
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].operation, "profile_set");
+        assert_eq!(history[0].body, "Be concise.");
         assert_eq!(history[1].operation, "profile_set");
+        assert_eq!(history[1].body, "Be precise.");
     }
 
     #[tokio::test]
@@ -1620,6 +1624,51 @@ mod tests {
             .await
             .expect("punctuation search")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_history_includes_revision_bodies() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let item = store
+            .remember_memory(
+                "global",
+                Some("First"),
+                "First body.",
+                &["initial".to_string()],
+                0,
+                false,
+            )
+            .await
+            .expect("memory");
+        store
+            .update_memory(
+                &item.id,
+                MemoryPatch {
+                    title: Some(Some("Second".to_string())),
+                    body: Some("Second body.".to_string()),
+                    tags: Some(vec!["updated".to_string()]),
+                    priority: Some(5),
+                    pinned: Some(true),
+                },
+            )
+            .await
+            .expect("update memory");
+
+        let history = store.memory_history(&item.id).await.expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].operation, "memory_remember");
+        assert_eq!(history[0].title.as_deref(), Some("First"));
+        assert_eq!(history[0].body, "First body.");
+        assert_eq!(history[0].tags, vec!["initial".to_string()]);
+        assert_eq!(history[1].operation, "memory_update");
+        assert_eq!(history[1].title.as_deref(), Some("Second"));
+        assert_eq!(history[1].body, "Second body.");
+        assert_eq!(history[1].tags, vec!["updated".to_string()]);
+        assert_eq!(history[1].priority, 5);
+        assert!(history[1].pinned);
     }
 
     #[tokio::test]
@@ -1739,7 +1788,7 @@ mod tests {
                 "global",
                 Some("Secret"),
                 "Never audit this body.",
-                &[],
+                &["secret-tag".to_string()],
                 0,
                 false,
             )
@@ -1754,6 +1803,7 @@ mod tests {
         assert!(encoded.contains("memory_remember"));
         assert!(!encoded.contains("Never audit this body."));
         assert!(!encoded.contains("Secret"));
+        assert!(!encoded.contains("secret-tag"));
     }
 
     #[cfg(unix)]
