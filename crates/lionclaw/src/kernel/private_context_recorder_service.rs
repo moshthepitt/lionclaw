@@ -39,7 +39,6 @@ const PRIVATE_CONTEXT_RECORDER_LOCK_RETRY: Duration = Duration::from_millis(10);
 pub(crate) struct PrivateContextRecorderService {
     private_context_id: Option<String>,
     recorder: Option<Arc<dyn PrivateContextRecorder>>,
-    record_lock: Arc<Mutex<()>>,
 }
 
 impl PrivateContextRecorderService {
@@ -56,7 +55,6 @@ impl PrivateContextRecorderService {
         request: PrivateContextRecordRequest,
     ) -> Option<PrivateContextRecordOutcome> {
         let recorder = self.recorder.as_ref()?;
-        let _guard = self.record_lock.lock().await;
         Some(recorder.record(request).await)
     }
 
@@ -68,7 +66,6 @@ impl PrivateContextRecorderService {
         Self {
             private_context_id: Some(private_context_id.into()),
             recorder: Some(recorder),
-            record_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -77,7 +74,6 @@ impl PrivateContextRecorderService {
         Self {
             private_context_id: Some(private_context_id.into()),
             recorder: None,
-            record_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -89,7 +85,6 @@ pub(crate) fn private_context_recorder_for_applied_state(
         return PrivateContextRecorderService {
             private_context_id: None,
             recorder: None,
-            record_lock: Arc::new(Mutex::new(())),
         };
     };
     let private_context_id = Some(private_context.skill_alias.clone());
@@ -98,7 +93,6 @@ pub(crate) fn private_context_recorder_for_applied_state(
     PrivateContextRecorderService {
         private_context_id,
         recorder,
-        record_lock: Arc::new(Mutex::new(())),
     }
 }
 
@@ -478,14 +472,7 @@ fn private_context_recorder_lock_is_held(err: Errno) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-        time::Duration,
-    };
+    use std::{fs, sync::Arc, time::Duration};
 
     use serde_json::Value;
     use uuid::Uuid;
@@ -569,34 +556,28 @@ mod tests {
         request
     }
 
-    struct ConcurrentRecorder {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
+    struct BarrierRecorder {
+        barrier: Arc<tokio::sync::Barrier>,
     }
 
     #[async_trait::async_trait]
-    impl PrivateContextRecorder for ConcurrentRecorder {
+    impl PrivateContextRecorder for BarrierRecorder {
         async fn record(
             &self,
             _request: PrivateContextRecordRequest,
         ) -> PrivateContextRecordOutcome {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(active, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.barrier.wait().await;
             PrivateContextRecordOutcome::completed(0)
         }
     }
 
     #[tokio::test]
-    async fn recorder_service_serializes_concurrent_requests() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
+    async fn recorder_service_does_not_queue_before_recorder_boundary() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
         let service = PrivateContextRecorderService::with_recorder(
             "private-context-core",
-            Arc::new(ConcurrentRecorder {
-                active: Arc::clone(&active),
-                max_active: Arc::clone(&max_active),
+            Arc::new(BarrierRecorder {
+                barrier: Arc::clone(&barrier),
             }),
         );
 
@@ -607,14 +588,19 @@ mod tests {
                 service.record(request()).await.expect("record outcome")
             }));
         }
-        for task in tasks {
-            assert_eq!(
-                task.await.expect("join").status,
-                PrivateContextRecordStatus::Completed
-            );
-        }
+        let outcomes = tokio::time::timeout(Duration::from_millis(500), async move {
+            let mut outcomes = Vec::new();
+            for task in tasks {
+                outcomes.push(task.await.expect("join"));
+            }
+            outcomes
+        })
+        .await
+        .expect("service must not serialize before recorder timeout boundary");
 
-        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert!(outcomes
+            .iter()
+            .all(|outcome| outcome.status == PrivateContextRecordStatus::Completed));
     }
 
     #[test]
