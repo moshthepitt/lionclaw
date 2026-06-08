@@ -1068,7 +1068,9 @@ omission on invalid output, and prompt-context audit metadata. Audit records
 projector metadata, requested class budgets, source counts, current-input byte
 counts, and cap status, never projected body text. Projector stdout is the
 protocol stream; stderr may be drained only as bounded operational diagnostics
-and must not enter prompt text or prompt-context audit body fields.
+and must not enter prompt text or prompt-context audit body fields. Final
+Markdown wrapping is part of the prompt section cap; capped projected sections
+keep only chunks that contribute visible projected text.
 `ACTIVE.md` is a kernel-generated hot projection from deterministic state and
 existing continuity files; it can be selected under smaller Untrusted budgets.
 Daily notes, artifacts, proposals, and open loops are visible Markdown records,

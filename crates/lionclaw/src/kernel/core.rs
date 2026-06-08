@@ -9421,6 +9421,43 @@ done
     }
 
     #[tokio::test]
+    async fn single_line_private_context_projector_output_keeps_visible_text_when_capped() {
+        let (projector, _requests) =
+            TestPrivateContextProjector::with_items(vec![memory_candidate("m".repeat(5 * 1024))]);
+        let fixture = prompt_context_fixture_with_private_context_projector(projector).await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Conservative,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains("## Memory"), "{rendered}");
+        assert!(rendered.contains("- Stable fact:"), "{rendered}");
+        assert!(rendered.contains("\n  > m"), "{rendered}");
+        assert!(!build
+            .audit
+            .excluded
+            .iter()
+            .any(|item| item.id == ContextItemId::MemoryContext));
+        assert!(build.audit.capped.iter().any(|item| {
+            item.id == ContextItemId::MemoryContext
+                && item.source == ContextSource::PrivateContextProjection
+                && item.original_bytes > item.included_bytes
+        }));
+        assert!(audit_json.contains("\"status\":\"included\""));
+        assert!(audit_json.contains("\"class\":\"memory\""));
+        assert!(audit_json.contains("\"cap_status\":\"capped\""));
+    }
+
+    #[tokio::test]
     async fn program_prompt_keeps_current_user_input_as_terminal_section() {
         let fixture = prompt_context_fixture().await;
         let session = open_prompt_context_session(
@@ -17212,28 +17249,132 @@ fn render_recent_transcript_tail_context(
     })
 }
 
-fn render_projected_context_items(
+fn render_budgeted_projected_context_items(
     item: &ContextItemSpec,
     candidates: &[&ProjectedContextItem],
-) -> String {
+    max_bytes: usize,
+) -> Option<RenderedPromptContextItem> {
     let mut section = format!("## {}", item.title);
-    for candidate in candidates {
-        section.push_str("\n\n- ");
-        section.push_str(candidate.kind.title());
-        section.push(':');
-        push_contained_projected_context_text(&mut section, &candidate.text);
+    let mut original_bytes = section.len();
+    let chunks = candidates
+        .iter()
+        .map(|candidate| {
+            let chunk = render_projected_context_item(candidate);
+            original_bytes = original_bytes.saturating_add(chunk.len());
+            (*candidate, chunk)
+        })
+        .collect::<Vec<_>>();
+    let mut rendered_item = false;
+
+    for (candidate, chunk) in chunks {
+        if section.len().saturating_add(chunk.len()) <= max_bytes {
+            section.push_str(&chunk);
+            rendered_item = true;
+            continue;
+        }
+
+        let remaining_bytes = max_bytes.saturating_sub(section.len());
+        if let Some(chunk) = render_projected_context_item_with_budget(candidate, remaining_bytes) {
+            section.push_str(&chunk);
+            rendered_item = true;
+            break;
+        }
     }
-    section
+
+    rendered_item.then_some(RenderedPromptContextItem {
+        content: section,
+        original_bytes,
+    })
+}
+
+fn render_projected_context_item(candidate: &ProjectedContextItem) -> String {
+    let mut chunk = projected_context_item_header(candidate);
+    push_contained_projected_context_text(&mut chunk, &candidate.text);
+    chunk
+}
+
+fn render_projected_context_item_with_budget(
+    candidate: &ProjectedContextItem,
+    max_bytes: usize,
+) -> Option<String> {
+    let mut chunk = projected_context_item_header(candidate);
+    (chunk.len() < max_bytes
+        && push_contained_projected_context_text_with_budget(
+            &mut chunk,
+            &candidate.text,
+            max_bytes,
+        ))
+    .then_some(chunk)
+}
+
+fn projected_context_item_header(candidate: &ProjectedContextItem) -> String {
+    format!("\n\n- {}:", candidate.kind.title())
 }
 
 fn push_contained_projected_context_text(section: &mut String, text: &str) {
-    let normalized = text.trim().replace("\r\n", "\n").replace('\r', "\n");
-    for line in normalized.lines() {
-        section.push_str("\n  >");
-        if !line.is_empty() {
-            section.push(' ');
-            section.push_str(line.trim_end());
+    let normalized = normalize_projected_context_text(text);
+    for line in normalized.lines().map(str::trim_end) {
+        push_projected_context_quote_line(section, line);
+    }
+}
+
+fn push_contained_projected_context_text_with_budget(
+    section: &mut String,
+    text: &str,
+    max_bytes: usize,
+) -> bool {
+    let normalized = normalize_projected_context_text(text);
+    let mut rendered_text = false;
+    for line in normalized.lines().map(str::trim_end) {
+        if line.is_empty() {
+            if rendered_text
+                && section
+                    .len()
+                    .saturating_add(projected_context_quote_prefix(line).len())
+                    <= max_bytes
+            {
+                push_projected_context_quote_line(section, line);
+            }
+            continue;
         }
+
+        let prefix = projected_context_quote_prefix(line);
+        if section.len().saturating_add(prefix.len()) >= max_bytes {
+            break;
+        }
+        let line_budget = max_bytes - section.len() - prefix.len();
+        let line_text = if line.len() <= line_budget {
+            line.to_string()
+        } else {
+            cap_utf8_at_line_boundary(line, line_budget).content
+        };
+        if line_text.is_empty() {
+            break;
+        }
+        section.push_str(prefix);
+        section.push_str(&line_text);
+        rendered_text = true;
+        if line_text.len() < line.len() {
+            break;
+        }
+    }
+    rendered_text
+}
+
+fn normalize_projected_context_text(text: &str) -> String {
+    text.trim().replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn push_projected_context_quote_line(section: &mut String, line: &str) {
+    section.push_str(projected_context_quote_prefix(line));
+    section.push_str(line);
+}
+
+fn projected_context_quote_prefix(line: &str) -> &'static str {
+    if line.is_empty() {
+        "\n  >"
+    } else {
+        "\n  > "
     }
 }
 
@@ -21583,9 +21724,13 @@ impl Kernel {
                     )),
                 ))
             }
-            ContextSource::PrivateContextProjection => Ok(
-                Self::render_private_context_projection_context(item, private_context_projection),
-            ),
+            ContextSource::PrivateContextProjection => {
+                Ok(Self::render_private_context_projection_context(
+                    item,
+                    private_context_projection,
+                    max_bytes,
+                ))
+            }
             ContextSource::ContinuityFile(file_name) => {
                 let Some(layout) = &self.continuity else {
                     return Ok(Self::omitted_prompt_context_item("missing_optional"));
@@ -21813,6 +21958,7 @@ impl Kernel {
     fn render_private_context_projection_context(
         item: &ContextItemSpec,
         projection: Option<&PrivateContextProjectionCache>,
+        max_bytes: usize,
     ) -> PromptContextRenderResult {
         let Some(projected_class) = item.id.projected_class() else {
             return Self::omitted_prompt_context_item("missing_optional");
@@ -21828,11 +21974,9 @@ impl Kernel {
             return Self::omitted_prompt_context_item("projector_returned_no_items");
         }
 
-        let content = render_projected_context_items(item, &items);
-        PromptContextRenderResult::Rendered(RenderedPromptContextItem {
-            original_bytes: content.trim().len(),
-            content,
-        })
+        render_budgeted_projected_context_items(item, &items, max_bytes)
+            .map(PromptContextRenderResult::Rendered)
+            .unwrap_or_else(|| Self::omitted_prompt_context_item("over_budget_excluded"))
     }
 
     async fn private_context_projection_sources(
