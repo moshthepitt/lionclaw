@@ -5978,12 +5978,12 @@ impl Kernel {
     }
 
     pub async fn scheduler_tick(&self) -> Result<JobTickResponse, KernelError> {
-        self.scheduler.tick(self).await
+        Box::pin(self.scheduler.tick(self)).await
     }
 
     pub async fn run_scheduler_loop(self: Arc<Self>) {
         let scheduler = self.scheduler.clone();
-        scheduler.run_loop(self).await;
+        Box::pin(scheduler.run_loop(self)).await;
     }
 
     pub(super) fn job_store(&self) -> &JobStore {
