@@ -1107,6 +1107,9 @@ when a recorder is configured, they produce only metadata skip audit. Bootstrap
 restart reconciliation remains a separate kernel recovery path audited through
 `session.turn.reconciled`, not `private_context.record`. Recorder failures never
 fail the user turn.
+Concurrent eligible turns are serialized per configured recorder before process
+spawn so skill-owned updates to `LIONCLAW_SKILL_STATE_DIR` have deterministic
+ordering.
 
 The recorder runs with the skill root as working directory, stdin piped, stdout
 and stderr piped, and the same small ambient process-start allowlist used for the

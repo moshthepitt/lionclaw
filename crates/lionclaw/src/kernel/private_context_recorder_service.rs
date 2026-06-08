@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
+    sync::Mutex,
     time::Instant,
 };
 
@@ -24,6 +25,7 @@ const PRIVATE_CONTEXT_RECORDER_STDOUT_MAX_BYTES: usize = 4096;
 pub(crate) struct PrivateContextRecorderService {
     private_context_id: Option<String>,
     recorder: Option<Arc<dyn PrivateContextRecorder>>,
+    record_lock: Arc<Mutex<()>>,
 }
 
 impl PrivateContextRecorderService {
@@ -40,6 +42,7 @@ impl PrivateContextRecorderService {
         request: PrivateContextRecordRequest,
     ) -> Option<PrivateContextRecordOutcome> {
         let recorder = self.recorder.as_ref()?;
+        let _guard = self.record_lock.lock().await;
         Some(recorder.record(request).await)
     }
 
@@ -51,6 +54,7 @@ impl PrivateContextRecorderService {
         Self {
             private_context_id: Some(private_context_id.into()),
             recorder: Some(recorder),
+            record_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -59,6 +63,7 @@ impl PrivateContextRecorderService {
         Self {
             private_context_id: Some(private_context_id.into()),
             recorder: None,
+            record_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -70,6 +75,7 @@ pub(crate) fn private_context_recorder_for_applied_state(
         return PrivateContextRecorderService {
             private_context_id: None,
             recorder: None,
+            record_lock: Arc::new(Mutex::new(())),
         };
     };
     let private_context_id = Some(private_context.skill_alias.clone());
@@ -80,6 +86,7 @@ pub(crate) fn private_context_recorder_for_applied_state(
     PrivateContextRecorderService {
         private_context_id,
         recorder,
+        record_lock: Arc::new(Mutex::new(())),
     }
 }
 
@@ -300,21 +307,30 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use serde_json::Value;
     use uuid::Uuid;
 
     use super::{
-        PrivateContextRecorder, SkillPrivateContextRecorder, SkillPrivateContextRecorderConfig,
+        PrivateContextRecorder, PrivateContextRecorderService, SkillPrivateContextRecorder,
+        SkillPrivateContextRecorderConfig,
     };
     use crate::{
         contracts::{SessionHistoryPolicy, TrustTier},
         kernel::{
             private_context_recorder_service::PRIVATE_CONTEXT_RECORDER_TIMEOUT,
             private_context_recording::{
-                PrivateContextRecordRequest, PrivateContextRecordStatus,
-                PrivateContextRecordSurface, PrivateContextRecordTranscript,
+                PrivateContextRecordOutcome, PrivateContextRecordRequest,
+                PrivateContextRecordStatus, PrivateContextRecordSurface,
+                PrivateContextRecordTranscript,
             },
         },
     };
@@ -360,6 +376,54 @@ mod tests {
             project_scope: Some("project:test".to_string()),
             transcript: PrivateContextRecordTranscript::from_committed_text("hello", "answer"),
         }
+    }
+
+    struct ConcurrentRecorder {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PrivateContextRecorder for ConcurrentRecorder {
+        async fn record(
+            &self,
+            _request: PrivateContextRecordRequest,
+        ) -> PrivateContextRecordOutcome {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            PrivateContextRecordOutcome::completed(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn recorder_service_serializes_concurrent_requests() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let service = PrivateContextRecorderService::with_recorder(
+            "private-context-core",
+            Arc::new(ConcurrentRecorder {
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            }),
+        );
+
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                service.record(request()).await.expect("record outcome")
+            }));
+        }
+        for task in tasks {
+            assert_eq!(
+                task.await.expect("join").status,
+                PrivateContextRecordStatus::Completed
+            );
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
