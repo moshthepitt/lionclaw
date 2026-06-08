@@ -21,8 +21,10 @@ The tarball contains:
 - `lionclawd`
 - `lionclaw-channel-email`
 - `lionclaw-channel-team-local`
+- `lionclaw-private-context`
 - `skills/channel-email/`
 - `skills/channel-team-local/`
+- `skills/lionclaw-private-context/`
 - `LICENSE`
 
 ## Notes

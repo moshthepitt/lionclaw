@@ -1006,7 +1006,7 @@ Private context projector selection is explicit operator config:
 
 ```toml
 [private_context]
-projector_skill = "private-context-core"
+projector_skill = "lionclaw-private-context"
 ```
 
 When unset, the kernel uses the noop private context projector. Installing a skill with
