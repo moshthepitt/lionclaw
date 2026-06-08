@@ -40,8 +40,8 @@ use crate::{
             validate_runtime_launch_prerequisites_for_work_root,
         },
         skill_metadata::{
-            load_private_context_projector_metadata, resolve_skill_entrypoint,
-            SkillEntrypointSymlinkPolicy,
+            load_private_context_skill_metadata, resolve_skill_entrypoint,
+            PrivateContextEntrypointMetadata, SkillEntrypointSymlinkPolicy,
         },
         snapshot::{install_snapshot_with_overlays, resolve_local_source},
         target::{
@@ -106,9 +106,9 @@ fn validate_configured_skill_replacement(
         })?;
     }
     if is_configured_private_context_projector_skill(config, alias) {
-        resolve_private_context_projector_entrypoint(source_path).with_context(|| {
+        validate_configured_private_context_skill_replacement(source_path).with_context(|| {
             format!(
-                "skill alias '{alias}' backs the configured private context projector and must keep valid [private_context_projector] metadata"
+                "skill alias '{alias}' backs the configured private context projector and must keep valid private context metadata"
             )
         })?;
     }
@@ -175,19 +175,41 @@ fn is_configured_private_context_projector_skill(config: &OperatorConfig, alias:
     config.private_context.projector_skill.as_deref() == Some(alias)
 }
 
-fn resolve_private_context_projector_entrypoint(skill_dir: &Path) -> Result<PathBuf> {
-    let metadata = load_private_context_projector_metadata(skill_dir)?.ok_or_else(|| {
+fn validate_configured_private_context_skill_replacement(skill_dir: &Path) -> Result<()> {
+    let metadata = load_private_context_skill_metadata(skill_dir)?;
+    let projector = metadata.projector.ok_or_else(|| {
         anyhow!(
             "configured private context projector skill '{}' does not declare [private_context_projector] metadata",
             skill_dir.display()
         )
     })?;
+    validate_private_context_skill_entrypoint(
+        skill_dir,
+        &projector,
+        "private context projector command",
+    )?;
+    if let Some(recorder) = metadata.recorder {
+        validate_private_context_skill_entrypoint(
+            skill_dir,
+            &recorder,
+            "private context recorder command",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_private_context_skill_entrypoint(
+    skill_dir: &Path,
+    metadata: &PrivateContextEntrypointMetadata,
+    label: &str,
+) -> Result<()> {
     resolve_skill_entrypoint(
         skill_dir,
         &metadata.command,
-        "private context projector command",
+        label,
         SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
-    )
+    )?;
+    Ok(())
 }
 
 pub async fn add_channel(
@@ -1293,9 +1315,22 @@ mod tests {
     }
 
     fn write_private_context_projector_metadata(skill_source: &Path, command: &str) {
+        write_private_context_metadata(skill_source, command, None);
+    }
+
+    fn write_private_context_metadata(
+        skill_source: &Path,
+        projector_command: &str,
+        recorder_command: Option<&str>,
+    ) {
+        let recorder = recorder_command
+            .map(|command| format!("\n[private_context_recorder]\ncommand = \"{command}\"\n"))
+            .unwrap_or_default();
         fs::write(
             skill_source.join("lionclaw.toml"),
-            format!("version = 1\n\n[private_context_projector]\ncommand = \"{command}\"\n"),
+            format!(
+                "version = 1\n\n[private_context_projector]\ncommand = \"{projector_command}\"\n{recorder}"
+            ),
         )
         .expect("private context projector metadata");
     }
@@ -2100,9 +2135,9 @@ mod tests {
         .await
         .expect_err("metadata-free replacement should fail");
 
-        assert!(err
-            .to_string()
-            .contains("must keep valid [private_context_projector] metadata"));
+        let err = format!("{err:#}");
+        assert!(err.contains("must keep valid private context metadata"));
+        assert!(err.contains("[private_context_projector]"));
         let state = load_operator_state(&home)
             .await
             .expect("existing private context projector should remain loadable");
@@ -2151,6 +2186,58 @@ mod tests {
         let err = format!("{err:#}");
         assert!(err.contains("private context projector command"));
         assert!(err.contains("not executable"));
+        let state = load_operator_state(&home)
+            .await
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_skill().is_some());
+    }
+
+    #[tokio::test]
+    async fn add_skill_preserves_recorder_requirements_for_private_context_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
+        let projector = bad_skill.join("scripts/projector");
+        fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
+        fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&projector);
+        write_private_context_metadata(
+            &bad_skill,
+            "scripts/projector",
+            Some("scripts/missing-recorder"),
+        );
+
+        add_skill(
+            &home,
+            "private-context-core".to_string(),
+            good_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let err = add_skill(
+            &home,
+            "private-context-core".to_string(),
+            bad_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect_err("invalid recorder replacement should fail");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("private context recorder command"));
+        assert!(err.contains("entrypoint is missing"));
         let state = load_operator_state(&home)
             .await
             .expect("existing private context projector should remain loadable");

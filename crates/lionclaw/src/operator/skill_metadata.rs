@@ -53,12 +53,6 @@ struct PrivateContextEntrypointMetadataSection {
     command: String,
 }
 
-pub fn load_private_context_projector_metadata(
-    skill_dir: &Path,
-) -> Result<Option<PrivateContextEntrypointMetadata>> {
-    Ok(load_private_context_skill_metadata(skill_dir)?.projector)
-}
-
 pub fn load_private_context_skill_metadata(
     skill_dir: &Path,
 ) -> Result<PrivateContextSkillMetadata> {
@@ -266,8 +260,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_private_context_projector_metadata, load_private_context_skill_metadata,
-        resolve_skill_entrypoint, skill_metadata_declares_channel, SkillEntrypointSymlinkPolicy,
+        load_private_context_skill_metadata, resolve_skill_entrypoint,
+        skill_metadata_declares_channel, SkillEntrypointSymlinkPolicy,
     };
 
     #[cfg(unix)]
@@ -322,8 +316,9 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "scripts/projector");
 
-        let metadata = load_private_context_projector_metadata(&skill)
+        let metadata = load_private_context_skill_metadata(&skill)
             .expect("metadata")
+            .projector
             .expect("private context metadata");
 
         assert_eq!(metadata.command, "scripts/projector");
@@ -361,7 +356,7 @@ mod tests {
         )
         .expect("metadata");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("legacy memory projector metadata should be rejected");
 
         assert!(err.to_string().contains("memory_projector"));
@@ -384,7 +379,7 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "/bin/echo");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("absolute private context projector command should fail");
 
         assert!(err.to_string().contains("must be relative"));
@@ -397,7 +392,7 @@ mod tests {
         let skill = write_skill(temp_dir.path());
         write_private_context_projector_metadata(&skill, "../projector");
 
-        let err = load_private_context_projector_metadata(&skill)
+        let err = load_private_context_skill_metadata(&skill)
             .expect_err("parent traversal private context projector command should fail");
 
         assert!(err.to_string().contains("must stay inside"));
