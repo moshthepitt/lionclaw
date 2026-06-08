@@ -89,10 +89,8 @@ pub(crate) fn private_context_recorder_for_applied_state(
         };
     };
     let private_context_id = Some(private_context.skill_alias.clone());
-    let recorder = private_context
-        .recorder
-        .as_ref()
-        .map(|_| Arc::new(SkillPrivateContextRecorder::from_applied(private_context)) as Arc<_>);
+    let recorder = SkillPrivateContextRecorder::from_applied(private_context)
+        .map(|recorder| Arc::new(recorder) as Arc<dyn PrivateContextRecorder>);
     PrivateContextRecorderService {
         private_context_id,
         recorder,
@@ -138,10 +136,8 @@ pub(crate) struct SkillPrivateContextRecorder {
 }
 
 impl SkillPrivateContextRecorder {
-    pub(crate) fn from_applied(private_context: &AppliedPrivateContextSkill) -> Self {
-        let config = SkillPrivateContextRecorderConfig::from_applied(private_context)
-            .expect("private context recorder config requires recorder entrypoint");
-        Self::new(config)
+    pub(crate) fn from_applied(private_context: &AppliedPrivateContextSkill) -> Option<Self> {
+        SkillPrivateContextRecorderConfig::from_applied(private_context).map(Self::new)
     }
 
     pub(crate) fn new(config: SkillPrivateContextRecorderConfig) -> Self {
@@ -506,7 +502,7 @@ mod tests {
             runtime_id: "mock".to_string(),
             trust_tier: TrustTier::Main,
             history_policy: SessionHistoryPolicy::Interactive,
-            surface: PrivateContextRecordSurface::ProgramTurn,
+            surface: PrivateContextRecordSurface::Program,
             project_scope: Some("project:test".to_string()),
             transcript: PrivateContextRecordTranscript::from_committed_text("hello", "answer"),
         }

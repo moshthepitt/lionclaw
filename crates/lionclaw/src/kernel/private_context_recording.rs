@@ -20,19 +20,21 @@ pub(crate) struct PrivateContextRecordRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum PrivateContextRecordSurface {
-    ProgramTurn,
-    AttachedNativeTuiTurn,
-    ChannelTurn,
+    #[serde(rename = "program_turn")]
+    Program,
+    #[serde(rename = "attached_native_tui_turn")]
+    AttachedNativeTui,
+    #[serde(rename = "channel_turn")]
+    Channel,
 }
 
 impl PrivateContextRecordSurface {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::ProgramTurn => "program_turn",
-            Self::AttachedNativeTuiTurn => "attached_native_tui_turn",
-            Self::ChannelTurn => "channel_turn",
+            Self::Program => "program_turn",
+            Self::AttachedNativeTui => "attached_native_tui_turn",
+            Self::Channel => "channel_turn",
         }
     }
 }

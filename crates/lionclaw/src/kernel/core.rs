@@ -1356,13 +1356,15 @@ impl Kernel {
             if imported_session.is_none() {
                 imported_session = Some(self.get_scoped_session(session_id).await?);
             }
-            let session = imported_session
-                .as_ref()
-                .expect("attached import session loaded after first import");
+            let session = imported_session.as_ref().ok_or_else(|| {
+                KernelError::Internal(
+                    "attached import session was not loaded after first import".to_string(),
+                )
+            })?;
             self.post_commit_session_turn(
                 session,
                 &imported,
-                PrivateContextRecordSurface::AttachedNativeTuiTurn,
+                PrivateContextRecordSurface::AttachedNativeTui,
             )
             .await?;
         }
@@ -8875,7 +8877,7 @@ mod tests {
             SessionTurnStatus::Completed,
             &user_text,
             &assistant_text,
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
 
@@ -8889,7 +8891,7 @@ mod tests {
             assert_eq!(request.runtime_id, "mock");
             assert!(matches!(request.trust_tier, TrustTier::Main));
             assert_eq!(request.history_policy, SessionHistoryPolicy::Interactive);
-            assert_eq!(request.surface, PrivateContextRecordSurface::ProgramTurn);
+            assert_eq!(request.surface, PrivateContextRecordSurface::Program);
             assert_eq!(
                 request.project_scope.as_deref(),
                 Some(kernel.session_scope())
@@ -8959,7 +8961,7 @@ mod tests {
             SessionTurnStatus::Completed,
             "untrusted user",
             "untrusted assistant",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
         assert_eq!(
@@ -8979,7 +8981,7 @@ mod tests {
             SessionTurnStatus::Completed,
             "conservative user",
             "conservative assistant",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
         assert_eq!(
@@ -8999,7 +9001,7 @@ mod tests {
             SessionTurnStatus::Failed,
             "failed user",
             "failed assistant",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
         assert_eq!(
@@ -9019,7 +9021,7 @@ mod tests {
             SessionTurnStatus::Completed,
             " \n\t",
             " \n\t",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
         assert_eq!(
@@ -9057,7 +9059,7 @@ mod tests {
             SessionTurnStatus::Completed,
             "user",
             "assistant",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
 
@@ -9100,7 +9102,7 @@ mod tests {
             SessionTurnStatus::Completed,
             "RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_USER",
             "RECORDER_BODY_SHOULD_NOT_REACH_AUDIT_ASSISTANT",
-            PrivateContextRecordSurface::ProgramTurn,
+            PrivateContextRecordSurface::Program,
         )
         .await;
 
@@ -9147,10 +9149,7 @@ mod tests {
         let requests = requests.lock().expect("private context recorder requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].turn_id, response.turn_id);
-        assert_eq!(
-            requests[0].surface,
-            PrivateContextRecordSurface::ProgramTurn
-        );
+        assert_eq!(requests[0].surface, PrivateContextRecordSurface::Program);
         assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
         assert_eq!(
             requests[0]
@@ -9246,7 +9245,7 @@ mod tests {
         let request = &requests[0];
         assert_eq!(
             request.surface,
-            PrivateContextRecordSurface::AttachedNativeTuiTurn
+            PrivateContextRecordSurface::AttachedNativeTui
         );
         assert_eq!(request.runtime_id, TEST_TERMINAL_RUNTIME_ID);
         assert_eq!(
@@ -9323,10 +9322,7 @@ mod tests {
         let requests = requests.lock().expect("private context recorder requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].turn_id, turn_id);
-        assert_eq!(
-            requests[0].surface,
-            PrivateContextRecordSurface::ChannelTurn
-        );
+        assert_eq!(requests[0].surface, PrivateContextRecordSurface::Channel);
         assert_eq!(requests[0].runtime_id, TEST_CAPTURE_PROMPT_RUNTIME_ID);
     }
 
@@ -19707,9 +19703,9 @@ impl Kernel {
             session,
             &completed_turn,
             if channel_stream_context.is_some() {
-                PrivateContextRecordSurface::ChannelTurn
+                PrivateContextRecordSurface::Channel
             } else {
-                PrivateContextRecordSurface::ProgramTurn
+                PrivateContextRecordSurface::Program
             },
         )
         .await?;
@@ -20008,9 +20004,9 @@ impl Kernel {
             session,
             &completed_turn,
             if channel_stream_context.is_some() {
-                PrivateContextRecordSurface::ChannelTurn
+                PrivateContextRecordSurface::Channel
             } else {
-                PrivateContextRecordSurface::ProgramTurn
+                PrivateContextRecordSurface::Program
             },
         )
         .await?;
@@ -20121,9 +20117,9 @@ impl Kernel {
             session,
             &completed_turn,
             if channel_stream_finalizer.stream_context.is_some() {
-                PrivateContextRecordSurface::ChannelTurn
+                PrivateContextRecordSurface::Channel
             } else {
-                PrivateContextRecordSurface::ProgramTurn
+                PrivateContextRecordSurface::Program
             },
         )
         .await?;
@@ -22553,7 +22549,7 @@ impl Kernel {
         self.post_commit_session_turn(
             session,
             &completed_turn,
-            PrivateContextRecordSurface::ChannelTurn,
+            PrivateContextRecordSurface::Channel,
         )
         .await?;
         if let Some(context) = &stream_context {
@@ -22697,7 +22693,7 @@ impl Kernel {
                     self.post_commit_session_turn(
                         &session,
                         &completed_turn,
-                        PrivateContextRecordSurface::ChannelTurn,
+                        PrivateContextRecordSurface::Channel,
                     )
                     .await?;
                 } else {
