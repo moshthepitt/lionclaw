@@ -8466,7 +8466,7 @@ mod tests {
         outcome: PrivateContextRecordOutcome,
         requests: TestPrivateContextRecordRequests,
         commit_probe: Option<TestPrivateContextRecordCommitProbe>,
-        delivery_probe: Option<TestPrivateContextRecordDeliveryProbe>,
+        channel_probe: Option<TestPrivateContextRecordChannelProbe>,
     }
 
     #[derive(Clone)]
@@ -8476,8 +8476,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestPrivateContextRecordDeliveryProbe {
+    struct TestPrivateContextRecordChannelProbe {
+        channel_state: ChannelStateStore,
         channel_outbox: ChannelOutboxStore,
+        require_delivery: bool,
+        require_terminal_done: bool,
     }
 
     #[async_trait::async_trait]
@@ -8506,16 +8509,44 @@ mod tests {
                 assert_eq!(stored_turn.status, SessionTurnStatus::Completed);
                 assert_eq!(stored_turn.sequence_no, request.sequence_no);
             }
-            if let Some(probe) = &self.delivery_probe {
-                let delivery = probe
-                    .channel_outbox
-                    .get_delivery_by_source("session_turn", &request.turn_id.to_string())
-                    .await
-                    .expect("probe channel delivery");
-                assert!(
-                    delivery.is_some(),
-                    "recorder ran before channel delivery was enqueued"
-                );
+            if let Some(probe) = &self.channel_probe {
+                if probe.require_delivery {
+                    let delivery = probe
+                        .channel_outbox
+                        .get_delivery_by_source("session_turn", &request.turn_id.to_string())
+                        .await
+                        .expect("probe channel delivery");
+                    assert!(
+                        delivery.is_some(),
+                        "recorder ran before channel delivery was enqueued"
+                    );
+                }
+
+                if probe.require_terminal_done {
+                    let channel_turn = probe
+                        .channel_state
+                        .get_turn(request.turn_id)
+                        .await
+                        .expect("probe channel turn")
+                        .expect("probe channel turn exists");
+                    assert_eq!(channel_turn.status, ChannelTurnStatus::Completed);
+                    assert!(
+                        channel_turn.finished_at.is_some(),
+                        "recorder ran before channel turn was terminalized"
+                    );
+                    let stream_events = probe
+                        .channel_state
+                        .list_stream_events_after(&channel_turn.channel_id, 0, 100)
+                        .await
+                        .expect("probe channel stream events");
+                    assert!(
+                        stream_events.iter().any(|event| {
+                            event.turn_id == Some(request.turn_id)
+                                && event.kind == ChannelStreamEventKind::Done
+                        }),
+                        "recorder ran before channel stream done was emitted"
+                    );
+                }
             }
 
             self.requests
@@ -8534,7 +8565,7 @@ mod tests {
                     outcome,
                     requests: Arc::clone(&requests),
                     commit_probe: None,
-                    delivery_probe: None,
+                    channel_probe: None,
                 },
                 requests,
             )
@@ -8549,8 +8580,21 @@ mod tests {
         }
 
         fn with_delivery_probe(mut self, kernel: &Kernel) -> Self {
-            self.delivery_probe = Some(TestPrivateContextRecordDeliveryProbe {
+            self.channel_probe = Some(TestPrivateContextRecordChannelProbe {
+                channel_state: kernel.channel_state.clone(),
                 channel_outbox: kernel.channel_outbox.clone(),
+                require_delivery: true,
+                require_terminal_done: false,
+            });
+            self
+        }
+
+        fn with_terminal_channel_probe(mut self, kernel: &Kernel) -> Self {
+            self.channel_probe = Some(TestPrivateContextRecordChannelProbe {
+                channel_state: kernel.channel_state.clone(),
+                channel_outbox: kernel.channel_outbox.clone(),
+                require_delivery: true,
+                require_terminal_done: true,
             });
             self
         }
@@ -8582,6 +8626,21 @@ mod tests {
         let recorder = recorder
             .with_commit_probe(kernel)
             .with_delivery_probe(kernel);
+        kernel.private_context_recorder = PrivateContextRecorderService::with_recorder(
+            "test_private_context_recorder",
+            Arc::new(recorder),
+        );
+        requests
+    }
+
+    fn install_test_private_context_recorder_with_terminal_channel_probe(
+        kernel: &mut Kernel,
+        outcome: PrivateContextRecordOutcome,
+    ) -> TestPrivateContextRecordRequests {
+        let (recorder, requests) = TestPrivateContextRecorder::new(outcome);
+        let recorder = recorder
+            .with_commit_probe(kernel)
+            .with_terminal_channel_probe(kernel);
         kernel.private_context_recorder = PrivateContextRecorderService::with_recorder(
             "test_private_context_recorder",
             Arc::new(recorder),
@@ -9425,6 +9484,191 @@ mod tests {
             .expect("channel turn");
 
         assert_eq!(response.status, SessionTurnStatus::Completed);
+        let requests = requests.lock().expect("private context recorder requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].turn_id, turn_id);
+        assert_eq!(requests[0].surface, PrivateContextRecordSurface::Channel);
+        assert_eq!(requests[0].runtime_id, TEST_REPLY_RUNTIME_ID);
+    }
+
+    #[tokio::test]
+    async fn queued_channel_action_invokes_private_context_recorder_after_terminal_done() {
+        let temp_dir = tempdir().expect("temp dir");
+        let mut kernel = kernel_with_loopback_channel(&temp_dir).await;
+        kernel
+            .register_runtime_adapter(
+                TEST_REPLY_RUNTIME_ID,
+                Arc::new(ReplyRuntimeAdapter {
+                    message: "continued channel response".to_string(),
+                }),
+            )
+            .await;
+        let requests = install_test_private_context_recorder_with_terminal_channel_probe(
+            &mut kernel,
+            PrivateContextRecordOutcome::completed(1),
+        );
+        let session_key = session_key_for_scope(
+            "loopback",
+            &SessionKeyScope::Direct {
+                sender_ref: "queued-recorder".to_string(),
+            },
+        );
+        let mut grant_tx = kernel
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .expect("begin channel grant transaction");
+        kernel
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut grant_tx,
+                ChannelGrantUpsert {
+                    channel_id: "loopback",
+                    sender_ref: Some("queued-recorder"),
+                    conversation_ref: None,
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Direct,
+                    trust_tier: TrustTier::Main,
+                    status: ChannelGrantStatus::Approved,
+                    label: Some("queued recorder"),
+                },
+            )
+            .await
+            .expect("approve direct channel grant");
+        grant_tx
+            .commit()
+            .await
+            .expect("commit channel grant transaction");
+        let session = kernel
+            .sessions
+            .open(
+                "loopback".to_string(),
+                session_key.clone(),
+                kernel.session_scope().to_string(),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open queued channel session");
+        let session_id = session.session_id;
+        let partial_turn = kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "original channel request".to_string(),
+                prompt_user_text: "original channel request".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: TEST_REPLY_RUNTIME_ID.to_string(),
+            })
+            .await
+            .expect("begin partial test turn");
+        kernel
+            .session_turns
+            .complete_turn(
+                partial_turn.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Interrupted,
+                    assistant_text: "partial channel response".to_string(),
+                    error_code: Some("runtime.interrupted".to_string()),
+                    error_text: Some("partial response interrupted".to_string()),
+                },
+            )
+            .await
+            .expect("complete partial test turn")
+            .expect("updated partial test turn");
+        kernel
+            .sessions
+            .record_turn(session_id)
+            .await
+            .expect("record partial turn");
+
+        let turn_id = Uuid::new_v4();
+        let prepared_turn = kernel
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id,
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "/lionclaw continue".to_string(),
+                prompt_user_text: "/lionclaw continue".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: TEST_REPLY_RUNTIME_ID.to_string(),
+            })
+            .await
+            .expect("begin queued continue turn");
+        let inbound_event_id = "queued-continue-recorder";
+        let provider_metadata = json!({});
+        let mut tx = kernel
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .expect("begin queued channel turn transaction");
+        kernel
+            .channel_state
+            .insert_inbound_event_in_tx(
+                &mut tx,
+                NewChannelInboundEvent {
+                    event_id: inbound_event_id,
+                    channel_id: "loopback",
+                    sender_ref: "queued-recorder",
+                    conversation_ref: "queued-recorder",
+                    thread_ref: None,
+                    message_ref: Some(inbound_event_id),
+                    text: Some("/lionclaw continue"),
+                    trigger: ChannelTrigger::Command,
+                    attachments: &[],
+                    reply_to_ref: None,
+                    provider_metadata: &provider_metadata,
+                    received_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("insert queued channel inbound event");
+        kernel
+            .channel_state
+            .enqueue_turn_in_tx(
+                &mut tx,
+                NewChannelTurn {
+                    turn_id,
+                    channel_id: "loopback",
+                    session_key: &session_key,
+                    session_id,
+                    inbound_event_id,
+                    runtime_id: TEST_REPLY_RUNTIME_ID,
+                    status: ChannelTurnStatus::Pending,
+                },
+            )
+            .await
+            .expect("enqueue queued channel turn");
+        tx.commit()
+            .await
+            .expect("commit queued channel turn transaction");
+        let channel_turn = kernel
+            .channel_state
+            .get_turn(turn_id)
+            .await
+            .expect("load queued channel turn")
+            .expect("queued channel turn exists");
+        let stream_context = kernel
+            .channel_stream_context_for_session(session_id, "loopback", &session_key, turn_id)
+            .await
+            .expect("resolve queued channel stream context");
+
+        kernel
+            .run_queued_session_action(
+                &channel_turn,
+                prepared_turn,
+                SessionActionKind::ContinueLastPartial,
+                stream_context,
+                TurnCancellation::new(),
+            )
+            .await
+            .expect("run queued continue action");
+
         let requests = requests.lock().expect("private context recorder requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].turn_id, turn_id);
@@ -19858,7 +20102,7 @@ impl Kernel {
             }
         }
         channel_delivery_result?;
-        if channel_stream_context.is_some() {
+        if channel_stream_context.is_some() && emit_channel_stream_done {
             self.record_private_context_turn_best_effort(
                 session,
                 &completed_turn,
@@ -20147,7 +20391,7 @@ impl Kernel {
             }
         }
         channel_delivery_result?;
-        if channel_stream_context.is_some() {
+        if channel_stream_context.is_some() && emit_channel_stream_done {
             self.record_private_context_turn_best_effort(
                 session,
                 &completed_turn,
@@ -20285,7 +20529,7 @@ impl Kernel {
             Err(err) => Err(err),
         };
         stream_result?;
-        if surface == PrivateContextRecordSurface::Channel {
+        if surface == PrivateContextRecordSurface::Channel && channel_stream_finalizer.emit_done {
             self.record_private_context_turn_best_effort(session, &completed_turn, surface)
                 .await;
         }
@@ -22669,8 +22913,7 @@ impl Kernel {
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
         let turn_id = prepared_turn.turn_id;
-        let completed_turn = self
-            .session_turns
+        self.session_turns
             .complete_turn(
                 turn_id,
                 SessionTurnCompletion {
@@ -22690,12 +22933,6 @@ impl Kernel {
             .finish_queued_lionclaw_control_turn(turn, turn_id, &message, stream_context.clone())
             .await;
         completion_result?;
-        self.record_private_context_turn_best_effort(
-            session,
-            &completed_turn,
-            PrivateContextRecordSurface::Channel,
-        )
-        .await;
         Ok(())
     }
 
@@ -22815,7 +23052,7 @@ impl Kernel {
             .await
             .map_err(internal)?
         {
-            if matches!(
+            let completed_session_turn = if matches!(
                 persisted_turn.status,
                 SessionTurnStatus::Running | SessionTurnStatus::WaitingForAttachments
             ) && status != ChannelTurnStatus::Completed
@@ -22837,15 +23074,32 @@ impl Kernel {
                     .ok_or_else(|| {
                         KernelError::Internal("terminalized session turn was not found".to_string())
                     })?;
+                Some((completed_turn, true))
+            } else if matches!(
+                persisted_turn.status,
+                SessionTurnStatus::Completed
+                    | SessionTurnStatus::Failed
+                    | SessionTurnStatus::TimedOut
+                    | SessionTurnStatus::Cancelled
+                    | SessionTurnStatus::Interrupted
+            ) {
+                Some((persisted_turn, false))
+            } else {
+                None
+            };
+
+            if let Some((completed_turn, completed_by_terminalizer)) = completed_session_turn {
                 if let Some(session) = self
                     .sessions
                     .get_scoped(turn.session_id, self.session_scope())
                     .await
                     .map_err(internal)?
                 {
-                    self.touch_committed_session_turn(&session).await?;
+                    if completed_by_terminalizer {
+                        self.touch_committed_session_turn(&session).await?;
+                    }
                     private_context_record = Some((session, completed_turn));
-                } else {
+                } else if completed_by_terminalizer {
                     self.sessions
                         .record_turn(turn.session_id)
                         .await
