@@ -172,7 +172,12 @@ impl PrivateContextRecorder for SkillPrivateContextRecorder {
         )
         .await;
         match wait_result {
-            Ok(outcome) => outcome_from_wait(outcome, started_at),
+            Ok(Ok(output)) => outcome_from_output(output, started_at),
+            Ok(Err(_)) => {
+                process.terminate();
+                process.finish_after_termination().await;
+                failed_outcome("io_error", started_at)
+            }
             Err(_) => {
                 process.terminate();
                 process.finish_after_termination().await;
@@ -393,14 +398,11 @@ async fn take_output(reader: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8
     }
 }
 
-fn outcome_from_wait(
-    wait: RecorderProcessWait,
+fn outcome_from_output(
+    output: RecorderProcessOutput,
     started_at: Instant,
 ) -> PrivateContextRecordOutcome {
     let elapsed_ms = elapsed_ms(started_at);
-    let Ok(output) = wait else {
-        return PrivateContextRecordOutcome::failed("io_error", None, elapsed_ms);
-    };
     if output.exit_status != Some(0) {
         return PrivateContextRecordOutcome::failed("nonzero_exit", output.exit_status, elapsed_ms);
     }
@@ -819,5 +821,30 @@ sleep 10
         .expect("recorder call should honor its own timeout");
 
         assert_eq!(outcome.status, PrivateContextRecordStatus::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_write_error_terminates_process_group() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_recorder_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+exec 0<&-
+(sleep 10; printf leaked > "$LIONCLAW_SKILL_STATE_DIR/leaked") &
+sleep 10
+"#,
+        )
+        .with_timeout(Duration::from_secs(1));
+        let state_dir = config.state_dir.clone();
+        let recorder = SkillPrivateContextRecorder::new(config);
+
+        let outcome = recorder.record(large_escaped_request()).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(outcome.status, PrivateContextRecordStatus::Failed);
+        assert_eq!(outcome.reason, Some("io_error"));
+        assert!(!state_dir.join("leaked").exists());
     }
 }
