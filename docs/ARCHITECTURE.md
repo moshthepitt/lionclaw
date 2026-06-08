@@ -94,7 +94,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: kernel-owned runtime registration, launch prerequisite checks, auth staging glue, and execution integration.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.prompt_context`: session-aware prompt context policy, section capping, and audit metadata for runtime-visible context.
-- `kernel.private_context_projection`: classed private context projection boundary from kernel-owned records into prompt-context policy.
+- `kernel.private_context_projection`: classed private context projection boundary from skill-owned records into prompt-context policy.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
 - `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.

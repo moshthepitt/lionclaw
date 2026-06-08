@@ -9126,6 +9126,56 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn configured_private_context_projector_missing_json_provenance_omits_only_that_class() {
+        let assistant_text = "CONFIGURED_ASSISTANT_PROFILE_VALID_SHOULD_APPEAR";
+        let user_text = "CONFIGURED_USER_PROFILE_MISSING_PROVENANCE_SHOULD_NOT_APPEAR";
+        let memory_text = "CONFIGURED_MEMORY_VALID_SHOULD_APPEAR";
+        let (fixture, _state_dir) = prompt_context_fixture_with_configured_private_context_projector(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+while IFS= read -r line; do
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  printf '{"request_id":"%s","projector_id":"%s","items":[{"class":"assistant_profile","text":"CONFIGURED_ASSISTANT_PROFILE_VALID_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1}]},{"class":"user_profile","text":"CONFIGURED_USER_PROFILE_MISSING_PROVENANCE_SHOULD_NOT_APPEAR"},{"class":"memory","text":"CONFIGURED_MEMORY_VALID_SHOULD_APPEAR","provenance":[{"source":"session_turn","sequence_no":1}]}]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+done
+"#,
+        )
+        .await;
+        let session = open_prompt_context_session(
+            &fixture.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        record_completed_test_turn(&fixture.kernel, session.session_id, "mock", 1).await;
+
+        let build =
+            build_test_prompt_context(&fixture, &session, PromptContextMode::ProgramPrimary, "hi")
+                .await;
+        let rendered = rendered_prompt(&build);
+        let audit_json = prompt_context_audit_json(&build);
+
+        assert!(rendered.contains("## Assistant Profile"), "{rendered}");
+        assert!(rendered.contains(assistant_text), "{rendered}");
+        assert!(rendered.contains("## Memory"), "{rendered}");
+        assert!(rendered.contains(memory_text), "{rendered}");
+        assert!(!rendered.contains("## User Profile"), "{rendered}");
+        assert!(!rendered.contains(user_text), "{rendered}");
+        assert!(
+            build.audit.excluded.iter().any(|item| {
+                item.id == ContextItemId::UserProfile && item.reason == "missing_provenance"
+            }),
+            "{:#?}",
+            build.audit.excluded
+        );
+        assert!(audit_json.contains("\"class\":\"user_profile\""));
+        assert!(audit_json.contains("\"reason\":\"missing_provenance\""));
+        assert!(!audit_json.contains(user_text));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn configured_private_context_projector_untrusted_prompt_does_not_start_process() {
         let (fixture, state_dir) = prompt_context_fixture_with_configured_private_context_projector(
             r#"#!/usr/bin/env bash

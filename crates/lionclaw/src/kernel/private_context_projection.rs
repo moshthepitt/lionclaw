@@ -91,6 +91,7 @@ pub(crate) struct PrivateContextProjection {
 pub(crate) struct ProjectedContextItem {
     pub class: ProjectedContextClass,
     pub text: String,
+    #[serde(default)]
     pub provenance: Vec<ProjectedContextProvenance>,
 }
 
@@ -980,6 +981,16 @@ mod tests {
             decoded.items[0].provenance[0].source,
             ProjectedContextProvenanceSource::SessionTurn
         );
+    }
+
+    #[test]
+    fn response_deserializes_missing_provenance_as_empty() {
+        let decoded: PrivateContextProjection = serde_json::from_str(
+            r#"{"request_id":"11111111-1111-1111-1111-111111111111","projector_id":"private-context-core","items":[{"class":"memory","text":"User prefers concise summaries."}]}"#,
+        )
+        .expect("decode response");
+
+        assert!(decoded.items[0].provenance.is_empty());
     }
 
     fn projection_with_items(

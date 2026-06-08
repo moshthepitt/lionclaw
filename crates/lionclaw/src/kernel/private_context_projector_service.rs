@@ -875,11 +875,55 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn malformed_response_retires_still_running_process() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = write_projector_script(
+            temp_dir.path(),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$LIONCLAW_SKILL_STATE_DIR"
+starts="$LIONCLAW_SKILL_STATE_DIR/starts"
+start_count=0
+if [ -f "$starts" ]; then start_count=$(wc -l < "$starts"); fi
+printf 'start\n' >> "$starts"
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  request_id=${line#*\"request_id\":\"}
+  request_id=${request_id%%\"*}
+  if [ "$start_count" = "0" ] && [ "$count" = "1" ]; then
+    printf 'not-json\n'
+  else
+    printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
+  fi
+done
+"#,
+        );
+        let projector = SkillPrivateContextProjector::new(config.clone());
+
+        let err = projector
+            .project(request())
+            .await
+            .expect_err("malformed response should fail");
+        assert!(err.to_string().contains("decode response"));
+
+        let second = projector
+            .project(request())
+            .await
+            .expect("second response should restart");
+        assert!(second.items.is_empty());
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("starts")).expect("starts"),
+            "start\nstart\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn fatal_decode_errors_retire_process_and_later_restart() {
         for first_response in [
             r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core"}"#,
             r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"class":"unknown","text":"remembered","provenance":[{"source":"session_turn","sequence_no":7,"event_id":null}]}]}"#,
-            r#"{"request_id":"__REQUEST_ID__","projector_id":"private-context-core","items":[{"class":"memory","text":"remembered"}]}"#,
         ] {
             let temp_dir = tempfile::tempdir().expect("temp dir");
             let config = write_projector_script(
