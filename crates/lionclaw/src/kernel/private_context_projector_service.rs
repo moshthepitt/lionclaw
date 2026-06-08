@@ -30,6 +30,7 @@ use super::private_context_projection::{
 pub(crate) const PRIVATE_CONTEXT_PROJECTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROJECTOR_STDERR_BYTES: usize = 4096;
 const MAX_PROJECTOR_RESPONSE_LINE_BYTES: usize = 64 * 1024;
+const PROJECTOR_STRAY_STDOUT_GRACE: Duration = Duration::from_millis(10);
 
 pub(crate) fn private_context_projector_for_applied_state(
     applied_state: &AppliedState,
@@ -308,23 +309,45 @@ impl ResidentPrivateContextProjectorProcess {
         let response = self.stdout.recv().await.ok_or_else(|| {
             PrivateContextProjectionError::failed("private context projector stdout reader stopped")
         })??;
-        tokio::task::yield_now().await;
-        let status = self.inspect_stdout()?;
+        let status = self.inspect_stdout_after_response().await?;
         Ok(ProjectorRead { response, status })
+    }
+
+    async fn inspect_stdout_after_response(
+        &mut self,
+    ) -> Result<ResidentProcessStatus, PrivateContextProjectionError> {
+        match self.inspect_stdout()? {
+            ResidentProcessStatus::Ready => {}
+            ResidentProcessStatus::Stale => return Ok(ResidentProcessStatus::Stale),
+        }
+
+        match tokio::time::timeout(PROJECTOR_STRAY_STDOUT_GRACE, self.stdout.recv()).await {
+            Ok(Some(line)) => Self::status_from_stdout_item(line),
+            Ok(None) => Ok(ResidentProcessStatus::Stale),
+            Err(_) => Ok(ResidentProcessStatus::Ready),
+        }
     }
 
     fn inspect_stdout(&mut self) -> Result<ResidentProcessStatus, PrivateContextProjectionError> {
         match self.stdout.try_recv() {
-            Ok(Ok(_line)) => Err(PrivateContextProjectionError::invalid_output(
+            Ok(line) => Self::status_from_stdout_item(line),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(ResidentProcessStatus::Ready),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(ResidentProcessStatus::Stale),
+        }
+    }
+
+    fn status_from_stdout_item(
+        line: Result<String, PrivateContextProjectionError>,
+    ) -> Result<ResidentProcessStatus, PrivateContextProjectionError> {
+        match line {
+            Ok(_line) => Err(PrivateContextProjectionError::invalid_output(
                 "unexpected_stdout",
                 "private context projector wrote stdout outside the request/response contract",
             )),
-            Ok(Err(err)) if err.kind() == PrivateContextProjectionErrorKind::ProjectorFailed => {
+            Err(err) if err.kind() == PrivateContextProjectionErrorKind::ProjectorFailed => {
                 Ok(ResidentProcessStatus::Stale)
             }
-            Ok(Err(err)) => Err(err),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(ResidentProcessStatus::Ready),
-            Err(mpsc::error::TryRecvError::Disconnected) => Ok(ResidentProcessStatus::Stale),
+            Err(err) => Err(err),
         }
     }
 
