@@ -74,6 +74,10 @@ impl LionClawHome {
         self.channel_env_dir().join(format!("{channel_id}.env"))
     }
 
+    pub fn skill_state_dir(&self, alias: &str) -> PathBuf {
+        self.config_dir().join("skill-state").join(alias)
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
     }
@@ -101,20 +105,6 @@ impl LionClawHome {
         project_root: &Path,
     ) -> PathBuf {
         runtime_project_dir_from_parts(
-            &self.runtime_dir(),
-            runtime_id,
-            workspace,
-            Some(project_root),
-        )
-    }
-
-    pub fn runtime_project_generated_agents_path(
-        &self,
-        runtime_id: &str,
-        workspace: &str,
-        project_root: &Path,
-    ) -> PathBuf {
-        runtime_project_generated_agents_path_from_parts(
             &self.runtime_dir(),
             runtime_id,
             workspace,
@@ -277,16 +267,6 @@ pub fn runtime_project_dir_from_parts(
         .join(runtime_project_partition_key(project_root))
 }
 
-pub fn runtime_project_generated_agents_path_from_parts(
-    runtime_root: &Path,
-    runtime_id: &str,
-    workspace: &str,
-    project_root: Option<&Path>,
-) -> PathBuf {
-    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
-        .join("AGENTS.generated.md")
-}
-
 pub fn runtime_project_drafts_dir_from_parts(
     runtime_root: &Path,
     runtime_id: &str,
@@ -436,6 +416,10 @@ mod tests {
         assert_eq!(
             home.runtime_secrets_env_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-secrets.env")
+        );
+        assert_eq!(
+            home.skill_state_dir("memory-core"),
+            std::path::PathBuf::from("/tmp/lionclaw-home/config/skill-state/memory-core")
         );
         assert_eq!(
             home.home_id_path(),

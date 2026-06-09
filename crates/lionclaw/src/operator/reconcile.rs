@@ -33,11 +33,15 @@ use crate::{
             unit_status_is_active, ChannelUnitSpec, DaemonProjectInstanceSpec, DaemonUnitSpec,
             ManagedUnit, UnitIdentity, UnitManager,
         },
-        private_paths::{create_private_dir_all, write_private_file},
+        private_paths::create_private_dir_all,
         redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
             validate_runtime_launch_prerequisites_for_work_root,
+        },
+        skill_metadata::{
+            load_private_context_skill_metadata, resolve_skill_entrypoint,
+            PrivateContextEntrypointMetadata, SkillEntrypointSymlinkPolicy,
         },
         snapshot::{install_snapshot_with_overlays, resolve_local_source},
         target::{
@@ -47,7 +51,7 @@ use crate::{
     },
     project_inventory::ProjectInstanceRuntimeContext,
     runtime_timeouts::RuntimeTurnTimeouts,
-    workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
+    workspace::bootstrap_workspace,
 };
 
 #[cfg(test)]
@@ -82,16 +86,32 @@ pub async fn add_skill(
     let source = normalize_local_source(&source)?;
     let source_path = resolve_local_source(&source)?;
     let config = OperatorConfig::load(home).await?;
+    validate_configured_skill_replacement(&alias, &source_path, &config)?;
+    home.ensure_base_dirs().await?;
+    let overlays = snapshot_overlays_for_source(&source_path)?;
+    install_snapshot_with_overlays(home, &alias, &source, &reference, &overlays)?;
+    Ok(())
+}
+
+fn validate_configured_skill_replacement(
+    alias: &str,
+    source_path: &Path,
+    config: &OperatorConfig,
+) -> Result<()> {
     if config.channels.iter().any(|channel| channel.skill == alias) {
-        resolve_worker_entrypoint(&source_path).with_context(|| {
+        resolve_worker_entrypoint(source_path).with_context(|| {
             format!(
                 "skill alias '{alias}' backs a configured channel and must keep a valid 'scripts/worker'"
             )
         })?;
     }
-    home.ensure_base_dirs().await?;
-    let overlays = snapshot_overlays_for_source(&source_path)?;
-    install_snapshot_with_overlays(home, &alias, &source, &reference, &overlays)?;
+    if is_configured_private_context_projector_skill(config, alias) {
+        validate_configured_private_context_skill_replacement(source_path).with_context(|| {
+            format!(
+                "skill alias '{alias}' backs the configured private context projector and must keep valid private context metadata"
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -108,6 +128,11 @@ pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
             alias,
             channel.id,
             channel.id
+        ));
+    }
+    if is_configured_private_context_projector_skill(&config, alias) {
+        return Err(anyhow!(
+            "skill alias '{alias}' is in use as the configured private context projector; clear [private_context].projector_skill first"
         ));
     }
 
@@ -144,6 +169,47 @@ pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
             Err(err).with_context(|| format!("failed to remove {}", snapshot_root.display()))
         }
     }
+}
+
+fn is_configured_private_context_projector_skill(config: &OperatorConfig, alias: &str) -> bool {
+    config.private_context.projector_skill.as_deref() == Some(alias)
+}
+
+fn validate_configured_private_context_skill_replacement(skill_dir: &Path) -> Result<()> {
+    let metadata = load_private_context_skill_metadata(skill_dir)?;
+    let projector = metadata.projector.ok_or_else(|| {
+        anyhow!(
+            "configured private context projector skill '{}' does not declare [private_context_projector] metadata",
+            skill_dir.display()
+        )
+    })?;
+    validate_private_context_skill_entrypoint(
+        skill_dir,
+        &projector,
+        "private context projector command",
+    )?;
+    if let Some(recorder) = metadata.recorder {
+        validate_private_context_skill_entrypoint(
+            skill_dir,
+            &recorder,
+            "private context recorder command",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_private_context_skill_entrypoint(
+    skill_dir: &Path,
+    metadata: &PrivateContextEntrypointMetadata,
+    label: &str,
+) -> Result<()> {
+    resolve_skill_entrypoint(
+        skill_dir,
+        &metadata.command,
+        label,
+        SkillEntrypointSymlinkPolicy::RejectParentSymlinks,
+    )?;
+    Ok(())
 }
 
 pub async fn add_channel(
@@ -430,7 +496,7 @@ pub async fn up_for_work_root<M: UnitManager>(
                 project_root: context.project_root.as_path(),
                 instance_name: context.instance_name.as_str(),
             });
-    render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
+    ensure_runtime_project_dirs_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
         &state.config,
@@ -781,17 +847,18 @@ pub(crate) fn resolve_channel_env(
 }
 
 #[cfg(test)]
-pub(crate) async fn render_runtime_cache(
+pub(crate) async fn ensure_runtime_project_dirs(
     home: &LionClawHome,
     config: &OperatorConfig,
     runtime_id: &str,
 ) -> Result<()> {
     let project_workspace_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    render_runtime_cache_for_work_root(home, config, runtime_id, &project_workspace_root).await
+    ensure_runtime_project_dirs_for_work_root(home, config, runtime_id, &project_workspace_root)
+        .await
 }
 
-pub(crate) async fn render_runtime_cache_for_work_root(
+pub(crate) async fn ensure_runtime_project_dirs_for_work_root(
     home: &LionClawHome,
     config: &OperatorConfig,
     runtime_id: &str,
@@ -800,42 +867,15 @@ pub(crate) async fn render_runtime_cache_for_work_root(
     let workspace = &config.daemon.workspace;
     let target_dir = home.runtime_project_dir(runtime_id, workspace, project_workspace_root);
     for path in [
-        target_dir.clone(),
+        target_dir,
         home.runtime_project_drafts_dir(runtime_id, workspace, project_workspace_root),
     ] {
-        create_private_dir_all(home, &path, "runtime cache directory")?;
+        create_private_dir_all(home, &path, "runtime project directory")?;
     }
-    let target_path = target_dir.join(GENERATED_AGENTS_FILE);
-
-    let mut sections = Vec::new();
-    for (name, content) in read_workspace_sections(&config.workspace_root(home)).await? {
-        sections.push(format!("## {}\n\n{}", name, content.trim()));
-    }
-
-    sections.push(
-        "## Draft Outputs\n\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.".to_string(),
-    );
-
-    sections.push(
-        "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
-    );
-
-    let rendered = render_marker_file(
-        &format!(
-            "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n"
-        ),
-        &sections.join("\n\n"),
-    );
-
-    write_private_file(
-        home,
-        &target_path,
-        rendered.as_bytes(),
-        "generated runtime context file",
-    )?;
     Ok(())
 }
 
+#[cfg(test)]
 fn render_marker_file(header: &str, body: &str) -> String {
     let start = "<!-- LIONCLAW:START -->";
     let end = "<!-- LIONCLAW:END -->";
@@ -1092,11 +1132,11 @@ mod tests {
 
     use super::{
         add_channel, add_channel_with_contact, add_channel_with_worker, add_skill, down,
-        ensure_managed_bind_configured, logs, open_kernel, open_kernel_with_project_root,
-        pairing_approve_sender, pairing_list, render_marker_file, render_runtime_cache,
-        render_runtime_cache_for_work_root, resolve_channel_env,
-        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, up_for_work_root,
-        ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
+        ensure_managed_bind_configured, ensure_runtime_project_dirs,
+        ensure_runtime_project_dirs_for_work_root, logs, open_kernel,
+        open_kernel_with_project_root, pairing_approve_sender, pairing_list, render_marker_file,
+        resolve_channel_env, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
+        up_for_work_root, ChannelContactSetup, ChannelWorkerSetup, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1116,7 +1156,6 @@ mod tests {
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
         },
-        workspace::GENERATED_AGENTS_FILE,
     };
     use axum::{routing::get, Json, Router};
 
@@ -1275,6 +1314,43 @@ mod tests {
         .expect("channel metadata");
     }
 
+    fn write_private_context_projector_metadata(skill_source: &Path, command: &str) {
+        write_private_context_metadata(skill_source, command, None);
+    }
+
+    fn write_private_context_metadata(
+        skill_source: &Path,
+        projector_command: &str,
+        recorder_command: Option<&str>,
+    ) {
+        let recorder = recorder_command
+            .map(|command| format!("\n[private_context_recorder]\ncommand = \"{command}\"\n"))
+            .unwrap_or_default();
+        fs::write(
+            skill_source.join("lionclaw.toml"),
+            format!(
+                "version = 1\n\n[private_context_projector]\ncommand = \"{projector_command}\"\n{recorder}"
+            ),
+        )
+        .expect("private context projector metadata");
+    }
+
+    fn write_private_context_projector_source(root: &Path, name: &str) -> PathBuf {
+        let skill_source = write_skill_source(root, name, "private context projector", false);
+        let projector = skill_source.join("scripts/projector");
+        fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
+        fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&projector);
+        write_private_context_projector_metadata(&skill_source, "scripts/projector");
+        skill_source
+    }
+
+    async fn configure_private_context_projector(home: &LionClawHome, alias: &str) {
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        config.private_context.projector_skill = Some(alias.to_string());
+        config.save(home).await.expect("save config");
+    }
+
     fn make_executable(path: &Path) {
         #[cfg(unix)]
         {
@@ -1340,7 +1416,11 @@ mod tests {
 
         assert_eq!(state.config.daemon.workspace, "main");
         assert!(home.home_id_path().exists());
-        assert!(home.workspace_dir("main").join("SOUL.md").exists());
+        let workspace = home.workspace_dir("main");
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(!workspace.join("IDENTITY.md").exists());
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("USER.md").exists());
     }
 
     #[tokio::test]
@@ -1357,31 +1437,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_runtime_cache_includes_runtime_secret_guidance() {
+    async fn ensure_runtime_project_dirs_creates_runtime_and_drafts_dirs() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
         let config = load_test_config(&home).await;
 
-        render_runtime_cache(&home, &config, "codex")
+        ensure_runtime_project_dirs(&home, &config, "codex")
             .await
-            .expect("render runtime cache");
+            .expect("ensure runtime project dirs");
         let project_workspace_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
 
-        let rendered = tokio::fs::read_to_string(
-            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
-                .join(GENERATED_AGENTS_FILE),
-        )
-        .await
-        .expect("read generated agents");
-        assert!(rendered.contains("/run/secrets"));
-        assert!(rendered.contains("lionclaw-runtime-secrets-"));
-        assert!(rendered.contains("do not print its contents"));
+        assert!(home
+            .runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
+            .is_dir());
+        assert!(home
+            .runtime_project_drafts_dir("codex", &config.daemon.workspace, &project_workspace_root)
+            .is_dir());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn render_runtime_cache_rejects_symlinked_project_cache_dir() {
+    async fn ensure_runtime_project_dirs_rejects_symlinked_project_runtime_dir() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1391,49 +1468,27 @@ mod tests {
         fs::create_dir(&project_workspace_root).expect("work root");
         let target_dir =
             home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
-        let outside = temp_dir.path().join("outside-cache");
+        let outside = temp_dir.path().join("outside-runtime-project");
         fs::create_dir_all(target_dir.parent().expect("target parent")).expect("target parent");
         fs::create_dir(&outside).expect("outside cache");
-        symlink(&outside, &target_dir).expect("runtime cache dir symlink");
+        symlink(&outside, &target_dir).expect("runtime project dir symlink");
 
-        let err =
-            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
-                .await
-                .expect_err("symlinked runtime cache dir should fail");
+        let err = ensure_runtime_project_dirs_for_work_root(
+            &home,
+            &config,
+            "codex",
+            &project_workspace_root,
+        )
+        .await
+        .expect_err("symlinked runtime project dir should fail");
 
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(
-            !outside.join(GENERATED_AGENTS_FILE).exists(),
-            "runtime cache rendering must not write through a symlinked project cache dir"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn render_runtime_cache_rejects_symlinked_generated_context_file() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-        let config = load_test_config(&home).await;
-        let project_workspace_root = temp_dir.path().join("work");
-        fs::create_dir(&project_workspace_root).expect("work root");
-        let target_dir =
-            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root);
-        let outside = temp_dir.path().join("outside-generated.md");
-        fs::create_dir_all(&target_dir).expect("target dir");
-        fs::write(&outside, "outside\n").expect("outside generated");
-        symlink(&outside, target_dir.join(GENERATED_AGENTS_FILE)).expect("generated symlink");
-
-        let err =
-            render_runtime_cache_for_work_root(&home, &config, "codex", &project_workspace_root)
-                .await
-                .expect_err("symlinked generated context should fail");
-
-        assert!(err.to_string().contains("must not be a symlink"));
-        assert_eq!(
-            fs::read_to_string(&outside).expect("outside contents"),
-            "outside\n"
+            fs::read_dir(&outside)
+                .expect("outside cache dir")
+                .next()
+                .is_none(),
+            "runtime project dir preparation must not write through a symlinked project runtime dir"
         );
     }
 
@@ -1649,6 +1704,33 @@ mod tests {
             .await
             .expect_err("channel-bound alias should fail");
         assert!(err.to_string().contains("remove the channel first"));
+    }
+
+    #[tokio::test]
+    async fn remove_skill_rejects_configured_private_context_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let skill_source =
+            write_private_context_projector_source(temp_dir.path(), "private-context-core");
+
+        add_skill(
+            &home,
+            "private-context-core".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let err = super::remove_skill(&home, "private-context-core")
+            .await
+            .expect_err("configured private context projector alias should fail");
+
+        assert!(err
+            .to_string()
+            .contains("configured private context projector"));
+        assert!(home.skills_dir().join("private-context-core").is_dir());
     }
 
     #[tokio::test]
@@ -2020,6 +2102,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_skill_preserves_metadata_requirements_for_private_context_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
+
+        add_skill(
+            &home,
+            "private-context-core".to_string(),
+            good_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let err = add_skill(
+            &home,
+            "private-context-core".to_string(),
+            bad_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect_err("metadata-free replacement should fail");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("must keep valid private context metadata"));
+        assert!(err.contains("[private_context_projector]"));
+        let state = load_operator_state(&home)
+            .await
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_skill().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_skill_preserves_command_requirements_for_private_context_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
+        let projector = bad_skill.join("scripts/projector");
+        fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
+        fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
+        write_private_context_projector_metadata(&bad_skill, "scripts/projector");
+
+        add_skill(
+            &home,
+            "private-context-core".to_string(),
+            good_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let err = add_skill(
+            &home,
+            "private-context-core".to_string(),
+            bad_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect_err("non-executable replacement should fail");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("private context projector command"));
+        assert!(err.contains("not executable"));
+        let state = load_operator_state(&home)
+            .await
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_skill().is_some());
+    }
+
+    #[tokio::test]
+    async fn add_skill_preserves_recorder_requirements_for_private_context_projector_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let good_skill = write_private_context_projector_source(
+            temp_dir.path(),
+            "private-context-core-original",
+        );
+        let bad_skill = write_skill_source(
+            temp_dir.path(),
+            "private-context-core-broken",
+            "private context",
+            false,
+        );
+        let projector = bad_skill.join("scripts/projector");
+        fs::create_dir_all(projector.parent().expect("projector parent")).expect("scripts dir");
+        fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&projector);
+        write_private_context_metadata(
+            &bad_skill,
+            "scripts/projector",
+            Some("scripts/missing-recorder"),
+        );
+
+        add_skill(
+            &home,
+            "private-context-core".to_string(),
+            good_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install private context projector skill");
+        configure_private_context_projector(&home, "private-context-core").await;
+
+        let err = add_skill(
+            &home,
+            "private-context-core".to_string(),
+            bad_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect_err("invalid recorder replacement should fail");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("private context recorder command"));
+        assert!(err.contains("entrypoint is missing"));
+        let state = load_operator_state(&home)
+            .await
+            .expect("existing private context projector should remain loadable");
+        assert!(state.applied_state.private_context_skill().is_some());
+    }
+
+    #[tokio::test]
     async fn add_skill_can_repair_missing_channel_bound_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = test_project_home(temp_dir.path());
@@ -2184,10 +2409,10 @@ mod tests {
             resolve_project_workspace_root().expect("resolve project workspace root");
 
         assert_eq!(state.applied_state.channels().len(), 1);
-        assert!(home
-            .runtime_project_dir("codex", "main", &project_workspace_root)
-            .join("AGENTS.generated.md")
-            .exists());
+        let runtime_project_dir =
+            home.runtime_project_dir("codex", "main", &project_workspace_root);
+        assert!(runtime_project_dir.exists());
+        assert!(!runtime_project_dir.join("AGENTS.generated.md").exists());
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());

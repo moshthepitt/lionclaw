@@ -20,7 +20,7 @@ use crate::{
     },
     operator::{
         config::OperatorConfig,
-        reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
+        reconcile::{ensure_runtime_project_dirs_for_work_root, open_runtime_kernel_for_work_root},
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites_for_work_root},
     },
     project_inventory::ProjectInstanceRuntimeContext,
@@ -32,7 +32,12 @@ pub(crate) async fn run_local(invocation: RunLocalInvocation<'_>) -> Result<()> 
     let stdout = std::io::stdout();
     let mut input = BufReader::new(stdin);
     let mut output = stdout;
-    run_local_with_io_and_timeouts(invocation, &mut input, &mut output).await
+    Box::pin(run_local_with_io_and_timeouts(
+        invocation,
+        &mut input,
+        &mut output,
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -102,7 +107,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         Some(work_root),
     )
     .await?;
-    render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
+    ensure_runtime_project_dirs_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = open_runtime_kernel_for_work_root(
@@ -701,7 +706,11 @@ mod tests {
         assert!(output.contains("you> "));
         assert!(output.contains("lionclaw> hello from repl"));
         assert!(output.contains("hello from repl"));
-        assert!(home.workspace_dir("main").join("SOUL.md").exists());
+        let workspace = home.workspace_dir("main");
+        assert!(workspace.join("AGENTS.md").exists());
+        assert!(!workspace.join("IDENTITY.md").exists());
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("USER.md").exists());
 
         let pool = Db::connect_file(&home.db_path())
             .await

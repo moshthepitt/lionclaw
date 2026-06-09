@@ -3,6 +3,7 @@ members = [
     "crates/lionclaw",
     "crates/lionclaw-channel-email",
     "crates/lionclaw-channel-team-local",
+    "crates/lionclaw-private-context",
     "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
     "crates/lionclaw-runtime-codex",

@@ -915,18 +915,9 @@ impl ContinuityLayout {
 }
 
 impl ContinuityLayout {
-    pub async fn read_prompt_sections(&self) -> Result<Vec<(String, String)>> {
+    pub async fn read_active_prompt_section(&self) -> Result<Option<String>> {
         let fs = self.fs().await?;
-        let mut sections = Vec::new();
-        for (label, path) in [
-            ("MEMORY.md".to_string(), self.memory_rel_path()),
-            ("continuity/ACTIVE.md".to_string(), self.active_rel_path()),
-        ] {
-            if let Some(content) = fs.read_to_string_if_exists(&path)? {
-                sections.push((label, content));
-            }
-        }
-        Ok(sections)
+        fs.read_to_string_if_exists(&self.active_rel_path())
     }
 
     async fn sort_relative_paths_by_modified_desc(
@@ -1282,11 +1273,14 @@ mod tests {
         assert!(layout.continuity_dir().join("artifacts").exists());
         assert!(layout.continuity_dir().join("proposals/memory").exists());
 
-        let prompt_sections = layout
-            .read_prompt_sections()
+        let memory = std::fs::read_to_string(layout.memory_path()).expect("read memory");
+        assert!(memory.contains("# Memory"));
+        let active = layout
+            .read_active_prompt_section()
             .await
-            .expect("prompt sections");
-        assert_eq!(prompt_sections.len(), 2);
+            .expect("read active")
+            .expect("active section");
+        assert!(active.contains("# Active Context"));
     }
 
     #[tokio::test]
@@ -2241,7 +2235,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_prompt_sections_surfaces_non_missing_read_failures() {
+    async fn targeted_active_prompt_read_surfaces_non_missing_read_failures() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempdir().expect("temp dir");
@@ -2254,7 +2248,7 @@ mod tests {
         symlink(&outside, layout.active_path()).expect("symlink active");
 
         let err = layout
-            .read_prompt_sections()
+            .read_active_prompt_section()
             .await
             .expect_err("symlinked active should fail");
         let message = err.to_string();

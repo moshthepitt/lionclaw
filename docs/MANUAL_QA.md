@@ -149,15 +149,15 @@ Expected:
 Check the selected runtime's native terminal UI:
 
 ```bash
-printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_MEMORY_OK\n' >> \
-  .lionclaw/instances/main/workspaces/main/MEMORY.md
+printf '\n- Native runtime TUI sentinel: LIONCLAW_NATIVE_TUI_CONTEXT_OK\n' >> \
+  .lionclaw/instances/main/workspaces/main/AGENTS.md
 "$LIONCLAW_BIN" run --runtime-tui
 ```
 
 Prompt inside the native runtime UI:
 
 ```text
-Reply with exactly the LionClaw native runtime TUI memory sentinel from your instructions.
+Reply with exactly the LionClaw native runtime TUI sentinel from your instructions.
 ```
 
 Expected:
@@ -169,7 +169,7 @@ Expected:
 - OpenCode native UI loads the generated LionClaw context through the
   generated config that points at `/runtime/AGENTS.md`, without showing an
   auto-update prompt
-- the answer is `LIONCLAW_NATIVE_TUI_MEMORY_OK`
+- the answer is `LIONCLAW_NATIVE_TUI_CONTEXT_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
 - completed Codex and OpenCode native UI turns are present in LionClaw session
@@ -267,7 +267,77 @@ Expected:
 - the answer is `project-b`
 - project B does not reuse project A work-root state
 
-## Phase 5: Channel Skill Acceptance
+## Phase 5: Private Context Skill Acceptance
+
+Exercise the bundled first-party private-context skill through the regular
+installer and LionClaw-managed skill state:
+
+```bash
+cd "$PROJ_A"
+export LIONCLAW_REPO_ROOT=$(cd "$(dirname "$LIONCLAW_BIN")/../.." && pwd)
+cargo build --manifest-path "$LIONCLAW_REPO_ROOT/Cargo.toml" --workspace --bins
+"$LIONCLAW_BIN" skill install \
+  "$LIONCLAW_REPO_ROOT/skills/lionclaw-private-context" \
+  --alias lionclaw-private-context
+"$LIONCLAW_BIN" configure --private-context-projector lionclaw-private-context
+export QA_PRIVATE_CONTEXT_SKILL=.lionclaw/instances/main/skills/lionclaw-private-context
+export QA_PRIVATE_CONTEXT_STATE=.lionclaw/instances/main/config/skill-state/lionclaw-private-context
+export LIONCLAW_SKILL_STATE_DIR="$QA_PRIVATE_CONTEXT_STATE"
+"$QA_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant set style \
+  "For QA private context marker prompts, reply exactly PRIVATE_CONTEXT_PROFILE_OK."
+"$QA_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant list
+PRIVATE_CONTEXT_MEMORY_ID=$(
+  "$QA_PRIVATE_CONTEXT_SKILL/scripts/context" memory remember \
+    "For QA private context memory marker prompts, reply exactly PRIVATE_CONTEXT_MEMORY_OK." \
+    --title "QA memory" \
+    --tag qa \
+    --priority 10 \
+    --pinned |
+  jq -r '.id'
+)
+"$QA_PRIVATE_CONTEXT_SKILL/scripts/context" memory search "private context memory marker"
+"$QA_PRIVATE_CONTEXT_SKILL/scripts/context" memory history "$PRIVATE_CONTEXT_MEMORY_ID"
+"$QA_PRIVATE_CONTEXT_SKILL/scripts/context" operations --item-id "$PRIVATE_CONTEXT_MEMORY_ID"
+```
+
+Check the installed skill snapshot and activation:
+
+```bash
+test -x "$QA_PRIVATE_CONTEXT_SKILL/bin/lionclaw-private-context"
+test -x "$QA_PRIVATE_CONTEXT_SKILL/scripts/projector"
+test -x "$QA_PRIVATE_CONTEXT_SKILL/scripts/recorder"
+test -f "$QA_PRIVATE_CONTEXT_SKILL/runtime/lionclaw-private-context/SKILL.md"
+"$LIONCLAW_BIN" doctor
+```
+
+Then run the everyday path:
+
+```bash
+cat <<'EOF' | "$LIONCLAW_BIN" run --plain
+What is the QA private context profile marker?
+What is the QA private context memory marker?
+/lionclaw exit
+EOF
+```
+
+Expected:
+
+- the context script creates a host-only SQLite store under
+  `.lionclaw/instances/main/config/skill-state/lionclaw-private-context`
+- profile, memory, history, search, and operations commands return JSON
+- memory search returns the explicit memory for matching input and does not
+  return unrelated records
+- the operation log omits profile bodies, memory bodies, titles, tags, prompt
+  text, and runtime output
+- `doctor` accepts the configured projector metadata without raw HTTP
+- the runtime has no direct access to the SQLite store
+- the profile marker answer is `PRIVATE_CONTEXT_PROFILE_OK`
+- the memory marker answer is `PRIVATE_CONTEXT_MEMORY_OK`
+
+Skip the final `run --plain` subcheck with the concrete runtime/auth blocker if
+no local runtime is available.
+
+## Phase 6: Channel Skill Acceptance
 
 Top-level QA checks only the kernel contract shared by channel skills.
 Transport-specific setup, commands, webhook behavior, attachment formats,
@@ -311,7 +381,7 @@ Expected when credentials are available:
 If credentials are not available, record this subphase as skipped with the
 concrete missing transport credential or conversation.
 
-## Phase 6: Background Operation
+## Phase 7: Background Operation
 
 On Linux with a systemd user manager:
 
@@ -343,7 +413,7 @@ systemctl --user status lionclaw*.service
 journalctl --user -u 'lionclaw*.service' -n 100 --no-pager
 ```
 
-## Phase 7: Jobs
+## Phase 8: Jobs
 
 Create and run a local job:
 
@@ -363,11 +433,11 @@ Expected:
 
 - manual job run succeeds
 - job history is visible through the CLI
-- if a credential-backed channel was configured in Phase 5, a separate delivery
+- if a credential-backed channel was configured in Phase 6, a separate delivery
   job can target that approved conversation and should reach the transport
   through the outbox lease/report flow
 
-## Phase 8: Doctor Diagnostics
+## Phase 9: Doctor Diagnostics
 
 Every diagnostic finding must include `[LC-D...]`, severity, `target`,
 `expected`, `observed`, and read-only `inspect`. `repair` appears only when the

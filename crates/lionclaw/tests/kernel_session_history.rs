@@ -608,6 +608,101 @@ async fn failed_runtime_control_close_failure_preserves_control_error() {
 }
 
 #[tokio::test]
+async fn runtime_control_route_audit_failure_fails_turn_before_runtime_start() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let starts = Arc::new(AtomicUsize::new(0));
+    let controls = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    kernel
+        .register_runtime_adapter(
+            "control-route-audit-fail",
+            Arc::new(RuntimeControlRouteAuditFailureAdapter {
+                starts: Arc::clone(&starts),
+                controls: Arc::clone(&controls),
+                closes: Arc::clone(&closes),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-route-audit-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let pool = connect_pool(&env.db_path()).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_runtime_control_route_audit \
+         BEFORE INSERT ON audit_events \
+         WHEN NEW.event_type = 'runtime.control.route' \
+         BEGIN \
+             SELECT RAISE(FAIL, 'runtime.control.route audit rejected'); \
+         END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install route audit failure trigger");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/handled".to_string(),
+            runtime_id: Some("control-route-audit-fail".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control route audit failure should fail the turn");
+
+    assert!(
+        err.to_string().contains("failed to append audit event"),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        0,
+        "route audit failure should happen before runtime session start"
+    );
+    assert_eq!(
+        controls.load(Ordering::SeqCst),
+        0,
+        "control execution should not run after route audit failure"
+    );
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        0,
+        "there should be no runtime session to close when route audit fails before start"
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history
+        .turns
+        .last()
+        .expect("failed runtime control route audit turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.display_user_text, "/handled");
+    assert_eq!(turn.prompt_user_text, "");
+    assert_eq!(turn.assistant_text, "");
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.error"));
+    assert!(
+        turn.error_text
+            .as_deref()
+            .is_some_and(|text| text.contains("failed to append audit event")),
+        "unexpected error_text: {:?}",
+        turn.error_text
+    );
+}
+
+#[tokio::test]
 async fn failed_runtime_control_clears_runtime_session_resumability_for_next_turn() {
     let env = TestEnv::new();
     let workspace_root = env.path().join("workspace");
@@ -1162,7 +1257,7 @@ async fn session_scoped_runtime_state_resumes_without_replaying_full_history() {
     assert!(prompts[0].contains("first request"));
     assert!(prompts[1].contains("second request"));
     assert!(
-        !prompts[1].contains("User: first request"),
+        !prompts[1].contains("first request"),
         "resumed harness sessions should not replay the full prior transcript"
     );
     assert!(
@@ -1600,6 +1695,12 @@ struct RuntimeControlCloseFailureAdapter {
     control_error_code: String,
     control_error_text: String,
     close_error_text: String,
+}
+
+struct RuntimeControlRouteAuditFailureAdapter {
+    starts: Arc<AtomicUsize>,
+    controls: Arc<AtomicUsize>,
+    closes: Arc<AtomicUsize>,
 }
 
 struct BlockingAnswerAdapter {
@@ -2056,6 +2157,58 @@ impl RuntimeAdapter for RuntimeControlCloseFailureAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         anyhow::bail!(self.close_error_text.clone())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for RuntimeControlRouteAuditFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "control-route-audit-fail".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("control-route-audit-fail-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn runtime_control(
+        &self,
+        _execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        self.controls.fetch_add(1, Ordering::SeqCst);
+        Ok(RuntimeControlOutcome::Handled {
+            message: "should not execute".to_string(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

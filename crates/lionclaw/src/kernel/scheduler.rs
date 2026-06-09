@@ -61,7 +61,7 @@ impl SchedulerEngine {
         }
 
         let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
-        let tick_result = async {
+        let tick_result = Box::pin(async {
             let mut claimed_runs = 0usize;
             while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
                 claimed_runs += 1;
@@ -69,7 +69,7 @@ impl SchedulerEngine {
             }
 
             Ok(JobTickResponse { claimed_runs })
-        }
+        })
         .await;
 
         let renewal_result = renewal_handle.stop().await;
@@ -81,7 +81,7 @@ impl SchedulerEngine {
 
     pub async fn run_loop(&self, kernel: Arc<Kernel>) {
         loop {
-            if let Err(err) = self.tick(&kernel).await {
+            if let Err(err) = Box::pin(self.tick(&kernel)).await {
                 if let Err(audit_err) = kernel
                     .audit_log()
                     .append(

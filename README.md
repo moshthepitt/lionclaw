@@ -91,14 +91,14 @@ lionclaw run --runtime-tui
 ```
 
 That path still goes through LionClaw's runtime plan, mounts, staged auth,
-generated memory/continuity context, and audit trail. LionClaw writes that
-context into session-scoped runtime control state as both `AGENTS.generated.md`
-and the runtime-standard `AGENTS.md`. The runtime's native private home is
-mounted separately at `/runtime/home` and persists across LionClaw sessions for
-the same project, runtime, compatibility identity, and execution security shape
-including workspace access, network mode, secret mounts, and escape classes. For
-Codex, LionClaw uses the outer container as the sandbox boundary and starts the
-inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
+policy-selected prompt context, and audit trail. LionClaw writes that context
+into session-scoped runtime control state as both `AGENTS.generated.md` and the
+runtime-standard `AGENTS.md`. The runtime's native private home is mounted
+separately at `/runtime/home` and persists across LionClaw sessions for the
+same project, runtime, compatibility identity, and execution security shape
+including workspace access, network mode, secret mounts, and escape classes.
+For Codex, LionClaw uses the outer container as the sandbox boundary and starts
+the inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
 config overrides mark the container workspace as trusted and disable update
 checks without rewriting the runtime-owned Codex config. Completed Codex and
 OpenCode native UI turns are reconciled from durable runtime state into
@@ -219,7 +219,8 @@ containing `:`.
 `lionclaw project init` creates `.lionclaw/project.toml` and a default `main`
 instance at `.lionclaw/instances/main`. A project is the local management
 boundary. An instance home stores one LionClaw instance's config, database,
-logs, installed skills, runtime cache, and assistant-home continuity.
+logs, installed skills, runtime-private state, drafts, and assistant-home
+continuity.
 
 Each project instance records a default work root. `project init` points `main`
 at the project root, and `instance create <name>` does the same unless you pass
