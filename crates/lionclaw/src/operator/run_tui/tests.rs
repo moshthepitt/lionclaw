@@ -720,6 +720,20 @@ fn activity_items_render_multiline_text_with_continuation_indent() {
     assert_eq!(rendered, vec!["→  ran cargo test", "   exit 0"]);
 }
 
+#[test]
+fn activity_items_keep_hyphenated_identifiers_readable() {
+    let lines = activity_item_lines(&ActivityItem {
+        kind: ActivityItemKind::Progress,
+        text: "progress: using `lionclaw-private-context` with --help command-79".to_string(),
+    });
+    let rendered = rendered_line_strings(&lines);
+
+    assert_eq!(
+        rendered,
+        vec!["•  progress: using `lionclaw‑private‑context` with --help command-79"]
+    );
+}
+
 #[tokio::test]
 async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
