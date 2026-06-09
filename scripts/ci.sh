@@ -17,6 +17,7 @@ bash -n skills/channel-email/scripts/worker
 bash -n skills/channel-team-local/scripts/worker
 bash -n skills/lionclaw-private-context/scripts/context
 bash -n skills/lionclaw-private-context/scripts/projector
+bash -n skills/lionclaw-private-context/scripts/recorder
 bash -n skills/channel-team-local/runtime/team-local/scripts/list
 bash -n skills/channel-team-local/runtime/team-local/scripts/resolve
 bash -n skills/channel-team-local/runtime/team-local/scripts/send
@@ -30,3 +31,4 @@ test -f skills/lionclaw-private-context/SKILL.md
 test -f skills/lionclaw-private-context/lionclaw.toml
 grep -q '^name: email$' skills/channel-email/runtime/email/SKILL.md
 grep -q '^name: lionclaw-private-context$' skills/lionclaw-private-context/SKILL.md
+grep -q '^name: lionclaw-private-context$' skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md

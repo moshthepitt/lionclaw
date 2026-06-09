@@ -114,6 +114,17 @@ pub(crate) struct MemoryPatch {
     pub pinned: Option<bool>,
 }
 
+struct MemoryWrite<'a> {
+    scope: &'a str,
+    title: Option<&'a str>,
+    body: &'a str,
+    tags: &'a [String],
+    priority: i64,
+    pinned: bool,
+    source: WriteSource,
+    now: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecordedTurn {
     pub private_context_id: String,
@@ -690,14 +701,16 @@ impl PrivateContextStore {
         let mut tx = self.pool.begin().await?;
         let item = remember_memory_in_tx(
             &mut tx,
-            scope,
-            title,
-            body,
-            tags,
-            priority,
-            pinned,
-            WriteSource::context_cli(),
-            &now,
+            MemoryWrite {
+                scope,
+                title,
+                body,
+                tags,
+                priority,
+                pinned,
+                source: WriteSource::context_cli(),
+                now: &now,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -976,14 +989,16 @@ impl PrivateContextStore {
                 ExplicitDirective::Memory(body) => {
                     remember_memory_in_tx(
                         &mut tx,
-                        &turn.scope,
-                        None,
-                        &body,
-                        &[],
-                        0,
-                        false,
-                        WriteSource::recorder(),
-                        &now,
+                        MemoryWrite {
+                            scope: &turn.scope,
+                            title: None,
+                            body: &body,
+                            tags: &[],
+                            priority: 0,
+                            pinned: false,
+                            source: WriteSource::recorder(),
+                            now: &now,
+                        },
                     )
                     .await?;
                 }
@@ -1209,15 +1224,18 @@ async fn set_profile_in_tx(
 
 async fn remember_memory_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    scope: &str,
-    title: Option<&str>,
-    body: &str,
-    tags: &[String],
-    priority: i64,
-    pinned: bool,
-    source: WriteSource,
-    now: &str,
+    write: MemoryWrite<'_>,
 ) -> Result<ContextItem> {
+    let MemoryWrite {
+        scope,
+        title,
+        body,
+        tags,
+        priority,
+        pinned,
+        source,
+        now,
+    } = write;
     let scope = validate_scope(scope)?;
     let title = validate_title(title)?;
     let body = validate_body("memory", body, MAX_MEMORY_BODY_BYTES)?;

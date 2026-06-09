@@ -118,10 +118,13 @@ jobs:
           test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/send"
           test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/context"
           test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/projector"
+          test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/recorder"
           test -f "$RELEASE_DIR/skills/lionclaw-private-context/README.md"
           test -f "$RELEASE_DIR/skills/lionclaw-private-context/SKILL.md"
           test -f "$RELEASE_DIR/skills/lionclaw-private-context/lionclaw.toml"
+          test -f "$RELEASE_DIR/skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md"
           grep -q '^name: lionclaw-private-context$' "$RELEASE_DIR/skills/lionclaw-private-context/SKILL.md"
+          grep -q '^name: lionclaw-private-context$' "$RELEASE_DIR/skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md"
 
           tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"
           (
