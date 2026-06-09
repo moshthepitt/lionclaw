@@ -2391,6 +2391,9 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        PrivateContextRecordSurface, PrivateContextRecordText, PrivateContextRecordTranscript,
+    };
     use tempfile::tempdir;
 
     fn request_for(
@@ -2418,6 +2421,264 @@ mod tests {
                 .collect(),
             sources: Vec::new(),
         }
+    }
+
+    fn record_request_for(
+        sequence_no: u64,
+        user_text: &str,
+        assistant_text: &str,
+        project_scope: Option<&str>,
+    ) -> PrivateContextRecordRequest {
+        PrivateContextRecordRequest {
+            session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            sequence_no,
+            runtime_id: "codex".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: crate::protocol::SessionHistoryPolicy::Interactive,
+            surface: PrivateContextRecordSurface::Program,
+            project_scope: project_scope.map(str::to_string),
+            transcript: PrivateContextRecordTranscript {
+                user: (!user_text.is_empty()).then(|| record_text(user_text)),
+                assistant: (!assistant_text.is_empty()).then(|| record_text(assistant_text)),
+            },
+        }
+    }
+
+    fn record_text(text: &str) -> PrivateContextRecordText {
+        PrivateContextRecordText {
+            text: text.to_string(),
+            included_bytes: text.len(),
+            original_bytes: text.len(),
+        }
+    }
+
+    async fn count_rows(store: &PrivateContextStore, table: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&store.pool)
+            .await
+            .expect("count rows")
+    }
+
+    #[tokio::test]
+    async fn recorder_inserts_turn_and_is_idempotent() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let request = record_request_for(
+            7,
+            "We discussed sqlite migrations.",
+            "Use a table rebuild for changed checks.",
+            Some("alpha"),
+        );
+
+        assert!(store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn"));
+        assert!(!store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record duplicate"));
+
+        assert_eq!(count_rows(&store, "recorded_turns").await, 1);
+        assert_eq!(count_rows(&store, "recorded_turns_fts").await, 1);
+        let turn = sqlx::query("SELECT * FROM recorded_turns")
+            .fetch_one(&store.pool)
+            .await
+            .expect("recorded turn");
+        assert_eq!(
+            turn.try_get::<String, _>("private_context_id").expect("id"),
+            "lionclaw-private-context"
+        );
+        assert_eq!(
+            turn.try_get::<String, _>("scope").expect("scope"),
+            "project:alpha"
+        );
+        assert_eq!(
+            turn.try_get::<String, _>("user_text").expect("user"),
+            "We discussed sqlite migrations."
+        );
+    }
+
+    #[tokio::test]
+    async fn recorder_directives_create_durable_items_with_shared_metadata() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let request = record_request_for(
+            8,
+            "remember: Use sqlx migrations carefully.\n- ASSISTANT STYLE: Be exact.\n* user preferences: Prefer terse status.",
+            "remember: assistant text must not write memory.",
+            None,
+        );
+
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn");
+
+        let memories = store
+            .list_memory(Some("global"), None)
+            .await
+            .expect("memories");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].body, "Use sqlx migrations carefully.");
+        assert_eq!(memories[0].source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
+        let assistant = store
+            .show_profile(ProjectedContextClass::AssistantProfile, "global", "style")
+            .await
+            .expect("assistant profile")
+            .expect("assistant style");
+        assert_eq!(assistant.body, "Be exact.");
+        assert_eq!(assistant.source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
+        let user = store
+            .show_profile(ProjectedContextClass::UserProfile, "global", "preferences")
+            .await
+            .expect("user profile")
+            .expect("user preferences");
+        assert_eq!(user.body, "Prefer terse status.");
+
+        let operations = store.operation_log(None).await.expect("operations");
+        assert_eq!(operations.len(), 3);
+        assert!(operations.iter().all(|operation| {
+            operation.source_kind == SOURCE_KIND_EXPLICIT_TRANSCRIPT
+                && operation.actor_surface == ACTOR_RECORDER
+        }));
+        let history = store
+            .memory_history(&memories[0].id)
+            .await
+            .expect("history");
+        assert_eq!(history[0].source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
+    }
+
+    #[tokio::test]
+    async fn recorder_ignores_non_explicit_and_substring_directives() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let request = record_request_for(
+            9,
+            "Please remember: this is not line-start grammar.\nI like deterministic tests.\nassistant style maybe terse.",
+            "assistant style: assistant text is ignored.",
+            None,
+        );
+
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn");
+
+        assert_eq!(count_rows(&store, "recorded_turns").await, 1);
+        assert_eq!(count_rows(&store, "context_items").await, 0);
+        assert_eq!(count_rows(&store, "operation_log").await, 0);
+    }
+
+    #[tokio::test]
+    async fn recorder_rolls_back_turn_when_directive_write_fails() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let body = "x".repeat(MAX_MEMORY_BODY_BYTES + 1);
+        let request = record_request_for(10, &format!("remember: {body}"), "ok", None);
+
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect_err("oversized directive should fail");
+
+        assert_eq!(count_rows(&store, "recorded_turns").await, 0);
+        assert_eq!(count_rows(&store, "recorded_turns_fts").await, 0);
+        assert_eq!(count_rows(&store, "context_items").await, 0);
+    }
+
+    #[tokio::test]
+    async fn recorded_turns_project_as_memory_with_session_turn_provenance() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let request = record_request_for(
+            11,
+            "The alpha project uses sqlite for private context.",
+            "Confirmed.",
+            Some("alpha"),
+        );
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn");
+
+        let projection = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(
+                    &[ProjectedContextClass::Memory],
+                    Some("sqlite"),
+                    Some("alpha"),
+                ),
+            )
+            .await
+            .expect("projection");
+
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(projection.items[0].class, ProjectedContextClass::Memory);
+        assert!(projection.items[0].text.contains("Turn 11"));
+        assert!(projection.items[0]
+            .text
+            .contains("User: The alpha project uses sqlite for private context."));
+        assert_eq!(
+            projection.items[0].provenance[0].source,
+            ProjectedContextProvenanceSource::SessionTurn
+        );
+        assert_eq!(projection.items[0].provenance[0].sequence_no, Some(11));
+    }
+
+    #[tokio::test]
+    async fn project_scoped_recorded_turns_do_not_leak() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(12, "Alpha sqlite detail.", "ok", Some("alpha")),
+            )
+            .await
+            .expect("alpha turn");
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(13, "Beta sqlite detail.", "ok", Some("beta")),
+            )
+            .await
+            .expect("beta turn");
+
+        let projection = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(
+                    &[ProjectedContextClass::Memory],
+                    Some("sqlite"),
+                    Some("alpha"),
+                ),
+            )
+            .await
+            .expect("projection");
+
+        let joined = projection
+            .items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Alpha sqlite detail."));
+        assert!(!joined.contains("Beta sqlite detail."));
     }
 
     #[tokio::test]
