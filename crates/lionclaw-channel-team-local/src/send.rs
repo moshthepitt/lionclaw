@@ -47,8 +47,6 @@ struct ChannelSendRequest<'a> {
     conversation_ref: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     thread_ref: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to_ref: Option<&'a str>,
     content: ChannelSendContent<'a>,
 }
 
@@ -69,7 +67,6 @@ struct SendRequestInput<'a> {
     message: &'a str,
     format_hint: &'a str,
     attachments: &'a [ChannelSendAttachment<'a>],
-    reply_to_ref: Option<&'a str>,
     idempotency_key: String,
 }
 
@@ -92,15 +89,6 @@ fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
     if message.trim().is_empty() && config.attachments.is_empty() {
         bail!("team-local send message or attachment is required");
     }
-    if config
-        .reply_to_ref
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        bail!("team-local does not support reply refs; send an addressed message to the instance instead");
-    }
-
     let recipients = unique_recipients(&config.recipients)?;
     let attachments = validate_attachments(&config.attachments)?;
     let inventory = ProjectInventory::load(&config.instances_file)?;
@@ -130,7 +118,6 @@ fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
                     message: message.as_str(),
                     format_hint: config.format_hint.as_str(),
                     attachments: attachments.as_slice(),
-                    reply_to_ref: config.reply_to_ref.as_deref(),
                     idempotency_key: idempotency_key_for(
                         &idempotency_base,
                         &item.recipient,
@@ -244,7 +231,6 @@ fn send_request(socket: &Path, request: SendRequestInput<'_>) -> Result<ChannelS
         channel_id: &request.route.channel_id,
         conversation_ref: &request.route.conversation_ref,
         thread_ref: request.route.thread_ref.as_deref(),
-        reply_to_ref: request.reply_to_ref,
         content: ChannelSendContent {
             text: request.message,
             format_hint: request.format_hint,
@@ -437,7 +423,6 @@ mod tests {
                 message: None,
                 format_hint: "markdown".to_string(),
                 attachments: Vec::new(),
-                reply_to_ref: None,
                 idempotency_key: Some("turn-1".to_string()),
             },
             " Please check this.\n".to_string(),
@@ -496,7 +481,6 @@ mod tests {
                 attachments: vec![SendAttachmentConfig {
                     path: "/runtime/output/report.html".to_string(),
                 }],
-                reply_to_ref: None,
                 idempotency_key: Some("turn-1".to_string()),
             },
             String::new(),
@@ -512,30 +496,6 @@ mod tests {
             request["content"]["attachments"][0]["path"],
             "/runtime/output/report.html"
         );
-    }
-
-    #[test]
-    fn rejects_reply_refs() {
-        let temp_dir = tempdir().expect("temp dir");
-        let inventory = write_single_recipient_inventory(temp_dir.path());
-
-        let err = send_message(
-            SendConfig {
-                self_instance: "main".to_string(),
-                instances_file: inventory,
-                channel_send_socket: temp_dir.path().join("missing.sock"),
-                recipients: vec!["reviewer".to_string()],
-                message: None,
-                format_hint: "markdown".to_string(),
-                attachments: Vec::new(),
-                reply_to_ref: Some("source-message".to_string()),
-                idempotency_key: Some("turn-1".to_string()),
-            },
-            "reply".to_string(),
-        )
-        .expect_err("team-local is address-only");
-
-        assert!(err.to_string().contains("does not support reply refs"));
     }
 
     fn write_single_recipient_inventory(root: &Path) -> PathBuf {
@@ -606,7 +566,6 @@ mod tests {
                 message: None,
                 format_hint: "markdown".to_string(),
                 attachments: Vec::new(),
-                reply_to_ref: None,
                 idempotency_key: Some("turn-1".to_string()),
             },
             "Please check this.".to_string(),

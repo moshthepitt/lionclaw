@@ -29,7 +29,6 @@ pub struct SendConfig {
     pub message: Option<String>,
     pub format_hint: String,
     pub attachments: Vec<SendAttachmentConfig>,
-    pub reply_to_ref: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -44,7 +43,6 @@ struct ParsedSendArgs {
     message: Option<String>,
     format_hint: String,
     attachments: Vec<SendAttachmentConfig>,
-    reply_to_ref: Option<String>,
     idempotency_key: Option<String>,
 }
 
@@ -197,7 +195,6 @@ impl Command {
             message: parsed.message,
             format_hint: parsed.format_hint,
             attachments: parsed.attachments,
-            reply_to_ref: parsed.reply_to_ref,
             idempotency_key: parsed.idempotency_key,
         }))
     }
@@ -223,7 +220,6 @@ fn parse_send_args(args: Vec<String>) -> Result<Option<ParsedSendArgs>> {
     let mut message_parts = None;
     let mut format_hint = "markdown".to_string();
     let mut attachments = Vec::new();
-    let mut reply_to_ref = None;
     let mut idempotency_key = None;
 
     let mut args = args.into_iter();
@@ -245,7 +241,7 @@ fn parse_send_args(args: Vec<String>) -> Result<Option<ParsedSendArgs>> {
                 });
             }
             "--reply-to-ref" => {
-                reply_to_ref = Some(parse_next_string(&mut args, "--reply-to-ref")?);
+                bail!("team-local send does not support --reply-to-ref; send an addressed message to the instance instead");
             }
             "-h" | "--help" => {
                 print_send_help();
@@ -265,7 +261,6 @@ fn parse_send_args(args: Vec<String>) -> Result<Option<ParsedSendArgs>> {
         message: message_parts.map(|parts| parts.join(" ")),
         format_hint,
         attachments,
-        reply_to_ref,
         idempotency_key,
     }))
 }
@@ -321,7 +316,7 @@ fn print_help() {
         "lionclaw-channel-team-local worker [--once] [--poll-ms MS] [--pull-limit N] [--lease-ms MS]\n\
          lionclaw-channel-team-local list\n\
          lionclaw-channel-team-local resolve <recipient>\n\
-         lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+         lionclaw-channel-team-local send [--format plain|markdown|html] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }
 
@@ -341,7 +336,7 @@ fn print_resolve_help() {
 
 fn print_send_help() {
     println!(
-        "lionclaw-channel-team-local send [--format plain|markdown|html] [--reply-to-ref REF] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
+        "lionclaw-channel-team-local send [--format plain|markdown|html] [--attachment /runtime/PATH]... [--idempotency-key KEY] <recipient>... [-- MESSAGE]"
     );
 }
 
@@ -358,8 +353,6 @@ mod tests {
             "/runtime/results/report.html".to_string(),
             "--attachment".to_string(),
             "/runtime/results/data.json".to_string(),
-            "--reply-to-ref".to_string(),
-            "source-message".to_string(),
             "--idempotency-key".to_string(),
             "turn-1".to_string(),
             "reviewer".to_string(),
@@ -377,7 +370,6 @@ mod tests {
         assert_eq!(parsed.attachments.len(), 2);
         assert_eq!(parsed.attachments[0].path, "/runtime/results/report.html");
         assert_eq!(parsed.attachments[1].path, "/runtime/results/data.json");
-        assert_eq!(parsed.reply_to_ref.as_deref(), Some("source-message"));
         assert_eq!(parsed.idempotency_key.as_deref(), Some("turn-1"));
     }
 
@@ -395,8 +387,21 @@ mod tests {
         assert_eq!(parsed.message.as_deref(), Some("Please check this."));
         assert_eq!(parsed.format_hint, "markdown");
         assert!(parsed.attachments.is_empty());
-        assert!(parsed.reply_to_ref.is_none());
         assert!(parsed.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn rejects_reply_ref_flag() {
+        let err = parse_send_args(vec![
+            "--reply-to-ref".to_string(),
+            "source-message".to_string(),
+            "reviewer".to_string(),
+            "--".to_string(),
+            "Reply".to_string(),
+        ])
+        .expect_err("reply refs are unsupported");
+
+        assert!(err.to_string().contains("does not support --reply-to-ref"));
     }
 
     #[test]
