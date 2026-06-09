@@ -58,8 +58,8 @@ stage/finalize endpoints.
 
 Team-local is address-only: explicit sends target instance names rather than
 provider message threads. If a local outbox delivery contains a reply ref, the
-worker reports it as delivered with a `reply_ref_ignored` receipt and does not
-post it to the target instance.
+worker reports a terminal `unsupported_reply_ref` failure and does not post it
+to the target instance.
 
 ## Manual QA
 

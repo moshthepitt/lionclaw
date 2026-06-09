@@ -157,8 +157,8 @@ impl TeamLocalWorker {
         delivery: &ChannelOutboxDelivery,
         worker_id: &str,
     ) -> Result<Value, DeliveryResult> {
-        if let Some(receipt) = reply_ref_ignored_receipt(delivery) {
-            return Ok(receipt);
+        if let Some(result) = unsupported_reply_ref(delivery) {
+            return Err(result);
         }
 
         let route = parse_delivery_route(&delivery.conversation_ref)
@@ -482,19 +482,16 @@ fn non_empty_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-fn reply_ref_ignored_receipt(delivery: &ChannelOutboxDelivery) -> Option<Value> {
-    let reply_to_ref = delivery
+fn unsupported_reply_ref(delivery: &ChannelOutboxDelivery) -> Option<DeliveryResult> {
+    delivery
         .reply_to_ref
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    Some(json!({
-        "provider": CHANNEL_ID,
-        "outcome": "reply_ref_ignored",
-        "reason": "team-local delivers addressed messages only",
-        "delivery_id": delivery.delivery_id,
-        "reply_to_ref": reply_to_ref,
-    }))
+    Some(terminal(
+        "unsupported_reply_ref",
+        anyhow!("team-local does not support reply refs; send an addressed message to the instance instead"),
+    ))
 }
 
 fn retryable(code: &'static str, err: anyhow::Error) -> DeliveryResult {
@@ -675,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reply_ref_delivery_is_reported_delivered_without_target_inbound() {
+    async fn reply_ref_delivery_is_terminal_failed_without_target_inbound() {
         let fixture = TeamLocalFixture::new().await;
         let target_state = Arc::new(TargetState {
             info: fixture.target_info(),
@@ -699,13 +696,13 @@ mod tests {
         assert!(target_state.authorize_requests.lock().await.is_empty());
         assert!(target_state.inbound_requests.lock().await.is_empty());
         let report = only_request(&local_state.reports).await;
-        assert_eq!(report["outcome"], "delivered");
-        assert_eq!(report["provider_receipt"]["outcome"], "reply_ref_ignored");
+        assert_eq!(report["outcome"], "terminal_failed");
+        assert!(report["provider_receipt"].is_null());
+        assert_eq!(report["error_code"], "unsupported_reply_ref");
         assert_eq!(
-            report["provider_receipt"]["reason"],
-            "team-local delivers addressed messages only"
+            report["error_text"],
+            "team-local does not support reply refs; send an addressed message to the instance instead"
         );
-        assert_eq!(report["provider_receipt"]["reply_to_ref"], "source-message");
     }
 
     #[tokio::test]
