@@ -61,6 +61,10 @@ are `identity`, `style`, `boundaries`, `workflow`, and `defaults`. User profile
 slots are `identity`, `preferences`, `environment`, `working_style`, and
 `standing_requests`.
 
+The examples below assume the default `main` project instance and are run from
+the project root. Use the matching installed skill directory and
+`config/skill-state/<alias>` directory for another instance or home.
+
 ```bash
 export LIONCLAW_PRIVATE_CONTEXT_SKILL=.lionclaw/instances/main/skills/lionclaw-private-context
 export LIONCLAW_SKILL_STATE_DIR=.lionclaw/instances/main/config/skill-state/lionclaw-private-context
