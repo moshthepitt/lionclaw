@@ -279,11 +279,7 @@ cargo build --manifest-path "$LIONCLAW_REPO_ROOT/Cargo.toml" --workspace --bins
 "$LIONCLAW_BIN" skill install \
   "$LIONCLAW_REPO_ROOT/skills/lionclaw-private-context" \
   --alias lionclaw-private-context
-cat >> .lionclaw/instances/main/config/lionclaw.toml <<'EOF'
-
-[private_context]
-projector_skill = "lionclaw-private-context"
-EOF
+"$LIONCLAW_BIN" configure --private-context-projector lionclaw-private-context
 export QA_PRIVATE_CONTEXT_SKILL=.lionclaw/instances/main/skills/lionclaw-private-context
 export QA_PRIVATE_CONTEXT_STATE=.lionclaw/instances/main/config/skill-state/lionclaw-private-context
 export LIONCLAW_SKILL_STATE_DIR="$QA_PRIVATE_CONTEXT_STATE"

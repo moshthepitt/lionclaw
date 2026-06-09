@@ -15,9 +15,10 @@ skill with the regular LionClaw skill installer:
 cargo build --workspace --bins
 export LIONCLAW_BIN=target/debug/lionclaw
 "$LIONCLAW_BIN" skill install skills/lionclaw-private-context --alias lionclaw-private-context
+"$LIONCLAW_BIN" configure --private-context-projector lionclaw-private-context
 ```
 
-Enable it in the selected LionClaw home or project instance config:
+This sets the selected LionClaw home or project instance config to:
 
 ```toml
 [private_context]

@@ -14,6 +14,7 @@ use cron::Schedule;
 use uuid::Uuid;
 
 use crate::{
+    applied::AppliedState,
     contracts::{
         ChannelGrantView, ChannelHealthCheck, ChannelPairingInviteRequest,
         ChannelPairingListResponse, ChannelPairingStatus, ChannelPairingView,
@@ -25,6 +26,7 @@ use crate::{
     kernel::{
         jobs::normalize_cron_expression,
         runtime::{ConfinementConfig, ExecutionLimits, MountAccess, OciConfinementConfig},
+        skills::validate_skill_alias,
     },
     operator::{
         attach::attach_channel,
@@ -185,6 +187,12 @@ struct RunArgs {
 struct ConfigureArgs {
     #[arg(long)]
     runtime: Option<String>,
+    #[arg(
+        long,
+        value_name = "ALIAS",
+        help = "Select an installed private-context projector skill"
+    )]
+    private_context_projector: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -829,9 +837,9 @@ pub async fn run() -> Result<ExitCode> {
             let mut input = BufReader::new(stdin);
             let stdout = std::io::stdout();
             let mut output = stdout;
-            let outcome = configure_runtime_with_io(
+            let outcome = configure_with_io(
                 &target.instance_home,
-                args.runtime,
+                args,
                 interactive,
                 &mut input,
                 &mut output,
@@ -1958,6 +1966,7 @@ fn print_installed_skills(skills: &[InstalledSkill]) {
     }
 }
 
+#[cfg(test)]
 async fn configure_runtime_with_io<R: BufRead, W: Write>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
@@ -1976,6 +1985,88 @@ async fn configure_runtime_with_io<R: BufRead, W: Write>(
     .await
 }
 
+#[derive(Debug)]
+struct ConfigureOutcome {
+    runtime: Option<ConfigureRuntimeOutcome>,
+    private_context_projector: Option<String>,
+}
+
+async fn configure_with_io<R: BufRead, W: Write>(
+    home: &LionClawHome,
+    args: ConfigureArgs,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<ConfigureOutcome> {
+    configure_with_io_and_engine_resolver(
+        home,
+        args,
+        interactive,
+        input,
+        output,
+        normalize_podman_executable,
+    )
+    .await
+}
+
+async fn configure_with_io_and_engine_resolver<R: BufRead, W: Write, F>(
+    home: &LionClawHome,
+    args: ConfigureArgs,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+    mut resolve_engine: F,
+) -> Result<ConfigureOutcome>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    let ConfigureArgs {
+        runtime: requested_runtime,
+        private_context_projector,
+    } = args;
+    let should_prompt_runtime =
+        requested_runtime.is_none() && private_context_projector.is_none() && interactive;
+    let runtime_id = match requested_runtime
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(runtime_id) => Some(runtime_id.to_string()),
+        None if should_prompt_runtime => Some(prompt_configure_runtime(input, output)?),
+        None if private_context_projector.is_some() => None,
+        None => return Err(anyhow!(configure_runtime_required_message())),
+    };
+    let private_context_projector = private_context_projector
+        .as_deref()
+        .map(normalize_private_context_projector_alias)
+        .transpose()?;
+
+    let mut config = OperatorConfig::load(home).await?;
+    let runtime = runtime_id
+        .as_deref()
+        .map(|runtime_id| {
+            configure_runtime_profile_with_engine_resolver(
+                &mut config,
+                runtime_id,
+                &mut resolve_engine,
+            )
+        })
+        .transpose()?;
+    if let Some(alias) = &private_context_projector {
+        config.private_context.projector_skill = Some(alias.clone());
+        AppliedState::from_home_read_only(home, &config).with_context(|| {
+            format!("configured private context projector skill '{alias}' is not usable")
+        })?;
+    }
+    config.save(home).await?;
+
+    Ok(ConfigureOutcome {
+        runtime,
+        private_context_projector,
+    })
+}
+
+#[cfg(test)]
 async fn configure_runtime_with_io_and_engine_resolver<R: BufRead, W: Write, F>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
@@ -2018,7 +2109,29 @@ fn prompt_configure_runtime<R: BufRead, W: Write>(input: &mut R, output: &mut W)
     Ok(runtime_id.to_string())
 }
 
-fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcome) {
+fn normalize_private_context_projector_alias(raw: &str) -> Result<String> {
+    let alias = raw.trim();
+    if alias.is_empty() {
+        bail!("private context projector skill alias is required");
+    }
+    validate_skill_alias(alias)?;
+    Ok(alias.to_string())
+}
+
+fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureOutcome) {
+    if let Some(runtime) = &outcome.runtime {
+        print_runtime_configure_outcome(home, runtime);
+    }
+    if let Some(alias) = &outcome.private_context_projector {
+        println!(
+            "private context projector set to {} for {}",
+            alias,
+            home.root().display()
+        );
+    }
+}
+
+fn print_runtime_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcome) {
     let profile_state = if outcome.created_profile {
         "created"
     } else {
@@ -2632,6 +2745,34 @@ mod tests {
     use std::io::Cursor;
     use tempfile::{NamedTempFile, TempDir};
 
+    fn write_installed_private_context_skill(home: &LionClawHome, alias: &str) {
+        let skill = home.skills_dir().join(alias);
+        std::fs::create_dir_all(skill.join("scripts")).expect("skill scripts dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {alias}\ndescription: private context\n---\n"),
+        )
+        .expect("skill md");
+        std::fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[private_context_projector]\ncommand = \"scripts/projector\"\n",
+        )
+        .expect("skill metadata");
+        let projector = skill.join("scripts/projector");
+        std::fs::write(&projector, "#!/usr/bin/env bash\n").expect("projector");
+        make_executable(&projector);
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod executable");
+        }
+    }
+
     #[cfg(unix)]
     fn runtime_add_args(kind: &str) -> (TempDir, RuntimeAddArgs) {
         use std::os::unix::fs::PermissionsExt;
@@ -2950,6 +3091,7 @@ mod tests {
             &selection,
             &Command::Configure(ConfigureArgs {
                 runtime: Some("codex".to_string()),
+                private_context_projector: None,
             }),
         )
         .expect("configure target should resolve without a work root")
@@ -3534,6 +3676,68 @@ mod tests {
         assert!(
             !home.config_path().exists(),
             "configure should not create config when runtime is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_private_context_projector_sets_valid_installed_skill() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        write_installed_private_context_skill(&home, "lionclaw-private-context");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let outcome = configure_with_io(
+            &home,
+            ConfigureArgs {
+                runtime: None,
+                private_context_projector: Some(" lionclaw-private-context ".to_string()),
+            },
+            false,
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("configure private context");
+
+        assert!(outcome.runtime.is_none());
+        assert_eq!(
+            outcome.private_context_projector.as_deref(),
+            Some("lionclaw-private-context")
+        );
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(
+            config.private_context.projector_skill.as_deref(),
+            Some("lionclaw-private-context")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_private_context_projector_rejects_missing_skill_without_writing_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        std::fs::create_dir_all(home.skills_dir()).expect("skills dir");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = configure_with_io(
+            &home,
+            ConfigureArgs {
+                runtime: None,
+                private_context_projector: Some("missing-private-context".to_string()),
+            },
+            false,
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect_err("missing skill should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("configured private context projector skill"));
+        assert!(
+            !home.config_path().exists(),
+            "configure should not save a missing private context projector"
         );
     }
 
