@@ -1,6 +1,6 @@
 ---
 name: lionclaw-private-context
-description: Use when the user invokes $lionclaw-private-context, asks what LionClaw remembers, or wants to remember, update, or clarify durable preferences, profile facts, standing requests, or private context.
+description: Use when the user invokes $lionclaw-private-context, asks what LionClaw remembers, or wants to remember, update, or clarify durable memory, style, preferences, or private context.
 ---
 
 # LionClaw Private Context
@@ -25,24 +25,26 @@ private-context store directly.
 ## Durable Updates
 
 LionClaw persists durable updates only from exact user directive lines in
-committed turns. If the user provided one of these lines, acknowledge it plainly
-as a pending durable directive:
+committed turns. Accepted directives are:
 
 ```text
 remember: <text>
-remember that <text>
-assistant style: <text>
-assistant workflow: <text>
-assistant default: <text>
-user preferences: <text>
-user standing requests: <text>
+style: <text>
+preferences: <text>
 ```
 
+When the current user message contains an accepted directive, acknowledge it
+plainly:
+
+- `remember:` -> `I'll remember that.`
+- `style:` -> `I'll use that style.`
+- `preferences:` -> `I'll remember that preference.`
+
 If the user asks you to remember something without using an accepted directive,
-ask them to confirm with one exact directive line they can send next. Do not
-claim you saved, wrote, or updated private context from inside the runtime. The
-accurate confirmation is that LionClaw will record an accepted directive after
-the turn is committed.
+ask them to send one exact directive line. If the user asks whether the database
+is already updated, explain that LionClaw records accepted directives after the
+turn is committed. Do not run host-side private-context scripts or access the
+private-context database from inside the runtime.
 
 ## Boundaries
 

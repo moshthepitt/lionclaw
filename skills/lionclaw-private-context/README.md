@@ -57,10 +57,8 @@ direct access to the SQLite store.
 
 ## Operator Commands
 
-Profile records are written explicitly by an operator. Assistant profile slots
-are `identity`, `style`, `boundaries`, `workflow`, and `defaults`. User profile
-slots are `identity`, `preferences`, `environment`, `working_style`, and
-`standing_requests`.
+Profile records are written explicitly by an operator. Assistant profile records
+use the `style` slot. User profile records use the `preferences` slot.
 
 The examples below assume the default `main` project instance and are run from
 the project root. Use the matching installed skill directory and
@@ -98,12 +96,8 @@ in committed turns:
 
 ```text
 remember: <text>
-remember that <text>
-assistant style: <text>
-assistant workflow: <text>
-assistant default: <text>
-user preferences: <text>
-user standing requests: <text>
+style: <text>
+preferences: <text>
 ```
 
 Directive parsing is exact, line-oriented, and case-insensitive at the prefix.
@@ -113,13 +107,13 @@ memory records.
 
 Inside the runtime, use `$lionclaw-private-context` when you want help checking
 what context was projected or when you want the agent to help phrase a durable
-directive. To persist a new fact, preference, or standing request, send the
-directive line as the user. For example:
+directive. To persist a new fact, style, or preference, send the directive line
+as the user. For example:
 
 ```text
-remember that the private context issue is tracked as issue 136
-user preferences: Prefer concise implementation updates while work is in flight.
-assistant workflow: Pause before broad changes and choose the smallest clean design.
+remember: the private context issue is tracked as issue 136
+preferences: Prefer concise implementation updates while work is in flight.
+style: Pause before broad changes and choose the smallest clean design.
 ```
 
 Use `--scope global` for global records or `--scope project:<scope-id>` for a

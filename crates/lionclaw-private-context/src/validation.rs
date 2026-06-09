@@ -11,15 +11,8 @@ pub(crate) const MAX_QUERY_BYTES: usize = 4 * 1024;
 pub(crate) const DEFAULT_LIST_LIMIT: usize = 100;
 pub(crate) const MAX_LIST_LIMIT: usize = 100;
 
-pub(crate) const ASSISTANT_PROFILE_SLOTS: &[&str] =
-    &["identity", "style", "boundaries", "workflow", "defaults"];
-pub(crate) const USER_PROFILE_SLOTS: &[&str] = &[
-    "identity",
-    "preferences",
-    "environment",
-    "working_style",
-    "standing_requests",
-];
+pub(crate) const ASSISTANT_PROFILE_SLOTS: &[&str] = &["style"];
+pub(crate) const USER_PROFILE_SLOTS: &[&str] = &["preferences"];
 
 pub(crate) fn required_profile_slots(class: ProjectedContextClass) -> &'static [&'static str] {
     match class {
@@ -39,7 +32,7 @@ pub(crate) fn validate_profile_class(class: ProjectedContextClass) -> Result<()>
 pub(crate) fn validate_profile_slot(class: ProjectedContextClass, slot: &str) -> Result<String> {
     validate_profile_class(class)?;
     let slot = slot.trim();
-    if required_profile_slots(class).contains(&slot) {
+    if profile_slot_is_supported(class, slot) {
         Ok(slot.to_string())
     } else {
         bail!(
@@ -49,6 +42,10 @@ pub(crate) fn validate_profile_slot(class: ProjectedContextClass, slot: &str) ->
             required_profile_slots(class).join(", ")
         );
     }
+}
+
+pub(crate) fn profile_slot_is_supported(class: ProjectedContextClass, slot: &str) -> bool {
+    required_profile_slots(class).contains(&slot)
 }
 
 pub(crate) fn validate_scope(raw: &str) -> Result<String> {
@@ -240,7 +237,13 @@ mod tests {
         assert!(
             validate_profile_slot(ProjectedContextClass::AssistantProfile, "preferences").is_err()
         );
+        assert!(
+            validate_profile_slot(ProjectedContextClass::AssistantProfile, "workflow").is_err()
+        );
         assert!(validate_profile_slot(ProjectedContextClass::UserProfile, "preferences").is_ok());
+        assert!(
+            validate_profile_slot(ProjectedContextClass::UserProfile, "standing_requests").is_err()
+        );
         assert!(validate_profile_slot(ProjectedContextClass::Memory, "identity").is_err());
     }
 

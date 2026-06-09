@@ -23,10 +23,10 @@ use crate::{
         ProjectedContextProvenance, ProjectedContextProvenanceSource, TrustTier,
     },
     validation::{
-        audit_safe_visible_handle, cap_utf8, projection_scopes, required_profile_slots,
-        validate_body, validate_limit, validate_profile_slot, validate_query, validate_record_id,
-        validate_scope, validate_scope_id, validate_tags, validate_text_chars, validate_title,
-        MAX_MEMORY_BODY_BYTES, MAX_PROFILE_BODY_BYTES,
+        audit_safe_visible_handle, cap_utf8, profile_slot_is_supported, projection_scopes,
+        required_profile_slots, validate_body, validate_limit, validate_profile_slot,
+        validate_query, validate_record_id, validate_scope, validate_scope_id, validate_tags,
+        validate_text_chars, validate_title, MAX_MEMORY_BODY_BYTES, MAX_PROFILE_BODY_BYTES,
     },
 };
 
@@ -577,6 +577,7 @@ impl PrivateContextStore {
             .await?
         };
         let mut items = rows_to_items(rows)?;
+        items.retain(|item| supported_profile_item_slot(class, item));
         sort_profiles(class, &mut items, &projection_scopes(None));
         Ok(items)
     }
@@ -1055,6 +1056,7 @@ impl PrivateContextStore {
         let scopes = projection_scopes(project_scope);
         let rows = query_items_for_scopes(&self.pool, budget.class, &scopes).await?;
         let mut items = rows_to_items(rows)?;
+        items.retain(|item| supported_profile_item_slot(budget.class, item));
         sort_profiles(budget.class, &mut items, &scopes);
         Ok(project_items(
             projector_id,
@@ -1267,41 +1269,17 @@ fn explicit_directive(raw_line: &str) -> Option<ExplicitDirective> {
     if let Some(body) = directive_body(line, "remember:") {
         return Some(ExplicitDirective::Memory(body));
     }
-    if let Some(body) = directive_body(line, "remember that ") {
-        return Some(ExplicitDirective::Memory(body));
-    }
-    if let Some(body) = directive_body(line, "assistant style:") {
+    if let Some(body) = directive_body(line, "style:") {
         return Some(ExplicitDirective::Profile {
             class: ProjectedContextClass::AssistantProfile,
             slot: "style",
             body,
         });
     }
-    if let Some(body) = directive_body(line, "assistant workflow:") {
-        return Some(ExplicitDirective::Profile {
-            class: ProjectedContextClass::AssistantProfile,
-            slot: "workflow",
-            body,
-        });
-    }
-    if let Some(body) = directive_body(line, "assistant default:") {
-        return Some(ExplicitDirective::Profile {
-            class: ProjectedContextClass::AssistantProfile,
-            slot: "defaults",
-            body,
-        });
-    }
-    if let Some(body) = directive_body(line, "user preferences:") {
+    if let Some(body) = directive_body(line, "preferences:") {
         return Some(ExplicitDirective::Profile {
             class: ProjectedContextClass::UserProfile,
             slot: "preferences",
-            body,
-        });
-    }
-    if let Some(body) = directive_body(line, "user standing requests:") {
-        return Some(ExplicitDirective::Profile {
-            class: ProjectedContextClass::UserProfile,
-            slot: "standing_requests",
             body,
         });
     }
@@ -1995,6 +1973,12 @@ fn sort_profiles(class: ProjectedContextClass, items: &mut [ContextItem], scopes
     });
 }
 
+fn supported_profile_item_slot(class: ProjectedContextClass, item: &ContextItem) -> bool {
+    item.slot
+        .as_deref()
+        .is_some_and(|slot| profile_slot_is_supported(class, slot))
+}
+
 fn budget_for_class(
     request: &PrivateContextProjectionRequest,
     class: ProjectedContextClass,
@@ -2658,7 +2642,7 @@ mod tests {
             .expect("store");
         let request = record_request_for(
             8,
-            "remember: Use sqlx migrations carefully.\n- ASSISTANT STYLE: Be exact.\n* user preferences: Prefer terse status.",
+            "remember: Use sqlx migrations carefully.\n- STYLE: Be exact.\n* preferences: Prefer terse status.",
             "remember: assistant text must not write memory.",
             None,
         );
@@ -2679,14 +2663,14 @@ mod tests {
             .show_profile(ProjectedContextClass::AssistantProfile, "global", "style")
             .await
             .expect("assistant profile")
-            .expect("assistant style");
+            .expect("style profile");
         assert_eq!(assistant.body, "Be exact.");
         assert_eq!(assistant.source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
         let user = store
             .show_profile(ProjectedContextClass::UserProfile, "global", "preferences")
             .await
             .expect("user profile")
-            .expect("user preferences");
+            .expect("preferences profile");
         assert_eq!(user.body, "Prefer terse status.");
 
         let operations = store.operation_log(None).await.expect("operations");
@@ -2703,27 +2687,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorder_remember_that_creates_durable_memory() {
+    async fn recorder_ignores_retired_directive_prefixes() {
         let temp_dir = tempdir().expect("temp dir");
         let store = PrivateContextStore::open(temp_dir.path())
             .await
             .expect("store");
+        let request = record_request_for(
+            18,
+            "remember that alpha uses sqlite WAL\nassistant style: Be terse.\nassistant workflow: First workflow.\nassistant default: Explain tradeoffs.\nuser preferences: Prefer terse status.\nuser standing requests: Pause before broad changes.",
+            "ok",
+            None,
+        );
 
         store
-            .record_turn(
-                "lionclaw-private-context",
-                &record_request_for(18, "remember that alpha uses sqlite WAL", "ok", None),
-            )
+            .record_turn("lionclaw-private-context", &request)
             .await
             .expect("record turn");
 
-        let memories = store
-            .list_memory(Some("global"), None)
-            .await
-            .expect("memories");
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].body, "alpha uses sqlite WAL");
-        assert_eq!(memories[0].source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
+        assert_eq!(count_rows(&store, "recorded_turns").await, 1);
+        assert_eq!(count_rows(&store, "context_items").await, 0);
+        assert_eq!(count_rows(&store, "operation_log").await, 0);
     }
 
     #[tokio::test]
@@ -2735,14 +2718,14 @@ mod tests {
         store
             .record_turn(
                 "lionclaw-private-context",
-                &record_request_for(19, "assistant workflow: First workflow.", "ok", None),
+                &record_request_for(19, "style: First style.", "ok", None),
             )
             .await
             .expect("first record");
         store
             .record_turn(
                 "lionclaw-private-context",
-                &record_request_for(20, "assistant workflow: Second workflow.", "ok", None),
+                &record_request_for(20, "style: Second style.", "ok", None),
             )
             .await
             .expect("second record");
@@ -2752,20 +2735,16 @@ mod tests {
             .await
             .expect("profiles");
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].body, "Second workflow.");
+        assert_eq!(profiles[0].body, "Second style.");
         assert_eq!(profiles[0].revision, 2);
 
         let history = store
-            .profile_history(
-                ProjectedContextClass::AssistantProfile,
-                "global",
-                "workflow",
-            )
+            .profile_history(ProjectedContextClass::AssistantProfile, "global", "style")
             .await
             .expect("history");
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].body, "First workflow.");
-        assert_eq!(history[1].body, "Second workflow.");
+        assert_eq!(history[0].body, "First style.");
+        assert_eq!(history[1].body, "Second style.");
     }
 
     #[tokio::test]
@@ -2776,8 +2755,8 @@ mod tests {
             .expect("store");
         let request = record_request_for(
             9,
-            "Please remember: this is not line-start grammar.\nI like deterministic tests.\nassistant style maybe terse.",
-            "assistant style: assistant text is ignored.",
+            "Please remember: this is not line-start grammar.\nI like deterministic tests.\nstyle maybe terse.",
+            "style: assistant text is ignored.",
             None,
         );
 
@@ -2989,6 +2968,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_profile_slots_are_hidden_from_lists_and_projection() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .set_profile(
+                ProjectedContextClass::AssistantProfile,
+                "global",
+                "style",
+                "Use current style.",
+            )
+            .await
+            .expect("profile");
+        let now = now_timestamp();
+        sqlx::query(
+            r#"
+            INSERT INTO context_items (
+                id, class, scope, slot, title, body, tags, priority, pinned,
+                created_at, updated_at, deleted_at, revision, source_kind
+            )
+            VALUES (
+                'pcx_unsupported_profile', 'assistant_profile', 'global', 'workflow',
+                NULL, 'Retired workflow.', '[]', 0, 0, ?, ?, NULL, 1,
+                'explicit_operator'
+            )
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&store.pool)
+        .await
+        .expect("insert unsupported profile");
+
+        let profiles = store
+            .list_profiles(ProjectedContextClass::AssistantProfile, Some("global"))
+            .await
+            .expect("profiles");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].slot.as_deref(), Some("style"));
+
+        let projection = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(&[ProjectedContextClass::AssistantProfile], None, None),
+            )
+            .await
+            .expect("projection");
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(projection.items[0].text, "global style: Use current style.");
+    }
+
+    #[tokio::test]
     async fn memory_search_requires_fts_match() {
         let temp_dir = tempdir().expect("temp dir");
         let store = PrivateContextStore::open(temp_dir.path())
@@ -3085,7 +3117,7 @@ mod tests {
             .set_profile(
                 ProjectedContextClass::AssistantProfile,
                 "global",
-                "identity",
+                "style",
                 "Global assistant.",
             )
             .await
@@ -3094,7 +3126,7 @@ mod tests {
             .set_profile(
                 ProjectedContextClass::AssistantProfile,
                 "project:alpha",
-                "identity",
+                "style",
                 "Project assistant.",
             )
             .await
@@ -3143,8 +3175,8 @@ mod tests {
             .filter(|item| item.class == ProjectedContextClass::AssistantProfile)
             .map(|item| item.text.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(profile_texts[0], "global identity: Global assistant.");
-        assert_eq!(profile_texts[1], "project identity: Project assistant.");
+        assert_eq!(profile_texts[0], "global style: Global assistant.");
+        assert_eq!(profile_texts[1], "project style: Project assistant.");
 
         let memory_texts = projection
             .items

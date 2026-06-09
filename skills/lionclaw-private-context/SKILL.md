@@ -21,12 +21,8 @@ committed turns for episodic recall, and create durable profile or memory record
 only from manual operator commands or explicit user directive lines:
 
 - `remember: <text>`
-- `remember that <text>`
-- `assistant style: <text>`
-- `assistant workflow: <text>`
-- `assistant default: <text>`
-- `user preferences: <text>`
-- `user standing requests: <text>`
+- `style: <text>`
+- `preferences: <text>`
 
 The skill must stay deterministic: no model calls, no embeddings, no runtime DB
 access, no LionClaw core DB reads, and no hidden transport or channel logic.
