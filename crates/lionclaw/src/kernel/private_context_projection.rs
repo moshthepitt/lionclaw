@@ -502,7 +502,7 @@ fn provenance_supported(
                 || provenance
                     .event_id
                     .as_deref()
-                    .is_some_and(valid_projector_record_handle)
+                    .is_some_and(valid_session_turn_event_id)
         }
         ProjectedContextProvenanceSource::CompactionSummary => {
             let Some(sequence_no) = provenance.sequence_no else {
@@ -538,6 +538,13 @@ fn valid_projector_record_handle(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_graphic() && !byte.is_ascii_whitespace() && byte != b'/' && byte != b'\\'
         })
+}
+
+fn valid_session_turn_event_id(value: &str) -> bool {
+    let Some((session_id, turn_id)) = value.split_once(':') else {
+        return false;
+    };
+    Uuid::parse_str(session_id).is_ok() && Uuid::parse_str(turn_id).is_ok()
 }
 
 #[cfg(test)]
@@ -815,6 +822,27 @@ mod tests {
             .expect("event-backed session turn provenance is valid");
         assert_eq!(valid.items.len(), 1);
         assert_eq!(valid.classes[0].accepted_item_count, 1);
+    }
+
+    #[test]
+    fn validation_rejects_session_turn_with_malformed_event_id_outside_source_range() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![ProjectedContextItem {
+                provenance: vec![session_turn_event_provenance(5, "not-a-session-turn-id")],
+                ..projected_context_item("remember this")
+            }],
+        );
+
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("malformed event id is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
     }
 
     #[test]
