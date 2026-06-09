@@ -13,7 +13,8 @@ skill with the regular LionClaw skill installer:
 
 ```bash
 cargo build --workspace --bins
-target/debug/lionclaw skill install skills/lionclaw-private-context --alias lionclaw-private-context
+export LIONCLAW_BIN=target/debug/lionclaw
+"$LIONCLAW_BIN" skill install skills/lionclaw-private-context --alias lionclaw-private-context
 ```
 
 Enable it in the selected LionClaw home or project instance config:
@@ -26,7 +27,7 @@ projector_skill = "lionclaw-private-context"
 Then start the normal interactive path:
 
 ```bash
-target/debug/lionclaw run
+"$LIONCLAW_BIN" run
 ```
 
 For Codex-backed runtimes, LionClaw projects the runtime skill as a standard
@@ -61,29 +62,30 @@ slots are `identity`, `preferences`, `environment`, `working_style`, and
 `standing_requests`.
 
 ```bash
-export LIONCLAW_SKILL_STATE_DIR=/path/to/lionclaw/skill-state/lionclaw-private-context
+export LIONCLAW_PRIVATE_CONTEXT_SKILL=.lionclaw/instances/main/skills/lionclaw-private-context
+export LIONCLAW_SKILL_STATE_DIR=.lionclaw/instances/main/config/skill-state/lionclaw-private-context
 
-skills/lionclaw-private-context/scripts/context profile assistant set style \
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant set style \
   "Prefer concise, concrete answers."
-skills/lionclaw-private-context/scripts/context profile user set preferences \
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" profile user set preferences \
   "The operator prefers direct status updates."
-skills/lionclaw-private-context/scripts/context profile assistant list
-skills/lionclaw-private-context/scripts/context profile assistant history style
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant list
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant history style
 ```
 
 Memory records are also explicit operator writes. They can be searched, listed,
 updated, deleted, and inspected through history.
 
 ```bash
-skills/lionclaw-private-context/scripts/context memory remember \
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" memory remember \
   "The project uses issue-136 for the private context skill." \
   --title "Issue marker" \
   --tag lionclaw \
   --priority 10 \
   --pinned
-skills/lionclaw-private-context/scripts/context memory search "private context issue"
-skills/lionclaw-private-context/scripts/context memory list --limit 20
-skills/lionclaw-private-context/scripts/context operations
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" memory search "private context issue"
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" memory list --limit 20
+"$LIONCLAW_PRIVATE_CONTEXT_SKILL/scripts/context" operations
 ```
 
 The recorder can also create durable records from explicit user directive lines

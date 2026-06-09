@@ -269,19 +269,23 @@ Expected:
 
 ## Phase 5: Private Context Skill Acceptance
 
-Exercise the bundled first-party private-context skill with an install-shaped
-skill directory:
+Exercise the bundled first-party private-context skill through the regular
+installer and LionClaw-managed skill state:
 
 ```bash
 cd "$PROJ_A"
 export LIONCLAW_REPO_ROOT=$(cd "$(dirname "$LIONCLAW_BIN")/../.." && pwd)
-export QA_PRIVATE_CONTEXT_SKILL=/tmp/lionclaw-live-$QA_STAMP-private-context-skill
-export QA_PRIVATE_CONTEXT_STATE=/tmp/lionclaw-live-$QA_STAMP-private-context-state
-rm -rf "$QA_PRIVATE_CONTEXT_SKILL" "$QA_PRIVATE_CONTEXT_STATE"
-cargo build --manifest-path "$LIONCLAW_REPO_ROOT/Cargo.toml" -p lionclaw-private-context
-cp -R "$LIONCLAW_REPO_ROOT/skills/lionclaw-private-context" "$QA_PRIVATE_CONTEXT_SKILL"
-mkdir -p "$QA_PRIVATE_CONTEXT_SKILL/bin"
-cp "$LIONCLAW_REPO_ROOT/target/debug/lionclaw-private-context" "$QA_PRIVATE_CONTEXT_SKILL/bin/"
+cargo build --manifest-path "$LIONCLAW_REPO_ROOT/Cargo.toml" --workspace --bins
+"$LIONCLAW_BIN" skill install \
+  "$LIONCLAW_REPO_ROOT/skills/lionclaw-private-context" \
+  --alias lionclaw-private-context
+cat >> .lionclaw/instances/main/config/lionclaw.toml <<'EOF'
+
+[private_context]
+projector_skill = "lionclaw-private-context"
+EOF
+export QA_PRIVATE_CONTEXT_SKILL=.lionclaw/instances/main/skills/lionclaw-private-context
+export QA_PRIVATE_CONTEXT_STATE=.lionclaw/instances/main/config/skill-state/lionclaw-private-context
 export LIONCLAW_SKILL_STATE_DIR="$QA_PRIVATE_CONTEXT_STATE"
 "$QA_PRIVATE_CONTEXT_SKILL/scripts/context" profile assistant set style \
   "For QA private context marker prompts, reply exactly PRIVATE_CONTEXT_PROFILE_OK."
@@ -300,16 +304,13 @@ PRIVATE_CONTEXT_MEMORY_ID=$(
 "$QA_PRIVATE_CONTEXT_SKILL/scripts/context" operations --item-id "$PRIVATE_CONTEXT_MEMORY_ID"
 ```
 
-Install and activate the skill for the project instance:
+Check the installed skill snapshot and activation:
 
 ```bash
-"$LIONCLAW_BIN" skill install "$QA_PRIVATE_CONTEXT_SKILL" \
-  --alias lionclaw-private-context
-cat >> .lionclaw/instances/main/config/lionclaw.toml <<'EOF'
-
-[private_context]
-projector_skill = "lionclaw-private-context"
-EOF
+test -x "$QA_PRIVATE_CONTEXT_SKILL/bin/lionclaw-private-context"
+test -x "$QA_PRIVATE_CONTEXT_SKILL/scripts/projector"
+test -x "$QA_PRIVATE_CONTEXT_SKILL/scripts/recorder"
+test -f "$QA_PRIVATE_CONTEXT_SKILL/runtime/lionclaw-private-context/SKILL.md"
 "$LIONCLAW_BIN" doctor
 ```
 
@@ -326,7 +327,7 @@ EOF
 Expected:
 
 - the context script creates a host-only SQLite store under
-  `$QA_PRIVATE_CONTEXT_STATE`
+  `.lionclaw/instances/main/config/skill-state/lionclaw-private-context`
 - profile, memory, history, search, and operations commands return JSON
 - memory search returns the explicit memory for matching input and does not
   return unrelated records
