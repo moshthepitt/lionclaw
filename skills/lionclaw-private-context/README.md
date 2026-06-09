@@ -6,11 +6,34 @@ records in host-only state, then projects selected context through LionClaw's
 existing private-context projector boundary. It also records bounded committed
 turns for deterministic episodic recall.
 
-## Enable
+## Install And Enable
+
+From a LionClaw source checkout, build the bundled binaries and install the
+skill with the regular LionClaw skill installer:
+
+```bash
+cargo build --workspace --bins
+target/debug/lionclaw skill install skills/lionclaw-private-context --alias lionclaw-private-context
+```
+
+Enable it in the selected LionClaw home or project instance config:
 
 ```toml
 [private_context]
 projector_skill = "lionclaw-private-context"
+```
+
+Then start the normal interactive path:
+
+```bash
+target/debug/lionclaw run
+```
+
+For Codex-backed runtimes, LionClaw projects the runtime skill as a standard
+Codex skill. Invoke it inside the runtime with:
+
+```text
+$lionclaw-private-context
 ```
 
 The skill-owned operator command is `scripts/context`. It expects
@@ -80,6 +103,17 @@ Directive parsing is exact, line-oriented, and case-insensitive at the prefix.
 One leading Markdown bullet marker, `- ` or `* `, is allowed. Assistant text is
 stored as part of the bounded episode but never creates durable profile or
 memory records.
+
+Inside the runtime, use `$lionclaw-private-context` when you want help checking
+what context was projected or when you want the agent to help phrase a durable
+directive. To persist a new fact, preference, or standing request, send the
+directive line as the user. For example:
+
+```text
+remember that the private context issue is tracked as issue 136
+user preferences: Prefer concise implementation updates while work is in flight.
+assistant workflow: Pause before broad changes and choose the smallest clean design.
+```
 
 Use `--scope global` for global records or `--scope project:<scope-id>` for a
 project-specific record. Project-scoped projections include global records and

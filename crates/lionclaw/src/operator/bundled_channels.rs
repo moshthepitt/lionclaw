@@ -175,6 +175,11 @@ mod tests {
             include_str!("../../../../skills/lionclaw-private-context/scripts/recorder")
                 .contains(private_context.installed_path)
         );
+        let private_context_runtime = include_str!(
+            "../../../../skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md"
+        );
+        assert!(private_context_runtime.contains("name: lionclaw-private-context"));
+        assert!(private_context_runtime.contains("$lionclaw-private-context"));
     }
 
     #[test]
