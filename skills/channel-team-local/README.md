@@ -19,10 +19,9 @@ The same binary backs the runtime-facing `runtime/team-local/scripts/list`,
 `runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
 helpers for sender-side team discovery and messages. The send helper resolves
 routes from the projected inventory and forwards provider-neutral text, format
-hints, reply refs, and `/runtime` attachments to the audited `channel.send`
-bridge. Its attachment option is path-only; the kernel derives the delivered
-filename and media type from the runtime file when it prepares the channel-send
-attachment.
+hints, and `/runtime` attachments to the audited `channel.send` bridge. Its
+attachment option is path-only; the kernel derives the delivered filename and
+media type from the runtime file when it prepares the channel-send attachment.
 
 The worker is a separate Rust workspace crate named
 `lionclaw-channel-team-local`; it does not depend on the `lionclaw` crate.
@@ -56,6 +55,11 @@ target daemon is `lionclawd` with the expected home id and canonical home path,
 preflights `/v0/channels/authorize`, then posts inbound events and attachments
 to the target daemon. Attachment bytes move through the existing attachment
 stage/finalize endpoints.
+
+Team-local is address-only: explicit sends target instance names rather than
+provider message threads. If a local outbox delivery contains a reply ref, the
+worker reports a terminal `unsupported_reply_ref` failure and does not post it
+to the target instance.
 
 ## Manual QA
 
