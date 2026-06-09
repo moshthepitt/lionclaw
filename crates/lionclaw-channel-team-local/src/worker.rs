@@ -157,6 +157,10 @@ impl TeamLocalWorker {
         delivery: &ChannelOutboxDelivery,
         worker_id: &str,
     ) -> Result<Value, DeliveryResult> {
+        if let Some(receipt) = reply_ref_ignored_receipt(delivery) {
+            return Ok(receipt);
+        }
+
         let route = parse_delivery_route(&delivery.conversation_ref)
             .map_err(|err| terminal("invalid_route", err))?;
         let target = discovery.member_for_route(&route).ok_or_else(|| {
@@ -478,6 +482,21 @@ fn non_empty_text(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_string())
 }
 
+fn reply_ref_ignored_receipt(delivery: &ChannelOutboxDelivery) -> Option<Value> {
+    let reply_to_ref = delivery
+        .reply_to_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "provider": CHANNEL_ID,
+        "outcome": "reply_ref_ignored",
+        "reason": "team-local delivers addressed messages only",
+        "delivery_id": delivery.delivery_id,
+        "reply_to_ref": reply_to_ref,
+    }))
+}
+
 fn retryable(code: &'static str, err: anyhow::Error) -> DeliveryResult {
     DeliveryResult::RetryableFailed {
         code,
@@ -621,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_preserves_thread_and_reply_refs() {
+    async fn delivery_preserves_thread_ref() {
         let fixture = TeamLocalFixture::new().await;
         let target_state = Arc::new(TargetState {
             info: fixture.target_info(),
@@ -632,12 +651,7 @@ mod tests {
         fixture.write_target_bind(&target_url);
         let local_state = Arc::new(LocalState::with_delivery(
             fixture.local_info(),
-            outbox_delivery_with_refs(
-                &fixture.target_home_id,
-                None,
-                Some("thread-alpha"),
-                Some("reply-bravo"),
-            ),
+            outbox_delivery_with_refs(&fixture.target_home_id, None, Some("thread-alpha"), None),
         ));
         let local_url = spawn_local_server(local_state.clone()).await;
 
@@ -652,15 +666,46 @@ mod tests {
         assert_eq!(authorize["thread_ref"], "thread-alpha");
         let inbound = only_request(&target_state.inbound_requests).await;
         assert_eq!(inbound["thread_ref"], "thread-alpha");
-        assert_eq!(inbound["reply_to_ref"], "reply-bravo");
         assert_eq!(
             inbound["provider_metadata"]["sender_thread_ref"],
             "thread-alpha"
         );
+        assert!(inbound["reply_to_ref"].is_null());
+        assert!(inbound["provider_metadata"]["sender_reply_to_ref"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reply_ref_delivery_is_reported_delivered_without_target_inbound() {
+        let fixture = TeamLocalFixture::new().await;
+        let target_state = Arc::new(TargetState {
+            info: fixture.target_info(),
+            inbound_outcomes: vec!["queued"],
+            ..TargetState::default()
+        });
+        let _target_url = spawn_target_server(target_state.clone()).await;
+        let local_state = Arc::new(LocalState::with_delivery(
+            fixture.local_info(),
+            outbox_delivery_with_refs(&fixture.target_home_id, None, None, Some("source-message")),
+        ));
+        let local_url = spawn_local_server(local_state.clone()).await;
+
+        let mut last_health_report = None;
+        TeamLocalWorker::new(fixture.worker_config(local_url))
+            .expect("worker")
+            .tick(&mut last_health_report)
+            .await
+            .expect("tick");
+
+        assert!(target_state.authorize_requests.lock().await.is_empty());
+        assert!(target_state.inbound_requests.lock().await.is_empty());
+        let report = only_request(&local_state.reports).await;
+        assert_eq!(report["outcome"], "delivered");
+        assert_eq!(report["provider_receipt"]["outcome"], "reply_ref_ignored");
         assert_eq!(
-            inbound["provider_metadata"]["sender_reply_to_ref"],
-            "reply-bravo"
+            report["provider_receipt"]["reason"],
+            "team-local delivers addressed messages only"
         );
+        assert_eq!(report["provider_receipt"]["reply_to_ref"], "source-message");
     }
 
     #[tokio::test]

@@ -92,6 +92,14 @@ fn send_message(config: SendConfig, message: String) -> Result<SendSummary> {
     if message.trim().is_empty() && config.attachments.is_empty() {
         bail!("team-local send message or attachment is required");
     }
+    if config
+        .reply_to_ref
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        bail!("team-local does not support reply refs; send an addressed message to the instance instead");
+    }
 
     let recipients = unique_recipients(&config.recipients)?;
     let attachments = validate_attachments(&config.attachments)?;
@@ -349,6 +357,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixListener,
+        path::{Path, PathBuf},
         thread,
     };
 
@@ -450,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_format_reply_ref_and_runtime_attachments() {
+    fn sends_format_and_runtime_attachments() {
         let temp_dir = tempdir().expect("temp dir");
         let socket = temp_dir.path().join("channel-send.sock");
         let listener = UnixListener::bind(&socket).expect("listener");
@@ -474,7 +483,63 @@ mod tests {
             request
         });
 
-        let inventory = temp_dir.path().join("instances.json");
+        let inventory = write_single_recipient_inventory(temp_dir.path());
+
+        let summary = send_message(
+            SendConfig {
+                self_instance: "main".to_string(),
+                instances_file: inventory,
+                channel_send_socket: socket,
+                recipients: vec!["reviewer".to_string()],
+                message: None,
+                format_hint: "html".to_string(),
+                attachments: vec![SendAttachmentConfig {
+                    path: "/runtime/output/report.html".to_string(),
+                }],
+                reply_to_ref: None,
+                idempotency_key: Some("turn-1".to_string()),
+            },
+            String::new(),
+        )
+        .expect("send");
+
+        assert!(summary.ok);
+        let request = server.join().expect("server");
+        assert!(request.get("reply_to_ref").is_none());
+        assert_eq!(request["content"]["text"], "");
+        assert_eq!(request["content"]["format_hint"], "html");
+        assert_eq!(
+            request["content"]["attachments"][0]["path"],
+            "/runtime/output/report.html"
+        );
+    }
+
+    #[test]
+    fn rejects_reply_refs() {
+        let temp_dir = tempdir().expect("temp dir");
+        let inventory = write_single_recipient_inventory(temp_dir.path());
+
+        let err = send_message(
+            SendConfig {
+                self_instance: "main".to_string(),
+                instances_file: inventory,
+                channel_send_socket: temp_dir.path().join("missing.sock"),
+                recipients: vec!["reviewer".to_string()],
+                message: None,
+                format_hint: "markdown".to_string(),
+                attachments: Vec::new(),
+                reply_to_ref: Some("source-message".to_string()),
+                idempotency_key: Some("turn-1".to_string()),
+            },
+            "reply".to_string(),
+        )
+        .expect_err("team-local is address-only");
+
+        assert!(err.to_string().contains("does not support reply refs"));
+    }
+
+    fn write_single_recipient_inventory(root: &Path) -> PathBuf {
+        let inventory = root.join("instances.json");
         std::fs::write(
             &inventory,
             json!({
@@ -495,34 +560,7 @@ mod tests {
             .to_string(),
         )
         .expect("inventory");
-
-        let summary = send_message(
-            SendConfig {
-                self_instance: "main".to_string(),
-                instances_file: inventory,
-                channel_send_socket: socket,
-                recipients: vec!["reviewer".to_string()],
-                message: None,
-                format_hint: "html".to_string(),
-                attachments: vec![SendAttachmentConfig {
-                    path: "/runtime/output/report.html".to_string(),
-                }],
-                reply_to_ref: Some("source-message".to_string()),
-                idempotency_key: Some("turn-1".to_string()),
-            },
-            String::new(),
-        )
-        .expect("send");
-
-        assert!(summary.ok);
-        let request = server.join().expect("server");
-        assert_eq!(request["reply_to_ref"], "source-message");
-        assert_eq!(request["content"]["text"], "");
-        assert_eq!(request["content"]["format_hint"], "html");
-        assert_eq!(
-            request["content"]["attachments"][0]["path"],
-            "/runtime/output/report.html"
-        );
+        inventory
     }
 
     #[test]
