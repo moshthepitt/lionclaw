@@ -1,6 +1,6 @@
 ---
 name: team-local
-description: Use this skill when asked to communicate with another local LionClaw project instance, teammate, reviewer, QA instance, or sibling agent through team-local. Use it to list reachable instances, resolve routes, and send acknowledgments, questions, results, or /runtime attachments via the LionClaw channel-send bridge.
+description: Use this skill when asked to communicate with another local LionClaw project instance, teammate, reviewer, QA instance, or sibling agent through team-local. Use it to list reachable instances, resolve routes, and send requested questions, results, updates, or /runtime attachments via the LionClaw channel-send bridge.
 compatibility: Requires a LionClaw project-instance program-backed runtime with projected inventory and the channel-send bridge.
 ---
 
