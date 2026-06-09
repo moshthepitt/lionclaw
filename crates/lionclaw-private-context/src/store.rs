@@ -961,7 +961,7 @@ impl PrivateContextStore {
             return Ok(false);
         }
         let turn = recorded_turn_from_request(&private_context_id, request)?;
-        let directives = explicit_directives(request.transcript.user_text());
+        let directives = explicit_directives(&turn.user_text);
         let now = turn.recorded_at.clone();
         let mut tx = self.pool.begin().await?;
         if recorded_turn_exists(&mut tx, &turn).await? {
@@ -2803,6 +2803,28 @@ mod tests {
             "remember: assistant directives are not durable writes.",
             None,
         );
+
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn");
+
+        assert_eq!(count_rows(&store, "recorded_turns").await, 1);
+        assert_eq!(count_rows(&store, "context_items").await, 0);
+        assert_eq!(count_rows(&store, "operation_log").await, 0);
+    }
+
+    #[tokio::test]
+    async fn recorder_ignores_directives_outside_recorded_user_text_cap() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let user_text = format!(
+            "{}\nremember: directives outside the recorded cap must not write.",
+            "x".repeat(MAX_RECORDED_USER_TEXT_BYTES)
+        );
+        let request = record_request_for(22, &user_text, "ok", None);
 
         store
             .record_turn("lionclaw-private-context", &request)
