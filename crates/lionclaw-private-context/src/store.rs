@@ -2156,7 +2156,7 @@ fn memory_match_provenance(
         MemoryProjectionMatch::Recorded(item) => ProjectedContextProvenance {
             source: ProjectedContextProvenanceSource::SessionTurn,
             sequence_no: Some(item.turn.sequence_no),
-            event_id: None,
+            event_id: Some(format!("{}:{}", item.turn.session_id, item.turn.turn_id)),
             projector_id: None,
             record_id: None,
             revision: None,
@@ -2636,6 +2636,7 @@ mod tests {
             ProjectedContextProvenanceSource::SessionTurn
         );
         assert_eq!(projection.items[0].provenance[0].sequence_no, Some(11));
+        assert!(projection.items[0].provenance[0].event_id.is_some());
     }
 
     #[tokio::test]

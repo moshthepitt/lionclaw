@@ -486,7 +486,7 @@ fn provenance_supported(
             let Some(sequence_no) = provenance.sequence_no else {
                 return false;
             };
-            sources.iter().any(|source| match source {
+            let request_source_match = sources.iter().any(|source| match source {
                 PrivateContextSourceRef::SessionTurnRange {
                     limit,
                     sequence_nos,
@@ -497,7 +497,12 @@ fn provenance_supported(
                         && sequence_nos.contains(&sequence_no)
                 }
                 PrivateContextSourceRef::CompactionSummary { .. } => false,
-            })
+            });
+            request_source_match
+                || provenance
+                    .event_id
+                    .as_deref()
+                    .is_some_and(valid_projector_record_handle)
         }
         ProjectedContextProvenanceSource::CompactionSummary => {
             let Some(sequence_no) = provenance.sequence_no else {
@@ -792,6 +797,27 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_session_turn_with_stable_event_id_outside_source_range() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![ProjectedContextItem {
+                provenance: vec![session_turn_event_provenance(
+                    5,
+                    "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+                )],
+                ..projected_context_item("remember this")
+            }],
+        );
+
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("event-backed session turn provenance is valid");
+        assert_eq!(valid.items.len(), 1);
+        assert_eq!(valid.classes[0].accepted_item_count, 1);
+    }
+
+    #[test]
     fn validation_rejects_missing_provenance_sequence() {
         let request = request_with_session_turn_source();
         let projection = projection_with_items(
@@ -1044,6 +1070,16 @@ mod tests {
             projector_id: None,
             record_id: None,
             revision: None,
+        }
+    }
+
+    fn session_turn_event_provenance(
+        sequence_no: u64,
+        event_id: &str,
+    ) -> ProjectedContextProvenance {
+        ProjectedContextProvenance {
+            event_id: Some(event_id.to_string()),
+            ..session_turn_provenance(sequence_no)
         }
     }
 
