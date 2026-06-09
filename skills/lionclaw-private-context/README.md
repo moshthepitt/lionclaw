@@ -3,7 +3,8 @@
 `lionclaw-private-context` is LionClaw's bundled first-party private-context
 skill. It stores explicit local assistant profile, user profile, and memory
 records in host-only state, then projects selected context through LionClaw's
-existing private-context projector boundary.
+existing private-context projector boundary. It also records bounded committed
+turns for deterministic episodic recall.
 
 ## Enable
 
@@ -20,11 +21,14 @@ The projector entrypoint is declared in `lionclaw.toml`:
 ```toml
 [private_context_projector]
 command = "scripts/projector"
+
+[private_context_recorder]
+command = "scripts/recorder"
 ```
 
-LionClaw starts the projector as a host process and passes the skill state
-directory through `LIONCLAW_SKILL_STATE_DIR`. Runtimes never receive direct
-access to the SQLite store.
+LionClaw starts the projector and recorder as host processes and passes the
+skill state directory through `LIONCLAW_SKILL_STATE_DIR`. Runtimes never receive
+direct access to the SQLite store.
 
 ## Operator Commands
 
@@ -59,6 +63,24 @@ skills/lionclaw-private-context/scripts/context memory list --limit 20
 skills/lionclaw-private-context/scripts/context operations
 ```
 
+The recorder can also create durable records from explicit user directive lines
+in committed turns:
+
+```text
+remember: <text>
+remember that <text>
+assistant style: <text>
+assistant workflow: <text>
+assistant default: <text>
+user preferences: <text>
+user standing requests: <text>
+```
+
+Directive parsing is exact, line-oriented, and case-insensitive at the prefix.
+One leading Markdown bullet marker, `- ` or `* `, is allowed. Assistant text is
+stored as part of the bounded episode but never creates durable profile or
+memory records.
+
 Use `--scope global` for global records or `--scope project:<scope-id>` for a
 project-specific record. Project-scoped projections include global records and
 exactly matching project records; profile projection orders global before
@@ -77,6 +99,7 @@ matching records. Priority, BM25 rank, update time, and stable id provide
 deterministic ordering after scope and pinning.
 
 The store keeps a WAL-mode SQLite database under the skill state directory with
-current records, revision history, FTS indexes, metadata, and an operation log.
-Operation log entries intentionally record metadata only; they do not store
-profile bodies, memory bodies, titles, tags, prompt text, or runtime output.
+current records, revision history, recorded turns, FTS indexes, metadata, and an
+operation log. Operation log entries intentionally record metadata only; they do
+not store profile bodies, memory bodies, titles, tags, transcript bodies, prompt
+text, or runtime output.

@@ -157,12 +157,22 @@ mod tests {
             private_context.installed_path,
             "bin/lionclaw-private-context"
         );
+        let private_context_metadata =
+            include_str!("../../../../skills/lionclaw-private-context/lionclaw.toml");
+        assert!(private_context_metadata.contains("[private_context_projector]"));
+        assert!(private_context_metadata.contains("command = \"scripts/projector\""));
+        assert!(private_context_metadata.contains("[private_context_recorder]"));
+        assert!(private_context_metadata.contains("command = \"scripts/recorder\""));
         assert!(
             include_str!("../../../../skills/lionclaw-private-context/scripts/projector")
                 .contains(private_context.installed_path)
         );
         assert!(
             include_str!("../../../../skills/lionclaw-private-context/scripts/context")
+                .contains(private_context.installed_path)
+        );
+        assert!(
+            include_str!("../../../../skills/lionclaw-private-context/scripts/recorder")
                 .contains(private_context.installed_path)
         );
     }
