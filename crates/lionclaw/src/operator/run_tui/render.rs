@@ -643,7 +643,7 @@ fn live_activity_lines(activity: &ActivitySummary) -> Vec<Line<'static>> {
     }
     if let Some(item) = activity.items.last() {
         lines.push(Line::styled(
-            format!("latest  {}", item.text),
+            format!("latest  {}", activity_display_text(&item.text)),
             Style::default().fg(PANEL_TEXT),
         ));
     }
@@ -1543,7 +1543,26 @@ pub(super) fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
         ActivityItemKind::Status => ("→", Style::default().fg(PANEL_MUTED)),
         ActivityItemKind::Error => ("!", Style::default().fg(PANEL_ERROR)),
     };
-    multiline_prefixed_lines(&format!("{icon}  "), "   ", style, &item.text)
+    let text = activity_display_text(&item.text);
+    multiline_prefixed_lines(&format!("{icon}  "), "   ", style, &text)
+}
+
+fn activity_display_text(text: &str) -> String {
+    let mut display = String::with_capacity(text.len());
+    let mut previous = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '-'
+            && previous.is_some_and(|previous: char| previous.is_ascii_alphabetic())
+            && chars.peek().is_some_and(|next| next.is_ascii_alphabetic())
+        {
+            display.push('‑');
+        } else {
+            display.push(ch);
+        }
+        previous = Some(ch);
+    }
+    display
 }
 
 fn audit_event_lines(event: &AuditEventItem) -> Vec<Line<'static>> {
