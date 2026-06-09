@@ -486,6 +486,11 @@ fn provenance_supported(
             let Some(sequence_no) = provenance.sequence_no else {
                 return false;
             };
+            let stable_event_id = match provenance.event_id.as_deref() {
+                Some(event_id) if valid_session_turn_event_id(event_id) => true,
+                Some(_) => return false,
+                None => false,
+            };
             let request_source_match = sources.iter().any(|source| match source {
                 PrivateContextSourceRef::SessionTurnRange {
                     limit,
@@ -498,11 +503,7 @@ fn provenance_supported(
                 }
                 PrivateContextSourceRef::CompactionSummary { .. } => false,
             });
-            request_source_match
-                || provenance
-                    .event_id
-                    .as_deref()
-                    .is_some_and(valid_session_turn_event_id)
+            request_source_match || stable_event_id
         }
         ProjectedContextProvenanceSource::CompactionSummary => {
             let Some(sequence_no) = provenance.sequence_no else {
@@ -832,6 +833,27 @@ mod tests {
             "test",
             vec![ProjectedContextItem {
                 provenance: vec![session_turn_event_provenance(5, "not-a-session-turn-id")],
+                ..projected_context_item("remember this")
+            }],
+        );
+
+        let valid = validate_private_context_projection(&request, "test", &projection)
+            .expect("malformed event id is class-scoped");
+        assert!(valid.items.is_empty());
+        assert_eq!(
+            valid.classes[0].reason.map(|reason| reason.as_str()),
+            Some("unsupported_provenance")
+        );
+    }
+
+    #[test]
+    fn validation_rejects_session_turn_with_malformed_event_id_inside_source_range() {
+        let request = request_with_session_turn_source();
+        let projection = projection_with_items(
+            request.request_id,
+            "test",
+            vec![ProjectedContextItem {
+                provenance: vec![session_turn_event_provenance(7, "not-a-session-turn-id")],
                 ..projected_context_item("remember this")
             }],
         );
