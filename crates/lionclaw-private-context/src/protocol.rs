@@ -38,6 +38,58 @@ pub(crate) struct PrivateContextProjectionRequest {
     pub sources: Vec<PrivateContextSourceRef>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PrivateContextRecordRequest {
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    pub sequence_no: u64,
+    pub runtime_id: String,
+    pub trust_tier: TrustTier,
+    pub history_policy: SessionHistoryPolicy,
+    pub surface: PrivateContextRecordSurface,
+    pub project_scope: Option<String>,
+    pub transcript: PrivateContextRecordTranscript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PrivateContextRecordSurface {
+    #[serde(rename = "program_turn")]
+    Program,
+    #[serde(rename = "attached_native_tui_turn")]
+    AttachedNativeTui,
+    #[serde(rename = "channel_turn")]
+    Channel,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PrivateContextRecordTranscript {
+    pub user: Option<PrivateContextRecordText>,
+    pub assistant: Option<PrivateContextRecordText>,
+}
+
+impl PrivateContextRecordTranscript {
+    pub(crate) fn user_text(&self) -> &str {
+        self.user.as_ref().map_or("", |text| text.text.as_str())
+    }
+
+    pub(crate) fn assistant_text(&self) -> &str {
+        self.assistant
+            .as_ref()
+            .map_or("", |text| text.text.as_str())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.user_text().trim().is_empty() && self.assistant_text().trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PrivateContextRecordText {
+    pub text: String,
+    pub included_bytes: usize,
+    pub original_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProjectedContextBudget {
     pub class: ProjectedContextClass,

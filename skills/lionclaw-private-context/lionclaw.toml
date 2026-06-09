@@ -2,3 +2,6 @@ version = 1
 
 [private_context_projector]
 command = "scripts/projector"
+
+[private_context_recorder]
+command = "scripts/recorder"

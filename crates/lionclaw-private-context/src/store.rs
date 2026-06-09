@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     fs,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -17,22 +18,27 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        PrivateContextProjection, PrivateContextProjectionRequest, ProjectedContextBudget,
-        ProjectedContextClass, ProjectedContextItem, ProjectedContextProvenance,
-        ProjectedContextProvenanceSource, TrustTier,
+        PrivateContextProjection, PrivateContextProjectionRequest, PrivateContextRecordRequest,
+        ProjectedContextBudget, ProjectedContextClass, ProjectedContextItem,
+        ProjectedContextProvenance, ProjectedContextProvenanceSource, TrustTier,
     },
     validation::{
-        cap_utf8, projection_scopes, required_profile_slots, validate_body, validate_limit,
-        validate_profile_slot, validate_query, validate_record_id, validate_scope, validate_tags,
-        validate_title, MAX_MEMORY_BODY_BYTES, MAX_PROFILE_BODY_BYTES,
+        audit_safe_visible_handle, cap_utf8, projection_scopes, required_profile_slots,
+        validate_body, validate_limit, validate_profile_slot, validate_query, validate_record_id,
+        validate_scope, validate_scope_id, validate_tags, validate_text_chars, validate_title,
+        MAX_MEMORY_BODY_BYTES, MAX_PROFILE_BODY_BYTES,
     },
 };
 
 const DB_FILE: &str = "lionclaw-private-context.sqlite3";
 const SOURCE_KIND_EXPLICIT_OPERATOR: &str = "explicit_operator";
+const SOURCE_KIND_EXPLICIT_TRANSCRIPT: &str = "explicit_transcript";
 const ACTOR_CONTEXT_CLI: &str = "context_cli";
+const ACTOR_RECORDER: &str = "recorder";
 const META_SCHEMA_VERSION: &str = "schema_version";
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
+const MAX_RECORDED_USER_TEXT_BYTES: usize = 16 * 1024;
+const MAX_RECORDED_ASSISTANT_TEXT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrivateContextStore {
@@ -80,6 +86,7 @@ pub(crate) struct ContextItemRevision {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
+    pub source_kind: String,
     pub recorded_at: String,
 }
 
@@ -105,6 +112,79 @@ pub(crate) struct MemoryPatch {
     pub tags: Option<Vec<String>>,
     pub priority: Option<i64>,
     pub pinned: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedTurn {
+    pub private_context_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub sequence_no: u64,
+    pub runtime_id: String,
+    pub scope: String,
+    pub user_text: String,
+    pub assistant_text: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteSource {
+    source_kind: SourceKind,
+    actor_surface: ActorSurface,
+}
+
+impl WriteSource {
+    fn context_cli() -> Self {
+        Self {
+            source_kind: SourceKind::ExplicitOperator,
+            actor_surface: ActorSurface::ContextCli,
+        }
+    }
+
+    fn recorder() -> Self {
+        Self {
+            source_kind: SourceKind::ExplicitTranscript,
+            actor_surface: ActorSurface::Recorder,
+        }
+    }
+
+    fn source_kind(self) -> &'static str {
+        self.source_kind.as_str()
+    }
+
+    fn actor_surface(self) -> &'static str {
+        self.actor_surface.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    ExplicitOperator,
+    ExplicitTranscript,
+}
+
+impl SourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitOperator => SOURCE_KIND_EXPLICIT_OPERATOR,
+            Self::ExplicitTranscript => SOURCE_KIND_EXPLICIT_TRANSCRIPT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorSurface {
+    ContextCli,
+    Recorder,
+}
+
+impl ActorSurface {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextCli => ACTOR_CONTEXT_CLI,
+            Self::Recorder => ACTOR_RECORDER,
+        }
+    }
 }
 
 impl MemoryPatch {
@@ -159,6 +239,8 @@ impl PrivateContextStore {
         .execute(&self.pool)
         .await?;
 
+        self.migrate_source_kind_constraints().await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS context_items (
@@ -175,7 +257,7 @@ impl PrivateContextStore {
                 updated_at TEXT NOT NULL,
                 deleted_at TEXT,
                 revision INTEGER NOT NULL,
-                source_kind TEXT NOT NULL CHECK (source_kind = 'explicit_operator'),
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
                 CHECK (
                     (
                         class IN ('assistant_profile', 'user_profile')
@@ -230,7 +312,7 @@ impl PrivateContextStore {
                 tags TEXT NOT NULL DEFAULT '[]',
                 priority INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
-                source_kind TEXT NOT NULL CHECK (source_kind = 'explicit_operator'),
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 deleted_at TEXT,
@@ -261,7 +343,7 @@ impl PrivateContextStore {
                 scope TEXT NOT NULL,
                 slot TEXT,
                 revision INTEGER NOT NULL,
-                source_kind TEXT NOT NULL CHECK (source_kind = 'explicit_operator'),
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
                 actor_surface TEXT NOT NULL,
                 recorded_at TEXT NOT NULL
             )
@@ -290,6 +372,49 @@ impl PrivateContextStore {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS recorded_turns (
+                private_context_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                runtime_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                user_text TEXT NOT NULL,
+                assistant_text TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY(private_context_id, session_id, turn_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS recorded_turns_scope_recorded_idx
+            ON recorded_turns (private_context_id, scope, recorded_at, sequence_no, turn_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS recorded_turns_fts
+            USING fts5(
+                private_context_id UNINDEXED,
+                session_id UNINDEXED,
+                turn_id UNINDEXED,
+                user_text,
+                assistant_text
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
             INSERT INTO meta (key, value)
             VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -303,6 +428,98 @@ impl PrivateContextStore {
         Ok(())
     }
 
+    async fn migrate_source_kind_constraints(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        rebuild_source_kind_table_if_needed(
+            &mut tx,
+            "context_items",
+            r#"
+            CREATE TABLE context_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                class TEXT NOT NULL CHECK (class IN ('assistant_profile', 'user_profile', 'memory')),
+                scope TEXT NOT NULL,
+                slot TEXT,
+                title TEXT,
+                body TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                priority INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                revision INTEGER NOT NULL,
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
+                CHECK (
+                    (
+                        class IN ('assistant_profile', 'user_profile')
+                        AND slot IS NOT NULL
+                        AND title IS NULL
+                        AND tags = '[]'
+                        AND priority = 0
+                        AND pinned = 0
+                    )
+                    OR (
+                        class = 'memory'
+                        AND slot IS NULL
+                    )
+                )
+            )
+            "#,
+            "id, class, scope, slot, title, body, tags, priority, pinned, created_at, updated_at, deleted_at, revision, source_kind",
+        )
+        .await?;
+        rebuild_source_kind_table_if_needed(
+            &mut tx,
+            "context_item_revisions",
+            r#"
+            CREATE TABLE context_item_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                operation TEXT NOT NULL,
+                class TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                slot TEXT,
+                title TEXT,
+                body TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                priority INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(item_id, revision)
+            )
+            "#,
+            "revision_id, item_id, revision, operation, class, scope, slot, title, body, tags, priority, pinned, source_kind, created_at, updated_at, deleted_at, recorded_at",
+        )
+        .await?;
+        rebuild_source_kind_table_if_needed(
+            &mut tx,
+            "operation_log",
+            r#"
+            CREATE TABLE operation_log (
+                operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                class TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                slot TEXT,
+                revision INTEGER NOT NULL,
+                source_kind TEXT NOT NULL CHECK (source_kind IN ('explicit_operator', 'explicit_transcript')),
+                actor_surface TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+            "#,
+            "operation_id, operation, item_id, class, scope, slot, revision, source_kind, actor_surface, recorded_at",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn set_profile(
         &self,
         class: ProjectedContextClass,
@@ -310,53 +527,18 @@ impl PrivateContextStore {
         slot: &str,
         body: &str,
     ) -> Result<ContextItem> {
-        let slot = validate_profile_slot(class, slot)?;
-        let scope = validate_scope(scope)?;
-        let body = validate_body("profile", body, MAX_PROFILE_BODY_BYTES)?;
         let now = now_timestamp();
         let mut tx = self.pool.begin().await?;
-        let existing = active_profile_row(&mut tx, class, &scope, &slot).await?;
-        let item = if let Some(existing) = existing {
-            let mut item = row_to_item(existing)?;
-            item.body = body;
-            item.updated_at = now.clone();
-            item.revision = item.revision.saturating_add(1);
-            sqlx::query(
-                r#"
-                UPDATE context_items
-                SET body = ?, updated_at = ?, revision = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(&item.body)
-            .bind(&item.updated_at)
-            .bind(item.revision)
-            .bind(&item.id)
-            .execute(&mut *tx)
-            .await?;
-            item
-        } else {
-            let item = ContextItem {
-                id: new_record_id(),
-                class,
-                scope,
-                slot: Some(slot),
-                title: None,
-                body,
-                tags: Vec::new(),
-                priority: 0,
-                pinned: false,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                deleted_at: None,
-                revision: 1,
-                source_kind: SOURCE_KIND_EXPLICIT_OPERATOR.to_string(),
-            };
-            insert_item(&mut tx, &item).await?;
-            item
-        };
-        record_revision(&mut tx, &item, "profile_set", &now).await?;
-        record_operation(&mut tx, &item, "profile_set", &now).await?;
+        let item = set_profile_in_tx(
+            &mut tx,
+            class,
+            scope,
+            slot,
+            body,
+            WriteSource::context_cli(),
+            &now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(item)
     }
@@ -442,21 +624,30 @@ impl PrivateContextStore {
         item.updated_at = now.clone();
         item.deleted_at = Some(now.clone());
         item.revision = item.revision.saturating_add(1);
+        item.source_kind = WriteSource::context_cli().source_kind().to_string();
         sqlx::query(
             r#"
             UPDATE context_items
-            SET updated_at = ?, deleted_at = ?, revision = ?
+            SET updated_at = ?, deleted_at = ?, revision = ?, source_kind = ?
             WHERE id = ?
             "#,
         )
         .bind(&item.updated_at)
         .bind(&item.deleted_at)
         .bind(item.revision)
+        .bind(&item.source_kind)
         .bind(&item.id)
         .execute(&mut *tx)
         .await?;
         record_revision(&mut tx, &item, "profile_delete", &now).await?;
-        record_operation(&mut tx, &item, "profile_delete", &now).await?;
+        record_operation(
+            &mut tx,
+            &item,
+            "profile_delete",
+            &now,
+            WriteSource::context_cli(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(item))
     }
@@ -494,32 +685,20 @@ impl PrivateContextStore {
         priority: i64,
         pinned: bool,
     ) -> Result<ContextItem> {
-        let scope = validate_scope(scope)?;
-        let title = validate_title(title)?;
-        let body = validate_body("memory", body, MAX_MEMORY_BODY_BYTES)?;
-        let tags = validate_tags(tags)?;
         let now = now_timestamp();
-        let item = ContextItem {
-            id: new_record_id(),
-            class: ProjectedContextClass::Memory,
+        let mut tx = self.pool.begin().await?;
+        let item = remember_memory_in_tx(
+            &mut tx,
             scope,
-            slot: None,
             title,
             body,
             tags,
             priority,
             pinned,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            deleted_at: None,
-            revision: 1,
-            source_kind: SOURCE_KIND_EXPLICIT_OPERATOR.to_string(),
-        };
-        let mut tx = self.pool.begin().await?;
-        insert_item(&mut tx, &item).await?;
-        refresh_fts(&mut tx, &item).await?;
-        record_revision(&mut tx, &item, "memory_remember", &now).await?;
-        record_operation(&mut tx, &item, "memory_remember", &now).await?;
+            WriteSource::context_cli(),
+            &now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(item)
     }
@@ -681,10 +860,18 @@ impl PrivateContextStore {
         }
         item.updated_at = now.clone();
         item.revision = item.revision.saturating_add(1);
+        item.source_kind = WriteSource::context_cli().source_kind().to_string();
         update_item(&mut tx, &item).await?;
         refresh_fts(&mut tx, &item).await?;
         record_revision(&mut tx, &item, "memory_update", &now).await?;
-        record_operation(&mut tx, &item, "memory_update", &now).await?;
+        record_operation(
+            &mut tx,
+            &item,
+            "memory_update",
+            &now,
+            WriteSource::context_cli(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(item))
     }
@@ -701,10 +888,18 @@ impl PrivateContextStore {
         item.updated_at = now.clone();
         item.deleted_at = Some(now.clone());
         item.revision = item.revision.saturating_add(1);
+        item.source_kind = WriteSource::context_cli().source_kind().to_string();
         update_item(&mut tx, &item).await?;
         refresh_fts(&mut tx, &item).await?;
         record_revision(&mut tx, &item, "memory_delete", &now).await?;
-        record_operation(&mut tx, &item, "memory_delete", &now).await?;
+        record_operation(
+            &mut tx,
+            &item,
+            "memory_delete",
+            &now,
+            WriteSource::context_cli(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(Some(item))
     }
@@ -754,6 +949,59 @@ impl PrivateContextStore {
             .await?
         };
         rows_to_operations(rows)
+    }
+
+    pub(crate) async fn record_turn(
+        &self,
+        private_context_id: &str,
+        request: &PrivateContextRecordRequest,
+    ) -> Result<bool> {
+        let private_context_id = validate_private_context_id(private_context_id)?;
+        if request.transcript.is_empty() {
+            return Ok(false);
+        }
+        let turn = recorded_turn_from_request(&private_context_id, request)?;
+        let directives = explicit_directives(request.transcript.user_text());
+        let now = turn.recorded_at.clone();
+        let mut tx = self.pool.begin().await?;
+        if recorded_turn_exists(&mut tx, &turn).await? {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        insert_recorded_turn(&mut tx, &turn).await?;
+        refresh_recorded_turn_fts(&mut tx, &turn).await?;
+        for directive in directives {
+            match directive {
+                ExplicitDirective::Memory(body) => {
+                    remember_memory_in_tx(
+                        &mut tx,
+                        &turn.scope,
+                        None,
+                        &body,
+                        &[],
+                        0,
+                        false,
+                        WriteSource::recorder(),
+                        &now,
+                    )
+                    .await?;
+                }
+                ExplicitDirective::Profile { class, slot, body } => {
+                    set_profile_in_tx(
+                        &mut tx,
+                        class,
+                        &turn.scope,
+                        slot,
+                        &body,
+                        WriteSource::recorder(),
+                        &now,
+                    )
+                    .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub(crate) async fn project(
@@ -830,16 +1078,34 @@ impl PrivateContextStore {
         };
         let mut scopes = projection_scopes(request.project_scope.as_deref());
         scopes.reverse();
-        let rows =
-            query_memory_projection(&self.pool, &fts_query, &scopes, budget.max_items).await?;
-        let items = rows_to_items(rows)?;
-        Ok(project_items(
-            projector_id,
-            budget,
-            items,
-            memory_projection_text,
-        ))
+        let limit = budget.max_items.saturating_mul(4).max(1);
+        let explicit =
+            query_explicit_memory_projection(&self.pool, &fts_query, &scopes, limit).await?;
+        let recorded =
+            query_recorded_turn_projection(&self.pool, projector_id, &fts_query, &scopes, limit)
+                .await?;
+        let mut matches = memory_projection_matches(explicit, recorded);
+        sort_memory_projection_matches(&mut matches, &scopes);
+        Ok(project_memory_matches(projector_id, budget, matches))
     }
+}
+
+#[derive(Debug, Clone)]
+struct ExplicitMemoryMatch {
+    item: ContextItem,
+    fts_rank: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RecordedTurnMatch {
+    turn: RecordedTurn,
+    fts_rank: f64,
+}
+
+#[derive(Debug, Clone)]
+enum MemoryProjectionMatch {
+    Explicit(ExplicitMemoryMatch),
+    Recorded(RecordedTurnMatch),
 }
 
 async fn active_profile_row(
@@ -878,6 +1144,330 @@ async fn active_memory_row(
     .fetch_optional(&mut **tx)
     .await
     .map_err(Into::into)
+}
+
+async fn set_profile_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    class: ProjectedContextClass,
+    scope: &str,
+    slot: &str,
+    body: &str,
+    source: WriteSource,
+    now: &str,
+) -> Result<ContextItem> {
+    let slot = validate_profile_slot(class, slot)?;
+    let scope = validate_scope(scope)?;
+    let body = validate_body("profile", body, MAX_PROFILE_BODY_BYTES)?;
+    let existing = active_profile_row(tx, class, &scope, &slot).await?;
+    let item = if let Some(existing) = existing {
+        let mut item = row_to_item(existing)?;
+        item.body = body;
+        item.updated_at = now.to_string();
+        item.revision = item.revision.saturating_add(1);
+        item.source_kind = source.source_kind().to_string();
+        sqlx::query(
+            r#"
+            UPDATE context_items
+            SET body = ?, updated_at = ?, revision = ?, source_kind = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&item.body)
+        .bind(&item.updated_at)
+        .bind(item.revision)
+        .bind(&item.source_kind)
+        .bind(&item.id)
+        .execute(&mut **tx)
+        .await?;
+        item
+    } else {
+        let item = ContextItem {
+            id: new_record_id(),
+            class,
+            scope,
+            slot: Some(slot),
+            title: None,
+            body,
+            tags: Vec::new(),
+            priority: 0,
+            pinned: false,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            deleted_at: None,
+            revision: 1,
+            source_kind: source.source_kind().to_string(),
+        };
+        insert_item(tx, &item).await?;
+        item
+    };
+    record_revision(tx, &item, "profile_set", now).await?;
+    record_operation(tx, &item, "profile_set", now, source).await?;
+    Ok(item)
+}
+
+async fn remember_memory_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    scope: &str,
+    title: Option<&str>,
+    body: &str,
+    tags: &[String],
+    priority: i64,
+    pinned: bool,
+    source: WriteSource,
+    now: &str,
+) -> Result<ContextItem> {
+    let scope = validate_scope(scope)?;
+    let title = validate_title(title)?;
+    let body = validate_body("memory", body, MAX_MEMORY_BODY_BYTES)?;
+    let tags = validate_tags(tags)?;
+    let item = ContextItem {
+        id: new_record_id(),
+        class: ProjectedContextClass::Memory,
+        scope,
+        slot: None,
+        title,
+        body,
+        tags,
+        priority,
+        pinned,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        deleted_at: None,
+        revision: 1,
+        source_kind: source.source_kind().to_string(),
+    };
+    insert_item(tx, &item).await?;
+    refresh_fts(tx, &item).await?;
+    record_revision(tx, &item, "memory_remember", now).await?;
+    record_operation(tx, &item, "memory_remember", now, source).await?;
+    Ok(item)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExplicitDirective {
+    Memory(String),
+    Profile {
+        class: ProjectedContextClass,
+        slot: &'static str,
+        body: String,
+    },
+}
+
+fn explicit_directives(user_text: &str) -> Vec<ExplicitDirective> {
+    user_text.lines().filter_map(explicit_directive).collect()
+}
+
+fn explicit_directive(raw_line: &str) -> Option<ExplicitDirective> {
+    let mut line = raw_line.trim();
+    line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .unwrap_or(line)
+        .trim_start();
+    if let Some(body) = directive_body(line, "remember:") {
+        return Some(ExplicitDirective::Memory(body));
+    }
+    if let Some(body) = directive_body(line, "remember that ") {
+        return Some(ExplicitDirective::Memory(body));
+    }
+    if let Some(body) = directive_body(line, "assistant style:") {
+        return Some(ExplicitDirective::Profile {
+            class: ProjectedContextClass::AssistantProfile,
+            slot: "style",
+            body,
+        });
+    }
+    if let Some(body) = directive_body(line, "assistant workflow:") {
+        return Some(ExplicitDirective::Profile {
+            class: ProjectedContextClass::AssistantProfile,
+            slot: "workflow",
+            body,
+        });
+    }
+    if let Some(body) = directive_body(line, "assistant default:") {
+        return Some(ExplicitDirective::Profile {
+            class: ProjectedContextClass::AssistantProfile,
+            slot: "defaults",
+            body,
+        });
+    }
+    if let Some(body) = directive_body(line, "user preferences:") {
+        return Some(ExplicitDirective::Profile {
+            class: ProjectedContextClass::UserProfile,
+            slot: "preferences",
+            body,
+        });
+    }
+    if let Some(body) = directive_body(line, "user standing requests:") {
+        return Some(ExplicitDirective::Profile {
+            class: ProjectedContextClass::UserProfile,
+            slot: "standing_requests",
+            body,
+        });
+    }
+    None
+}
+
+fn directive_body(line: &str, prefix: &str) -> Option<String> {
+    let head = line.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let body = line.get(prefix.len()..)?.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+fn recorded_turn_from_request(
+    private_context_id: &str,
+    request: &PrivateContextRecordRequest,
+) -> Result<RecordedTurn> {
+    let scope = record_scope(request.project_scope.as_deref())?;
+    let runtime_id = validate_runtime_id(&request.runtime_id)?;
+    let user_text = validate_recorded_text(
+        "recorded user text",
+        request.transcript.user_text(),
+        MAX_RECORDED_USER_TEXT_BYTES,
+    )?;
+    let assistant_text = validate_recorded_text(
+        "recorded assistant text",
+        request.transcript.assistant_text(),
+        MAX_RECORDED_ASSISTANT_TEXT_BYTES,
+    )?;
+    Ok(RecordedTurn {
+        private_context_id: private_context_id.to_string(),
+        session_id: request.session_id.to_string(),
+        turn_id: request.turn_id.to_string(),
+        sequence_no: request.sequence_no,
+        runtime_id,
+        scope,
+        user_text,
+        assistant_text,
+        recorded_at: now_timestamp(),
+    })
+}
+
+fn record_scope(project_scope: Option<&str>) -> Result<String> {
+    match project_scope {
+        Some(scope) => {
+            let scope = scope.trim();
+            validate_scope_id(scope)?;
+            Ok(format!("project:{scope}"))
+        }
+        None => Ok("global".to_string()),
+    }
+}
+
+fn validate_private_context_id(private_context_id: &str) -> Result<String> {
+    if !audit_safe_visible_handle(private_context_id) {
+        bail!(
+            "private context id must be 1..128 visible ASCII bytes with no whitespace or path separators"
+        );
+    }
+    Ok(private_context_id.to_string())
+}
+
+fn validate_runtime_id(runtime_id: &str) -> Result<String> {
+    if !audit_safe_visible_handle(runtime_id) {
+        bail!(
+            "runtime id must be 1..128 visible ASCII bytes with no whitespace or path separators"
+        );
+    }
+    Ok(runtime_id.to_string())
+}
+
+fn validate_recorded_text(label: &str, text: &str, max_bytes: usize) -> Result<String> {
+    validate_text_chars(label, text)?;
+    Ok(cap_utf8_preserving(text, max_bytes))
+}
+
+fn cap_utf8_preserving(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+async fn recorded_turn_exists(
+    tx: &mut Transaction<'_, Sqlite>,
+    turn: &RecordedTurn,
+) -> Result<bool> {
+    let exists = sqlx::query(
+        r#"
+        SELECT 1
+        FROM recorded_turns
+        WHERE private_context_id = ? AND session_id = ? AND turn_id = ?
+        "#,
+    )
+    .bind(&turn.private_context_id)
+    .bind(&turn.session_id)
+    .bind(&turn.turn_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    Ok(exists)
+}
+
+async fn insert_recorded_turn(tx: &mut Transaction<'_, Sqlite>, turn: &RecordedTurn) -> Result<()> {
+    let sequence_no =
+        i64::try_from(turn.sequence_no).context("recorded turn sequence number exceeds i64")?;
+    sqlx::query(
+        r#"
+        INSERT INTO recorded_turns (
+            private_context_id, session_id, turn_id, sequence_no, runtime_id,
+            scope, user_text, assistant_text, recorded_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&turn.private_context_id)
+    .bind(&turn.session_id)
+    .bind(&turn.turn_id)
+    .bind(sequence_no)
+    .bind(&turn.runtime_id)
+    .bind(&turn.scope)
+    .bind(&turn.user_text)
+    .bind(&turn.assistant_text)
+    .bind(&turn.recorded_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn refresh_recorded_turn_fts(
+    tx: &mut Transaction<'_, Sqlite>,
+    turn: &RecordedTurn,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM recorded_turns_fts
+        WHERE private_context_id = ? AND session_id = ? AND turn_id = ?
+        "#,
+    )
+    .bind(&turn.private_context_id)
+    .bind(&turn.session_id)
+    .bind(&turn.turn_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO recorded_turns_fts (
+            private_context_id, session_id, turn_id, user_text, assistant_text
+        )
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&turn.private_context_id)
+    .bind(&turn.session_id)
+    .bind(&turn.turn_id)
+    .bind(&turn.user_text)
+    .bind(&turn.assistant_text)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn insert_item(tx: &mut Transaction<'_, Sqlite>, item: &ContextItem) -> Result<()> {
@@ -920,7 +1510,8 @@ async fn update_item(tx: &mut Transaction<'_, Sqlite>, item: &ContextItem) -> Re
             pinned = ?,
             updated_at = ?,
             deleted_at = ?,
-            revision = ?
+            revision = ?,
+            source_kind = ?
         WHERE id = ?
         "#,
     )
@@ -932,6 +1523,7 @@ async fn update_item(tx: &mut Transaction<'_, Sqlite>, item: &ContextItem) -> Re
     .bind(&item.updated_at)
     .bind(&item.deleted_at)
     .bind(item.revision)
+    .bind(&item.source_kind)
     .bind(&item.id)
     .execute(&mut **tx)
     .await?;
@@ -979,6 +1571,7 @@ async fn record_operation(
     item: &ContextItem,
     operation: &str,
     recorded_at: &str,
+    source: WriteSource,
 ) -> Result<()> {
     sqlx::query(
         r#"
@@ -996,7 +1589,7 @@ async fn record_operation(
     .bind(&item.slot)
     .bind(item.revision)
     .bind(&item.source_kind)
-    .bind(ACTOR_CONTEXT_CLI)
+    .bind(source.actor_surface())
     .bind(recorded_at)
     .execute(&mut **tx)
     .await?;
@@ -1062,18 +1655,18 @@ async fn query_items_for_scopes(
     }
 }
 
-async fn query_memory_projection(
+async fn query_explicit_memory_projection(
     pool: &SqlitePool,
     fts_query: &str,
     scopes: &[String],
     max_items: usize,
-) -> Result<Vec<SqliteRow>> {
+) -> Result<Vec<ExplicitMemoryMatch>> {
     let limit = i64::try_from(max_items.max(1)).unwrap_or(i64::MAX);
     let first = required_scope(scopes, 0)?;
-    if let Some(second) = scopes.get(1) {
+    let rows: Vec<SqliteRow> = if let Some(second) = scopes.get(1) {
         sqlx::query(
             r#"
-            SELECT ci.*
+            SELECT ci.*, bm25(context_item_fts) AS fts_rank
             FROM context_item_fts
             JOIN context_items ci ON ci.id = context_item_fts.item_id
             WHERE context_item_fts MATCH ?
@@ -1095,12 +1688,11 @@ async fn query_memory_projection(
         .bind(first)
         .bind(limit)
         .fetch_all(pool)
-        .await
-        .map_err(Into::into)
+        .await?
     } else {
         sqlx::query(
             r#"
-            SELECT ci.*
+            SELECT ci.*, bm25(context_item_fts) AS fts_rank
             FROM context_item_fts
             JOIN context_items ci ON ci.id = context_item_fts.item_id
             WHERE context_item_fts MATCH ?
@@ -1119,9 +1711,76 @@ async fn query_memory_projection(
         .bind(first)
         .bind(limit)
         .fetch_all(pool)
-        .await
-        .map_err(Into::into)
-    }
+        .await?
+    };
+    rows.into_iter().map(row_to_explicit_memory_match).collect()
+}
+
+async fn query_recorded_turn_projection(
+    pool: &SqlitePool,
+    private_context_id: &str,
+    fts_query: &str,
+    scopes: &[String],
+    max_items: usize,
+) -> Result<Vec<RecordedTurnMatch>> {
+    let private_context_id = validate_private_context_id(private_context_id)?;
+    let limit = i64::try_from(max_items.max(1)).unwrap_or(i64::MAX);
+    let first = required_scope(scopes, 0)?;
+    let rows: Vec<SqliteRow> = if let Some(second) = scopes.get(1) {
+        sqlx::query(
+            r#"
+            SELECT rt.*, bm25(recorded_turns_fts) AS fts_rank
+            FROM recorded_turns_fts
+            JOIN recorded_turns rt
+                ON rt.private_context_id = recorded_turns_fts.private_context_id
+                AND rt.session_id = recorded_turns_fts.session_id
+                AND rt.turn_id = recorded_turns_fts.turn_id
+            WHERE recorded_turns_fts MATCH ?
+                AND rt.private_context_id = ?
+                AND (rt.scope = ? OR rt.scope = ?)
+            ORDER BY CASE rt.scope WHEN ? THEN 0 ELSE 1 END,
+                bm25(recorded_turns_fts) ASC,
+                rt.recorded_at DESC,
+                rt.session_id ASC,
+                rt.turn_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(fts_query)
+        .bind(&private_context_id)
+        .bind(first)
+        .bind(second)
+        .bind(first)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT rt.*, bm25(recorded_turns_fts) AS fts_rank
+            FROM recorded_turns_fts
+            JOIN recorded_turns rt
+                ON rt.private_context_id = recorded_turns_fts.private_context_id
+                AND rt.session_id = recorded_turns_fts.session_id
+                AND rt.turn_id = recorded_turns_fts.turn_id
+            WHERE recorded_turns_fts MATCH ?
+                AND rt.private_context_id = ?
+                AND rt.scope = ?
+            ORDER BY bm25(recorded_turns_fts) ASC,
+                rt.recorded_at DESC,
+                rt.session_id ASC,
+                rt.turn_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(fts_query)
+        .bind(&private_context_id)
+        .bind(first)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter().map(row_to_recorded_turn_match).collect()
 }
 
 fn required_scope(scopes: &[String], index: usize) -> Result<&str> {
@@ -1129,6 +1788,46 @@ fn required_scope(scopes: &[String], index: usize) -> Result<&str> {
         .get(index)
         .map(String::as_str)
         .ok_or_else(|| anyhow!("projection scope list was unexpectedly empty"))
+}
+
+async fn rebuild_source_kind_table_if_needed(
+    tx: &mut Transaction<'_, Sqlite>,
+    table: &str,
+    create_sql: &str,
+    columns: &str,
+) -> Result<()> {
+    let Some(sql) = table_create_sql(tx, table).await? else {
+        return Ok(());
+    };
+    if sql.contains("source_kind IN ('explicit_operator', 'explicit_transcript')") {
+        return Ok(());
+    }
+    if !sql.contains("source_kind = 'explicit_operator'") {
+        bail!("unsupported {table} source_kind constraint");
+    }
+    let replacement = format!("{table}__source_kind_migration");
+    sqlx::query(&format!("ALTER TABLE {table} RENAME TO {replacement}"))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(create_sql).execute(&mut **tx).await?;
+    sqlx::query(&format!(
+        "INSERT INTO {table} ({columns}) SELECT {columns} FROM {replacement}"
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!("DROP TABLE {replacement}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn table_create_sql(tx: &mut Transaction<'_, Sqlite>, table: &str) -> Result<Option<String>> {
+    sqlx::query("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+        .bind(table)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|row| row.try_get("sql").map_err(Into::into))
+        .transpose()
 }
 
 fn rows_to_items(rows: Vec<SqliteRow>) -> Result<Vec<ContextItem>> {
@@ -1141,6 +1840,22 @@ fn rows_to_revisions(rows: Vec<SqliteRow>) -> Result<Vec<ContextItemRevision>> {
 
 fn rows_to_operations(rows: Vec<SqliteRow>) -> Result<Vec<OperationLogEntry>> {
     rows.into_iter().map(row_to_operation).collect()
+}
+
+fn row_to_explicit_memory_match(row: SqliteRow) -> Result<ExplicitMemoryMatch> {
+    let fts_rank = row.try_get("fts_rank")?;
+    Ok(ExplicitMemoryMatch {
+        item: row_to_item(row)?,
+        fts_rank,
+    })
+}
+
+fn row_to_recorded_turn_match(row: SqliteRow) -> Result<RecordedTurnMatch> {
+    let fts_rank = row.try_get("fts_rank")?;
+    Ok(RecordedTurnMatch {
+        turn: row_to_recorded_turn(row)?,
+        fts_rank,
+    })
 }
 
 fn row_to_item(row: SqliteRow) -> Result<ContextItem> {
@@ -1164,6 +1879,22 @@ fn row_to_item(row: SqliteRow) -> Result<ContextItem> {
     })
 }
 
+fn row_to_recorded_turn(row: SqliteRow) -> Result<RecordedTurn> {
+    let sequence_no = u64::try_from(row.try_get::<i64, _>("sequence_no")?)
+        .context("recorded turn sequence number is negative")?;
+    Ok(RecordedTurn {
+        private_context_id: row.try_get("private_context_id")?,
+        session_id: row.try_get("session_id")?,
+        turn_id: row.try_get("turn_id")?,
+        sequence_no,
+        runtime_id: row.try_get("runtime_id")?,
+        scope: row.try_get("scope")?,
+        user_text: row.try_get("user_text")?,
+        assistant_text: row.try_get("assistant_text")?,
+        recorded_at: row.try_get("recorded_at")?,
+    })
+}
+
 fn row_to_revision(row: SqliteRow) -> Result<ContextItemRevision> {
     let class = class_from_str(row.try_get::<String, _>("class")?.as_str())?;
     let tags = parse_tags(row.try_get::<String, _>("tags")?)?;
@@ -1183,6 +1914,7 @@ fn row_to_revision(row: SqliteRow) -> Result<ContextItemRevision> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         deleted_at: row.try_get("deleted_at")?,
+        source_kind: row.try_get("source_kind")?,
         recorded_at: row.try_get("recorded_at")?,
     })
 }
@@ -1288,6 +2020,150 @@ fn project_items(
     projected
 }
 
+fn memory_projection_matches(
+    explicit: Vec<ExplicitMemoryMatch>,
+    recorded: Vec<RecordedTurnMatch>,
+) -> Vec<MemoryProjectionMatch> {
+    explicit
+        .into_iter()
+        .map(MemoryProjectionMatch::Explicit)
+        .chain(recorded.into_iter().map(MemoryProjectionMatch::Recorded))
+        .collect()
+}
+
+fn sort_memory_projection_matches(items: &mut [MemoryProjectionMatch], scopes: &[String]) {
+    items.sort_by(|left, right| {
+        memory_scope_rank(left, scopes)
+            .cmp(&memory_scope_rank(right, scopes))
+            .then_with(|| memory_kind_rank(left).cmp(&memory_kind_rank(right)))
+            .then_with(|| memory_pinned_rank(left).cmp(&memory_pinned_rank(right)))
+            .then_with(|| memory_priority_cmp(left, right))
+            .then_with(|| memory_fts_rank(left).total_cmp(&memory_fts_rank(right)))
+            .then_with(|| memory_recency(right).cmp(memory_recency(left)))
+            .then_with(|| memory_stable_id(left).cmp(&memory_stable_id(right)))
+    });
+}
+
+fn project_memory_matches(
+    projector_id: &str,
+    budget: &ProjectedContextBudget,
+    items: Vec<MemoryProjectionMatch>,
+) -> Vec<ProjectedContextItem> {
+    let mut projected = Vec::new();
+    let mut accepted_bytes = 0usize;
+    for item in items {
+        if projected.len() >= budget.max_items {
+            break;
+        }
+        let remaining = budget.max_bytes.saturating_sub(accepted_bytes);
+        if remaining == 0 {
+            break;
+        }
+        let text = cap_utf8(&memory_match_text(&item), remaining);
+        if text.trim().is_empty() {
+            continue;
+        }
+        accepted_bytes = accepted_bytes.saturating_add(text.len());
+        projected.push(ProjectedContextItem {
+            class: ProjectedContextClass::Memory,
+            text,
+            provenance: vec![memory_match_provenance(projector_id, &item)],
+        });
+    }
+    projected
+}
+
+fn memory_scope_rank(item: &MemoryProjectionMatch, scopes: &[String]) -> usize {
+    scopes
+        .iter()
+        .position(|scope| scope == memory_scope(item))
+        .unwrap_or(usize::MAX)
+}
+
+fn memory_scope(item: &MemoryProjectionMatch) -> &str {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => &item.item.scope,
+        MemoryProjectionMatch::Recorded(item) => &item.turn.scope,
+    }
+}
+
+fn memory_kind_rank(item: &MemoryProjectionMatch) -> usize {
+    match item {
+        MemoryProjectionMatch::Explicit(_) => 0,
+        MemoryProjectionMatch::Recorded(_) => 1,
+    }
+}
+
+fn memory_pinned_rank(item: &MemoryProjectionMatch) -> bool {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => !item.item.pinned,
+        MemoryProjectionMatch::Recorded(_) => true,
+    }
+}
+
+fn memory_priority_cmp(left: &MemoryProjectionMatch, right: &MemoryProjectionMatch) -> Ordering {
+    match (left, right) {
+        (MemoryProjectionMatch::Explicit(left), MemoryProjectionMatch::Explicit(right)) => {
+            right.item.priority.cmp(&left.item.priority)
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+fn memory_fts_rank(item: &MemoryProjectionMatch) -> f64 {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => item.fts_rank,
+        MemoryProjectionMatch::Recorded(item) => item.fts_rank,
+    }
+}
+
+fn memory_recency(item: &MemoryProjectionMatch) -> &str {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => &item.item.updated_at,
+        MemoryProjectionMatch::Recorded(item) => &item.turn.recorded_at,
+    }
+}
+
+fn memory_stable_id(item: &MemoryProjectionMatch) -> String {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => item.item.id.clone(),
+        MemoryProjectionMatch::Recorded(item) => {
+            format!("{}:{}", item.turn.session_id, item.turn.turn_id)
+        }
+    }
+}
+
+fn memory_match_text(item: &MemoryProjectionMatch) -> String {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => memory_projection_text(&item.item),
+        MemoryProjectionMatch::Recorded(item) => recorded_turn_projection_text(&item.turn),
+    }
+}
+
+fn memory_match_provenance(
+    projector_id: &str,
+    item: &MemoryProjectionMatch,
+) -> ProjectedContextProvenance {
+    match item {
+        MemoryProjectionMatch::Explicit(item) => ProjectedContextProvenance {
+            source: ProjectedContextProvenanceSource::ProjectorRecord,
+            sequence_no: None,
+            event_id: None,
+            projector_id: Some(projector_id.to_string()),
+            record_id: Some(item.item.id.clone()),
+            revision: Some(item.item.revision.to_string()),
+        },
+        MemoryProjectionMatch::Recorded(item) => ProjectedContextProvenance {
+            source: ProjectedContextProvenanceSource::SessionTurn,
+            sequence_no: Some(item.turn.sequence_no),
+            event_id: None,
+            projector_id: None,
+            record_id: None,
+            revision: None,
+        },
+    }
+}
+
 fn profile_projection_text(item: &ContextItem) -> String {
     let scope = scope_label(&item.scope);
     let slot = item.slot.as_deref().unwrap_or("profile");
@@ -1299,6 +2175,13 @@ fn memory_projection_text(item: &ContextItem) -> String {
         Some(title) => format!("{title}\n{}", item.body),
         None => item.body.clone(),
     }
+}
+
+fn recorded_turn_projection_text(turn: &RecordedTurn) -> String {
+    format!(
+        "Turn {}\nUser: {}\nAssistant: {}",
+        turn.sequence_no, turn.user_text, turn.assistant_text
+    )
 }
 
 fn scope_label(scope: &str) -> &'static str {

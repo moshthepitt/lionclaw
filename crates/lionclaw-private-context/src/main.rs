@@ -34,6 +34,7 @@ mod cli;
 mod context;
 mod projector;
 mod protocol;
+mod recorder;
 mod store;
 mod validation;
 
