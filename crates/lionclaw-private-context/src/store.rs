@@ -1809,6 +1809,7 @@ async fn rebuild_source_kind_table_if_needed(
     sqlx::query(&format!("ALTER TABLE {table} RENAME TO {replacement}"))
         .execute(&mut **tx)
         .await?;
+    drop_rebuilt_table_indexes(tx, table).await?;
     sqlx::query(create_sql).execute(&mut **tx).await?;
     sqlx::query(&format!(
         "INSERT INTO {table} ({columns}) SELECT {columns} FROM {replacement}"
@@ -1818,6 +1819,24 @@ async fn rebuild_source_kind_table_if_needed(
     sqlx::query(&format!("DROP TABLE {replacement}"))
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+async fn drop_rebuilt_table_indexes(tx: &mut Transaction<'_, Sqlite>, table: &str) -> Result<()> {
+    let indexes: &[&str] = match table {
+        "context_items" => &[
+            "context_items_active_profile_slot_idx",
+            "context_items_class_scope_updated_idx",
+        ],
+        "context_item_revisions" => &["context_item_revisions_item_idx"],
+        "operation_log" => &["operation_log_item_idx"],
+        _ => &[],
+    };
+    for index in indexes {
+        sqlx::query(&format!("DROP INDEX IF EXISTS {index}"))
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -2460,6 +2479,93 @@ mod tests {
             .expect("count rows")
     }
 
+    async fn create_legacy_context_items_schema(state_dir: &Path) {
+        fs::create_dir_all(state_dir).expect("state dir");
+        let db_path = state_dir.join(DB_FILE);
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("legacy db");
+        sqlx::query(
+            r#"
+            CREATE TABLE context_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                class TEXT NOT NULL CHECK (class IN ('assistant_profile', 'user_profile', 'memory')),
+                scope TEXT NOT NULL,
+                slot TEXT,
+                title TEXT,
+                body TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                priority INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                revision INTEGER NOT NULL,
+                source_kind TEXT NOT NULL CHECK (source_kind = 'explicit_operator'),
+                CHECK (
+                    (
+                        class IN ('assistant_profile', 'user_profile')
+                        AND slot IS NOT NULL
+                        AND title IS NULL
+                        AND tags = '[]'
+                        AND priority = 0
+                        AND pinned = 0
+                    )
+                    OR (
+                        class = 'memory'
+                        AND slot IS NULL
+                    )
+                )
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy context_items");
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX context_items_active_profile_slot_idx
+            ON context_items (class, scope, slot)
+            WHERE deleted_at IS NULL AND class IN ('assistant_profile', 'user_profile')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy profile index");
+        sqlx::query(
+            r#"
+            CREATE INDEX context_items_class_scope_updated_idx
+            ON context_items (class, scope, deleted_at, updated_at, id)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy class index");
+        let now = now_timestamp();
+        sqlx::query(
+            r#"
+            INSERT INTO context_items (
+                id, class, scope, slot, title, body, tags, priority, pinned,
+                created_at, updated_at, deleted_at, revision, source_kind
+            )
+            VALUES (
+                'pcx_legacy', 'memory', 'global', NULL, NULL, 'legacy body',
+                '[]', 0, 0, ?, ?, NULL, 1, 'explicit_operator'
+            )
+            "#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("legacy item");
+        pool.close().await;
+    }
+
     #[tokio::test]
     async fn recorder_inserts_turn_and_is_idempotent() {
         let temp_dir = tempdir().expect("temp dir");
@@ -2500,6 +2606,48 @@ mod tests {
             turn.try_get::<String, _>("user_text").expect("user"),
             "We discussed sqlite migrations."
         );
+    }
+
+    #[tokio::test]
+    async fn source_kind_migration_recreates_indexes_on_rebuilt_table() {
+        let temp_dir = tempdir().expect("temp dir");
+        create_legacy_context_items_schema(temp_dir.path()).await;
+
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("migrated store");
+        let index_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM sqlite_schema
+            WHERE type = 'index'
+                AND tbl_name = 'context_items'
+                AND name IN (
+                    'context_items_active_profile_slot_idx',
+                    'context_items_class_scope_updated_idx'
+                )
+            "#,
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("index count");
+        assert_eq!(index_count, 2);
+        assert_eq!(
+            store
+                .list_memory(Some("global"), None)
+                .await
+                .expect("legacy memory")
+                .len(),
+            1
+        );
+
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(17, "remember: migrated transcript memory", "ok", None),
+            )
+            .await
+            .expect("record explicit transcript after migration");
     }
 
     #[tokio::test]
@@ -2555,6 +2703,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorder_remember_that_creates_durable_memory() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(18, "remember that alpha uses sqlite WAL", "ok", None),
+            )
+            .await
+            .expect("record turn");
+
+        let memories = store
+            .list_memory(Some("global"), None)
+            .await
+            .expect("memories");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].body, "alpha uses sqlite WAL");
+        assert_eq!(memories[0].source_kind, SOURCE_KIND_EXPLICIT_TRANSCRIPT);
+    }
+
+    #[tokio::test]
+    async fn recorder_profile_directives_are_slot_upserts() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(19, "assistant workflow: First workflow.", "ok", None),
+            )
+            .await
+            .expect("first record");
+        store
+            .record_turn(
+                "lionclaw-private-context",
+                &record_request_for(20, "assistant workflow: Second workflow.", "ok", None),
+            )
+            .await
+            .expect("second record");
+
+        let profiles = store
+            .list_profiles(ProjectedContextClass::AssistantProfile, Some("global"))
+            .await
+            .expect("profiles");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].body, "Second workflow.");
+        assert_eq!(profiles[0].revision, 2);
+
+        let history = store
+            .profile_history(
+                ProjectedContextClass::AssistantProfile,
+                "global",
+                "workflow",
+            )
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].body, "First workflow.");
+        assert_eq!(history[1].body, "Second workflow.");
+    }
+
+    #[tokio::test]
     async fn recorder_ignores_non_explicit_and_substring_directives() {
         let temp_dir = tempdir().expect("temp dir");
         let store = PrivateContextStore::open(temp_dir.path())
@@ -2564,6 +2778,29 @@ mod tests {
             9,
             "Please remember: this is not line-start grammar.\nI like deterministic tests.\nassistant style maybe terse.",
             "assistant style: assistant text is ignored.",
+            None,
+        );
+
+        store
+            .record_turn("lionclaw-private-context", &request)
+            .await
+            .expect("record turn");
+
+        assert_eq!(count_rows(&store, "recorded_turns").await, 1);
+        assert_eq!(count_rows(&store, "context_items").await, 0);
+        assert_eq!(count_rows(&store, "operation_log").await, 0);
+    }
+
+    #[tokio::test]
+    async fn assistant_text_alone_cannot_create_durable_items() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let request = record_request_for(
+            21,
+            "",
+            "remember: assistant directives are not durable writes.",
             None,
         );
 
@@ -2944,11 +3181,156 @@ mod tests {
             .operation_log(Some(&item.id))
             .await
             .expect("operation log");
+        assert_eq!(log[0].source_kind, SOURCE_KIND_EXPLICIT_OPERATOR);
+        assert_eq!(log[0].actor_surface, ACTOR_CONTEXT_CLI);
+        let history = store.memory_history(&item.id).await.expect("history");
+        assert_eq!(history[0].source_kind, SOURCE_KIND_EXPLICIT_OPERATOR);
         let encoded = serde_json::to_string(&log).expect("json");
         assert!(encoded.contains("memory_remember"));
         assert!(!encoded.contains("Never audit this body."));
         assert!(!encoded.contains("Secret"));
         assert!(!encoded.contains("secret-tag"));
+    }
+
+    #[tokio::test]
+    async fn profile_projection_does_not_depend_on_fts_relevance() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .set_profile(
+                ProjectedContextClass::UserProfile,
+                "global",
+                "preferences",
+                "Prefers direct answers.",
+            )
+            .await
+            .expect("profile");
+
+        let projection = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(
+                    &[ProjectedContextClass::UserProfile],
+                    Some("unrelated punctuation ?!?"),
+                    None,
+                ),
+            )
+            .await
+            .expect("projection");
+
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(
+            projection.items[0].class,
+            ProjectedContextClass::UserProfile
+        );
+        assert!(projection.items[0].text.contains("Prefers direct answers."));
+    }
+
+    #[tokio::test]
+    async fn memory_projection_requires_fts_relevance() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .remember_memory("global", Some("Pinned"), "sqlite details.", &[], 100, true)
+            .await
+            .expect("pinned memory");
+
+        let punctuation = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(&[ProjectedContextClass::Memory], Some("?!?!"), None),
+            )
+            .await
+            .expect("punctuation projection");
+        assert!(punctuation.items.is_empty());
+
+        let unrelated = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(&[ProjectedContextClass::Memory], Some("banana"), None),
+            )
+            .await
+            .expect("unrelated projection");
+        assert!(unrelated.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_memory_is_not_searched_or_projected() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        let item = store
+            .remember_memory("global", None, "sqlite deletion marker.", &[], 0, false)
+            .await
+            .expect("memory");
+        store.delete_memory(&item.id).await.expect("delete memory");
+
+        assert!(store
+            .search_memory("sqlite deletion", None, None)
+            .await
+            .expect("search")
+            .is_empty());
+        let projection = store
+            .project(
+                "lionclaw-private-context",
+                &request_for(
+                    &[ProjectedContextClass::Memory],
+                    Some("sqlite deletion"),
+                    None,
+                ),
+            )
+            .await
+            .expect("projection");
+        assert!(projection.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn projection_respects_requested_classes_and_budgets() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = PrivateContextStore::open(temp_dir.path())
+            .await
+            .expect("store");
+        store
+            .set_profile(
+                ProjectedContextClass::AssistantProfile,
+                "global",
+                "style",
+                "Be concise.",
+            )
+            .await
+            .expect("profile");
+        store
+            .remember_memory(
+                "global",
+                Some("SQLite"),
+                "sqlite budget marker.",
+                &[],
+                0,
+                false,
+            )
+            .await
+            .expect("memory");
+
+        let mut request = request_for(&[ProjectedContextClass::Memory], Some("sqlite"), None);
+        request.budgets[0].max_items = 1;
+        request.budgets[0].max_bytes = 10;
+        let projection = store
+            .project("lionclaw-private-context", &request)
+            .await
+            .expect("projection");
+
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(projection.items[0].class, ProjectedContextClass::Memory);
+        assert!(projection.items[0].text.len() <= 10);
+        assert!(!projection
+            .items
+            .iter()
+            .any(|item| item.class == ProjectedContextClass::AssistantProfile));
     }
 
     #[cfg(unix)]
