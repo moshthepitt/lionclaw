@@ -1660,7 +1660,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lionclaw"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1703,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-channel-email"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-channel-team-local"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1749,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-durable-fs"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "rustix",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-private-context"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-runtime-api"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-runtime-codex"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-runtime-mock"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "lionclaw-runtime-opencode"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
