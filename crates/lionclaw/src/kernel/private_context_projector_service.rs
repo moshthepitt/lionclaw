@@ -502,6 +502,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{SkillPrivateContextProjector, SkillPrivateContextProjectorConfig};
+    #[cfg(unix)]
+    use crate::kernel::private_context_test_support::write_shell_command_fixture;
     use crate::{
         contracts::{SessionHistoryPolicy, TrustTier},
         kernel::private_context_projection::{
@@ -513,30 +515,16 @@ mod tests {
     };
 
     #[cfg(unix)]
-    fn make_executable(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod");
-    }
-
-    #[cfg(unix)]
     fn write_projector_script(
         root: &std::path::Path,
         body: &str,
     ) -> SkillPrivateContextProjectorConfig {
-        let skill_root = root.join("skill");
-        let state_dir = root.join("state");
-        fs::create_dir_all(skill_root.join("scripts")).expect("scripts");
-        let command_path = skill_root.join("scripts/projector");
-        fs::write(&command_path, body).expect("script");
-        make_executable(&command_path);
+        let fixture = write_shell_command_fixture(root, body);
         SkillPrivateContextProjectorConfig {
             projector_id: "private-context-core".to_string(),
-            command_path,
-            skill_root,
-            state_dir,
+            command_path: fixture.command_path,
+            skill_root: fixture.skill_root,
+            state_dir: fixture.state_dir,
             request_timeout: Duration::from_secs(1),
         }
     }
@@ -931,7 +919,7 @@ fi
 printf '{"request_id":"%s","projector_id":"%s","items":[]}\n' "$request_id" "$LIONCLAW_PRIVATE_CONTEXT_PROJECTOR_ID"
 "#,
         )
-        .with_request_timeout(Duration::from_millis(50));
+        .with_request_timeout(Duration::from_millis(200));
         let projector = SkillPrivateContextProjector::new(config.clone());
 
         let err = projector

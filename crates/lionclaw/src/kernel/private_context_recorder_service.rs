@@ -488,6 +488,8 @@ mod tests {
         PrivateContextRecorder, PrivateContextRecorderService, SkillPrivateContextRecorder,
         SkillPrivateContextRecorderConfig,
     };
+    #[cfg(unix)]
+    use crate::kernel::private_context_test_support::write_shell_command_fixture;
     use crate::{
         contracts::{SessionHistoryPolicy, TrustTier},
         kernel::{
@@ -512,30 +514,16 @@ mod tests {
     const RECORDER_LOCK_STATE_DIR_ENV: &str = "LIONCLAW_TEST_RECORDER_STATE_DIR";
 
     #[cfg(unix)]
-    fn make_executable(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod");
-    }
-
-    #[cfg(unix)]
     fn write_recorder_script(
         root: &std::path::Path,
         body: &str,
     ) -> SkillPrivateContextRecorderConfig {
-        let skill_root = root.join("skill");
-        let state_dir = root.join("state");
-        fs::create_dir_all(skill_root.join("scripts")).expect("scripts");
-        let command_path = skill_root.join("scripts/recorder");
-        fs::write(&command_path, body).expect("script");
-        make_executable(&command_path);
+        let fixture = write_shell_command_fixture(root, body);
         SkillPrivateContextRecorderConfig {
             recorder_id: "private-context-core".to_string(),
-            command_path,
-            skill_root,
-            state_dir,
+            command_path: fixture.command_path,
+            skill_root: fixture.skill_root,
+            state_dir: fixture.state_dir,
             timeout: PRIVATE_CONTEXT_RECORDER_TIMEOUT,
         }
     }

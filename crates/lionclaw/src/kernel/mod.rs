@@ -19,6 +19,8 @@ pub(crate) mod private_context_projection;
 pub(crate) mod private_context_projector_service;
 pub(crate) mod private_context_recorder_service;
 pub(crate) mod private_context_recording;
+#[cfg(all(test, unix))]
+pub(crate) mod private_context_test_support;
 pub mod prompt_context;
 pub mod runtime;
 pub mod runtime_policy;
