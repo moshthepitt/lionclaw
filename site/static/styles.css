@@ -460,6 +460,14 @@ section {
   font-size: 1.08rem;
 }
 
+.contact-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 1.35rem;
+  font-family: var(--sans);
+}
+
 .point-head {
   display: grid;
   grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
@@ -687,6 +695,54 @@ section {
 
 .article-body li + li {
   margin-top: 0.45rem;
+}
+
+.consulting-page {
+  max-width: 72ch;
+  padding: clamp(3rem, 5vw, 4.5rem) 0 clamp(3rem, 7vw, 5.5rem);
+  border-top: 0;
+}
+
+.consulting-page-head {
+  padding-bottom: 1.55rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.consulting-page h1 {
+  max-width: 14ch;
+  font-size: clamp(2.55rem, 4.2vw, 4.2rem);
+  line-height: 1.05;
+}
+
+.consulting-letter {
+  margin-top: 1.6rem;
+  color: var(--text);
+  font-size: clamp(1.03rem, 1.1vw, 1.12rem);
+  line-height: 1.7;
+}
+
+.consulting-letter p {
+  max-width: none;
+}
+
+.consulting-section {
+  padding: 2.25rem 0 0;
+  margin-top: 2.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.consulting-section h2 {
+  max-width: none;
+  font-size: clamp(1.65rem, 2.6vw, 2.15rem);
+  line-height: 1.16;
+}
+
+.consulting-list p:first-child {
+  margin-top: 0.2rem;
+}
+
+.consulting-list p {
+  max-width: none;
 }
 
 @media (max-width: 980px) {

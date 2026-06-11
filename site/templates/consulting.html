@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title }} / {{ config.title }}{% endblock title %}
+{% block description %}{{ page.description }}{% endblock description %}
+{% block og_title %}{{ page.title }} / {{ config.title }}{% endblock og_title %}
+{% block og_description %}{{ page.description }}{% endblock og_description %}
+
+{% block content %}
+<article class="consulting-page">
+  <header class="consulting-page-head">
+    <p class="eyebrow">Work with me</p>
+    <h1>Need a hand with code?</h1>
+    <p class="article-standfirst">
+      Backend systems. AI. Rust. Solana. Developer tools.
+    </p>
+  </header>
+
+  <div class="consulting-letter">
+    <p>
+      Code review, bug fixing, small features, and technical decisions.
+    </p>
+
+    <p>
+      We can start small.
+    </p>
+
+    <div class="contact-links" aria-label="Contact options">
+      <a class="button primary" href="mailto:kelvin@jayanoris.com?subject=Code%20help">Email me</a>
+      <a class="button" href="https://t.me/moshthepitt" rel="noopener noreferrer">Telegram</a>
+      <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+    </div>
+  </div>
+
+  <section class="consulting-section" aria-labelledby="when-heading">
+    <h2 id="when-heading">What I can help with</h2>
+    <div class="consulting-list">
+      <p>Code review.</p>
+      <p>Bug fixing.</p>
+      <p>Small backend features.</p>
+      <p>Rust and Solana issues.</p>
+      <p>Developer tooling.</p>
+      <p>Old code that needs another pair of eyes.</p>
+    </div>
+  </section>
+
+  <section class="consulting-section" aria-labelledby="work-heading">
+    <h2 id="work-heading">How it works</h2>
+    <div class="consulting-list">
+      <p>Send me the problem.</p>
+      <p>I will tell you if I can help.</p>
+      <p>If it makes sense, we agree on a small first task.</p>
+    </div>
+  </section>
+
+  <section class="consulting-section" aria-labelledby="proof-heading">
+    <h2 id="proof-heading">Background</h2>
+    <div class="consulting-list">
+      <p>I have written production software for 15+ years.</p>
+      <p>Recently: Rust, Solana, backend systems, developer tools, and LionClaw.</p>
+    </div>
+  </section>
+</article>
+{% endblock content %}
