@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script="$PWD/scripts/private-context-command"
+if [ ! -f "$script" ]; then
+  printf 'missing private context test script: %s\n' "$script" >&2
+  exit 127
+fi
+
+exec /usr/bin/env bash "$script"
