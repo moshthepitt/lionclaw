@@ -1278,7 +1278,7 @@ async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
          SET lease_owner = 'stale-owner', lease_expires_at_ms = ?1, last_tick_started_at_ms = ?2 \
          WHERE state_id = 1",
     )
-    .bind((now + ChronoDuration::milliseconds(40)).timestamp_millis())
+    .bind((now + ChronoDuration::seconds(60)).timestamp_millis())
     .bind(now.timestamp_millis())
     .execute(&pool)
     .await
@@ -1317,7 +1317,16 @@ async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
             .expect("load status during lease");
     assert_eq!(status_during_lease, "running");
 
-    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_expires_at_ms = ?1 \
+         WHERE state_id = 1 AND lease_owner = 'stale-owner'",
+    )
+    .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("expire stale owner lease");
+
     let tick = recovered_kernel
         .scheduler_tick()
         .await

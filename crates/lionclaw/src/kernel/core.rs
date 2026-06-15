@@ -1510,6 +1510,7 @@ impl Kernel {
     pub(super) async fn reconcile_stale_scheduler_runs_after_tick_lease(
         &self,
     ) -> Result<(), KernelError> {
+        let recovery_started_at_ms = Utc::now().timestamp_millis();
         let run_reason = "scheduled job interrupted after scheduler lease expired";
         let interrupted_runs = self
             .jobs
@@ -1527,7 +1528,11 @@ impl Kernel {
         let turn_reason = "turn interrupted after scheduler lease expired";
         let interrupted_turns = self
             .session_turns
-            .interrupt_running_scheduler_turns_for_jobs(&job_ids, turn_reason)
+            .interrupt_running_scheduler_turns_for_jobs_started_before(
+                &job_ids,
+                recovery_started_at_ms,
+                turn_reason,
+            )
             .await
             .map_err(internal)?;
         for turn in &interrupted_turns {
