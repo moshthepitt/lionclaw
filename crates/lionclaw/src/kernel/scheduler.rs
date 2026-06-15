@@ -255,6 +255,57 @@ impl SchedulerEngine {
         }
     }
 
+    fn initial_delivery_status(job: &SchedulerJobRecord) -> SchedulerJobDeliveryStatus {
+        if job.delivery.is_some() {
+            SchedulerJobDeliveryStatus::Pending
+        } else {
+            SchedulerJobDeliveryStatus::NotRequested
+        }
+    }
+
+    async fn deliver_completed_job_result(
+        &self,
+        kernel: &Kernel,
+        job: &SchedulerJobRecord,
+        run_id: Uuid,
+        content: &str,
+    ) -> Result<SchedulerJobDeliveryStatus, KernelError> {
+        let delivery_status = self.deliver_job_result(kernel, job, run_id, content).await;
+        if delivery_status == SchedulerJobDeliveryStatus::Failed {
+            let updated = kernel
+                .job_store()
+                .update_run_delivery_status(run_id, delivery_status)
+                .await
+                .map_err(internal)?;
+            if !updated {
+                warn!(%run_id, "failed to update completed scheduler run delivery status");
+            }
+        }
+        Ok(delivery_status)
+    }
+
+    async fn finish_if_run_no_longer_current(
+        &self,
+        kernel: &Kernel,
+        job_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<AttemptOutcome>, KernelError> {
+        let Some(final_run) = kernel.job_store().get_run(run_id).await.map_err(internal)? else {
+            return Ok(None);
+        };
+        let Some(updated_job) = kernel.job_store().get_job(job_id).await.map_err(internal)? else {
+            return Ok(None);
+        };
+
+        if final_run.status != SchedulerJobRunStatus::Running {
+            return Ok(Some(AttemptOutcome::Finished(Box::new((
+                updated_job,
+                final_run,
+            )))));
+        }
+        Ok(None)
+    }
+
     async fn run_job_attempt(
         &self,
         kernel: &Kernel,
@@ -276,16 +327,14 @@ impl SchedulerEngine {
 
         match turn_result {
             Ok(response) => {
-                let delivery_status = self
-                    .deliver_job_result(kernel, job, current_run.run_id, &response.assistant_text)
-                    .await;
+                let initial_delivery_status = Self::initial_delivery_status(job);
                 let updated_job = kernel
                     .job_store()
                     .complete_run_success(
                         current_run.run_id,
                         response.session_id,
                         response.turn_id,
-                        delivery_status,
+                        initial_delivery_status,
                     )
                     .await
                     .map_err(internal)?
@@ -294,6 +343,14 @@ impl SchedulerEngine {
                             "scheduled job disappeared during completion".to_string(),
                         )
                     })?;
+                let delivery_status = self
+                    .deliver_completed_job_result(
+                        kernel,
+                        job,
+                        current_run.run_id,
+                        &response.assistant_text,
+                    )
+                    .await?;
                 let final_run = kernel
                     .job_store()
                     .get_run(current_run.run_id)
@@ -328,6 +385,19 @@ impl SchedulerEngine {
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
+                let run_still_owns_turn = kernel
+                    .job_store()
+                    .running_run_owns_turn(current_run.run_id, opened.session_id, turn_id)
+                    .await
+                    .map_err(internal)?;
+                if !run_still_owns_turn {
+                    if let Some(outcome) = self
+                        .finish_if_run_no_longer_current(kernel, job.job_id, current_run.run_id)
+                        .await?
+                    {
+                        return Ok(outcome);
+                    }
+                }
                 self.handle_failed_attempt(
                     kernel,
                     job,
@@ -382,9 +452,7 @@ impl SchedulerEngine {
 
         let error_text = err.to_string();
         let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, error_text);
-        let delivery_status = self
-            .deliver_job_result(kernel, job, current_run.run_id, &failure_summary)
-            .await;
+        let initial_delivery_status = Self::initial_delivery_status(job);
         let updated_job = kernel
             .job_store()
             .complete_run_failure(
@@ -393,7 +461,7 @@ impl SchedulerEngine {
                 context.turn_id,
                 &error_text,
                 SchedulerJobRunStatus::DeadLetter,
-                delivery_status,
+                initial_delivery_status,
             )
             .await
             .map_err(internal)?
@@ -402,6 +470,9 @@ impl SchedulerEngine {
                     "scheduled job disappeared during failure completion".to_string(),
                 )
             })?;
+        let delivery_status = self
+            .deliver_completed_job_result(kernel, job, current_run.run_id, &failure_summary)
+            .await?;
         let final_run = kernel
             .job_store()
             .get_run(current_run.run_id)

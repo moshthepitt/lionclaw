@@ -1177,6 +1177,7 @@ async fn scheduler_tick_surfaces_unexpected_job_completion_failures() {
     let message = err.to_string();
     assert!(
         message.contains("scheduled job disappeared during completion")
+            || message.contains("scheduled job disappeared during failure completion")
             || message.contains("failed to load scheduler job for success"),
         "unexpected tick failure should surface the completion error, got: {message}"
     );
@@ -1253,6 +1254,129 @@ async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
     adapter.release_first_turn.notify_one();
     let tick = tick.await.expect("join tick").expect("tick should finish");
     assert_eq!(tick.claimed_runs, 1);
+}
+
+#[tokio::test]
+async fn recovered_scheduler_run_cannot_be_completed_by_stale_runtime() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "recovered scheduler tick".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "stale runtime must not complete".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create live job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick = tokio::spawn(async move { kernel_for_tick.scheduler_tick().await });
+    adapter.first_turn_started.notified().await;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let (run_id, _session_id, turn_id): (String, String, String) = sqlx::query_as(
+        "SELECT run_id, session_id, turn_id \
+         FROM scheduler_job_runs \
+         WHERE job_id = ?1 AND status = 'running' \
+         ORDER BY started_at_ms DESC LIMIT 1",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("load attached running scheduler job run");
+
+    let recovered_at_ms = Utc::now().timestamp_millis();
+    let updated_run = sqlx::query(
+        "UPDATE scheduler_job_runs \
+         SET finished_at_ms = ?2, status = 'interrupted', error_text = 'simulated recovery' \
+         WHERE run_id = ?1 AND status = 'running'",
+    )
+    .bind(&run_id)
+    .bind(recovered_at_ms)
+    .execute(&pool)
+    .await
+    .expect("interrupt running scheduler run");
+    assert_eq!(updated_run.rows_affected(), 1);
+
+    let updated_job = sqlx::query(
+        "UPDATE scheduler_jobs \
+         SET enabled = 0, next_run_at_ms = NULL, running_run_id = NULL, \
+             last_status = 'interrupted', last_error = 'simulated recovery', updated_at_ms = ?2 \
+         WHERE job_id = ?1 AND running_run_id = ?3",
+    )
+    .bind(created.job.job_id.to_string())
+    .bind(recovered_at_ms)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("clear recovered scheduler job state");
+    assert_eq!(updated_job.rows_affected(), 1);
+
+    let updated_turn = sqlx::query(
+        "UPDATE session_turns \
+         SET status = 'interrupted', error_code = 'runtime.interrupted', error_text = 'simulated recovery', finished_at_ms = ?2 \
+         WHERE turn_id = ?1 AND status = 'running'",
+    )
+    .bind(&turn_id)
+    .bind(recovered_at_ms)
+    .execute(&pool)
+    .await
+    .expect("interrupt running scheduler turn");
+    assert_eq!(updated_turn.rows_affected(), 1);
+
+    adapter.release_first_turn.notify_one();
+    let tick = tick
+        .await
+        .expect("join stale tick")
+        .expect("stale tick should observe recovered run");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered run");
+    assert_eq!(run_status, "interrupted");
+    assert_eq!(run_error.as_deref(), Some("simulated recovery"));
+
+    let (turn_status, assistant_text, turn_error): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, assistant_text, error_text FROM session_turns WHERE turn_id = ?1",
+        )
+        .bind(&turn_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered turn");
+    assert_eq!(turn_status, "interrupted");
+    assert_eq!(assistant_text, "");
+    assert_eq!(turn_error.as_deref(), Some("simulated recovery"));
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 0);
+    assert_eq!(
+        adapter.prompts(),
+        vec!["stale runtime must not complete".to_string()]
+    );
 }
 
 #[tokio::test]

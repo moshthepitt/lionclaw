@@ -169,11 +169,34 @@ impl SessionTurnStore {
         turn_id: Uuid,
         completion: SessionTurnCompletion,
     ) -> Result<Option<SessionTurnRecord>> {
+        self.complete_turn_with_required_status(turn_id, completion, None)
+            .await
+    }
+
+    pub async fn complete_running_turn(
+        &self,
+        turn_id: Uuid,
+        completion: SessionTurnCompletion,
+    ) -> Result<Option<SessionTurnRecord>> {
+        self.complete_turn_with_required_status(
+            turn_id,
+            completion,
+            Some(SessionTurnStatus::Running),
+        )
+        .await
+    }
+
+    async fn complete_turn_with_required_status(
+        &self,
+        turn_id: Uuid,
+        completion: SessionTurnCompletion,
+        required_status: Option<SessionTurnStatus>,
+    ) -> Result<Option<SessionTurnRecord>> {
         let finished_at_ms = now_ms();
         let updated = sqlx::query(
             "UPDATE session_turns \
              SET status = ?2, assistant_text = ?3, error_code = ?4, error_text = ?5, finished_at_ms = ?6 \
-             WHERE turn_id = ?1",
+             WHERE turn_id = ?1 AND (?7 IS NULL OR status = ?7)",
         )
         .bind(turn_id.to_string())
         .bind(completion.status.as_str())
@@ -181,6 +204,7 @@ impl SessionTurnStore {
         .bind(completion.error_code)
         .bind(completion.error_text)
         .bind(finished_at_ms)
+        .bind(required_status.map(|status| status.as_str()))
         .execute(&self.pool)
         .await
         .context("failed to finalize session turn")?;
@@ -977,6 +1001,63 @@ mod tests {
                     | SessionTurnStatus::Interrupted
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn complete_running_turn_does_not_overwrite_terminal_turn() {
+        let (store, session_id) = new_store_with_session().await;
+        let turn = store
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "recover".to_string(),
+                prompt_user_text: "recover".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin turn");
+
+        store
+            .complete_turn(
+                turn.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Interrupted,
+                    assistant_text: String::new(),
+                    error_code: Some("runtime.interrupted".to_string()),
+                    error_text: Some("recovered".to_string()),
+                },
+            )
+            .await
+            .expect("interrupt turn")
+            .expect("turn interrupted");
+
+        let stale_completion = store
+            .complete_running_turn(
+                turn.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "stale output".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("attempt stale completion");
+        assert!(
+            stale_completion.is_none(),
+            "terminal turn must not be overwritten by running-only completion"
+        );
+
+        let stored = store
+            .get(turn.turn_id)
+            .await
+            .expect("load turn")
+            .expect("turn exists");
+        assert_eq!(stored.status, SessionTurnStatus::Interrupted);
+        assert_eq!(stored.assistant_text, "");
+        assert_eq!(stored.error_text.as_deref(), Some("recovered"));
     }
 
     #[tokio::test]

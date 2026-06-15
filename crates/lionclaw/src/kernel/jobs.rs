@@ -1074,6 +1074,12 @@ impl JobStore {
                 .context("failed to finish stale success completion transaction")?;
             return Ok(None);
         }
+        if run.session_id != Some(session_id) || run.turn_id != Some(turn_id) {
+            tx.commit()
+                .await
+                .context("failed to finish mismatched success completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual;
 
@@ -1107,7 +1113,7 @@ impl JobStore {
         let updated_run = sqlx::query(
             "UPDATE scheduler_job_runs \
              SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = NULL \
-             WHERE run_id = ?1 AND status = ?7",
+             WHERE run_id = ?1 AND status = ?7 AND session_id = ?8 AND turn_id = ?9",
         )
         .bind(run_id.to_string())
         .bind(finished_at_ms)
@@ -1116,6 +1122,8 @@ impl JobStore {
         .bind(turn_id.to_string())
         .bind(delivery_status.as_str())
         .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
         .execute(&mut *tx)
         .await
         .context("failed to finalize successful scheduler job run")?;
@@ -1176,6 +1184,14 @@ impl JobStore {
             tx.commit()
                 .await
                 .context("failed to finish stale failure completion transaction")?;
+            return Ok(None);
+        }
+        if session_id.is_some_and(|session_id| run.session_id != Some(session_id))
+            || turn_id.is_some_and(|turn_id| run.turn_id != Some(turn_id))
+        {
+            tx.commit()
+                .await
+                .context("failed to finish mismatched failure completion transaction")?;
             return Ok(None);
         }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
@@ -1364,6 +1380,35 @@ impl JobStore {
         .context("failed to attach scheduler run turn")?;
 
         Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn running_run_owns_turn(
+        &self,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let owns = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS( \
+               SELECT 1 \
+               FROM scheduler_job_runs \
+               JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+               WHERE scheduler_job_runs.run_id = ?1 \
+                 AND scheduler_job_runs.status = ?2 \
+                 AND scheduler_job_runs.session_id = ?3 \
+                 AND scheduler_job_runs.turn_id = ?4 \
+                 AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+             )",
+        )
+        .bind(run_id.to_string())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to verify scheduler run turn ownership")?;
+
+        Ok(owns != 0)
     }
 
     pub async fn interrupt_running_runs(
@@ -2227,6 +2272,42 @@ mod tests {
             .attach_run_turn(run_id, session_id, turn_id)
             .await
             .expect("terminal run should not attach"));
+    }
+
+    #[tokio::test]
+    async fn running_run_owns_turn_requires_current_running_attachment() {
+        let store = new_store().await;
+        let (_job, run_id) = create_running_one_shot_job(&store, "active-turn-owner").await;
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("unattached run ownership"));
+
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attach run turn"));
+        assert!(store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attached run ownership"));
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, Uuid::new_v4())
+            .await
+            .expect("different turn ownership"));
+
+        store
+            .interrupt_run(run_id, "recovered")
+            .await
+            .expect("interrupt run")
+            .expect("run interrupted");
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("interrupted run ownership"));
     }
 
     #[tokio::test]

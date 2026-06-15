@@ -18954,6 +18954,7 @@ struct RuntimeControlSessionExecution<'a> {
     sink: Option<RuntimeEventSink>,
     cancellation: TurnCancellation,
     audit_actor: String,
+    scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
 }
 
 #[derive(Default)]
@@ -19363,12 +19364,20 @@ struct StartedRuntimePreTurnFailure<'a> {
     handle: &'a RuntimeSessionHandle,
     error: &'a KernelError,
     channel_stream_finalizer: ChannelStreamFinalizer<'a>,
+    scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
 }
 
 #[derive(Clone, Copy)]
 struct ChannelStreamFinalizer<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
     emit_done: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerRunTurnGuard {
+    run_id: Uuid,
+    session_id: Uuid,
+    turn_id: Uuid,
 }
 
 enum QueuedTurnTerminal {
@@ -19822,6 +19831,7 @@ impl Kernel {
             handle,
             error,
             channel_stream_finalizer,
+            scheduler_turn_guard,
         } = failure;
 
         self.clear_runtime_session_ready(execution_plan).await;
@@ -19853,6 +19863,7 @@ impl Kernel {
                 stream_error_emitted: false,
             },
             channel_stream_finalizer,
+            scheduler_turn_guard,
         )
         .await?;
         Ok(())
@@ -20047,7 +20058,7 @@ impl Kernel {
                 .map_err(internal)?,
         };
 
-        if let Some(run_id) = scheduler_run_id {
+        let scheduler_turn_guard = if let Some(run_id) = scheduler_run_id {
             let attached = self
                 .jobs
                 .attach_run_turn(run_id, session.session_id, persisted_turn.turn_id)
@@ -20056,7 +20067,7 @@ impl Kernel {
             if !attached {
                 let error_text = "scheduled job run is no longer active".to_string();
                 self.session_turns
-                    .complete_turn(
+                    .complete_running_turn(
                         persisted_turn.turn_id,
                         SessionTurnCompletion {
                             status: SessionTurnStatus::Interrupted,
@@ -20069,7 +20080,14 @@ impl Kernel {
                     .map_err(internal)?;
                 return Err(KernelError::Conflict(error_text));
             }
-        }
+            Some(SchedulerRunTurnGuard {
+                run_id,
+                session_id: session.session_id,
+                turn_id: persisted_turn.turn_id,
+            })
+        } else {
+            None
+        };
 
         if let Some(control) = runtime_control.as_ref() {
             if let Err(err) = self
@@ -20092,6 +20110,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -20117,11 +20136,16 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
             }
         };
+
+        if let Some(guard) = scheduler_turn_guard {
+            self.ensure_scheduler_run_owns_turn(guard).await?;
+        }
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -20148,6 +20172,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
@@ -20171,6 +20196,7 @@ impl Kernel {
                     sink,
                     cancellation,
                     audit_actor,
+                    scheduler_turn_guard,
                 })
                 .await;
         }
@@ -20197,6 +20223,7 @@ impl Kernel {
                     handle: &handle,
                     error: &err,
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 })
                 .await?;
                 return Err(err);
@@ -20254,6 +20281,7 @@ impl Kernel {
                             stream_error_emitted,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                 return self.terminal_turn_result(
@@ -20334,6 +20362,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -20353,6 +20382,7 @@ impl Kernel {
                                 stream_error_emitted: true,
                             },
                             channel_stream_finalizer,
+                            scheduler_turn_guard,
                         )
                         .await?;
                     return self.terminal_turn_result(
@@ -20374,6 +20404,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(close_err);
@@ -20390,6 +20421,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -20410,6 +20442,7 @@ impl Kernel {
                         stream_error_emitted: artifacts.saw_error,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
             return self.terminal_turn_result(
@@ -20445,6 +20478,7 @@ impl Kernel {
                             stream_error_emitted: false,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                     return Err(err);
@@ -20454,8 +20488,7 @@ impl Kernel {
             PreparedChannelDeliveryAttachments::default()
         };
         let completed_turn = self
-            .session_turns
-            .complete_turn(
+            .complete_execution_session_turn(
                 turn_id,
                 SessionTurnCompletion {
                     status: SessionTurnStatus::Completed,
@@ -20463,12 +20496,10 @@ impl Kernel {
                     error_code: None,
                     error_text: None,
                 },
+                scheduler_turn_guard,
+                "completed session turn was not found",
             )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("completed session turn was not found".to_string())
-            })?;
+            .await?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &artifacts.assistant_text)
                 .await?;
@@ -20589,6 +20620,7 @@ impl Kernel {
             sink,
             cancellation,
             audit_actor,
+            scheduler_turn_guard,
         } = execution;
         let channel_stream_finalizer = ChannelStreamFinalizer {
             stream_context: &channel_stream_context,
@@ -20649,6 +20681,7 @@ impl Kernel {
                             stream_error_emitted,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                 return self.terminal_turn_result(
@@ -20699,6 +20732,7 @@ impl Kernel {
                     stream_error_emitted: runtime_events_include_error(&turn_err.events),
                 },
                 channel_stream_finalizer,
+                scheduler_turn_guard,
             )
             .await?;
             return Err(kernel_error_for_turn_status(
@@ -20745,6 +20779,7 @@ impl Kernel {
                         stream_error_emitted: runtime_events_include_error(&runtime_events),
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
@@ -20761,14 +20796,14 @@ impl Kernel {
                     stream_error_emitted: false,
                 },
                 channel_stream_finalizer,
+                scheduler_turn_guard,
             )
             .await?;
             return Err(KernelError::Runtime(message));
         }
 
         let completed_turn = self
-            .session_turns
-            .complete_turn(
+            .complete_execution_session_turn(
                 turn_id,
                 SessionTurnCompletion {
                     status,
@@ -20776,12 +20811,10 @@ impl Kernel {
                     error_code: error_code.clone(),
                     error_text: error_text.clone(),
                 },
+                scheduler_turn_guard,
+                "completed runtime control turn was not found",
             )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("completed runtime control turn was not found".to_string())
-            })?;
+            .await?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &assistant_text)
                 .await?;
@@ -20887,6 +20920,7 @@ impl Kernel {
         persisted_turn: &SessionTurnRecord,
         failure: FailedSessionTurnCompletion,
         channel_stream_finalizer: ChannelStreamFinalizer<'_>,
+        scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
     ) -> Result<SessionTurnCompletion, KernelError> {
         let FailedSessionTurnCompletion {
             assistant_text,
@@ -20904,13 +20938,13 @@ impl Kernel {
         };
 
         let completed_turn = self
-            .session_turns
-            .complete_turn(persisted_turn.turn_id, completion.clone())
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("failed session turn was not found".to_string())
-            })?;
+            .complete_execution_session_turn(
+                persisted_turn.turn_id,
+                completion.clone(),
+                scheduler_turn_guard,
+                "failed session turn was not found",
+            )
+            .await?;
         let surface = if channel_stream_finalizer.stream_context.is_some() {
             PrivateContextRecordSurface::Channel
         } else {
@@ -20982,6 +21016,62 @@ impl Kernel {
             runtime_id,
             stream_events: runtime_events_to_views(&runtime_events),
         }
+    }
+
+    async fn ensure_scheduler_run_owns_turn(
+        &self,
+        guard: SchedulerRunTurnGuard,
+    ) -> Result<(), KernelError> {
+        if self
+            .jobs
+            .running_run_owns_turn(guard.run_id, guard.session_id, guard.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            return Ok(());
+        }
+
+        let error_text = "scheduled job run is no longer active".to_string();
+        self.session_turns
+            .complete_running_turn(
+                guard.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Interrupted,
+                    assistant_text: String::new(),
+                    error_code: Some("runtime.interrupted".to_string()),
+                    error_text: Some(error_text.clone()),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        Err(KernelError::Conflict(error_text))
+    }
+
+    async fn complete_execution_session_turn(
+        &self,
+        turn_id: Uuid,
+        completion: SessionTurnCompletion,
+        scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
+        missing_message: &'static str,
+    ) -> Result<SessionTurnRecord, KernelError> {
+        let completed_turn = if let Some(guard) = scheduler_turn_guard {
+            self.ensure_scheduler_run_owns_turn(guard).await?;
+            self.session_turns
+                .complete_running_turn(turn_id, completion)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    KernelError::Conflict("scheduled job turn is no longer active".to_string())
+                })?
+        } else {
+            self.session_turns
+                .complete_turn(turn_id, completion)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| KernelError::Internal(missing_message.to_string()))?
+        };
+
+        Ok(completed_turn)
     }
 
     fn terminal_turn_result(
