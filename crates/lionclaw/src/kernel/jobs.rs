@@ -999,25 +999,16 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before success completion"))?;
+        if run.status != SchedulerJobRunStatus::Running || job.running_run_id != Some(run_id) {
+            tx.commit()
+                .await
+                .context("failed to finish stale success completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual;
 
-        sqlx::query(
-            "UPDATE scheduler_job_runs \
-             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = NULL \
-             WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .bind(finished_at_ms)
-        .bind(SchedulerJobRunStatus::Completed.as_str())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(delivery_status.as_str())
-        .execute(&mut *tx)
-        .await
-        .context("failed to finalize successful scheduler job run")?;
-
-        sqlx::query(
+        let updated_job_state = sqlx::query(
             "UPDATE scheduler_jobs \
              SET enabled = CASE WHEN ?2 THEN 0 ELSE enabled END, \
                  next_run_at_ms = CASE WHEN ?2 THEN NULL ELSE next_run_at_ms END, \
@@ -1027,15 +1018,41 @@ impl JobStore {
                  last_error = NULL, \
                  consecutive_failures = 0, \
                  updated_at_ms = ?3 \
-             WHERE job_id = ?1",
+             WHERE job_id = ?1 AND running_run_id = ?5",
         )
         .bind(run.job_id.to_string())
         .bind(if disable_one_shot { 1 } else { 0 })
         .bind(finished_at_ms)
         .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(run_id.to_string())
         .execute(&mut *tx)
         .await
         .context("failed to finalize scheduler job state after success")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale success completion transaction")?;
+            return Ok(None);
+        }
+
+        let updated_run = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = NULL \
+             WHERE run_id = ?1 AND status = ?7",
+        )
+        .bind(run_id.to_string())
+        .bind(finished_at_ms)
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(delivery_status.as_str())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to finalize successful scheduler job run")?;
+        if updated_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during success completion");
+        }
 
         let updated_job = self
             .get_job_in_tx(
@@ -1086,27 +1103,17 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before failure completion"))?;
+        if run.status != SchedulerJobRunStatus::Running || job.running_run_id != Some(run_id) {
+            tx.commit()
+                .await
+                .context("failed to finish stale failure completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual
             && final_status == SchedulerJobRunStatus::DeadLetter;
 
-        sqlx::query(
-            "UPDATE scheduler_job_runs \
-             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = ?7 \
-             WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .bind(finished_at_ms)
-        .bind(final_status.as_str())
-        .bind(session_id.map(|value| value.to_string()))
-        .bind(turn_id.map(|value| value.to_string()))
-        .bind(delivery_status.as_str())
-        .bind(error_text)
-        .execute(&mut *tx)
-        .await
-        .context("failed to finalize failed scheduler job run")?;
-
-        sqlx::query(
+        let updated_job_state = sqlx::query(
             "UPDATE scheduler_jobs \
              SET enabled = CASE WHEN ?2 THEN 0 ELSE enabled END, \
                  next_run_at_ms = CASE WHEN ?2 THEN NULL ELSE next_run_at_ms END, \
@@ -1116,16 +1123,43 @@ impl JobStore {
                  last_error = ?5, \
                  consecutive_failures = consecutive_failures + 1, \
                  updated_at_ms = ?3 \
-             WHERE job_id = ?1",
+             WHERE job_id = ?1 AND running_run_id = ?6",
         )
         .bind(run.job_id.to_string())
         .bind(if disable_one_shot { 1 } else { 0 })
         .bind(finished_at_ms)
         .bind(final_status.as_str())
         .bind(error_text)
+        .bind(run_id.to_string())
         .execute(&mut *tx)
         .await
         .context("failed to finalize scheduler job state after failure")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale failure completion transaction")?;
+            return Ok(None);
+        }
+
+        let updated_run = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = ?7 \
+             WHERE run_id = ?1 AND status = ?8",
+        )
+        .bind(run_id.to_string())
+        .bind(finished_at_ms)
+        .bind(final_status.as_str())
+        .bind(session_id.map(|value| value.to_string()))
+        .bind(turn_id.map(|value| value.to_string()))
+        .bind(delivery_status.as_str())
+        .bind(error_text)
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to finalize failed scheduler job run")?;
+        if updated_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during failure completion");
+        }
 
         let updated_job = self
             .get_job_in_tx(
@@ -1321,8 +1355,26 @@ impl JobStore {
             .into_iter()
             .map(map_run_row)
             .collect::<Result<Vec<_>>>()?;
+        let mut interrupted_runs = Vec::new();
 
         for run in &runs {
+            let updated_run = sqlx::query(
+                "UPDATE scheduler_job_runs \
+                 SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
+                 WHERE run_id = ?1 AND status = ?5",
+            )
+            .bind(run.run_id.to_string())
+            .bind(finished_at_ms)
+            .bind(SchedulerJobRunStatus::Interrupted.as_str())
+            .bind(error_text)
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("failed to interrupt scheduler-owned job run")?;
+            if updated_run.rows_affected() == 0 {
+                continue;
+            }
+
             sqlx::query(
                 "UPDATE scheduler_jobs \
                  SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
@@ -1336,27 +1388,24 @@ impl JobStore {
             .execute(&mut *tx)
             .await
             .context("failed to clear interrupted scheduler-owned job state")?;
-        }
 
-        sqlx::query(
-            "UPDATE scheduler_job_runs \
-             SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
-             WHERE status = ?1 AND trigger_kind != ?5",
-        )
-        .bind(SchedulerJobRunStatus::Running.as_str())
-        .bind(finished_at_ms)
-        .bind(SchedulerJobRunStatus::Interrupted.as_str())
-        .bind(error_text)
-        .bind(SchedulerJobTriggerKind::Manual.as_str())
-        .execute(&mut *tx)
-        .await
-        .context("failed to interrupt scheduler-owned job runs")?;
+            let updated_row = sqlx::query(
+                "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+                 status, session_id, turn_id, delivery_status, error_text \
+                 FROM scheduler_job_runs WHERE run_id = ?1",
+            )
+            .bind(run.run_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to reload interrupted scheduler-owned job run")?;
+            interrupted_runs.push(map_run_row(updated_row)?);
+        }
 
         tx.commit()
             .await
             .context("failed to commit interrupted scheduler-owned job runs")?;
 
-        Ok(runs)
+        Ok(interrupted_runs)
     }
 }
 
@@ -1972,6 +2021,104 @@ mod tests {
             updated_job.last_error.as_deref(),
             Some("unexpected scheduler failure")
         );
+    }
+
+    #[tokio::test]
+    async fn run_completion_requires_current_job_claim() {
+        let store = new_store().await;
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "completion-owner".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create completion job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim original job");
+        let stale_run_id = claimed[0].run.run_id;
+        let current_run_id = Uuid::new_v4();
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO scheduler_job_runs \
+             (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+              status, session_id, turn_id, delivery_status, error_text) \
+             VALUES (?1, ?2, 1, 'manual', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
+        )
+        .bind(current_run_id.to_string())
+        .bind(job.job_id.to_string())
+        .bind(job.next_run_at.map(|value| value.timestamp_millis()))
+        .bind(now_ms)
+        .execute(store.pool())
+        .await
+        .expect("insert current manual run");
+        sqlx::query("UPDATE scheduler_jobs SET running_run_id = ?2 WHERE job_id = ?1")
+            .bind(job.job_id.to_string())
+            .bind(current_run_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("move job ownership to current run");
+
+        let stale_success = store
+            .complete_run_success(
+                stale_run_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete stale success");
+        assert!(
+            stale_success.is_none(),
+            "a stale run must not complete after losing job ownership"
+        );
+
+        let stale_failure = store
+            .complete_run_failure(
+                stale_run_id,
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                "late failure",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete stale failure");
+        assert!(
+            stale_failure.is_none(),
+            "a stale run must not fail/dead-letter after losing job ownership"
+        );
+
+        let stale_run = store
+            .get_run(stale_run_id)
+            .await
+            .expect("load stale run")
+            .expect("stale run exists");
+        assert_eq!(stale_run.status, SchedulerJobRunStatus::Running);
+        assert!(stale_run.finished_at.is_none());
+
+        let current_run = store
+            .get_run(current_run_id)
+            .await
+            .expect("load current run")
+            .expect("current run exists");
+        assert_eq!(current_run.status, SchedulerJobRunStatus::Running);
+
+        let updated_job = store
+            .get_job(job.job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, Some(current_run_id));
+        assert!(updated_job.enabled);
     }
 
     #[tokio::test]
