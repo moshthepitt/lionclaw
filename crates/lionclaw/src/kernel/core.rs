@@ -1512,29 +1512,35 @@ impl Kernel {
     ) -> Result<(), KernelError> {
         let recovery_started_at_ms = Utc::now().timestamp_millis();
         let run_reason = "scheduled job interrupted after scheduler lease expired";
-        let interrupted_runs = self
+        let reconciliation = self
             .jobs
             .interrupt_running_scheduler_owned_runs(run_reason)
             .await
             .map_err(internal)?;
-        if interrupted_runs.is_empty() {
+        if reconciliation.interrupted_runs.is_empty() {
             return Ok(());
         }
 
-        let job_ids = interrupted_runs
+        let mut job_ids = reconciliation
+            .job_owned_runs
             .iter()
             .map(|run| run.job_id)
             .collect::<Vec<_>>();
+        job_ids.sort_unstable();
+        job_ids.dedup();
         let turn_reason = "turn interrupted after scheduler lease expired";
-        let interrupted_turns = self
-            .session_turns
-            .interrupt_running_scheduler_turns_for_jobs_started_before(
-                &job_ids,
-                recovery_started_at_ms,
-                turn_reason,
-            )
-            .await
-            .map_err(internal)?;
+        let interrupted_turns = if job_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.session_turns
+                .interrupt_running_scheduler_turns_for_jobs_started_before(
+                    &job_ids,
+                    recovery_started_at_ms,
+                    turn_reason,
+                )
+                .await
+                .map_err(internal)?
+        };
         for turn in &interrupted_turns {
             if let Err(err) = self.sessions.record_turn(turn.session_id).await {
                 warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
@@ -1547,7 +1553,7 @@ impl Kernel {
             "kernel",
             json!({
                 "status": "interrupted",
-                "run_count": interrupted_runs.len(),
+                "run_count": reconciliation.interrupted_runs.len(),
                 "turn_count": interrupted_turns.len(),
                 "reason": run_reason,
             }),

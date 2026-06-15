@@ -171,6 +171,14 @@ pub struct SchedulerJobRunRecord {
     pub error_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SchedulerOwnedRunReconciliation {
+    /// Runs that this recovery pass actually moved out of Running.
+    pub interrupted_runs: Vec<SchedulerJobRunRecord>,
+    /// Interrupted runs that still owned their scheduler job and are safe for job-scoped cleanup.
+    pub job_owned_runs: Vec<SchedulerJobRunRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewSchedulerJob {
     pub name: String,
@@ -1345,7 +1353,7 @@ impl JobStore {
     pub async fn interrupt_running_scheduler_owned_runs(
         &self,
         error_text: &str,
-    ) -> Result<Vec<SchedulerJobRunRecord>> {
+    ) -> Result<SchedulerOwnedRunReconciliation> {
         let finished_at_ms = now_ms();
         let mut tx = self
             .pool
@@ -1370,7 +1378,7 @@ impl JobStore {
             .into_iter()
             .map(map_run_row)
             .collect::<Result<Vec<_>>>()?;
-        let mut interrupted_runs = Vec::new();
+        let mut reconciliation = SchedulerOwnedRunReconciliation::default();
 
         for run in &runs {
             let updated_run = sqlx::query(
@@ -1390,6 +1398,20 @@ impl JobStore {
                 continue;
             }
 
+            let updated_row = sqlx::query(
+                "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+                 status, session_id, turn_id, delivery_status, error_text \
+                 FROM scheduler_job_runs WHERE run_id = ?1",
+            )
+            .bind(run.run_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to reload interrupted scheduler-owned job run")?;
+            let interrupted_run = map_run_row(updated_row)?;
+            reconciliation
+                .interrupted_runs
+                .push(interrupted_run.clone());
+
             let cleared_job_state = sqlx::query(
                 "UPDATE scheduler_jobs \
                  SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
@@ -1407,23 +1429,14 @@ impl JobStore {
                 continue;
             }
 
-            let updated_row = sqlx::query(
-                "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-                 status, session_id, turn_id, delivery_status, error_text \
-                 FROM scheduler_job_runs WHERE run_id = ?1",
-            )
-            .bind(run.run_id.to_string())
-            .fetch_one(&mut *tx)
-            .await
-            .context("failed to reload interrupted scheduler-owned job run")?;
-            interrupted_runs.push(map_run_row(updated_row)?);
+            reconciliation.job_owned_runs.push(interrupted_run);
         }
 
         tx.commit()
             .await
             .context("failed to commit interrupted scheduler-owned job runs")?;
 
-        Ok(interrupted_runs)
+        Ok(reconciliation)
     }
 }
 
@@ -2185,12 +2198,14 @@ mod tests {
         let stale_run_id = claimed[0].run.run_id;
         let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
 
-        let interrupted = store
+        let reconciliation = store
             .interrupt_running_scheduler_owned_runs("recover stale scheduler run")
             .await
             .expect("interrupt stale scheduler-owned runs");
+        assert_eq!(reconciliation.interrupted_runs.len(), 1);
+        assert_eq!(reconciliation.interrupted_runs[0].run_id, stale_run_id);
         assert!(
-            interrupted.is_empty(),
+            reconciliation.job_owned_runs.is_empty(),
             "a stale orphan run must not drive job-scoped turn cleanup"
         );
 
