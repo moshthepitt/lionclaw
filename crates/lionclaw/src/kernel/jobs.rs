@@ -631,6 +631,24 @@ impl JobStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn has_active_tick_lease(&self) -> Result<bool> {
+        let now = now_ms();
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM scheduler_state \
+             WHERE state_id = 1 \
+               AND lease_owner IS NOT NULL \
+               AND lease_expires_at_ms IS NOT NULL \
+               AND lease_expires_at_ms >= ?1",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query scheduler tick lease")?;
+
+        Ok(active > 0)
+    }
+
     pub async fn release_tick_lease(&self, owner: &str) -> Result<()> {
         let now = now_ms();
         sqlx::query(

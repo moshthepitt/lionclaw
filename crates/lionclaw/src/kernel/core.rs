@@ -1431,28 +1431,31 @@ impl Kernel {
                 );
             }
         }
-        let reason = "turn interrupted by kernel restart";
-        if let Ok(interrupted_turns) = self
-            .session_turns
-            .interrupt_running_turns_without_pending_channel_turns(reason)
-            .await
-        {
-            for turn in &interrupted_turns {
-                if let Err(err) = self.sessions.record_turn(turn.session_id).await {
-                    warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
+        let active_scheduler_tick = self.active_scheduler_tick_lease_for_bootstrap().await;
+        if !active_scheduler_tick {
+            let reason = "turn interrupted by kernel restart";
+            if let Ok(interrupted_turns) = self
+                .session_turns
+                .interrupt_running_turns_without_pending_channel_turns(reason)
+                .await
+            {
+                for turn in &interrupted_turns {
+                    if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                        warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
+                    }
                 }
+                self.append_audit_event_best_effort(
+                    "session.turn.reconciled",
+                    None,
+                    "kernel",
+                    json!({
+                        "status": "interrupted",
+                        "count": interrupted_turns.len(),
+                        "reason": reason,
+                    }),
+                )
+                .await;
             }
-            self.append_audit_event_best_effort(
-                "session.turn.reconciled",
-                None,
-                "kernel",
-                json!({
-                    "status": "interrupted",
-                    "count": interrupted_turns.len(),
-                    "reason": reason,
-                }),
-            )
-            .await;
         }
         if let Err(err) = self
             .channel_state
@@ -1471,18 +1474,33 @@ impl Kernel {
             );
         }
         self.ensure_pending_channel_turn_workers().await;
-        if let Err(err) = self
-            .jobs
-            .interrupt_running_runs("scheduled job interrupted by kernel restart")
-            .await
-        {
-            warn!(
-                ?err,
-                "failed to reconcile running scheduled jobs during bootstrap"
-            );
+        if !active_scheduler_tick {
+            if let Err(err) = self
+                .jobs
+                .interrupt_running_runs("scheduled job interrupted by kernel restart")
+                .await
+            {
+                warn!(
+                    ?err,
+                    "failed to reconcile running scheduled jobs during bootstrap"
+                );
+            }
         }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
+    }
+
+    async fn active_scheduler_tick_lease_for_bootstrap(&self) -> bool {
+        match self.jobs.has_active_tick_lease().await {
+            Ok(active) => active,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to check scheduler tick lease during bootstrap; preserving running scheduler work"
+                );
+                true
+            }
         }
     }
 

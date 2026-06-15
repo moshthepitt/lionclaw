@@ -1183,6 +1183,68 @@ async fn scheduler_tick_surfaces_unexpected_job_completion_failures() {
 }
 
 #[tokio::test]
+async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "live scheduler tick".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "keep running".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create live job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick = tokio::spawn(async move { kernel_for_tick.scheduler_tick().await });
+    adapter.first_turn_started.notified().await;
+
+    let _second_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init must not reconcile live scheduler work");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let run_status: String = sqlx::query_scalar(
+        "SELECT status FROM scheduler_job_runs WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("load running scheduler job run");
+    assert_eq!(
+        run_status, "running",
+        "opening another kernel while the scheduler lease is active must not interrupt the job run"
+    );
+
+    let turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns ORDER BY started_at_ms DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("load running scheduler session turn");
+    assert_eq!(
+        turn_status, "running",
+        "opening another kernel while the scheduler lease is active must not interrupt the session turn"
+    );
+
+    adapter.release_first_turn.notify_one();
+    let tick = tick.await.expect("join tick").expect("tick should finish");
+    assert_eq!(tick.claimed_runs, 1);
+}
+
+#[tokio::test]
 async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
