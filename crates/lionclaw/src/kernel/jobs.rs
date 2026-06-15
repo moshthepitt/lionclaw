@@ -892,7 +892,9 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before retry"))?;
-        if current.status != SchedulerJobRunStatus::Running {
+        if current.status != SchedulerJobRunStatus::Running
+            || job.running_run_id != Some(current_run_id)
+        {
             tx.commit()
                 .await
                 .context("failed to finish skipped retry transaction")?;
@@ -901,28 +903,41 @@ impl JobStore {
 
         let retry_run_id = Uuid::new_v4();
         let started_at_ms = now.timestamp_millis();
-        sqlx::query(
+        let updated_job_state = sqlx::query(
+            "UPDATE scheduler_jobs \
+             SET running_run_id = ?2, updated_at_ms = ?3 \
+             WHERE job_id = ?1 AND running_run_id = ?4",
+        )
+        .bind(current.job_id.to_string())
+        .bind(retry_run_id.to_string())
+        .bind(started_at_ms)
+        .bind(current_run_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to switch running scheduler job run to retry")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale retry transaction")?;
+            return Ok(None);
+        }
+
+        let updated_current_run = sqlx::query(
             "UPDATE scheduler_job_runs \
              SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
-             WHERE run_id = ?1",
+             WHERE run_id = ?1 AND status = ?5",
         )
         .bind(current_run_id.to_string())
         .bind(started_at_ms)
         .bind(SchedulerJobRunStatus::Failed.as_str())
         .bind("retrying after failed attempt")
+        .bind(SchedulerJobRunStatus::Running.as_str())
         .execute(&mut *tx)
         .await
         .context("failed to mark current run failed before retry")?;
-
-        sqlx::query(
-            "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
-        )
-        .bind(current.job_id.to_string())
-        .bind(retry_run_id.to_string())
-        .bind(started_at_ms)
-        .execute(&mut *tx)
-        .await
-        .context("failed to switch running scheduler job run to retry")?;
+        if updated_current_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during retry");
+        }
 
         sqlx::query(
             "INSERT INTO scheduler_job_runs \
@@ -1375,7 +1390,7 @@ impl JobStore {
                 continue;
             }
 
-            sqlx::query(
+            let cleared_job_state = sqlx::query(
                 "UPDATE scheduler_jobs \
                  SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
                  WHERE job_id = ?1 AND running_run_id = ?5",
@@ -1388,6 +1403,9 @@ impl JobStore {
             .execute(&mut *tx)
             .await
             .context("failed to clear interrupted scheduler-owned job state")?;
+            if cleared_job_state.rows_affected() == 0 {
+                continue;
+            }
 
             let updated_row = sqlx::query(
                 "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
@@ -1668,6 +1686,31 @@ mod tests {
         let db = Db::connect_memory().await.expect("connect memory db");
         let pool = db.pool();
         (JobStore::new(pool.clone()), PolicyStore::new(pool))
+    }
+
+    async fn move_job_ownership_to_manual_run(store: &JobStore, job: &SchedulerJobRecord) -> Uuid {
+        let run_id = Uuid::new_v4();
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO scheduler_job_runs \
+             (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+              status, session_id, turn_id, delivery_status, error_text) \
+             VALUES (?1, ?2, 1, 'manual', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
+        )
+        .bind(run_id.to_string())
+        .bind(job.job_id.to_string())
+        .bind(job.next_run_at.map(|value| value.timestamp_millis()))
+        .bind(now_ms)
+        .execute(store.pool())
+        .await
+        .expect("insert current manual run");
+        sqlx::query("UPDATE scheduler_jobs SET running_run_id = ?2 WHERE job_id = ?1")
+            .bind(job.job_id.to_string())
+            .bind(run_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("move job ownership to current run");
+        run_id
     }
 
     #[test]
@@ -2024,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_completion_requires_current_job_claim() {
+    async fn stale_run_mutations_require_current_job_claim() {
         let store = new_store().await;
         let job = store
             .create_job(NewSchedulerJob {
@@ -2045,27 +2088,16 @@ mod tests {
             .await
             .expect("claim original job");
         let stale_run_id = claimed[0].run.run_id;
-        let current_run_id = Uuid::new_v4();
-        let now_ms = Utc::now().timestamp_millis();
-        sqlx::query(
-            "INSERT INTO scheduler_job_runs \
-             (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-              status, session_id, turn_id, delivery_status, error_text) \
-             VALUES (?1, ?2, 1, 'manual', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
-        )
-        .bind(current_run_id.to_string())
-        .bind(job.job_id.to_string())
-        .bind(job.next_run_at.map(|value| value.timestamp_millis()))
-        .bind(now_ms)
-        .execute(store.pool())
-        .await
-        .expect("insert current manual run");
-        sqlx::query("UPDATE scheduler_jobs SET running_run_id = ?2 WHERE job_id = ?1")
-            .bind(job.job_id.to_string())
-            .bind(current_run_id.to_string())
-            .execute(store.pool())
+        let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
+
+        let stale_retry = store
+            .begin_retry_run(stale_run_id, Utc::now() + ChronoDuration::seconds(1))
             .await
-            .expect("move job ownership to current run");
+            .expect("retry stale run");
+        assert!(
+            stale_retry.is_none(),
+            "a stale run must not create a retry after losing job ownership"
+        );
 
         let stale_success = store
             .complete_run_success(
@@ -2119,6 +2151,69 @@ mod tests {
             .expect("job exists");
         assert_eq!(updated_job.running_run_id, Some(current_run_id));
         assert!(updated_job.enabled);
+
+        let run_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1")
+                .bind(job.job_id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .expect("count job runs");
+        assert_eq!(run_count, 2, "stale retry must not insert another run");
+    }
+
+    #[tokio::test]
+    async fn scheduler_owned_recovery_reports_only_runs_that_owned_the_job() {
+        let store = new_store().await;
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "recovery-owner".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create recovery job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim original job");
+        let stale_run_id = claimed[0].run.run_id;
+        let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
+
+        let interrupted = store
+            .interrupt_running_scheduler_owned_runs("recover stale scheduler run")
+            .await
+            .expect("interrupt stale scheduler-owned runs");
+        assert!(
+            interrupted.is_empty(),
+            "a stale orphan run must not drive job-scoped turn cleanup"
+        );
+
+        let stale_run = store
+            .get_run(stale_run_id)
+            .await
+            .expect("load stale run")
+            .expect("stale run exists");
+        assert_eq!(stale_run.status, SchedulerJobRunStatus::Interrupted);
+
+        let current_run = store
+            .get_run(current_run_id)
+            .await
+            .expect("load current run")
+            .expect("current run exists");
+        assert_eq!(current_run.status, SchedulerJobRunStatus::Running);
+
+        let updated_job = store
+            .get_job(job.job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, Some(current_run_id));
     }
 
     #[tokio::test]
