@@ -62,6 +62,9 @@ impl SchedulerEngine {
 
         let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
         let tick_result = Box::pin(async {
+            kernel
+                .reconcile_stale_scheduler_runs_after_tick_lease()
+                .await?;
             let mut claimed_runs = 0usize;
             while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
                 claimed_runs += 1;

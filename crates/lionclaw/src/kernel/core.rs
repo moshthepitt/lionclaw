@@ -1432,30 +1432,33 @@ impl Kernel {
             }
         }
         let active_scheduler_tick = self.active_scheduler_tick_lease_for_bootstrap().await;
-        if !active_scheduler_tick {
-            let reason = "turn interrupted by kernel restart";
-            if let Ok(interrupted_turns) = self
-                .session_turns
+        let reason = "turn interrupted by kernel restart";
+        let interrupted_turns = if active_scheduler_tick {
+            self.session_turns
+                .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(reason)
+                .await
+        } else {
+            self.session_turns
                 .interrupt_running_turns_without_pending_channel_turns(reason)
                 .await
-            {
-                for turn in &interrupted_turns {
-                    if let Err(err) = self.sessions.record_turn(turn.session_id).await {
-                        warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
-                    }
+        };
+        if let Ok(interrupted_turns) = interrupted_turns {
+            for turn in &interrupted_turns {
+                if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                    warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
                 }
-                self.append_audit_event_best_effort(
-                    "session.turn.reconciled",
-                    None,
-                    "kernel",
-                    json!({
-                        "status": "interrupted",
-                        "count": interrupted_turns.len(),
-                        "reason": reason,
-                    }),
-                )
-                .await;
             }
+            self.append_audit_event_best_effort(
+                "session.turn.reconciled",
+                None,
+                "kernel",
+                json!({
+                    "status": "interrupted",
+                    "count": interrupted_turns.len(),
+                    "reason": reason,
+                }),
+            )
+            .await;
         }
         if let Err(err) = self
             .channel_state
@@ -1502,6 +1505,51 @@ impl Kernel {
                 true
             }
         }
+    }
+
+    pub(super) async fn reconcile_stale_scheduler_runs_after_tick_lease(
+        &self,
+    ) -> Result<(), KernelError> {
+        let run_reason = "scheduled job interrupted after scheduler lease expired";
+        let interrupted_runs = self
+            .jobs
+            .interrupt_running_scheduler_owned_runs(run_reason)
+            .await
+            .map_err(internal)?;
+        if interrupted_runs.is_empty() {
+            return Ok(());
+        }
+
+        let job_ids = interrupted_runs
+            .iter()
+            .map(|run| run.job_id)
+            .collect::<Vec<_>>();
+        let turn_reason = "turn interrupted after scheduler lease expired";
+        let interrupted_turns = self
+            .session_turns
+            .interrupt_running_scheduler_turns_for_jobs(&job_ids, turn_reason)
+            .await
+            .map_err(internal)?;
+        for turn in &interrupted_turns {
+            if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
+            }
+        }
+
+        self.append_audit_event_best_effort(
+            "scheduler.run.reconciled",
+            None,
+            "kernel",
+            json!({
+                "status": "interrupted",
+                "run_count": interrupted_runs.len(),
+                "turn_count": interrupted_turns.len(),
+                "reason": run_reason,
+            }),
+        )
+        .await;
+
+        Ok(())
     }
 
     pub async fn reconcile_stale_channel_attachments(&self) -> Result<(), KernelError> {

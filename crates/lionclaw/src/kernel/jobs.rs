@@ -1292,6 +1292,72 @@ impl JobStore {
 
         rows.into_iter().map(map_run_row).collect()
     }
+
+    pub async fn interrupt_running_scheduler_owned_runs(
+        &self,
+        error_text: &str,
+    ) -> Result<Vec<SchedulerJobRunRecord>> {
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupt scheduler-owned runs transaction")?;
+
+        let rows = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs \
+             WHERE status = ?1 AND trigger_kind != ?2 \
+             ORDER BY started_at_ms ASC, run_id ASC",
+        )
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(SchedulerJobTriggerKind::Manual.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query running scheduler-owned job runs")?;
+
+        let runs = rows
+            .into_iter()
+            .map(map_run_row)
+            .collect::<Result<Vec<_>>>()?;
+
+        for run in &runs {
+            sqlx::query(
+                "UPDATE scheduler_jobs \
+                 SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
+                 WHERE job_id = ?1 AND running_run_id = ?5",
+            )
+            .bind(run.job_id.to_string())
+            .bind(SchedulerJobRunStatus::Interrupted.as_str())
+            .bind(error_text)
+            .bind(finished_at_ms)
+            .bind(run.run_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear interrupted scheduler-owned job state")?;
+        }
+
+        sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
+             WHERE status = ?1 AND trigger_kind != ?5",
+        )
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(finished_at_ms)
+        .bind(SchedulerJobRunStatus::Interrupted.as_str())
+        .bind(error_text)
+        .bind(SchedulerJobTriggerKind::Manual.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to interrupt scheduler-owned job runs")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted scheduler-owned job runs")?;
+
+        Ok(runs)
+    }
 }
 
 pub fn compute_initial_next_run(

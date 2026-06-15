@@ -1245,6 +1245,104 @@ async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
 }
 
 #[tokio::test]
+async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "stale scheduler owner".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "recover stale run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create stale-owner job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let stale_run_id = Uuid::new_v4();
+    let now = Utc::now();
+    let scheduled_for = created
+        .job
+        .next_run_at
+        .expect("one-shot job should have next run");
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_owner = 'stale-owner', lease_expires_at_ms = ?1, last_tick_started_at_ms = ?2 \
+         WHERE state_id = 1",
+    )
+    .bind((now + ChronoDuration::milliseconds(40)).timestamp_millis())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("seed active stale lease");
+    sqlx::query(
+        "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
+    )
+    .bind(created.job.job_id.to_string())
+    .bind(stale_run_id.to_string())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("mark job running under stale owner");
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'schedule', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
+    )
+    .bind(stale_run_id.to_string())
+    .bind(created.job.job_id.to_string())
+    .bind(scheduled_for.timestamp_millis())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("seed stale running scheduler run");
+
+    let recovered_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("kernel init during active stale lease");
+    let status_during_lease: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load status during lease");
+    assert_eq!(status_during_lease, "running");
+
+    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    let tick = recovered_kernel
+        .scheduler_tick()
+        .await
+        .expect("tick after stale lease expiry");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let stale_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_status, "interrupted");
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 1);
+}
+
+#[tokio::test]
 async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));

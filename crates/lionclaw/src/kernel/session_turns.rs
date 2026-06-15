@@ -286,6 +286,23 @@ impl SessionTurnStore {
         &self,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>> {
+        self.interrupt_running_turns_without_pending_channel_turns_inner(reason, false)
+            .await
+    }
+
+    pub async fn interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
+        self.interrupt_running_turns_without_pending_channel_turns_inner(reason, true)
+            .await
+    }
+
+    async fn interrupt_running_turns_without_pending_channel_turns_inner(
+        &self,
+        reason: &str,
+        exclude_scheduler: bool,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
         let finished_at_ms = now_ms();
         let mut tx = self
             .pool
@@ -293,7 +310,16 @@ impl SessionTurnStore {
             .await
             .context("failed to start interrupted session turn transaction")?;
 
-        let rows = sqlx::query(
+        let scheduler_filter = if exclude_scheduler {
+            " AND NOT EXISTS ( \
+                SELECT 1 FROM sessions \
+                WHERE sessions.session_id = session_turns.session_id \
+                  AND sessions.channel_id = 'scheduler' \
+              )"
+        } else {
+            ""
+        };
+        let select_sql = format!(
             "SELECT turn_id, session_id \
              FROM session_turns \
              WHERE status = ?1 \
@@ -302,14 +328,16 @@ impl SessionTurnStore {
                  WHERE channel_turns.turn_id = session_turns.turn_id \
                    AND channel_turns.status = 'pending' \
                ) \
-             ORDER BY started_at_ms ASC, turn_id ASC",
-        )
-        .bind(SessionTurnStatus::Running.as_str())
-        .fetch_all(&mut *tx)
-        .await
-        .context("failed to query running session turns")?;
+              {scheduler_filter} \
+             ORDER BY started_at_ms ASC, turn_id ASC"
+        );
+        let rows = sqlx::query(&select_sql)
+            .bind(SessionTurnStatus::Running.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .context("failed to query running session turns")?;
 
-        sqlx::query(
+        let update_sql = format!(
             "UPDATE session_turns \
              SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
              WHERE status = ?5 \
@@ -317,16 +345,18 @@ impl SessionTurnStore {
                  SELECT 1 FROM channel_turns \
                  WHERE channel_turns.turn_id = session_turns.turn_id \
                    AND channel_turns.status = 'pending' \
-               )",
-        )
-        .bind(SessionTurnStatus::Interrupted.as_str())
-        .bind("runtime.interrupted")
-        .bind(reason)
-        .bind(finished_at_ms)
-        .bind(SessionTurnStatus::Running.as_str())
-        .execute(&mut *tx)
-        .await
-        .context("failed to interrupt running session turns")?;
+               ) \
+              {scheduler_filter}"
+        );
+        sqlx::query(&update_sql)
+            .bind(SessionTurnStatus::Interrupted.as_str())
+            .bind("runtime.interrupted")
+            .bind(reason)
+            .bind(finished_at_ms)
+            .bind(SessionTurnStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("failed to interrupt running session turns")?;
 
         tx.commit()
             .await
@@ -347,6 +377,81 @@ impl SessionTurnStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn interrupt_running_scheduler_turns_for_jobs(
+        &self,
+        job_ids: &[Uuid],
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupted scheduler turn transaction")?;
+        let mut interrupted = Vec::new();
+
+        for job_id in job_ids {
+            let peer_id = format!("job:{job_id}");
+            let rows = sqlx::query(
+                "SELECT session_turns.turn_id, session_turns.session_id \
+                 FROM session_turns \
+                 JOIN sessions ON sessions.session_id = session_turns.session_id \
+                 WHERE session_turns.status = ?1 \
+                   AND sessions.channel_id = 'scheduler' \
+                   AND sessions.peer_id = ?2 \
+                 ORDER BY session_turns.started_at_ms ASC, session_turns.turn_id ASC",
+            )
+            .bind(SessionTurnStatus::Running.as_str())
+            .bind(&peer_id)
+            .fetch_all(&mut *tx)
+            .await
+            .context("failed to query running scheduler session turns")?;
+
+            sqlx::query(
+                "UPDATE session_turns \
+                 SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
+                 WHERE status = ?5 \
+                   AND session_id IN ( \
+                     SELECT session_id FROM sessions \
+                     WHERE channel_id = 'scheduler' AND peer_id = ?6 \
+                   )",
+            )
+            .bind(SessionTurnStatus::Interrupted.as_str())
+            .bind("runtime.interrupted")
+            .bind(reason)
+            .bind(finished_at_ms)
+            .bind(SessionTurnStatus::Running.as_str())
+            .bind(&peer_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to interrupt running scheduler session turns")?;
+
+            for row in rows {
+                let turn_id_raw: String = row.get("turn_id");
+                let session_id_raw: String = row.get("session_id");
+                let turn_id = Uuid::parse_str(&turn_id_raw)
+                    .with_context(|| format!("invalid interrupted turn_id '{turn_id_raw}'"))?;
+                let session_id = Uuid::parse_str(&session_id_raw).with_context(|| {
+                    format!("invalid interrupted session_id '{session_id_raw}'")
+                })?;
+                interrupted.push(InterruptedSessionTurn {
+                    turn_id,
+                    session_id,
+                });
+            }
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted scheduler turn transaction")?;
+
+        Ok(interrupted)
     }
 
     pub async fn get(&self, turn_id: Uuid) -> Result<Option<SessionTurnRecord>> {
