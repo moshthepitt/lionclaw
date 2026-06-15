@@ -1496,7 +1496,10 @@ impl Kernel {
             {
                 if let Err(err) = self
                     .jobs
-                    .interrupt_running_runs("scheduled job interrupted by kernel restart")
+                    .interrupt_running_runs_with_recovery_lease(
+                        &scheduler_recovery_owner,
+                        "scheduled job interrupted by kernel restart",
+                    )
                     .await
                 {
                     warn!(

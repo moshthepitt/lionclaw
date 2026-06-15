@@ -1341,12 +1341,51 @@ impl JobStore {
         &self,
         error_text: &str,
     ) -> Result<Vec<SchedulerJobRunRecord>> {
+        self.interrupt_running_runs_inner(error_text, None).await
+    }
+
+    pub(crate) async fn interrupt_running_runs_with_recovery_lease(
+        &self,
+        owner: &str,
+        error_text: &str,
+    ) -> Result<Vec<SchedulerJobRunRecord>> {
+        self.interrupt_running_runs_inner(error_text, Some(owner))
+            .await
+    }
+
+    async fn interrupt_running_runs_inner(
+        &self,
+        error_text: &str,
+        lease_owner: Option<&str>,
+    ) -> Result<Vec<SchedulerJobRunRecord>> {
         let finished_at_ms = now_ms();
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to start interrupt scheduler runs transaction")?;
+
+        if let Some(owner) = lease_owner {
+            let guarded = sqlx::query(
+                "UPDATE scheduler_state \
+                 SET lease_owner = lease_owner \
+                 WHERE state_id = 1 \
+                   AND lease_owner = ?1 \
+                   AND lease_expires_at_ms IS NOT NULL \
+                   AND lease_expires_at_ms >= ?2",
+            )
+            .bind(owner)
+            .bind(now_ms())
+            .execute(&mut *tx)
+            .await
+            .context("failed to guard scheduler recovery lease")?;
+            if guarded.rows_affected() == 0 {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback unowned scheduler recovery reconciliation")?;
+                return Ok(Vec::new());
+            }
+        }
 
         let rows = sqlx::query(
             "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
@@ -1768,6 +1807,64 @@ mod tests {
         run_id
     }
 
+    async fn create_running_one_shot_job(
+        store: &JobStore,
+        name: &str,
+    ) -> (SchedulerJobRecord, Uuid) {
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: name.to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 10, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim job");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job.job_id, job.job_id);
+
+        (job, claimed[0].run.run_id)
+    }
+
+    async fn assert_interrupted_job_state(store: &JobStore, job_id: Uuid, run_id: Uuid) {
+        let updated_run = store
+            .get_run(run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(updated_run.status, SchedulerJobRunStatus::Interrupted);
+        let updated_job = store
+            .get_job(job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert!(updated_job.running_run_id.is_none());
+    }
+
+    async fn assert_running_job_state(store: &JobStore, job_id: Uuid, run_id: Uuid) {
+        let updated_run = store
+            .get_run(run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(updated_run.status, SchedulerJobRunStatus::Running);
+        let updated_job = store
+            .get_job(job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, Some(run_id));
+    }
+
     #[test]
     fn interval_schedule_anchoring_prevents_drift() {
         let anchor = dt(2026, 3, 31, 9, 0, 0);
@@ -1980,6 +2077,80 @@ mod tests {
             .expect("reclaim interrupted one-shot job");
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].job.job_id, job.job_id);
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_owned_interrupt_requires_current_lease() {
+        let store = new_store().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "lease-owned-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        let interrupted = store
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under recovery lease");
+
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].run_id, run_id);
+        assert_interrupted_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_owned_interrupt_skips_after_lease_expiry() {
+        let store = new_store().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "expired-lease-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        sqlx::query(
+            "UPDATE scheduler_state SET lease_expires_at_ms = ?2 WHERE state_id = 1 AND lease_owner = ?1",
+        )
+        .bind("bootstrap-a")
+        .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
+        .execute(store.pool())
+        .await
+        .expect("expire recovery lease");
+
+        let interrupted = store
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under expired recovery lease");
+
+        assert!(interrupted.is_empty());
+        assert_running_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_owned_interrupt_skips_after_lease_transfer() {
+        let store = new_store().await;
+        let (job, run_id) =
+            create_running_one_shot_job(&store, "transferred-lease-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        sqlx::query(
+            "UPDATE scheduler_state SET lease_owner = ?1, lease_expires_at_ms = ?2 WHERE state_id = 1",
+        )
+        .bind("tick-a")
+        .bind((Utc::now() + ChronoDuration::seconds(60)).timestamp_millis())
+        .execute(store.pool())
+        .await
+        .expect("transfer recovery lease");
+
+        let interrupted = store
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under transferred recovery lease");
+
+        assert!(interrupted.is_empty());
+        assert_running_job_state(&store, job.job_id, run_id).await;
     }
 
     #[tokio::test]
