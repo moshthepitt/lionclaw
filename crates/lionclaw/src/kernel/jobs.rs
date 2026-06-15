@@ -605,21 +605,48 @@ impl JobStore {
     }
 
     pub async fn try_acquire_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.try_acquire_scheduler_lease(owner, ttl, true, "failed to acquire scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn try_acquire_recovery_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        self.try_acquire_scheduler_lease(
+            owner,
+            ttl,
+            false,
+            "failed to acquire scheduler recovery lease",
+        )
+        .await
+    }
+
+    async fn try_acquire_scheduler_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+        record_tick_start: bool,
+        context: &'static str,
+    ) -> Result<bool> {
         let now = now_ms();
         let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
         let result = sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_owner = ?2, lease_expires_at_ms = ?3, last_tick_started_at_ms = ?4 \
+             SET lease_owner = ?2, \
+                 lease_expires_at_ms = ?3, \
+                 last_tick_started_at_ms = CASE WHEN ?4 THEN ?1 ELSE last_tick_started_at_ms END \
              WHERE state_id = 1 \
                AND (lease_owner IS NULL OR lease_expires_at_ms IS NULL OR lease_expires_at_ms < ?1 OR lease_owner = ?2)",
         )
         .bind(now)
         .bind(owner)
         .bind(lease_expires)
-        .bind(now)
+        .bind(if record_tick_start { 1_i64 } else { 0_i64 })
         .execute(&self.pool)
         .await
-        .context("failed to acquire scheduler tick lease")?;
+        .context(context)?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -639,36 +666,36 @@ impl JobStore {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn has_active_tick_lease(&self) -> Result<bool> {
-        let now = now_ms();
-        let active: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) \
-             FROM scheduler_state \
-             WHERE state_id = 1 \
-               AND lease_owner IS NOT NULL \
-               AND lease_expires_at_ms IS NOT NULL \
-               AND lease_expires_at_ms >= ?1",
-        )
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await
-        .context("failed to query scheduler tick lease")?;
-
-        Ok(active > 0)
+    pub async fn release_tick_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, true, "failed to release scheduler tick lease")
+            .await
     }
 
-    pub async fn release_tick_lease(&self, owner: &str) -> Result<()> {
+    pub(crate) async fn release_recovery_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, false, "failed to release scheduler recovery lease")
+            .await
+    }
+
+    async fn release_scheduler_lease(
+        &self,
+        owner: &str,
+        record_tick_finish: bool,
+        context: &'static str,
+    ) -> Result<()> {
         let now = now_ms();
         sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_owner = NULL, lease_expires_at_ms = NULL, last_tick_finished_at_ms = ?2 \
+             SET lease_owner = NULL, \
+                 lease_expires_at_ms = NULL, \
+                 last_tick_finished_at_ms = CASE WHEN ?3 THEN ?2 ELSE last_tick_finished_at_ms END \
              WHERE state_id = 1 AND lease_owner = ?1",
         )
         .bind(owner)
         .bind(now)
+        .bind(if record_tick_finish { 1_i64 } else { 0_i64 })
         .execute(&self.pool)
         .await
-        .context("failed to release scheduler tick lease")?;
+        .context(context)?;
         Ok(())
     }
 
@@ -2004,6 +2031,37 @@ mod tests {
             .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
             .await
             .expect("second owner acquires released lease"));
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_blocks_ticks_without_recording_tick_times() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        assert!(!store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should be blocked by recovery lease"));
+
+        let tick_times: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT last_tick_started_at_ms, last_tick_finished_at_ms FROM scheduler_state WHERE state_id = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load scheduler state");
+        assert_eq!(tick_times, (None, None));
+
+        store
+            .release_recovery_lease("bootstrap-a")
+            .await
+            .expect("release recovery lease");
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should acquire after recovery release"));
     }
 
     #[tokio::test]

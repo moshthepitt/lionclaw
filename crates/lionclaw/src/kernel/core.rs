@@ -190,6 +190,7 @@ const STALE_CHANNEL_ATTACHMENT_BATCH_AFTER: Duration = Duration::from_secs(60 * 
 const STALE_CHANNEL_ATTACHMENT_TEMP_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL: Duration = Duration::from_secs(60);
 const CHANNEL_ATTACHMENT_NOT_STAGED: &str = "not_staged";
 const CHANNEL_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
 const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
@@ -1431,9 +1432,13 @@ impl Kernel {
                 );
             }
         }
-        let active_scheduler_tick = self.active_scheduler_tick_lease_for_bootstrap().await;
+        let scheduler_recovery_owner = format!("bootstrap:{}", Uuid::new_v4());
+        let scheduler_recovery_lease = self
+            .acquire_scheduler_recovery_lease_for_bootstrap(&scheduler_recovery_owner)
+            .await;
+        let preserve_scheduler_work = !scheduler_recovery_lease;
         let reason = "turn interrupted by kernel restart";
-        let interrupted_turns = if active_scheduler_tick {
+        let interrupted_turns = if preserve_scheduler_work {
             self.session_turns
                 .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(reason)
                 .await
@@ -1460,6 +1465,28 @@ impl Kernel {
             )
             .await;
         }
+        if scheduler_recovery_lease {
+            if let Err(err) = self
+                .jobs
+                .interrupt_running_runs("scheduled job interrupted by kernel restart")
+                .await
+            {
+                warn!(
+                    ?err,
+                    "failed to reconcile running scheduled jobs during bootstrap"
+                );
+            }
+            if let Err(err) = self
+                .jobs
+                .release_recovery_lease(&scheduler_recovery_owner)
+                .await
+            {
+                warn!(
+                    ?err,
+                    "failed to release scheduler recovery lease during bootstrap"
+                );
+            }
+        }
         if let Err(err) = self
             .channel_state
             .interrupt_running_turns("channel turn interrupted by restart")
@@ -1477,32 +1504,24 @@ impl Kernel {
             );
         }
         self.ensure_pending_channel_turn_workers().await;
-        if !active_scheduler_tick {
-            if let Err(err) = self
-                .jobs
-                .interrupt_running_runs("scheduled job interrupted by kernel restart")
-                .await
-            {
-                warn!(
-                    ?err,
-                    "failed to reconcile running scheduled jobs during bootstrap"
-                );
-            }
-        }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
         }
     }
 
-    async fn active_scheduler_tick_lease_for_bootstrap(&self) -> bool {
-        match self.jobs.has_active_tick_lease().await {
-            Ok(active) => active,
+    async fn acquire_scheduler_recovery_lease_for_bootstrap(&self, owner: &str) -> bool {
+        match self
+            .jobs
+            .try_acquire_recovery_lease(owner, SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL)
+            .await
+        {
+            Ok(acquired) => acquired,
             Err(err) => {
                 warn!(
                     ?err,
-                    "failed to check scheduler tick lease during bootstrap; preserving running scheduler work"
+                    "failed to acquire scheduler recovery lease during bootstrap; preserving running scheduler work"
                 );
-                true
+                false
             }
         }
     }
