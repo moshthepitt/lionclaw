@@ -24,7 +24,7 @@ use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, Notify, RwLock, Semaphore},
+    sync::{oneshot, Mutex, Notify, RwLock, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
@@ -225,6 +225,25 @@ struct AttachedRuntimeReconciliation {
     warning_count: usize,
     reconciled: bool,
     resumable: bool,
+}
+
+struct SchedulerRecoveryLeaseRenewal {
+    stop_tx: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<anyhow::Result<()>>,
+}
+
+impl SchedulerRecoveryLeaseRenewal {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    async fn stop(mut self) -> Result<(), KernelError> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;
+        renewal_result.map_err(internal)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1436,6 +1455,8 @@ impl Kernel {
         let scheduler_recovery_lease = self
             .acquire_scheduler_recovery_lease_for_bootstrap(&scheduler_recovery_owner)
             .await;
+        let scheduler_recovery_renewal = scheduler_recovery_lease
+            .then(|| self.spawn_scheduler_recovery_lease_renewal(scheduler_recovery_owner.clone()));
         let preserve_scheduler_work = !scheduler_recovery_lease;
         let reason = "turn interrupted by kernel restart";
         let interrupted_turns = if preserve_scheduler_work {
@@ -1466,15 +1487,33 @@ impl Kernel {
             .await;
         }
         if scheduler_recovery_lease {
-            if let Err(err) = self
-                .jobs
-                .interrupt_running_runs("scheduled job interrupted by kernel restart")
+            if self
+                .renew_scheduler_recovery_lease_for_bootstrap(
+                    &scheduler_recovery_owner,
+                    scheduler_recovery_renewal.as_ref(),
+                )
                 .await
             {
-                warn!(
-                    ?err,
-                    "failed to reconcile running scheduled jobs during bootstrap"
-                );
+                if let Err(err) = self
+                    .jobs
+                    .interrupt_running_runs("scheduled job interrupted by kernel restart")
+                    .await
+                {
+                    warn!(
+                        ?err,
+                        "failed to reconcile running scheduled jobs during bootstrap"
+                    );
+                }
+            } else {
+                warn!("skipping scheduler job reconciliation after recovery lease loss");
+            }
+            if let Some(renewal) = scheduler_recovery_renewal {
+                if let Err(err) = renewal.stop().await {
+                    warn!(
+                        ?err,
+                        "scheduler recovery lease renewal failed during bootstrap"
+                    );
+                }
             }
             if let Err(err) = self
                 .jobs
@@ -1509,6 +1548,35 @@ impl Kernel {
         }
     }
 
+    fn spawn_scheduler_recovery_lease_renewal(
+        &self,
+        owner: String,
+    ) -> SchedulerRecoveryLeaseRenewal {
+        let jobs = self.jobs.clone();
+        let lease_ttl = SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL;
+        let renew_every = (lease_ttl / 2).max(Duration::from_secs(1));
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return Ok(()),
+                    _ = sleep(renew_every) => {
+                        let renewed = jobs.renew_recovery_lease(&owner, lease_ttl).await?;
+                        if !renewed {
+                            return Err(anyhow::anyhow!(
+                                "scheduler recovery lease lost during bootstrap"
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+        SchedulerRecoveryLeaseRenewal {
+            stop_tx: Some(stop_tx),
+            handle,
+        }
+    }
+
     async fn acquire_scheduler_recovery_lease_for_bootstrap(&self, owner: &str) -> bool {
         match self
             .jobs
@@ -1520,6 +1588,32 @@ impl Kernel {
                 warn!(
                     ?err,
                     "failed to acquire scheduler recovery lease during bootstrap; preserving running scheduler work"
+                );
+                false
+            }
+        }
+    }
+
+    async fn renew_scheduler_recovery_lease_for_bootstrap(
+        &self,
+        owner: &str,
+        renewal: Option<&SchedulerRecoveryLeaseRenewal>,
+    ) -> bool {
+        if renewal.is_some_and(|renewal| renewal.is_finished()) {
+            warn!("scheduler recovery lease renewal stopped before job reconciliation");
+            return false;
+        }
+
+        match self
+            .jobs
+            .renew_recovery_lease(owner, SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL)
+            .await
+        {
+            Ok(renewed) => renewed,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to renew scheduler recovery lease before job reconciliation"
                 );
                 false
             }

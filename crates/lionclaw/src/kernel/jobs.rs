@@ -651,6 +651,21 @@ impl JobStore {
     }
 
     pub async fn renew_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn renew_recovery_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler recovery lease")
+            .await
+    }
+
+    async fn renew_scheduler_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+        context: &'static str,
+    ) -> Result<bool> {
         let now = now_ms();
         let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
         let result = sqlx::query(
@@ -662,7 +677,7 @@ impl JobStore {
         .bind(lease_expires)
         .execute(&self.pool)
         .await
-        .context("failed to renew scheduler tick lease")?;
+        .context(context)?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -2062,6 +2077,36 @@ mod tests {
             .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
             .await
             .expect("tick lease should acquire after recovery release"));
+    }
+
+    #[tokio::test]
+    async fn renewed_recovery_lease_stays_owned_without_recording_tick_times() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_millis(80))
+            .await
+            .expect("acquire recovery lease"));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(store
+            .renew_recovery_lease("bootstrap-a", Duration::from_millis(200))
+            .await
+            .expect("renew recovery lease"));
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert!(!store
+            .try_acquire_tick_lease("owner-b", Duration::from_millis(80))
+            .await
+            .expect("renewed recovery lease should block tick owner"));
+
+        let tick_times: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT last_tick_started_at_ms, last_tick_finished_at_ms FROM scheduler_state WHERE state_id = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load scheduler state");
+        assert_eq!(tick_times, (None, None));
     }
 
     #[tokio::test]
