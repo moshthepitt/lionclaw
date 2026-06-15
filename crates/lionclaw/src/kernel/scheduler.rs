@@ -398,13 +398,18 @@ impl SchedulerEngine {
                         return Ok(outcome);
                     }
                 }
+                let (session_id, turn_id) = if run_still_owns_turn {
+                    (Some(opened.session_id), Some(turn_id))
+                } else {
+                    (None, None)
+                };
                 self.handle_failed_attempt(
                     kernel,
                     job,
                     current_run,
                     AttemptFailureContext {
-                        session_id: Some(opened.session_id),
-                        turn_id: Some(turn_id),
+                        session_id,
+                        turn_id,
                         failure_phase: None,
                     },
                     &err,

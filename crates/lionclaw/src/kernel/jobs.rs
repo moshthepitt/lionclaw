@@ -1186,8 +1186,12 @@ impl JobStore {
                 .context("failed to finish stale failure completion transaction")?;
             return Ok(None);
         }
-        if session_id.is_some_and(|session_id| run.session_id != Some(session_id))
-            || turn_id.is_some_and(|turn_id| run.turn_id != Some(turn_id))
+        if session_id
+            .zip(run.session_id)
+            .is_some_and(|(expected, actual)| expected != actual)
+            || turn_id
+                .zip(run.turn_id)
+                .is_some_and(|(expected, actual)| expected != actual)
         {
             tx.commit()
                 .await
@@ -2308,6 +2312,65 @@ mod tests {
             .running_run_owns_turn(run_id, session_id, turn_id)
             .await
             .expect("interrupted run ownership"));
+    }
+
+    #[tokio::test]
+    async fn complete_run_failure_accepts_unattached_context_but_rejects_mismatch() {
+        let store = new_store().await;
+        let (_job, run_id) = create_running_one_shot_job(&store, "unattached-failure").await;
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+
+        let completed = store
+            .complete_run_failure(
+                run_id,
+                Some(session_id),
+                Some(turn_id),
+                "failed before attachment",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unattached failure");
+        assert!(
+            completed.is_some(),
+            "unattached pre-runtime failures should still complete"
+        );
+
+        let failed_run = store
+            .get_run(run_id)
+            .await
+            .expect("load failed run")
+            .expect("failed run exists");
+        assert_eq!(failed_run.status, SchedulerJobRunStatus::DeadLetter);
+        assert_eq!(failed_run.session_id, Some(session_id));
+        assert_eq!(failed_run.turn_id, Some(turn_id));
+
+        let (mismatch_job, attached_run_id) =
+            create_running_one_shot_job(&store, "mismatched-failure").await;
+        let attached_session_id = Uuid::new_v4();
+        let attached_turn_id = Uuid::new_v4();
+        assert!(store
+            .attach_run_turn(attached_run_id, attached_session_id, attached_turn_id)
+            .await
+            .expect("attach run"));
+
+        let mismatched = store
+            .complete_run_failure(
+                attached_run_id,
+                Some(attached_session_id),
+                Some(Uuid::new_v4()),
+                "wrong turn",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete mismatched failure");
+        assert!(
+            mismatched.is_none(),
+            "attached runs must reject mismatched failure context"
+        );
+        assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
     }
 
     #[tokio::test]
