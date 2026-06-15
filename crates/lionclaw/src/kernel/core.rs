@@ -21055,14 +21055,30 @@ impl Kernel {
         missing_message: &'static str,
     ) -> Result<SessionTurnRecord, KernelError> {
         let completed_turn = if let Some(guard) = scheduler_turn_guard {
-            self.ensure_scheduler_run_owns_turn(guard).await?;
-            self.session_turns
-                .complete_running_turn(turn_id, completion)
+            if turn_id != guard.turn_id {
+                return Err(KernelError::Conflict(
+                    "scheduled job turn is no longer active".to_string(),
+                ));
+            }
+            match self
+                .session_turns
+                .complete_running_turn_for_current_scheduler_run(
+                    guard.turn_id,
+                    guard.run_id,
+                    guard.session_id,
+                    completion,
+                )
                 .await
                 .map_err(internal)?
-                .ok_or_else(|| {
-                    KernelError::Conflict("scheduled job turn is no longer active".to_string())
-                })?
+            {
+                Some(completed_turn) => completed_turn,
+                None => {
+                    self.ensure_scheduler_run_owns_turn(guard).await?;
+                    return Err(KernelError::Conflict(
+                        "scheduled job turn is no longer active".to_string(),
+                    ));
+                }
+            }
         } else {
             self.session_turns
                 .complete_turn(turn_id, completion)

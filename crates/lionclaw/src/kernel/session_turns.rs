@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     contracts::{SessionTurnKind, SessionTurnStatus, SessionTurnView},
     kernel::db::{datetime_to_ms, ms_to_datetime, now_ms},
+    kernel::jobs::SchedulerJobRunStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -184,6 +185,56 @@ impl SessionTurnStore {
             Some(SessionTurnStatus::Running),
         )
         .await
+    }
+
+    pub async fn complete_running_turn_for_current_scheduler_run(
+        &self,
+        turn_id: Uuid,
+        run_id: Uuid,
+        session_id: Uuid,
+        completion: SessionTurnCompletion,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let finished_at_ms = now_ms();
+        let updated = sqlx::query(
+            "UPDATE session_turns \
+             SET status = ?2, assistant_text = ?3, error_code = ?4, error_text = ?5, finished_at_ms = ?6 \
+             WHERE turn_id = ?1 \
+               AND status = ?7 \
+               AND session_id = ?8 \
+               AND EXISTS ( \
+                 SELECT 1 FROM sessions \
+                 WHERE sessions.session_id = ?8 AND sessions.channel_id = 'scheduler' \
+               ) \
+               AND EXISTS ( \
+                 SELECT 1 \
+                 FROM scheduler_job_runs \
+                 JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+                 WHERE scheduler_job_runs.run_id = ?9 \
+                   AND scheduler_job_runs.status = ?10 \
+                   AND scheduler_job_runs.session_id = ?8 \
+                   AND scheduler_job_runs.turn_id = ?1 \
+                   AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+               )",
+        )
+        .bind(turn_id.to_string())
+        .bind(completion.status.as_str())
+        .bind(completion.assistant_text)
+        .bind(completion.error_code)
+        .bind(completion.error_text)
+        .bind(finished_at_ms)
+        .bind(SessionTurnStatus::Running.as_str())
+        .bind(session_id.to_string())
+        .bind(run_id.to_string())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to finalize scheduler-owned session turn")?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(turn_id).await
     }
 
     async fn complete_turn_with_required_status(
@@ -784,7 +835,9 @@ mod tests {
     use super::*;
     use crate::contracts::{SessionHistoryPolicy, TrustTier};
     use crate::home::runtime_project_partition_key;
+    use crate::kernel::jobs::{JobSchedule, JobStore, NewSchedulerJob, SchedulerJobTriggerKind};
     use crate::kernel::{db::Db, sessions::SessionStore};
+    use chrono::Duration as ChronoDuration;
 
     async fn new_store_with_session() -> (SessionTurnStore, Uuid) {
         let db = Db::connect_memory().await.expect("connect memory db");
@@ -802,6 +855,68 @@ mod tests {
             .await
             .expect("open session");
         (turns, session.session_id)
+    }
+
+    async fn new_store_with_scheduler_run() -> (SessionTurnStore, JobStore, Uuid, Uuid, Uuid) {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        let sessions = SessionStore::new(pool.clone());
+        let turns = SessionTurnStore::new(pool.clone());
+        let jobs = JobStore::new(pool);
+        let job = jobs
+            .create_job(NewSchedulerJob {
+                name: "scheduler-turn".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create scheduler job");
+        let session = sessions
+            .open(
+                "scheduler".to_string(),
+                format!("job:{}", job.job_id),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+            )
+            .await
+            .expect("open scheduler session");
+        let turn = turns
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id: session.session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "job".to_string(),
+                prompt_user_text: "prompt".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin scheduler turn");
+        let claimed = jobs
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim scheduler job")
+            .pop()
+            .expect("claimed scheduler job");
+        assert_eq!(claimed.job.job_id, job.job_id);
+        assert!(jobs
+            .attach_run_turn(claimed.run.run_id, session.session_id, turn.turn_id)
+            .await
+            .expect("attach scheduler run turn"));
+
+        (
+            turns,
+            jobs,
+            session.session_id,
+            turn.turn_id,
+            claimed.run.run_id,
+        )
     }
 
     #[tokio::test]
@@ -1058,6 +1173,62 @@ mod tests {
         assert_eq!(stored.status, SessionTurnStatus::Interrupted);
         assert_eq!(stored.assistant_text, "");
         assert_eq!(stored.error_text.as_deref(), Some("recovered"));
+    }
+
+    #[tokio::test]
+    async fn complete_running_turn_for_current_scheduler_run_completes_owned_turn() {
+        let (store, _jobs, session_id, turn_id, run_id) = new_store_with_scheduler_run().await;
+
+        let completed = store
+            .complete_running_turn_for_current_scheduler_run(
+                turn_id,
+                run_id,
+                session_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "done".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("complete owned scheduler turn")
+            .expect("owned scheduler turn completed");
+
+        assert_eq!(completed.status, SessionTurnStatus::Completed);
+        assert_eq!(completed.assistant_text, "done");
+    }
+
+    #[tokio::test]
+    async fn complete_running_turn_for_current_scheduler_run_rejects_stale_owner() {
+        let (store, jobs, session_id, turn_id, run_id) = new_store_with_scheduler_run().await;
+        jobs.interrupt_run(run_id, "recovered")
+            .await
+            .expect("interrupt scheduler run")
+            .expect("scheduler run");
+
+        let stale_completion = store
+            .complete_running_turn_for_current_scheduler_run(
+                turn_id,
+                run_id,
+                session_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "stale output".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("attempt stale scheduler completion");
+        assert!(
+            stale_completion.is_none(),
+            "stale scheduler owner must not complete the turn"
+        );
+
+        let stored = store.get(turn_id).await.expect("load turn").expect("turn");
+        assert_eq!(stored.status, SessionTurnStatus::Running);
+        assert_eq!(stored.assistant_text, "");
     }
 
     #[tokio::test]
