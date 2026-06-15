@@ -1580,39 +1580,56 @@ impl Kernel {
             .map_err(internal)?;
         let interrupted_run_count = interrupted_runs.len();
         let interrupted_turn_count = self
-            .interrupt_scheduler_turns_for_runs_started_before(
-                &interrupted_runs,
-                started_before_ms,
-                turn_reason,
-            )
+            .interrupt_scheduler_turns_for_runs(&interrupted_runs, started_before_ms, turn_reason)
             .await?
             .len();
 
         Ok((interrupted_run_count, interrupted_turn_count))
     }
 
-    async fn interrupt_scheduler_turns_for_runs_started_before(
+    async fn interrupt_scheduler_turns_for_runs(
         &self,
         runs: &[SchedulerJobRunRecord],
         started_before_ms: i64,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>, KernelError> {
-        let mut job_ids = runs.iter().map(|run| run.job_id).collect::<Vec<_>>();
-        job_ids.sort_unstable();
-        job_ids.dedup();
-        if job_ids.is_empty() {
+        if runs.is_empty() {
             return Ok(Vec::new());
         }
 
-        let interrupted_turns = self
+        let mut turn_ids = runs
+            .iter()
+            .filter_map(|run| run.turn_id)
+            .collect::<Vec<_>>();
+        turn_ids.sort_unstable();
+        turn_ids.dedup();
+
+        let mut interrupted_turns = self
             .session_turns
-            .interrupt_running_scheduler_turns_for_jobs_started_before(
-                &job_ids,
-                started_before_ms,
-                reason,
-            )
+            .interrupt_running_scheduler_turns_by_id(&turn_ids, reason)
             .await
             .map_err(internal)?;
+
+        let mut fallback_job_ids = runs
+            .iter()
+            .filter(|run| run.turn_id.is_none())
+            .map(|run| run.job_id)
+            .collect::<Vec<_>>();
+        fallback_job_ids.sort_unstable();
+        fallback_job_ids.dedup();
+        if !fallback_job_ids.is_empty() {
+            interrupted_turns.extend(
+                self.session_turns
+                    .interrupt_running_scheduler_turns_for_jobs_started_before(
+                        &fallback_job_ids,
+                        started_before_ms,
+                        reason,
+                    )
+                    .await
+                    .map_err(internal)?,
+            );
+        }
+
         for turn in &interrupted_turns {
             if let Err(err) = self.sessions.record_turn(turn.session_id).await {
                 warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
@@ -1710,7 +1727,7 @@ impl Kernel {
 
         let turn_reason = "turn interrupted after scheduler lease expired";
         let interrupted_turns = self
-            .interrupt_scheduler_turns_for_runs_started_before(
+            .interrupt_scheduler_turns_for_runs(
                 &reconciliation.job_owned_runs,
                 recovery_started_at_ms,
                 turn_reason,

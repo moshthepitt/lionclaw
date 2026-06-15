@@ -1217,16 +1217,27 @@ async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
     let pool = SqlitePool::connect(&env.db_url())
         .await
         .expect("open sqlite pool");
-    let run_status: String = sqlx::query_scalar(
-        "SELECT status FROM scheduler_job_runs WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
-    )
-    .bind(created.job.job_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("load running scheduler job run");
+    let (run_status, run_session_id, run_turn_id): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, session_id, turn_id \
+             FROM scheduler_job_runs \
+             WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
+        )
+        .bind(created.job.job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("load running scheduler job run");
     assert_eq!(
         run_status, "running",
         "opening another kernel while the scheduler lease is active must not interrupt the job run"
+    );
+    assert!(
+        run_session_id.is_some(),
+        "running scheduler job run should be attached to its session"
+    );
+    assert!(
+        run_turn_id.is_some(),
+        "running scheduler job run should be attached to its turn"
     );
 
     let turn_status: String =

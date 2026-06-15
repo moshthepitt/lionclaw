@@ -439,6 +439,83 @@ impl SessionTurnStore {
         Ok(interrupted)
     }
 
+    pub async fn interrupt_running_scheduler_turns_by_id(
+        &self,
+        turn_ids: &[Uuid],
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
+        if turn_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupted scheduler turn transaction")?;
+        let mut interrupted = Vec::new();
+
+        for turn_id in turn_ids {
+            let row = sqlx::query(
+                "SELECT session_turns.turn_id, session_turns.session_id \
+                 FROM session_turns \
+                 JOIN sessions ON sessions.session_id = session_turns.session_id \
+                 WHERE session_turns.turn_id = ?1 \
+                   AND session_turns.status = ?2 \
+                   AND sessions.channel_id = 'scheduler'",
+            )
+            .bind(turn_id.to_string())
+            .bind(SessionTurnStatus::Running.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .context("failed to query running scheduler session turn")?;
+
+            let Some(row) = row else {
+                continue;
+            };
+
+            let updated = sqlx::query(
+                "UPDATE session_turns \
+                 SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
+                 WHERE turn_id = ?5 \
+                   AND status = ?6 \
+                   AND session_id IN ( \
+                     SELECT session_id FROM sessions WHERE channel_id = 'scheduler' \
+                   )",
+            )
+            .bind(SessionTurnStatus::Interrupted.as_str())
+            .bind("runtime.interrupted")
+            .bind(reason)
+            .bind(finished_at_ms)
+            .bind(turn_id.to_string())
+            .bind(SessionTurnStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("failed to interrupt running scheduler session turn")?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+
+            let turn_id_raw: String = row.get("turn_id");
+            let session_id_raw: String = row.get("session_id");
+            let turn_id = Uuid::parse_str(&turn_id_raw)
+                .with_context(|| format!("invalid interrupted turn_id '{turn_id_raw}'"))?;
+            let session_id = Uuid::parse_str(&session_id_raw)
+                .with_context(|| format!("invalid interrupted session_id '{session_id_raw}'"))?;
+            interrupted.push(InterruptedSessionTurn {
+                turn_id,
+                session_id,
+            });
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted scheduler turn transaction")?;
+
+        Ok(interrupted)
+    }
+
     pub async fn get(&self, turn_id: Uuid) -> Result<Option<SessionTurnRecord>> {
         let row = sqlx::query(
             "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
@@ -977,6 +1054,94 @@ mod tests {
                 .await
                 .expect("load fresh turn")
                 .expect("fresh turn")
+                .status,
+            SessionTurnStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_turn_recovery_by_id_interrupts_only_scheduler_turns() {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        let sessions = SessionStore::new(pool.clone());
+        let store = SessionTurnStore::new(pool);
+        let scheduler_session = sessions
+            .open(
+                "scheduler".to_string(),
+                format!("job:{}", Uuid::new_v4()),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+            )
+            .await
+            .expect("open scheduler session");
+        let normal_session = sessions
+            .open(
+                "local-cli".to_string(),
+                "normal-peer".to_string(),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open normal session");
+
+        let scheduler_turn = store
+            .begin_turn_with_started_at(
+                NewSessionTurn {
+                    turn_id: Uuid::new_v4(),
+                    session_id: scheduler_session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "scheduler".to_string(),
+                    prompt_user_text: "scheduler".to_string(),
+                    attachment_source_turn_id: None,
+                    runtime_id: "mock".to_string(),
+                },
+                300,
+            )
+            .await
+            .expect("begin scheduler turn");
+        let normal_turn = store
+            .begin_turn_with_started_at(
+                NewSessionTurn {
+                    turn_id: Uuid::new_v4(),
+                    session_id: normal_session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "normal".to_string(),
+                    prompt_user_text: "normal".to_string(),
+                    attachment_source_turn_id: None,
+                    runtime_id: "mock".to_string(),
+                },
+                300,
+            )
+            .await
+            .expect("begin normal turn");
+
+        let interrupted = store
+            .interrupt_running_scheduler_turns_by_id(
+                &[scheduler_turn.turn_id, normal_turn.turn_id],
+                "recover scheduler turn",
+            )
+            .await
+            .expect("interrupt scheduler turn by id");
+
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].turn_id, scheduler_turn.turn_id);
+        assert_eq!(
+            store
+                .get(scheduler_turn.turn_id)
+                .await
+                .expect("load scheduler turn")
+                .expect("scheduler turn")
+                .status,
+            SessionTurnStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get(normal_turn.turn_id)
+                .await
+                .expect("load normal turn")
+                .expect("normal turn")
                 .status,
             SessionTurnStatus::Running
         );

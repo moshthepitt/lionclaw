@@ -1341,6 +1341,31 @@ impl JobStore {
         Ok(changed.rows_affected() > 0)
     }
 
+    pub async fn attach_run_turn(
+        &self,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET session_id = ?2, turn_id = ?3 \
+             WHERE run_id = ?1 \
+               AND status = ?4 \
+               AND (session_id IS NULL OR session_id = ?2) \
+               AND (turn_id IS NULL OR turn_id = ?3)",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to attach scheduler run turn")?;
+
+        Ok(changed.rows_affected() > 0)
+    }
+
     pub async fn interrupt_running_runs(
         &self,
         error_text: &str,
@@ -2163,6 +2188,45 @@ mod tests {
 
         assert!(interrupted.is_empty());
         assert_running_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_records_running_run_identity_once() {
+        let store = new_store().await;
+        let (_job, run_id) = create_running_one_shot_job(&store, "attached-turn").await;
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attach run turn"));
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("reattach same run turn"));
+        assert!(!store
+            .attach_run_turn(run_id, session_id, Uuid::new_v4())
+            .await
+            .expect("refuse different turn"));
+
+        let attached = store
+            .get_run(run_id)
+            .await
+            .expect("load attached run")
+            .expect("attached run exists");
+        assert_eq!(attached.session_id, Some(session_id));
+        assert_eq!(attached.turn_id, Some(turn_id));
+
+        store
+            .interrupt_run(run_id, "terminal run")
+            .await
+            .expect("interrupt run")
+            .expect("run interrupted");
+        assert!(!store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("terminal run should not attach"));
     }
 
     #[tokio::test]
