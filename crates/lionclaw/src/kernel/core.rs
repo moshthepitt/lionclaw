@@ -177,8 +177,8 @@ use super::{
         turns_to_history_views, CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{
-        ImportedSessionTurn, NewSessionTurn, SessionTurnCompletion, SessionTurnRecord,
-        SessionTurnStore,
+        ImportedSessionTurn, InterruptedSessionTurn, NewSessionTurn, SessionTurnCompletion,
+        SessionTurnRecord, SessionTurnStore,
     },
     sessions::SessionStore,
     skills::validate_skill_alias,
@@ -1451,23 +1451,18 @@ impl Kernel {
                 );
             }
         }
+        let scheduler_recovery_started_at_ms = Utc::now().timestamp_millis();
         let scheduler_recovery_owner = format!("bootstrap:{}", Uuid::new_v4());
         let scheduler_recovery_lease = self
             .acquire_scheduler_recovery_lease_for_bootstrap(&scheduler_recovery_owner)
             .await;
         let scheduler_recovery_renewal = scheduler_recovery_lease
             .then(|| self.spawn_scheduler_recovery_lease_renewal(scheduler_recovery_owner.clone()));
-        let preserve_scheduler_work = !scheduler_recovery_lease;
         let reason = "turn interrupted by kernel restart";
-        let interrupted_turns = if preserve_scheduler_work {
-            self.session_turns
-                .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(reason)
-                .await
-        } else {
-            self.session_turns
-                .interrupt_running_turns_without_pending_channel_turns(reason)
-                .await
-        };
+        let interrupted_turns = self
+            .session_turns
+            .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(reason)
+            .await;
         if let Ok(interrupted_turns) = interrupted_turns {
             for turn in &interrupted_turns {
                 if let Err(err) = self.sessions.record_turn(turn.session_id).await {
@@ -1494,18 +1489,36 @@ impl Kernel {
                 )
                 .await
             {
-                if let Err(err) = self
-                    .jobs
-                    .interrupt_running_runs_with_recovery_lease(
+                match self
+                    .interrupt_scheduler_runs_and_turns_for_bootstrap(
                         &scheduler_recovery_owner,
-                        "scheduled job interrupted by kernel restart",
+                        scheduler_recovery_started_at_ms,
+                        reason,
                     )
                     .await
                 {
-                    warn!(
-                        ?err,
-                        "failed to reconcile running scheduled jobs during bootstrap"
-                    );
+                    Ok((interrupted_run_count, interrupted_turn_count)) => {
+                        if interrupted_run_count > 0 {
+                            self.append_audit_event_best_effort(
+                                "scheduler.run.reconciled",
+                                None,
+                                "kernel",
+                                json!({
+                                    "status": "interrupted",
+                                    "run_count": interrupted_run_count,
+                                    "turn_count": interrupted_turn_count,
+                                    "reason": "scheduled job interrupted by kernel restart",
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "failed to reconcile running scheduled jobs during bootstrap"
+                        );
+                    }
                 }
             } else {
                 warn!("skipping scheduler job reconciliation after recovery lease loss");
@@ -1549,6 +1562,64 @@ impl Kernel {
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
         }
+    }
+
+    async fn interrupt_scheduler_runs_and_turns_for_bootstrap(
+        &self,
+        recovery_owner: &str,
+        started_before_ms: i64,
+        turn_reason: &str,
+    ) -> Result<(usize, usize), KernelError> {
+        let interrupted_runs = self
+            .jobs
+            .interrupt_running_runs_with_recovery_lease(
+                recovery_owner,
+                "scheduled job interrupted by kernel restart",
+            )
+            .await
+            .map_err(internal)?;
+        let interrupted_run_count = interrupted_runs.len();
+        let interrupted_turn_count = self
+            .interrupt_scheduler_turns_for_runs_started_before(
+                &interrupted_runs,
+                started_before_ms,
+                turn_reason,
+            )
+            .await?
+            .len();
+
+        Ok((interrupted_run_count, interrupted_turn_count))
+    }
+
+    async fn interrupt_scheduler_turns_for_runs_started_before(
+        &self,
+        runs: &[SchedulerJobRunRecord],
+        started_before_ms: i64,
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>, KernelError> {
+        let mut job_ids = runs.iter().map(|run| run.job_id).collect::<Vec<_>>();
+        job_ids.sort_unstable();
+        job_ids.dedup();
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let interrupted_turns = self
+            .session_turns
+            .interrupt_running_scheduler_turns_for_jobs_started_before(
+                &job_ids,
+                started_before_ms,
+                reason,
+            )
+            .await
+            .map_err(internal)?;
+        for turn in &interrupted_turns {
+            if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
+            }
+        }
+
+        Ok(interrupted_turns)
     }
 
     fn spawn_scheduler_recovery_lease_renewal(
@@ -1637,31 +1708,14 @@ impl Kernel {
             return Ok(());
         }
 
-        let mut job_ids = reconciliation
-            .job_owned_runs
-            .iter()
-            .map(|run| run.job_id)
-            .collect::<Vec<_>>();
-        job_ids.sort_unstable();
-        job_ids.dedup();
         let turn_reason = "turn interrupted after scheduler lease expired";
-        let interrupted_turns = if job_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.session_turns
-                .interrupt_running_scheduler_turns_for_jobs_started_before(
-                    &job_ids,
-                    recovery_started_at_ms,
-                    turn_reason,
-                )
-                .await
-                .map_err(internal)?
-        };
-        for turn in &interrupted_turns {
-            if let Err(err) = self.sessions.record_turn(turn.session_id).await {
-                warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
-            }
-        }
+        let interrupted_turns = self
+            .interrupt_scheduler_turns_for_runs_started_before(
+                &reconciliation.job_owned_runs,
+                recovery_started_at_ms,
+                turn_reason,
+            )
+            .await?;
 
         self.append_audit_event_best_effort(
             "scheduler.run.reconciled",

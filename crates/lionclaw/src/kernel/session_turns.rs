@@ -282,26 +282,9 @@ impl SessionTurnStore {
         self.get(turn_id).await
     }
 
-    pub async fn interrupt_running_turns_without_pending_channel_turns(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<InterruptedSessionTurn>> {
-        self.interrupt_running_turns_without_pending_channel_turns_inner(reason, false)
-            .await
-    }
-
     pub async fn interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(
         &self,
         reason: &str,
-    ) -> Result<Vec<InterruptedSessionTurn>> {
-        self.interrupt_running_turns_without_pending_channel_turns_inner(reason, true)
-            .await
-    }
-
-    async fn interrupt_running_turns_without_pending_channel_turns_inner(
-        &self,
-        reason: &str,
-        exclude_scheduler: bool,
     ) -> Result<Vec<InterruptedSessionTurn>> {
         let finished_at_ms = now_ms();
         let mut tx = self
@@ -310,16 +293,7 @@ impl SessionTurnStore {
             .await
             .context("failed to start interrupted session turn transaction")?;
 
-        let scheduler_filter = if exclude_scheduler {
-            " AND NOT EXISTS ( \
-                SELECT 1 FROM sessions \
-                WHERE sessions.session_id = session_turns.session_id \
-                  AND sessions.channel_id = 'scheduler' \
-              )"
-        } else {
-            ""
-        };
-        let select_sql = format!(
+        let rows = sqlx::query(
             "SELECT turn_id, session_id \
              FROM session_turns \
              WHERE status = ?1 \
@@ -328,16 +302,19 @@ impl SessionTurnStore {
                  WHERE channel_turns.turn_id = session_turns.turn_id \
                    AND channel_turns.status = 'pending' \
                ) \
-              {scheduler_filter} \
-             ORDER BY started_at_ms ASC, turn_id ASC"
-        );
-        let rows = sqlx::query(&select_sql)
-            .bind(SessionTurnStatus::Running.as_str())
-            .fetch_all(&mut *tx)
-            .await
-            .context("failed to query running session turns")?;
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM sessions \
+                 WHERE sessions.session_id = session_turns.session_id \
+                   AND sessions.channel_id = 'scheduler' \
+               ) \
+             ORDER BY started_at_ms ASC, turn_id ASC",
+        )
+        .bind(SessionTurnStatus::Running.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query running session turns")?;
 
-        let update_sql = format!(
+        sqlx::query(
             "UPDATE session_turns \
              SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
              WHERE status = ?5 \
@@ -346,17 +323,20 @@ impl SessionTurnStore {
                  WHERE channel_turns.turn_id = session_turns.turn_id \
                    AND channel_turns.status = 'pending' \
                ) \
-              {scheduler_filter}"
-        );
-        sqlx::query(&update_sql)
-            .bind(SessionTurnStatus::Interrupted.as_str())
-            .bind("runtime.interrupted")
-            .bind(reason)
-            .bind(finished_at_ms)
-            .bind(SessionTurnStatus::Running.as_str())
-            .execute(&mut *tx)
-            .await
-            .context("failed to interrupt running session turns")?;
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM sessions \
+                 WHERE sessions.session_id = session_turns.session_id \
+                   AND sessions.channel_id = 'scheduler' \
+               )",
+        )
+        .bind(SessionTurnStatus::Interrupted.as_str())
+        .bind("runtime.interrupted")
+        .bind(reason)
+        .bind(finished_at_ms)
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to interrupt running session turns")?;
 
         tx.commit()
             .await
@@ -721,6 +701,93 @@ mod tests {
             .await
             .expect("open session");
         (turns, session.session_id)
+    }
+
+    #[tokio::test]
+    async fn restart_turn_recovery_excludes_scheduler_sessions() {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        let sessions = SessionStore::new(pool.clone());
+        let store = SessionTurnStore::new(pool);
+        let normal_session = sessions
+            .open(
+                "local-cli".to_string(),
+                "restart-peer".to_string(),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open normal session");
+        let scheduler_session = sessions
+            .open(
+                "scheduler".to_string(),
+                format!("job:{}", Uuid::new_v4()),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+            )
+            .await
+            .expect("open scheduler session");
+
+        let normal_turn = store
+            .begin_turn_with_started_at(
+                NewSessionTurn {
+                    turn_id: Uuid::new_v4(),
+                    session_id: normal_session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "normal".to_string(),
+                    prompt_user_text: "normal".to_string(),
+                    attachment_source_turn_id: None,
+                    runtime_id: "mock".to_string(),
+                },
+                100,
+            )
+            .await
+            .expect("begin normal turn");
+        let scheduler_turn = store
+            .begin_turn_with_started_at(
+                NewSessionTurn {
+                    turn_id: Uuid::new_v4(),
+                    session_id: scheduler_session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "scheduler".to_string(),
+                    prompt_user_text: "scheduler".to_string(),
+                    attachment_source_turn_id: None,
+                    runtime_id: "mock".to_string(),
+                },
+                100,
+            )
+            .await
+            .expect("begin scheduler turn");
+
+        let interrupted = store
+            .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(
+                "kernel restart",
+            )
+            .await
+            .expect("interrupt restart turns");
+
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].turn_id, normal_turn.turn_id);
+        assert_eq!(
+            store
+                .get(normal_turn.turn_id)
+                .await
+                .expect("load normal turn")
+                .expect("normal turn")
+                .status,
+            SessionTurnStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get(scheduler_turn.turn_id)
+                .await
+                .expect("load scheduler turn")
+                .expect("scheduler turn")
+                .status,
+            SessionTurnStatus::Running
+        );
     }
 
     #[tokio::test]

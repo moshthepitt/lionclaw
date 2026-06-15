@@ -631,7 +631,7 @@ impl JobStore {
         context: &'static str,
     ) -> Result<bool> {
         let now = now_ms();
-        let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        let lease_expires = lease_expires_at_ms(now, ttl);
         let result = sqlx::query(
             "UPDATE scheduler_state \
              SET lease_owner = ?2, \
@@ -667,13 +667,17 @@ impl JobStore {
         context: &'static str,
     ) -> Result<bool> {
         let now = now_ms();
-        let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        let lease_expires = lease_expires_at_ms(now, ttl);
         let result = sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_expires_at_ms = ?2 \
-             WHERE state_id = 1 AND lease_owner = ?1",
+             SET lease_expires_at_ms = ?3 \
+             WHERE state_id = 1 \
+               AND lease_owner = ?1 \
+               AND lease_expires_at_ms IS NOT NULL \
+               AND lease_expires_at_ms >= ?2",
         )
         .bind(owner)
+        .bind(now)
         .bind(lease_expires)
         .execute(&self.pool)
         .await
@@ -1521,6 +1525,10 @@ impl JobStore {
     }
 }
 
+fn lease_expires_at_ms(now: i64, ttl: Duration) -> i64 {
+    now.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
+}
+
 pub fn compute_initial_next_run(
     schedule: &JobSchedule,
     now: DateTime<Utc>,
@@ -1865,6 +1873,17 @@ mod tests {
         assert_eq!(updated_job.running_run_id, Some(run_id));
     }
 
+    async fn expire_scheduler_lease(store: &JobStore, owner: &str) {
+        sqlx::query(
+            "UPDATE scheduler_state SET lease_expires_at_ms = ?2 WHERE state_id = 1 AND lease_owner = ?1",
+        )
+        .bind(owner)
+        .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
+        .execute(store.pool())
+        .await
+        .expect("expire scheduler lease");
+    }
+
     #[test]
     fn interval_schedule_anchoring_prevents_drift() {
         let anchor = dt(2026, 3, 31, 9, 0, 0);
@@ -2107,14 +2126,7 @@ mod tests {
             .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
             .await
             .expect("acquire recovery lease"));
-        sqlx::query(
-            "UPDATE scheduler_state SET lease_expires_at_ms = ?2 WHERE state_id = 1 AND lease_owner = ?1",
-        )
-        .bind("bootstrap-a")
-        .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
-        .execute(store.pool())
-        .await
-        .expect("expire recovery lease");
+        expire_scheduler_lease(&store, "bootstrap-a").await;
 
         let interrupted = store
             .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
@@ -2281,6 +2293,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_recovery_lease_cannot_be_renewed() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        expire_scheduler_lease(&store, "bootstrap-a").await;
+
+        assert!(!store
+            .renew_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("expired recovery lease renewal should not succeed"));
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should acquire after recovery expiry"));
+    }
+
+    #[tokio::test]
     async fn renewed_tick_lease_stays_owned_past_original_expiry() {
         let store = new_store().await;
 
@@ -2300,6 +2332,34 @@ mod tests {
             .try_acquire_tick_lease("owner-b", Duration::from_millis(80))
             .await
             .expect("renewed lease should still block another owner"));
+    }
+
+    #[tokio::test]
+    async fn expired_tick_lease_cannot_be_renewed() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_tick_lease("owner-a", Duration::from_secs(60))
+            .await
+            .expect("acquire tick lease"));
+        expire_scheduler_lease(&store, "owner-a").await;
+
+        assert!(!store
+            .renew_tick_lease("owner-a", Duration::from_secs(60))
+            .await
+            .expect("expired tick lease renewal should not succeed"));
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("second owner should acquire expired tick lease"));
+    }
+
+    #[test]
+    fn lease_expiry_saturates_at_i64_max() {
+        assert_eq!(
+            lease_expires_at_ms(i64::MAX - 1, Duration::from_secs(60)),
+            i64::MAX
+        );
     }
 
     #[tokio::test]
