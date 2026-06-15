@@ -1186,13 +1186,9 @@ impl JobStore {
                 .context("failed to finish stale failure completion transaction")?;
             return Ok(None);
         }
-        if session_id
-            .zip(run.session_id)
-            .is_some_and(|(expected, actual)| expected != actual)
-            || turn_id
-                .zip(run.turn_id)
-                .is_some_and(|(expected, actual)| expected != actual)
-        {
+        let stored_unattached = run.session_id.is_none() && run.turn_id.is_none();
+        let context_matches_attached_run = run.session_id == session_id && run.turn_id == turn_id;
+        if !stored_unattached && !context_matches_attached_run {
             tx.commit()
                 .await
                 .context("failed to finish mismatched failure completion transaction")?;
@@ -1233,7 +1229,11 @@ impl JobStore {
         let updated_run = sqlx::query(
             "UPDATE scheduler_job_runs \
              SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = ?7 \
-             WHERE run_id = ?1 AND status = ?8",
+             WHERE run_id = ?1 AND status = ?8 \
+               AND ( \
+                 (session_id IS NULL AND turn_id IS NULL) \
+                 OR (session_id = ?9 AND turn_id = ?10) \
+               )",
         )
         .bind(run_id.to_string())
         .bind(finished_at_ms)
@@ -1243,6 +1243,8 @@ impl JobStore {
         .bind(delivery_status.as_str())
         .bind(error_text)
         .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(session_id.map(|value| value.to_string()))
+        .bind(turn_id.map(|value| value.to_string()))
         .execute(&mut *tx)
         .await
         .context("failed to finalize failed scheduler job run")?;
@@ -2369,6 +2371,23 @@ mod tests {
         assert!(
             mismatched.is_none(),
             "attached runs must reject mismatched failure context"
+        );
+        assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
+
+        let no_context = store
+            .complete_run_failure(
+                attached_run_id,
+                None,
+                None,
+                "missing context",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete missing-context failure");
+        assert!(
+            no_context.is_none(),
+            "attached runs must reject missing failure context"
         );
         assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
     }

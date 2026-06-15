@@ -284,26 +284,20 @@ impl SchedulerEngine {
         Ok(delivery_status)
     }
 
-    async fn finish_if_run_no_longer_current(
+    async fn finish_current_run_snapshot(
         &self,
         kernel: &Kernel,
         job_id: Uuid,
-        run_id: Uuid,
+        final_run: SchedulerJobRunRecord,
     ) -> Result<Option<AttemptOutcome>, KernelError> {
-        let Some(final_run) = kernel.job_store().get_run(run_id).await.map_err(internal)? else {
-            return Ok(None);
-        };
         let Some(updated_job) = kernel.job_store().get_job(job_id).await.map_err(internal)? else {
             return Ok(None);
         };
 
-        if final_run.status != SchedulerJobRunStatus::Running {
-            return Ok(Some(AttemptOutcome::Finished(Box::new((
-                updated_job,
-                final_run,
-            )))));
-        }
-        Ok(None)
+        Ok(Some(AttemptOutcome::Finished(Box::new((
+            updated_job,
+            final_run,
+        )))))
     }
 
     async fn run_job_attempt(
@@ -390,18 +384,31 @@ impl SchedulerEngine {
                     .running_run_owns_turn(current_run.run_id, opened.session_id, turn_id)
                     .await
                     .map_err(internal)?;
-                if !run_still_owns_turn {
-                    if let Some(outcome) = self
-                        .finish_if_run_no_longer_current(kernel, job.job_id, current_run.run_id)
-                        .await?
-                    {
-                        return Ok(outcome);
-                    }
-                }
                 let (session_id, turn_id) = if run_still_owns_turn {
                     (Some(opened.session_id), Some(turn_id))
                 } else {
-                    (None, None)
+                    let maybe_run = kernel
+                        .job_store()
+                        .get_run(current_run.run_id)
+                        .await
+                        .map_err(internal)?;
+                    match maybe_run {
+                        Some(run)
+                            if run.status != SchedulerJobRunStatus::Running
+                                || run.session_id.is_some()
+                                || run.turn_id.is_some() =>
+                        {
+                            if let Some(outcome) = self
+                                .finish_current_run_snapshot(kernel, job.job_id, run)
+                                .await?
+                            {
+                                return Ok(outcome);
+                            }
+                            (Some(opened.session_id), Some(turn_id))
+                        }
+                        Some(_) => (None, None),
+                        None => (Some(opened.session_id), Some(turn_id)),
+                    }
                 };
                 self.handle_failed_attempt(
                     kernel,
