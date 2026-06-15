@@ -2860,6 +2860,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(
                         runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
@@ -2894,6 +2895,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(
                         runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
@@ -7076,6 +7078,7 @@ impl Kernel {
 
     pub(super) async fn execute_scheduled_job_turn(
         &self,
+        run_id: Uuid,
         session_id: Uuid,
         turn_id: Uuid,
         job: &SchedulerJobRecord,
@@ -7094,6 +7097,7 @@ impl Kernel {
                 runtime_prompt_user_text: None,
                 attachment_source_turn_id: None,
                 prepared_turn: None,
+                scheduler_run_id: Some(run_id),
                 requested_runtime_id: Some(job.runtime_id.clone()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -8254,6 +8258,7 @@ mod tests {
                     runtime_prompt_user_text: Some(runtime_prompt_user_text),
                     attachment_source_turn_id: None,
                     prepared_turn: Some(prepared_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(runtime_id.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -9827,6 +9832,7 @@ mod tests {
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: None,
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_REPLY_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -10111,6 +10117,7 @@ mod tests {
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: None,
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -11697,6 +11704,7 @@ done
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: Some(prepared_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -18963,6 +18971,7 @@ struct SessionTurnExecution {
     runtime_prompt_user_text: Option<String>,
     attachment_source_turn_id: Option<Uuid>,
     prepared_turn: Option<SessionTurnRecord>,
+    scheduler_run_id: Option<Uuid>,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
@@ -19637,6 +19646,7 @@ impl Kernel {
                 runtime_prompt_user_text: None,
                 attachment_source_turn_id: None,
                 prepared_turn: None,
+                scheduler_run_id: None,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
@@ -19861,6 +19871,7 @@ impl Kernel {
             runtime_prompt_user_text,
             attachment_source_turn_id,
             prepared_turn,
+            scheduler_run_id,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
@@ -20035,6 +20046,30 @@ impl Kernel {
                 .await
                 .map_err(internal)?,
         };
+
+        if let Some(run_id) = scheduler_run_id {
+            let attached = self
+                .jobs
+                .attach_run_turn(run_id, session.session_id, persisted_turn.turn_id)
+                .await
+                .map_err(internal)?;
+            if !attached {
+                let error_text = "scheduled job run is no longer active".to_string();
+                self.session_turns
+                    .complete_turn(
+                        persisted_turn.turn_id,
+                        SessionTurnCompletion {
+                            status: SessionTurnStatus::Interrupted,
+                            assistant_text: String::new(),
+                            error_code: Some("runtime.interrupted".to_string()),
+                            error_text: Some(error_text.clone()),
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Err(KernelError::Conflict(error_text));
+            }
+        }
 
         if let Some(control) = runtime_control.as_ref() {
             if let Err(err) = self
@@ -23121,6 +23156,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: Some(persisted_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,

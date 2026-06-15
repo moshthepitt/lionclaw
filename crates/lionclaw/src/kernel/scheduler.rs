@@ -270,18 +270,8 @@ impl SchedulerEngine {
             })
             .await?;
         let turn_id = Uuid::new_v4();
-        if !kernel
-            .job_store()
-            .attach_run_turn(current_run.run_id, opened.session_id, turn_id)
-            .await
-            .map_err(internal)?
-        {
-            return Err(KernelError::Conflict(
-                "scheduled job run is no longer active".to_string(),
-            ));
-        }
         let turn_result = kernel
-            .execute_scheduled_job_turn(opened.session_id, turn_id, job)
+            .execute_scheduled_job_turn(current_run.run_id, opened.session_id, turn_id, job)
             .await;
 
         match turn_result {
