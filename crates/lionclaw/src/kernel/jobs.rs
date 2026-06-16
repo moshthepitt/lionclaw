@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use crate::kernel::{
-    db::{ms_to_datetime, now_ms},
-    policy::{Capability, PolicyStore, Scope},
+use crate::{
+    contracts::SessionTurnStatus,
+    kernel::{
+        db::{ms_to_datetime, now_ms},
+        policy::{Capability, PolicyStore, Scope},
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +212,22 @@ struct JobRunClaim {
 pub struct JobStore {
     pool: SqlitePool,
 }
+
+const RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL: &str = "SELECT EXISTS( \
+   SELECT 1 \
+   FROM scheduler_job_runs \
+   JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+   JOIN sessions ON sessions.session_id = scheduler_job_runs.session_id \
+   JOIN session_turns ON session_turns.turn_id = scheduler_job_runs.turn_id \
+                     AND session_turns.session_id = scheduler_job_runs.session_id \
+   WHERE scheduler_job_runs.run_id = ?1 \
+     AND scheduler_job_runs.status = ?2 \
+     AND scheduler_job_runs.session_id = ?3 \
+     AND scheduler_job_runs.turn_id = ?4 \
+     AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+     AND sessions.channel_id = 'scheduler' \
+     AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
+ )";
 
 impl JobStore {
     pub fn new(pool: SqlitePool) -> Self {
@@ -1080,6 +1099,15 @@ impl JobStore {
                 .context("failed to finish mismatched success completion transaction")?;
             return Ok(None);
         }
+        if !self
+            .running_run_owns_turn_in_tx(&mut tx, run_id, session_id, turn_id)
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to finish unbound success completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual;
 
@@ -1187,12 +1215,31 @@ impl JobStore {
             return Ok(None);
         }
         let stored_unattached = run.session_id.is_none() && run.turn_id.is_none();
-        let context_matches_attached_run = run.session_id == session_id && run.turn_id == turn_id;
+        let stored_attached = run.session_id.is_some() && run.turn_id.is_some();
+        let context_matches_attached_run =
+            stored_attached && run.session_id == session_id && run.turn_id == turn_id;
         if !stored_unattached && !context_matches_attached_run {
             tx.commit()
                 .await
                 .context("failed to finish mismatched failure completion transaction")?;
             return Ok(None);
+        }
+        if context_matches_attached_run {
+            let (Some(session_id), Some(turn_id)) = (session_id, turn_id) else {
+                tx.commit()
+                    .await
+                    .context("failed to finish partial failure completion transaction")?;
+                return Ok(None);
+            };
+            if !self
+                .running_run_owns_turn_in_tx(&mut tx, run_id, session_id, turn_id)
+                .await?
+            {
+                tx.commit()
+                    .await
+                    .context("failed to finish unbound failure completion transaction")?;
+                return Ok(None);
+            }
         }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual
@@ -1380,16 +1427,20 @@ impl JobStore {
                  SELECT 1 \
                  FROM scheduler_jobs \
                  JOIN sessions ON sessions.session_id = ?2 \
+                 JOIN session_turns ON session_turns.turn_id = ?3 \
+                                   AND session_turns.session_id = ?2 \
                  WHERE scheduler_jobs.job_id = scheduler_job_runs.job_id \
                    AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
                    AND sessions.channel_id = 'scheduler' \
                    AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
+                   AND session_turns.status = ?5 \
                )",
         )
         .bind(run_id.to_string())
         .bind(session_id.to_string())
         .bind(turn_id.to_string())
         .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(SessionTurnStatus::Running.as_str())
         .execute(&self.pool)
         .await
         .context("failed to attach scheduler run turn")?;
@@ -1403,28 +1454,33 @@ impl JobStore {
         session_id: Uuid,
         turn_id: Uuid,
     ) -> Result<bool> {
-        let owns = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS( \
-               SELECT 1 \
-               FROM scheduler_job_runs \
-               JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
-               JOIN sessions ON sessions.session_id = scheduler_job_runs.session_id \
-               WHERE scheduler_job_runs.run_id = ?1 \
-                 AND scheduler_job_runs.status = ?2 \
-                 AND scheduler_job_runs.session_id = ?3 \
-                 AND scheduler_job_runs.turn_id = ?4 \
-                 AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
-                 AND sessions.channel_id = 'scheduler' \
-                 AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
-             )",
-        )
-        .bind(run_id.to_string())
-        .bind(SchedulerJobRunStatus::Running.as_str())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .context("failed to verify scheduler run turn ownership")?;
+        let owns = sqlx::query_scalar::<_, i64>(RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL)
+            .bind(run_id.to_string())
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .bind(session_id.to_string())
+            .bind(turn_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to verify scheduler run turn ownership")?;
+
+        Ok(owns != 0)
+    }
+
+    async fn running_run_owns_turn_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let owns = sqlx::query_scalar::<_, i64>(RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL)
+            .bind(run_id.to_string())
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .bind(session_id.to_string())
+            .bind(turn_id.to_string())
+            .fetch_one(&mut **tx)
+            .await
+            .context("failed to verify scheduler run turn ownership")?;
 
         Ok(owns != 0)
     }
@@ -1858,9 +1914,14 @@ fn map_run_row(row: SqliteRow) -> Result<SchedulerJobRunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{SessionHistoryPolicy, TrustTier};
+    use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, TrustTier};
     use crate::home::runtime_project_partition_key;
-    use crate::kernel::{db::Db, policy::PolicyStore, sessions::SessionStore};
+    use crate::kernel::{
+        db::Db,
+        policy::PolicyStore,
+        session_turns::{NewSessionTurn, SessionTurnStore},
+        sessions::SessionStore,
+    };
     use chrono::{Duration as ChronoDuration, TimeZone};
 
     fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
@@ -1880,10 +1941,14 @@ mod tests {
         (JobStore::new(pool.clone()), PolicyStore::new(pool))
     }
 
-    async fn new_store_and_sessions() -> (JobStore, SessionStore) {
+    async fn new_store_and_sessions() -> (JobStore, SessionStore, SessionTurnStore) {
         let db = Db::connect_memory().await.expect("connect memory db");
         let pool = db.pool();
-        (JobStore::new(pool.clone()), SessionStore::new(pool))
+        (
+            JobStore::new(pool.clone()),
+            SessionStore::new(pool.clone()),
+            SessionTurnStore::new(pool),
+        )
     }
 
     async fn open_scheduler_session_for_job(sessions: &SessionStore, job_id: Uuid) -> Uuid {
@@ -1898,6 +1963,22 @@ mod tests {
             .await
             .expect("open scheduler session")
             .session_id
+    }
+
+    async fn begin_running_turn(turns: &SessionTurnStore, session_id: Uuid) -> Uuid {
+        turns
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "job".to_string(),
+                prompt_user_text: "prompt".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin scheduler turn")
+            .turn_id
     }
 
     async fn move_job_ownership_to_manual_run(store: &JobStore, job: &SchedulerJobRecord) -> Uuid {
@@ -2277,10 +2358,10 @@ mod tests {
 
     #[tokio::test]
     async fn attach_run_turn_records_running_run_identity_once() {
-        let (store, sessions) = new_store_and_sessions().await;
+        let (store, sessions, turns) = new_store_and_sessions().await;
         let (job, run_id) = create_running_one_shot_job(&store, "attached-turn").await;
         let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
-        let turn_id = Uuid::new_v4();
+        let turn_id = begin_running_turn(&turns, session_id).await;
 
         assert!(store
             .attach_run_turn(run_id, session_id, turn_id)
@@ -2290,8 +2371,9 @@ mod tests {
             .attach_run_turn(run_id, session_id, turn_id)
             .await
             .expect("reattach same run turn"));
+        let other_turn_id = begin_running_turn(&turns, session_id).await;
         assert!(!store
-            .attach_run_turn(run_id, session_id, Uuid::new_v4())
+            .attach_run_turn(run_id, session_id, other_turn_id)
             .await
             .expect("refuse different turn"));
 
@@ -2316,7 +2398,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_run_turn_requires_matching_scheduler_job_session() {
-        let (store, sessions) = new_store_and_sessions().await;
+        let (store, sessions, turns) = new_store_and_sessions().await;
         let (job, run_id) = create_running_one_shot_job(&store, "bound-session").await;
         let normal_session = sessions
             .open(
@@ -2329,18 +2411,20 @@ mod tests {
             .await
             .expect("open normal session");
         let wrong_job_session = open_scheduler_session_for_job(&sessions, Uuid::new_v4()).await;
-        let turn_id = Uuid::new_v4();
+        let normal_turn_id = begin_running_turn(&turns, normal_session.session_id).await;
+        let wrong_job_turn_id = begin_running_turn(&turns, wrong_job_session).await;
 
         assert!(!store
-            .attach_run_turn(run_id, normal_session.session_id, turn_id)
+            .attach_run_turn(run_id, normal_session.session_id, normal_turn_id)
             .await
             .expect("normal session must not attach"));
         assert!(!store
-            .attach_run_turn(run_id, wrong_job_session, turn_id)
+            .attach_run_turn(run_id, wrong_job_session, wrong_job_turn_id)
             .await
             .expect("wrong scheduler peer must not attach"));
 
         let scheduler_session = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let turn_id = begin_running_turn(&turns, scheduler_session).await;
         assert!(store
             .attach_run_turn(run_id, scheduler_session, turn_id)
             .await
@@ -2348,11 +2432,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_run_turn_requires_running_turn_in_scheduler_session() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "running-turn-required").await;
+        let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let missing_turn_id = Uuid::new_v4();
+
+        assert!(!store
+            .attach_run_turn(run_id, session_id, missing_turn_id)
+            .await
+            .expect("missing turn must not attach"));
+
+        let normal_session = sessions
+            .open(
+                "local-cli".to_string(),
+                "normal-peer".to_string(),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open normal session");
+        let other_session_turn_id = begin_running_turn(&turns, normal_session.session_id).await;
+        assert!(!store
+            .attach_run_turn(run_id, session_id, other_session_turn_id)
+            .await
+            .expect("turn from another session must not attach"));
+
+        let turn_id = begin_running_turn(&turns, session_id).await;
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("running scheduler turn attaches"));
+    }
+
+    #[tokio::test]
     async fn running_run_owns_turn_requires_current_running_attachment() {
-        let (store, sessions) = new_store_and_sessions().await;
+        let (store, sessions, turns) = new_store_and_sessions().await;
         let (job, run_id) = create_running_one_shot_job(&store, "active-turn-owner").await;
         let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
-        let turn_id = Uuid::new_v4();
+        let turn_id = begin_running_turn(&turns, session_id).await;
 
         assert!(!store
             .running_run_owns_turn(run_id, session_id, turn_id)
@@ -2396,7 +2515,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_run_failure_accepts_unattached_context_but_rejects_mismatch() {
-        let (store, sessions) = new_store_and_sessions().await;
+        let (store, sessions, turns) = new_store_and_sessions().await;
         let (_job, run_id) = create_running_one_shot_job(&store, "unattached-failure").await;
         let session_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
@@ -2430,7 +2549,7 @@ mod tests {
             create_running_one_shot_job(&store, "mismatched-failure").await;
         let attached_session_id =
             open_scheduler_session_for_job(&sessions, mismatch_job.job_id).await;
-        let attached_turn_id = Uuid::new_v4();
+        let attached_turn_id = begin_running_turn(&turns, attached_session_id).await;
         assert!(store
             .attach_run_turn(attached_run_id, attached_session_id, attached_turn_id)
             .await
@@ -2469,6 +2588,74 @@ mod tests {
             "attached runs must reject missing failure context"
         );
         assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
+    }
+
+    #[tokio::test]
+    async fn run_completion_requires_job_bound_scheduler_turn() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (success_job, success_run_id) =
+            create_running_one_shot_job(&store, "unbound-success").await;
+        let success_session_id =
+            open_scheduler_session_for_job(&sessions, success_job.job_id).await;
+        let success_turn_id = begin_running_turn(&turns, success_session_id).await;
+        assert!(store
+            .attach_run_turn(success_run_id, success_session_id, success_turn_id)
+            .await
+            .expect("attach success run"));
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(success_session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(store.pool())
+            .await
+            .expect("move success scheduler peer");
+
+        let success = store
+            .complete_run_success(
+                success_run_id,
+                success_session_id,
+                success_turn_id,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unbound success");
+        assert!(
+            success.is_none(),
+            "success completion must reject unbound scheduler turns"
+        );
+        assert_running_job_state(&store, success_job.job_id, success_run_id).await;
+
+        let (failure_job, failure_run_id) =
+            create_running_one_shot_job(&store, "unbound-failure").await;
+        let failure_session_id =
+            open_scheduler_session_for_job(&sessions, failure_job.job_id).await;
+        let failure_turn_id = begin_running_turn(&turns, failure_session_id).await;
+        assert!(store
+            .attach_run_turn(failure_run_id, failure_session_id, failure_turn_id)
+            .await
+            .expect("attach failure run"));
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(failure_session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(store.pool())
+            .await
+            .expect("move failure scheduler peer");
+
+        let failure = store
+            .complete_run_failure(
+                failure_run_id,
+                Some(failure_session_id),
+                Some(failure_turn_id),
+                "wrong peer",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unbound failure");
+        assert!(
+            failure.is_none(),
+            "failure completion must reject unbound scheduler turns"
+        );
+        assert_running_job_state(&store, failure_job.job_id, failure_run_id).await;
     }
 
     #[tokio::test]
