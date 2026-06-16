@@ -1403,8 +1403,10 @@ impl JobStore {
              SET session_id = ?2, turn_id = ?3 \
              WHERE run_id = ?1 \
                AND status = ?4 \
-               AND (session_id IS NULL OR session_id = ?2) \
-               AND (turn_id IS NULL OR turn_id = ?3) \
+               AND ( \
+                 (session_id IS NULL AND turn_id IS NULL) \
+                 OR (session_id = ?2 AND turn_id = ?3) \
+               ) \
                AND EXISTS ( \
                  SELECT 1 \
                  FROM scheduler_jobs \
@@ -2465,6 +2467,47 @@ mod tests {
             .attach_run_turn(run_id, session_id, turn_id)
             .await
             .expect("running scheduler turn attaches"));
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_rejects_partial_existing_attachment() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+
+        let (session_only_job, session_only_run_id) =
+            create_running_one_shot_job(&store, "session-only-attachment").await;
+        let session_only_session_id =
+            open_scheduler_session_for_job(&sessions, session_only_job.job_id).await;
+        let session_only_turn_id = begin_running_turn(&turns, session_only_session_id).await;
+        sqlx::query("UPDATE scheduler_job_runs SET session_id = ?2 WHERE run_id = ?1")
+            .bind(session_only_run_id.to_string())
+            .bind(session_only_session_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("seed session-only attachment");
+        assert!(!store
+            .attach_run_turn(
+                session_only_run_id,
+                session_only_session_id,
+                session_only_turn_id,
+            )
+            .await
+            .expect("session-only attachment should not be repaired"));
+
+        let (turn_only_job, turn_only_run_id) =
+            create_running_one_shot_job(&store, "turn-only-attachment").await;
+        let turn_only_session_id =
+            open_scheduler_session_for_job(&sessions, turn_only_job.job_id).await;
+        let turn_only_turn_id = begin_running_turn(&turns, turn_only_session_id).await;
+        sqlx::query("UPDATE scheduler_job_runs SET turn_id = ?2 WHERE run_id = ?1")
+            .bind(turn_only_run_id.to_string())
+            .bind(turn_only_turn_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("seed turn-only attachment");
+        assert!(!store
+            .attach_run_turn(turn_only_run_id, turn_only_session_id, turn_only_turn_id)
+            .await
+            .expect("turn-only attachment should not be repaired"));
     }
 
     #[tokio::test]
