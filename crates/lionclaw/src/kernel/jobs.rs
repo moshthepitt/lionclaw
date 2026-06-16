@@ -1214,32 +1214,14 @@ impl JobStore {
                 .context("failed to finish stale failure completion transaction")?;
             return Ok(None);
         }
-        let stored_unattached = run.session_id.is_none() && run.turn_id.is_none();
-        let stored_attached = run.session_id.is_some() && run.turn_id.is_some();
-        let context_matches_attached_run =
-            stored_attached && run.session_id == session_id && run.turn_id == turn_id;
-        if !stored_unattached && !context_matches_attached_run {
+        if !self
+            .failure_context_matches_run_in_tx(&mut tx, &run, session_id, turn_id)
+            .await?
+        {
             tx.commit()
                 .await
                 .context("failed to finish mismatched failure completion transaction")?;
             return Ok(None);
-        }
-        if context_matches_attached_run {
-            let (Some(session_id), Some(turn_id)) = (session_id, turn_id) else {
-                tx.commit()
-                    .await
-                    .context("failed to finish partial failure completion transaction")?;
-                return Ok(None);
-            };
-            if !self
-                .running_run_owns_turn_in_tx(&mut tx, run_id, session_id, turn_id)
-                .await?
-            {
-                tx.commit()
-                    .await
-                    .context("failed to finish unbound failure completion transaction")?;
-                return Ok(None);
-            }
         }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual
@@ -1483,6 +1465,25 @@ impl JobStore {
             .context("failed to verify scheduler run turn ownership")?;
 
         Ok(owns != 0)
+    }
+
+    async fn failure_context_matches_run_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &SchedulerJobRunRecord,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+    ) -> Result<bool> {
+        match (run.session_id, run.turn_id, session_id, turn_id) {
+            (None, None, None, None) => Ok(true),
+            (Some(stored_session_id), Some(stored_turn_id), Some(session_id), Some(turn_id))
+                if stored_session_id == session_id && stored_turn_id == turn_id =>
+            {
+                self.running_run_owns_turn_in_tx(tx, run.run_id, session_id, turn_id)
+                    .await
+            }
+            _ => Ok(false),
+        }
     }
 
     pub async fn interrupt_running_runs(
@@ -2514,17 +2515,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_run_failure_accepts_unattached_context_but_rejects_mismatch() {
+    async fn complete_run_failure_requires_absent_or_attached_context() {
         let (store, sessions, turns) = new_store_and_sessions().await;
-        let (_job, run_id) = create_running_one_shot_job(&store, "unattached-failure").await;
+        let (job, run_id) = create_running_one_shot_job(&store, "unattached-failure").await;
         let session_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
 
-        let completed = store
+        let fake_context = store
             .complete_run_failure(
                 run_id,
                 Some(session_id),
                 Some(turn_id),
+                "fake failure context",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete fake-context failure");
+        assert!(
+            fake_context.is_none(),
+            "unattached runs must reject caller-supplied failure context"
+        );
+        assert_running_job_state(&store, job.job_id, run_id).await;
+
+        let completed = store
+            .complete_run_failure(
+                run_id,
+                None,
+                None,
                 "failed before attachment",
                 SchedulerJobRunStatus::DeadLetter,
                 SchedulerJobDeliveryStatus::NotRequested,
@@ -2542,8 +2560,8 @@ mod tests {
             .expect("load failed run")
             .expect("failed run exists");
         assert_eq!(failed_run.status, SchedulerJobRunStatus::DeadLetter);
-        assert_eq!(failed_run.session_id, Some(session_id));
-        assert_eq!(failed_run.turn_id, Some(turn_id));
+        assert_eq!(failed_run.session_id, None);
+        assert_eq!(failed_run.turn_id, None);
 
         let (mismatch_job, attached_run_id) =
             create_running_one_shot_job(&store, "mismatched-failure").await;
