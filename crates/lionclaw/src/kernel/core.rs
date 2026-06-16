@@ -240,7 +240,9 @@ impl SchedulerRecoveryLeaseRenewal {
 
     async fn stop(mut self) -> Result<(), KernelError> {
         if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
+            if stop_tx.send(()).is_err() {
+                // The renewal task already stopped; awaiting the handle below reports its result.
+            }
         }
         let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;
         renewal_result.map_err(internal)
