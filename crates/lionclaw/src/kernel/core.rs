@@ -1575,7 +1575,7 @@ impl Kernel {
     ) -> Result<(usize, usize), KernelError> {
         let reconciliation = self
             .jobs
-            .interrupt_running_scheduler_owned_runs_with_recovery_lease(
+            .interrupt_running_runs_with_recovery_lease(
                 recovery_owner,
                 "scheduled job interrupted by kernel restart",
             )
@@ -1720,14 +1720,14 @@ impl Kernel {
         }
     }
 
-    pub(super) async fn reconcile_stale_scheduler_runs_after_tick_lease(
+    pub(super) async fn reconcile_stale_scheduler_runs_after_scheduler_lease(
         &self,
     ) -> Result<(), KernelError> {
         let recovery_started_at_ms = Utc::now().timestamp_millis();
         let run_reason = "scheduled job interrupted after scheduler lease expired";
         let reconciliation = self
             .jobs
-            .interrupt_running_scheduler_owned_runs(run_reason)
+            .interrupt_running_recoverable_runs(run_reason)
             .await
             .map_err(internal)?;
         if reconciliation.interrupted_runs.is_empty() {
@@ -6418,19 +6418,12 @@ impl Kernel {
             ExecutionPlanPurpose::Interactive,
         )
         .await?;
-        let claimed = self
-            .jobs
-            .claim_manual_run(req.job_id, Utc::now())
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                if existing.running_run_id.is_some() {
-                    KernelError::Conflict("job is already running".to_string())
-                } else {
-                    KernelError::Conflict("job could not be claimed for manual run".to_string())
-                }
-            })?;
-        let (job, run) = self.scheduler.run_claimed_job(self, claimed).await?;
+        let (job, run) = Box::pin(self.scheduler.run_manual_job(
+            self,
+            req.job_id,
+            existing.running_run_id.is_some(),
+        ))
+        .await?;
         Ok(JobManualRunResponse {
             job: to_job_view(job),
             run: to_job_run_view(run),

@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use chrono::Utc;
@@ -49,38 +48,57 @@ impl SchedulerEngine {
     }
 
     pub async fn tick(&self, kernel: &Kernel) -> Result<JobTickResponse, KernelError> {
-        let owner = format!("scheduler:{}", Uuid::new_v4());
-        let lease_ttl = self.config.tick_interval.max(Duration::from_secs(60));
-        if !kernel
-            .job_store()
-            .try_acquire_tick_lease(&owner, lease_ttl)
-            .await
-            .map_err(internal)?
-        {
-            return Ok(JobTickResponse { claimed_runs: 0 });
-        }
+        let tick =
+            Box::pin(
+                self.with_scheduler_lease(kernel, SchedulerLeaseMode::Tick, || async {
+                    kernel
+                        .reconcile_stale_scheduler_runs_after_scheduler_lease()
+                        .await?;
+                    kernel.recover_pending_scheduler_deliveries().await?;
+                    let mut claimed_runs = 0usize;
+                    while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
+                        claimed_runs += 1;
+                        self.run_claimed_job(kernel, claimed_job).await?;
+                    }
 
-        let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
-        let tick_result = Box::pin(async {
-            kernel
-                .reconcile_stale_scheduler_runs_after_tick_lease()
-                .await?;
-            kernel.recover_pending_scheduler_deliveries().await?;
-            let mut claimed_runs = 0usize;
-            while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
-                claimed_runs += 1;
-                self.run_claimed_job(kernel, claimed_job).await?;
-            }
+                    Ok(JobTickResponse { claimed_runs })
+                }),
+            )
+            .await?;
 
-            Ok(JobTickResponse { claimed_runs })
-        })
-        .await;
+        Ok(tick.unwrap_or(JobTickResponse { claimed_runs: 0 }))
+    }
 
-        let renewal_result = renewal_handle.stop().await;
-        let release_result = kernel.job_store().release_tick_lease(&owner).await;
-        release_result.map_err(internal)?;
-        renewal_result?;
-        tick_result
+    pub async fn run_manual_job(
+        &self,
+        kernel: &Kernel,
+        job_id: Uuid,
+        job_already_running: bool,
+    ) -> Result<(SchedulerJobRecord, SchedulerJobRunRecord), KernelError> {
+        Box::pin(
+            self.with_scheduler_lease(kernel, SchedulerLeaseMode::Execution, || async {
+                kernel
+                    .reconcile_stale_scheduler_runs_after_scheduler_lease()
+                    .await?;
+                let claimed = kernel
+                    .job_store()
+                    .claim_manual_run(job_id, Utc::now())
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        if job_already_running {
+                            KernelError::Conflict("job is already running".to_string())
+                        } else {
+                            KernelError::Conflict(
+                                "job could not be claimed for manual run".to_string(),
+                            )
+                        }
+                    })?;
+                self.run_claimed_job(kernel, claimed).await
+            }),
+        )
+        .await?
+        .ok_or_else(|| KernelError::Conflict("scheduler is already running".to_string()))
     }
 
     pub async fn run_loop(&self, kernel: Arc<Kernel>) {
@@ -538,12 +556,58 @@ impl SchedulerEngine {
         Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
     }
 
+    async fn with_scheduler_lease<F, Fut, T>(
+        &self,
+        kernel: &Kernel,
+        mode: SchedulerLeaseMode,
+        work: F,
+    ) -> Result<Option<T>, KernelError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, KernelError>>,
+    {
+        let owner = format!("{}:{}", mode.owner_prefix(), Uuid::new_v4());
+        let lease_ttl = self.config.tick_interval.max(Duration::from_secs(60));
+        let acquired = match mode {
+            SchedulerLeaseMode::Tick => {
+                kernel
+                    .job_store()
+                    .try_acquire_tick_lease(&owner, lease_ttl)
+                    .await
+            }
+            SchedulerLeaseMode::Execution => {
+                kernel
+                    .job_store()
+                    .try_acquire_execution_lease(&owner, lease_ttl)
+                    .await
+            }
+        }
+        .map_err(internal)?;
+        if !acquired {
+            return Ok(None);
+        }
+
+        let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl, mode);
+        let work_result = work().await;
+        let renewal_result = renewal_handle.stop().await;
+        let release_result = match mode {
+            SchedulerLeaseMode::Tick => kernel.job_store().release_tick_lease(&owner).await,
+            SchedulerLeaseMode::Execution => {
+                kernel.job_store().release_execution_lease(&owner).await
+            }
+        };
+        release_result.map_err(internal)?;
+        renewal_result?;
+        work_result.map(Some)
+    }
+
     fn spawn_lease_renewal(
         &self,
         kernel: &Kernel,
         owner: String,
         lease_ttl: Duration,
-    ) -> TickLeaseRenewal {
+        mode: SchedulerLeaseMode,
+    ) -> SchedulerLeaseRenewal {
         let jobs = kernel.job_store().clone();
         let renew_every = (lease_ttl / 2).max(Duration::from_secs(1));
         let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -552,22 +616,47 @@ impl SchedulerEngine {
                 tokio::select! {
                     _ = &mut stop_rx => return Ok(()),
                     _ = sleep(renew_every) => {
-                        let renewed = jobs.renew_tick_lease(&owner, lease_ttl).await?;
+                        let renewed = match mode {
+                            SchedulerLeaseMode::Tick => jobs.renew_tick_lease(&owner, lease_ttl).await,
+                            SchedulerLeaseMode::Execution => jobs.renew_execution_lease(&owner, lease_ttl).await,
+                        }?;
                         if !renewed {
-                            return Err(anyhow!("scheduler tick lease lost during execution"));
+                            return Err(anyhow!(mode.lost_message()));
                         }
                     }
                 }
             }
         });
-        TickLeaseRenewal {
+        SchedulerLeaseRenewal {
             stop_tx: Some(stop_tx),
             handle,
         }
     }
 }
 
-struct TickLeaseRenewal {
+#[derive(Debug, Clone, Copy)]
+enum SchedulerLeaseMode {
+    Tick,
+    Execution,
+}
+
+impl SchedulerLeaseMode {
+    fn owner_prefix(self) -> &'static str {
+        match self {
+            Self::Tick => "scheduler",
+            Self::Execution => "manual",
+        }
+    }
+
+    fn lost_message(self) -> &'static str {
+        match self {
+            Self::Tick => "scheduler tick lease lost during execution",
+            Self::Execution => "scheduler execution lease lost during execution",
+        }
+    }
+}
+
+struct SchedulerLeaseRenewal {
     stop_tx: Option<oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -583,11 +672,11 @@ struct AttemptFailureContext {
     failure_phase: Option<&'static str>,
 }
 
-impl TickLeaseRenewal {
+impl SchedulerLeaseRenewal {
     async fn stop(mut self) -> Result<(), KernelError> {
         if let Some(stop_tx) = self.stop_tx.take() {
             if stop_tx.send(()).is_err() {
-                debug!("tick lease renewal task already stopped");
+                debug!("scheduler lease renewal task already stopped");
             }
         }
         let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;

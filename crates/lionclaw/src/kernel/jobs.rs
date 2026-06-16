@@ -175,11 +175,11 @@ pub struct SchedulerJobRunRecord {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SchedulerOwnedRunReconciliation {
+pub(crate) struct SchedulerRunReconciliation {
     /// Runs that this recovery pass actually moved out of Running.
-    pub interrupted_runs: Vec<SchedulerJobRunRecord>,
+    pub(crate) interrupted_runs: Vec<SchedulerJobRunRecord>,
     /// Interrupted runs that still owned their scheduler job and are safe for job-scoped cleanup.
-    pub job_owned_runs: Vec<SchedulerJobRunRecord>,
+    pub(crate) job_owned_runs: Vec<SchedulerJobRunRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -628,6 +628,20 @@ impl JobStore {
             .await
     }
 
+    pub(crate) async fn try_acquire_execution_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        self.try_acquire_scheduler_lease(
+            owner,
+            ttl,
+            false,
+            "failed to acquire scheduler execution lease",
+        )
+        .await
+    }
+
     pub(crate) async fn try_acquire_recovery_lease(
         &self,
         owner: &str,
@@ -674,6 +688,11 @@ impl JobStore {
             .await
     }
 
+    pub(crate) async fn renew_execution_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler execution lease")
+            .await
+    }
+
     pub(crate) async fn renew_recovery_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
         self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler recovery lease")
             .await
@@ -706,6 +725,11 @@ impl JobStore {
 
     pub async fn release_tick_lease(&self, owner: &str) -> Result<()> {
         self.release_scheduler_lease(owner, true, "failed to release scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn release_execution_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, false, "failed to release scheduler execution lease")
             .await
     }
 
@@ -1565,41 +1589,41 @@ impl JobStore {
         Ok(guarded.rows_affected() > 0)
     }
 
-    pub async fn interrupt_running_scheduler_owned_runs(
+    pub(crate) async fn interrupt_running_recoverable_runs(
         &self,
         error_text: &str,
-    ) -> Result<SchedulerOwnedRunReconciliation> {
-        self.interrupt_running_scheduler_owned_runs_inner(error_text, None)
+    ) -> Result<SchedulerRunReconciliation> {
+        self.interrupt_running_recoverable_runs_inner(error_text, None)
             .await
     }
 
-    pub(crate) async fn interrupt_running_scheduler_owned_runs_with_recovery_lease(
+    pub(crate) async fn interrupt_running_runs_with_recovery_lease(
         &self,
         owner: &str,
         error_text: &str,
-    ) -> Result<SchedulerOwnedRunReconciliation> {
-        self.interrupt_running_scheduler_owned_runs_inner(error_text, Some(owner))
+    ) -> Result<SchedulerRunReconciliation> {
+        self.interrupt_running_recoverable_runs_inner(error_text, Some(owner))
             .await
     }
 
-    async fn interrupt_running_scheduler_owned_runs_inner(
+    async fn interrupt_running_recoverable_runs_inner(
         &self,
         error_text: &str,
         lease_owner: Option<&str>,
-    ) -> Result<SchedulerOwnedRunReconciliation> {
+    ) -> Result<SchedulerRunReconciliation> {
         let finished_at_ms = now_ms();
         let mut tx = self
             .pool
             .begin()
             .await
-            .context("failed to start interrupt scheduler-owned runs transaction")?;
+            .context("failed to start interrupt scheduler runs transaction")?;
 
         if let Some(owner) = lease_owner {
             if !self.guard_recovery_lease_in_tx(&mut tx, owner).await? {
                 tx.rollback()
                     .await
-                    .context("failed to rollback unowned scheduler-owned reconciliation")?;
-                return Ok(SchedulerOwnedRunReconciliation::default());
+                    .context("failed to rollback unowned scheduler reconciliation")?;
+                return Ok(SchedulerRunReconciliation::default());
             }
         }
 
@@ -1607,20 +1631,19 @@ impl JobStore {
             "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
              status, session_id, turn_id, delivery_status, error_text \
              FROM scheduler_job_runs \
-             WHERE status = ?1 AND trigger_kind != ?2 \
+             WHERE status = ?1 \
              ORDER BY started_at_ms ASC, run_id ASC",
         )
         .bind(SchedulerJobRunStatus::Running.as_str())
-        .bind(SchedulerJobTriggerKind::Manual.as_str())
         .fetch_all(&mut *tx)
         .await
-        .context("failed to query running scheduler-owned job runs")?;
+        .context("failed to query running scheduler job runs")?;
 
         let runs = rows
             .into_iter()
             .map(map_run_row)
             .collect::<Result<Vec<_>>>()?;
-        let mut reconciliation = SchedulerOwnedRunReconciliation::default();
+        let mut reconciliation = SchedulerRunReconciliation::default();
 
         for run in &runs {
             let updated_run = sqlx::query(
@@ -1635,7 +1658,7 @@ impl JobStore {
             .bind(SchedulerJobRunStatus::Running.as_str())
             .execute(&mut *tx)
             .await
-            .context("failed to interrupt scheduler-owned job run")?;
+            .context("failed to interrupt scheduler job run")?;
             if updated_run.rows_affected() == 0 {
                 continue;
             }
@@ -1648,7 +1671,7 @@ impl JobStore {
             .bind(run.run_id.to_string())
             .fetch_one(&mut *tx)
             .await
-            .context("failed to reload interrupted scheduler-owned job run")?;
+            .context("failed to reload interrupted scheduler job run")?;
             let interrupted_run = map_run_row(updated_row)?;
             reconciliation
                 .interrupted_runs
@@ -1666,7 +1689,7 @@ impl JobStore {
             .bind(run.run_id.to_string())
             .execute(&mut *tx)
             .await
-            .context("failed to clear interrupted scheduler-owned job state")?;
+            .context("failed to clear interrupted scheduler job state")?;
             if cleared_job_state.rows_affected() == 0 {
                 continue;
             }
@@ -1676,7 +1699,7 @@ impl JobStore {
 
         tx.commit()
             .await
-            .context("failed to commit interrupted scheduler-owned job runs")?;
+            .context("failed to commit interrupted scheduler job runs")?;
 
         Ok(reconciliation)
     }
@@ -2312,10 +2335,7 @@ mod tests {
             .await
             .expect("acquire recovery lease"));
         let reconciliation = store
-            .interrupt_running_scheduler_owned_runs_with_recovery_lease(
-                "bootstrap-a",
-                "simulated restart",
-            )
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
             .await
             .expect("interrupt under recovery lease");
 
@@ -2336,10 +2356,7 @@ mod tests {
         expire_scheduler_lease(&store, "bootstrap-a").await;
 
         let reconciliation = store
-            .interrupt_running_scheduler_owned_runs_with_recovery_lease(
-                "bootstrap-a",
-                "simulated restart",
-            )
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
             .await
             .expect("interrupt under expired recovery lease");
 
@@ -2367,10 +2384,7 @@ mod tests {
         .expect("transfer recovery lease");
 
         let reconciliation = store
-            .interrupt_running_scheduler_owned_runs_with_recovery_lease(
-                "bootstrap-a",
-                "simulated restart",
-            )
+            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
             .await
             .expect("interrupt under transferred recovery lease");
 
@@ -3082,7 +3096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_owned_recovery_reports_only_runs_that_owned_the_job() {
+    async fn scheduler_recovery_reports_only_runs_that_owned_the_job() {
         let store = new_store().await;
         let job = store
             .create_job(NewSchedulerJob {
@@ -3106,15 +3120,24 @@ mod tests {
         let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
 
         let reconciliation = store
-            .interrupt_running_scheduler_owned_runs("recover stale scheduler run")
+            .interrupt_running_recoverable_runs("recover stale scheduler run")
             .await
-            .expect("interrupt stale scheduler-owned runs");
-        assert_eq!(reconciliation.interrupted_runs.len(), 1);
-        assert_eq!(reconciliation.interrupted_runs[0].run_id, stale_run_id);
-        assert!(
-            reconciliation.job_owned_runs.is_empty(),
+            .expect("interrupt stale scheduler runs");
+        assert_eq!(reconciliation.interrupted_runs.len(), 2);
+        assert!(reconciliation
+            .interrupted_runs
+            .iter()
+            .any(|run| run.run_id == stale_run_id));
+        assert!(reconciliation
+            .interrupted_runs
+            .iter()
+            .any(|run| run.run_id == current_run_id));
+        assert_eq!(
+            reconciliation.job_owned_runs.len(),
+            1,
             "a stale orphan run must not drive job-scoped turn cleanup"
         );
+        assert_eq!(reconciliation.job_owned_runs[0].run_id, current_run_id);
 
         let stale_run = store
             .get_run(stale_run_id)
@@ -3128,14 +3151,14 @@ mod tests {
             .await
             .expect("load current run")
             .expect("current run exists");
-        assert_eq!(current_run.status, SchedulerJobRunStatus::Running);
+        assert_eq!(current_run.status, SchedulerJobRunStatus::Interrupted);
 
         let updated_job = store
             .get_job(job.job_id)
             .await
             .expect("load job")
             .expect("job exists");
-        assert_eq!(updated_job.running_run_id, Some(current_run_id));
+        assert_eq!(updated_job.running_run_id, None);
     }
 
     #[tokio::test]

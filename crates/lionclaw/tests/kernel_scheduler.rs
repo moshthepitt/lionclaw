@@ -1553,6 +1553,153 @@ async fn bootstrap_does_not_interrupt_live_manual_run() {
 }
 
 #[tokio::test]
+async fn bootstrap_interrupts_stale_manual_run_after_owner_loss() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "stale manual run".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "recover stale manual run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session");
+    let turn_id = Uuid::new_v4();
+    let started_at_ms = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(session.session_id.to_string())
+    .bind(started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed running manual turn");
+    let run_id = seed_running_manual_scheduler_run(
+        &pool,
+        created.job.job_id,
+        Some(session.session_id),
+        Some(turn_id),
+        started_at_ms,
+    )
+    .await;
+    drop(kernel);
+
+    let _recovered_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init should recover stale manual work");
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale manual run");
+    assert_eq!(run_status, "interrupted");
+    assert_eq!(
+        run_error.as_deref(),
+        Some("scheduled job interrupted by kernel restart")
+    );
+
+    let (running_run_id, last_status): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT running_run_id, last_status FROM scheduler_jobs WHERE job_id = ?1")
+            .bind(created.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered job");
+    assert!(running_run_id.is_none());
+    assert_eq!(last_status.as_deref(), Some("interrupted"));
+
+    let (turn_status, turn_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM session_turns WHERE turn_id = ?1")
+            .bind(turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale manual turn");
+    assert_eq!(turn_status, "interrupted");
+    assert_eq!(
+        turn_error.as_deref(),
+        Some("turn interrupted by kernel restart")
+    );
+}
+
+#[tokio::test]
+async fn manual_job_run_recovers_stale_manual_run_before_claim() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "manual after stale manual".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "run after stale manual".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let stale_run_id = seed_running_manual_scheduler_run(
+        &pool,
+        created.job.job_id,
+        None,
+        None,
+        Utc::now().timestamp_millis(),
+    )
+    .await;
+
+    let manual = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect("manual run should recover stale manual owner before claim");
+    assert_eq!(
+        manual.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_ne!(manual.run.run_id, stale_run_id);
+
+    let stale_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_status, "interrupted");
+}
+
+#[tokio::test]
 async fn recovered_scheduler_run_cannot_be_completed_by_stale_runtime() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
@@ -2302,6 +2449,40 @@ async fn approve_channel_grant(kernel: &Kernel, channel_id: &str, peer_id: &str)
         })
         .await
         .expect("approve channel pairing");
+}
+
+async fn seed_running_manual_scheduler_run(
+    pool: &SqlitePool,
+    job_id: Uuid,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    started_at_ms: i64,
+) -> Uuid {
+    let run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'manual', ?3, ?3, NULL, 'running', ?4, ?5, 'not_requested', NULL)",
+    )
+    .bind(run_id.to_string())
+    .bind(job_id.to_string())
+    .bind(started_at_ms)
+    .bind(session_id.map(|id| id.to_string()))
+    .bind(turn_id.map(|id| id.to_string()))
+    .execute(pool)
+    .await
+    .expect("seed running manual scheduler run");
+    sqlx::query(
+        "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
+    )
+    .bind(job_id.to_string())
+    .bind(run_id.to_string())
+    .bind(started_at_ms)
+    .execute(pool)
+    .await
+    .expect("attach stale manual run to scheduler job");
+    run_id
 }
 
 struct TestEnv {
