@@ -1559,6 +1559,108 @@ async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
 }
 
 #[tokio::test]
+async fn scheduler_tick_interrupts_attached_orphan_scheduler_turns() {
+    let env = TestEnv::new();
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "attached orphan run".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "recover attached orphan".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create attached orphan job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session");
+    let turn_id = Uuid::new_v4();
+    let started_at_ms = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(session.session_id.to_string())
+    .bind(started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed running scheduler turn");
+
+    let stale_run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'schedule', ?3, ?4, NULL, 'running', ?5, ?6, 'not_requested', NULL)",
+    )
+    .bind(stale_run_id.to_string())
+    .bind(created.job.job_id.to_string())
+    .bind(
+        created
+            .job
+            .next_run_at
+            .expect("job should be due")
+            .timestamp_millis(),
+    )
+    .bind(started_at_ms)
+    .bind(session.session_id.to_string())
+    .bind(turn_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("seed attached orphan scheduler run");
+
+    let tick = kernel
+        .scheduler_tick()
+        .await
+        .expect("tick should recover attached orphan");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let stale_run_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_run_status, "interrupted");
+
+    let stale_turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns WHERE turn_id = ?1")
+            .bind(turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale turn status");
+    assert_eq!(stale_turn_status, "interrupted");
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 1);
+}
+
+#[tokio::test]
 async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
