@@ -1460,6 +1460,99 @@ async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
 }
 
 #[tokio::test]
+async fn bootstrap_does_not_interrupt_live_manual_run() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "live manual run".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "keep manual run active".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let kernel_for_manual = kernel.clone();
+    let job_id = created.job.job_id;
+    let manual = tokio::spawn(async move {
+        kernel_for_manual
+            .run_job_now(JobRefRequest { job_id })
+            .await
+    });
+    adapter.first_turn_started.notified().await;
+
+    let _second_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init must not reconcile live manual work");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let (trigger_kind, run_status, run_session_id, run_turn_id): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT trigger_kind, status, session_id, turn_id \
+         FROM scheduler_job_runs \
+         WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("load running manual job run");
+    assert_eq!(trigger_kind, "manual");
+    assert_eq!(
+        run_status, "running",
+        "opening another kernel must not interrupt a live manual job run"
+    );
+    assert!(
+        run_session_id.is_some(),
+        "running manual job run should be attached to its session"
+    );
+    assert!(
+        run_turn_id.is_some(),
+        "running manual job run should be attached to its turn"
+    );
+
+    let turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns ORDER BY started_at_ms DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("load running manual session turn");
+    assert_eq!(
+        turn_status, "running",
+        "opening another kernel must not interrupt the manual run turn"
+    );
+
+    adapter.release_first_turn.notify_one();
+    let manual = manual
+        .await
+        .expect("join manual run")
+        .expect("manual run should finish");
+    assert_eq!(
+        manual.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_eq!(
+        manual.run.trigger_kind,
+        lionclaw::contracts::SchedulerJobTriggerKindDto::Manual
+    );
+}
+
+#[tokio::test]
 async fn recovered_scheduler_run_cannot_be_completed_by_stale_runtime() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));

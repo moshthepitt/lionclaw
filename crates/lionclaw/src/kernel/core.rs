@@ -1573,19 +1573,19 @@ impl Kernel {
         started_before_ms: i64,
         turn_reason: &str,
     ) -> Result<(usize, usize), KernelError> {
-        let interrupted_runs = self
+        let reconciliation = self
             .jobs
-            .interrupt_running_runs_with_recovery_lease(
+            .interrupt_running_scheduler_owned_runs_with_recovery_lease(
                 recovery_owner,
                 "scheduled job interrupted by kernel restart",
             )
             .await
             .map_err(internal)?;
-        let interrupted_run_count = interrupted_runs.len();
+        let interrupted_run_count = reconciliation.interrupted_runs.len();
         let interrupted_turn_count = self
             .interrupt_scheduler_turns_for_runs(
-                &interrupted_runs,
-                &interrupted_runs,
+                &reconciliation.interrupted_runs,
+                &reconciliation.job_owned_runs,
                 started_before_ms,
                 turn_reason,
             )
