@@ -197,6 +197,7 @@ const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
 const CHANNEL_ATTACHMENT_PROJECTIONS_DIR: &str = "attachment-projections";
 const CHANNEL_ATTACHMENT_MOUNT_TARGET: &str = "/attachments";
 const CHANNEL_OUTBOX_ARTIFACTS_DIR: &str = "channel-outbox";
+const SCHEDULER_RUN_SOURCE_KIND: &str = "scheduler_run";
 const MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY: usize = 10;
 const MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
@@ -1755,6 +1756,190 @@ impl Kernel {
         .await;
 
         Ok(())
+    }
+
+    pub(super) async fn recover_pending_scheduler_deliveries(&self) -> Result<usize, KernelError> {
+        let reconciled_statuses = self
+            .reconcile_terminal_scheduler_outbox_delivery_statuses()
+            .await?;
+        let run_ids = sqlx::query_scalar::<_, String>(
+            "SELECT scheduler_job_runs.run_id \
+             FROM scheduler_job_runs \
+             JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+             WHERE scheduler_job_runs.delivery_status = ?1 \
+               AND scheduler_jobs.delivery_json IS NOT NULL \
+               AND scheduler_job_runs.status IN (?2, ?3) \
+               AND NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM channel_outbox_messages \
+                 WHERE source_kind = ?4 \
+                   AND source_id = scheduler_job_runs.run_id \
+               ) \
+             ORDER BY COALESCE(scheduler_job_runs.finished_at_ms, scheduler_job_runs.started_at_ms) ASC, \
+                      scheduler_job_runs.run_id ASC",
+        )
+        .bind(SchedulerJobDeliveryStatus::Pending.as_str())
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(SchedulerJobRunStatus::DeadLetter.as_str())
+        .bind(SCHEDULER_RUN_SOURCE_KIND)
+        .fetch_all(self.jobs.pool())
+        .await
+        .map_err(|err| internal(err.into()))?;
+
+        let mut recovered = 0usize;
+        for raw_run_id in run_ids {
+            let run_id = Uuid::parse_str(&raw_run_id).map_err(|err| {
+                internal(anyhow::anyhow!(
+                    "invalid scheduler run id '{raw_run_id}' during delivery recovery: {err}"
+                ))
+            })?;
+            let Some(run) = self.jobs.get_run(run_id).await.map_err(internal)? else {
+                continue;
+            };
+            if run.delivery_status != Some(SchedulerJobDeliveryStatus::Pending)
+                || !matches!(
+                    run.status,
+                    SchedulerJobRunStatus::Completed | SchedulerJobRunStatus::DeadLetter
+                )
+            {
+                continue;
+            }
+            let Some(job) = self.jobs.get_job(run.job_id).await.map_err(internal)? else {
+                continue;
+            };
+            let Some(delivery) = &job.delivery else {
+                self.jobs
+                    .update_run_delivery_status(
+                        run.run_id,
+                        SchedulerJobDeliveryStatus::NotRequested,
+                    )
+                    .await
+                    .map_err(internal)?;
+                continue;
+            };
+            let Some(content) = self
+                .recovered_scheduler_run_delivery_content(&job, &run)
+                .await?
+            else {
+                self.jobs
+                    .update_run_delivery_status(run.run_id, SchedulerJobDeliveryStatus::Failed)
+                    .await
+                    .map_err(internal)?;
+                warn!(%run_id, "failed to reconstruct pending scheduler delivery content");
+                continue;
+            };
+            match self
+                .enqueue_scheduler_run_delivery(
+                    &job,
+                    run.run_id,
+                    run.session_id,
+                    run.turn_id,
+                    ChannelDeliveryRoute {
+                        channel_id: &delivery.channel_id,
+                        conversation_ref: &delivery.conversation_ref,
+                        thread_ref: delivery.thread_ref.as_deref(),
+                        reply_to_ref: delivery.reply_to_ref.as_deref(),
+                    },
+                    &content,
+                )
+                .await
+            {
+                Ok(_) => recovered += 1,
+                Err(err) => {
+                    self.jobs
+                        .update_run_delivery_status(run.run_id, SchedulerJobDeliveryStatus::Failed)
+                        .await
+                        .map_err(internal)?;
+                    warn!(?err, %run_id, "failed to recover scheduler run delivery");
+                }
+            }
+        }
+
+        if recovered > 0 || reconciled_statuses > 0 {
+            self.append_audit_event_best_effort(
+                "scheduler.delivery.recovered",
+                None,
+                "kernel",
+                json!({
+                    "outbox_recreated_count": recovered,
+                    "status_reconciled_count": reconciled_statuses,
+                }),
+            )
+            .await;
+        }
+        Ok(recovered + reconciled_statuses)
+    }
+
+    async fn reconcile_terminal_scheduler_outbox_delivery_statuses(
+        &self,
+    ) -> Result<usize, KernelError> {
+        let delivery_ids = sqlx::query_scalar::<_, String>(
+            "SELECT channel_outbox_messages.delivery_id \
+             FROM scheduler_job_runs \
+             JOIN channel_outbox_messages \
+               ON channel_outbox_messages.source_kind = ?1 \
+              AND channel_outbox_messages.source_id = scheduler_job_runs.run_id \
+             WHERE scheduler_job_runs.delivery_status = ?2 \
+               AND scheduler_job_runs.status IN (?3, ?4) \
+               AND channel_outbox_messages.status IN (?5, ?6) \
+             ORDER BY COALESCE(scheduler_job_runs.finished_at_ms, scheduler_job_runs.started_at_ms) ASC, \
+                      scheduler_job_runs.run_id ASC, channel_outbox_messages.created_at_ms ASC",
+        )
+        .bind(SCHEDULER_RUN_SOURCE_KIND)
+        .bind(SchedulerJobDeliveryStatus::Pending.as_str())
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(SchedulerJobRunStatus::DeadLetter.as_str())
+        .bind(ChannelOutboxDeliveryStatus::Delivered.as_str())
+        .bind(ChannelOutboxDeliveryStatus::Failed.as_str())
+        .fetch_all(self.jobs.pool())
+        .await
+        .map_err(|err| internal(err.into()))?;
+
+        let mut reconciled = 0usize;
+        for raw_delivery_id in delivery_ids {
+            let delivery_id = Uuid::parse_str(&raw_delivery_id).map_err(|err| {
+                internal(anyhow::anyhow!(
+                    "invalid scheduler outbox delivery id '{raw_delivery_id}' during delivery status recovery: {err}"
+                ))
+            })?;
+            let Some(delivery) = self
+                .channel_outbox
+                .get_delivery(delivery_id)
+                .await
+                .map_err(internal)?
+            else {
+                continue;
+            };
+            self.update_scheduler_delivery_from_outbox(&delivery)
+                .await?;
+            reconciled += 1;
+        }
+
+        Ok(reconciled)
+    }
+
+    async fn recovered_scheduler_run_delivery_content(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+    ) -> Result<Option<String>, KernelError> {
+        match run.status {
+            SchedulerJobRunStatus::Completed => {
+                let Some(turn_id) = run.turn_id else {
+                    return Ok(None);
+                };
+                let turn = self.session_turns.get(turn_id).await.map_err(internal)?;
+                Ok(turn.map(|turn| turn.assistant_text))
+            }
+            SchedulerJobRunStatus::DeadLetter => Ok(Some(format!(
+                "Scheduled job '{}' failed: {}",
+                job.name,
+                run.error_text.as_deref().unwrap_or("unknown error")
+            ))),
+            SchedulerJobRunStatus::Running
+            | SchedulerJobRunStatus::Failed
+            | SchedulerJobRunStatus::Interrupted => Ok(None),
+        }
     }
 
     pub async fn reconcile_stale_channel_attachments(&self) -> Result<(), KernelError> {
@@ -6271,7 +6456,7 @@ impl Kernel {
         &self,
         delivery: &ChannelDeliveryRecord,
     ) -> Result<(), KernelError> {
-        if delivery.source_kind.as_deref() != Some("scheduler_run") {
+        if delivery.source_kind.as_deref() != Some(SCHEDULER_RUN_SOURCE_KIND) {
             return Ok(());
         }
         let Some(source_id) = delivery.source_id.as_deref() else {
@@ -17853,6 +18038,33 @@ fn runtime_channel_send_fingerprint(
     Ok(sha256_hex(&encoded))
 }
 
+fn scheduler_run_delivery_text(job_name: &str, content: &str) -> String {
+    if content.trim().is_empty() {
+        format!("Scheduled job '{job_name}' completed with no assistant output.")
+    } else {
+        content.to_string()
+    }
+}
+
+fn scheduler_run_delivery_fingerprint(
+    route: &ChannelDeliveryRoute<'_>,
+    content: &ChannelDeliveryContent,
+) -> Result<String, KernelError> {
+    let canonical = json!({
+        "channel_id": route.channel_id,
+        "conversation_ref": route.conversation_ref,
+        "thread_ref": route.thread_ref,
+        "reply_to_ref": route.reply_to_ref,
+        "content": {
+            "text": content.text,
+            "format_hint": content.format_hint,
+            "attachments": content.attachments,
+        },
+    });
+    let encoded = serde_json::to_vec(&canonical).map_err(|err| internal(err.into()))?;
+    Ok(sha256_hex(&encoded))
+}
+
 fn runtime_channel_send_artifacts(
     context: &RuntimeChannelSendContext,
     content: &RuntimeChannelSendContent,
@@ -22165,6 +22377,79 @@ impl Kernel {
             .await?;
         self.audit_channel_outbox_created(&delivery).await?;
         Ok(delivery.delivery_id)
+    }
+
+    pub(super) async fn enqueue_scheduler_run_delivery(
+        &self,
+        job: &SchedulerJobRecord,
+        run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        route: ChannelDeliveryRoute<'_>,
+        content: &str,
+    ) -> Result<Uuid, KernelError> {
+        let channel_id = route.channel_id.trim();
+        let conversation_ref = route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        let delivery_content = ChannelDeliveryContent {
+            text: scheduler_run_delivery_text(&job.name, content),
+            format_hint: "plain".to_string(),
+            attachments: Vec::new(),
+        };
+        if delivery_content.text.trim().is_empty() && delivery_content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
+        self.require_active_channel_binding(channel_id).await?;
+
+        let thread_ref = route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let route = ChannelDeliveryRoute {
+            channel_id,
+            conversation_ref,
+            thread_ref,
+            reply_to_ref,
+        };
+        let fingerprint = scheduler_run_delivery_fingerprint(&route, &delivery_content)?;
+        let source_id = run_id.to_string();
+        let delivery = self
+            .channel_outbox
+            .enqueue_delivery_idempotent(NewChannelDelivery {
+                route,
+                session_id,
+                turn_id,
+                source_kind: Some(SCHEDULER_RUN_SOURCE_KIND),
+                source_id: Some(&source_id),
+                source_fingerprint: Some(&fingerprint),
+                content: delivery_content,
+            })
+            .await
+            .map_err(internal)?;
+
+        match delivery {
+            ChannelOutboxEnqueueResult::Created(delivery) => {
+                if let Err(err) = self.audit_channel_outbox_created(&delivery).await {
+                    warn!(?err, %run_id, delivery_id = %delivery.delivery_id, "failed to audit scheduler outbox creation");
+                }
+                Ok(delivery.delivery_id)
+            }
+            ChannelOutboxEnqueueResult::Existing(delivery) => Ok(delivery.delivery_id),
+            ChannelOutboxEnqueueResult::Conflict(delivery) => Err(KernelError::Conflict(format!(
+                "scheduler run delivery source conflict for run {run_id}; existing delivery {} has a different fingerprint",
+                delivery.delivery_id
+            ))),
+        }
     }
 
     async fn enqueue_channel_turn_text_delivery(

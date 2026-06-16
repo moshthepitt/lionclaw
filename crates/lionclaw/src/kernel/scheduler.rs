@@ -65,6 +65,7 @@ impl SchedulerEngine {
             kernel
                 .reconcile_stale_scheduler_runs_after_tick_lease()
                 .await?;
+            kernel.recover_pending_scheduler_deliveries().await?;
             let mut claimed_runs = 0usize;
             while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
                 claimed_runs += 1;
@@ -220,33 +221,26 @@ impl SchedulerEngine {
         kernel: &Kernel,
         job: &SchedulerJobRecord,
         run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
         content: &str,
     ) -> SchedulerJobDeliveryStatus {
         let Some(delivery) = &job.delivery else {
             return SchedulerJobDeliveryStatus::NotRequested;
         };
-        let text = if content.trim().is_empty() {
-            format!(
-                "Scheduled job '{}' completed with no assistant output.",
-                job.name
-            )
-        } else {
-            content.to_string()
-        };
-        let source_id = run_id.to_string();
         match kernel
-            .enqueue_channel_delivery(
+            .enqueue_scheduler_run_delivery(
+                job,
+                run_id,
+                session_id,
+                turn_id,
                 ChannelDeliveryRoute {
                     channel_id: &delivery.channel_id,
                     conversation_ref: &delivery.conversation_ref,
                     thread_ref: delivery.thread_ref.as_deref(),
                     reply_to_ref: delivery.reply_to_ref.as_deref(),
                 },
-                None,
-                None,
-                Some("scheduler_run"),
-                Some(&source_id),
-                &text,
+                content,
             )
             .await
         {
@@ -268,9 +262,13 @@ impl SchedulerEngine {
         kernel: &Kernel,
         job: &SchedulerJobRecord,
         run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
         content: &str,
     ) -> Result<SchedulerJobDeliveryStatus, KernelError> {
-        let delivery_status = self.deliver_job_result(kernel, job, run_id, content).await;
+        let delivery_status = self
+            .deliver_job_result(kernel, job, run_id, session_id, turn_id, content)
+            .await;
         if delivery_status == SchedulerJobDeliveryStatus::Failed {
             let updated = kernel
                 .job_store()
@@ -347,6 +345,8 @@ impl SchedulerEngine {
                         kernel,
                         job,
                         current_run.run_id,
+                        Some(response.session_id),
+                        Some(response.turn_id),
                         &response.assistant_text,
                     )
                     .await?;
@@ -491,7 +491,14 @@ impl SchedulerEngine {
                 )
             })?;
         let delivery_status = self
-            .deliver_completed_job_result(kernel, job, current_run.run_id, &failure_summary)
+            .deliver_completed_job_result(
+                kernel,
+                job,
+                current_run.run_id,
+                context.session_id,
+                context.turn_id,
+                &failure_summary,
+            )
             .await?;
         let final_run = kernel
             .job_store()

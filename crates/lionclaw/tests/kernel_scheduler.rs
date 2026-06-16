@@ -909,6 +909,207 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
 }
 
 #[tokio::test]
+async fn scheduler_tick_recovers_missing_pending_delivery_outbox() {
+    let env = TestEnv::new();
+    install_and_bind_channel(&env, "loopback", "loopback-recovery").await;
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "recoverable brief".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "produce a recoverable delivery".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
+                channel_id: "loopback".to_string(),
+                conversation_ref: "carol".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
+            }),
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create recoverable job");
+
+    let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list recoverable job runs")
+        .runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Pending)
+    );
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect test db");
+    let deleted = sqlx::query(
+        "DELETE FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' AND source_id = ?1",
+    )
+    .bind(runs[0].run_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("delete scheduler outbox delivery");
+    assert_eq!(deleted.rows_affected(), 1);
+
+    let tick = kernel.scheduler_tick().await.expect("run recovery tick");
+    assert_eq!(tick.claimed_runs, 0);
+
+    let recovered_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) \
+         FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' \
+           AND source_id = ?1 \
+           AND source_fingerprint IS NOT NULL",
+    )
+    .bind(runs[0].run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count recovered scheduler outbox delivery");
+    assert_eq!(recovered_count, 1);
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-recovery-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(20),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull recovered delivery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "carol");
+    assert_eq!(outbox.deliveries[0].session_id, runs[0].session_id);
+    assert_eq!(outbox.deliveries[0].turn_id, runs[0].turn_id);
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_reconciles_terminal_outbox_delivery_status() {
+    let env = TestEnv::new();
+    install_and_bind_channel(&env, "loopback", "loopback-status-recovery").await;
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "status recovery brief".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "produce a status recovery delivery".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
+                channel_id: "loopback".to_string(),
+                conversation_ref: "dana".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
+            }),
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create status recovery job");
+
+    kernel.scheduler_tick().await.expect("run scheduler tick");
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-status-recovery-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(20),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull status recovery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+
+    kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-status-recovery-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_id": "provider-2"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report delivered scheduler outbox");
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list delivered runs")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect test db");
+    sqlx::query("UPDATE scheduler_job_runs SET delivery_status = 'pending' WHERE run_id = ?1")
+        .bind(runs[0].run_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("reset scheduler delivery status");
+
+    let tick = kernel
+        .scheduler_tick()
+        .await
+        .expect("run status recovery tick");
+    assert_eq!(tick.claimed_runs, 0);
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list status recovered runs")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
+
+    let scheduler_outbox_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) \
+         FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' AND source_id = ?1",
+    )
+    .bind(runs[0].run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count scheduler outbox deliveries");
+    assert_eq!(scheduler_outbox_count, 1);
+}
+
+#[tokio::test]
 async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     let env = TestEnv::new();
     install_and_bind_channel(&env, "loopback", "loopback-failure").await;
