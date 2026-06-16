@@ -202,18 +202,17 @@ impl SessionTurnStore {
                AND status = ?7 \
                AND session_id = ?8 \
                AND EXISTS ( \
-                 SELECT 1 FROM sessions \
-                 WHERE sessions.session_id = ?8 AND sessions.channel_id = 'scheduler' \
-               ) \
-               AND EXISTS ( \
                  SELECT 1 \
                  FROM scheduler_job_runs \
                  JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+                 JOIN sessions ON sessions.session_id = scheduler_job_runs.session_id \
                  WHERE scheduler_job_runs.run_id = ?9 \
                    AND scheduler_job_runs.status = ?10 \
                    AND scheduler_job_runs.session_id = ?8 \
                    AND scheduler_job_runs.turn_id = ?1 \
                    AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+                   AND sessions.channel_id = 'scheduler' \
+                   AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
                )",
         )
         .bind(turn_id.to_string())
@@ -1224,6 +1223,40 @@ mod tests {
         assert!(
             stale_completion.is_none(),
             "stale scheduler owner must not complete the turn"
+        );
+
+        let stored = store.get(turn_id).await.expect("load turn").expect("turn");
+        assert_eq!(stored.status, SessionTurnStatus::Running);
+        assert_eq!(stored.assistant_text, "");
+    }
+
+    #[tokio::test]
+    async fn complete_running_turn_for_current_scheduler_run_requires_job_bound_session() {
+        let (store, _jobs, session_id, turn_id, run_id) = new_store_with_scheduler_run().await;
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(&store.pool)
+            .await
+            .expect("move scheduler session peer");
+
+        let mismatched_completion = store
+            .complete_running_turn_for_current_scheduler_run(
+                turn_id,
+                run_id,
+                session_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "wrong peer".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("attempt mismatched scheduler completion");
+        assert!(
+            mismatched_completion.is_none(),
+            "scheduler completion must require the job-bound scheduler session"
         );
 
         let stored = store.get(turn_id).await.expect("load turn").expect("turn");
