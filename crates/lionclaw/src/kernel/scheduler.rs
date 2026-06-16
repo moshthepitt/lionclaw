@@ -293,6 +293,11 @@ impl SchedulerEngine {
         let Some(updated_job) = kernel.job_store().get_job(job_id).await.map_err(internal)? else {
             return Ok(None);
         };
+        if final_run.status == SchedulerJobRunStatus::Running
+            && updated_job.running_run_id == Some(final_run.run_id)
+        {
+            return Ok(None);
+        }
 
         Ok(Some(AttemptOutcome::Finished(Box::new((
             updated_job,
@@ -404,7 +409,10 @@ impl SchedulerEngine {
                             {
                                 return Ok(outcome);
                             }
-                            (Some(opened.session_id), Some(turn_id))
+                            return Err(KernelError::Conflict(
+                                "scheduled job run attachment no longer matches current turn"
+                                    .to_string(),
+                            ));
                         }
                         Some(_) => (None, None),
                         None => (Some(opened.session_id), Some(turn_id)),

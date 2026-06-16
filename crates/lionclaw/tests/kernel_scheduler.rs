@@ -22,12 +22,14 @@ use lionclaw::{
     },
     home::LionClawHome,
     kernel::{
+        jobs::{JobStore, SchedulerJobTriggerKind},
         runtime::{
             ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, RuntimeAdapter,
             RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
         },
+        scheduler::SchedulerEngine,
         Kernel, KernelError, KernelOptions,
     },
     operator::{
@@ -1377,6 +1379,76 @@ async fn recovered_scheduler_run_cannot_be_completed_by_stale_runtime() {
         adapter.prompts(),
         vec!["stale runtime must not complete".to_string()]
     );
+}
+
+#[tokio::test]
+async fn scheduler_run_partial_attachment_is_interrupted_not_reported_finished() {
+    let env = TestEnv::new();
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "partial attachment".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "partial attachment should not block".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create partial attachment job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let store = JobStore::new(pool.clone());
+    let claimed = store
+        .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+        .await
+        .expect("claim partial attachment job")
+        .pop()
+        .expect("claimed partial attachment job");
+    let run_id = claimed.run.run_id;
+    sqlx::query("UPDATE scheduler_job_runs SET session_id = ?2 WHERE run_id = ?1")
+        .bind(run_id.to_string())
+        .bind(Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await
+        .expect("seed partial scheduler run attachment");
+
+    let result = SchedulerEngine::new(Default::default())
+        .run_claimed_job(&kernel, claimed)
+        .await;
+    assert!(
+        matches!(result, Err(KernelError::Conflict(message)) if message.contains("attachment no longer matches")),
+        "malformed current attachments should fail through the interrupt path"
+    );
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load interrupted partial run");
+    assert_eq!(run_status, "interrupted");
+    assert!(
+        run_error
+            .as_deref()
+            .is_some_and(|error| error.contains("attachment no longer matches")),
+        "interrupted run should record the ownership mismatch"
+    );
+
+    let (running_run_id, last_status): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT running_run_id, last_status FROM scheduler_jobs WHERE job_id = ?1")
+            .bind(created.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load interrupted partial job");
+    assert!(running_run_id.is_none());
+    assert_eq!(last_status.as_deref(), Some("interrupted"));
 }
 
 #[tokio::test]
