@@ -767,6 +767,28 @@ impl JobStore {
         limit: usize,
         trigger_kind: SchedulerJobTriggerKind,
     ) -> Result<Vec<ClaimedSchedulerJob>> {
+        self.claim_due_jobs_inner(now, limit, trigger_kind, None)
+            .await
+    }
+
+    pub(crate) async fn claim_due_jobs_with_scheduler_lease(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        trigger_kind: SchedulerJobTriggerKind,
+        lease_owner: &str,
+    ) -> Result<Vec<ClaimedSchedulerJob>> {
+        self.claim_due_jobs_inner(now, limit, trigger_kind, Some(lease_owner))
+            .await
+    }
+
+    async fn claim_due_jobs_inner(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        trigger_kind: SchedulerJobTriggerKind,
+        lease_owner: Option<&str>,
+    ) -> Result<Vec<ClaimedSchedulerJob>> {
         let jobs = self.load_due_jobs(now, limit).await?;
         let mut claimed = Vec::new();
         for job in jobs {
@@ -781,6 +803,7 @@ impl JobStore {
                         require_enabled: true,
                         now,
                     },
+                    lease_owner,
                 )
                 .await?
             {
@@ -796,6 +819,25 @@ impl JobStore {
         job_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedSchedulerJob>> {
+        self.claim_manual_run_inner(job_id, now, None).await
+    }
+
+    pub(crate) async fn claim_manual_run_with_scheduler_lease(
+        &self,
+        job_id: Uuid,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+    ) -> Result<Option<ClaimedSchedulerJob>> {
+        self.claim_manual_run_inner(job_id, now, Some(lease_owner))
+            .await
+    }
+
+    async fn claim_manual_run_inner(
+        &self,
+        job_id: Uuid,
+        now: DateTime<Utc>,
+        lease_owner: Option<&str>,
+    ) -> Result<Option<ClaimedSchedulerJob>> {
         self.claim_job_run(
             job_id,
             JobRunClaim {
@@ -806,6 +848,7 @@ impl JobStore {
                 require_enabled: false,
                 now,
             },
+            lease_owner,
         )
         .await
     }
@@ -814,6 +857,7 @@ impl JobStore {
         &self,
         job_id: Uuid,
         claim: JobRunClaim,
+        lease_owner: Option<&str>,
     ) -> Result<Option<ClaimedSchedulerJob>> {
         let JobRunClaim {
             trigger_kind,
@@ -828,6 +872,18 @@ impl JobStore {
             .begin()
             .await
             .context("failed to start claim scheduler job transaction")?;
+
+        if let Some(lease_owner) = lease_owner {
+            if !self
+                .guard_scheduler_lease_in_tx(&mut tx, lease_owner)
+                .await?
+            {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback unowned scheduler job claim")?;
+                return Ok(None);
+            }
+        }
 
         let Some(job) = self
             .get_job_in_tx(&mut tx, job_id, "failed to load scheduler job for claim")

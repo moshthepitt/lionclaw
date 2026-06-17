@@ -2193,6 +2193,81 @@ async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     );
 }
 
+#[tokio::test]
+async fn scheduler_tick_stops_claiming_when_lease_owner_changes() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    kernel
+        .create_job(JobCreateRequest {
+            name: "first due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(2),
+            },
+            prompt_text: "first prompt".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create first job");
+    let second_job = kernel
+        .create_job(JobCreateRequest {
+            name: "second due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "second prompt".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create second job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick =
+        tokio::spawn(async move { kernel_for_tick.scheduler_tick().await.expect("first tick") });
+
+    adapter.first_turn_started.notified().await;
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect db");
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_owner = ?1, lease_expires_at_ms = ?2 \
+         WHERE state_id = 1",
+    )
+    .bind("competing-scheduler")
+    .bind((Utc::now() + ChronoDuration::minutes(5)).timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("move scheduler lease to competing owner");
+
+    adapter.release_first_turn.notify_one();
+
+    let tick = tick.await.expect("join tick");
+    assert_eq!(tick.claimed_runs, 1);
+    assert_eq!(adapter.prompts(), vec!["first prompt".to_string()]);
+
+    let second_run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1")
+            .bind(second_job.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("count second job runs");
+    assert_eq!(
+        second_run_count, 0,
+        "a stale scheduler lease owner must not claim additional due jobs"
+    );
+}
+
 struct AlwaysFailRuntimeAdapter;
 
 struct CountingRuntimeAdapter {

@@ -61,7 +61,7 @@ impl SchedulerEngine {
                 }
                 kernel.recover_pending_scheduler_deliveries().await?;
                 let mut claimed_runs = 0usize;
-                while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
+                while let Some(claimed_job) = self.claim_next_due_job(kernel, &lease_owner).await? {
                     claimed_runs += 1;
                     self.run_claimed_job(kernel, claimed_job).await?;
                 }
@@ -95,7 +95,7 @@ impl SchedulerEngine {
                 }
                 let claimed = kernel
                     .job_store()
-                    .claim_manual_run(job_id, Utc::now())
+                    .claim_manual_run_with_scheduler_lease(job_id, Utc::now(), &lease_owner)
                     .await
                     .map_err(internal)?
                     .ok_or_else(|| {
@@ -217,10 +217,16 @@ impl SchedulerEngine {
     async fn claim_next_due_job(
         &self,
         kernel: &Kernel,
+        lease_owner: &str,
     ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
         let Some(claimed_job) = kernel
             .job_store()
-            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .claim_due_jobs_with_scheduler_lease(
+                Utc::now(),
+                1,
+                SchedulerJobTriggerKind::Schedule,
+                lease_owner,
+            )
             .await
             .map_err(internal)?
             .into_iter()
