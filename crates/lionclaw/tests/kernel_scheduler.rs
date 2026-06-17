@@ -22,12 +22,14 @@ use lionclaw::{
     },
     home::LionClawHome,
     kernel::{
+        jobs::{JobStore, SchedulerJobTriggerKind},
         runtime::{
             ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, RuntimeAdapter,
             RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
         },
+        scheduler::SchedulerEngine,
         Kernel, KernelError, KernelOptions,
     },
     operator::{
@@ -907,6 +909,207 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
 }
 
 #[tokio::test]
+async fn scheduler_tick_recovers_missing_pending_delivery_outbox() {
+    let env = TestEnv::new();
+    install_and_bind_channel(&env, "loopback", "loopback-recovery").await;
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "recoverable brief".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "produce a recoverable delivery".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
+                channel_id: "loopback".to_string(),
+                conversation_ref: "carol".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
+            }),
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create recoverable job");
+
+    let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list recoverable job runs")
+        .runs;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Pending)
+    );
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect test db");
+    let deleted = sqlx::query(
+        "DELETE FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' AND source_id = ?1",
+    )
+    .bind(runs[0].run_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("delete scheduler outbox delivery");
+    assert_eq!(deleted.rows_affected(), 1);
+
+    let tick = kernel.scheduler_tick().await.expect("run recovery tick");
+    assert_eq!(tick.claimed_runs, 0);
+
+    let recovered_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) \
+         FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' \
+           AND source_id = ?1 \
+           AND source_fingerprint IS NOT NULL",
+    )
+    .bind(runs[0].run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count recovered scheduler outbox delivery");
+    assert_eq!(recovered_count, 1);
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-recovery-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(20),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull recovered delivery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "carol");
+    assert_eq!(outbox.deliveries[0].session_id, runs[0].session_id);
+    assert_eq!(outbox.deliveries[0].turn_id, runs[0].turn_id);
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_reconciles_terminal_outbox_delivery_status() {
+    let env = TestEnv::new();
+    install_and_bind_channel(&env, "loopback", "loopback-status-recovery").await;
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "status recovery brief".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "produce a status recovery delivery".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
+                channel_id: "loopback".to_string(),
+                conversation_ref: "dana".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
+            }),
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create status recovery job");
+
+    kernel.scheduler_tick().await.expect("run scheduler tick");
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-status-recovery-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(20),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull status recovery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+
+    kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "loopback".to_string(),
+            worker_id: "scheduler-status-recovery-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_id": "provider-2"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report delivered scheduler outbox");
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list delivered runs")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect test db");
+    sqlx::query("UPDATE scheduler_job_runs SET delivery_status = 'pending' WHERE run_id = ?1")
+        .bind(runs[0].run_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("reset scheduler delivery status");
+
+    let tick = kernel
+        .scheduler_tick()
+        .await
+        .expect("run status recovery tick");
+    assert_eq!(tick.claimed_runs, 0);
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list status recovered runs")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
+
+    let scheduler_outbox_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) \
+         FROM channel_outbox_messages \
+         WHERE source_kind = 'scheduler_run' AND source_id = ?1",
+    )
+    .bind(runs[0].run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count scheduler outbox deliveries");
+    assert_eq!(scheduler_outbox_count, 1);
+}
+
+#[tokio::test]
 async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     let env = TestEnv::new();
     install_and_bind_channel(&env, "loopback", "loopback-failure").await;
@@ -1177,9 +1380,757 @@ async fn scheduler_tick_surfaces_unexpected_job_completion_failures() {
     let message = err.to_string();
     assert!(
         message.contains("scheduled job disappeared during completion")
+            || message.contains("scheduled job disappeared during failure completion")
             || message.contains("failed to load scheduler job for success"),
         "unexpected tick failure should surface the completion error, got: {message}"
     );
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_interrupt_live_scheduler_tick() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "live scheduler tick".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "keep running".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create live job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick = tokio::spawn(async move { kernel_for_tick.scheduler_tick().await });
+    adapter.first_turn_started.notified().await;
+
+    let _second_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init must not reconcile live scheduler work");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let (run_status, run_session_id, run_turn_id): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, session_id, turn_id \
+             FROM scheduler_job_runs \
+             WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
+        )
+        .bind(created.job.job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("load running scheduler job run");
+    assert_eq!(
+        run_status, "running",
+        "opening another kernel while the scheduler lease is active must not interrupt the job run"
+    );
+    assert!(
+        run_session_id.is_some(),
+        "running scheduler job run should be attached to its session"
+    );
+    assert!(
+        run_turn_id.is_some(),
+        "running scheduler job run should be attached to its turn"
+    );
+
+    let turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns ORDER BY started_at_ms DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("load running scheduler session turn");
+    assert_eq!(
+        turn_status, "running",
+        "opening another kernel while the scheduler lease is active must not interrupt the session turn"
+    );
+
+    adapter.release_first_turn.notify_one();
+    let tick = tick.await.expect("join tick").expect("tick should finish");
+    assert_eq!(tick.claimed_runs, 1);
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_interrupt_live_manual_run() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "live manual run".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "keep manual run active".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let kernel_for_manual = kernel.clone();
+    let job_id = created.job.job_id;
+    let manual = tokio::spawn(async move {
+        kernel_for_manual
+            .run_job_now(JobRefRequest { job_id })
+            .await
+    });
+    adapter.first_turn_started.notified().await;
+
+    let _second_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init must not reconcile live manual work");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let (trigger_kind, run_status, run_session_id, run_turn_id): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT trigger_kind, status, session_id, turn_id \
+         FROM scheduler_job_runs \
+         WHERE job_id = ?1 ORDER BY started_at_ms DESC LIMIT 1",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("load running manual job run");
+    assert_eq!(trigger_kind, "manual");
+    assert_eq!(
+        run_status, "running",
+        "opening another kernel must not interrupt a live manual job run"
+    );
+    assert!(
+        run_session_id.is_some(),
+        "running manual job run should be attached to its session"
+    );
+    assert!(
+        run_turn_id.is_some(),
+        "running manual job run should be attached to its turn"
+    );
+
+    let turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns ORDER BY started_at_ms DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("load running manual session turn");
+    assert_eq!(
+        turn_status, "running",
+        "opening another kernel must not interrupt the manual run turn"
+    );
+
+    adapter.release_first_turn.notify_one();
+    let manual = manual
+        .await
+        .expect("join manual run")
+        .expect("manual run should finish");
+    assert_eq!(
+        manual.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_eq!(
+        manual.run.trigger_kind,
+        lionclaw::contracts::SchedulerJobTriggerKindDto::Manual
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_interrupts_stale_manual_run_after_owner_loss() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "stale manual run".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "recover stale manual run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session");
+    let turn_id = Uuid::new_v4();
+    let started_at_ms = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(session.session_id.to_string())
+    .bind(started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed running manual turn");
+    let run_id = seed_running_manual_scheduler_run(
+        &pool,
+        created.job.job_id,
+        Some(session.session_id),
+        Some(turn_id),
+        started_at_ms,
+    )
+    .await;
+    drop(kernel);
+
+    let _recovered_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("second kernel init should recover stale manual work");
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale manual run");
+    assert_eq!(run_status, "interrupted");
+    assert_eq!(
+        run_error.as_deref(),
+        Some("scheduled job interrupted by kernel restart")
+    );
+
+    let (running_run_id, last_status): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT running_run_id, last_status FROM scheduler_jobs WHERE job_id = ?1")
+            .bind(created.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered job");
+    assert!(running_run_id.is_none());
+    assert_eq!(last_status.as_deref(), Some("interrupted"));
+
+    let (turn_status, turn_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM session_turns WHERE turn_id = ?1")
+            .bind(turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale manual turn");
+    assert_eq!(turn_status, "interrupted");
+    assert_eq!(
+        turn_error.as_deref(),
+        Some("turn interrupted by kernel restart")
+    );
+}
+
+#[tokio::test]
+async fn manual_job_run_recovers_stale_manual_run_before_claim() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "manual after stale manual".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "run after stale manual".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create manual job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let stale_run_id = seed_running_manual_scheduler_run(
+        &pool,
+        created.job.job_id,
+        None,
+        None,
+        Utc::now().timestamp_millis(),
+    )
+    .await;
+
+    let manual = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect("manual run should recover stale manual owner before claim");
+    assert_eq!(
+        manual.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+    assert_ne!(manual.run.run_id, stale_run_id);
+
+    let stale_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_status, "interrupted");
+}
+
+#[tokio::test]
+async fn recovered_scheduler_run_cannot_be_completed_by_stale_runtime() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "recovered scheduler tick".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "stale runtime must not complete".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create live job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick = tokio::spawn(async move { kernel_for_tick.scheduler_tick().await });
+    adapter.first_turn_started.notified().await;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let (run_id, _session_id, turn_id): (String, String, String) = sqlx::query_as(
+        "SELECT run_id, session_id, turn_id \
+         FROM scheduler_job_runs \
+         WHERE job_id = ?1 AND status = 'running' \
+         ORDER BY started_at_ms DESC LIMIT 1",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("load attached running scheduler job run");
+
+    let recovered_at_ms = Utc::now().timestamp_millis();
+    let updated_run = sqlx::query(
+        "UPDATE scheduler_job_runs \
+         SET finished_at_ms = ?2, status = 'interrupted', error_text = 'simulated recovery' \
+         WHERE run_id = ?1 AND status = 'running'",
+    )
+    .bind(&run_id)
+    .bind(recovered_at_ms)
+    .execute(&pool)
+    .await
+    .expect("interrupt running scheduler run");
+    assert_eq!(updated_run.rows_affected(), 1);
+
+    let updated_job = sqlx::query(
+        "UPDATE scheduler_jobs \
+         SET enabled = 0, next_run_at_ms = NULL, running_run_id = NULL, \
+             last_status = 'interrupted', last_error = 'simulated recovery', updated_at_ms = ?2 \
+         WHERE job_id = ?1 AND running_run_id = ?3",
+    )
+    .bind(created.job.job_id.to_string())
+    .bind(recovered_at_ms)
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .expect("clear recovered scheduler job state");
+    assert_eq!(updated_job.rows_affected(), 1);
+
+    let updated_turn = sqlx::query(
+        "UPDATE session_turns \
+         SET status = 'interrupted', error_code = 'runtime.interrupted', error_text = 'simulated recovery', finished_at_ms = ?2 \
+         WHERE turn_id = ?1 AND status = 'running'",
+    )
+    .bind(&turn_id)
+    .bind(recovered_at_ms)
+    .execute(&pool)
+    .await
+    .expect("interrupt running scheduler turn");
+    assert_eq!(updated_turn.rows_affected(), 1);
+
+    adapter.release_first_turn.notify_one();
+    let tick = tick
+        .await
+        .expect("join stale tick")
+        .expect("stale tick should observe recovered run");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered run");
+    assert_eq!(run_status, "interrupted");
+    assert_eq!(run_error.as_deref(), Some("simulated recovery"));
+
+    let (turn_status, assistant_text, turn_error): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, assistant_text, error_text FROM session_turns WHERE turn_id = ?1",
+        )
+        .bind(&turn_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered turn");
+    assert_eq!(turn_status, "interrupted");
+    assert_eq!(assistant_text, "");
+    assert_eq!(turn_error.as_deref(), Some("simulated recovery"));
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 0);
+    assert_eq!(
+        adapter.prompts(),
+        vec!["stale runtime must not complete".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn scheduler_run_partial_attachment_is_interrupted_not_reported_finished() {
+    let env = TestEnv::new();
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "partial attachment".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "partial attachment should not block".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create partial attachment job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let store = JobStore::new(pool.clone());
+    let claimed = store
+        .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+        .await
+        .expect("claim partial attachment job")
+        .pop()
+        .expect("claimed partial attachment job");
+    let run_id = claimed.run.run_id;
+    sqlx::query("UPDATE scheduler_job_runs SET session_id = ?2 WHERE run_id = ?1")
+        .bind(run_id.to_string())
+        .bind(Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await
+        .expect("seed partial scheduler run attachment");
+
+    let result = SchedulerEngine::new(Default::default())
+        .run_claimed_job(&kernel, claimed)
+        .await;
+    assert!(
+        matches!(result, Err(KernelError::Conflict(message)) if message.contains("attachment no longer matches")),
+        "malformed current attachments should fail through the interrupt path"
+    );
+
+    let (run_status, run_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_text FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load interrupted partial run");
+    assert_eq!(run_status, "interrupted");
+    assert!(
+        run_error
+            .as_deref()
+            .is_some_and(|error| error.contains("attachment no longer matches")),
+        "interrupted run should record the ownership mismatch"
+    );
+
+    let (running_run_id, last_status): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT running_run_id, last_status FROM scheduler_jobs WHERE job_id = ?1")
+            .bind(created.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load interrupted partial job");
+    assert!(running_run_id.is_none());
+    assert_eq!(last_status.as_deref(), Some("interrupted"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "stale scheduler owner".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "recover stale run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create stale-owner job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let stale_run_id = Uuid::new_v4();
+    let now = Utc::now();
+    let scheduled_for = created
+        .job
+        .next_run_at
+        .expect("one-shot job should have next run");
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_owner = 'stale-owner', lease_expires_at_ms = ?1, last_tick_started_at_ms = ?2 \
+         WHERE state_id = 1",
+    )
+    .bind((now + ChronoDuration::seconds(60)).timestamp_millis())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("seed active stale lease");
+    sqlx::query(
+        "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
+    )
+    .bind(created.job.job_id.to_string())
+    .bind(stale_run_id.to_string())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("mark job running under stale owner");
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'schedule', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
+    )
+    .bind(stale_run_id.to_string())
+    .bind(created.job.job_id.to_string())
+    .bind(scheduled_for.timestamp_millis())
+    .bind(now.timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("seed stale running scheduler run");
+
+    let orphan_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session for unattached orphan turn");
+    let orphan_turn_id = Uuid::new_v4();
+    let orphan_started_at_ms = (Utc::now() + ChronoDuration::minutes(1)).timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(orphan_turn_id.to_string())
+    .bind(orphan_session.session_id.to_string())
+    .bind(orphan_started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed future-started unattached orphan scheduler turn");
+
+    let recovered_kernel = Kernel::new(&env.db_path())
+        .await
+        .expect("kernel init during active stale lease");
+    let status_during_lease: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load status during lease");
+    assert_eq!(status_during_lease, "running");
+
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_expires_at_ms = ?1 \
+         WHERE state_id = 1 AND lease_owner = 'stale-owner'",
+    )
+    .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("expire stale owner lease");
+
+    let tick = recovered_kernel
+        .scheduler_tick()
+        .await
+        .expect("tick after stale lease expiry");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let stale_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_status, "interrupted");
+
+    let orphan_turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns WHERE turn_id = ?1")
+            .bind(orphan_turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load orphan turn status");
+    assert_eq!(orphan_turn_status, "interrupted");
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 1);
+}
+
+#[tokio::test]
+async fn scheduler_tick_interrupts_attached_orphan_scheduler_turns() {
+    let env = TestEnv::new();
+    let kernel = env.kernel().await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "attached orphan run".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "recover attached orphan".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create attached orphan job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session");
+    let turn_id = Uuid::new_v4();
+    let started_at_ms = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(session.session_id.to_string())
+    .bind(started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed running scheduler turn");
+
+    let stale_run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'schedule', ?3, ?4, NULL, 'running', ?5, ?6, 'not_requested', NULL)",
+    )
+    .bind(stale_run_id.to_string())
+    .bind(created.job.job_id.to_string())
+    .bind(
+        created
+            .job
+            .next_run_at
+            .expect("job should be due")
+            .timestamp_millis(),
+    )
+    .bind(started_at_ms)
+    .bind(session.session_id.to_string())
+    .bind(turn_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("seed attached orphan scheduler run");
+
+    let tick = kernel
+        .scheduler_tick()
+        .await
+        .expect("tick should recover attached orphan");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let stale_run_status: String =
+        sqlx::query_scalar("SELECT status FROM scheduler_job_runs WHERE run_id = ?1")
+            .bind(stale_run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale run status");
+    assert_eq!(stale_run_status, "interrupted");
+
+    let stale_turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns WHERE turn_id = ?1")
+            .bind(turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load stale turn status");
+    assert_eq!(stale_turn_status, "interrupted");
+
+    let completed_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",
+    )
+    .bind(created.job.job_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count completed runs");
+    assert_eq!(completed_runs, 1);
 }
 
 #[tokio::test]
@@ -1239,6 +2190,81 @@ async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     assert_eq!(
         adapter.prompts(),
         vec!["first prompt".to_string(), "second prompt".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn scheduler_tick_stops_claiming_when_lease_owner_changes() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    kernel
+        .create_job(JobCreateRequest {
+            name: "first due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(2),
+            },
+            prompt_text: "first prompt".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create first job");
+    let second_job = kernel
+        .create_job(JobCreateRequest {
+            name: "second due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "second prompt".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create second job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick =
+        tokio::spawn(async move { kernel_for_tick.scheduler_tick().await.expect("first tick") });
+
+    adapter.first_turn_started.notified().await;
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("connect db");
+    sqlx::query(
+        "UPDATE scheduler_state \
+         SET lease_owner = ?1, lease_expires_at_ms = ?2 \
+         WHERE state_id = 1",
+    )
+    .bind("competing-scheduler")
+    .bind((Utc::now() + ChronoDuration::minutes(5)).timestamp_millis())
+    .execute(&pool)
+    .await
+    .expect("move scheduler lease to competing owner");
+
+    adapter.release_first_turn.notify_one();
+
+    let tick = tick.await.expect("join tick");
+    assert_eq!(tick.claimed_runs, 1);
+    assert_eq!(adapter.prompts(), vec!["first prompt".to_string()]);
+
+    let second_run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1")
+            .bind(second_job.job.job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("count second job runs");
+    assert_eq!(
+        second_run_count, 0,
+        "a stale scheduler lease owner must not claim additional due jobs"
     );
 }
 
@@ -1530,6 +2556,40 @@ async fn approve_channel_grant(kernel: &Kernel, channel_id: &str, peer_id: &str)
         })
         .await
         .expect("approve channel pairing");
+}
+
+async fn seed_running_manual_scheduler_run(
+    pool: &SqlitePool,
+    job_id: Uuid,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    started_at_ms: i64,
+) -> Uuid {
+    let run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO scheduler_job_runs \
+         (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+          status, session_id, turn_id, delivery_status, error_text) \
+         VALUES (?1, ?2, 1, 'manual', ?3, ?3, NULL, 'running', ?4, ?5, 'not_requested', NULL)",
+    )
+    .bind(run_id.to_string())
+    .bind(job_id.to_string())
+    .bind(started_at_ms)
+    .bind(session_id.map(|id| id.to_string()))
+    .bind(turn_id.map(|id| id.to_string()))
+    .execute(pool)
+    .await
+    .expect("seed running manual scheduler run");
+    sqlx::query(
+        "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
+    )
+    .bind(job_id.to_string())
+    .bind(run_id.to_string())
+    .bind(started_at_ms)
+    .execute(pool)
+    .await
+    .expect("attach stale manual run to scheduler job");
+    run_id
 }
 
 struct TestEnv {

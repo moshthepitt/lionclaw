@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use crate::kernel::{
-    db::{ms_to_datetime, now_ms},
-    policy::{Capability, PolicyStore, Scope},
+use crate::{
+    contracts::SessionTurnStatus,
+    kernel::{
+        db::{ms_to_datetime, now_ms},
+        policy::{Capability, PolicyStore, Scope},
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +174,14 @@ pub struct SchedulerJobRunRecord {
     pub error_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchedulerRunReconciliation {
+    /// Runs that this recovery pass actually moved out of Running.
+    pub(crate) interrupted_runs: Vec<SchedulerJobRunRecord>,
+    /// Interrupted runs that still owned their scheduler job and are safe for job-scoped cleanup.
+    pub(crate) job_owned_runs: Vec<SchedulerJobRunRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewSchedulerJob {
     pub name: String,
@@ -201,6 +212,22 @@ struct JobRunClaim {
 pub struct JobStore {
     pool: SqlitePool,
 }
+
+const RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL: &str = "SELECT EXISTS( \
+   SELECT 1 \
+   FROM scheduler_job_runs \
+   JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+   JOIN sessions ON sessions.session_id = scheduler_job_runs.session_id \
+   JOIN session_turns ON session_turns.turn_id = scheduler_job_runs.turn_id \
+                     AND session_turns.session_id = scheduler_job_runs.session_id \
+   WHERE scheduler_job_runs.run_id = ?1 \
+     AND scheduler_job_runs.status = ?2 \
+     AND scheduler_job_runs.session_id = ?3 \
+     AND scheduler_job_runs.turn_id = ?4 \
+     AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+     AND sessions.channel_id = 'scheduler' \
+     AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
+ )";
 
 impl JobStore {
     pub fn new(pool: SqlitePool) -> Self {
@@ -597,52 +624,140 @@ impl JobStore {
     }
 
     pub async fn try_acquire_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.try_acquire_scheduler_lease(owner, ttl, true, "failed to acquire scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn try_acquire_execution_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        self.try_acquire_scheduler_lease(
+            owner,
+            ttl,
+            false,
+            "failed to acquire scheduler execution lease",
+        )
+        .await
+    }
+
+    pub(crate) async fn try_acquire_recovery_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        self.try_acquire_scheduler_lease(
+            owner,
+            ttl,
+            false,
+            "failed to acquire scheduler recovery lease",
+        )
+        .await
+    }
+
+    async fn try_acquire_scheduler_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+        record_tick_start: bool,
+        context: &'static str,
+    ) -> Result<bool> {
         let now = now_ms();
-        let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        let lease_expires = lease_expires_at_ms(now, ttl);
         let result = sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_owner = ?2, lease_expires_at_ms = ?3, last_tick_started_at_ms = ?4 \
+             SET lease_owner = ?2, \
+                 lease_expires_at_ms = ?3, \
+                 last_tick_started_at_ms = CASE WHEN ?4 THEN ?1 ELSE last_tick_started_at_ms END \
              WHERE state_id = 1 \
                AND (lease_owner IS NULL OR lease_expires_at_ms IS NULL OR lease_expires_at_ms < ?1 OR lease_owner = ?2)",
         )
         .bind(now)
         .bind(owner)
         .bind(lease_expires)
-        .bind(now)
+        .bind(if record_tick_start { 1_i64 } else { 0_i64 })
         .execute(&self.pool)
         .await
-        .context("failed to acquire scheduler tick lease")?;
+        .context(context)?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn renew_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn renew_execution_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler execution lease")
+            .await
+    }
+
+    pub(crate) async fn renew_recovery_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        self.renew_scheduler_lease(owner, ttl, "failed to renew scheduler recovery lease")
+            .await
+    }
+
+    async fn renew_scheduler_lease(
+        &self,
+        owner: &str,
+        ttl: Duration,
+        context: &'static str,
+    ) -> Result<bool> {
         let now = now_ms();
-        let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        let lease_expires = lease_expires_at_ms(now, ttl);
         let result = sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_expires_at_ms = ?2 \
-             WHERE state_id = 1 AND lease_owner = ?1",
+             SET lease_expires_at_ms = ?3 \
+             WHERE state_id = 1 \
+               AND lease_owner = ?1 \
+               AND lease_expires_at_ms IS NOT NULL \
+               AND lease_expires_at_ms >= ?2",
         )
         .bind(owner)
+        .bind(now)
         .bind(lease_expires)
         .execute(&self.pool)
         .await
-        .context("failed to renew scheduler tick lease")?;
+        .context(context)?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn release_tick_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, true, "failed to release scheduler tick lease")
+            .await
+    }
+
+    pub(crate) async fn release_execution_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, false, "failed to release scheduler execution lease")
+            .await
+    }
+
+    pub(crate) async fn release_recovery_lease(&self, owner: &str) -> Result<()> {
+        self.release_scheduler_lease(owner, false, "failed to release scheduler recovery lease")
+            .await
+    }
+
+    async fn release_scheduler_lease(
+        &self,
+        owner: &str,
+        record_tick_finish: bool,
+        context: &'static str,
+    ) -> Result<()> {
         let now = now_ms();
         sqlx::query(
             "UPDATE scheduler_state \
-             SET lease_owner = NULL, lease_expires_at_ms = NULL, last_tick_finished_at_ms = ?2 \
+             SET lease_owner = NULL, \
+                 lease_expires_at_ms = NULL, \
+                 last_tick_finished_at_ms = CASE WHEN ?3 THEN ?2 ELSE last_tick_finished_at_ms END \
              WHERE state_id = 1 AND lease_owner = ?1",
         )
         .bind(owner)
         .bind(now)
+        .bind(if record_tick_finish { 1_i64 } else { 0_i64 })
         .execute(&self.pool)
         .await
-        .context("failed to release scheduler tick lease")?;
+        .context(context)?;
         Ok(())
     }
 
@@ -651,6 +766,28 @@ impl JobStore {
         now: DateTime<Utc>,
         limit: usize,
         trigger_kind: SchedulerJobTriggerKind,
+    ) -> Result<Vec<ClaimedSchedulerJob>> {
+        self.claim_due_jobs_inner(now, limit, trigger_kind, None)
+            .await
+    }
+
+    pub(crate) async fn claim_due_jobs_with_scheduler_lease(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        trigger_kind: SchedulerJobTriggerKind,
+        lease_owner: &str,
+    ) -> Result<Vec<ClaimedSchedulerJob>> {
+        self.claim_due_jobs_inner(now, limit, trigger_kind, Some(lease_owner))
+            .await
+    }
+
+    async fn claim_due_jobs_inner(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        trigger_kind: SchedulerJobTriggerKind,
+        lease_owner: Option<&str>,
     ) -> Result<Vec<ClaimedSchedulerJob>> {
         let jobs = self.load_due_jobs(now, limit).await?;
         let mut claimed = Vec::new();
@@ -666,6 +803,7 @@ impl JobStore {
                         require_enabled: true,
                         now,
                     },
+                    lease_owner,
                 )
                 .await?
             {
@@ -681,6 +819,25 @@ impl JobStore {
         job_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedSchedulerJob>> {
+        self.claim_manual_run_inner(job_id, now, None).await
+    }
+
+    pub(crate) async fn claim_manual_run_with_scheduler_lease(
+        &self,
+        job_id: Uuid,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+    ) -> Result<Option<ClaimedSchedulerJob>> {
+        self.claim_manual_run_inner(job_id, now, Some(lease_owner))
+            .await
+    }
+
+    async fn claim_manual_run_inner(
+        &self,
+        job_id: Uuid,
+        now: DateTime<Utc>,
+        lease_owner: Option<&str>,
+    ) -> Result<Option<ClaimedSchedulerJob>> {
         self.claim_job_run(
             job_id,
             JobRunClaim {
@@ -691,6 +848,7 @@ impl JobStore {
                 require_enabled: false,
                 now,
             },
+            lease_owner,
         )
         .await
     }
@@ -699,6 +857,7 @@ impl JobStore {
         &self,
         job_id: Uuid,
         claim: JobRunClaim,
+        lease_owner: Option<&str>,
     ) -> Result<Option<ClaimedSchedulerJob>> {
         let JobRunClaim {
             trigger_kind,
@@ -713,6 +872,18 @@ impl JobStore {
             .begin()
             .await
             .context("failed to start claim scheduler job transaction")?;
+
+        if let Some(lease_owner) = lease_owner {
+            if !self
+                .guard_scheduler_lease_in_tx(&mut tx, lease_owner)
+                .await?
+            {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback unowned scheduler job claim")?;
+                return Ok(None);
+            }
+        }
 
         let Some(job) = self
             .get_job_in_tx(&mut tx, job_id, "failed to load scheduler job for claim")
@@ -874,7 +1045,9 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before retry"))?;
-        if current.status != SchedulerJobRunStatus::Running {
+        if current.status != SchedulerJobRunStatus::Running
+            || job.running_run_id != Some(current_run_id)
+        {
             tx.commit()
                 .await
                 .context("failed to finish skipped retry transaction")?;
@@ -883,28 +1056,41 @@ impl JobStore {
 
         let retry_run_id = Uuid::new_v4();
         let started_at_ms = now.timestamp_millis();
-        sqlx::query(
+        let updated_job_state = sqlx::query(
+            "UPDATE scheduler_jobs \
+             SET running_run_id = ?2, updated_at_ms = ?3 \
+             WHERE job_id = ?1 AND running_run_id = ?4",
+        )
+        .bind(current.job_id.to_string())
+        .bind(retry_run_id.to_string())
+        .bind(started_at_ms)
+        .bind(current_run_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to switch running scheduler job run to retry")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale retry transaction")?;
+            return Ok(None);
+        }
+
+        let updated_current_run = sqlx::query(
             "UPDATE scheduler_job_runs \
              SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
-             WHERE run_id = ?1",
+             WHERE run_id = ?1 AND status = ?5",
         )
         .bind(current_run_id.to_string())
         .bind(started_at_ms)
         .bind(SchedulerJobRunStatus::Failed.as_str())
         .bind("retrying after failed attempt")
+        .bind(SchedulerJobRunStatus::Running.as_str())
         .execute(&mut *tx)
         .await
         .context("failed to mark current run failed before retry")?;
-
-        sqlx::query(
-            "UPDATE scheduler_jobs SET running_run_id = ?2, updated_at_ms = ?3 WHERE job_id = ?1",
-        )
-        .bind(current.job_id.to_string())
-        .bind(retry_run_id.to_string())
-        .bind(started_at_ms)
-        .execute(&mut *tx)
-        .await
-        .context("failed to switch running scheduler job run to retry")?;
+        if updated_current_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during retry");
+        }
 
         sqlx::query(
             "INSERT INTO scheduler_job_runs \
@@ -981,25 +1167,31 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before success completion"))?;
+        if run.status != SchedulerJobRunStatus::Running || job.running_run_id != Some(run_id) {
+            tx.commit()
+                .await
+                .context("failed to finish stale success completion transaction")?;
+            return Ok(None);
+        }
+        if run.session_id != Some(session_id) || run.turn_id != Some(turn_id) {
+            tx.commit()
+                .await
+                .context("failed to finish mismatched success completion transaction")?;
+            return Ok(None);
+        }
+        if !self
+            .running_run_owns_turn_in_tx(&mut tx, run_id, session_id, turn_id)
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to finish unbound success completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual;
 
-        sqlx::query(
-            "UPDATE scheduler_job_runs \
-             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = NULL \
-             WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .bind(finished_at_ms)
-        .bind(SchedulerJobRunStatus::Completed.as_str())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(delivery_status.as_str())
-        .execute(&mut *tx)
-        .await
-        .context("failed to finalize successful scheduler job run")?;
-
-        sqlx::query(
+        let updated_job_state = sqlx::query(
             "UPDATE scheduler_jobs \
              SET enabled = CASE WHEN ?2 THEN 0 ELSE enabled END, \
                  next_run_at_ms = CASE WHEN ?2 THEN NULL ELSE next_run_at_ms END, \
@@ -1009,15 +1201,43 @@ impl JobStore {
                  last_error = NULL, \
                  consecutive_failures = 0, \
                  updated_at_ms = ?3 \
-             WHERE job_id = ?1",
+             WHERE job_id = ?1 AND running_run_id = ?5",
         )
         .bind(run.job_id.to_string())
         .bind(if disable_one_shot { 1 } else { 0 })
         .bind(finished_at_ms)
         .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(run_id.to_string())
         .execute(&mut *tx)
         .await
         .context("failed to finalize scheduler job state after success")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale success completion transaction")?;
+            return Ok(None);
+        }
+
+        let updated_run = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = NULL \
+             WHERE run_id = ?1 AND status = ?7 AND session_id = ?8 AND turn_id = ?9",
+        )
+        .bind(run_id.to_string())
+        .bind(finished_at_ms)
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(delivery_status.as_str())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to finalize successful scheduler job run")?;
+        if updated_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during success completion");
+        }
 
         let updated_job = self
             .get_job_in_tx(
@@ -1068,27 +1288,26 @@ impl JobStore {
             )
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared before failure completion"))?;
+        if run.status != SchedulerJobRunStatus::Running || job.running_run_id != Some(run_id) {
+            tx.commit()
+                .await
+                .context("failed to finish stale failure completion transaction")?;
+            return Ok(None);
+        }
+        if !self
+            .failure_context_matches_run_in_tx(&mut tx, &run, session_id, turn_id)
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to finish mismatched failure completion transaction")?;
+            return Ok(None);
+        }
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual
             && final_status == SchedulerJobRunStatus::DeadLetter;
 
-        sqlx::query(
-            "UPDATE scheduler_job_runs \
-             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = ?7 \
-             WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .bind(finished_at_ms)
-        .bind(final_status.as_str())
-        .bind(session_id.map(|value| value.to_string()))
-        .bind(turn_id.map(|value| value.to_string()))
-        .bind(delivery_status.as_str())
-        .bind(error_text)
-        .execute(&mut *tx)
-        .await
-        .context("failed to finalize failed scheduler job run")?;
-
-        sqlx::query(
+        let updated_job_state = sqlx::query(
             "UPDATE scheduler_jobs \
              SET enabled = CASE WHEN ?2 THEN 0 ELSE enabled END, \
                  next_run_at_ms = CASE WHEN ?2 THEN NULL ELSE next_run_at_ms END, \
@@ -1098,16 +1317,49 @@ impl JobStore {
                  last_error = ?5, \
                  consecutive_failures = consecutive_failures + 1, \
                  updated_at_ms = ?3 \
-             WHERE job_id = ?1",
+             WHERE job_id = ?1 AND running_run_id = ?6",
         )
         .bind(run.job_id.to_string())
         .bind(if disable_one_shot { 1 } else { 0 })
         .bind(finished_at_ms)
         .bind(final_status.as_str())
         .bind(error_text)
+        .bind(run_id.to_string())
         .execute(&mut *tx)
         .await
         .context("failed to finalize scheduler job state after failure")?;
+        if updated_job_state.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .context("failed to finish stale failure completion transaction")?;
+            return Ok(None);
+        }
+
+        let updated_run = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, session_id = ?4, turn_id = ?5, delivery_status = ?6, error_text = ?7 \
+             WHERE run_id = ?1 AND status = ?8 \
+               AND ( \
+                 (session_id IS NULL AND turn_id IS NULL) \
+                 OR (session_id = ?9 AND turn_id = ?10) \
+               )",
+        )
+        .bind(run_id.to_string())
+        .bind(finished_at_ms)
+        .bind(final_status.as_str())
+        .bind(session_id.map(|value| value.to_string()))
+        .bind(turn_id.map(|value| value.to_string()))
+        .bind(delivery_status.as_str())
+        .bind(error_text)
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(session_id.map(|value| value.to_string()))
+        .bind(turn_id.map(|value| value.to_string()))
+        .execute(&mut *tx)
+        .await
+        .context("failed to finalize failed scheduler job run")?;
+        if updated_run.rows_affected() == 0 {
+            anyhow::bail!("current scheduler job run was not running during failure completion");
+        }
 
         let updated_job = self
             .get_job_in_tx(
@@ -1220,6 +1472,102 @@ impl JobStore {
         Ok(changed.rows_affected() > 0)
     }
 
+    pub async fn attach_run_turn(
+        &self,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET session_id = ?2, turn_id = ?3 \
+             WHERE run_id = ?1 \
+               AND status = ?4 \
+               AND ( \
+                 (session_id IS NULL AND turn_id IS NULL) \
+                 OR (session_id = ?2 AND turn_id = ?3) \
+               ) \
+               AND EXISTS ( \
+                 SELECT 1 \
+                 FROM scheduler_jobs \
+                 JOIN sessions ON sessions.session_id = ?2 \
+                 JOIN session_turns ON session_turns.turn_id = ?3 \
+                                   AND session_turns.session_id = ?2 \
+                 WHERE scheduler_jobs.job_id = scheduler_job_runs.job_id \
+                   AND scheduler_jobs.running_run_id = scheduler_job_runs.run_id \
+                   AND sessions.channel_id = 'scheduler' \
+                   AND sessions.peer_id = 'job:' || scheduler_job_runs.job_id \
+                   AND session_turns.status = ?5 \
+               )",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to attach scheduler run turn")?;
+
+        Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn running_run_owns_turn(
+        &self,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let owns = sqlx::query_scalar::<_, i64>(RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL)
+            .bind(run_id.to_string())
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .bind(session_id.to_string())
+            .bind(turn_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to verify scheduler run turn ownership")?;
+
+        Ok(owns != 0)
+    }
+
+    async fn running_run_owns_turn_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run_id: Uuid,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let owns = sqlx::query_scalar::<_, i64>(RUNNING_JOB_BOUND_RUN_TURN_EXISTS_SQL)
+            .bind(run_id.to_string())
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .bind(session_id.to_string())
+            .bind(turn_id.to_string())
+            .fetch_one(&mut **tx)
+            .await
+            .context("failed to verify scheduler run turn ownership")?;
+
+        Ok(owns != 0)
+    }
+
+    async fn failure_context_matches_run_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &SchedulerJobRunRecord,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+    ) -> Result<bool> {
+        match (run.session_id, run.turn_id, session_id, turn_id) {
+            (None, None, None, None) => Ok(true),
+            (Some(stored_session_id), Some(stored_turn_id), Some(session_id), Some(turn_id))
+                if stored_session_id == session_id && stored_turn_id == turn_id =>
+            {
+                self.running_run_owns_turn_in_tx(tx, run.run_id, session_id, turn_id)
+                    .await
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub async fn interrupt_running_runs(
         &self,
         error_text: &str,
@@ -1274,6 +1622,140 @@ impl JobStore {
 
         rows.into_iter().map(map_run_row).collect()
     }
+
+    async fn guard_scheduler_lease_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        owner: &str,
+    ) -> Result<bool> {
+        let guarded = sqlx::query(
+            "UPDATE scheduler_state \
+             SET lease_owner = lease_owner \
+             WHERE state_id = 1 \
+               AND lease_owner = ?1 \
+               AND lease_expires_at_ms IS NOT NULL \
+               AND lease_expires_at_ms >= ?2",
+        )
+        .bind(owner)
+        .bind(now_ms())
+        .execute(&mut **tx)
+        .await
+        .context("failed to guard scheduler lease")?;
+
+        Ok(guarded.rows_affected() > 0)
+    }
+
+    pub(crate) async fn interrupt_running_runs_with_scheduler_lease(
+        &self,
+        owner: &str,
+        error_text: &str,
+    ) -> Result<Option<SchedulerRunReconciliation>> {
+        self.interrupt_running_recoverable_runs_inner(error_text, owner)
+            .await
+    }
+
+    async fn interrupt_running_recoverable_runs_inner(
+        &self,
+        error_text: &str,
+        lease_owner: &str,
+    ) -> Result<Option<SchedulerRunReconciliation>> {
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupt scheduler runs transaction")?;
+
+        if !self
+            .guard_scheduler_lease_in_tx(&mut tx, lease_owner)
+            .await?
+        {
+            tx.rollback()
+                .await
+                .context("failed to rollback unowned scheduler reconciliation")?;
+            return Ok(None);
+        }
+
+        let rows = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs \
+             WHERE status = ?1 \
+             ORDER BY started_at_ms ASC, run_id ASC",
+        )
+        .bind(SchedulerJobRunStatus::Running.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query running scheduler job runs")?;
+
+        let runs = rows
+            .into_iter()
+            .map(map_run_row)
+            .collect::<Result<Vec<_>>>()?;
+        let mut reconciliation = SchedulerRunReconciliation::default();
+
+        for run in &runs {
+            let updated_run = sqlx::query(
+                "UPDATE scheduler_job_runs \
+                 SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
+                 WHERE run_id = ?1 AND status = ?5",
+            )
+            .bind(run.run_id.to_string())
+            .bind(finished_at_ms)
+            .bind(SchedulerJobRunStatus::Interrupted.as_str())
+            .bind(error_text)
+            .bind(SchedulerJobRunStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("failed to interrupt scheduler job run")?;
+            if updated_run.rows_affected() == 0 {
+                continue;
+            }
+
+            let updated_row = sqlx::query(
+                "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+                 status, session_id, turn_id, delivery_status, error_text \
+                 FROM scheduler_job_runs WHERE run_id = ?1",
+            )
+            .bind(run.run_id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to reload interrupted scheduler job run")?;
+            let interrupted_run = map_run_row(updated_row)?;
+            reconciliation
+                .interrupted_runs
+                .push(interrupted_run.clone());
+
+            let cleared_job_state = sqlx::query(
+                "UPDATE scheduler_jobs \
+                 SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
+                 WHERE job_id = ?1 AND running_run_id = ?5",
+            )
+            .bind(run.job_id.to_string())
+            .bind(SchedulerJobRunStatus::Interrupted.as_str())
+            .bind(error_text)
+            .bind(finished_at_ms)
+            .bind(run.run_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear interrupted scheduler job state")?;
+            if cleared_job_state.rows_affected() == 0 {
+                continue;
+            }
+
+            reconciliation.job_owned_runs.push(interrupted_run);
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted scheduler job runs")?;
+
+        Ok(Some(reconciliation))
+    }
+}
+
+fn lease_expires_at_ms(now: i64, ttl: Duration) -> i64 {
+    now.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
 }
 
 pub fn compute_initial_next_run(
@@ -1517,7 +1999,14 @@ fn map_run_row(row: SqliteRow) -> Result<SchedulerJobRunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::{db::Db, policy::PolicyStore};
+    use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, TrustTier};
+    use crate::home::runtime_project_partition_key;
+    use crate::kernel::{
+        db::Db,
+        policy::PolicyStore,
+        session_turns::{NewSessionTurn, SessionTurnStore},
+        sessions::SessionStore,
+    };
     use chrono::{Duration as ChronoDuration, TimeZone};
 
     fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
@@ -1535,6 +2024,140 @@ mod tests {
         let db = Db::connect_memory().await.expect("connect memory db");
         let pool = db.pool();
         (JobStore::new(pool.clone()), PolicyStore::new(pool))
+    }
+
+    async fn new_store_and_sessions() -> (JobStore, SessionStore, SessionTurnStore) {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        (
+            JobStore::new(pool.clone()),
+            SessionStore::new(pool.clone()),
+            SessionTurnStore::new(pool),
+        )
+    }
+
+    async fn open_scheduler_session_for_job(sessions: &SessionStore, job_id: Uuid) -> Uuid {
+        sessions
+            .open(
+                "scheduler".to_string(),
+                format!("job:{job_id}"),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Conservative,
+            )
+            .await
+            .expect("open scheduler session")
+            .session_id
+    }
+
+    async fn begin_running_turn(turns: &SessionTurnStore, session_id: Uuid) -> Uuid {
+        turns
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "job".to_string(),
+                prompt_user_text: "prompt".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin scheduler turn")
+            .turn_id
+    }
+
+    async fn move_job_ownership_to_manual_run(store: &JobStore, job: &SchedulerJobRecord) -> Uuid {
+        let run_id = Uuid::new_v4();
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO scheduler_job_runs \
+             (run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+              status, session_id, turn_id, delivery_status, error_text) \
+             VALUES (?1, ?2, 1, 'manual', ?3, ?4, NULL, 'running', NULL, NULL, 'not_requested', NULL)",
+        )
+        .bind(run_id.to_string())
+        .bind(job.job_id.to_string())
+        .bind(job.next_run_at.map(|value| value.timestamp_millis()))
+        .bind(now_ms)
+        .execute(store.pool())
+        .await
+        .expect("insert current manual run");
+        sqlx::query("UPDATE scheduler_jobs SET running_run_id = ?2 WHERE job_id = ?1")
+            .bind(job.job_id.to_string())
+            .bind(run_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("move job ownership to current run");
+        run_id
+    }
+
+    async fn create_running_one_shot_job(
+        store: &JobStore,
+        name: &str,
+    ) -> (SchedulerJobRecord, Uuid) {
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: name.to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 10, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim job");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job.job_id, job.job_id);
+
+        (job, claimed[0].run.run_id)
+    }
+
+    async fn assert_interrupted_job_state(store: &JobStore, job_id: Uuid, run_id: Uuid) {
+        let updated_run = store
+            .get_run(run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(updated_run.status, SchedulerJobRunStatus::Interrupted);
+        let updated_job = store
+            .get_job(job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert!(updated_job.running_run_id.is_none());
+    }
+
+    async fn assert_running_job_state(store: &JobStore, job_id: Uuid, run_id: Uuid) {
+        let updated_run = store
+            .get_run(run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(updated_run.status, SchedulerJobRunStatus::Running);
+        let updated_job = store
+            .get_job(job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, Some(run_id));
+    }
+
+    async fn expire_scheduler_lease(store: &JobStore, owner: &str) {
+        sqlx::query(
+            "UPDATE scheduler_state SET lease_expires_at_ms = ?2 WHERE state_id = 1 AND lease_owner = ?1",
+        )
+        .bind(owner)
+        .bind((Utc::now() - ChronoDuration::seconds(1)).timestamp_millis())
+        .execute(store.pool())
+        .await
+        .expect("expire scheduler lease");
     }
 
     #[test]
@@ -1752,6 +2375,434 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_lease_owned_interrupt_requires_current_lease() {
+        let store = new_store().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "lease-owned-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        let reconciliation = store
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under recovery lease")
+            .expect("recovery lease should be held");
+
+        assert_eq!(reconciliation.interrupted_runs.len(), 1);
+        assert_eq!(reconciliation.interrupted_runs[0].run_id, run_id);
+        assert_interrupted_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_owned_interrupt_skips_after_lease_expiry() {
+        let store = new_store().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "expired-lease-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        expire_scheduler_lease(&store, "bootstrap-a").await;
+
+        let reconciliation = store
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under expired recovery lease");
+
+        assert!(reconciliation.is_none());
+        assert_running_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_owned_interrupt_skips_after_lease_transfer() {
+        let store = new_store().await;
+        let (job, run_id) =
+            create_running_one_shot_job(&store, "transferred-lease-interrupt").await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        sqlx::query(
+            "UPDATE scheduler_state SET lease_owner = ?1, lease_expires_at_ms = ?2 WHERE state_id = 1",
+        )
+        .bind("tick-a")
+        .bind((Utc::now() + ChronoDuration::seconds(60)).timestamp_millis())
+        .execute(store.pool())
+        .await
+        .expect("transfer recovery lease");
+
+        let reconciliation = store
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
+            .await
+            .expect("interrupt under transferred recovery lease");
+
+        assert!(reconciliation.is_none());
+        assert_running_job_state(&store, job.job_id, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_records_running_run_identity_once() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "attached-turn").await;
+        let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let turn_id = begin_running_turn(&turns, session_id).await;
+
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attach run turn"));
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("reattach same run turn"));
+        let other_turn_id = begin_running_turn(&turns, session_id).await;
+        assert!(!store
+            .attach_run_turn(run_id, session_id, other_turn_id)
+            .await
+            .expect("refuse different turn"));
+
+        let attached = store
+            .get_run(run_id)
+            .await
+            .expect("load attached run")
+            .expect("attached run exists");
+        assert_eq!(attached.session_id, Some(session_id));
+        assert_eq!(attached.turn_id, Some(turn_id));
+
+        store
+            .interrupt_run(run_id, "terminal run")
+            .await
+            .expect("interrupt run")
+            .expect("run interrupted");
+        assert!(!store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("terminal run should not attach"));
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_requires_matching_scheduler_job_session() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "bound-session").await;
+        let normal_session = sessions
+            .open(
+                "local-cli".to_string(),
+                "not-scheduler".to_string(),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open normal session");
+        let wrong_job_session = open_scheduler_session_for_job(&sessions, Uuid::new_v4()).await;
+        let normal_turn_id = begin_running_turn(&turns, normal_session.session_id).await;
+        let wrong_job_turn_id = begin_running_turn(&turns, wrong_job_session).await;
+
+        assert!(!store
+            .attach_run_turn(run_id, normal_session.session_id, normal_turn_id)
+            .await
+            .expect("normal session must not attach"));
+        assert!(!store
+            .attach_run_turn(run_id, wrong_job_session, wrong_job_turn_id)
+            .await
+            .expect("wrong scheduler peer must not attach"));
+
+        let scheduler_session = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let turn_id = begin_running_turn(&turns, scheduler_session).await;
+        assert!(store
+            .attach_run_turn(run_id, scheduler_session, turn_id)
+            .await
+            .expect("matching scheduler session attaches"));
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_requires_running_turn_in_scheduler_session() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "running-turn-required").await;
+        let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let missing_turn_id = Uuid::new_v4();
+
+        assert!(!store
+            .attach_run_turn(run_id, session_id, missing_turn_id)
+            .await
+            .expect("missing turn must not attach"));
+
+        let normal_session = sessions
+            .open(
+                "local-cli".to_string(),
+                "normal-peer".to_string(),
+                runtime_project_partition_key(None),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open normal session");
+        let other_session_turn_id = begin_running_turn(&turns, normal_session.session_id).await;
+        assert!(!store
+            .attach_run_turn(run_id, session_id, other_session_turn_id)
+            .await
+            .expect("turn from another session must not attach"));
+
+        let turn_id = begin_running_turn(&turns, session_id).await;
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("running scheduler turn attaches"));
+    }
+
+    #[tokio::test]
+    async fn attach_run_turn_rejects_partial_existing_attachment() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+
+        let (session_only_job, session_only_run_id) =
+            create_running_one_shot_job(&store, "session-only-attachment").await;
+        let session_only_session_id =
+            open_scheduler_session_for_job(&sessions, session_only_job.job_id).await;
+        let session_only_turn_id = begin_running_turn(&turns, session_only_session_id).await;
+        sqlx::query("UPDATE scheduler_job_runs SET session_id = ?2 WHERE run_id = ?1")
+            .bind(session_only_run_id.to_string())
+            .bind(session_only_session_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("seed session-only attachment");
+        assert!(!store
+            .attach_run_turn(
+                session_only_run_id,
+                session_only_session_id,
+                session_only_turn_id,
+            )
+            .await
+            .expect("session-only attachment should not be repaired"));
+
+        let (turn_only_job, turn_only_run_id) =
+            create_running_one_shot_job(&store, "turn-only-attachment").await;
+        let turn_only_session_id =
+            open_scheduler_session_for_job(&sessions, turn_only_job.job_id).await;
+        let turn_only_turn_id = begin_running_turn(&turns, turn_only_session_id).await;
+        sqlx::query("UPDATE scheduler_job_runs SET turn_id = ?2 WHERE run_id = ?1")
+            .bind(turn_only_run_id.to_string())
+            .bind(turn_only_turn_id.to_string())
+            .execute(store.pool())
+            .await
+            .expect("seed turn-only attachment");
+        assert!(!store
+            .attach_run_turn(turn_only_run_id, turn_only_session_id, turn_only_turn_id)
+            .await
+            .expect("turn-only attachment should not be repaired"));
+    }
+
+    #[tokio::test]
+    async fn running_run_owns_turn_requires_current_running_attachment() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "active-turn-owner").await;
+        let session_id = open_scheduler_session_for_job(&sessions, job.job_id).await;
+        let turn_id = begin_running_turn(&turns, session_id).await;
+
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("unattached run ownership"));
+
+        assert!(store
+            .attach_run_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attach run turn"));
+        assert!(store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("attached run ownership"));
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, Uuid::new_v4())
+            .await
+            .expect("different turn ownership"));
+
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(store.pool())
+            .await
+            .expect("move scheduler session peer");
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("wrong peer ownership"));
+
+        store
+            .interrupt_run(run_id, "recovered")
+            .await
+            .expect("interrupt run")
+            .expect("run interrupted");
+        assert!(!store
+            .running_run_owns_turn(run_id, session_id, turn_id)
+            .await
+            .expect("interrupted run ownership"));
+    }
+
+    #[tokio::test]
+    async fn complete_run_failure_requires_absent_or_attached_context() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (job, run_id) = create_running_one_shot_job(&store, "unattached-failure").await;
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+
+        let fake_context = store
+            .complete_run_failure(
+                run_id,
+                Some(session_id),
+                Some(turn_id),
+                "fake failure context",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete fake-context failure");
+        assert!(
+            fake_context.is_none(),
+            "unattached runs must reject caller-supplied failure context"
+        );
+        assert_running_job_state(&store, job.job_id, run_id).await;
+
+        let completed = store
+            .complete_run_failure(
+                run_id,
+                None,
+                None,
+                "failed before attachment",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unattached failure");
+        assert!(
+            completed.is_some(),
+            "unattached pre-runtime failures should still complete"
+        );
+
+        let failed_run = store
+            .get_run(run_id)
+            .await
+            .expect("load failed run")
+            .expect("failed run exists");
+        assert_eq!(failed_run.status, SchedulerJobRunStatus::DeadLetter);
+        assert_eq!(failed_run.session_id, None);
+        assert_eq!(failed_run.turn_id, None);
+
+        let (mismatch_job, attached_run_id) =
+            create_running_one_shot_job(&store, "mismatched-failure").await;
+        let attached_session_id =
+            open_scheduler_session_for_job(&sessions, mismatch_job.job_id).await;
+        let attached_turn_id = begin_running_turn(&turns, attached_session_id).await;
+        assert!(store
+            .attach_run_turn(attached_run_id, attached_session_id, attached_turn_id)
+            .await
+            .expect("attach run"));
+
+        let mismatched = store
+            .complete_run_failure(
+                attached_run_id,
+                Some(attached_session_id),
+                Some(Uuid::new_v4()),
+                "wrong turn",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete mismatched failure");
+        assert!(
+            mismatched.is_none(),
+            "attached runs must reject mismatched failure context"
+        );
+        assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
+
+        let no_context = store
+            .complete_run_failure(
+                attached_run_id,
+                None,
+                None,
+                "missing context",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete missing-context failure");
+        assert!(
+            no_context.is_none(),
+            "attached runs must reject missing failure context"
+        );
+        assert_running_job_state(&store, mismatch_job.job_id, attached_run_id).await;
+    }
+
+    #[tokio::test]
+    async fn run_completion_requires_job_bound_scheduler_turn() {
+        let (store, sessions, turns) = new_store_and_sessions().await;
+        let (success_job, success_run_id) =
+            create_running_one_shot_job(&store, "unbound-success").await;
+        let success_session_id =
+            open_scheduler_session_for_job(&sessions, success_job.job_id).await;
+        let success_turn_id = begin_running_turn(&turns, success_session_id).await;
+        assert!(store
+            .attach_run_turn(success_run_id, success_session_id, success_turn_id)
+            .await
+            .expect("attach success run"));
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(success_session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(store.pool())
+            .await
+            .expect("move success scheduler peer");
+
+        let success = store
+            .complete_run_success(
+                success_run_id,
+                success_session_id,
+                success_turn_id,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unbound success");
+        assert!(
+            success.is_none(),
+            "success completion must reject unbound scheduler turns"
+        );
+        assert_running_job_state(&store, success_job.job_id, success_run_id).await;
+
+        let (failure_job, failure_run_id) =
+            create_running_one_shot_job(&store, "unbound-failure").await;
+        let failure_session_id =
+            open_scheduler_session_for_job(&sessions, failure_job.job_id).await;
+        let failure_turn_id = begin_running_turn(&turns, failure_session_id).await;
+        assert!(store
+            .attach_run_turn(failure_run_id, failure_session_id, failure_turn_id)
+            .await
+            .expect("attach failure run"));
+        sqlx::query("UPDATE sessions SET peer_id = ?2 WHERE session_id = ?1")
+            .bind(failure_session_id.to_string())
+            .bind(format!("job:{}", Uuid::new_v4()))
+            .execute(store.pool())
+            .await
+            .expect("move failure scheduler peer");
+
+        let failure = store
+            .complete_run_failure(
+                failure_run_id,
+                Some(failure_session_id),
+                Some(failure_turn_id),
+                "wrong peer",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete unbound failure");
+        assert!(
+            failure.is_none(),
+            "failure completion must reject unbound scheduler turns"
+        );
+        assert_running_job_state(&store, failure_job.job_id, failure_run_id).await;
+    }
+
+    #[tokio::test]
     async fn retry_run_preserves_not_requested_delivery_status() {
         let store = new_store().await;
         let job = store
@@ -1818,6 +2869,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_lease_blocks_ticks_without_recording_tick_times() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        assert!(!store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should be blocked by recovery lease"));
+
+        let tick_times: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT last_tick_started_at_ms, last_tick_finished_at_ms FROM scheduler_state WHERE state_id = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load scheduler state");
+        assert_eq!(tick_times, (None, None));
+
+        store
+            .release_recovery_lease("bootstrap-a")
+            .await
+            .expect("release recovery lease");
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should acquire after recovery release"));
+    }
+
+    #[tokio::test]
+    async fn renewed_recovery_lease_stays_owned_without_recording_tick_times() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_millis(80))
+            .await
+            .expect("acquire recovery lease"));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(store
+            .renew_recovery_lease("bootstrap-a", Duration::from_millis(200))
+            .await
+            .expect("renew recovery lease"));
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert!(!store
+            .try_acquire_tick_lease("owner-b", Duration::from_millis(80))
+            .await
+            .expect("renewed recovery lease should block tick owner"));
+
+        let tick_times: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT last_tick_started_at_ms, last_tick_finished_at_ms FROM scheduler_state WHERE state_id = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load scheduler state");
+        assert_eq!(tick_times, (None, None));
+    }
+
+    #[tokio::test]
+    async fn expired_recovery_lease_cannot_be_renewed() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+        expire_scheduler_lease(&store, "bootstrap-a").await;
+
+        assert!(!store
+            .renew_recovery_lease("bootstrap-a", Duration::from_secs(60))
+            .await
+            .expect("expired recovery lease renewal should not succeed"));
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("tick lease should acquire after recovery expiry"));
+    }
+
+    #[tokio::test]
     async fn renewed_tick_lease_stays_owned_past_original_expiry() {
         let store = new_store().await;
 
@@ -1837,6 +2969,34 @@ mod tests {
             .try_acquire_tick_lease("owner-b", Duration::from_millis(80))
             .await
             .expect("renewed lease should still block another owner"));
+    }
+
+    #[tokio::test]
+    async fn expired_tick_lease_cannot_be_renewed() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_tick_lease("owner-a", Duration::from_secs(60))
+            .await
+            .expect("acquire tick lease"));
+        expire_scheduler_lease(&store, "owner-a").await;
+
+        assert!(!store
+            .renew_tick_lease("owner-a", Duration::from_secs(60))
+            .await
+            .expect("expired tick lease renewal should not succeed"));
+        assert!(store
+            .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
+            .await
+            .expect("second owner should acquire expired tick lease"));
+    }
+
+    #[test]
+    fn lease_expiry_saturates_at_i64_max() {
+        assert_eq!(
+            lease_expires_at_ms(i64::MAX - 1, Duration::from_secs(60)),
+            i64::MAX
+        );
     }
 
     #[tokio::test]
@@ -1888,6 +3048,175 @@ mod tests {
             updated_job.last_error.as_deref(),
             Some("unexpected scheduler failure")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_run_mutations_require_current_job_claim() {
+        let store = new_store().await;
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "completion-owner".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create completion job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim original job");
+        let stale_run_id = claimed[0].run.run_id;
+        let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
+
+        let stale_retry = store
+            .begin_retry_run(stale_run_id, Utc::now() + ChronoDuration::seconds(1))
+            .await
+            .expect("retry stale run");
+        assert!(
+            stale_retry.is_none(),
+            "a stale run must not create a retry after losing job ownership"
+        );
+
+        let stale_success = store
+            .complete_run_success(
+                stale_run_id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete stale success");
+        assert!(
+            stale_success.is_none(),
+            "a stale run must not complete after losing job ownership"
+        );
+
+        let stale_failure = store
+            .complete_run_failure(
+                stale_run_id,
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                "late failure",
+                SchedulerJobRunStatus::DeadLetter,
+                SchedulerJobDeliveryStatus::NotRequested,
+            )
+            .await
+            .expect("complete stale failure");
+        assert!(
+            stale_failure.is_none(),
+            "a stale run must not fail/dead-letter after losing job ownership"
+        );
+
+        let stale_run = store
+            .get_run(stale_run_id)
+            .await
+            .expect("load stale run")
+            .expect("stale run exists");
+        assert_eq!(stale_run.status, SchedulerJobRunStatus::Running);
+        assert!(stale_run.finished_at.is_none());
+
+        let current_run = store
+            .get_run(current_run_id)
+            .await
+            .expect("load current run")
+            .expect("current run exists");
+        assert_eq!(current_run.status, SchedulerJobRunStatus::Running);
+
+        let updated_job = store
+            .get_job(job.job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, Some(current_run_id));
+        assert!(updated_job.enabled);
+
+        let run_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1")
+                .bind(job.job_id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .expect("count job runs");
+        assert_eq!(run_count, 2, "stale retry must not insert another run");
+    }
+
+    #[tokio::test]
+    async fn scheduler_recovery_reports_only_runs_that_owned_the_job() {
+        let store = new_store().await;
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "recovery-owner".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create recovery job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim original job");
+        let stale_run_id = claimed[0].run.run_id;
+        let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
+        assert!(store
+            .try_acquire_recovery_lease("recovery-owner", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
+
+        let reconciliation = store
+            .interrupt_running_runs_with_scheduler_lease(
+                "recovery-owner",
+                "recover stale scheduler run",
+            )
+            .await
+            .expect("interrupt stale scheduler runs")
+            .expect("recovery lease should be held");
+        assert_eq!(reconciliation.interrupted_runs.len(), 2);
+        assert!(reconciliation
+            .interrupted_runs
+            .iter()
+            .any(|run| run.run_id == stale_run_id));
+        assert!(reconciliation
+            .interrupted_runs
+            .iter()
+            .any(|run| run.run_id == current_run_id));
+        assert_eq!(
+            reconciliation.job_owned_runs.len(),
+            1,
+            "a stale orphan run must not drive job-scoped turn cleanup"
+        );
+        assert_eq!(reconciliation.job_owned_runs[0].run_id, current_run_id);
+
+        let stale_run = store
+            .get_run(stale_run_id)
+            .await
+            .expect("load stale run")
+            .expect("stale run exists");
+        assert_eq!(stale_run.status, SchedulerJobRunStatus::Interrupted);
+
+        let current_run = store
+            .get_run(current_run_id)
+            .await
+            .expect("load current run")
+            .expect("current run exists");
+        assert_eq!(current_run.status, SchedulerJobRunStatus::Interrupted);
+
+        let updated_job = store
+            .get_job(job.job_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(updated_job.running_run_id, None);
     }
 
     #[tokio::test]

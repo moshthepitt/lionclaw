@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
 use chrono::Utc;
@@ -12,7 +11,7 @@ use crate::contracts::{JobTickResponse, SessionHistoryPolicy, SessionOpenRequest
 
 use super::{
     channel_outbox::ChannelDeliveryRoute,
-    core::Kernel,
+    core::{Kernel, SchedulerLeaseReconciliation},
     error::KernelError,
     jobs::{
         ClaimedSchedulerJob, SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
@@ -49,34 +48,70 @@ impl SchedulerEngine {
     }
 
     pub async fn tick(&self, kernel: &Kernel) -> Result<JobTickResponse, KernelError> {
-        let owner = format!("scheduler:{}", Uuid::new_v4());
-        let lease_ttl = self.config.tick_interval.max(Duration::from_secs(60));
-        if !kernel
-            .job_store()
-            .try_acquire_tick_lease(&owner, lease_ttl)
-            .await
-            .map_err(internal)?
-        {
-            return Ok(JobTickResponse { claimed_runs: 0 });
-        }
+        let tick = Box::pin(self.with_scheduler_lease(
+            kernel,
+            SchedulerLeaseMode::Tick,
+            |lease_owner| async move {
+                if kernel
+                    .reconcile_stale_scheduler_runs_after_scheduler_lease(&lease_owner)
+                    .await?
+                    == SchedulerLeaseReconciliation::LeaseLost
+                {
+                    return Ok(JobTickResponse { claimed_runs: 0 });
+                }
+                kernel.recover_pending_scheduler_deliveries().await?;
+                let mut claimed_runs = 0usize;
+                while let Some(claimed_job) = self.claim_next_due_job(kernel, &lease_owner).await? {
+                    claimed_runs += 1;
+                    self.run_claimed_job(kernel, claimed_job).await?;
+                }
 
-        let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
-        let tick_result = Box::pin(async {
-            let mut claimed_runs = 0usize;
-            while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
-                claimed_runs += 1;
-                self.run_claimed_job(kernel, claimed_job).await?;
-            }
+                Ok(JobTickResponse { claimed_runs })
+            },
+        ))
+        .await?;
 
-            Ok(JobTickResponse { claimed_runs })
-        })
-        .await;
+        Ok(tick.unwrap_or(JobTickResponse { claimed_runs: 0 }))
+    }
 
-        let renewal_result = renewal_handle.stop().await;
-        let release_result = kernel.job_store().release_tick_lease(&owner).await;
-        release_result.map_err(internal)?;
-        renewal_result?;
-        tick_result
+    pub async fn run_manual_job(
+        &self,
+        kernel: &Kernel,
+        job_id: Uuid,
+        job_already_running: bool,
+    ) -> Result<(SchedulerJobRecord, SchedulerJobRunRecord), KernelError> {
+        Box::pin(self.with_scheduler_lease(
+            kernel,
+            SchedulerLeaseMode::Execution,
+            |lease_owner| async move {
+                if kernel
+                    .reconcile_stale_scheduler_runs_after_scheduler_lease(&lease_owner)
+                    .await?
+                    == SchedulerLeaseReconciliation::LeaseLost
+                {
+                    return Err(KernelError::Conflict(
+                        "scheduler lease lost before manual run".to_string(),
+                    ));
+                }
+                let claimed = kernel
+                    .job_store()
+                    .claim_manual_run_with_scheduler_lease(job_id, Utc::now(), &lease_owner)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        if job_already_running {
+                            KernelError::Conflict("job is already running".to_string())
+                        } else {
+                            KernelError::Conflict(
+                                "job could not be claimed for manual run".to_string(),
+                            )
+                        }
+                    })?;
+                self.run_claimed_job(kernel, claimed).await
+            },
+        ))
+        .await?
+        .ok_or_else(|| KernelError::Conflict("scheduler is already running".to_string()))
     }
 
     pub async fn run_loop(&self, kernel: Arc<Kernel>) {
@@ -182,10 +217,16 @@ impl SchedulerEngine {
     async fn claim_next_due_job(
         &self,
         kernel: &Kernel,
+        lease_owner: &str,
     ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
         let Some(claimed_job) = kernel
             .job_store()
-            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .claim_due_jobs_with_scheduler_lease(
+                Utc::now(),
+                1,
+                SchedulerJobTriggerKind::Schedule,
+                lease_owner,
+            )
             .await
             .map_err(internal)?
             .into_iter()
@@ -217,39 +258,86 @@ impl SchedulerEngine {
         kernel: &Kernel,
         job: &SchedulerJobRecord,
         run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
         content: &str,
     ) -> SchedulerJobDeliveryStatus {
         let Some(delivery) = &job.delivery else {
             return SchedulerJobDeliveryStatus::NotRequested;
         };
-        let text = if content.trim().is_empty() {
-            format!(
-                "Scheduled job '{}' completed with no assistant output.",
-                job.name
-            )
-        } else {
-            content.to_string()
-        };
-        let source_id = run_id.to_string();
         match kernel
-            .enqueue_channel_delivery(
+            .enqueue_scheduler_run_delivery(
+                job,
+                run_id,
+                session_id,
+                turn_id,
                 ChannelDeliveryRoute {
                     channel_id: &delivery.channel_id,
                     conversation_ref: &delivery.conversation_ref,
                     thread_ref: delivery.thread_ref.as_deref(),
                     reply_to_ref: delivery.reply_to_ref.as_deref(),
                 },
-                None,
-                None,
-                Some("scheduler_run"),
-                Some(&source_id),
-                &text,
+                content,
             )
             .await
         {
             Ok(_) => SchedulerJobDeliveryStatus::Pending,
             Err(_) => SchedulerJobDeliveryStatus::Failed,
         }
+    }
+
+    fn initial_delivery_status(job: &SchedulerJobRecord) -> SchedulerJobDeliveryStatus {
+        if job.delivery.is_some() {
+            SchedulerJobDeliveryStatus::Pending
+        } else {
+            SchedulerJobDeliveryStatus::NotRequested
+        }
+    }
+
+    async fn deliver_completed_job_result(
+        &self,
+        kernel: &Kernel,
+        job: &SchedulerJobRecord,
+        run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        content: &str,
+    ) -> Result<SchedulerJobDeliveryStatus, KernelError> {
+        let delivery_status = self
+            .deliver_job_result(kernel, job, run_id, session_id, turn_id, content)
+            .await;
+        if delivery_status == SchedulerJobDeliveryStatus::Failed {
+            let updated = kernel
+                .job_store()
+                .update_run_delivery_status(run_id, delivery_status)
+                .await
+                .map_err(internal)?;
+            if !updated {
+                warn!(%run_id, "failed to update completed scheduler run delivery status");
+            }
+        }
+        Ok(delivery_status)
+    }
+
+    async fn finish_current_run_snapshot(
+        &self,
+        kernel: &Kernel,
+        job_id: Uuid,
+        final_run: SchedulerJobRunRecord,
+    ) -> Result<Option<AttemptOutcome>, KernelError> {
+        let Some(updated_job) = kernel.job_store().get_job(job_id).await.map_err(internal)? else {
+            return Ok(None);
+        };
+        if final_run.status == SchedulerJobRunStatus::Running
+            && updated_job.running_run_id == Some(final_run.run_id)
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(AttemptOutcome::Finished(Box::new((
+            updated_job,
+            final_run,
+        )))))
     }
 
     async fn run_job_attempt(
@@ -268,21 +356,19 @@ impl SchedulerEngine {
             .await?;
         let turn_id = Uuid::new_v4();
         let turn_result = kernel
-            .execute_scheduled_job_turn(opened.session_id, turn_id, job)
+            .execute_scheduled_job_turn(current_run.run_id, opened.session_id, turn_id, job)
             .await;
 
         match turn_result {
             Ok(response) => {
-                let delivery_status = self
-                    .deliver_job_result(kernel, job, current_run.run_id, &response.assistant_text)
-                    .await;
+                let initial_delivery_status = Self::initial_delivery_status(job);
                 let updated_job = kernel
                     .job_store()
                     .complete_run_success(
                         current_run.run_id,
                         response.session_id,
                         response.turn_id,
-                        delivery_status,
+                        initial_delivery_status,
                     )
                     .await
                     .map_err(internal)?
@@ -291,6 +377,16 @@ impl SchedulerEngine {
                             "scheduled job disappeared during completion".to_string(),
                         )
                     })?;
+                let delivery_status = self
+                    .deliver_completed_job_result(
+                        kernel,
+                        job,
+                        current_run.run_id,
+                        Some(response.session_id),
+                        Some(response.turn_id),
+                        &response.assistant_text,
+                    )
+                    .await?;
                 let final_run = kernel
                     .job_store()
                     .get_run(current_run.run_id)
@@ -325,13 +421,47 @@ impl SchedulerEngine {
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
+                let run_still_owns_turn = kernel
+                    .job_store()
+                    .running_run_owns_turn(current_run.run_id, opened.session_id, turn_id)
+                    .await
+                    .map_err(internal)?;
+                let (session_id, turn_id) = if run_still_owns_turn {
+                    (Some(opened.session_id), Some(turn_id))
+                } else {
+                    let maybe_run = kernel
+                        .job_store()
+                        .get_run(current_run.run_id)
+                        .await
+                        .map_err(internal)?;
+                    match maybe_run {
+                        Some(run)
+                            if run.status != SchedulerJobRunStatus::Running
+                                || run.session_id.is_some()
+                                || run.turn_id.is_some() =>
+                        {
+                            if let Some(outcome) = self
+                                .finish_current_run_snapshot(kernel, job.job_id, run)
+                                .await?
+                            {
+                                return Ok(outcome);
+                            }
+                            return Err(KernelError::Conflict(
+                                "scheduled job run attachment no longer matches current turn"
+                                    .to_string(),
+                            ));
+                        }
+                        Some(_) => (None, None),
+                        None => (Some(opened.session_id), Some(turn_id)),
+                    }
+                };
                 self.handle_failed_attempt(
                     kernel,
                     job,
                     current_run,
                     AttemptFailureContext {
-                        session_id: Some(opened.session_id),
-                        turn_id: Some(turn_id),
+                        session_id,
+                        turn_id,
                         failure_phase: None,
                     },
                     &err,
@@ -379,9 +509,7 @@ impl SchedulerEngine {
 
         let error_text = err.to_string();
         let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, error_text);
-        let delivery_status = self
-            .deliver_job_result(kernel, job, current_run.run_id, &failure_summary)
-            .await;
+        let initial_delivery_status = Self::initial_delivery_status(job);
         let updated_job = kernel
             .job_store()
             .complete_run_failure(
@@ -390,7 +518,7 @@ impl SchedulerEngine {
                 context.turn_id,
                 &error_text,
                 SchedulerJobRunStatus::DeadLetter,
-                delivery_status,
+                initial_delivery_status,
             )
             .await
             .map_err(internal)?
@@ -399,6 +527,16 @@ impl SchedulerEngine {
                     "scheduled job disappeared during failure completion".to_string(),
                 )
             })?;
+        let delivery_status = self
+            .deliver_completed_job_result(
+                kernel,
+                job,
+                current_run.run_id,
+                context.session_id,
+                context.turn_id,
+                &failure_summary,
+            )
+            .await?;
         let final_run = kernel
             .job_store()
             .get_run(current_run.run_id)
@@ -437,12 +575,58 @@ impl SchedulerEngine {
         Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
     }
 
+    async fn with_scheduler_lease<F, Fut, T>(
+        &self,
+        kernel: &Kernel,
+        mode: SchedulerLeaseMode,
+        work: F,
+    ) -> Result<Option<T>, KernelError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Result<T, KernelError>>,
+    {
+        let owner = format!("{}:{}", mode.owner_prefix(), Uuid::new_v4());
+        let lease_ttl = self.config.tick_interval.max(Duration::from_secs(60));
+        let acquired = match mode {
+            SchedulerLeaseMode::Tick => {
+                kernel
+                    .job_store()
+                    .try_acquire_tick_lease(&owner, lease_ttl)
+                    .await
+            }
+            SchedulerLeaseMode::Execution => {
+                kernel
+                    .job_store()
+                    .try_acquire_execution_lease(&owner, lease_ttl)
+                    .await
+            }
+        }
+        .map_err(internal)?;
+        if !acquired {
+            return Ok(None);
+        }
+
+        let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl, mode);
+        let work_result = work(owner.clone()).await;
+        let renewal_result = renewal_handle.stop().await;
+        let release_result = match mode {
+            SchedulerLeaseMode::Tick => kernel.job_store().release_tick_lease(&owner).await,
+            SchedulerLeaseMode::Execution => {
+                kernel.job_store().release_execution_lease(&owner).await
+            }
+        };
+        release_result.map_err(internal)?;
+        renewal_result?;
+        work_result.map(Some)
+    }
+
     fn spawn_lease_renewal(
         &self,
         kernel: &Kernel,
         owner: String,
         lease_ttl: Duration,
-    ) -> TickLeaseRenewal {
+        mode: SchedulerLeaseMode,
+    ) -> SchedulerLeaseRenewal {
         let jobs = kernel.job_store().clone();
         let renew_every = (lease_ttl / 2).max(Duration::from_secs(1));
         let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -451,22 +635,47 @@ impl SchedulerEngine {
                 tokio::select! {
                     _ = &mut stop_rx => return Ok(()),
                     _ = sleep(renew_every) => {
-                        let renewed = jobs.renew_tick_lease(&owner, lease_ttl).await?;
+                        let renewed = match mode {
+                            SchedulerLeaseMode::Tick => jobs.renew_tick_lease(&owner, lease_ttl).await,
+                            SchedulerLeaseMode::Execution => jobs.renew_execution_lease(&owner, lease_ttl).await,
+                        }?;
                         if !renewed {
-                            return Err(anyhow!("scheduler tick lease lost during execution"));
+                            return Err(anyhow!(mode.lost_message()));
                         }
                     }
                 }
             }
         });
-        TickLeaseRenewal {
+        SchedulerLeaseRenewal {
             stop_tx: Some(stop_tx),
             handle,
         }
     }
 }
 
-struct TickLeaseRenewal {
+#[derive(Debug, Clone, Copy)]
+enum SchedulerLeaseMode {
+    Tick,
+    Execution,
+}
+
+impl SchedulerLeaseMode {
+    fn owner_prefix(self) -> &'static str {
+        match self {
+            Self::Tick => "scheduler",
+            Self::Execution => "manual",
+        }
+    }
+
+    fn lost_message(self) -> &'static str {
+        match self {
+            Self::Tick => "scheduler tick lease lost during execution",
+            Self::Execution => "scheduler execution lease lost during execution",
+        }
+    }
+}
+
+struct SchedulerLeaseRenewal {
     stop_tx: Option<oneshot::Sender<()>>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -482,11 +691,11 @@ struct AttemptFailureContext {
     failure_phase: Option<&'static str>,
 }
 
-impl TickLeaseRenewal {
+impl SchedulerLeaseRenewal {
     async fn stop(mut self) -> Result<(), KernelError> {
         if let Some(stop_tx) = self.stop_tx.take() {
             if stop_tx.send(()).is_err() {
-                debug!("tick lease renewal task already stopped");
+                debug!("scheduler lease renewal task already stopped");
             }
         }
         let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;

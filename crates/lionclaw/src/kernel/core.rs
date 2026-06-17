@@ -24,7 +24,7 @@ use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, Notify, RwLock, Semaphore},
+    sync::{oneshot, Mutex, Notify, RwLock, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
@@ -177,8 +177,8 @@ use super::{
         turns_to_history_views, CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{
-        ImportedSessionTurn, NewSessionTurn, SessionTurnCompletion, SessionTurnRecord,
-        SessionTurnStore,
+        ImportedSessionTurn, InterruptedSessionTurn, NewSessionTurn, SessionTurnCompletion,
+        SessionTurnRecord, SessionTurnStore,
     },
     sessions::SessionStore,
     skills::validate_skill_alias,
@@ -190,12 +190,14 @@ const STALE_CHANNEL_ATTACHMENT_BATCH_AFTER: Duration = Duration::from_secs(60 * 
 const STALE_CHANNEL_ATTACHMENT_TEMP_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL: Duration = Duration::from_secs(60);
 const CHANNEL_ATTACHMENT_NOT_STAGED: &str = "not_staged";
 const CHANNEL_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
 const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
 const CHANNEL_ATTACHMENT_PROJECTIONS_DIR: &str = "attachment-projections";
 const CHANNEL_ATTACHMENT_MOUNT_TARGET: &str = "/attachments";
 const CHANNEL_OUTBOX_ARTIFACTS_DIR: &str = "channel-outbox";
+const SCHEDULER_RUN_SOURCE_KIND: &str = "scheduler_run";
 const MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY: usize = 10;
 const MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
@@ -224,6 +226,33 @@ struct AttachedRuntimeReconciliation {
     warning_count: usize,
     reconciled: bool,
     resumable: bool,
+}
+
+struct SchedulerRecoveryLeaseRenewal {
+    stop_tx: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<anyhow::Result<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchedulerLeaseReconciliation {
+    Completed,
+    LeaseLost,
+}
+
+impl SchedulerRecoveryLeaseRenewal {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    async fn stop(mut self) -> Result<(), KernelError> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            if stop_tx.send(()).is_err() {
+                // The renewal task already stopped; awaiting the handle below reports its result.
+            }
+        }
+        let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;
+        renewal_result.map_err(internal)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1431,12 +1460,18 @@ impl Kernel {
                 );
             }
         }
+        let scheduler_recovery_owner = format!("bootstrap:{}", Uuid::new_v4());
+        let scheduler_recovery_lease = self
+            .acquire_scheduler_recovery_lease_for_bootstrap(&scheduler_recovery_owner)
+            .await;
+        let scheduler_recovery_renewal = scheduler_recovery_lease
+            .then(|| self.spawn_scheduler_recovery_lease_renewal(scheduler_recovery_owner.clone()));
         let reason = "turn interrupted by kernel restart";
-        if let Ok(interrupted_turns) = self
+        let interrupted_turns = self
             .session_turns
-            .interrupt_running_turns_without_pending_channel_turns(reason)
-            .await
-        {
+            .interrupt_running_turns_without_pending_channel_turns_excluding_scheduler(reason)
+            .await;
+        if let Ok(interrupted_turns) = interrupted_turns {
             for turn in &interrupted_turns {
                 if let Err(err) = self.sessions.record_turn(turn.session_id).await {
                     warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
@@ -1453,6 +1488,66 @@ impl Kernel {
                 }),
             )
             .await;
+        }
+        if scheduler_recovery_lease {
+            if self
+                .renew_scheduler_recovery_lease_for_bootstrap(
+                    &scheduler_recovery_owner,
+                    scheduler_recovery_renewal.as_ref(),
+                )
+                .await
+            {
+                match self
+                    .interrupt_scheduler_runs_and_turns_for_bootstrap(
+                        &scheduler_recovery_owner,
+                        reason,
+                    )
+                    .await
+                {
+                    Ok((interrupted_run_count, interrupted_turn_count)) => {
+                        if interrupted_run_count > 0 {
+                            self.append_audit_event_best_effort(
+                                "scheduler.run.reconciled",
+                                None,
+                                "kernel",
+                                json!({
+                                    "status": "interrupted",
+                                    "run_count": interrupted_run_count,
+                                    "turn_count": interrupted_turn_count,
+                                    "reason": "scheduled job interrupted by kernel restart",
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "failed to reconcile running scheduled jobs during bootstrap"
+                        );
+                    }
+                }
+            } else {
+                warn!("skipping scheduler job reconciliation after recovery lease loss");
+            }
+            if let Some(renewal) = scheduler_recovery_renewal {
+                if let Err(err) = renewal.stop().await {
+                    warn!(
+                        ?err,
+                        "scheduler recovery lease renewal failed during bootstrap"
+                    );
+                }
+            }
+            if let Err(err) = self
+                .jobs
+                .release_recovery_lease(&scheduler_recovery_owner)
+                .await
+            {
+                warn!(
+                    ?err,
+                    "failed to release scheduler recovery lease during bootstrap"
+                );
+            }
         }
         if let Err(err) = self
             .channel_state
@@ -1471,18 +1566,384 @@ impl Kernel {
             );
         }
         self.ensure_pending_channel_turn_workers().await;
-        if let Err(err) = self
-            .jobs
-            .interrupt_running_runs("scheduled job interrupted by kernel restart")
-            .await
-        {
-            warn!(
-                ?err,
-                "failed to reconcile running scheduled jobs during bootstrap"
-            );
-        }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
+    }
+
+    async fn interrupt_scheduler_runs_and_turns_for_bootstrap(
+        &self,
+        recovery_owner: &str,
+        turn_reason: &str,
+    ) -> Result<(usize, usize), KernelError> {
+        let reconciliation = self
+            .jobs
+            .interrupt_running_runs_with_scheduler_lease(
+                recovery_owner,
+                "scheduled job interrupted by kernel restart",
+            )
+            .await
+            .map_err(internal)?;
+        let Some(reconciliation) = reconciliation else {
+            warn!("skipping scheduler job reconciliation after recovery lease loss");
+            return Ok((0, 0));
+        };
+        let interrupted_run_count = reconciliation.interrupted_runs.len();
+        let interrupted_turn_count = self
+            .interrupt_scheduler_turns_for_runs(
+                &reconciliation.interrupted_runs,
+                &reconciliation.job_owned_runs,
+                turn_reason,
+            )
+            .await?
+            .len();
+
+        Ok((interrupted_run_count, interrupted_turn_count))
+    }
+
+    async fn interrupt_scheduler_turns_for_runs(
+        &self,
+        exact_turn_runs: &[SchedulerJobRunRecord],
+        fallback_job_runs: &[SchedulerJobRunRecord],
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>, KernelError> {
+        if exact_turn_runs.is_empty() && fallback_job_runs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut turn_ids = exact_turn_runs
+            .iter()
+            .filter_map(|run| run.turn_id)
+            .collect::<Vec<_>>();
+        turn_ids.sort_unstable();
+        turn_ids.dedup();
+
+        let mut interrupted_turns = self
+            .session_turns
+            .interrupt_running_scheduler_turns_by_id(&turn_ids, reason)
+            .await
+            .map_err(internal)?;
+
+        let mut fallback_job_ids = fallback_job_runs
+            .iter()
+            .filter(|run| run.turn_id.is_none())
+            .map(|run| run.job_id)
+            .collect::<Vec<_>>();
+        fallback_job_ids.sort_unstable();
+        fallback_job_ids.dedup();
+        if !fallback_job_ids.is_empty() {
+            interrupted_turns.extend(
+                self.session_turns
+                    .interrupt_running_scheduler_turns_for_jobs(&fallback_job_ids, reason)
+                    .await
+                    .map_err(internal)?,
+            );
+        }
+
+        for turn in &interrupted_turns {
+            if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                warn!(?err, session_id = %turn.session_id, "failed to touch interrupted scheduler session");
+            }
+        }
+
+        Ok(interrupted_turns)
+    }
+
+    fn spawn_scheduler_recovery_lease_renewal(
+        &self,
+        owner: String,
+    ) -> SchedulerRecoveryLeaseRenewal {
+        let jobs = self.jobs.clone();
+        let lease_ttl = SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL;
+        let renew_every = (lease_ttl / 2).max(Duration::from_secs(1));
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return Ok(()),
+                    _ = sleep(renew_every) => {
+                        let renewed = jobs.renew_recovery_lease(&owner, lease_ttl).await?;
+                        if !renewed {
+                            return Err(anyhow::anyhow!(
+                                "scheduler recovery lease lost during bootstrap"
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+        SchedulerRecoveryLeaseRenewal {
+            stop_tx: Some(stop_tx),
+            handle,
+        }
+    }
+
+    async fn acquire_scheduler_recovery_lease_for_bootstrap(&self, owner: &str) -> bool {
+        match self
+            .jobs
+            .try_acquire_recovery_lease(owner, SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL)
+            .await
+        {
+            Ok(acquired) => acquired,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to acquire scheduler recovery lease during bootstrap; preserving running scheduler work"
+                );
+                false
+            }
+        }
+    }
+
+    async fn renew_scheduler_recovery_lease_for_bootstrap(
+        &self,
+        owner: &str,
+        renewal: Option<&SchedulerRecoveryLeaseRenewal>,
+    ) -> bool {
+        if renewal.is_some_and(|renewal| renewal.is_finished()) {
+            warn!("scheduler recovery lease renewal stopped before job reconciliation");
+            return false;
+        }
+
+        match self
+            .jobs
+            .renew_recovery_lease(owner, SCHEDULER_BOOTSTRAP_RECOVERY_LEASE_TTL)
+            .await
+        {
+            Ok(renewed) => renewed,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to renew scheduler recovery lease before job reconciliation"
+                );
+                false
+            }
+        }
+    }
+
+    pub(super) async fn reconcile_stale_scheduler_runs_after_scheduler_lease(
+        &self,
+        lease_owner: &str,
+    ) -> Result<SchedulerLeaseReconciliation, KernelError> {
+        let run_reason = "scheduled job interrupted after scheduler lease expired";
+        let reconciliation = self
+            .jobs
+            .interrupt_running_runs_with_scheduler_lease(lease_owner, run_reason)
+            .await
+            .map_err(internal)?;
+        let Some(reconciliation) = reconciliation else {
+            return Ok(SchedulerLeaseReconciliation::LeaseLost);
+        };
+        if reconciliation.interrupted_runs.is_empty() {
+            return Ok(SchedulerLeaseReconciliation::Completed);
+        }
+
+        let turn_reason = "turn interrupted after scheduler lease expired";
+        let interrupted_turns = self
+            .interrupt_scheduler_turns_for_runs(
+                &reconciliation.interrupted_runs,
+                &reconciliation.job_owned_runs,
+                turn_reason,
+            )
+            .await?;
+
+        self.append_audit_event_best_effort(
+            "scheduler.run.reconciled",
+            None,
+            "kernel",
+            json!({
+                "status": "interrupted",
+                "run_count": reconciliation.interrupted_runs.len(),
+                "turn_count": interrupted_turns.len(),
+                "reason": run_reason,
+            }),
+        )
+        .await;
+
+        Ok(SchedulerLeaseReconciliation::Completed)
+    }
+
+    pub(super) async fn recover_pending_scheduler_deliveries(&self) -> Result<usize, KernelError> {
+        let reconciled_statuses = self
+            .reconcile_terminal_scheduler_outbox_delivery_statuses()
+            .await?;
+        let run_ids = sqlx::query_scalar::<_, String>(
+            "SELECT scheduler_job_runs.run_id \
+             FROM scheduler_job_runs \
+             JOIN scheduler_jobs ON scheduler_jobs.job_id = scheduler_job_runs.job_id \
+             WHERE scheduler_job_runs.delivery_status = ?1 \
+               AND scheduler_jobs.delivery_json IS NOT NULL \
+               AND scheduler_job_runs.status IN (?2, ?3) \
+               AND NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM channel_outbox_messages \
+                 WHERE source_kind = ?4 \
+                   AND source_id = scheduler_job_runs.run_id \
+               ) \
+             ORDER BY COALESCE(scheduler_job_runs.finished_at_ms, scheduler_job_runs.started_at_ms) ASC, \
+                      scheduler_job_runs.run_id ASC",
+        )
+        .bind(SchedulerJobDeliveryStatus::Pending.as_str())
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(SchedulerJobRunStatus::DeadLetter.as_str())
+        .bind(SCHEDULER_RUN_SOURCE_KIND)
+        .fetch_all(self.jobs.pool())
+        .await
+        .map_err(|err| internal(err.into()))?;
+
+        let mut recovered = 0usize;
+        for raw_run_id in run_ids {
+            let run_id = Uuid::parse_str(&raw_run_id).map_err(|err| {
+                internal(anyhow::anyhow!(
+                    "invalid scheduler run id '{raw_run_id}' during delivery recovery: {err}"
+                ))
+            })?;
+            let Some(run) = self.jobs.get_run(run_id).await.map_err(internal)? else {
+                continue;
+            };
+            if run.delivery_status != Some(SchedulerJobDeliveryStatus::Pending)
+                || !matches!(
+                    run.status,
+                    SchedulerJobRunStatus::Completed | SchedulerJobRunStatus::DeadLetter
+                )
+            {
+                continue;
+            }
+            let Some(job) = self.jobs.get_job(run.job_id).await.map_err(internal)? else {
+                continue;
+            };
+            let Some(delivery) = &job.delivery else {
+                self.jobs
+                    .update_run_delivery_status(
+                        run.run_id,
+                        SchedulerJobDeliveryStatus::NotRequested,
+                    )
+                    .await
+                    .map_err(internal)?;
+                continue;
+            };
+            let Some(content) = self
+                .recovered_scheduler_run_delivery_content(&job, &run)
+                .await?
+            else {
+                self.jobs
+                    .update_run_delivery_status(run.run_id, SchedulerJobDeliveryStatus::Failed)
+                    .await
+                    .map_err(internal)?;
+                warn!(%run_id, "failed to reconstruct pending scheduler delivery content");
+                continue;
+            };
+            match self
+                .enqueue_scheduler_run_delivery(
+                    &job,
+                    run.run_id,
+                    run.session_id,
+                    run.turn_id,
+                    ChannelDeliveryRoute {
+                        channel_id: &delivery.channel_id,
+                        conversation_ref: &delivery.conversation_ref,
+                        thread_ref: delivery.thread_ref.as_deref(),
+                        reply_to_ref: delivery.reply_to_ref.as_deref(),
+                    },
+                    &content,
+                )
+                .await
+            {
+                Ok(_) => recovered += 1,
+                Err(err) => {
+                    self.jobs
+                        .update_run_delivery_status(run.run_id, SchedulerJobDeliveryStatus::Failed)
+                        .await
+                        .map_err(internal)?;
+                    warn!(?err, %run_id, "failed to recover scheduler run delivery");
+                }
+            }
+        }
+
+        if recovered > 0 || reconciled_statuses > 0 {
+            self.append_audit_event_best_effort(
+                "scheduler.delivery.recovered",
+                None,
+                "kernel",
+                json!({
+                    "outbox_recreated_count": recovered,
+                    "status_reconciled_count": reconciled_statuses,
+                }),
+            )
+            .await;
+        }
+        Ok(recovered + reconciled_statuses)
+    }
+
+    async fn reconcile_terminal_scheduler_outbox_delivery_statuses(
+        &self,
+    ) -> Result<usize, KernelError> {
+        let delivery_ids = sqlx::query_scalar::<_, String>(
+            "SELECT channel_outbox_messages.delivery_id \
+             FROM scheduler_job_runs \
+             JOIN channel_outbox_messages \
+               ON channel_outbox_messages.source_kind = ?1 \
+              AND channel_outbox_messages.source_id = scheduler_job_runs.run_id \
+             WHERE scheduler_job_runs.delivery_status = ?2 \
+               AND scheduler_job_runs.status IN (?3, ?4) \
+               AND channel_outbox_messages.status IN (?5, ?6) \
+             ORDER BY COALESCE(scheduler_job_runs.finished_at_ms, scheduler_job_runs.started_at_ms) ASC, \
+                      scheduler_job_runs.run_id ASC, channel_outbox_messages.created_at_ms ASC",
+        )
+        .bind(SCHEDULER_RUN_SOURCE_KIND)
+        .bind(SchedulerJobDeliveryStatus::Pending.as_str())
+        .bind(SchedulerJobRunStatus::Completed.as_str())
+        .bind(SchedulerJobRunStatus::DeadLetter.as_str())
+        .bind(ChannelOutboxDeliveryStatus::Delivered.as_str())
+        .bind(ChannelOutboxDeliveryStatus::Failed.as_str())
+        .fetch_all(self.jobs.pool())
+        .await
+        .map_err(|err| internal(err.into()))?;
+
+        let mut reconciled = 0usize;
+        for raw_delivery_id in delivery_ids {
+            let delivery_id = Uuid::parse_str(&raw_delivery_id).map_err(|err| {
+                internal(anyhow::anyhow!(
+                    "invalid scheduler outbox delivery id '{raw_delivery_id}' during delivery status recovery: {err}"
+                ))
+            })?;
+            let Some(delivery) = self
+                .channel_outbox
+                .get_delivery(delivery_id)
+                .await
+                .map_err(internal)?
+            else {
+                continue;
+            };
+            self.update_scheduler_delivery_from_outbox(&delivery)
+                .await?;
+            reconciled += 1;
+        }
+
+        Ok(reconciled)
+    }
+
+    async fn recovered_scheduler_run_delivery_content(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+    ) -> Result<Option<String>, KernelError> {
+        match run.status {
+            SchedulerJobRunStatus::Completed => {
+                let Some(turn_id) = run.turn_id else {
+                    return Ok(None);
+                };
+                let turn = self.session_turns.get(turn_id).await.map_err(internal)?;
+                Ok(turn.map(|turn| turn.assistant_text))
+            }
+            SchedulerJobRunStatus::DeadLetter => Ok(Some(format!(
+                "Scheduled job '{}' failed: {}",
+                job.name,
+                run.error_text.as_deref().unwrap_or("unknown error")
+            ))),
+            SchedulerJobRunStatus::Running
+            | SchedulerJobRunStatus::Failed
+            | SchedulerJobRunStatus::Interrupted => Ok(None),
         }
     }
 
@@ -2596,6 +3057,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(
                         runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
@@ -2630,6 +3092,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(
                         runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
@@ -5958,19 +6421,12 @@ impl Kernel {
             ExecutionPlanPurpose::Interactive,
         )
         .await?;
-        let claimed = self
-            .jobs
-            .claim_manual_run(req.job_id, Utc::now())
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                if existing.running_run_id.is_some() {
-                    KernelError::Conflict("job is already running".to_string())
-                } else {
-                    KernelError::Conflict("job could not be claimed for manual run".to_string())
-                }
-            })?;
-        let (job, run) = self.scheduler.run_claimed_job(self, claimed).await?;
+        let (job, run) = Box::pin(self.scheduler.run_manual_job(
+            self,
+            req.job_id,
+            existing.running_run_id.is_some(),
+        ))
+        .await?;
         Ok(JobManualRunResponse {
             job: to_job_view(job),
             run: to_job_run_view(run),
@@ -5998,7 +6454,7 @@ impl Kernel {
         &self,
         delivery: &ChannelDeliveryRecord,
     ) -> Result<(), KernelError> {
-        if delivery.source_kind.as_deref() != Some("scheduler_run") {
+        if delivery.source_kind.as_deref() != Some(SCHEDULER_RUN_SOURCE_KIND) {
             return Ok(());
         }
         let Some(source_id) = delivery.source_id.as_deref() else {
@@ -6812,6 +7268,7 @@ impl Kernel {
 
     pub(super) async fn execute_scheduled_job_turn(
         &self,
+        run_id: Uuid,
         session_id: Uuid,
         turn_id: Uuid,
         job: &SchedulerJobRecord,
@@ -6830,6 +7287,7 @@ impl Kernel {
                 runtime_prompt_user_text: None,
                 attachment_source_turn_id: None,
                 prepared_turn: None,
+                scheduler_run_id: Some(run_id),
                 requested_runtime_id: Some(job.runtime_id.clone()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -7990,6 +8448,7 @@ mod tests {
                     runtime_prompt_user_text: Some(runtime_prompt_user_text),
                     attachment_source_turn_id: None,
                     prepared_turn: Some(prepared_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(runtime_id.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -9563,6 +10022,7 @@ mod tests {
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: None,
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_REPLY_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -9847,6 +10307,7 @@ mod tests {
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: None,
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -11433,6 +11894,7 @@ done
                     runtime_prompt_user_text: None,
                     attachment_source_turn_id: None,
                     prepared_turn: Some(prepared_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(TEST_PRE_TURN_FAILURE_RUNTIME_ID.to_string()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -17574,6 +18036,33 @@ fn runtime_channel_send_fingerprint(
     Ok(sha256_hex(&encoded))
 }
 
+fn scheduler_run_delivery_text(job_name: &str, content: &str) -> String {
+    if content.trim().is_empty() {
+        format!("Scheduled job '{job_name}' completed with no assistant output.")
+    } else {
+        content.to_string()
+    }
+}
+
+fn scheduler_run_delivery_fingerprint(
+    route: &ChannelDeliveryRoute<'_>,
+    content: &ChannelDeliveryContent,
+) -> Result<String, KernelError> {
+    let canonical = json!({
+        "channel_id": route.channel_id,
+        "conversation_ref": route.conversation_ref,
+        "thread_ref": route.thread_ref,
+        "reply_to_ref": route.reply_to_ref,
+        "content": {
+            "text": content.text,
+            "format_hint": content.format_hint,
+            "attachments": content.attachments,
+        },
+    });
+    let encoded = serde_json::to_vec(&canonical).map_err(|err| internal(err.into()))?;
+    Ok(sha256_hex(&encoded))
+}
+
 fn runtime_channel_send_artifacts(
     context: &RuntimeChannelSendContext,
     content: &RuntimeChannelSendContent,
@@ -18682,6 +19171,7 @@ struct RuntimeControlSessionExecution<'a> {
     sink: Option<RuntimeEventSink>,
     cancellation: TurnCancellation,
     audit_actor: String,
+    scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
 }
 
 #[derive(Default)]
@@ -18699,6 +19189,7 @@ struct SessionTurnExecution {
     runtime_prompt_user_text: Option<String>,
     attachment_source_turn_id: Option<Uuid>,
     prepared_turn: Option<SessionTurnRecord>,
+    scheduler_run_id: Option<Uuid>,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
@@ -19090,12 +19581,20 @@ struct StartedRuntimePreTurnFailure<'a> {
     handle: &'a RuntimeSessionHandle,
     error: &'a KernelError,
     channel_stream_finalizer: ChannelStreamFinalizer<'a>,
+    scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
 }
 
 #[derive(Clone, Copy)]
 struct ChannelStreamFinalizer<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
     emit_done: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerRunTurnGuard {
+    run_id: Uuid,
+    session_id: Uuid,
+    turn_id: Uuid,
 }
 
 enum QueuedTurnTerminal {
@@ -19373,6 +19872,7 @@ impl Kernel {
                 runtime_prompt_user_text: None,
                 attachment_source_turn_id: None,
                 prepared_turn: None,
+                scheduler_run_id: None,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
@@ -19548,6 +20048,7 @@ impl Kernel {
             handle,
             error,
             channel_stream_finalizer,
+            scheduler_turn_guard,
         } = failure;
 
         self.clear_runtime_session_ready(execution_plan).await;
@@ -19579,6 +20080,7 @@ impl Kernel {
                 stream_error_emitted: false,
             },
             channel_stream_finalizer,
+            scheduler_turn_guard,
         )
         .await?;
         Ok(())
@@ -19597,6 +20099,7 @@ impl Kernel {
             runtime_prompt_user_text,
             attachment_source_turn_id,
             prepared_turn,
+            scheduler_run_id,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
@@ -19772,6 +20275,37 @@ impl Kernel {
                 .map_err(internal)?,
         };
 
+        let scheduler_turn_guard = if let Some(run_id) = scheduler_run_id {
+            let attached = self
+                .jobs
+                .attach_run_turn(run_id, session.session_id, persisted_turn.turn_id)
+                .await
+                .map_err(internal)?;
+            if !attached {
+                let error_text = "scheduled job run is no longer active".to_string();
+                self.session_turns
+                    .complete_running_turn(
+                        persisted_turn.turn_id,
+                        SessionTurnCompletion {
+                            status: SessionTurnStatus::Interrupted,
+                            assistant_text: String::new(),
+                            error_code: Some("runtime.interrupted".to_string()),
+                            error_text: Some(error_text.clone()),
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Err(KernelError::Conflict(error_text));
+            }
+            Some(SchedulerRunTurnGuard {
+                run_id,
+                session_id: session.session_id,
+                turn_id: persisted_turn.turn_id,
+            })
+        } else {
+            None
+        };
+
         if let Some(control) = runtime_control.as_ref() {
             if let Err(err) = self
                 .append_runtime_control_route_audit(
@@ -19793,6 +20327,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -19818,11 +20353,16 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
             }
         };
+
+        if let Some(guard) = scheduler_turn_guard {
+            self.ensure_scheduler_run_owns_turn(guard).await?;
+        }
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -19849,6 +20389,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
@@ -19872,6 +20413,7 @@ impl Kernel {
                     sink,
                     cancellation,
                     audit_actor,
+                    scheduler_turn_guard,
                 })
                 .await;
         }
@@ -19898,6 +20440,7 @@ impl Kernel {
                     handle: &handle,
                     error: &err,
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 })
                 .await?;
                 return Err(err);
@@ -19955,6 +20498,7 @@ impl Kernel {
                             stream_error_emitted,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                 return self.terminal_turn_result(
@@ -20035,6 +20579,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -20054,6 +20599,7 @@ impl Kernel {
                                 stream_error_emitted: true,
                             },
                             channel_stream_finalizer,
+                            scheduler_turn_guard,
                         )
                         .await?;
                     return self.terminal_turn_result(
@@ -20075,6 +20621,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(close_err);
@@ -20091,6 +20638,7 @@ impl Kernel {
                         stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(err);
@@ -20111,6 +20659,7 @@ impl Kernel {
                         stream_error_emitted: artifacts.saw_error,
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
             return self.terminal_turn_result(
@@ -20146,6 +20695,7 @@ impl Kernel {
                             stream_error_emitted: false,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                     return Err(err);
@@ -20155,8 +20705,7 @@ impl Kernel {
             PreparedChannelDeliveryAttachments::default()
         };
         let completed_turn = self
-            .session_turns
-            .complete_turn(
+            .complete_execution_session_turn(
                 turn_id,
                 SessionTurnCompletion {
                     status: SessionTurnStatus::Completed,
@@ -20164,12 +20713,10 @@ impl Kernel {
                     error_code: None,
                     error_text: None,
                 },
+                scheduler_turn_guard,
+                "completed session turn was not found",
             )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("completed session turn was not found".to_string())
-            })?;
+            .await?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &artifacts.assistant_text)
                 .await?;
@@ -20290,6 +20837,7 @@ impl Kernel {
             sink,
             cancellation,
             audit_actor,
+            scheduler_turn_guard,
         } = execution;
         let channel_stream_finalizer = ChannelStreamFinalizer {
             stream_context: &channel_stream_context,
@@ -20350,6 +20898,7 @@ impl Kernel {
                             stream_error_emitted,
                         },
                         channel_stream_finalizer,
+                        scheduler_turn_guard,
                     )
                     .await?;
                 return self.terminal_turn_result(
@@ -20400,6 +20949,7 @@ impl Kernel {
                     stream_error_emitted: runtime_events_include_error(&turn_err.events),
                 },
                 channel_stream_finalizer,
+                scheduler_turn_guard,
             )
             .await?;
             return Err(kernel_error_for_turn_status(
@@ -20446,6 +20996,7 @@ impl Kernel {
                         stream_error_emitted: runtime_events_include_error(&runtime_events),
                     },
                     channel_stream_finalizer,
+                    scheduler_turn_guard,
                 )
                 .await?;
                 return Err(KernelError::Runtime(error_text));
@@ -20462,14 +21013,14 @@ impl Kernel {
                     stream_error_emitted: false,
                 },
                 channel_stream_finalizer,
+                scheduler_turn_guard,
             )
             .await?;
             return Err(KernelError::Runtime(message));
         }
 
         let completed_turn = self
-            .session_turns
-            .complete_turn(
+            .complete_execution_session_turn(
                 turn_id,
                 SessionTurnCompletion {
                     status,
@@ -20477,12 +21028,10 @@ impl Kernel {
                     error_code: error_code.clone(),
                     error_text: error_text.clone(),
                 },
+                scheduler_turn_guard,
+                "completed runtime control turn was not found",
             )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("completed runtime control turn was not found".to_string())
-            })?;
+            .await?;
         if let Some(stream_context) = &channel_stream_context {
             self.emit_turn_completed_snapshot(stream_context, &assistant_text)
                 .await?;
@@ -20588,6 +21137,7 @@ impl Kernel {
         persisted_turn: &SessionTurnRecord,
         failure: FailedSessionTurnCompletion,
         channel_stream_finalizer: ChannelStreamFinalizer<'_>,
+        scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
     ) -> Result<SessionTurnCompletion, KernelError> {
         let FailedSessionTurnCompletion {
             assistant_text,
@@ -20605,13 +21155,13 @@ impl Kernel {
         };
 
         let completed_turn = self
-            .session_turns
-            .complete_turn(persisted_turn.turn_id, completion.clone())
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::Internal("failed session turn was not found".to_string())
-            })?;
+            .complete_execution_session_turn(
+                persisted_turn.turn_id,
+                completion.clone(),
+                scheduler_turn_guard,
+                "failed session turn was not found",
+            )
+            .await?;
         let surface = if channel_stream_finalizer.stream_context.is_some() {
             PrivateContextRecordSurface::Channel
         } else {
@@ -20683,6 +21233,78 @@ impl Kernel {
             runtime_id,
             stream_events: runtime_events_to_views(&runtime_events),
         }
+    }
+
+    async fn ensure_scheduler_run_owns_turn(
+        &self,
+        guard: SchedulerRunTurnGuard,
+    ) -> Result<(), KernelError> {
+        if self
+            .jobs
+            .running_run_owns_turn(guard.run_id, guard.session_id, guard.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            return Ok(());
+        }
+
+        let error_text = "scheduled job run is no longer active".to_string();
+        self.session_turns
+            .complete_running_turn(
+                guard.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Interrupted,
+                    assistant_text: String::new(),
+                    error_code: Some("runtime.interrupted".to_string()),
+                    error_text: Some(error_text.clone()),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        Err(KernelError::Conflict(error_text))
+    }
+
+    async fn complete_execution_session_turn(
+        &self,
+        turn_id: Uuid,
+        completion: SessionTurnCompletion,
+        scheduler_turn_guard: Option<SchedulerRunTurnGuard>,
+        missing_message: &'static str,
+    ) -> Result<SessionTurnRecord, KernelError> {
+        let completed_turn = if let Some(guard) = scheduler_turn_guard {
+            if turn_id != guard.turn_id {
+                return Err(KernelError::Conflict(
+                    "scheduled job turn is no longer active".to_string(),
+                ));
+            }
+            match self
+                .session_turns
+                .complete_running_turn_for_current_scheduler_run(
+                    guard.turn_id,
+                    guard.run_id,
+                    guard.session_id,
+                    completion,
+                )
+                .await
+                .map_err(internal)?
+            {
+                Some(completed_turn) => completed_turn,
+                None => {
+                    self.ensure_scheduler_run_owns_turn(guard).await?;
+                    return Err(KernelError::Conflict(
+                        "scheduled job turn is no longer active".to_string(),
+                    ));
+                }
+            }
+        } else {
+            self.session_turns
+                .complete_turn(turn_id, completion)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| KernelError::Internal(missing_message.to_string()))?
+        };
+
+        Ok(completed_turn)
     }
 
     fn terminal_turn_result(
@@ -21753,6 +22375,79 @@ impl Kernel {
             .await?;
         self.audit_channel_outbox_created(&delivery).await?;
         Ok(delivery.delivery_id)
+    }
+
+    pub(super) async fn enqueue_scheduler_run_delivery(
+        &self,
+        job: &SchedulerJobRecord,
+        run_id: Uuid,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        route: ChannelDeliveryRoute<'_>,
+        content: &str,
+    ) -> Result<Uuid, KernelError> {
+        let channel_id = route.channel_id.trim();
+        let conversation_ref = route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        let delivery_content = ChannelDeliveryContent {
+            text: scheduler_run_delivery_text(&job.name, content),
+            format_hint: "plain".to_string(),
+            attachments: Vec::new(),
+        };
+        if delivery_content.text.trim().is_empty() && delivery_content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
+        self.require_active_channel_binding(channel_id).await?;
+
+        let thread_ref = route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let route = ChannelDeliveryRoute {
+            channel_id,
+            conversation_ref,
+            thread_ref,
+            reply_to_ref,
+        };
+        let fingerprint = scheduler_run_delivery_fingerprint(&route, &delivery_content)?;
+        let source_id = run_id.to_string();
+        let delivery = self
+            .channel_outbox
+            .enqueue_delivery_idempotent(NewChannelDelivery {
+                route,
+                session_id,
+                turn_id,
+                source_kind: Some(SCHEDULER_RUN_SOURCE_KIND),
+                source_id: Some(&source_id),
+                source_fingerprint: Some(&fingerprint),
+                content: delivery_content,
+            })
+            .await
+            .map_err(internal)?;
+
+        match delivery {
+            ChannelOutboxEnqueueResult::Created(delivery) => {
+                if let Err(err) = self.audit_channel_outbox_created(&delivery).await {
+                    warn!(?err, %run_id, delivery_id = %delivery.delivery_id, "failed to audit scheduler outbox creation");
+                }
+                Ok(delivery.delivery_id)
+            }
+            ChannelOutboxEnqueueResult::Existing(delivery) => Ok(delivery.delivery_id),
+            ChannelOutboxEnqueueResult::Conflict(delivery) => Err(KernelError::Conflict(format!(
+                "scheduler run delivery source conflict for run {run_id}; existing delivery {} has a different fingerprint",
+                delivery.delivery_id
+            ))),
+        }
     }
 
     async fn enqueue_channel_turn_text_delivery(
@@ -22857,6 +23552,7 @@ impl Kernel {
                     runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
                     attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: Some(persisted_turn),
+                    scheduler_run_id: None,
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
