@@ -439,6 +439,29 @@ impl SessionTurnStore {
         started_before_ms: i64,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>> {
+        self.interrupt_running_scheduler_turns_for_jobs_inner(
+            job_ids,
+            Some(started_before_ms),
+            reason,
+        )
+        .await
+    }
+
+    pub async fn interrupt_running_scheduler_turns_for_jobs(
+        &self,
+        job_ids: &[Uuid],
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
+        self.interrupt_running_scheduler_turns_for_jobs_inner(job_ids, None, reason)
+            .await
+    }
+
+    async fn interrupt_running_scheduler_turns_for_jobs_inner(
+        &self,
+        job_ids: &[Uuid],
+        started_before_ms: Option<i64>,
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -460,7 +483,7 @@ impl SessionTurnStore {
                  WHERE session_turns.status = ?1 \
                    AND sessions.channel_id = 'scheduler' \
                    AND sessions.peer_id = ?2 \
-                   AND session_turns.started_at_ms < ?3 \
+                   AND (?3 IS NULL OR session_turns.started_at_ms < ?3) \
                  ORDER BY session_turns.started_at_ms ASC, session_turns.turn_id ASC",
             )
             .bind(SessionTurnStatus::Running.as_str())
@@ -474,7 +497,7 @@ impl SessionTurnStore {
                 "UPDATE session_turns \
                  SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
                  WHERE status = ?5 \
-                   AND started_at_ms < ?6 \
+                   AND (?6 IS NULL OR started_at_ms < ?6) \
                    AND session_id IN ( \
                      SELECT session_id FROM sessions \
                      WHERE channel_id = 'scheduler' AND peer_id = ?7 \

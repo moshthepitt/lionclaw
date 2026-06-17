@@ -1954,6 +1954,30 @@ async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
     .await
     .expect("seed stale running scheduler run");
 
+    let orphan_session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open scheduler session for unattached orphan turn");
+    let orphan_turn_id = Uuid::new_v4();
+    let orphan_started_at_ms = (Utc::now() + ChronoDuration::minutes(1)).timestamp_millis();
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, \
+          error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'job', 'prompt', '', NULL, NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(orphan_turn_id.to_string())
+    .bind(orphan_session.session_id.to_string())
+    .bind(orphan_started_at_ms)
+    .execute(&pool)
+    .await
+    .expect("seed future-started unattached orphan scheduler turn");
+
     let recovered_kernel = Kernel::new(&env.db_path())
         .await
         .expect("kernel init during active stale lease");
@@ -1988,6 +2012,14 @@ async fn scheduler_tick_reconciles_stale_runs_after_lease_expiry() {
             .await
             .expect("load stale run status");
     assert_eq!(stale_status, "interrupted");
+
+    let orphan_turn_status: String =
+        sqlx::query_scalar("SELECT status FROM session_turns WHERE turn_id = ?1")
+            .bind(orphan_turn_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("load orphan turn status");
+    assert_eq!(orphan_turn_status, "interrupted");
 
     let completed_runs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scheduler_job_runs WHERE job_id = ?1 AND status = 'completed'",

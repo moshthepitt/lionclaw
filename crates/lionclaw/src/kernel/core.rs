@@ -1460,7 +1460,6 @@ impl Kernel {
                 );
             }
         }
-        let scheduler_recovery_started_at_ms = Utc::now().timestamp_millis();
         let scheduler_recovery_owner = format!("bootstrap:{}", Uuid::new_v4());
         let scheduler_recovery_lease = self
             .acquire_scheduler_recovery_lease_for_bootstrap(&scheduler_recovery_owner)
@@ -1501,7 +1500,6 @@ impl Kernel {
                 match self
                     .interrupt_scheduler_runs_and_turns_for_bootstrap(
                         &scheduler_recovery_owner,
-                        scheduler_recovery_started_at_ms,
                         reason,
                     )
                     .await
@@ -1576,7 +1574,6 @@ impl Kernel {
     async fn interrupt_scheduler_runs_and_turns_for_bootstrap(
         &self,
         recovery_owner: &str,
-        started_before_ms: i64,
         turn_reason: &str,
     ) -> Result<(usize, usize), KernelError> {
         let reconciliation = self
@@ -1596,7 +1593,6 @@ impl Kernel {
             .interrupt_scheduler_turns_for_runs(
                 &reconciliation.interrupted_runs,
                 &reconciliation.job_owned_runs,
-                started_before_ms,
                 turn_reason,
             )
             .await?
@@ -1609,7 +1605,6 @@ impl Kernel {
         &self,
         exact_turn_runs: &[SchedulerJobRunRecord],
         fallback_job_runs: &[SchedulerJobRunRecord],
-        started_before_ms: i64,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>, KernelError> {
         if exact_turn_runs.is_empty() && fallback_job_runs.is_empty() {
@@ -1639,11 +1634,7 @@ impl Kernel {
         if !fallback_job_ids.is_empty() {
             interrupted_turns.extend(
                 self.session_turns
-                    .interrupt_running_scheduler_turns_for_jobs_started_before(
-                        &fallback_job_ids,
-                        started_before_ms,
-                        reason,
-                    )
+                    .interrupt_running_scheduler_turns_for_jobs(&fallback_job_ids, reason)
                     .await
                     .map_err(internal)?,
             );
@@ -1734,7 +1725,6 @@ impl Kernel {
         &self,
         lease_owner: &str,
     ) -> Result<SchedulerLeaseReconciliation, KernelError> {
-        let recovery_started_at_ms = Utc::now().timestamp_millis();
         let run_reason = "scheduled job interrupted after scheduler lease expired";
         let reconciliation = self
             .jobs
@@ -1753,7 +1743,6 @@ impl Kernel {
             .interrupt_scheduler_turns_for_runs(
                 &reconciliation.interrupted_runs,
                 &reconciliation.job_owned_runs,
-                recovery_started_at_ms,
                 turn_reason,
             )
             .await?;
