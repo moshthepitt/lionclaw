@@ -1567,7 +1567,7 @@ impl JobStore {
         rows.into_iter().map(map_run_row).collect()
     }
 
-    async fn guard_recovery_lease_in_tx(
+    async fn guard_scheduler_lease_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         owner: &str,
@@ -1584,33 +1584,25 @@ impl JobStore {
         .bind(now_ms())
         .execute(&mut **tx)
         .await
-        .context("failed to guard scheduler recovery lease")?;
+        .context("failed to guard scheduler lease")?;
 
         Ok(guarded.rows_affected() > 0)
     }
 
-    pub(crate) async fn interrupt_running_recoverable_runs(
-        &self,
-        error_text: &str,
-    ) -> Result<SchedulerRunReconciliation> {
-        self.interrupt_running_recoverable_runs_inner(error_text, None)
-            .await
-    }
-
-    pub(crate) async fn interrupt_running_runs_with_recovery_lease(
+    pub(crate) async fn interrupt_running_runs_with_scheduler_lease(
         &self,
         owner: &str,
         error_text: &str,
-    ) -> Result<SchedulerRunReconciliation> {
-        self.interrupt_running_recoverable_runs_inner(error_text, Some(owner))
+    ) -> Result<Option<SchedulerRunReconciliation>> {
+        self.interrupt_running_recoverable_runs_inner(error_text, owner)
             .await
     }
 
     async fn interrupt_running_recoverable_runs_inner(
         &self,
         error_text: &str,
-        lease_owner: Option<&str>,
-    ) -> Result<SchedulerRunReconciliation> {
+        lease_owner: &str,
+    ) -> Result<Option<SchedulerRunReconciliation>> {
         let finished_at_ms = now_ms();
         let mut tx = self
             .pool
@@ -1618,13 +1610,14 @@ impl JobStore {
             .await
             .context("failed to start interrupt scheduler runs transaction")?;
 
-        if let Some(owner) = lease_owner {
-            if !self.guard_recovery_lease_in_tx(&mut tx, owner).await? {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback unowned scheduler reconciliation")?;
-                return Ok(SchedulerRunReconciliation::default());
-            }
+        if !self
+            .guard_scheduler_lease_in_tx(&mut tx, lease_owner)
+            .await?
+        {
+            tx.rollback()
+                .await
+                .context("failed to rollback unowned scheduler reconciliation")?;
+            return Ok(None);
         }
 
         let rows = sqlx::query(
@@ -1701,7 +1694,7 @@ impl JobStore {
             .await
             .context("failed to commit interrupted scheduler job runs")?;
 
-        Ok(reconciliation)
+        Ok(Some(reconciliation))
     }
 }
 
@@ -2335,9 +2328,10 @@ mod tests {
             .await
             .expect("acquire recovery lease"));
         let reconciliation = store
-            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
             .await
-            .expect("interrupt under recovery lease");
+            .expect("interrupt under recovery lease")
+            .expect("recovery lease should be held");
 
         assert_eq!(reconciliation.interrupted_runs.len(), 1);
         assert_eq!(reconciliation.interrupted_runs[0].run_id, run_id);
@@ -2356,11 +2350,11 @@ mod tests {
         expire_scheduler_lease(&store, "bootstrap-a").await;
 
         let reconciliation = store
-            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
             .await
             .expect("interrupt under expired recovery lease");
 
-        assert!(reconciliation.interrupted_runs.is_empty());
+        assert!(reconciliation.is_none());
         assert_running_job_state(&store, job.job_id, run_id).await;
     }
 
@@ -2384,11 +2378,11 @@ mod tests {
         .expect("transfer recovery lease");
 
         let reconciliation = store
-            .interrupt_running_runs_with_recovery_lease("bootstrap-a", "simulated restart")
+            .interrupt_running_runs_with_scheduler_lease("bootstrap-a", "simulated restart")
             .await
             .expect("interrupt under transferred recovery lease");
 
-        assert!(reconciliation.interrupted_runs.is_empty());
+        assert!(reconciliation.is_none());
         assert_running_job_state(&store, job.job_id, run_id).await;
     }
 
@@ -3118,11 +3112,19 @@ mod tests {
             .expect("claim original job");
         let stale_run_id = claimed[0].run.run_id;
         let current_run_id = move_job_ownership_to_manual_run(&store, &job).await;
+        assert!(store
+            .try_acquire_recovery_lease("recovery-owner", Duration::from_secs(60))
+            .await
+            .expect("acquire recovery lease"));
 
         let reconciliation = store
-            .interrupt_running_recoverable_runs("recover stale scheduler run")
+            .interrupt_running_runs_with_scheduler_lease(
+                "recovery-owner",
+                "recover stale scheduler run",
+            )
             .await
-            .expect("interrupt stale scheduler runs");
+            .expect("interrupt stale scheduler runs")
+            .expect("recovery lease should be held");
         assert_eq!(reconciliation.interrupted_runs.len(), 2);
         assert!(reconciliation
             .interrupted_runs

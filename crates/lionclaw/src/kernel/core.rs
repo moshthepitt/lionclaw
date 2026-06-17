@@ -233,6 +233,12 @@ struct SchedulerRecoveryLeaseRenewal {
     handle: JoinHandle<anyhow::Result<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SchedulerLeaseReconciliation {
+    Completed,
+    LeaseLost,
+}
+
 impl SchedulerRecoveryLeaseRenewal {
     fn is_finished(&self) -> bool {
         self.handle.is_finished()
@@ -1575,12 +1581,16 @@ impl Kernel {
     ) -> Result<(usize, usize), KernelError> {
         let reconciliation = self
             .jobs
-            .interrupt_running_runs_with_recovery_lease(
+            .interrupt_running_runs_with_scheduler_lease(
                 recovery_owner,
                 "scheduled job interrupted by kernel restart",
             )
             .await
             .map_err(internal)?;
+        let Some(reconciliation) = reconciliation else {
+            warn!("skipping scheduler job reconciliation after recovery lease loss");
+            return Ok((0, 0));
+        };
         let interrupted_run_count = reconciliation.interrupted_runs.len();
         let interrupted_turn_count = self
             .interrupt_scheduler_turns_for_runs(
@@ -1722,16 +1732,20 @@ impl Kernel {
 
     pub(super) async fn reconcile_stale_scheduler_runs_after_scheduler_lease(
         &self,
-    ) -> Result<(), KernelError> {
+        lease_owner: &str,
+    ) -> Result<SchedulerLeaseReconciliation, KernelError> {
         let recovery_started_at_ms = Utc::now().timestamp_millis();
         let run_reason = "scheduled job interrupted after scheduler lease expired";
         let reconciliation = self
             .jobs
-            .interrupt_running_recoverable_runs(run_reason)
+            .interrupt_running_runs_with_scheduler_lease(lease_owner, run_reason)
             .await
             .map_err(internal)?;
+        let Some(reconciliation) = reconciliation else {
+            return Ok(SchedulerLeaseReconciliation::LeaseLost);
+        };
         if reconciliation.interrupted_runs.is_empty() {
-            return Ok(());
+            return Ok(SchedulerLeaseReconciliation::Completed);
         }
 
         let turn_reason = "turn interrupted after scheduler lease expired";
@@ -1757,7 +1771,7 @@ impl Kernel {
         )
         .await;
 
-        Ok(())
+        Ok(SchedulerLeaseReconciliation::Completed)
     }
 
     pub(super) async fn recover_pending_scheduler_deliveries(&self) -> Result<usize, KernelError> {
