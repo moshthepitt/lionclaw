@@ -3104,9 +3104,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_codex_app_server_program, build_codex_terminal_program, load_saved_thread_id,
-        save_thread_id, AppServerTransport, CodexAppServerClient, CodexRuntimeAdapter,
-        CodexRuntimeConfig, CodexTerminalTranscriptExportRequest, CODEX_THREAD_ID_STATE_FILE,
+        build_codex_app_server_program, build_codex_terminal_program, extract_app_server_turn_id,
+        load_saved_thread_id, save_thread_id, AppServerTransport, CodexAppServerClient,
+        CodexRuntimeAdapter, CodexRuntimeConfig, CodexTerminalTranscriptExportRequest,
+        CODEX_THREAD_ID_STATE_FILE,
     };
 
     fn runtime_not_ready() -> RuntimeSessionReady {
@@ -3245,6 +3246,9 @@ mod tests {
             ),
             "turn_interrupt_v2" => {
                 include_str!("../tests/fixtures/codex_app_server/turn_interrupt_v2.json")
+            }
+            "successful_turn_v2" => {
+                include_str!("../tests/fixtures/codex_app_server/successful_turn_v2.json")
             }
             other => panic!("unknown Codex protocol fixture: {other}"),
         };
@@ -5811,6 +5815,65 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_successful_turn_uses_contract_fixture() {
+        let fixture = codex_protocol_fixture("successful_turn_v2");
+        let (method, params) = fixture_client_request(&fixture);
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(fixture_server_messages(&fixture));
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request(method, params, &event_tx, &thread_state)
+            .await
+            .expect("turn/start request");
+        let turn_id = extract_app_server_turn_id(&response);
+        assert_eq!(turn_id.as_deref(), Some("turn_1"));
+        client
+            .wait_for_turn_completed(
+                turn_id.as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn should complete through notifications");
+
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent, vec![fixture_client_message(&fixture)]);
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "Hello ".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "world!".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+        assert_eq!(answer_text_from_events(events), "Hello world!");
 
         adapter.close(&handle).await.expect("close");
     }

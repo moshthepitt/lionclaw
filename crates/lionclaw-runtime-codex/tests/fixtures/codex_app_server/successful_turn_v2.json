@@ -1,0 +1,89 @@
+{
+  "codexCliVersion": "0.135.0",
+  "source": "https://github.com/openai/codex/blob/4daceea869704f9f35e0a3949fc34711ef978a4e/codex-rs/app-server/README.md",
+  "client": {
+    "id": 1,
+    "method": "turn/start",
+    "params": {
+      "threadId": "thr_1",
+      "input": [
+        {
+          "type": "text",
+          "text": "Say hello."
+        }
+      ]
+    }
+  },
+  "server": [
+    {
+      "id": 1,
+      "result": {
+        "turn": {
+          "id": "turn_1",
+          "status": "inProgress",
+          "items": [],
+          "error": null
+        }
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1"
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "item": {
+          "id": "item_0",
+          "type": "agentMessage"
+        }
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "itemId": "item_0",
+        "delta": "Hello "
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "itemId": "item_0",
+        "delta": "world!"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "item": {
+          "id": "item_0",
+          "type": "agentMessage",
+          "text": "Hello world!"
+        }
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "turn": {
+          "id": "turn_1",
+          "status": "completed"
+        }
+      }
+    }
+  ]
+}
