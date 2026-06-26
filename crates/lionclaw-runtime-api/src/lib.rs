@@ -1105,6 +1105,51 @@ pub enum RuntimeEvent {
     },
 }
 
+/// Raw, driver-specific payload retained alongside a canonical event for
+/// debugging. Retention is debug-only: it is never parsed back into canonical
+/// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTurnPayload {
+    /// Driver/protocol that produced the payload, e.g. `"codex-app-server"`.
+    pub driver: String,
+    /// The payload exactly as the driver emitted it (e.g. one JSON-RPC line).
+    pub payload: String,
+}
+
+/// One record in a runtime turn's canonical journal.
+///
+/// A protocol driver translates each harness message into journal records.
+/// `event` is the canonical, public output LionClaw persists, replays, and
+/// shows operators. `raw`, when present, retains the originating driver payload
+/// for debugging only and is excluded from every canonical projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEvent {
+    pub event: RuntimeEvent,
+    pub raw: Option<RawTurnPayload>,
+}
+
+impl TurnEvent {
+    /// A record for a kernel-synthesized event with no retained raw payload.
+    pub fn canonical(event: RuntimeEvent) -> Self {
+        Self { event, raw: None }
+    }
+
+    /// A record retaining the raw driver payload the event was derived from.
+    pub fn with_raw(event: RuntimeEvent, raw: RawTurnPayload) -> Self {
+        Self {
+            event,
+            raw: Some(raw),
+        }
+    }
+}
+
+/// Project a canonical journal to its public [`RuntimeEvent`] stream, dropping
+/// every retained raw payload. This is the only sanctioned way to derive
+/// operator-visible output from a journal: raw retention never contributes.
+pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeEvent> {
+    journal.iter().map(|record| &record.event)
+}
+
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
@@ -1555,13 +1600,14 @@ mod tests {
     };
 
     use super::{
-        execute_program_backed_turn, load_ready_state_value, safe_relative_path, ExecutionOutput,
-        NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
-        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        canonical_events, execute_program_backed_turn, load_ready_state_value, safe_relative_path,
+        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
+        RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimePathProjection,
+        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, TurnEvent,
+        RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1569,6 +1615,36 @@ mod tests {
         sync::mpsc,
         time::{sleep, timeout},
     };
+
+    #[test]
+    fn canonical_events_drops_retained_raw_payloads() {
+        let journal = vec![
+            TurnEvent::with_raw(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "hi".to_string(),
+                },
+                RawTurnPayload {
+                    driver: "codex-app-server".to_string(),
+                    payload: "{\"method\":\"item/agentMessage/delta\"}".to_string(),
+                },
+            ),
+            TurnEvent::canonical(RuntimeEvent::Done),
+        ];
+
+        let events: Vec<RuntimeEvent> = canonical_events(&journal).cloned().collect();
+
+        assert_eq!(
+            events,
+            vec![
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "hi".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+    }
 
     #[derive(Clone)]
     struct StubAttempt {
