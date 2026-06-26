@@ -1079,7 +1079,7 @@ pub struct RuntimeFileChange {
     pub total_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     MessageDelta {
         lane: RuntimeMessageLane,
