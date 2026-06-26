@@ -1487,7 +1487,7 @@ where
             if response_id(&message).is_some_and(|response_id| response_id == id) {
                 return parse_app_server_response(message, method);
             }
-            self.handle_message(message, events, thread_state).await?;
+            self.dispatch_message(message, events, thread_state).await?;
             if let Some(message) = self.turn_failure(None) {
                 bail!("{message}");
             }
@@ -1526,7 +1526,7 @@ where
                             let Some(message) = message? else {
                                 bail!("codex app-server closed before turn completed");
                             };
-                            self.handle_message(message, events, thread_state).await?;
+                            self.dispatch_message(message, events, thread_state).await?;
                         }
                         interrupt = interrupt_rx.recv() => {
                             if let Some(interrupt) = interrupt {
@@ -1545,7 +1545,7 @@ where
                     let Some(message) = self.transport.recv().await? else {
                         bail!("codex app-server closed before turn completed");
                     };
-                    self.handle_message(message, events, thread_state).await?;
+                    self.dispatch_message(message, events, thread_state).await?;
                 }
                 self.register_active_wait_turn(
                     thread_id,
@@ -1600,7 +1600,7 @@ where
                         let Some(message) = message? else {
                             bail!("codex app-server closed before context compaction completed");
                         };
-                        self.handle_message(message, events, thread_state).await?;
+                        self.dispatch_message(message, events, thread_state).await?;
                     }
                     interrupt = interrupt_rx.recv() => {
                         if let Some(interrupt) = interrupt {
@@ -1688,7 +1688,7 @@ where
                 parse_app_server_response(message, method)?;
                 return Ok(());
             }
-            self.handle_message(message, events, thread_state).await?;
+            self.dispatch_message(message, events, thread_state).await?;
         }
     }
 
@@ -1778,46 +1778,50 @@ where
                 .contains(thread_id)
     }
 
+    /// Translate one app-server message into the canonical `RuntimeEvent`s it
+    /// produces, in order. Protocol side effects (responding to server-initiated
+    /// requests, persisting the thread id, recording turn state) happen here;
+    /// emitting the returned events to a sender or journal is the caller's job.
     async fn handle_message(
         &mut self,
         message: Value,
-        events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
-    ) -> Result<()> {
+    ) -> Result<Vec<RuntimeEvent>> {
+        let mut events = Vec::new();
         if message.get("id").is_some() && message.get("method").is_some() {
             self.respond_to_server_request(&message).await?;
-            return Ok(());
+            return Ok(events);
         }
 
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             if let Some(artifact) =
                 self.generated_artifact_for_message(None, &message, thread_state)?
             {
-                drop(events.send(RuntimeEvent::Artifact { artifact }));
+                events.push(RuntimeEvent::Artifact { artifact });
             }
-            return Ok(());
+            return Ok(events);
         };
         let params = message.get("params").unwrap_or(&Value::Null);
         if let Some(artifact) =
             self.generated_artifact_for_message(Some(method), params, thread_state)?
         {
-            drop(events.send(RuntimeEvent::Artifact { artifact }));
+            events.push(RuntimeEvent::Artifact { artifact });
         }
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
                     thread_state.persist_thread_id(&thread_id)?;
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: None,
                         text: format!("codex thread started: {thread_id}"),
-                    }));
+                    });
                 }
             }
             "thread/name/updated" => {
-                drop(events.send(RuntimeEvent::Status {
+                events.push(RuntimeEvent::Status {
                     code: None,
                     text: "codex thread renamed".to_string(),
-                }));
+                });
             }
             "turn/started" => {
                 self.reset_turn_message_state();
@@ -1827,10 +1831,10 @@ where
                 ) {
                     self.started_thread_turns.insert(thread_id, turn_id);
                 }
-                drop(events.send(RuntimeEvent::Status {
+                events.push(RuntimeEvent::Status {
                     code: None,
                     text: "codex turn started".to_string(),
-                }));
+                });
             }
             "turn/completed" => {
                 self.reset_turn_message_state();
@@ -1845,47 +1849,61 @@ where
                     } else {
                         self.unmatched_turn_completed = true;
                     }
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: None,
                         text: "codex turn completed".to_string(),
-                    }));
-                    drop(events.send(RuntimeEvent::Done));
+                    });
+                    events.push(RuntimeEvent::Done);
                 }
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
                     let lane = self.agent_message_lane(params);
                     if lane == RuntimeMessageLane::Answer {
-                        self.record_answer_delta_boundary(params, events);
+                        if let Some(boundary) = self.record_answer_delta_boundary(params) {
+                            events.push(boundary);
+                        }
                     }
-                    drop(events.send(RuntimeEvent::MessageDelta { lane, text }));
+                    events.push(RuntimeEvent::MessageDelta { lane, text });
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    drop(events.send(RuntimeEvent::MessageDelta {
+                    events.push(RuntimeEvent::MessageDelta {
                         lane: RuntimeMessageLane::Reasoning,
                         text,
-                    }));
+                    });
                 }
             }
             "item/started" | "item/completed" | "item/updated" => {
-                for event in self.record_app_server_item(method, params) {
-                    drop(events.send(event));
-                }
+                events.extend(self.record_app_server_item(method, params));
             }
             "error" => {
                 let message = app_server_error_text(params);
                 if error_notification_will_retry(params) {
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: Some("runtime.retrying".to_string()),
                         text: message,
-                    }));
+                    });
                 } else {
                     self.remember_turn_failure(params, message);
                 }
             }
             _ => {}
+        }
+        Ok(events)
+    }
+
+    /// Translate one app-server message and forward its canonical events to the
+    /// live runtime event stream.
+    async fn dispatch_message(
+        &mut self,
+        message: Value,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        for event in self.handle_message(message, thread_state).await? {
+            drop(events.send(event));
         }
         Ok(())
     }
@@ -1975,11 +1993,9 @@ where
         }
     }
 
-    fn record_answer_delta_boundary(&mut self, params: &Value, events: &RuntimeEventSender) {
-        let Some(item_id) = self.agent_message_item_id(params) else {
-            return;
-        };
-        self.begin_answer_item(item_id, events);
+    fn record_answer_delta_boundary(&mut self, params: &Value) -> Option<RuntimeEvent> {
+        let item_id = self.agent_message_item_id(params)?;
+        self.begin_answer_item(item_id)
     }
 
     fn record_answer_item_completion(&mut self, method: &str, params: &Value) {
@@ -2001,18 +2017,21 @@ where
         self.agent_message_lanes.remove(&item_id);
     }
 
-    fn begin_answer_item(&mut self, item_id: String, events: &RuntimeEventSender) {
-        if self.active_answer_item_ids.insert(item_id.clone())
+    fn begin_answer_item(&mut self, item_id: String) -> Option<RuntimeEvent> {
+        let boundary = if self.active_answer_item_ids.insert(item_id.clone())
             && self
                 .last_answer_item_id
                 .as_deref()
                 .is_some_and(|last_item_id| last_item_id != item_id)
         {
-            drop(events.send(RuntimeEvent::MessageBoundary {
+            Some(RuntimeEvent::MessageBoundary {
                 lane: RuntimeMessageLane::Answer,
-            }));
-        }
+            })
+        } else {
+            None
+        };
         self.last_answer_item_id = Some(item_id);
+        boundary
     }
 
     fn reset_turn_message_state(&mut self) {
@@ -4822,7 +4841,7 @@ mod tests {
             json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_final", "delta": "Final answer."}}),
         ] {
             client
-                .handle_message(message, &event_tx, &thread_state)
+                .dispatch_message(message, &event_tx, &thread_state)
                 .await
                 .expect("handle message");
         }
@@ -4880,7 +4899,7 @@ mod tests {
             json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_body", "delta": "**Project**"}}),
         ] {
             client
-                .handle_message(message, &event_tx, &thread_state)
+                .dispatch_message(message, &event_tx, &thread_state)
                 .await
                 .expect("handle message");
         }
@@ -5930,7 +5949,7 @@ mod tests {
         let mut registered_turn_id = None;
 
         client
-            .handle_message(
+            .dispatch_message(
                 json!({
                     "method": "turn/started",
                     "params": {
