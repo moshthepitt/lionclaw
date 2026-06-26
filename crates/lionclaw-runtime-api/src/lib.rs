@@ -1116,6 +1116,10 @@ pub struct RawTurnPayload {
     pub payload: String,
 }
 
+// TODO(#159 OpenCode driver): the canonical journal is currently produced only
+// in tests (see the Codex equivalence test). Live program-backed turns and the
+// `ConversationDriver` trait adopt it when the second driver lands; remove this
+// note then.
 /// One record in a runtime turn's canonical journal.
 ///
 /// A protocol driver translates each harness message into journal records.

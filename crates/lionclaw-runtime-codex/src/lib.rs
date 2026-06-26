@@ -3109,14 +3109,14 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use lionclaw_runtime_api::{
-        append_streamed_text_boundary, append_streamed_text_delta, ExecutionOutput, NetworkMode,
-        RuntimeAdapter, RuntimeAuthKind, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-        RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
+        append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
+        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAuthKind,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChangeStatus,
+        RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
+        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
         RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
-        RUNTIME_SESSION_READY_MARKER,
+        TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
     use serde_json::{json, Value};
     use tokio::time::Instant;
@@ -3124,9 +3124,9 @@ mod tests {
 
     use super::{
         build_codex_app_server_program, build_codex_terminal_program, extract_app_server_turn_id,
-        load_saved_thread_id, save_thread_id, AppServerTransport, CodexAppServerClient,
-        CodexRuntimeAdapter, CodexRuntimeConfig, CodexTerminalTranscriptExportRequest,
-        CODEX_THREAD_ID_STATE_FILE,
+        load_saved_thread_id, response_id, save_thread_id, AppServerTransport,
+        CodexAppServerClient, CodexRuntimeAdapter, CodexRuntimeConfig,
+        CodexTerminalTranscriptExportRequest, CODEX_THREAD_ID_STATE_FILE,
     };
 
     fn runtime_not_ready() -> RuntimeSessionReady {
@@ -5836,6 +5836,106 @@ mod tests {
             .any(|event| matches!(event, RuntimeEvent::Done)));
 
         adapter.close(&handle).await.expect("close");
+    }
+
+    /// Translate a fixture's server notifications into a canonical turn journal,
+    /// tagging every event with the raw app-server message it came from. The
+    /// JSON-RPC response is consumed by `request` in the real flow, not
+    /// translated, so it is skipped here. Returns the client too, so callers can
+    /// inspect recorded turn state (e.g. failures) the journal does not carry.
+    async fn codex_fixture_canonical_journal(
+        fixture_name: &str,
+    ) -> (Vec<TurnEvent>, CodexAppServerClient<FakeAppServerTransport>) {
+        let fixture = codex_protocol_fixture(fixture_name);
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let mut journal = Vec::new();
+        for message in fixture_server_messages(&fixture) {
+            if response_id(&message).is_some() {
+                continue;
+            }
+            let raw = RawTurnPayload {
+                driver: "codex-app-server".to_string(),
+                payload: message.to_string(),
+            };
+            let events = client
+                .handle_message(message, &thread_state)
+                .await
+                .expect("handle message");
+            journal.extend(
+                events
+                    .into_iter()
+                    .map(|event| TurnEvent::with_raw(event, raw.clone())),
+            );
+        }
+        (journal, client)
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_turn_journals_project_to_canonical_events() {
+        let (successful, _) = codex_fixture_canonical_journal("successful_turn_v2").await;
+        assert_eq!(
+            canonical_events(&successful).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "Hello ".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "world!".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+        assert!(successful.iter().all(|record| record
+            .raw
+            .as_ref()
+            .is_some_and(|raw| raw.driver == "codex-app-server")));
+
+        let (compaction, _) =
+            codex_fixture_canonical_journal("compact_context_compaction_v2").await;
+        assert_eq!(
+            canonical_events(&compaction).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compaction started".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compacted".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+
+        // An interrupted turn records a failure instead of emitting events, so
+        // its canonical journal is empty and the interruption is recorded as a
+        // turn failure (an empty journal alone would not distinguish a recorded
+        // interruption from the notification being ignored).
+        let (interrupted, client) = codex_fixture_canonical_journal("turn_interrupt_v2").await;
+        assert!(interrupted.is_empty());
+        assert_eq!(
+            client.turn_failure(Some("turn_1")),
+            Some("codex turn interrupted")
+        );
     }
 
     #[tokio::test]
