@@ -334,21 +334,40 @@ impl SessionTurnStore {
         let raw_payload = record.raw.as_ref().map(|raw| raw.payload.as_str());
         let created_at_ms = now_ms();
 
-        let row = sqlx::query(
-            "INSERT INTO session_turn_journal_events \
-             (turn_id, sequence_no, event_json, raw_driver, raw_payload, created_at_ms) \
-             VALUES (?1, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turn_journal_events WHERE turn_id = ?1), ?2, ?3, ?4, ?5) \
-             RETURNING sequence_no",
+        let mut tx = self.pool.begin().await.with_context(|| {
+            format!("failed to begin journal append for session turn {turn_id}")
+        })?;
+        let sequence_no_raw: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_no), 0) + 1 \
+             FROM session_turn_journal_events \
+             WHERE turn_id = ?1",
         )
         .bind(turn_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| {
+            format!("failed to allocate journal sequence for session turn {turn_id}")
+        })?;
+
+        sqlx::query(
+            "INSERT INTO session_turn_journal_events \
+             (turn_id, sequence_no, event_json, raw_driver, raw_payload, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(turn_id.to_string())
+        .bind(sequence_no_raw)
         .bind(event_json)
         .bind(raw_driver)
         .bind(raw_payload)
         .bind(created_at_ms)
-        .fetch_one(&self.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to append journal event for session turn {turn_id}"))?;
-        let sequence_no_raw: i64 = row.get("sequence_no");
+
+        tx.commit().await.with_context(|| {
+            format!("failed to commit journal append for session turn {turn_id}")
+        })?;
+
         u64::try_from(sequence_no_raw)
             .with_context(|| format!("invalid journal sequence_no '{sequence_no_raw}'"))
     }

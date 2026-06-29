@@ -608,6 +608,7 @@ pub struct KernelOptions {
     pub project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub scheduler: SchedulerConfig,
     pub applied_state: AppliedState,
+    pub retain_runtime_raw_turn_payloads: bool,
 }
 
 impl fmt::Debug for KernelOptions {
@@ -636,6 +637,10 @@ impl fmt::Debug for KernelOptions {
             .field("project_instance_runtime", &self.project_instance_runtime)
             .field("scheduler", &self.scheduler)
             .field("applied_state", &"..")
+            .field(
+                "retain_runtime_raw_turn_payloads",
+                &self.retain_runtime_raw_turn_payloads,
+            )
             .finish()
     }
 }
@@ -661,6 +666,7 @@ impl Default for KernelOptions {
             project_instance_runtime: None,
             scheduler: SchedulerConfig::default(),
             applied_state: AppliedState::default(),
+            retain_runtime_raw_turn_payloads: false,
         }
     }
 }
@@ -861,6 +867,7 @@ pub struct Kernel {
     private_context_projector: Arc<dyn PrivateContextProjector>,
     private_context_recorder: PrivateContextRecorderService,
     hidden_compaction_turn_timeout: Duration,
+    retain_runtime_raw_turn_payloads: bool,
 }
 
 impl Kernel {
@@ -1032,6 +1039,7 @@ impl Kernel {
             private_context_projector,
             private_context_recorder,
             hidden_compaction_turn_timeout,
+            retain_runtime_raw_turn_payloads: options.retain_runtime_raw_turn_payloads,
         };
 
         kernel.bootstrap().await;
@@ -7785,7 +7793,7 @@ mod tests {
         PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES, PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
     };
     use crate::kernel::runtime::{
-        RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+        RawTurnPayload, RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
         RuntimeTurnJournalSender,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
@@ -8104,6 +8112,7 @@ mod tests {
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
     const TEST_REPLY_RUNTIME_ID: &str = "reply-runtime";
+    const TEST_RAW_JOURNAL_RUNTIME_ID: &str = "raw-journal-runtime";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -8355,6 +8364,69 @@ mod tests {
         }
     }
 
+    struct RawJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for RawJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_RAW_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("raw-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(journal.send(TurnEvent::with_raw(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "raw-backed answer".to_string(),
+                },
+                RawTurnPayload {
+                    driver: "test-driver".to_string(),
+                    payload: "{\"secret\":\"debug-only\"}".to_string(),
+                },
+            )));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     struct RuntimeCallCounters {
         starts: Arc<AtomicUsize>,
         turns: Arc<AtomicUsize>,
@@ -8466,6 +8538,69 @@ mod tests {
                 },
             )
             .await
+    }
+
+    async fn execute_raw_journal_runtime_turn(retain_raw: bool) -> Vec<TurnEvent> {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                retain_runtime_raw_turn_payloads: retain_raw,
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_RAW_JOURNAL_RUNTIME_ID,
+                Arc::new(RawJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "hello".to_string(),
+                    prompt_user_text: "hello".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_RAW_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("raw journal runtime turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        assert_eq!(response.assistant_text, "raw-backed answer");
+        kernel
+            .session_turns
+            .list_journal_events(turn_id)
+            .await
+            .expect("list runtime journal")
     }
 
     async fn open_test_session(kernel: &Kernel) -> Uuid {
@@ -9982,6 +10117,40 @@ mod tests {
                 .text,
             "hello from native tui"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_strips_raw_payloads_unless_debug_retention_enabled() {
+        let default_journal = execute_raw_journal_runtime_turn(false).await;
+        assert_eq!(default_journal.len(), 2);
+        assert!(default_journal.iter().all(|record| record.raw.is_none()));
+
+        let retained_journal = execute_raw_journal_runtime_turn(true).await;
+        assert_eq!(
+            default_journal
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            retained_journal
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            retained_journal[0]
+                .raw
+                .as_ref()
+                .map(|raw| raw.driver.as_str()),
+            Some("test-driver")
+        );
+        assert_eq!(
+            retained_journal[0]
+                .raw
+                .as_ref()
+                .map(|raw| raw.payload.as_str()),
+            Some("{\"secret\":\"debug-only\"}")
+        );
+        assert!(retained_journal[1].raw.is_none());
     }
 
     #[tokio::test]
@@ -22338,8 +22507,17 @@ impl Kernel {
         events: &mut Vec<RuntimeEvent>,
         checkpoints: &mut AssistantCheckpointState,
     ) -> Result<(), FailedRuntimeTurn> {
+        let event = record.event;
+        let persisted_record = if self.retain_runtime_raw_turn_payloads {
+            TurnEvent {
+                event: event.clone(),
+                raw: record.raw,
+            }
+        } else {
+            TurnEvent::canonical(event.clone())
+        };
         self.session_turns
-            .append_journal_event(turn_id, &record)
+            .append_journal_event(turn_id, &persisted_record)
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
@@ -22351,7 +22529,7 @@ impl Kernel {
             turn_id,
             stream_context,
             event_sink,
-            record.event,
+            event,
             events,
             checkpoints,
         )
