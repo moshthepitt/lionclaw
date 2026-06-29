@@ -74,6 +74,7 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                                 .collect(),
                             model: runtime.model.clone(),
                             mode: runtime.mode.clone(),
+                            auth: runtime.auth.clone(),
                             session_id_state_file: ".lionclaw-acp-session-id".to_string(),
                             default_working_dir: "/workspace".to_string(),
                         })),

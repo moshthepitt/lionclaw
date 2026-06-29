@@ -42,10 +42,11 @@ use uuid::Uuid;
 
 use lionclaw_runtime_api::{
     load_ready_state_value, save_state_value, ConversationDriver, ExecutionOutput, RawTurnPayload,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeEvent,
+    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
+    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
+    RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
@@ -60,6 +61,7 @@ pub struct AcpRuntimeConfig {
     pub environment: Vec<(String, String)>,
     pub model: Option<String>,
     pub mode: Option<String>,
+    pub auth: Option<RuntimeAuthKind>,
     pub session_id_state_file: String,
     pub default_working_dir: String,
 }
@@ -77,6 +79,7 @@ impl AcpRuntimeConfig {
             environment: Vec::new(),
             model: None,
             mode: None,
+            auth: None,
             session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
             default_working_dir: ACP_DEFAULT_WORKING_DIR.to_string(),
         }
@@ -260,7 +263,7 @@ fn build_acp_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
         args: config.args.clone(),
         environment: config.environment.clone(),
         stdin: String::new(),
-        auth: None,
+        auth: config.auth.clone(),
     }
 }
 
@@ -828,11 +831,11 @@ mod tests {
     use uuid::Uuid;
 
     use lionclaw_runtime_api::{
-        canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent,
-        RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
-        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
-        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-        RUNTIME_SESSION_READY_MARKER,
+        canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind,
+        RuntimeEvent, RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
@@ -848,6 +851,7 @@ mod tests {
             environment: vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())],
             model,
             mode,
+            auth: None,
             session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
             default_working_dir: "/workspace".to_string(),
         }
@@ -880,6 +884,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeAcpProgramExecutor {
         inbound: VecDeque<String>,
+        expected_auth: Option<RuntimeAuthKind>,
         state: Arc<Mutex<FakeAcpProgramState>>,
     }
 
@@ -911,7 +916,7 @@ mod tests {
                 vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())]
             );
             assert!(program.stdin.is_empty());
-            assert!(program.auth.is_none());
+            assert_eq!(program.auth, self.expected_auth);
             Ok(Box::new(FakeAcpProgramSession {
                 inbound: std::mem::take(&mut self.inbound),
                 output: ExecutionOutput {
@@ -1048,10 +1053,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(
-            Some("gpt-5".to_string()),
-            Some("plan".to_string()),
-        ));
+        let expected_auth = RuntimeAuthKind::from_static("test-acp-auth");
+        let mut config = opencode_acp_config(Some("gpt-5".to_string()), Some("plan".to_string()));
+        config.auth = Some(expected_auth.clone());
+        let adapter = AcpRuntimeAdapter::new(config);
         assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
 
         let handle = adapter
@@ -1076,6 +1081,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"answer"}}}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
             ]),
+            expected_auth: Some(expected_auth),
             state: Arc::clone(&fake_state),
         };
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1222,6 +1228,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
             ]),
+            expected_auth: None,
             state: Arc::clone(&fake_state),
         };
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
