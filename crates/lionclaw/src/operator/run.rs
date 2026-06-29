@@ -1292,12 +1292,12 @@ exit 0
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -1324,12 +1324,12 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
         let healthy_dir = temp_dir.path().join("healthy-runtime");
         fs::create_dir_all(&healthy_dir).expect("healthy runtime dir");
         let opencode_stub = healthy_dir.join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &opencode_stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
         let broken_podman = temp_dir.path().join("podman");
         write_script(
@@ -1382,13 +1382,13 @@ exit 0
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"reasoning","text":"planning next step"}'
-echo '{"type":"text","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_test","content":{"type":"text","text":"planning next step"}}}}"#,
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -1414,13 +1414,12 @@ echo '{"type":"text","text":"hello from opencode"}'
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"reasoning","text":"checking the workspace"}'
-exit 7
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_test","content":{"type":"text","text":"checking the workspace"}}}}"#,
+            ],
+            7,
         );
 
         let mut config = OperatorConfig::default();
@@ -1610,6 +1609,59 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_test","turnId":"turn_compact_test","turn":{"id":"turn_compact_test","status":"completed"}}}'
       ;;
   esac
+done
+"#,
+        );
+
+        write_script(path, &script);
+    }
+
+    #[cfg(unix)]
+    fn write_opencode_acp_stub(path: &std::path::Path, turn_events: &[&str], exit_code: i32) {
+        let mut script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+while IFS= read -r line; do
+  case "${line}" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_test","configOptions":[]}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}'
+      ;;
+    *'"method":"session/prompt"'*)
+"#
+        .to_string();
+
+        for event in turn_events {
+            assert!(
+                !event.contains('\''),
+                "test event JSON cannot contain single quotes"
+            );
+            script.push_str("      printf '%s\\n' '");
+            script.push_str(event);
+            script.push_str("'\n");
+        }
+
+        if exit_code == 0 {
+            script.push_str(
+                r#"      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}'
+      ;;
+"#,
+            );
+        } else {
+            script.push_str(&format!(
+                r#"      exit {exit_code}
+      ;;
+"#
+            ));
+        }
+
+        script.push_str(
+            r#"  esac
 done
 "#,
         );

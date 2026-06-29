@@ -3265,6 +3265,7 @@ mod tests {
     ) -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_path_projections: vec![
@@ -5110,6 +5111,7 @@ mod tests {
                     },
                     context: RuntimeExecutionContext {
                         network_mode: NetworkMode::On,
+                        working_dir: None,
                         environment: Vec::new(),
                         runtime_state_root: None,
                         runtime_path_projections: Vec::new(),
@@ -5591,6 +5593,7 @@ mod tests {
         let runtime_state_root = PathBuf::from("/host/runtime-state");
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_path_projections: vec![

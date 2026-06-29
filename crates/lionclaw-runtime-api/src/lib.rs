@@ -815,6 +815,8 @@ pub struct RuntimeProgramTurnExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionContext {
     pub network_mode: NetworkMode,
+    /// Runtime-visible current working directory for program-backed turns.
+    pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub runtime_state_root: Option<PathBuf>,
     pub runtime_path_projections: Vec<RuntimePathProjection>,
@@ -1844,6 +1846,7 @@ mod tests {
     fn execution_context() -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
@@ -1870,6 +1873,7 @@ mod tests {
     fn runtime_execution_context_resolves_longest_runtime_path_projection() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(PathBuf::from("/host/runtime-root")),
             runtime_path_projections: vec![
@@ -1914,6 +1918,7 @@ mod tests {
     fn runtime_execution_context_keeps_equal_depth_blocks_order_independent() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: vec![

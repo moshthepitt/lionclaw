@@ -147,21 +147,21 @@ use super::{
     },
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
-        execute_captured, execute_streaming, project_runtime_skills,
-        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
-        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
-        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
-        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        execute_captured, execute_streaming, map_host_path_into_runtime_mount,
+        project_runtime_skills, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, runtime_native_home_mount_source,
+        runtime_state_mount_source, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
@@ -363,6 +363,7 @@ impl RuntimeChannelSendContext {
     fn host_path_for_runtime_path(&self, runtime_path: impl AsRef<Path>) -> Option<PathBuf> {
         RuntimeExecutionContext {
             network_mode: NetworkMode::None,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(self.runtime_state_root.clone()),
             runtime_path_projections: self.runtime_path_projections.clone(),
@@ -760,6 +761,13 @@ fn runtime_execution_context(
 ) -> anyhow::Result<RuntimeExecutionContext> {
     Ok(RuntimeExecutionContext {
         network_mode: plan.network_mode,
+        working_dir: plan
+            .working_dir
+            .as_deref()
+            .map(|working_dir| {
+                map_host_path_into_runtime_mount(working_dir, &plan.mounts, "working directory")
+            })
+            .transpose()?,
         environment: plan.environment.clone(),
         runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
         runtime_path_projections: runtime_path_projections_for_plan(plan)?,
@@ -8050,6 +8058,31 @@ mod tests {
             escape_classes: std::collections::BTreeSet::new(),
             limits: crate::kernel::runtime::ExecutionLimits::default(),
         }
+    }
+
+    #[test]
+    fn runtime_execution_context_uses_runtime_visible_working_dir() {
+        let mut plan = test_execution_plan("opencode");
+        plan.working_dir = Some("/host/workspace/crates/runtime".to_string());
+        plan.mounts = vec![
+            MountSpec {
+                source: "/host/workspace".into(),
+                target: "/workspace".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: "/host/workspace/crates".into(),
+                target: "/workspace/crates".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let context = runtime_execution_context(&plan).expect("runtime context");
+
+        assert_eq!(
+            context.working_dir.as_deref(),
+            Some("/workspace/crates/runtime")
+        );
     }
 
     const TEST_NATIVE_HOME_ARTIFACT_DIR: &str = "generated-artifacts/images";

@@ -144,11 +144,16 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let RuntimeProgramTurnExecution {
-            input, executor, ..
+            input,
+            context,
+            executor,
         } = execution;
         let mut driver = OpenCodeAcpConversationDriver {
             config: self.config.clone(),
             sessions: Arc::clone(&self.sessions),
+            working_dir: context
+                .working_dir
+                .unwrap_or_else(|| OPENCODE_ACP_WORKSPACE_PATH.to_string()),
             executor,
         };
         driver.run_turn(input, journal).await
@@ -212,6 +217,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 struct OpenCodeAcpConversationDriver {
     config: OpenCodeRuntimeConfig,
     sessions: Arc<RwLock<HashMap<String, OpenCodeSessionState>>>,
+    working_dir: String,
     executor: Box<dyn RuntimeProgramExecutor>,
 }
 
@@ -235,7 +241,12 @@ impl ConversationDriver for OpenCodeAcpConversationDriver {
         let result = async {
             client.initialize().await?;
             let session_id = client
-                .ensure_session(&self.sessions, &runtime_session_id, &session_state)
+                .ensure_session(
+                    &self.sessions,
+                    &runtime_session_id,
+                    &session_state,
+                    &self.working_dir,
+                )
                 .await?;
             client.configure_session(&self.config, &session_id).await?;
             client.prompt(&session_id, &input.prompt, &journal).await?;
@@ -306,13 +317,14 @@ impl OpenCodeAcpClient {
         sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
         runtime_session_id: &str,
         session_state: &OpenCodeSessionState,
+        working_dir: &str,
     ) -> Result<String> {
         if let Some(session_id) = session_state.session_id.as_deref() {
             self.request(
                 "session/load",
                 json!({
                     "sessionId": session_id,
-                    "cwd": OPENCODE_ACP_WORKSPACE_PATH,
+                    "cwd": working_dir,
                     "mcpServers": [],
                 }),
                 None,
@@ -325,7 +337,7 @@ impl OpenCodeAcpClient {
             .request(
                 "session/new",
                 json!({
-                    "cwd": OPENCODE_ACP_WORKSPACE_PATH,
+                    "cwd": working_dir,
                     "mcpServers": [],
                 }),
                 None,
@@ -1662,6 +1674,7 @@ mod tests {
     fn opencode_acp_driver_context(runtime_state_root: PathBuf) -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root),
             runtime_path_projections: Vec::new(),
@@ -1948,6 +1961,8 @@ mod tests {
             state: Arc::clone(&fake_state),
         };
         let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = opencode_acp_driver_context(runtime_state_root.clone());
+        context.working_dir = Some("/workspace/crates/example".to_string());
 
         adapter
             .program_backed_turn(
@@ -1958,7 +1973,7 @@ mod tests {
                         fresh_prompt: None,
                         runtime_skill_ids: Vec::new(),
                     },
-                    context: opencode_acp_driver_context(runtime_state_root.clone()),
+                    context,
                     executor: Box::new(executor),
                 },
                 journal_tx,
@@ -2003,6 +2018,7 @@ mod tests {
                 "session/prompt",
             ]
         );
+        assert_eq!(sent[1]["params"]["cwd"], json!("/workspace/crates/example"));
         assert_eq!(sent[2]["params"]["modelId"], json!("gpt-5"));
         assert_eq!(sent[3]["params"]["configId"], json!("mode"));
         assert_eq!(sent[3]["params"]["value"], json!("plan"));
@@ -2057,6 +2073,80 @@ mod tests {
             .await
             .expect("start");
         assert!(handle.resumes_existing_session);
+    }
+
+    #[tokio::test]
+    async fn opencode_acp_resume_uses_effective_working_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE),
+            "ses_ready\n",
+        )
+        .expect("write session id");
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            })
+            .await
+            .expect("start");
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+            ]),
+            state: Arc::clone(&fake_state),
+        };
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = opencode_acp_driver_context(runtime_state_root);
+        context.working_dir = Some("/workspace/packages/runtime".to_string());
+
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id,
+                        prompt: "continue".to_string(),
+                        fresh_prompt: None,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context,
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP resume turn");
+
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![RuntimeEvent::Done]
+        );
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+        assert_eq!(
+            sent.iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "session/load", "session/prompt"]
+        );
+        assert_eq!(sent[1]["params"]["sessionId"], json!("ses_ready"));
+        assert_eq!(
+            sent[1]["params"]["cwd"],
+            json!("/workspace/packages/runtime")
+        );
     }
 
     #[test]

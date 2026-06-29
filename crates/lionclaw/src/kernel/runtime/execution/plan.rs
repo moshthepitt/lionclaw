@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::skills::validate_skill_alias;
@@ -41,6 +42,51 @@ pub fn runtime_state_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
 
 pub fn runtime_native_home_mount_source(mounts: &[MountSpec]) -> Option<&Path> {
     mount_source_for_target(mounts, RUNTIME_HOME_MOUNT_TARGET)
+}
+
+/// Maps a host-side path selected by execution policy into the path visible to
+/// the runtime process through the configured mounts.
+pub fn map_host_path_into_runtime_mount(
+    host_path: &str,
+    mounts: &[MountSpec],
+    path_label: &str,
+) -> Result<String> {
+    let requested = PathBuf::from(host_path);
+    let (mount, relative) = longest_mount_prefix(&requested, mounts).ok_or_else(|| {
+        anyhow!(
+            "{path_label} '{}' is not inside any configured runtime mount",
+            requested.display()
+        )
+    })?;
+
+    let runtime_root = Path::new(&mount.target);
+    let mapped = if relative.as_os_str().is_empty() {
+        runtime_root.to_path_buf()
+    } else {
+        runtime_root.join(relative)
+    };
+
+    Ok(mapped.to_string_lossy().to_string())
+}
+
+fn longest_mount_prefix<'a>(
+    requested: &Path,
+    mounts: &'a [MountSpec],
+) -> Option<(&'a MountSpec, PathBuf)> {
+    mounts
+        .iter()
+        .filter_map(|mount| {
+            strip_mount_prefix(requested, &mount.source).map(|relative| (mount, relative))
+        })
+        .max_by_key(|(mount, _)| mount.source.components().count())
+}
+
+fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
+    if requested == source {
+        return Some(PathBuf::new());
+    }
+
+    requested.strip_prefix(source).ok().map(Path::to_path_buf)
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.

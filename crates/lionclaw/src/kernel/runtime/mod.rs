@@ -10,7 +10,7 @@ mod skill_projection;
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime_home};
 pub use execution::{
-    execute_attached, execute_captured, execute_streaming,
+    execute_attached, execute_captured, execute_streaming, map_host_path_into_runtime_mount,
     resolve_oci_image_compatibility_identity, runtime_native_home_mount_source,
     runtime_skill_mount_target_alias, runtime_state_mount_source, skill_mount_target,
     spawn_interactive, validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
