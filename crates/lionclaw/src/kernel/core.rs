@@ -8173,6 +8173,7 @@ mod tests {
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
     const TEST_REPLY_RUNTIME_ID: &str = "reply-runtime";
     const TEST_RAW_JOURNAL_RUNTIME_ID: &str = "raw-journal-runtime";
+    const TEST_TIMEOUT_JOURNAL_RUNTIME_ID: &str = "timeout-journal-runtime";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -8462,6 +8463,65 @@ mod tests {
                 },
             )));
             drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TimeoutJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for TimeoutJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("timeout-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "before timeout".to_string(),
+                })),
+            );
+            sleep(Duration::from_millis(250)).await;
             Ok(RuntimeTurnResult::default())
         }
 
@@ -10211,6 +10271,89 @@ mod tests {
             Some("{\"secret\":\"debug-only\"}")
         );
         assert!(retained_journal[1].raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn timed_out_runtime_turn_flushes_buffered_journal_before_abort() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_turn_idle_timeout: Duration::from_millis(50),
+                runtime_turn_hard_timeout: Duration::from_millis(500),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_TIMEOUT_JOURNAL_RUNTIME_ID,
+                Arc::new(TimeoutJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "timeout".to_string(),
+                    prompt_user_text: "timeout".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("runtime timeout response");
+
+        assert_eq!(response.status, SessionTurnStatus::TimedOut);
+        let journal = kernel
+            .session_turns
+            .list_journal_events(turn_id)
+            .await
+            .expect("list timeout journal");
+        let events = journal
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "before timeout".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::Error {
+                code: Some(code),
+                text,
+            } if code == "runtime.timeout" && text.contains("idle timed out")
+        ));
     }
 
     #[tokio::test]
@@ -19871,6 +20014,53 @@ impl QueuedTurnTerminal {
 
 const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
 const ASSISTANT_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_JOURNAL_FLUSH_RECORDS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeJournalContext<'a> {
+    turn_id: Uuid,
+    session_id: Uuid,
+    runtime_id: &'a str,
+    runtime_session_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeTurnEventDispatch<'a> {
+    stream_context: &'a Option<ChannelStreamContext>,
+    event_sink: &'a Option<RuntimeEventSink>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeJournalPersistence {
+    pending: Vec<TurnEvent>,
+}
+
+impl RuntimeJournalPersistence {
+    fn push(&mut self, record: TurnEvent) {
+        self.pending.push(record);
+    }
+
+    fn flush_due(&self) -> bool {
+        self.pending.len() >= RUNTIME_JOURNAL_FLUSH_RECORDS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pending(&self) -> &[TurnEvent] {
+        &self.pending
+    }
+
+    fn clear_flushed(&mut self) {
+        self.pending.clear();
+    }
+}
+
+struct RecordRuntimeTurnEventOutcome {
+    persisted_record: TurnEvent,
+    checkpointed: bool,
+}
 
 #[derive(Debug, Default)]
 struct AssistantCheckpointState {
@@ -22465,9 +22655,9 @@ impl Kernel {
         turn_id: Uuid,
         stream_context: &Option<ChannelStreamContext>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), KernelError> {
+    ) -> Result<bool, KernelError> {
         if !checkpoints.checkpoint_due() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.session_turns
@@ -22483,7 +22673,7 @@ impl Kernel {
             }
         }
         checkpoints.mark_checkpointed();
-        Ok(())
+        Ok(true)
     }
 
     async fn record_runtime_event(
@@ -22494,7 +22684,7 @@ impl Kernel {
         event: RuntimeEvent,
         events: &mut Vec<RuntimeEvent>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), FailedRuntimeTurn> {
+    ) -> Result<bool, FailedRuntimeTurn> {
         checkpoints.observe(&event);
         let appended_sequence = if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
             // Durable channel streams get their terminal done after the turn is persisted.
@@ -22511,7 +22701,8 @@ impl Kernel {
                 })?
         };
         checkpoints.observe_sequence(&event, appended_sequence);
-        self.checkpoint_running_turn(turn_id, stream_context, checkpoints)
+        let checkpointed = self
+            .checkpoint_running_turn(turn_id, stream_context, checkpoints)
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
@@ -22520,7 +22711,7 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         events.push(event);
-        Ok(())
+        Ok(checkpointed)
     }
 
     async fn record_runtime_turn_event(
@@ -22531,7 +22722,7 @@ impl Kernel {
         record: TurnEvent,
         events: &mut Vec<RuntimeEvent>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), FailedRuntimeTurn> {
+    ) -> Result<RecordRuntimeTurnEventOutcome, FailedRuntimeTurn> {
         let event = record.event;
         let persisted_record = if self.retain_runtime_raw_turn_payloads {
             TurnEvent {
@@ -22541,24 +22732,111 @@ impl Kernel {
         } else {
             TurnEvent::canonical(event.clone())
         };
-        self.session_turns
-            .append_journal_event(turn_id, &persisted_record)
+        let checkpointed = self
+            .record_runtime_event(
+                turn_id,
+                stream_context,
+                event_sink,
+                event,
+                events,
+                checkpoints,
+            )
+            .await?;
+        Ok(RecordRuntimeTurnEventOutcome {
+            persisted_record,
+            checkpointed,
+        })
+    }
+
+    async fn record_and_buffer_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+        journal: &mut RuntimeJournalPersistence,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let outcome = self
+            .record_runtime_turn_event(
+                journal_context.turn_id,
+                dispatch.stream_context,
+                dispatch.event_sink,
+                record,
+                events,
+                checkpoints,
+            )
+            .await?;
+        journal.push(outcome.persisted_record);
+        if outcome.checkpointed || journal.flush_due() {
+            self.flush_runtime_turn_journal_best_effort(journal_context, journal)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn flush_runtime_turn_journal_best_effort(
+        &self,
+        context: RuntimeJournalContext<'_>,
+        journal: &mut RuntimeJournalPersistence,
+    ) {
+        if journal.is_empty() {
+            return;
+        }
+        let record_count = journal.pending().len();
+        match self
+            .session_turns
+            .append_journal_events(context.turn_id, journal.pending())
             .await
-            .map_err(|err| FailedRuntimeTurn {
-                events: events.clone(),
-                status: SessionTurnStatus::Failed,
-                error_code: "runtime.error".to_string(),
-                error_text: err.to_string(),
-            })?;
-        self.record_runtime_event(
-            turn_id,
-            stream_context,
-            event_sink,
-            event,
+        {
+            Ok(_) => journal.clear_flushed(),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    turn_id = %context.turn_id,
+                    runtime_id = context.runtime_id,
+                    runtime_session_id = context.runtime_session_id,
+                    record_count,
+                    "failed to append runtime turn journal batch"
+                );
+                self.append_audit_event_best_effort(
+                    "runtime.turn.journal_append_failed",
+                    Some(context.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": context.turn_id,
+                        "runtime_id": context.runtime_id,
+                        "runtime_session_id": context.runtime_session_id,
+                        "record_count": record_count,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_and_flush_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let mut journal = RuntimeJournalPersistence::default();
+        self.record_and_buffer_runtime_turn_event(
+            journal_context,
+            dispatch,
+            record,
             events,
             checkpoints,
+            &mut journal,
         )
-        .await
+        .await?;
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal)
+            .await;
+        Ok(())
     }
 
     fn session_key_worker_key(channel_id: &str, session_key: &str) -> String {
@@ -25073,6 +25351,17 @@ impl Kernel {
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
         let mut journal_rx_open = true;
 
         loop {
@@ -25080,13 +25369,13 @@ impl Kernel {
                 maybe_record = journal_rx.recv(), if journal_rx_open => {
                     match maybe_record {
                         Some(record) => {
-                            self.record_runtime_turn_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
+                            self.record_and_buffer_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
                                 record,
                                 &mut events,
                                 &mut checkpoints,
+                                &mut journal_persistence,
                             )
                             .await?;
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
@@ -25098,16 +25387,18 @@ impl Kernel {
                 }
                 output = &mut turn_task => {
                     while let Some(record) = journal_rx.recv().await {
-                        self.record_runtime_turn_event(
-                            turn_id,
-                            &stream_context,
-                            &event_sink,
+                        self.record_and_buffer_runtime_turn_event(
+                            journal_context,
+                            event_dispatch,
                             record,
                             &mut events,
                             &mut checkpoints,
+                            &mut journal_persistence,
                         )
                         .await?;
                     }
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return match output {
                         Ok(Ok(result)) => {
                             self.audit
@@ -25166,10 +25457,9 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_turn_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
                                 TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
@@ -25205,10 +25495,9 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_turn_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
                                 TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
@@ -25231,6 +25520,8 @@ impl Kernel {
                         "Runtime idle timed out after {} with no output.",
                         format_duration(idle_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25255,6 +25546,8 @@ impl Kernel {
                         "Runtime reached the {} safety limit.",
                         format_duration(hard_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25275,6 +25568,8 @@ impl Kernel {
                         .await;
                 }
                 reason = &mut cancel_signal => {
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25768,10 +26063,17 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
-        self.record_runtime_turn_event(
-            turn_id,
-            stream_context,
-            event_sink,
+        self.record_and_flush_runtime_turn_event(
+            RuntimeJournalContext {
+                turn_id,
+                session_id,
+                runtime_id,
+                runtime_session_id: &handle.runtime_session_id,
+            },
+            RuntimeTurnEventDispatch {
+                stream_context,
+                event_sink,
+            },
             TurnEvent::canonical(RuntimeEvent::Error {
                 code: Some(error_code.to_string()),
                 text: reason.clone(),
@@ -25812,18 +26114,31 @@ impl Kernel {
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
         checkpoints.seed(assistant_text);
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
         while let Some(event) = event_rx.recv().await {
-            self.record_runtime_turn_event(
-                turn_id,
-                &stream_context,
-                &event_sink,
+            self.record_and_buffer_runtime_turn_event(
+                journal_context,
+                event_dispatch,
                 TurnEvent::canonical(event),
                 &mut events,
                 &mut checkpoints,
+                &mut journal_persistence,
             )
             .await
             .map_err(|err| anyhow::anyhow!(err.error_text))?;
         }
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+            .await;
 
         self.audit
             .append(

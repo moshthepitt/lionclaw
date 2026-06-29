@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -13,9 +13,9 @@ use lionclaw::{
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
-            RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
-            RuntimeTurnResult, TurnEvent,
+            RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeProgramTurnExecution,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+            RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
         },
         Kernel, KernelOptions,
     },
@@ -111,6 +111,66 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
         timeout_events.events[0].details["timeout_kind"].as_str(),
         Some("idle"),
         "timeout audit should distinguish idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn runtime_timeout_waits_for_program_backed_cancel_cleanup_before_abort() {
+    let sandbox = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &sandbox.db_path(),
+        KernelOptions {
+            default_runtime_id: Some("cleanup-program".to_string()),
+            runtime_turn_idle_timeout: Duration::from_millis(50),
+            runtime_turn_hard_timeout: Duration::from_millis(500),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let cancel_requested_notify = Arc::new(tokio::sync::Notify::new());
+    let turn_cleaned_up = Arc::new(AtomicBool::new(false));
+    let turn_cleaned_notify = Arc::new(tokio::sync::Notify::new());
+    kernel
+        .register_runtime_adapter(
+            "cleanup-program",
+            Arc::new(CleanupAwareProgramBackedRuntimeAdapter {
+                cancel_requested: cancel_requested.clone(),
+                cancel_requested_notify: cancel_requested_notify.clone(),
+                turn_cleaned_up: turn_cleaned_up.clone(),
+                turn_cleaned_notify: turn_cleaned_notify.clone(),
+            }),
+        )
+        .await;
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "cleanup-peer".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("open session");
+
+    let turn = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "trigger cleanup-aware timeout".to_string(),
+            runtime_id: Some("cleanup-program".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should resolve as timed out");
+
+    assert_eq!(turn.status, SessionTurnStatus::TimedOut);
+    assert!(
+        turn_cleaned_up.load(Ordering::SeqCst),
+        "kernel should wait for adapter.cancel() before aborting the program-backed turn task"
     );
 }
 
@@ -497,10 +557,42 @@ struct ClosedEventStreamRuntimeAdapter {
     sleep_for: Duration,
 }
 
+struct CleanupAwareProgramBackedRuntimeAdapter {
+    cancel_requested: Arc<AtomicBool>,
+    cancel_requested_notify: Arc<tokio::sync::Notify>,
+    turn_cleaned_up: Arc<AtomicBool>,
+    turn_cleaned_notify: Arc<tokio::sync::Notify>,
+}
+
+struct ProgramBackedCleanupGuard {
+    cleaned_up: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
 struct ReportedTerminalRuntimeAdapter {
     id: &'static str,
     code: &'static str,
     text: &'static str,
+}
+
+impl Drop for ProgramBackedCleanupGuard {
+    fn drop(&mut self) {
+        self.cleaned_up.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
+async fn wait_for_atomic_notify(flag: &AtomicBool, notify: &tokio::sync::Notify) {
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = notify.notified();
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 #[async_trait]
@@ -552,6 +644,69 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for CleanupAwareProgramBackedRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "cleanup-program".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    fn turn_mode(&self) -> RuntimeTurnMode {
+        RuntimeTurnMode::ProgramBacked
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("cleanup-program-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn program_backed_turn(
+        &self,
+        _execution: RuntimeProgramTurnExecution,
+        _journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _cleanup = ProgramBackedCleanupGuard {
+            cleaned_up: self.turn_cleaned_up.clone(),
+            notify: self.turn_cleaned_notify.clone(),
+        };
+        wait_for_atomic_notify(&self.cancel_requested, &self.cancel_requested_notify).await;
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        self.cancel_requested_notify.notify_waiters();
+        wait_for_atomic_notify(&self.turn_cleaned_up, &self.turn_cleaned_notify).await;
+        assert!(
+            self.turn_cleaned_up.load(Ordering::SeqCst),
+            "program-backed turn should clean up before adapter.cancel returns"
+        );
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
     }
 }

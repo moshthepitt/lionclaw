@@ -32,26 +32,33 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::time::timeout;
 use tracing::warn;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    load_ready_state_value, save_state_value, ConversationDriver, ExecutionOutput, RawTurnPayload,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
+    load_ready_state_value, save_state_value, ExecutionOutput, RawTurnPayload, RuntimeAdapter,
+    RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeDriverConfig,
+    RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
 pub const ACP_DEFAULT_WORKING_DIR: &str = "/workspace";
 pub const ACP_SESSION_ID_STATE_FILE: &str = ".lionclaw-acp-session-id";
+const ACP_CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpRuntimeConfig {
@@ -67,24 +74,6 @@ pub struct AcpRuntimeConfig {
 }
 
 impl AcpRuntimeConfig {
-    pub fn new(
-        runtime_id: impl Into<String>,
-        executable: impl Into<String>,
-        args: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            runtime_id: runtime_id.into(),
-            executable: executable.into(),
-            args: args.into_iter().map(Into::into).collect(),
-            environment: Vec::new(),
-            model: None,
-            mode: None,
-            auth: None,
-            session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
-            default_working_dir: ACP_DEFAULT_WORKING_DIR.to_string(),
-        }
-    }
-
     fn normalized_runtime_id(&self) -> String {
         let runtime_id = self.runtime_id.trim();
         if runtime_id.is_empty() {
@@ -92,12 +81,6 @@ impl AcpRuntimeConfig {
         } else {
             runtime_id.to_string()
         }
-    }
-}
-
-impl Default for AcpRuntimeConfig {
-    fn default() -> Self {
-        Self::new("acp", "acp", std::iter::empty::<&str>())
     }
 }
 
@@ -134,6 +117,45 @@ pub struct AcpRuntimeAdapter {
 struct AcpSessionState {
     runtime_state_root: Option<PathBuf>,
     session_id: Option<String>,
+    active_turn: Option<ActiveAcpTurn>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAcpTurn {
+    session_id: String,
+    cancel_tx: mpsc::UnboundedSender<AcpCancelRequest>,
+    completion: Arc<AcpTurnCompletion>,
+}
+
+#[derive(Debug)]
+struct AcpCancelRequest {
+    sent: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Debug, Default)]
+struct AcpTurnCompletion {
+    done: AtomicBool,
+    notify: Notify,
+}
+
+impl AcpTurnCompletion {
+    async fn wait(&self) {
+        loop {
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn mark_done(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 impl AcpRuntimeAdapter {
@@ -159,6 +181,13 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         RuntimeTurnMode::ProgramBacked
     }
 
+    fn build_terminal_program(
+        &self,
+        _input: lionclaw_runtime_api::RuntimeTerminalProgramInput,
+    ) -> Result<RuntimeProgramSpec> {
+        Ok(build_acp_terminal_program(&self.config))
+    }
+
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_id = self.config.normalized_runtime_id();
         let runtime_session_id = format!("{runtime_id}-{}", Uuid::new_v4());
@@ -177,6 +206,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
                 AcpSessionState {
                     runtime_state_root: input.runtime_state_root,
                     session_id,
+                    active_turn: None,
                 },
             );
 
@@ -196,7 +226,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             context,
             executor,
         } = execution;
-        let mut driver = AcpConversationDriver {
+        let mut driver = AcpTurnRunner {
             config: self.config.clone(),
             sessions: Arc::clone(&self.sessions),
             working_dir: context
@@ -222,8 +252,53 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
-        Ok(())
+    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        let active_turn = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?
+            .get(&handle.runtime_session_id)
+            .and_then(|state| state.active_turn.clone());
+        let Some(active_turn) = active_turn else {
+            return Ok(());
+        };
+
+        let completion = Arc::clone(&active_turn.completion);
+        let (sent, cancel_sent) = oneshot::channel();
+        active_turn
+            .cancel_tx
+            .send(AcpCancelRequest { sent })
+            .map_err(|_| {
+                anyhow!(
+                    "ACP turn '{}' is no longer accepting cancellation",
+                    active_turn.session_id
+                )
+            })?;
+        match timeout(ACP_CANCEL_ACK_TIMEOUT, cancel_sent).await {
+            Ok(Ok(result)) => result.map_err(anyhow::Error::msg),
+            Ok(Err(_)) => Err(anyhow!(
+                "ACP turn cancellation send acknowledgement was dropped for '{}'",
+                active_turn.session_id
+            )),
+            Err(_) => {
+                warn!(
+                    session_id = active_turn.session_id,
+                    "timed out waiting for ACP session/cancel send acknowledgement"
+                );
+                return Ok(());
+            }
+        }?;
+
+        match timeout(ACP_CANCEL_ACK_TIMEOUT, completion.wait()).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                warn!(
+                    session_id = active_turn.session_id,
+                    "timed out waiting for ACP cancelled turn to finish"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
@@ -235,19 +310,14 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
     }
 }
 
-struct AcpConversationDriver {
+struct AcpTurnRunner {
     config: AcpRuntimeConfig,
     sessions: Arc<RwLock<HashMap<String, AcpSessionState>>>,
     working_dir: String,
     executor: Box<dyn RuntimeProgramExecutor>,
 }
 
-#[async_trait]
-impl ConversationDriver for AcpConversationDriver {
-    fn protocol_name(&self) -> &'static str {
-        ACP_PROTOCOL_NAME
-    }
-
+impl AcpTurnRunner {
     async fn run_turn(
         &mut self,
         input: RuntimeTurnInput,
@@ -258,6 +328,7 @@ impl ConversationDriver for AcpConversationDriver {
         let program = build_acp_program(&self.config);
         let session = self.executor.spawn(program).await?;
         let mut client = AcpClient::new(session);
+        let mut active_turn = None;
 
         let result = async {
             client.initialize().await?;
@@ -271,12 +342,24 @@ impl ConversationDriver for AcpConversationDriver {
                 )
                 .await?;
             client.configure_session(&self.config, &session_id).await?;
-            client.prompt(&session_id, &input.prompt, &journal).await?;
+            let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+            active_turn = Some(register_active_acp_turn(
+                &self.sessions,
+                &runtime_session_id,
+                &session_id,
+                cancel_tx,
+            )?);
+            let prompt_result = client
+                .prompt(&session_id, &input.prompt, &journal, &mut cancel_rx)
+                .await;
+            prompt_result?;
             Ok(RuntimeTurnResult::default())
         }
         .await;
 
-        finish_acp_session(client, result).await
+        let result = finish_acp_session(client, result).await;
+        drop(active_turn);
+        result
     }
 }
 
@@ -284,6 +367,16 @@ fn build_acp_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
     RuntimeProgramSpec {
         executable: config.executable.clone(),
         args: config.args.clone(),
+        environment: config.environment.clone(),
+        stdin: String::new(),
+        auth: config.auth.clone(),
+    }
+}
+
+fn build_acp_terminal_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
+    RuntimeProgramSpec {
+        executable: config.executable.clone(),
+        args: Vec::new(),
         environment: config.environment.clone(),
         stdin: String::new(),
         auth: config.auth.clone(),
@@ -305,6 +398,11 @@ struct AcpMessage {
 struct AcpResponse {
     raw: String,
     result: Value,
+}
+
+struct AcpCancelWait<'a> {
+    session_id: &'a str,
+    cancel_rx: &'a mut mpsc::UnboundedReceiver<AcpCancelRequest>,
 }
 
 impl AcpClient {
@@ -384,10 +482,11 @@ impl AcpClient {
     ) -> Result<()> {
         if let Some(model) = config.model.as_deref() {
             self.request(
-                "session/set_model",
+                "session/set_config_option",
                 json!({
                     "sessionId": session_id,
-                    "modelId": model,
+                    "configId": "model",
+                    "value": model,
                 }),
                 None,
             )
@@ -415,9 +514,10 @@ impl AcpClient {
         session_id: &str,
         prompt: &str,
         journal: &RuntimeTurnJournalSender,
+        cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
     ) -> Result<()> {
         let response = self
-            .request(
+            .request_with_cancel(
                 "session/prompt",
                 json!({
                     "sessionId": session_id,
@@ -427,6 +527,8 @@ impl AcpClient {
                     }],
                 }),
                 Some(journal),
+                session_id,
+                cancel_rx,
             )
             .await?;
         drop(journal.send(TurnEvent::with_raw(
@@ -439,6 +541,28 @@ impl AcpClient {
         Ok(())
     }
 
+    async fn request_with_cancel(
+        &mut self,
+        method: &str,
+        params: Value,
+        journal: Option<&RuntimeTurnJournalSender>,
+        session_id: &str,
+        cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
+    ) -> Result<AcpResponse> {
+        let id = self.next_request_id();
+        self.send_request(id, method, params).await?;
+        self.wait_for_response(
+            id,
+            method,
+            journal,
+            Some(AcpCancelWait {
+                session_id,
+                cancel_rx,
+            }),
+        )
+        .await
+    }
+
     async fn request(
         &mut self,
         method: &str,
@@ -446,13 +570,40 @@ impl AcpClient {
         journal: Option<&RuntimeTurnJournalSender>,
     ) -> Result<AcpResponse> {
         let id = self.next_request_id();
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await?;
+        self.send_request(id, method, params).await?;
+        self.wait_for_response(id, method, journal, None).await
+    }
+
+    async fn wait_for_response(
+        &mut self,
+        id: u64,
+        method: &str,
+        journal: Option<&RuntimeTurnJournalSender>,
+        mut cancel: Option<AcpCancelWait<'_>>,
+    ) -> Result<AcpResponse> {
+        if let Some(cancel) = cancel.as_mut() {
+            loop {
+                tokio::select! {
+                    maybe_cancel = cancel.cancel_rx.recv() => {
+                        match maybe_cancel {
+                            Some(cancel_request) => {
+                                self.cancel_session(cancel.session_id, cancel_request).await;
+                            }
+                            None => break,
+                        }
+                    }
+                    maybe_message = self.recv() => {
+                        let Some(message) = maybe_message? else {
+                            return Err(anyhow!("ACP process closed before responding to {method}"));
+                        };
+                        if acp_response_id(&message.value).is_some_and(|response_id| response_id == id) {
+                            return parse_acp_response(message, method);
+                        }
+                        self.dispatch_message(message, journal).await?;
+                    }
+                }
+            }
+        }
 
         loop {
             let Some(message) = self.recv().await? else {
@@ -463,6 +614,38 @@ impl AcpClient {
             }
             self.dispatch_message(message, journal).await?;
         }
+    }
+
+    async fn send_request(&mut self, id: u64, method: &str, params: Value) -> Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await
+    }
+
+    async fn send_notification(&mut self, method: &str, params: Value) -> Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .await
+    }
+
+    async fn cancel_session(&mut self, session_id: &str, cancel: AcpCancelRequest) {
+        let result = self
+            .send_notification(
+                "session/cancel",
+                json!({
+                    "sessionId": session_id,
+                }),
+            )
+            .await
+            .map_err(|err| err.to_string());
+        drop(cancel.sent.send(result));
     }
 
     async fn dispatch_message(
@@ -602,7 +785,61 @@ fn update_runtime_session_id(
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
     state.session_id = Some(session_id);
-    Ok(state.runtime_state_root.clone())
+    let runtime_state_root = state.runtime_state_root.clone();
+    drop(sessions);
+    Ok(runtime_state_root)
+}
+
+fn register_active_acp_turn(
+    sessions: &Arc<RwLock<HashMap<String, AcpSessionState>>>,
+    runtime_session_id: &str,
+    session_id: &str,
+    cancel_tx: mpsc::UnboundedSender<AcpCancelRequest>,
+) -> Result<ActiveAcpTurnRegistration> {
+    let sessions_ref = Arc::clone(sessions);
+    let completion = Arc::new(AcpTurnCompletion::default());
+    {
+        let mut sessions = sessions
+            .write()
+            .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
+        let state = sessions
+            .get_mut(runtime_session_id)
+            .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
+        state.active_turn = Some(ActiveAcpTurn {
+            session_id: session_id.to_string(),
+            cancel_tx,
+            completion: Arc::clone(&completion),
+        });
+        drop(sessions);
+    }
+    Ok(ActiveAcpTurnRegistration {
+        sessions: sessions_ref,
+        runtime_session_id: runtime_session_id.to_string(),
+        completion,
+    })
+}
+
+struct ActiveAcpTurnRegistration {
+    sessions: Arc<RwLock<HashMap<String, AcpSessionState>>>,
+    runtime_session_id: String,
+    completion: Arc<AcpTurnCompletion>,
+}
+
+impl Drop for ActiveAcpTurnRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.write() {
+            if let Some(state) = sessions.get_mut(&self.runtime_session_id) {
+                if state
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|turn| Arc::ptr_eq(&turn.completion, &self.completion))
+                {
+                    state.active_turn = None;
+                }
+            }
+        }
+        self.completion.mark_done();
+    }
 }
 
 fn save_acp_session_id(
@@ -847,10 +1084,14 @@ fn ensure_acp_exit_success(output: ExecutionOutput) -> Result<()> {
 mod tests {
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     use serde::Deserialize;
     use serde_json::{json, Value};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use lionclaw_runtime_api::{
@@ -858,7 +1099,8 @@ mod tests {
         RuntimeEvent, RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor,
         RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
         RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
+        RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
@@ -896,6 +1138,12 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     struct AcpFixture {
+        raw_in: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AcpConfigOptionsFixture {
+        raw_out: Vec<String>,
         raw_in: Vec<String>,
     }
 
@@ -975,11 +1223,142 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CancelableAcpProgramExecutor {
+        state: Arc<CancelableAcpProgramState>,
+    }
+
+    #[derive(Debug)]
+    struct CancelableAcpProgramState {
+        inbound: Mutex<VecDeque<String>>,
+        sent: Mutex<Vec<Value>>,
+        notify: Notify,
+        shutdown: AtomicBool,
+    }
+
+    impl CancelableAcpProgramState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inbound: Mutex::new(VecDeque::from([
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_cancel","configOptions":[]}}"#.to_string(),
+                ])),
+                sent: Mutex::new(Vec::new()),
+                notify: Notify::new(),
+                shutdown: AtomicBool::new(false),
+            })
+        }
+
+        fn sent_methods(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .expect("cancelable ACP sent")
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+
+        fn is_shutdown(&self) -> bool {
+            self.shutdown.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeProgramExecutor for CancelableAcpProgramExecutor {
+        async fn execute_streaming(
+            &mut self,
+            _program: RuntimeProgramSpec,
+            _stdout: RuntimeProgramStdoutSender,
+        ) -> anyhow::Result<ExecutionOutput> {
+            unreachable!("ACP driver should spawn an interactive program")
+        }
+
+        async fn execute_captured(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> anyhow::Result<ExecutionOutput> {
+            unreachable!("ACP driver should spawn an interactive program")
+        }
+
+        async fn spawn(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
+            Ok(Box::new(CancelableAcpProgramSession {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancelableAcpProgramSession {
+        state: Arc<CancelableAcpProgramState>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeProgramSession for CancelableAcpProgramSession {
+        async fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+            let value = serde_json::from_str::<Value>(line).expect("driver writes JSON-RPC");
+            if value.get("method").and_then(Value::as_str) == Some("session/cancel") {
+                self.state
+                    .inbound
+                    .lock()
+                    .expect("cancelable ACP inbound")
+                    .push_back(
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled","_meta":{}}}"#
+                        .to_string(),
+                );
+                self.state.notify.notify_waiters();
+            }
+            self.state
+                .sent
+                .lock()
+                .expect("cancelable ACP sent")
+                .push(value);
+            Ok(())
+        }
+
+        async fn read_line(&mut self) -> anyhow::Result<Option<String>> {
+            loop {
+                if let Some(line) = self
+                    .state
+                    .inbound
+                    .lock()
+                    .expect("cancelable ACP inbound")
+                    .pop_front()
+                {
+                    return Ok(Some(line));
+                }
+                self.state.notify.notified().await;
+            }
+        }
+
+        async fn shutdown(self: Box<Self>) -> anyhow::Result<ExecutionOutput> {
+            self.state.shutdown.store(true, Ordering::Release);
+            Ok(ExecutionOutput {
+                exit_code: Some(0),
+                ..ExecutionOutput::default()
+            })
+        }
+    }
+
     fn opencode_acp_fixture() -> AcpFixture {
         serde_json::from_str(include_str!(
             "../tests/fixtures/opencode_acp_success_1_17_9.json"
         ))
         .expect("OpenCode ACP fixture JSON")
+    }
+
+    fn opencode_acp_config_options_fixture() -> AcpConfigOptionsFixture {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/opencode_acp_config_options_1_17_9.json"
+        ))
+        .expect("OpenCode ACP config-options fixture JSON")
     }
 
     fn project_opencode_acp_fixture_events() -> Vec<RuntimeEvent> {
@@ -1071,6 +1450,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opencode_acp_config_options_fixture_pins_model_and_mode_protocol() {
+        let fixture = opencode_acp_config_options_fixture();
+        let raw_out = fixture
+            .raw_out
+            .iter()
+            .map(|raw| serde_json::from_str::<Value>(raw).expect("fixture raw_out JSON"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            raw_out
+                .iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec![
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+            ]
+        );
+        assert_eq!(raw_out[2]["params"]["configId"], json!("model"));
+        assert_eq!(
+            raw_out[2]["params"]["value"],
+            json!("openai/gpt-5.3-codex-spark")
+        );
+        assert_eq!(raw_out[3]["params"]["configId"], json!("mode"));
+        assert_eq!(raw_out[3]["params"]["value"], json!("plan"));
+
+        let responses = fixture
+            .raw_in
+            .iter()
+            .map(|raw| serde_json::from_str::<Value>(raw).expect("fixture raw_in JSON"))
+            .collect::<Vec<_>>();
+        let model_response = acp_response_by_id(&responses, 3).expect("model response");
+        let mode_response = acp_response_by_id(&responses, 4).expect("mode response");
+        assert_eq!(
+            acp_config_current_value(model_response, "model"),
+            Some("openai/gpt-5.3-codex-spark")
+        );
+        assert_eq!(
+            acp_config_current_value(mode_response, "mode"),
+            Some("plan")
+        );
+    }
+
+    fn acp_response_by_id(messages: &[Value], id: u64) -> Option<&Value> {
+        messages
+            .iter()
+            .find(|message| message.get("id").and_then(Value::as_u64) == Some(id))
+    }
+
+    fn acp_config_current_value<'a>(message: &'a Value, config_id: &str) -> Option<&'a str> {
+        message
+            .pointer("/result/configOptions")?
+            .as_array()?
+            .iter()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))?
+            .get("currentValue")?
+            .as_str()
+    }
+
     #[tokio::test]
     async fn acp_program_backed_turn_uses_profile_driver_journal() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1160,15 +1601,134 @@ mod tests {
             vec![
                 "initialize",
                 "session/new",
-                "session/set_model",
+                "session/set_config_option",
                 "session/set_config_option",
                 "session/prompt",
             ]
         );
         assert_eq!(sent[1]["params"]["cwd"], json!("/workspace/crates/example"));
-        assert_eq!(sent[2]["params"]["modelId"], json!("gpt-5"));
+        assert_eq!(sent[2]["params"]["configId"], json!("model"));
+        assert_eq!(sent[2]["params"]["value"], json!("gpt-5"));
         assert_eq!(sent[3]["params"]["configId"], json!("mode"));
         assert_eq!(sent[3]["params"]["value"], json!("plan"));
+    }
+
+    #[tokio::test]
+    async fn acp_terminal_program_uses_native_command_without_protocol_args() {
+        let mut config = opencode_acp_config(None, None);
+        config.auth = Some(RuntimeAuthKind::from_static("test-acp-auth"));
+        let adapter = AcpRuntimeAdapter::new(config);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root,
+                runtime_session_ready: runtime_not_ready(),
+            })
+            .expect("terminal program");
+
+        assert_eq!(program.executable, "opencode");
+        assert!(program.args.is_empty());
+        assert_eq!(
+            program.environment,
+            vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            program.auth,
+            Some(RuntimeAuthKind::from_static("test-acp-auth"))
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_sends_session_cancel_for_active_prompt() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        let adapter = Arc::new(AcpRuntimeAdapter::new(opencode_acp_config(None, None)));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: runtime_not_ready(),
+            })
+            .await
+            .expect("start");
+        let state = CancelableAcpProgramState::new();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter_for_task = Arc::clone(&adapter);
+        let handle_for_task = handle.clone();
+        let state_for_task = Arc::clone(&state);
+        let turn_task = tokio::spawn(async move {
+            adapter_for_task
+                .program_backed_turn(
+                    RuntimeProgramTurnExecution {
+                        input: RuntimeTurnInput {
+                            runtime_session_id: handle_for_task.runtime_session_id,
+                            prompt: "cancel me".to_string(),
+                            fresh_prompt: None,
+                            runtime_skill_ids: Vec::new(),
+                        },
+                        context: acp_driver_context(runtime_state_root),
+                        executor: Box::new(CancelableAcpProgramExecutor {
+                            state: state_for_task,
+                        }),
+                    },
+                    journal_tx,
+                )
+                .await
+        });
+
+        for _ in 0..100 {
+            if state
+                .sent_methods()
+                .iter()
+                .any(|method| method == "session/prompt")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state
+                .sent_methods()
+                .iter()
+                .any(|method| method == "session/prompt"),
+            "ACP prompt request was not sent"
+        );
+
+        adapter
+            .cancel(&handle, Some("operator cancelled".to_string()))
+            .await
+            .expect("cancel active ACP prompt");
+        assert!(
+            state.is_shutdown(),
+            "ACP cancel should wait until the prompt response path has shut down the session"
+        );
+        turn_task.await.expect("turn task").expect("turn completes");
+
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![RuntimeEvent::Done]
+        );
+        assert_eq!(
+            state.sent_methods(),
+            vec![
+                "initialize".to_string(),
+                "session/new".to_string(),
+                "session/prompt".to_string(),
+                "session/cancel".to_string(),
+            ]
+        );
     }
 
     #[test]

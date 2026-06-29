@@ -56,14 +56,14 @@ pub use host_auth::{
 use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
     normalize_terminal_transcript_launch_started_at, safe_relative_path, save_state_value,
-    ConversationDriver, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
-    RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeControlExecution, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
-    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange,
-    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo,
+    RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution,
+    RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent,
+    RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange, RuntimeFileChangeStatus,
+    RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
     RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnJournalSender,
     RuntimeTurnMode, RuntimeTurnResult, TerminalTranscriptCandidate, TerminalTranscriptTarget,
@@ -99,6 +99,29 @@ pub struct CodexRuntimeDriver;
 impl RuntimeDriverProvider for CodexRuntimeDriver {
     fn driver(&self) -> &'static str {
         CODEX_RUNTIME_DRIVER
+    }
+
+    fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
+        if !config.args.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime args");
+        }
+        if !config.environment.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime environment");
+        }
+        if config.mode.is_some() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime mode");
+        }
+        if let Some(auth) = &config.auth {
+            let expected = codex_runtime_auth_kind();
+            if auth != &expected {
+                bail!(
+                    "driver '{CODEX_RUNTIME_DRIVER}' requires auth kind '{}', got '{}'",
+                    expected.as_str(),
+                    auth.as_str()
+                );
+            }
+        }
+        Ok(())
     }
 
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
@@ -177,18 +200,13 @@ struct CodexTerminalTranscriptExportRequest<'a> {
     hard_timeout: Duration,
 }
 
-struct CodexAppServerConversationDriver<'a> {
+struct CodexAppServerTurnRunner<'a> {
     adapter: &'a CodexRuntimeAdapter,
     context: RuntimeExecutionContext,
     executor: Box<dyn RuntimeProgramExecutor>,
 }
 
-#[async_trait]
-impl ConversationDriver for CodexAppServerConversationDriver<'_> {
-    fn protocol_name(&self) -> &'static str {
-        CODEX_APP_SERVER_DRIVER
-    }
-
+impl CodexAppServerTurnRunner<'_> {
     async fn run_turn(
         &mut self,
         input: RuntimeTurnInput,
@@ -305,7 +323,7 @@ impl CodexRuntimeAdapter {
             context,
             executor,
         } = execution;
-        let mut driver = CodexAppServerConversationDriver {
+        let mut driver = CodexAppServerTurnRunner {
             adapter: self,
             context,
             executor,

@@ -147,7 +147,7 @@ execution plan. The kernel gives program-backed adapters a constrained executor
 plus observable runtime context, then still decides launch allowance, mounts,
 secrets, auth materialization, audit, and persistence.
 
-Side-effecting live protocol translation lives behind `ConversationDriver`.
+Side-effecting live protocol translation lives inside each protocol adapter.
 Codex's app-server driver and the ACP driver own their protocol handshakes,
 permission replies, runtime session continuity updates, and JSON-RPC loops.
 Their shared output is a turn journal of `TurnEvent` records: one canonical
@@ -155,6 +155,9 @@ Their shared output is a turn journal of `TurnEvent` records: one canonical
 debugging. Kernel routing and prompt reconstruction project the journal through
 `canonical_events`, so raw payloads are never replayed into prompts or used to
 build canonical assistant text.
+The persisted journal is currently a kernel-owned debug/audit record of the
+driver translation, not the production transcript reader for prompt history;
+canonical session turn state remains the source for user-visible history.
 
 Runtime context may include host projections for runtime-visible paths. A
 directory projection maps a runtime tree such as `/runtime` to the runtime state
@@ -231,6 +234,9 @@ request/notification assumptions are pinned by checked-in fixtures under the
 protocol crate, including the target CLI version and immutable source commit;
 update those fixtures with the driver when the target protocol contract
 changes.
+The runtime profile format is intentionally pre-v1 breaking: profiles use
+`driver` and `command`; the removed `kind`/`executable` shape fails to load with
+an explicit operator-facing error.
 
 ## Native Runtime TUI Flow
 
@@ -253,7 +259,8 @@ Flow:
 5. The OCI backend attaches the operator's terminal to the runtime process with
    a TTY.
 6. On launch and exit, the kernel writes `runtime.tui.launch`,
-   `runtime.tui.exit`, and transcript reconciliation audit events.
+   `runtime.tui.exit`, and adapter transcript reconciliation audit events when
+   the selected driver supports transcript export.
 
 For Codex, the attached terminal program runs the real Codex CLI in
 danger-full-access mode with approval disabled. That is intentional: LionClaw's
@@ -269,9 +276,14 @@ LionClaw's runtime image/update path. Those overrides do not rewrite
 `/runtime/home/.codex/config.toml`, and the host Codex home is not mutated.
 
 LionClaw does not scrape terminal output. Native TUI transcript import is an
-adapter contract over runtime-owned durable state. Codex continuity is a
-LionClaw-owned link to one Codex CLI thread id stored in session-scoped runtime
-control state.
+adapter contract over runtime-owned durable state, and attached-mode
+transcripts are best-effort rather than the source of truth for normal turns.
+ACP drivers launch the harness's native interactive command from the profile
+command without ACP protocol args, with the same confinement, staged auth,
+skills, and non-privileged runtime layout as other runtime executions; ACP does
+not provide a canonical transcript unless a later adapter explicitly implements
+one. Codex continuity is a LionClaw-owned link to one Codex CLI thread id stored
+in session-scoped runtime control state.
 Native TUI launches resume with `codex resume <threadID>` only when that link
 also has LionClaw's ready marker from a proven resumable reconciliation.
 Before launching an attached native TUI, LionClaw records a launch timestamp in
@@ -1252,7 +1264,7 @@ Runtime integration is driver-per-protocol, not crate-per-product.
    product.
 2. If the runtime brings a new conversation protocol, add one
    `crates/lionclaw-runtime-<protocol>` crate implementing the protocol driver
-   against `ConversationDriver` and the existing adapter boundary in
+   behind the existing adapter and `RuntimeDriverProvider` boundary in
    `lionclaw-runtime-api`.
 3. Keep protocol-specific auth staging, session ids, resume data, parsing, and
    raw protocol retention in that protocol crate. Core/kernel code consumes

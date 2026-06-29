@@ -44,8 +44,15 @@ impl OperatorConfig {
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut config: Self = match toml::from_str(&content) {
+            Ok(config) => config,
+            Err(err) => {
+                if let Some(message) = legacy_runtime_profile_config_error(&content) {
+                    return Err(anyhow!("failed to parse {}: {message}", path.display()));
+                }
+                return Err(err).with_context(|| format!("failed to parse {}", path.display()));
+            }
+        };
         config.normalize();
         Ok(config)
     }
@@ -399,6 +406,22 @@ impl std::str::FromStr for ChannelLaunchMode {
             )),
         }
     }
+}
+
+fn legacy_runtime_profile_config_error(content: &str) -> Option<String> {
+    let value = toml::from_str::<toml::Value>(content).ok()?;
+    let runtimes = value.get("runtimes")?.as_table()?;
+    for (runtime_id, runtime) in runtimes {
+        let Some(profile) = runtime.as_table() else {
+            continue;
+        };
+        if profile.contains_key("kind") || profile.contains_key("executable") {
+            return Some(format!(
+                "runtime profile '{runtime_id}' uses the removed pre-#159 config format (kind/executable); update it to driver/command, for example driver = \"acp\" and command = \"opencode\""
+            ));
+        }
+    }
+    None
 }
 
 pub fn default_bind() -> String {
@@ -870,6 +893,33 @@ mod tests {
         assert!(config.runtimes.is_empty());
         assert!(config.presets.is_empty());
         assert!(config.private_context.projector_skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_runtime_profile_shape_reports_explicit_break() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        tokio::fs::create_dir_all(home.config_dir())
+            .await
+            .expect("config dir");
+        tokio::fs::write(
+            home.config_path(),
+            r#"
+[runtimes.opencode]
+kind = "opencode"
+executable = "opencode"
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let err = OperatorConfig::load(&home)
+            .await
+            .expect_err("legacy runtime profile shape should fail clearly");
+        let message = err.to_string();
+        assert!(message.contains("pre-#159 config format"), "{message}");
+        assert!(message.contains("kind/executable"), "{message}");
+        assert!(message.contains("driver/command"), "{message}");
     }
 
     #[tokio::test]

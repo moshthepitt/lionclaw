@@ -87,11 +87,18 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
             );
             continue;
         };
+        let driver_config = runtime_driver_config(id, runtime);
+        if let Err(err) = driver.validate_config(&driver_config) {
+            warn!(
+                ?err,
+                runtime_id = %id,
+                driver = %runtime.driver(),
+                "skipping runtime adapter registration for invalid driver config"
+            );
+            continue;
+        }
         kernel
-            .register_runtime_adapter(
-                id.clone(),
-                driver.create_adapter(runtime_driver_config(id, runtime)),
-            )
+            .register_runtime_adapter(id.clone(), driver.create_adapter(driver_config))
             .await;
     }
 
@@ -161,13 +168,20 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
         .validate()
         .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' is invalid: {err}"))?;
     let drivers = runtime_driver_registry();
-    if drivers.get(profile.driver()).is_none() {
+    let Some(driver) = drivers.get(profile.driver()) else {
         return Err(anyhow!(
             "configured runtime profile '{runtime_id}' uses unsupported runtime driver '{}'; supported drivers: {}",
             profile.driver(),
             supported_runtime_drivers(&drivers)
         ));
-    }
+    };
+    let driver_config = runtime_driver_config(runtime_id, profile);
+    driver.validate_config(&driver_config).map_err(|err| {
+        anyhow!(
+            "configured runtime profile '{runtime_id}' is invalid for runtime driver '{}': {err}",
+            profile.driver()
+        )
+    })?;
     Ok(())
 }
 
@@ -472,6 +486,28 @@ mod tests {
         register_configured_runtimes(&kernel, &config)
             .await
             .expect("non-launchable profile should not block kernel registration");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_runtime_profile_rejects_ignored_driver_fields() {
+        let (_temp_dir, engine) = fake_podman();
+        let mut config = OperatorConfig::default();
+        let mut profile = codex_runtime_profile(engine);
+        profile.args = vec!["acp".to_string()];
+        profile
+            .environment
+            .insert("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string());
+        profile.mode = Some("plan".to_string());
+        config.upsert_runtime("codex".to_string(), profile);
+
+        let err = validate_runtime_availability(&config, "codex")
+            .expect_err("Codex should reject driver fields it does not honor");
+
+        assert!(
+            err.to_string().contains("does not support runtime args"),
+            "{err}"
+        );
     }
 
     fn codex_runtime_profile(engine: String) -> RuntimeProfileConfig {

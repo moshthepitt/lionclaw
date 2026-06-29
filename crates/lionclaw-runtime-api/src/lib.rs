@@ -1287,17 +1287,6 @@ pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeE
 pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
-#[async_trait]
-pub trait ConversationDriver: Send {
-    fn protocol_name(&self) -> &'static str;
-
-    async fn run_turn(
-        &mut self,
-        input: RuntimeTurnInput,
-        journal: RuntimeTurnJournalSender,
-    ) -> Result<RuntimeTurnResult>;
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeDriverConfig {
     pub runtime_id: String,
@@ -1311,6 +1300,10 @@ pub struct RuntimeDriverConfig {
 
 pub trait RuntimeDriverProvider: Send + Sync {
     fn driver(&self) -> &'static str;
+
+    fn validate_config(&self, _config: &RuntimeDriverConfig) -> Result<()> {
+        Ok(())
+    }
 
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
 

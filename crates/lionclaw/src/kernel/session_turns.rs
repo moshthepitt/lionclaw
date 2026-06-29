@@ -328,10 +328,24 @@ impl SessionTurnStore {
     }
 
     pub async fn append_journal_event(&self, turn_id: Uuid, record: &TurnEvent) -> Result<u64> {
-        let event_json = serde_json::to_string(&record.event)
-            .context("failed to encode session turn journal event")?;
-        let raw_driver = record.raw.as_ref().map(|raw| raw.driver.as_str());
-        let raw_payload = record.raw.as_ref().map(|raw| raw.payload.as_str());
+        self.append_journal_events(turn_id, std::slice::from_ref(record))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("journal append produced no sequence number"))
+    }
+
+    pub async fn append_journal_events(
+        &self,
+        turn_id: Uuid,
+        records: &[TurnEvent],
+    ) -> Result<Option<u64>> {
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let encoded_records = records
+            .iter()
+            .map(EncodedJournalEvent::from_turn_event)
+            .collect::<Result<Vec<_>>>()?;
         let created_at_ms = now_ms();
 
         let mut tx = self
@@ -353,27 +367,39 @@ impl SessionTurnStore {
             format!("failed to allocate journal sequence for session turn {turn_id}")
         })?;
 
-        sqlx::query(
-            "INSERT INTO session_turn_journal_events \
-             (turn_id, sequence_no, event_json, raw_driver, raw_payload, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(turn_id.to_string())
-        .bind(sequence_no_raw)
-        .bind(event_json)
-        .bind(raw_driver)
-        .bind(raw_payload)
-        .bind(created_at_ms)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("failed to append journal event for session turn {turn_id}"))?;
+        for (offset, record) in encoded_records.iter().enumerate() {
+            let offset = i64::try_from(offset).with_context(|| {
+                format!("journal batch for session turn {turn_id} is too large")
+            })?;
+            sqlx::query(
+                "INSERT INTO session_turn_journal_events \
+                 (turn_id, sequence_no, event_json, raw_driver, raw_payload, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(turn_id.to_string())
+            .bind(sequence_no_raw + offset)
+            .bind(&record.event_json)
+            .bind(record.raw_driver.as_deref())
+            .bind(record.raw_payload.as_deref())
+            .bind(created_at_ms)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| {
+                format!("failed to append journal event for session turn {turn_id}")
+            })?;
+        }
 
         tx.commit().await.with_context(|| {
             format!("failed to commit journal append for session turn {turn_id}")
         })?;
 
-        u64::try_from(sequence_no_raw)
-            .with_context(|| format!("invalid journal sequence_no '{sequence_no_raw}'"))
+        let last_sequence_no_raw = sequence_no_raw
+            + i64::try_from(encoded_records.len() - 1).with_context(|| {
+                format!("journal batch for session turn {turn_id} is too large")
+            })?;
+        u64::try_from(last_sequence_no_raw)
+            .with_context(|| format!("invalid journal sequence_no '{last_sequence_no_raw}'"))
+            .map(Some)
     }
 
     pub async fn list_journal_events(&self, turn_id: Uuid) -> Result<Vec<TurnEvent>> {
@@ -931,6 +957,23 @@ fn map_session_turn_journal_row(row: SqliteRow) -> Result<TurnEvent> {
     Ok(TurnEvent { event, raw })
 }
 
+struct EncodedJournalEvent {
+    event_json: String,
+    raw_driver: Option<String>,
+    raw_payload: Option<String>,
+}
+
+impl EncodedJournalEvent {
+    fn from_turn_event(record: &TurnEvent) -> Result<Self> {
+        Ok(Self {
+            event_json: serde_json::to_string(&record.event)
+                .context("failed to encode session turn journal event")?,
+            raw_driver: record.raw.as_ref().map(|raw| raw.driver.clone()),
+            raw_payload: record.raw.as_ref().map(|raw| raw.payload.clone()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,17 +1181,10 @@ mod tests {
 
         assert_eq!(
             store
-                .append_journal_event(turn.turn_id, &first)
+                .append_journal_events(turn.turn_id, &[first.clone(), second.clone()])
                 .await
-                .expect("append first"),
-            1
-        );
-        assert_eq!(
-            store
-                .append_journal_event(turn.turn_id, &second)
-                .await
-                .expect("append second"),
-            2
+                .expect("append batch"),
+            Some(2)
         );
 
         let journal = store

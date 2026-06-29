@@ -82,6 +82,9 @@ Expected:
 - `main` and `reviewer` instance homes exist and can be targeted independently
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
+- runtime profiles in config use the current `driver`/`command` shape; old
+  `kind`/`executable` profiles intentionally fail to load with an explicit
+  format-break error rather than being migrated
 
 Check explicit runtime mounts:
 
@@ -169,6 +172,9 @@ Expected:
 - the answer is `LIONCLAW_NATIVE_TUI_CONTEXT_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
+- ACP profiles such as OpenCode launch the profile command as the native UI
+  without ACP protocol args; they do not guarantee canonical transcript import
+  unless the ACP driver later implements runtime-owned transcript export
 - completed Codex native UI turns are present in LionClaw session history and
   are available to later `lionclaw run`, `run --plain`, and channel context
 - opening and exiting the native UI without completing a turn leaves the launch
