@@ -1244,7 +1244,7 @@ pub enum RuntimeEvent {
 /// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawTurnPayload {
-    /// Driver/protocol that produced the payload, e.g. `"codex-app-server"`.
+    /// Driver/protocol that produced the payload, e.g. `"driver-protocol"`.
     pub driver: String,
     /// The payload exactly as the driver emitted it (e.g. one JSON-RPC line).
     pub payload: String,
@@ -1793,8 +1793,8 @@ mod tests {
                     text: "hi".to_string(),
                 },
                 RawTurnPayload {
-                    driver: "codex-app-server".to_string(),
-                    payload: "{\"method\":\"item/agentMessage/delta\"}".to_string(),
+                    driver: "test-driver".to_string(),
+                    payload: "{\"method\":\"message/delta\"}".to_string(),
                 },
             ),
             TurnEvent::canonical(RuntimeEvent::Done),

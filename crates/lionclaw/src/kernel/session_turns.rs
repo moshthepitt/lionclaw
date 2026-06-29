@@ -1119,7 +1119,7 @@ mod tests {
                 display_user_text: "hello".to_string(),
                 prompt_user_text: "hello".to_string(),
                 attachment_source_turn_id: None,
-                runtime_id: "codex".to_string(),
+                runtime_id: "runtime-a".to_string(),
             })
             .await
             .expect("begin turn");
@@ -1130,8 +1130,8 @@ mod tests {
                 text: "hi".to_string(),
             },
             RawTurnPayload {
-                driver: "codex-app-server".to_string(),
-                payload: "{\"method\":\"item/agentMessage/delta\"}".to_string(),
+                driver: "test-driver".to_string(),
+                payload: "{\"method\":\"message/delta\"}".to_string(),
             },
         );
         let second = TurnEvent::canonical(RuntimeEvent::Done);
