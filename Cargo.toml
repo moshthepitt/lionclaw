@@ -6,9 +6,9 @@ members = [
     "crates/lionclaw-private-context",
     "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
+    "crates/lionclaw-runtime-acp",
     "crates/lionclaw-runtime-codex",
     "crates/lionclaw-runtime-mock",
-    "crates/lionclaw-runtime-opencode",
 ]
 resolver = "2"
 
@@ -27,9 +27,9 @@ clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
+lionclaw-runtime-acp = { path = "crates/lionclaw-runtime-acp" }
 lionclaw-runtime-codex = { path = "crates/lionclaw-runtime-codex" }
 lionclaw-runtime-mock = { path = "crates/lionclaw-runtime-mock" }
-lionclaw-runtime-opencode = { path = "crates/lionclaw-runtime-opencode" }
 reqwest = { version = "0.12", default-features = false }
 rustix = "1.1"
 serde = "1.0"

@@ -1052,14 +1052,14 @@ fn render_runtime_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleA
         section_line("◉", "Runtime"),
         Line::raw(""),
         kv_line("profile", &ready.runtime_id),
-        kv_line("kind", &ready.runtime_kind),
+        kv_line("driver", &ready.runtime_driver),
         kv_line("executable", &ready.runtime_executable),
     ];
     if let Some(model) = ready.runtime_model.as_deref() {
         lines.push(kv_line("model", model));
     }
-    if let Some(agent) = ready.runtime_agent.as_deref() {
-        lines.push(kv_line("agent", agent));
+    if let Some(mode) = ready.runtime_mode.as_deref() {
+        lines.push(kv_line("mode", mode));
     }
     lines.push(kv_line(
         "selected by",

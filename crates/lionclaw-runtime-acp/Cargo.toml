@@ -1,5 +1,5 @@
 [package]
-name = "lionclaw-runtime-opencode"
+name = "lionclaw-runtime-acp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,11 +10,9 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-chrono = { workspace = true, features = ["serde", "clock"] }
 lionclaw-runtime-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 

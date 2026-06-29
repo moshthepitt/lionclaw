@@ -21,10 +21,10 @@ pub use execution::{
     WorkspaceAccess, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
     DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT,
 };
+pub use lionclaw_runtime_acp::{AcpRuntimeAdapter, AcpRuntimeConfig};
 pub use lionclaw_runtime_api::*;
 pub use lionclaw_runtime_codex::{CodexRuntimeAdapter, CodexRuntimeConfig};
 pub use lionclaw_runtime_mock::MockRuntimeAdapter;
-pub use lionclaw_runtime_opencode::{OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
 pub use skill_projection::project_runtime_skills;
 
 async fn validate_runtime_auth_prerequisites(

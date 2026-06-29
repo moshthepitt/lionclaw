@@ -33,7 +33,6 @@ pub async fn project_runtime_skills(
 fn native_runtime_skills_relative_root(runtime_kind: &str) -> Option<&'static [&'static str]> {
     match runtime_kind {
         "codex" => Some(&[".codex", "skills"]),
-        "opencode" => Some(&[".config", "opencode", "skills"]),
         _ => None,
     }
 }
@@ -308,7 +307,7 @@ mod tests {
     async fn removes_stale_runtime_skill_symlinks() {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_home = temp_dir.path().join("runtime-home");
-        let stale_root = runtime_home.join(".config/opencode/skills");
+        let stale_root = runtime_home.join(".codex/skills");
         tokio::fs::create_dir_all(&stale_root)
             .await
             .expect("create stale root");
@@ -326,9 +325,9 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        project_runtime_skills("opencode", &runtime_home, &mounts)
+        project_runtime_skills("codex", &runtime_home, &mounts)
             .await
-            .expect("project opencode skills");
+            .expect("project codex skills");
 
         assert!(!tokio::fs::try_exists(stale_root.join("old"))
             .await

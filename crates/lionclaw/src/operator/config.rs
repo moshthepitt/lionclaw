@@ -409,49 +409,55 @@ pub fn default_channel_worker() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "driver")]
 pub enum RuntimeProfileConfig {
     #[serde(rename = "codex")]
     Codex {
+        #[serde(rename = "command")]
         executable: String,
         #[serde(default)]
         model: Option<String>,
         confinement: ConfinementConfig,
     },
-    #[serde(rename = "opencode")]
-    OpenCode {
+    #[serde(rename = "acp")]
+    Acp {
+        #[serde(rename = "command")]
         executable: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
-        agent: Option<String>,
+        mode: Option<String>,
         confinement: ConfinementConfig,
     },
 }
 
 impl RuntimeProfileConfig {
-    pub fn kind(&self) -> &'static str {
+    pub fn driver(&self) -> &'static str {
         match self {
             Self::Codex { .. } => "codex",
-            Self::OpenCode { .. } => "opencode",
+            Self::Acp { .. } => "acp",
         }
     }
 
     pub fn executable(&self) -> &str {
         match self {
-            Self::Codex { executable, .. } | Self::OpenCode { executable, .. } => executable,
+            Self::Codex { executable, .. } | Self::Acp { executable, .. } => executable,
         }
     }
 
     pub fn confinement(&self) -> &ConfinementConfig {
         match self {
-            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
+            Self::Codex { confinement, .. } | Self::Acp { confinement, .. } => confinement,
         }
     }
 
     pub fn confinement_mut(&mut self) -> &mut ConfinementConfig {
         match self {
-            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
+            Self::Codex { confinement, .. } | Self::Acp { confinement, .. } => confinement,
         }
     }
 
@@ -461,7 +467,7 @@ impl RuntimeProfileConfig {
                 confinement: ConfinementConfig::Oci(_),
                 ..
             } => Some(RuntimeAuthKind::Codex),
-            Self::OpenCode { .. } => None,
+            Self::Acp { .. } => None,
         }
     }
 
@@ -554,18 +560,30 @@ impl RuntimeProfileConfig {
                     .filter(|value| !value.is_empty());
                 normalize_confinement_config(confinement);
             }
-            Self::OpenCode {
+            Self::Acp {
                 executable,
+                args,
+                environment,
                 model,
-                agent,
+                mode,
                 confinement,
             } => {
                 *executable = executable.trim().to_string();
+                *args = args
+                    .iter()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                *environment = std::mem::take(environment)
+                    .into_iter()
+                    .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                    .filter(|(key, _)| !key.is_empty())
+                    .collect();
                 *model = model
                     .as_ref()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
-                *agent = agent
+                *mode = mode
                     .as_ref()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());

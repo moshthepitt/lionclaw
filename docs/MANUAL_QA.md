@@ -166,15 +166,11 @@ Expected:
   boundary
 - Codex shows `/workspace` as the directory and no inner Codex sandbox or
   workspace-trust prompt
-- OpenCode native UI loads the generated LionClaw context through the
-  generated config that points at `/runtime/AGENTS.md`, without showing an
-  auto-update prompt
 - the answer is `LIONCLAW_NATIVE_TUI_CONTEXT_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
-- completed Codex and OpenCode native UI turns are present in LionClaw session
-  history and are available to later `lionclaw run`, `run --plain`, and
-  channel context
+- completed Codex native UI turns are present in LionClaw session history and
+  are available to later `lionclaw run`, `run --plain`, and channel context
 - opening and exiting the native UI without completing a turn leaves the launch
   clean but does not prime a later program-backed continuation
 - after a clean exit, relaunching the native UI starts without a prelaunch
@@ -361,8 +357,8 @@ export QA_CHANNEL_ENV_FILE=/path/to/channel.env
 
 Expected when credentials are available:
 
-- the default runtime image reports Codex and OpenCode versions matching the
-  `CODEX_VERSION` and `OPENCODE_VERSION` pins in
+- the default runtime image reports the Codex version matching the
+  `CODEX_VERSION` pin in
   `containers/runtime/Containerfile`, and can run common assistant probes such
   as `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`

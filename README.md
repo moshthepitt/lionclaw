@@ -101,11 +101,8 @@ For Codex, LionClaw uses the outer container as the sandbox boundary and starts
 the inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
 config overrides mark the container workspace as trusted and disable update
 checks without rewriting the runtime-owned Codex config. Completed Codex and
-OpenCode native UI turns are reconciled from durable runtime state into
-LionClaw session history on exit. OpenCode uses the persistent HOME/XDG roots
-under `/runtime/home`; LionClaw points `OPENCODE_CONFIG` at a generated
-session-scoped config file that loads `/runtime/AGENTS.md`, and disables the
-auto-update prompt so runtime updates stay under LionClaw's runtime image path.
+other supported native UI turns are reconciled from durable runtime state into
+LionClaw session history on exit.
 If a prior native launch did not finish cleanly, LionClaw reconciles before the
 next launch; prior LionClaw session history is then included in the generated
 runtime context.

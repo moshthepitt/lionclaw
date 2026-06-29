@@ -323,8 +323,8 @@ struct InstanceAdoptArgs {
 struct ProjectValidateArgs {
     #[arg(long = "runtime-id")]
     runtime_id: String,
-    #[arg(long = "runtime-kind")]
-    runtime_kind: String,
+    #[arg(long = "runtime-driver")]
+    runtime_driver: String,
     #[arg(long = "runtime-bin")]
     runtime_bin: String,
     #[arg(long = "podman-bin")]
@@ -366,16 +366,24 @@ enum RuntimeMountCommand {
 struct RuntimeAddArgs {
     id: String,
     #[arg(long)]
-    kind: String,
+    driver: String,
     #[arg(
         long = "bin",
         help = "Runtime command to execute inside the confinement image"
     )]
     executable: String,
+    #[arg(long = "arg", value_name = "ARG", help = "Runtime command argument")]
+    runtime_args: Vec<String>,
+    #[arg(
+        long = "env",
+        value_name = "KEY=VALUE",
+        help = "Environment value passed to the runtime command"
+    )]
+    environment: Vec<String>,
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
-    agent: Option<String>,
+    mode: Option<String>,
     #[arg(long, help = "Host Podman executable LionClaw should use")]
     engine: Option<String>,
     #[arg(long, help = "Runtime image LionClaw should run with Podman")]
@@ -1080,10 +1088,10 @@ pub async fn run() -> Result<ExitCode> {
                             " "
                         };
                         println!(
-                            "{} {} kind={} command={} confinement={}",
+                            "{} {} driver={} command={} confinement={}",
                             marker,
                             id,
-                            profile.kind(),
+                            profile.driver(),
                             profile.executable(),
                             profile.confinement().backend().as_str()
                         );
@@ -2422,12 +2430,12 @@ async fn validate_project_managed_config(
     let mut issues = Vec::new();
 
     if let Some(runtime) = config.runtime(&args.runtime_id) {
-        if runtime.kind() != args.runtime_kind {
+        if runtime.driver() != args.runtime_driver {
             issues.push(format!(
-                "runtime {:?} has kind={:?}; expected {:?}",
+                "runtime {:?} has driver={:?}; expected {:?}",
                 args.runtime_id,
-                runtime.kind(),
-                args.runtime_kind
+                runtime.driver(),
+                args.runtime_driver
             ));
         }
         if runtime.executable() != args.runtime_bin {
@@ -2655,7 +2663,7 @@ fn build_runtime_profile(
     args: &RuntimeAddArgs,
     executable: String,
 ) -> Result<RuntimeProfileConfig> {
-    match args.kind.trim() {
+    match args.driver.trim() {
         "codex" => {
             validate_codex_profile_args(args)?;
             let confinement = build_confinement_config(args)?;
@@ -2665,17 +2673,19 @@ fn build_runtime_profile(
                 confinement,
             })
         }
-        "opencode" => {
+        "acp" => {
             let confinement = build_confinement_config(args)?;
-            Ok(RuntimeProfileConfig::OpenCode {
+            Ok(RuntimeProfileConfig::Acp {
                 executable,
+                args: normalize_runtime_args(&args.runtime_args),
+                environment: parse_runtime_environment(&args.environment)?,
                 model: args.model.clone(),
-                agent: args.agent.clone(),
+                mode: args.mode.clone(),
                 confinement,
             })
         }
         other => Err(anyhow!(
-            "unsupported runtime kind '{other}'; expected 'codex' or 'opencode'"
+            "unsupported runtime driver '{other}'; expected 'codex' or 'acp'"
         )),
     }
 }
@@ -2726,10 +2736,54 @@ fn build_confinement_config(args: &RuntimeAddArgs) -> Result<ConfinementConfig> 
 }
 
 fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
-    if args.agent.is_some() {
+    if args.mode.is_some() || !args.runtime_args.is_empty() || !args.environment.is_empty() {
         return Err(anyhow!(
-            "opencode-specific flags are not valid for kind 'codex'"
+            "ACP profile flags are not valid for driver 'codex'"
         ));
+    }
+    Ok(())
+}
+
+fn normalize_runtime_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn parse_runtime_environment(values: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for raw in values {
+        let Some((key, value)) = raw.split_once('=') else {
+            bail!("runtime environment value must be KEY=VALUE, got '{raw}'");
+        };
+        let key = key.trim();
+        validate_runtime_environment_key(key)?;
+        if environment
+            .insert(key.to_string(), value.trim().to_string())
+            .is_some()
+        {
+            bail!("runtime environment variable '{key}' is configured more than once");
+        }
+    }
+    Ok(environment)
+}
+
+fn validate_runtime_environment_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("runtime environment variable name cannot be empty");
+    }
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        bail!("runtime environment variable name cannot be empty");
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        bail!("runtime environment variable name '{key}' must start with an ASCII letter or '_'");
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        bail!(
+            "runtime environment variable name '{key}' may only contain ASCII letters, numbers, and '_'"
+        );
     }
     Ok(())
 }
@@ -2774,7 +2828,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn runtime_add_args(kind: &str) -> (TempDir, RuntimeAddArgs) {
+    fn runtime_add_args(driver: &str) -> (TempDir, RuntimeAddArgs) {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -2787,10 +2841,12 @@ mod tests {
             temp_dir,
             RuntimeAddArgs {
                 id: "runtime".to_string(),
-                kind: kind.to_string(),
+                driver: driver.to_string(),
                 executable: "runtime-bin".to_string(),
+                runtime_args: Vec::new(),
+                environment: Vec::new(),
                 model: None,
-                agent: None,
+                mode: None,
                 engine: Some(podman.to_string_lossy().to_string()),
                 image: None,
                 read_only_rootfs: false,
@@ -3967,7 +4023,7 @@ mod tests {
     fn project_validate_args(root: &std::path::Path) -> ProjectValidateArgs {
         ProjectValidateArgs {
             runtime_id: "codex".to_string(),
-            runtime_kind: "codex".to_string(),
+            runtime_driver: "codex".to_string(),
             runtime_bin: "codex".to_string(),
             podman_bin: Some("/usr/bin/podman".to_string()),
             runtime_image: "project-runtime:v1".to_string(),
@@ -4111,14 +4167,72 @@ mod tests {
     }
 
     #[test]
-    fn codex_rejects_opencode_specific_flags() {
+    fn acp_runtime_profile_keeps_command_args_and_environment() {
+        let (_temp_dir, mut args) = runtime_add_args("acp");
+        args.image = Some("ghcr.io/lionclaw/runtime:v1".to_string());
+        args.runtime_args = vec![" acp ".to_string(), "".to_string()];
+        args.environment = vec!["OPENCODE_DISABLE_AUTOUPDATE=1".to_string()];
+        args.model = Some("gpt-5".to_string());
+        args.mode = Some("plan".to_string());
+
+        let profile = build_runtime_profile(&args, "opencode".to_string()).expect("profile");
+        let RuntimeProfileConfig::Acp {
+            executable,
+            args,
+            environment,
+            model,
+            mode,
+            confinement: _,
+        } = profile
+        else {
+            panic!("expected ACP profile");
+        };
+
+        assert_eq!(executable, "opencode");
+        assert_eq!(args, vec!["acp".to_string()]);
+        assert_eq!(
+            environment,
+            BTreeMap::from([("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())])
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn acp_runtime_profile_rejects_malformed_environment() {
+        let (_temp_dir, mut args) = runtime_add_args("acp");
+        args.image = Some("ghcr.io/lionclaw/runtime:v1".to_string());
+        args.environment = vec!["OPENCODE_DISABLE_AUTOUPDATE".to_string()];
+
+        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("runtime environment value must be KEY=VALUE"));
+    }
+
+    #[test]
+    fn acp_runtime_profile_rejects_invalid_environment_name() {
+        let (_temp_dir, mut args) = runtime_add_args("acp");
+        args.image = Some("ghcr.io/lionclaw/runtime:v1".to_string());
+        args.environment = vec!["1BAD=value".to_string()];
+
+        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("must start with an ASCII letter or '_'"));
+    }
+
+    #[test]
+    fn codex_rejects_acp_profile_flags() {
         let (_temp_dir, mut args) = runtime_add_args("codex");
-        args.agent = Some("planner".to_string());
+        args.mode = Some("planner".to_string());
+        args.runtime_args = vec!["acp".to_string()];
+        args.environment = vec!["OPENCODE_DISABLE_AUTOUPDATE=1".to_string()];
         args.image = Some("ghcr.io/lionclaw/codex:v1".to_string());
 
         let err = build_runtime_profile(&args, "codex".to_string()).expect_err("should fail");
         assert!(err
             .to_string()
-            .contains("opencode-specific flags are not valid for kind 'codex'"));
+            .contains("ACP profile flags are not valid for driver 'codex'"));
     }
 }

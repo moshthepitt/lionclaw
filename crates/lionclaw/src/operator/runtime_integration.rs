@@ -5,7 +5,7 @@ use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
 use super::config::{normalize_podman_executable, OperatorConfig, RuntimeProfileConfig};
 
 pub const CODEX_RUNTIME_ID: &str = "codex";
-pub const CODEX_RUNTIME_KIND: &str = "codex";
+pub const CODEX_RUNTIME_DRIVER: &str = "codex";
 pub const CODEX_DEFAULT_EXECUTABLE: &str = "codex";
 pub const DEFAULT_OCI_ENGINE: &str = "podman";
 pub const DEFAULT_RUNTIME_IMAGE: &str = "lionclaw-runtime:v1";
@@ -19,7 +19,7 @@ pub struct ConfigureRuntimeOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProfileFacts {
-    pub kind: String,
+    pub driver: String,
     pub executable: String,
     pub confinement: String,
     pub engine: Option<String>,
@@ -47,9 +47,9 @@ impl ConfigureRuntime {
         }
     }
 
-    fn kind(self) -> &'static str {
+    fn driver(self) -> &'static str {
         match self {
-            Self::Codex => CODEX_RUNTIME_KIND,
+            Self::Codex => CODEX_RUNTIME_DRIVER,
         }
     }
 
@@ -91,11 +91,11 @@ where
     let mut created_profile = false;
 
     match config.runtimes.get(runtime_id) {
-        Some(profile) if profile.kind() == runtime.kind() => {}
+        Some(profile) if profile.driver() == runtime.driver() => {}
         Some(profile) => bail!(
-            "runtime profile \"{runtime_id}\" already exists with kind \"{}\"; expected kind \"{}\"",
-            profile.kind(),
-            runtime.kind()
+            "runtime profile \"{runtime_id}\" already exists with driver \"{}\"; expected driver \"{}\"",
+            profile.driver(),
+            runtime.driver()
         ),
         None => {
             let oci_engine = resolve_engine(DEFAULT_OCI_ENGINE)?;
@@ -120,7 +120,7 @@ pub fn runtime_profile_facts(profile: &RuntimeProfileConfig) -> RuntimeProfileFa
         ConfinementConfig::Oci(oci) => (Some(oci.engine.clone()), oci.image.clone()),
     };
     RuntimeProfileFacts {
-        kind: profile.kind().to_string(),
+        driver: profile.driver().to_string(),
         executable: profile.executable().to_string(),
         confinement: profile.confinement().backend().as_str().to_string(),
         engine,
@@ -237,26 +237,20 @@ mod tests {
     }
 
     #[test]
-    fn configure_rejects_wrong_kind_existing_profile() {
+    fn configure_rejects_wrong_driver_existing_profile() {
         let mut config = OperatorConfig::default();
-        config.runtimes.insert(
-            "codex".to_string(),
-            RuntimeProfileConfig::OpenCode {
-                executable: "opencode".to_string(),
-                model: None,
-                agent: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-            },
-        );
+        config
+            .runtimes
+            .insert("codex".to_string(), test_acp_profile());
 
         let err = configure_runtime_profile_with_engine_resolver(&mut config, "codex", |_| {
             panic!("engine resolver should not run for a wrong-kind profile")
         })
-        .expect_err("wrong kind should fail");
+        .expect_err("wrong driver should fail");
 
         assert!(err
             .to_string()
-            .contains("already exists with kind \"opencode\""));
+            .contains("already exists with driver \"acp\""));
     }
 
     #[test]
@@ -280,16 +274,22 @@ mod tests {
             model: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
         };
-        let opencode = RuntimeProfileConfig::OpenCode {
-            executable: "opencode".to_string(),
-            model: None,
-            agent: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-        };
+        let acp = test_acp_profile();
 
         assert!(runtime_auth_guidance(&codex)
             .expect("codex guidance")
             .contains("codex login"));
-        assert!(runtime_auth_guidance(&opencode).is_none());
+        assert!(runtime_auth_guidance(&acp).is_none());
+    }
+
+    fn test_acp_profile() -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Acp {
+            executable: "opencode".to_string(),
+            args: vec!["acp".to_string()],
+            environment: std::collections::BTreeMap::new(),
+            model: None,
+            mode: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+        }
     }
 }

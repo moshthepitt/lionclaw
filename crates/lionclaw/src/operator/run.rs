@@ -1787,10 +1787,15 @@ esac
     }
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::OpenCode {
+        RuntimeProfileConfig::Acp {
             executable: executable.display().to_string(),
+            args: vec!["acp".to_string()],
+            environment: std::collections::BTreeMap::from([(
+                "OPENCODE_DISABLE_AUTOUPDATE".to_string(),
+                "1".to_string(),
+            )]),
             model: None,
-            agent: None,
+            mode: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
                 engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),

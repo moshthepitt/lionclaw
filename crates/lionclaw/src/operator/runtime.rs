@@ -11,8 +11,8 @@ use crate::kernel::{
     runtime::execution::planner::resolve_execution_network_mode,
     runtime::{
         resolve_oci_image_compatibility_identity, validate_runtime_execution_prerequisites,
-        CodexRuntimeAdapter, CodexRuntimeConfig, ExecutionPlanPurpose, NetworkMode,
-        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeAuthKind, RuntimeExecutionProfile,
+        AcpRuntimeAdapter, AcpRuntimeConfig, CodexRuntimeAdapter, CodexRuntimeConfig,
+        ExecutionPlanPurpose, NetworkMode, RuntimeAuthKind, RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -57,19 +57,29 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                     )
                     .await;
             }
-            RuntimeProfileConfig::OpenCode {
+            RuntimeProfileConfig::Acp {
                 executable,
+                args,
+                environment,
                 model,
-                agent,
+                mode,
                 confinement: _,
             } => {
                 kernel
                     .register_runtime_adapter(
                         id.clone(),
-                        Arc::new(OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
+                        Arc::new(AcpRuntimeAdapter::new(AcpRuntimeConfig {
+                            runtime_id: id.clone(),
                             executable: executable.clone(),
+                            args: args.clone(),
+                            environment: environment
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect(),
                             model: model.clone(),
-                            agent: agent.clone(),
+                            mode: mode.clone(),
+                            session_id_state_file: ".lionclaw-acp-session-id".to_string(),
+                            default_working_dir: "/workspace".to_string(),
                         })),
                     )
                     .await;

@@ -199,18 +199,18 @@ async fn try_open_selected_instance(
         .map_err(kernel_to_anyhow)?
         .session_id;
     let runtime = config.runtime(&runtime_id);
-    let runtime_kind = runtime
-        .map(|runtime| runtime.kind().to_string())
+    let runtime_driver = runtime
+        .map(|runtime| runtime.driver().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let runtime_executable = runtime
         .map(|runtime| runtime.executable().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let (runtime_model, runtime_agent) = match runtime {
+    let (runtime_model, runtime_mode) = match runtime {
         Some(crate::operator::config::RuntimeProfileConfig::Codex { model, .. }) => {
             (model.clone(), None)
         }
-        Some(crate::operator::config::RuntimeProfileConfig::OpenCode { model, agent, .. }) => {
-            (model.clone(), agent.clone())
+        Some(crate::operator::config::RuntimeProfileConfig::Acp { model, mode, .. }) => {
+            (model.clone(), mode.clone())
         }
         None => (None, None),
     };
@@ -219,10 +219,10 @@ async fn try_open_selected_instance(
     Ok(ReadyInstance {
         summary,
         runtime_id,
-        runtime_kind,
+        runtime_driver,
         runtime_executable,
         runtime_model,
-        runtime_agent,
+        runtime_mode,
         runtime_override: launch.requested_runtime.clone(),
         boundary,
         kernel,

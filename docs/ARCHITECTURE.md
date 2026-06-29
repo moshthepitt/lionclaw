@@ -112,8 +112,8 @@ Shared crate primitives:
 ## Runtime Adapter Contract
 
 The shared Rust contract lives in `crates/lionclaw-runtime-api`. Concrete
-runtime adapters live in their own crates, currently
-`crates/lionclaw-runtime-codex`, `crates/lionclaw-runtime-opencode`, and
+conversation drivers live in crates by protocol, not by product: currently
+`crates/lionclaw-runtime-acp`, `crates/lionclaw-runtime-codex`, and
 `crates/lionclaw-runtime-mock`.
 
 Runtime adapters implement:
@@ -132,7 +132,7 @@ Runtime adapters implement:
 Adapters also declare a turn mode:
 
 - `ProgramBacked`: LionClaw launches a real agent CLI inside the compiled
-  execution plan. Codex and OpenCode are the first supported examples.
+  execution plan. Codex and ACP profiles are the first supported examples.
 - `Direct`: the runtime may return explicit `RuntimeCapabilityRequest` items
   for the kernel to broker.
 
@@ -148,7 +148,7 @@ plus observable runtime context, then still decides launch allowance, mounts,
 secrets, auth materialization, audit, and persistence.
 
 Side-effecting live protocol translation lives behind `ConversationDriver`.
-Codex's app-server and OpenCode's ACP driver both own their protocol handshakes,
+Codex's app-server driver and the ACP driver own their protocol handshakes,
 permission replies, runtime session continuity updates, and JSON-RPC loops.
 Their shared output is a turn journal of `TurnEvent` records: one canonical
 `RuntimeEvent` paired with an optional raw protocol payload retained only for
@@ -223,12 +223,13 @@ turns publish typed status/error events followed by exactly one `done`.
 
 Codex is launched through its app-server protocol with `externalSandbox`
 permissions inside the outer Podman boundary. LionClaw does not use
-`codex exec` as a fallback path. OpenCode program-backed turns use ACP rather
-than `opencode run --format json`. Codex app-server and OpenCode ACP
-request/notification assumptions are pinned by checked-in protocol fixtures
-under each runtime crate, including the target CLI version and immutable source
-commit; update those fixtures with the adapter when the target protocol
-contract changes.
+`codex exec` as a fallback path. ACP runtimes such as OpenCode are configured
+as profiles (`driver = "acp"`, command, args, model/mode, auth, confinement)
+served by `lionclaw-runtime-acp`; adding another ACP harness is a profile
+change, not a new Rust crate. Protocol request/notification assumptions are
+pinned by checked-in fixtures under the protocol crate, including the target
+CLI version and immutable source commit; update those fixtures with the driver
+when the target protocol contract changes.
 
 ## Native Runtime TUI Flow
 
@@ -266,14 +267,6 @@ own workspace prompt inside the container while keeping runtime updates under
 LionClaw's runtime image/update path. Those overrides do not rewrite
 `/runtime/home/.codex/config.toml`, and the host Codex home is not mutated.
 
-For OpenCode native TUI launches, LionClaw lets HOME/XDG point at
-`/runtime/home`, sets `OPENCODE_DISABLE_AUTOUPDATE=1`, and points
-`OPENCODE_CONFIG` at `/runtime/opencode.generated.json`. That session-scoped
-config file loads `/runtime/AGENTS.md` as global runtime instructions while
-project-level `.opencode` and `AGENTS.md` files remain project-owned. Program
-turns carry LionClaw context through the normal prompt envelope. Runtime updates
-stay under LionClaw's runtime image/update path.
-
 LionClaw does not scrape terminal output. Native TUI transcript import is an
 adapter contract over runtime-owned durable state. Codex continuity is a
 LionClaw-owned link to one Codex CLI thread id stored in session-scoped runtime
@@ -293,21 +286,6 @@ from that thread's exported turn state, falling back to the saved link when
 listing cannot produce a current thread, and sorting before canonical import.
 Codex threads that the app-server reports as not yet materialized before the
 first user message reconcile as empty, non-resumable continuation sources.
-OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
-stored in session-scoped runtime control state. Program-backed OpenCode turns
-load that id through ACP `session/load`; new ACP sessions persist the returned
-session id back into LionClaw runtime state. Native TUI launches resume with
-`opencode --session <sessionID>` only when that link also has LionClaw's ready
-marker from a proven resumable reconciliation.
-After native TUI exit, LionClaw uses OpenCode's `session list --format json`
-only to identify whether the runtime moved to a newer root session during the
-launch, choosing by exported update timestamp instead of relying on list order.
-It records the chosen root session as the native UI continuation link, then
-imports through `export <sessionID>` for that current linked session and, when
-different, the previously linked session. Program-backed OpenCode resumability
-is proved separately from the current linked session's exported message state.
-LionClaw does not depend on a private OpenCode SQLite schema and does not try to
-backfill an arbitrary session-list window.
 The kernel imports those turns into canonical `session_turns` with deterministic
 source-derived ids, so reconciliation is idempotent. Reconciliation runs after
 process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
@@ -329,11 +307,8 @@ target is valid from runtime-owned state and the latest continuation turn can be
 represented in LionClaw's canonical transcript. For Codex, the saved
 continuation thread must export cleanly far enough to prove its newest turn is
 explicitly completed, importable, and free of a non-null app-server error. For
-OpenCode, the linked continuation session must export cleanly and its raw
-message state must have an assistant finish reason that OpenCode's own prompt
-loop treats as terminal, answering the latest user message with no unresolved
-non-provider-executed tool part; older good sessions do not make the next
-`opencode run --session` safe.
+other attached runtime UIs, resumability remains adapter-owned and must be
+proved from runtime-owned state before a later launch reuses a continuation.
 Transcript export passes are bounded by a kernel native-export timeout no greater
 than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
 TUI exit handling unbounded. Adapters may return partial transcripts with source
@@ -1229,9 +1204,9 @@ home.
 
 1. Policy checks deny unless an explicit grant exists.
 2. No default external channel is built into the core.
-3. Runtime adapters registered by default: local `mock` only. `codex` and
-   `opencode` are configured runtime profiles bound at startup.
-4. Configured Codex/OpenCode profiles run through the shared execution planner
+3. Runtime adapters registered by default: local `mock` only. `codex` and ACP
+   profiles such as `opencode` are configured runtime profiles bound at startup.
+4. Configured Codex/ACP profiles run through the shared execution planner
    and Podman backend, then map runtime output into kernel events.
 5. Runtime idle timeout, hard timeout, and cancellation are kernel-enforced and
    audited. Local interactive runs default to a 30 minute idle timeout and a 2

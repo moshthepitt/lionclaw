@@ -777,10 +777,10 @@ async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
         selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
             summary: main,
             runtime_id: "codex".to_string(),
-            runtime_kind: "codex".to_string(),
+            runtime_driver: "codex".to_string(),
             runtime_executable: "codex".to_string(),
             runtime_model: Some("gpt-5".to_string()),
-            runtime_agent: None,
+            runtime_mode: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),
@@ -1459,10 +1459,10 @@ async fn project_objects_load_real_sessions() {
     let selected = SelectedInstanceState::Ready(Box::new(ReadyInstance {
         summary,
         runtime_id: "codex".to_string(),
-        runtime_kind: "codex".to_string(),
+        runtime_driver: "codex".to_string(),
         runtime_executable: "codex".to_string(),
         runtime_model: Some("gpt-5".to_string()),
-        runtime_agent: None,
+        runtime_mode: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -2121,10 +2121,10 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempD
     let selected = SelectedInstanceState::Ready(Box::new(ReadyInstance {
         summary: summary.clone(),
         runtime_id: "codex".to_string(),
-        runtime_kind: "codex".to_string(),
+        runtime_driver: "codex".to_string(),
         runtime_executable: "codex".to_string(),
         runtime_model: Some("gpt-5".to_string()),
-        runtime_agent: None,
+        runtime_mode: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -2267,10 +2267,12 @@ async fn save_project_runtime_config(
 
 #[cfg(unix)]
 fn test_opencode_runtime(runtime_executable: &Path, podman: &Path) -> RuntimeProfileConfig {
-    RuntimeProfileConfig::OpenCode {
+    RuntimeProfileConfig::Acp {
         executable: runtime_executable.display().to_string(),
+        args: vec!["acp".to_string()],
+        environment: std::collections::BTreeMap::new(),
         model: None,
-        agent: None,
+        mode: None,
         confinement: ConfinementConfig::Oci(OciConfinementConfig {
             engine: podman.display().to_string(),
             image: Some("ghcr.io/lionclaw/operator-console-test-runtime:latest".to_string()),
@@ -2338,10 +2340,10 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
             summary: main,
             runtime_id: "codex".to_string(),
-            runtime_kind: "codex".to_string(),
+            runtime_driver: "codex".to_string(),
             runtime_executable: "codex".to_string(),
             runtime_model: Some("gpt-5".to_string()),
-            runtime_agent: None,
+            runtime_mode: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),
