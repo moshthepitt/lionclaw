@@ -334,9 +334,13 @@ impl SessionTurnStore {
         let raw_payload = record.raw.as_ref().map(|raw| raw.payload.as_str());
         let created_at_ms = now_ms();
 
-        let mut tx = self.pool.begin().await.with_context(|| {
-            format!("failed to begin journal append for session turn {turn_id}")
-        })?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .with_context(|| {
+                format!("failed to begin journal append for session turn {turn_id}")
+            })?;
         let sequence_no_raw: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_no), 0) + 1 \
              FROM session_turn_journal_events \
