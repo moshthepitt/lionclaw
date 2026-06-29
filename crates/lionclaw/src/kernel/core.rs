@@ -153,15 +153,16 @@ use super::{
         runtime_state_mount_source, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
         EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
         ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
-        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionContext,
-        RuntimeExecutionProfile, RuntimeExecutionSession, RuntimeFileChange,
-        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeAuthContext,
+        RuntimeAuthRegistry, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
+        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
@@ -601,7 +602,8 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_registry: RuntimeAuthRegistry,
+    pub runtime_auth_context: RuntimeAuthContext,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -630,7 +632,8 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
-            .field("codex_home_override", &self.codex_home_override)
+            .field("runtime_auth_registry", &self.runtime_auth_registry)
+            .field("runtime_auth_context", &self.runtime_auth_context)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -659,7 +662,8 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -697,13 +701,15 @@ struct AttachedRuntimeLaunchLock {
 
 struct AttachedRuntimeTranscriptProgramExecutor {
     plan: EffectiveExecutionPlan,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
 }
 
 struct KernelRuntimeProgramExecutor {
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
 }
 
 #[async_trait::async_trait]
@@ -716,9 +722,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
         execute_streaming(
             ExecutionRequest {
                 plan: self.plan.clone(),
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             stdout,
         )
@@ -731,9 +741,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<ExecutionOutput> {
         execute_captured(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await
     }
@@ -744,9 +758,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
         let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
@@ -809,9 +827,13 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
             hard_timeout,
             execute_captured(ExecutionRequest {
                 plan: self.plan.clone(),
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount: None,
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             }),
         )
         .await
@@ -829,9 +851,13 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
     ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
         let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: None,
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
@@ -860,7 +886,8 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -934,8 +961,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_execution_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                     network_mode,
                 )
                 .await
@@ -944,8 +972,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_launch_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                 )
                 .await
             }
@@ -1032,7 +1061,8 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
-            codex_home_override: options.codex_home_override,
+            runtime_auth_registry: options.runtime_auth_registry,
+            runtime_auth_context: options.runtime_auth_context,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -1127,7 +1157,7 @@ impl Kernel {
             .await;
         self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
-        self.materialize_attached_runtime_plan(&runtime_kind, &execution_plan)
+        self.materialize_attached_runtime_plan(&execution_plan)
             .await?;
         if recover_before_launch {
             self.reconcile_attached_runtime_transcript_best_effort(
@@ -1179,9 +1209,13 @@ impl Kernel {
         Ok(PreparedAttachedRuntimeLaunch {
             request: ExecutionRequest {
                 plan: execution_plan,
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount,
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             _launch_lock: launch_lock,
         })
@@ -1345,7 +1379,8 @@ impl Kernel {
         };
         let mut executor = AttachedRuntimeTranscriptProgramExecutor {
             plan: plan.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_registry: self.runtime_auth_registry.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         };
         let RuntimeTerminalTranscript {
             mut turns,
@@ -7123,7 +7158,8 @@ impl Kernel {
         let runtime_executor = KernelRuntimeProgramExecutor {
             plan: execution_plan,
             runtime_secrets_mount,
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_registry: self.runtime_auth_registry.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         };
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
@@ -8012,7 +8048,8 @@ mod tests {
         plan.hard_timeout = ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT * 10;
         let executor = AttachedRuntimeTranscriptProgramExecutor {
             plan,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
         };
         assert_eq!(
             executor.hard_timeout(),
@@ -8023,7 +8060,8 @@ mod tests {
         plan.hard_timeout = Duration::from_secs(5);
         let executor = AttachedRuntimeTranscriptProgramExecutor {
             plan,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
         };
         assert_eq!(executor.hard_timeout(), Duration::from_secs(5));
     }
@@ -8035,6 +8073,7 @@ mod tests {
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
@@ -12815,14 +12854,17 @@ done
     }
 
     #[tokio::test]
-    async fn materialize_runtime_plan_projects_skills_using_runtime_kind() {
+    async fn materialize_runtime_plan_projects_skills_using_profile_projection() {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let mut plan = test_execution_plan("work-codex");
+        let mut plan = test_execution_plan("work-runtime");
+        plan.skill_projection = Some(
+            crate::kernel::runtime::RuntimeSkillProjectionConfig::native_dir(".native/skills"),
+        );
         plan.mounts = vec![
             MountSpec {
                 source: temp_dir.path().join("workspace"),
@@ -12847,12 +12889,12 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
         assert!(runtime_state_root.exists());
-        let link = runtime_home_root.join(".codex/skills/loopback");
+        let link = runtime_home_root.join(".native/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
@@ -12870,7 +12912,7 @@ done
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
         let legacy_home_root = runtime_state_root.join(crate::home::RUNTIME_NATIVE_HOME_DIR);
-        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let legacy_config = legacy_home_root.join(".native/config.toml");
         tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
             .await
             .expect("create legacy home");
@@ -12892,7 +12934,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -12938,7 +12980,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -13198,7 +13240,7 @@ done
         std::os::unix::fs::symlink(&outside, &generated_agents).expect("generated context symlink");
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("cached generated context is not part of runtime plan materialization");
 
@@ -14401,6 +14443,7 @@ done
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
@@ -20376,7 +20419,6 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
-        let runtime_kind = adapter.info().await.id;
         let runtime_turn_mode = adapter.turn_mode();
         let RuntimeExecutionSkills {
             skill_ids: runtime_skill_ids,
@@ -20406,8 +20448,7 @@ impl Kernel {
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;
         }
-        self.materialize_runtime_plan(&runtime_kind, &execution_plan)
-            .await?;
+        self.materialize_runtime_plan(&execution_plan).await?;
         if let Some(turn) = &prepared_turn {
             if turn.runtime_id != runtime_id {
                 return Err(KernelError::Internal(
@@ -21868,25 +21909,20 @@ impl Kernel {
 
     async fn materialize_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_attached_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_runtime_mounts_and_skills(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
@@ -21908,9 +21944,13 @@ impl Kernel {
         let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
-            .await
-            .map_err(internal)
+        project_runtime_skills(
+            plan.skill_projection.as_ref(),
+            runtime_home_root,
+            &plan.mounts,
+        )
+        .await
+        .map_err(internal)
     }
 
     async fn reset_runtime_plan_state(
@@ -25000,7 +25040,8 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut turn_task = tokio::spawn(async move {
             match runtime_turn_mode {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, journal_tx).await,
@@ -25008,7 +25049,8 @@ impl Kernel {
                     let runtime_executor = KernelRuntimeProgramExecutor {
                         plan: execution_plan,
                         runtime_secrets_mount,
-                        codex_home_override,
+                        runtime_auth_registry,
+                        runtime_auth_context,
                     };
                     adapter_for_task
                         .program_backed_turn(
@@ -25322,12 +25364,14 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut control_task = tokio::spawn(async move {
             let runtime_executor = KernelRuntimeProgramExecutor {
                 plan: execution_plan,
                 runtime_secrets_mount,
-                codex_home_override,
+                runtime_auth_registry,
+                runtime_auth_context,
             };
             adapter_for_task
                 .runtime_control(

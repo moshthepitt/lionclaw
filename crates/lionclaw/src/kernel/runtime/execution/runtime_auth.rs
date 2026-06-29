@@ -1,43 +1,43 @@
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::anyhow;
+use anyhow::Result;
+use lionclaw_runtime_api::RuntimeAuthPreparation;
 
 use super::{
     backend::ExecutionRequest,
-    plan::{runtime_native_home_mount_source, MountSpec, NetworkMode, RuntimeAuthKind},
+    plan::{runtime_native_home_mount_source, MountSpec},
 };
-use crate::kernel::runtime::sync_codex_home_into_runtime_home;
-
-const CONTAINER_CODEX_HOME: &str = "/runtime/home/.codex";
 
 pub async fn prepare_runtime_auth(request: &ExecutionRequest) -> Result<Vec<(String, String)>> {
-    match request.program.auth {
+    match &request.program.auth {
         None => Ok(Vec::new()),
-        Some(RuntimeAuthKind::Codex) => prepare_codex_runtime_auth(request).await,
+        Some(auth) => {
+            let provider = request.runtime_auth_provider.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "runtime '{}' requested unsupported runtime auth kind '{}'",
+                    request.plan.runtime_id,
+                    auth.as_str()
+                )
+            })?;
+            if provider.kind() != auth.as_str() {
+                return Err(anyhow!(
+                    "runtime '{}' requested auth kind '{}' but received provider '{}'",
+                    request.plan.runtime_id,
+                    auth.as_str(),
+                    provider.kind()
+                ));
+            }
+            provider
+                .prepare(RuntimeAuthPreparation {
+                    runtime_id: &request.plan.runtime_id,
+                    network_mode: request.plan.network_mode,
+                    runtime_home_root: runtime_home_root(&request.plan.mounts),
+                    host_context: &request.runtime_auth_context,
+                })
+                .await
+        }
     }
-}
-
-async fn prepare_codex_runtime_auth(request: &ExecutionRequest) -> Result<Vec<(String, String)>> {
-    if request.plan.network_mode != NetworkMode::On {
-        bail!(
-            "runtime '{}' requires network-mode 'on' when Codex runtime auth is enabled",
-            request.plan.runtime_id
-        );
-    }
-
-    let runtime_home_root = runtime_home_root(&request.plan.mounts).ok_or_else(|| {
-        anyhow!(
-            "runtime '{}' requires a /runtime/home mount when Codex runtime auth is enabled",
-            request.plan.runtime_id
-        )
-    })?;
-    sync_codex_home_into_runtime_home(runtime_home_root, request.codex_home_override.as_deref())
-        .await?;
-
-    Ok(vec![(
-        "CODEX_HOME".to_string(),
-        CONTAINER_CODEX_HOME.to_string(),
-    )])
 }
 
 fn runtime_home_root(mounts: &[MountSpec]) -> Option<&Path> {
@@ -46,18 +46,53 @@ fn runtime_home_root(mounts: &[MountSpec]) -> Option<&Path> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::bail;
+    use async_trait::async_trait;
+    use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthProvider};
+
     use super::*;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, MountAccess, MountSpec,
-        OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
+        NetworkMode, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
     };
+
+    const TEST_AUTH_KIND: &str = "test-auth";
+
+    #[derive(Debug)]
+    struct TestRuntimeAuthProvider;
+
+    #[async_trait]
+    impl RuntimeAuthProvider for TestRuntimeAuthProvider {
+        fn kind(&self) -> &'static str {
+            TEST_AUTH_KIND
+        }
+
+        async fn validate(&self, _context: &RuntimeAuthContext) -> Result<()> {
+            Ok(())
+        }
+
+        async fn prepare(
+            &self,
+            input: RuntimeAuthPreparation<'_>,
+        ) -> Result<Vec<(String, String)>> {
+            if input.network_mode != NetworkMode::On {
+                bail!(
+                    "runtime '{}' requires network-mode 'on' when test runtime auth is enabled",
+                    input.runtime_id
+                );
+            }
+
+            Ok(vec![("TEST_AUTH".to_string(), "enabled".to_string())])
+        }
+    }
 
     fn sample_request(network_mode: NetworkMode) -> ExecutionRequest {
         ExecutionRequest {
             plan: EffectiveExecutionPlan {
-                runtime_id: "codex".to_string(),
+                runtime_id: "test-runtime".to_string(),
                 preset_name: "everyday".to_string(),
                 confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                skill_projection: None,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode,
                 working_dir: None,
@@ -81,14 +116,15 @@ mod tests {
                 limits: ExecutionLimits::default(),
             },
             program: RuntimeProgramSpec {
-                executable: "codex".to_string(),
+                executable: "test-runtime".to_string(),
                 args: vec!["exec".to_string()],
                 environment: Vec::new(),
                 stdin: "hello".to_string(),
-                auth: Some(RuntimeAuthKind::Codex),
+                auth: Some(RuntimeAuthKind::from_static(TEST_AUTH_KIND)),
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: Some(std::sync::Arc::new(TestRuntimeAuthProvider)),
+            runtime_auth_context: Default::default(),
         }
     }
 
@@ -117,10 +153,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_runtime_auth_requires_network() {
+    async fn runtime_auth_provider_receives_execution_context() {
         let err = prepare_runtime_auth(&sample_request(NetworkMode::None))
             .await
-            .expect_err("network-off Codex launch should fail");
+            .expect_err("network-off auth preparation should fail");
 
         assert!(err.to_string().contains("requires network-mode 'on'"));
     }

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -27,6 +27,86 @@ pub fn runtime_skill_mount_target_alias(target: &str) -> Option<&str> {
         .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
         .and_then(|suffix| suffix.strip_prefix('/'))
         .filter(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RuntimeSkillProjectionConfig {
+    NativeDir {
+        root: String,
+        #[serde(default)]
+        format: RuntimeSkillProjectionFormat,
+    },
+}
+
+impl RuntimeSkillProjectionConfig {
+    pub fn native_dir(root: impl Into<String>) -> Self {
+        let mut projection = Self::NativeDir {
+            root: root.into(),
+            format: RuntimeSkillProjectionFormat::SkillMd,
+        };
+        projection.normalize();
+        projection
+    }
+
+    pub fn native_dir_root(&self) -> &str {
+        match self {
+            Self::NativeDir { root, .. } => root,
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        match self {
+            Self::NativeDir { root, .. } => {
+                *root = normalize_runtime_skill_projection_root(root);
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::NativeDir { root, .. } => validate_runtime_skill_projection_root(root),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSkillProjectionFormat {
+    #[default]
+    SkillMd,
+}
+
+fn normalize_runtime_skill_projection_root(root: &str) -> String {
+    root.trim().to_string()
+}
+
+fn validate_runtime_skill_projection_root(root: &str) -> Result<()> {
+    let normalized = normalize_runtime_skill_projection_root(root);
+    if normalized.is_empty() {
+        anyhow::bail!("runtime skill projection root is required");
+    }
+
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        anyhow::bail!("runtime skill projection root must be relative");
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "runtime skill projection root must not contain traversal or absolute components"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn mount_source_for_target<'a>(mounts: &'a [MountSpec], target: &str) -> Option<&'a Path> {
@@ -263,6 +343,7 @@ pub struct EffectiveExecutionPlan {
     pub runtime_id: String,
     pub preset_name: String,
     pub confinement: ConfinementConfig,
+    pub skill_projection: Option<RuntimeSkillProjectionConfig>,
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     pub working_dir: Option<String>,
@@ -281,6 +362,7 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("runtime_id", &self.runtime_id)
             .field("preset_name", &self.preset_name)
             .field("confinement", &self.confinement)
+            .field("skill_projection", &self.skill_projection)
             .field("workspace_access", &self.workspace_access)
             .field("network_mode", &self.network_mode)
             .field("working_dir", &self.working_dir)
@@ -418,5 +500,20 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("hello"));
+    }
+
+    #[test]
+    fn runtime_skill_projection_root_must_be_safe_relative_path() {
+        let valid = super::RuntimeSkillProjectionConfig::native_dir(" .config/runtime/skills ");
+        assert_eq!(valid.native_dir_root(), ".config/runtime/skills");
+        valid.validate().expect("valid projection root");
+
+        for root in ["/absolute/skills", "../skills", "skills/../other", ""] {
+            let projection = super::RuntimeSkillProjectionConfig::native_dir(root);
+            assert!(
+                projection.validate().is_err(),
+                "{root:?} should be rejected"
+            );
+        }
     }
 }

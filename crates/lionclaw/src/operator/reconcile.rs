@@ -1108,7 +1108,8 @@ async fn open_kernel_with_project_root(
             execution_presets: config.presets.clone(),
             runtime_execution_profiles: runtime_context.execution_profiles,
             runtime_secrets_home: Some(home.clone()),
-            codex_home_override: runtime_context.codex_home_override,
+            runtime_auth_registry: runtime_context.runtime_auth_registry,
+            runtime_auth_context: runtime_context.runtime_auth_context,
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
@@ -1143,7 +1144,7 @@ mod tests {
         config::resolve_project_workspace_root,
         contracts::{ChannelRoutingProfile, DaemonInfoResponse, TrustTier},
         home::{runtime_project_partition_key, LionClawHome},
-        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig},
         operator::{
             channel_env::{merge_channel_env, ChannelEnv},
             config::{
@@ -1158,6 +1159,7 @@ mod tests {
         },
     };
     use axum::{routing::get, Json, Router};
+    use lionclaw_runtime_codex::codex_runtime_auth_kind;
 
     async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -1378,17 +1380,25 @@ mod tests {
     }
 
     fn test_codex_runtime(runtime_stub: &Path) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                engine: ensure_fake_podman(runtime_stub)
-                    .to_string_lossy()
-                    .to_string(),
+        test_codex_runtime_with_engine(
+            ensure_fake_podman(runtime_stub)
+                .to_string_lossy()
+                .to_string(),
+        )
+    }
+
+    fn test_codex_runtime_with_engine(engine: String) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::new(
+            "codex",
+            "codex",
+            ConfinementConfig::Oci(OciConfinementConfig {
+                engine,
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),
-        }
+        )
+        .with_auth(codex_runtime_auth_kind())
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"))
     }
 
     async fn write_test_codex_auth(home: &LionClawHome) {
@@ -2711,15 +2721,7 @@ mod tests {
 
         config.runtimes = [(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: broken_podman.to_string_lossy().to_string(),
-                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            test_codex_runtime_with_engine(broken_podman.to_string_lossy().to_string()),
         )]
         .into_iter()
         .collect();

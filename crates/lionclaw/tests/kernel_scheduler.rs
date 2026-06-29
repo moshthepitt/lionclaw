@@ -40,6 +40,8 @@ use lionclaw::{
     },
     workspace::bootstrap_workspace,
 };
+use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthProvider, RuntimeAuthRegistry};
+use lionclaw_runtime_codex::{codex_runtime_auth_kind, CodexRuntimeAuthProvider};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -2704,10 +2706,14 @@ async fn kernel_with_counting_codex_runtime_and_podman_body_and_options(
             }),
             "codex-auth".to_string(),
             None,
-            Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
+            Some(codex_runtime_auth_kind()),
         ),
     )]);
-    options.codex_home_override = Some(home.root().join(".codex"));
+    options.runtime_auth_registry = RuntimeAuthRegistry::new([
+        Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>
+    ]);
+    options.runtime_auth_context =
+        RuntimeAuthContext::new().with_home_override("codex", home.root().join(".codex"));
 
     let kernel = env.kernel_with_options(options).await;
     kernel

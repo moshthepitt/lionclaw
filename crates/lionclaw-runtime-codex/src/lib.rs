@@ -30,6 +30,8 @@
     )
 )]
 
+mod host_auth;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -45,6 +47,11 @@ use tokio::{
 };
 use tracing::warn;
 use uuid::Uuid;
+
+pub use host_auth::{
+    codex_home_identity, ensure_codex_host_auth_ready, prepare_codex_runtime_auth,
+    sync_codex_home_into_runtime_home, CodexRuntimeAuthProvider,
+};
 
 use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
@@ -65,12 +72,17 @@ use lionclaw_runtime_api::{
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_DRIVER: &str = "codex-app-server";
+pub const CODEX_RUNTIME_AUTH_KIND: &str = "codex";
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
 const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
 const CODEX_GENERATED_IMAGES_RUNTIME_DIR: &str = "/runtime/home/.codex/generated_images";
 const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
 const CODEX_TRUSTED_LEVEL: &str = "trusted";
+
+pub fn codex_runtime_auth_kind() -> RuntimeAuthKind {
+    RuntimeAuthKind::from_static(CODEX_RUNTIME_AUTH_KIND)
+}
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -969,7 +981,7 @@ fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgram
         args,
         environment: Vec::new(),
         stdin: String::new(),
-        auth: Some(RuntimeAuthKind::Codex),
+        auth: Some(codex_runtime_auth_kind()),
     }
 }
 
@@ -998,7 +1010,7 @@ fn build_codex_terminal_program(
         args,
         environment: Vec::new(),
         stdin: String::new(),
-        auth: Some(RuntimeAuthKind::Codex),
+        auth: Some(codex_runtime_auth_kind()),
     }
 }
 
@@ -3226,14 +3238,16 @@ mod tests {
     use chrono::{DateTime, Utc};
     use lionclaw_runtime_api::{
         append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
-        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAuthKind,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChangeStatus,
-        RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
-        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
+        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
         RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
         TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
+
+    use crate::codex_runtime_auth_kind;
     use serde_json::{json, Value};
     use tokio::time::Instant;
     use uuid::Uuid;
@@ -3575,7 +3589,7 @@ mod tests {
                 "gpt-5.5".to_string(),
             ]
         );
-        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
+        assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
         assert!(program.environment.is_empty());
         assert!(program.stdin.is_empty());
     }
@@ -4798,7 +4812,7 @@ mod tests {
             ]
         );
         assert_eq!(program.stdin, "");
-        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
+        assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
     }
 
     #[test]

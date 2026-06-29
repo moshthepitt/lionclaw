@@ -1,8 +1,12 @@
 use anyhow::{anyhow, bail, Result};
+use lionclaw_runtime_codex::codex_runtime_auth_kind;
 
-use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
+use crate::kernel::runtime::{
+    ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
+};
 
 use super::config::{normalize_podman_executable, OperatorConfig, RuntimeProfileConfig};
+use super::runtime::runtime_auth_registry;
 
 pub const CODEX_RUNTIME_ID: &str = "codex";
 pub const CODEX_RUNTIME_DRIVER: &str = "codex";
@@ -55,15 +59,17 @@ impl ConfigureRuntime {
 
     fn default_profile(self, oci_engine: String) -> RuntimeProfileConfig {
         match self {
-            Self::Codex => RuntimeProfileConfig::Codex {
-                executable: CODEX_DEFAULT_EXECUTABLE.to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            Self::Codex => RuntimeProfileConfig::new(
+                CODEX_RUNTIME_DRIVER,
+                CODEX_DEFAULT_EXECUTABLE,
+                ConfinementConfig::Oci(OciConfinementConfig {
                     engine: oci_engine,
                     image: Some(DEFAULT_RUNTIME_IMAGE.to_string()),
                     ..OciConfinementConfig::default()
                 }),
-            },
+            )
+            .with_auth(codex_runtime_auth_kind())
+            .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills")),
         }
     }
 }
@@ -140,10 +146,8 @@ pub fn unsupported_configure_runtime_message(runtime_id: &str) -> String {
 }
 
 pub fn runtime_auth_guidance(profile: &RuntimeProfileConfig) -> Option<&'static str> {
-    match profile {
-        RuntimeProfileConfig::Codex { .. } => Some("Codex auth is checked at launch; run `codex login` on the host if launch reports missing auth."),
-        _ => None,
-    }
+    let auth = profile.required_runtime_auth()?;
+    runtime_auth_registry().get(&auth)?.guidance()
 }
 
 #[cfg(test)]
@@ -172,15 +176,18 @@ mod tests {
 
         assert!(outcome.created_profile);
         assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
-        let RuntimeProfileConfig::Codex {
-            executable,
-            confinement,
-            ..
-        } = config.runtimes.get("codex").expect("codex profile")
-        else {
-            panic!("expected codex profile");
-        };
-        assert_eq!(executable, "codex");
+        let profile = config.runtimes.get("codex").expect("codex profile");
+        assert_eq!(profile.driver, "codex");
+        assert_eq!(profile.executable, "codex");
+        assert_eq!(profile.auth, Some(codex_runtime_auth_kind()));
+        assert_eq!(
+            profile
+                .skill_projection
+                .as_ref()
+                .map(RuntimeSkillProjectionConfig::native_dir_root),
+            Some(".codex/skills")
+        );
+        let confinement = &profile.confinement;
         let ConfinementConfig::Oci(oci) = confinement;
         assert_eq!(oci.engine, RESOLVED_PODMAN);
         assert_eq!(oci.image.as_deref(), Some("lionclaw-runtime:v1"));
@@ -189,18 +196,21 @@ mod tests {
     #[test]
     fn configure_codex_is_idempotent_and_preserves_existing_fields() {
         let mut config = OperatorConfig::default();
-        config.runtimes.insert(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "custom-codex".to_string(),
-                model: Some("gpt-5.2".to_string()),
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: "/usr/bin/podman".to_string(),
-                    image: Some("custom-runtime:v2".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
+        let mut existing_profile = RuntimeProfileConfig::new(
+            "codex",
+            "custom-codex",
+            ConfinementConfig::Oci(OciConfinementConfig {
+                engine: "/usr/bin/podman".to_string(),
+                image: Some("custom-runtime:v2".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        )
+        .with_auth(codex_runtime_auth_kind())
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"));
+        existing_profile.model = Some("gpt-5.2".to_string());
+        config
+            .runtimes
+            .insert("codex".to_string(), existing_profile);
 
         let outcome = configure_runtime_profile_with_engine_resolver(&mut config, "codex", |_| {
             panic!("engine resolver should not run for an existing profile")
@@ -209,16 +219,10 @@ mod tests {
 
         assert!(!outcome.created_profile);
         assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
-        let RuntimeProfileConfig::Codex {
-            executable,
-            model,
-            confinement,
-        } = config.runtimes.get("codex").expect("codex profile")
-        else {
-            panic!("expected codex profile");
-        };
-        assert_eq!(executable, "custom-codex");
-        assert_eq!(model.as_deref(), Some("gpt-5.2"));
+        let profile = config.runtimes.get("codex").expect("codex profile");
+        assert_eq!(profile.executable, "custom-codex");
+        assert_eq!(profile.model.as_deref(), Some("gpt-5.2"));
+        let confinement = &profile.confinement;
         let ConfinementConfig::Oci(oci) = confinement;
         assert_eq!(oci.engine, "/usr/bin/podman");
         assert_eq!(oci.image.as_deref(), Some("custom-runtime:v2"));
@@ -269,11 +273,12 @@ mod tests {
 
     #[test]
     fn auth_guidance_follows_profile_kind() {
-        let codex = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-        };
+        let codex = RuntimeProfileConfig::new(
+            "codex",
+            "codex",
+            ConfinementConfig::Oci(OciConfinementConfig::default()),
+        )
+        .with_auth(codex_runtime_auth_kind());
         let acp = test_acp_profile();
 
         assert!(runtime_auth_guidance(&codex)
@@ -283,13 +288,15 @@ mod tests {
     }
 
     fn test_acp_profile() -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Acp {
-            executable: "opencode".to_string(),
-            args: vec!["acp".to_string()],
-            environment: std::collections::BTreeMap::new(),
-            model: None,
-            mode: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-        }
+        let mut profile = RuntimeProfileConfig::new(
+            "acp",
+            "opencode",
+            ConfinementConfig::Oci(OciConfinementConfig::default()),
+        )
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+            ".config/opencode/skills",
+        ));
+        profile.args = vec!["acp".to_string()];
+        profile
     }
 }

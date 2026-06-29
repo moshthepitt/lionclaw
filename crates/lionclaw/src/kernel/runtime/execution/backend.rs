@@ -1,8 +1,8 @@
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lionclaw_runtime_api::RuntimeProgramSession;
+use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthProvider, RuntimeProgramSession};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -48,7 +48,8 @@ pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_provider: Option<Arc<dyn RuntimeAuthProvider>>,
+    pub runtime_auth_context: RuntimeAuthContext,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -57,7 +58,14 @@ impl fmt::Debug for ExecutionRequest {
             .field("plan", &self.plan)
             .field("program", &self.program)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
-            .field("codex_home_override", &self.codex_home_override)
+            .field(
+                "runtime_auth_provider",
+                &self
+                    .runtime_auth_provider
+                    .as_ref()
+                    .map(|provider| provider.kind()),
+            )
+            .field("runtime_auth_context", &self.runtime_auth_context)
             .finish()
     }
 }
@@ -166,7 +174,7 @@ mod tests {
     use super::{ExecutionRequest, RuntimeSecretsMount, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkMode,
-        OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
+        OciConfinementConfig, RuntimeAuthContext, RuntimeProgramSpec, WorkspaceAccess,
     };
 
     #[test]
@@ -178,6 +186,7 @@ mod tests {
                     runtime_id: "codex".to_string(),
                     preset_name: "everyday".to_string(),
                     confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                    skill_projection: None,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     network_mode: NetworkMode::On,
                     working_dir: None,
@@ -199,14 +208,15 @@ mod tests {
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),
-                codex_home_override: Some("/tmp/test-codex-home".into()),
+                runtime_auth_provider: None,
+                runtime_auth_context: RuntimeAuthContext::default(),
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
-        assert!(debug.contains("codex_home_override"));
+        assert!(debug.contains("runtime_auth_context"));
     }
 
     #[test]

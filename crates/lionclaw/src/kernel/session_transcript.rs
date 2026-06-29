@@ -1107,7 +1107,7 @@ mod tests {
             Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").expect("uuid"),
             SessionTurnStatus::Completed,
             "/compact",
-            "Compacted Codex thread.",
+            "Compacted runtime thread.",
             None,
         );
         runtime_control.kind = SessionTurnKind::RuntimeControl;

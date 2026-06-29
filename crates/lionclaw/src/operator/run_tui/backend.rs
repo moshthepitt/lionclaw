@@ -205,15 +205,9 @@ async fn try_open_selected_instance(
     let runtime_executable = runtime
         .map(|runtime| runtime.executable().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let (runtime_model, runtime_mode) = match runtime {
-        Some(crate::operator::config::RuntimeProfileConfig::Codex { model, .. }) => {
-            (model.clone(), None)
-        }
-        Some(crate::operator::config::RuntimeProfileConfig::Acp { model, mode, .. }) => {
-            (model.clone(), mode.clone())
-        }
-        None => (None, None),
-    };
+    let (runtime_model, runtime_mode) = runtime
+        .map(|runtime| (runtime.model.clone(), runtime.mode.clone()))
+        .unwrap_or((None, None));
     let boundary = resolve_boundary_summary(&config, effective_timeouts)?;
 
     Ok(ReadyInstance {

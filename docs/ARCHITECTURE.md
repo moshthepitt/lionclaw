@@ -224,12 +224,13 @@ turns publish typed status/error events followed by exactly one `done`.
 Codex is launched through its app-server protocol with `externalSandbox`
 permissions inside the outer Podman boundary. LionClaw does not use
 `codex exec` as a fallback path. ACP runtimes such as OpenCode are configured
-as profiles (`driver = "acp"`, command, args, model/mode, auth, confinement)
-served by `lionclaw-runtime-acp`; adding another ACP harness is a profile
-change, not a new Rust crate. Protocol request/notification assumptions are
-pinned by checked-in fixtures under the protocol crate, including the target
-CLI version and immutable source commit; update those fixtures with the driver
-when the target protocol contract changes.
+as profiles (`driver = "acp"`, command, args, model/mode, auth, confinement,
+and optional `skill_projection`) served by `lionclaw-runtime-acp`; adding
+another ACP harness is a profile change, not a new Rust crate. Protocol
+request/notification assumptions are pinned by checked-in fixtures under the
+protocol crate, including the target CLI version and immutable source commit;
+update those fixtures with the driver when the target protocol contract
+changes.
 
 ## Native Runtime TUI Flow
 
@@ -1242,14 +1243,30 @@ home.
 
 ## Adding A Runtime
 
-1. Add a `crates/lionclaw-runtime-<id>` crate implementing `RuntimeAdapter`
-   from `lionclaw-runtime-api`.
-2. Choose `ProgramBacked` or `Direct` turn mode deliberately.
-3. Reuse workspace package versions and `workspace = true` lint settings.
-4. Wire configured registration in `operator/runtime.rs` and kernel runtime
-   re-exports only as needed.
-5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
+Runtime integration is driver-per-protocol, not crate-per-product.
+
+1. If the runtime speaks an existing conversation protocol, add a runtime
+   profile only. For ACP harnesses such as OpenCode, configure
+   `driver = "acp"`, `command`, `args`, model/mode, auth, confinement, and any
+   native skill projection data. Do not add a Rust crate for another ACP
+   product.
+2. If the runtime brings a new conversation protocol, add one
+   `crates/lionclaw-runtime-<protocol>` crate implementing the protocol driver
+   against `ConversationDriver` and the existing adapter boundary in
+   `lionclaw-runtime-api`.
+3. Keep protocol-specific auth staging, session ids, resume data, parsing, and
+   raw protocol retention in that protocol crate. Core/kernel code consumes
+   canonical `TurnEvent` journals and runtime profile data only.
+4. Declare native skill support as profile data, for example
+   `skill_projection = { kind = "native-dir", root = ".config/opencode/skills", format = "skill-md" }`.
+   The kernel validates and materializes supported projection kinds but must
+   not match on runtime product names.
+5. Reuse workspace package versions and `workspace = true` lint settings for a
+   new protocol crate. Only touch `kernel/runtime/builtins.rs` for intentional
    builtin test/kernel scaffolding.
-6. Add unit tests in the adapter module plus one kernel-level integration case.
-7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime
-   introduces new auth, state, or confinement behavior.
+6. Add protocol fixture tests proving canonical `RuntimeEvent` equivalence and
+   at least one kernel-level integration case for live journal persistence and
+   streaming behavior.
+7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime or
+   protocol introduces new auth, state, confinement, or operator workflow
+   behavior.

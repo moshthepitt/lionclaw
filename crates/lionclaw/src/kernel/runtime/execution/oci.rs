@@ -1259,7 +1259,8 @@ mod tests {
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
@@ -1330,7 +1331,8 @@ mod tests {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
@@ -1356,12 +1358,16 @@ mod tests {
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request, None).expect("prepare"),
-            &[("CODEX_HOME".to_string(), "/runtime/home/.codex".to_string())],
+            &[(
+                "RUNTIME_AUTH_HOME".to_string(),
+                "/runtime/home/auth".to_string(),
+            )],
         );
 
         #[cfg(unix)]
@@ -1374,7 +1380,7 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
-                "CODEX_HOME=/runtime/home/.codex".to_string(),
+                "RUNTIME_AUTH_HOME=/runtime/home/auth".to_string(),
             ]
         }));
         assert!(
@@ -1396,7 +1402,8 @@ mod tests {
                 plan,
                 program: RuntimeProgramSpec::default(),
                 runtime_secrets_mount: None,
-                codex_home_override: None,
+                runtime_auth_provider: None,
+                runtime_auth_context: Default::default(),
             },
             None,
         )
@@ -1432,7 +1439,8 @@ mod tests {
                 plan,
                 program: RuntimeProgramSpec::default(),
                 runtime_secrets_mount: None,
-                codex_home_override: None,
+                runtime_auth_provider: None,
+                runtime_auth_context: Default::default(),
             },
             None,
         )
@@ -1492,7 +1500,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
         fs::write(
             request
@@ -1585,7 +1594,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
         fs::write(
             request
@@ -1632,6 +1642,7 @@ esac
                     pids_limit: Some(256),
                 },
             }),
+            skill_projection: None,
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
             working_dir: Some("/host/workspace/src".to_string()),
@@ -1691,7 +1702,8 @@ esac
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         }
     }
 

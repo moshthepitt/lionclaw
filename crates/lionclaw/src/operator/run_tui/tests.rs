@@ -5,7 +5,7 @@ use crate::{
 };
 #[cfg(unix)]
 use crate::{
-    kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+    kernel::runtime::{ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig},
     operator::config::{OperatorConfig, RuntimeProfileConfig},
 };
 use ratatui::backend::TestBackend;
@@ -2267,18 +2267,20 @@ async fn save_project_runtime_config(
 
 #[cfg(unix)]
 fn test_opencode_runtime(runtime_executable: &Path, podman: &Path) -> RuntimeProfileConfig {
-    RuntimeProfileConfig::Acp {
-        executable: runtime_executable.display().to_string(),
-        args: vec!["acp".to_string()],
-        environment: std::collections::BTreeMap::new(),
-        model: None,
-        mode: None,
-        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+    let mut profile = RuntimeProfileConfig::new(
+        "acp",
+        runtime_executable.display().to_string(),
+        ConfinementConfig::Oci(OciConfinementConfig {
             engine: podman.display().to_string(),
             image: Some("ghcr.io/lionclaw/operator-console-test-runtime:latest".to_string()),
             ..OciConfinementConfig::default()
         }),
-    }
+    )
+    .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+        ".config/opencode/skills",
+    ));
+    profile.args = vec!["acp".to_string()];
+    profile
 }
 
 #[cfg(unix)]

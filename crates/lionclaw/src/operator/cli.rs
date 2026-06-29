@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use cron::Schedule;
+use lionclaw_runtime_codex::codex_runtime_auth_kind;
 use uuid::Uuid;
 
 use crate::{
@@ -25,7 +26,10 @@ use crate::{
     home::LionClawHome,
     kernel::{
         jobs::normalize_cron_expression,
-        runtime::{ConfinementConfig, ExecutionLimits, MountAccess, OciConfinementConfig},
+        runtime::{
+            ConfinementConfig, ExecutionLimits, MountAccess, OciConfinementConfig,
+            RuntimeSkillProjectionConfig,
+        },
         skills::validate_skill_alias,
     },
     operator::{
@@ -384,6 +388,12 @@ struct RuntimeAddArgs {
     model: Option<String>,
     #[arg(long)]
     mode: Option<String>,
+    #[arg(
+        long = "skill-root",
+        value_name = "ROOT",
+        help = "Runtime-native skill directory under /runtime/home"
+    )]
+    skill_projection_root: Option<String>,
     #[arg(long, help = "Host Podman executable LionClaw should use")]
     engine: Option<String>,
     #[arg(long, help = "Runtime image LionClaw should run with Podman")]
@@ -2667,20 +2677,37 @@ fn build_runtime_profile(
         "codex" => {
             validate_codex_profile_args(args)?;
             let confinement = build_confinement_config(args)?;
-            Ok(RuntimeProfileConfig::Codex {
+            Ok(RuntimeProfileConfig {
+                driver: "codex".to_string(),
                 executable,
+                args: Vec::new(),
+                environment: BTreeMap::new(),
                 model: args.model.clone(),
+                mode: None,
+                auth: Some(codex_runtime_auth_kind()),
+                skill_projection: Some(native_skill_projection(
+                    args.skill_projection_root
+                        .clone()
+                        .unwrap_or_else(|| ".codex/skills".to_string()),
+                )?),
                 confinement,
             })
         }
         "acp" => {
             let confinement = build_confinement_config(args)?;
-            Ok(RuntimeProfileConfig::Acp {
+            Ok(RuntimeProfileConfig {
+                driver: "acp".to_string(),
                 executable,
                 args: normalize_runtime_args(&args.runtime_args),
                 environment: parse_runtime_environment(&args.environment)?,
                 model: args.model.clone(),
                 mode: args.mode.clone(),
+                auth: None,
+                skill_projection: args
+                    .skill_projection_root
+                    .clone()
+                    .map(native_skill_projection)
+                    .transpose()?,
                 confinement,
             })
         }
@@ -2688,6 +2715,12 @@ fn build_runtime_profile(
             "unsupported runtime driver '{other}'; expected 'codex' or 'acp'"
         )),
     }
+}
+
+fn native_skill_projection(root: String) -> Result<RuntimeSkillProjectionConfig> {
+    let projection = RuntimeSkillProjectionConfig::native_dir(root);
+    projection.validate()?;
+    Ok(projection)
 }
 
 fn build_confinement_config(args: &RuntimeAddArgs) -> Result<ConfinementConfig> {
@@ -2847,6 +2880,7 @@ mod tests {
                 environment: Vec::new(),
                 model: None,
                 mode: None,
+                skill_projection_root: None,
                 engine: Some(podman.to_string_lossy().to_string()),
                 image: None,
                 read_only_rootfs: false,
@@ -4039,10 +4073,10 @@ mod tests {
     }
 
     fn project_runtime(image: &str) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+        RuntimeProfileConfig::new(
+            "codex",
+            "codex",
+            ConfinementConfig::Oci(OciConfinementConfig {
                 engine: "/usr/bin/podman".to_string(),
                 image: Some(image.to_string()),
                 read_only_rootfs: false,
@@ -4050,7 +4084,9 @@ mod tests {
                 additional_mounts: Vec::new(),
                 limits: ExecutionLimits::default(),
             }),
-        }
+        )
+        .with_auth(codex_runtime_auth_kind())
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"))
     }
 
     #[tokio::test]
@@ -4137,18 +4173,18 @@ mod tests {
         args.memory_limit = Some("4g".to_string());
 
         let profile = build_runtime_profile(&args, "codex".to_string()).expect("build profile");
-        let RuntimeProfileConfig::Codex {
-            executable,
-            model,
-            confinement,
-        } = profile
-        else {
-            panic!("expected codex profile");
-        };
-
-        assert_eq!(executable, "codex");
-        assert!(model.is_none());
-        match confinement {
+        assert_eq!(profile.driver, "codex");
+        assert_eq!(profile.executable, "codex");
+        assert!(profile.model.is_none());
+        assert_eq!(profile.auth, Some(codex_runtime_auth_kind()));
+        assert_eq!(
+            profile
+                .skill_projection
+                .as_ref()
+                .map(RuntimeSkillProjectionConfig::native_dir_root),
+            Some(".codex/skills")
+        );
+        match profile.confinement {
             ConfinementConfig::Oci(config) => {
                 assert!(config.engine.ends_with("/podman"));
                 assert_eq!(config.image.as_deref(), Some("ghcr.io/lionclaw/codex:v1"));
@@ -4174,28 +4210,25 @@ mod tests {
         args.environment = vec!["OPENCODE_DISABLE_AUTOUPDATE=1".to_string()];
         args.model = Some("gpt-5".to_string());
         args.mode = Some("plan".to_string());
+        args.skill_projection_root = Some(".config/opencode/skills".to_string());
 
         let profile = build_runtime_profile(&args, "opencode".to_string()).expect("profile");
-        let RuntimeProfileConfig::Acp {
-            executable,
-            args,
-            environment,
-            model,
-            mode,
-            confinement: _,
-        } = profile
-        else {
-            panic!("expected ACP profile");
-        };
-
-        assert_eq!(executable, "opencode");
-        assert_eq!(args, vec!["acp".to_string()]);
+        assert_eq!(profile.driver, "acp");
+        assert_eq!(profile.executable, "opencode");
+        assert_eq!(profile.args, vec!["acp".to_string()]);
         assert_eq!(
-            environment,
+            profile.environment,
             BTreeMap::from([("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())])
         );
-        assert_eq!(model.as_deref(), Some("gpt-5"));
-        assert_eq!(mode.as_deref(), Some("plan"));
+        assert_eq!(profile.model.as_deref(), Some("gpt-5"));
+        assert_eq!(profile.mode.as_deref(), Some("plan"));
+        assert_eq!(
+            profile
+                .skill_projection
+                .as_ref()
+                .map(RuntimeSkillProjectionConfig::native_dir_root),
+            Some(".config/opencode/skills")
+        );
     }
 
     #[test]

@@ -24,8 +24,9 @@ pub use plan::{
     runtime_skill_mount_target_alias, runtime_state_mount_source, skill_mount_target,
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
     ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,
-    RuntimeProgramSpec, WorkspaceAccess, DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET,
-    RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
+    RuntimeProgramSpec, RuntimeSkillProjectionConfig, RuntimeSkillProjectionFormat,
+    WorkspaceAccess, DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+    SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
 };
 pub use planner::{
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
