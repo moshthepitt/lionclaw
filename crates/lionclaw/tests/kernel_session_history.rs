@@ -22,7 +22,8 @@ use lionclaw::{
             ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
             RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
             RuntimeEventSender, RuntimeExecutionProfile, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
+            RuntimeTurnResult, TurnEvent,
         },
         Kernel, KernelError, KernelOptions,
     },
@@ -31,6 +32,10 @@ use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+fn send_turn_event(journal: &RuntimeTurnJournalSender, event: RuntimeEvent) {
+    let _ = journal.send(TurnEvent::canonical(event));
+}
 
 #[tokio::test]
 async fn interactive_history_carries_partial_reply_forward() {
@@ -1731,12 +1736,15 @@ impl RuntimeAdapter for PartialTimeoutAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: self.partial_text.clone(),
-        });
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: self.partial_text.clone(),
+            },
+        );
         tokio::time::sleep(self.sleep_for).await;
         Ok(RuntimeTurnResult::default())
     }
@@ -1783,14 +1791,17 @@ impl RuntimeAdapter for CapturePromptAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         self.prompts.lock().expect("prompt lock").push(input.prompt);
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: self.reply.clone(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: self.reply.clone(),
+            },
+        );
+        send_turn_event(&journal, RuntimeEvent::Done);
         Ok(RuntimeTurnResult::default())
     }
 
@@ -1848,14 +1859,17 @@ impl RuntimeAdapter for ResumableCaptureAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         self.prompts.lock().expect("prompt lock").push(input.prompt);
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: self.reply.clone(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: self.reply.clone(),
+            },
+        );
+        send_turn_event(&journal, RuntimeEvent::Done);
         Ok(RuntimeTurnResult::default())
     }
 
@@ -1909,26 +1923,35 @@ impl RuntimeAdapter for ResumableFlakyAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let turn_index = self.turn_counter.fetch_add(1, Ordering::SeqCst);
         if turn_index == 0 {
-            let _ = events.send(RuntimeEvent::MessageDelta {
-                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-                text: "partial".to_string(),
-            });
-            let _ = events.send(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: "failed after partial".to_string(),
-            });
+            send_turn_event(
+                &journal,
+                RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "partial".to_string(),
+                },
+            );
+            send_turn_event(
+                &journal,
+                RuntimeEvent::Error {
+                    code: Some("runtime.error".to_string()),
+                    text: "failed after partial".to_string(),
+                },
+            );
             anyhow::bail!("failed after partial");
         }
 
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: "continued".to_string(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: "continued".to_string(),
+            },
+        );
+        send_turn_event(&journal, RuntimeEvent::Done);
         Ok(RuntimeTurnResult::default())
     }
 
@@ -1986,34 +2009,46 @@ impl RuntimeAdapter for ResumeAfterFailureAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         match self.turn_counter.fetch_add(1, Ordering::SeqCst) {
             0 => {
-                let _ = events.send(RuntimeEvent::MessageDelta {
-                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-                    text: "first success".to_string(),
-                });
-                let _ = events.send(RuntimeEvent::Done);
+                send_turn_event(
+                    &journal,
+                    RuntimeEvent::MessageDelta {
+                        lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                        text: "first success".to_string(),
+                    },
+                );
+                send_turn_event(&journal, RuntimeEvent::Done);
                 Ok(RuntimeTurnResult::default())
             }
             1 => {
-                let _ = events.send(RuntimeEvent::MessageDelta {
-                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-                    text: "partial failure".to_string(),
-                });
-                let _ = events.send(RuntimeEvent::Error {
-                    code: Some("runtime.error".to_string()),
-                    text: "failed after success".to_string(),
-                });
+                send_turn_event(
+                    &journal,
+                    RuntimeEvent::MessageDelta {
+                        lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                        text: "partial failure".to_string(),
+                    },
+                );
+                send_turn_event(
+                    &journal,
+                    RuntimeEvent::Error {
+                        code: Some("runtime.error".to_string()),
+                        text: "failed after success".to_string(),
+                    },
+                );
                 anyhow::bail!("failed after success");
             }
             _ => {
-                let _ = events.send(RuntimeEvent::MessageDelta {
-                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-                    text: "fresh recovery".to_string(),
-                });
-                let _ = events.send(RuntimeEvent::Done);
+                send_turn_event(
+                    &journal,
+                    RuntimeEvent::MessageDelta {
+                        lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                        text: "fresh recovery".to_string(),
+                    },
+                );
+                send_turn_event(&journal, RuntimeEvent::Done);
                 Ok(RuntimeTurnResult::default())
             }
         }
@@ -2073,13 +2108,16 @@ impl RuntimeAdapter for RuntimeControlFailureClearingAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: "control failure adapter reply".to_string(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: "control failure adapter reply".to_string(),
+            },
+        );
+        send_turn_event(&journal, RuntimeEvent::Done);
         Ok(RuntimeTurnResult::default())
     }
 
@@ -2235,12 +2273,15 @@ impl RuntimeAdapter for BlockingAnswerAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::MessageDelta {
-            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
-            text: self.answer.clone(),
-        });
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: self.answer.clone(),
+            },
+        );
         tokio::time::sleep(self.sleep_for).await;
         Ok(RuntimeTurnResult::default())
     }

@@ -14,7 +14,8 @@ use lionclaw::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
             RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
+            RuntimeTurnResult, TurnEvent,
         },
         Kernel, KernelOptions,
     },
@@ -525,10 +526,10 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         tokio::time::sleep(self.sleep_for).await;
-        let _ = events.send(RuntimeEvent::Done);
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -578,9 +579,9 @@ impl RuntimeAdapter for ClosedEventStreamRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        drop(events);
+        drop(journal);
         tokio::time::sleep(self.sleep_for).await;
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
@@ -643,13 +644,13 @@ impl RuntimeAdapter for ReportedTerminalRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::Error {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Error {
             code: Some(self.code.to_string()),
             text: self.text.to_string(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        }));
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -697,20 +698,20 @@ impl RuntimeAdapter for ChattyRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         for _ in 0..self.event_count {
-            let _ = events.send(RuntimeEvent::Status {
+            let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Status {
                 code: None,
                 text: "still working".to_string(),
-            });
+            }));
             tokio::time::sleep(self.idle_gap).await;
         }
-        let _ = events.send(RuntimeEvent::MessageDelta {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
             lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
             text: "done".to_string(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        }));
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })

@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use lionclaw_runtime_api::{RawTurnPayload, RuntimeEvent, TurnEvent};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -324,6 +325,47 @@ impl SessionTurnStore {
         }
 
         self.get(turn_id).await
+    }
+
+    pub async fn append_journal_event(&self, turn_id: Uuid, record: &TurnEvent) -> Result<u64> {
+        let event_json = serde_json::to_string(&record.event)
+            .context("failed to encode session turn journal event")?;
+        let raw_driver = record.raw.as_ref().map(|raw| raw.driver.as_str());
+        let raw_payload = record.raw.as_ref().map(|raw| raw.payload.as_str());
+        let created_at_ms = now_ms();
+
+        let row = sqlx::query(
+            "INSERT INTO session_turn_journal_events \
+             (turn_id, sequence_no, event_json, raw_driver, raw_payload, created_at_ms) \
+             VALUES (?1, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turn_journal_events WHERE turn_id = ?1), ?2, ?3, ?4, ?5) \
+             RETURNING sequence_no",
+        )
+        .bind(turn_id.to_string())
+        .bind(event_json)
+        .bind(raw_driver)
+        .bind(raw_payload)
+        .bind(created_at_ms)
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("failed to append journal event for session turn {turn_id}"))?;
+        let sequence_no_raw: i64 = row.get("sequence_no");
+        u64::try_from(sequence_no_raw)
+            .with_context(|| format!("invalid journal sequence_no '{sequence_no_raw}'"))
+    }
+
+    pub async fn list_journal_events(&self, turn_id: Uuid) -> Result<Vec<TurnEvent>> {
+        let rows = sqlx::query(
+            "SELECT event_json, raw_driver, raw_payload \
+             FROM session_turn_journal_events \
+             WHERE turn_id = ?1 \
+             ORDER BY sequence_no ASC",
+        )
+        .bind(turn_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to query journal events for session turn {turn_id}"))?;
+
+        rows.into_iter().map(map_session_turn_journal_row).collect()
     }
 
     pub async fn update_running_turn_input(
@@ -852,6 +894,20 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
     })
 }
 
+fn map_session_turn_journal_row(row: SqliteRow) -> Result<TurnEvent> {
+    let event_json: String = row.get("event_json");
+    let raw_driver: Option<String> = row.get("raw_driver");
+    let raw_payload: Option<String> = row.get("raw_payload");
+    let event = serde_json::from_str::<RuntimeEvent>(&event_json)
+        .context("failed to decode session turn journal event")?;
+    let raw = match (raw_driver, raw_payload) {
+        (Some(driver), Some(payload)) => Some(RawTurnPayload { driver, payload }),
+        (None, None) => None,
+        _ => return Err(anyhow!("session turn journal raw payload is incomplete")),
+    };
+    Ok(TurnEvent { event, raw })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,6 +916,7 @@ mod tests {
     use crate::kernel::jobs::{JobSchedule, JobStore, NewSchedulerJob, SchedulerJobTriggerKind};
     use crate::kernel::{db::Db, sessions::SessionStore};
     use chrono::Duration as ChronoDuration;
+    use lionclaw_runtime_api::{canonical_events, RuntimeMessageLane};
 
     async fn new_store_with_session() -> (SessionTurnStore, Uuid) {
         let db = Db::connect_memory().await.expect("connect memory db");
@@ -1025,6 +1082,67 @@ mod tests {
                 .expect("scheduler turn")
                 .status,
             SessionTurnStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_journal_persists_ordered_canonical_events_with_raw_retention() {
+        let (store, session_id) = new_store_with_session().await;
+        let turn = store
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "hello".to_string(),
+                prompt_user_text: "hello".to_string(),
+                attachment_source_turn_id: None,
+                runtime_id: "codex".to_string(),
+            })
+            .await
+            .expect("begin turn");
+
+        let first = TurnEvent::with_raw(
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "hi".to_string(),
+            },
+            RawTurnPayload {
+                driver: "codex-app-server".to_string(),
+                payload: "{\"method\":\"item/agentMessage/delta\"}".to_string(),
+            },
+        );
+        let second = TurnEvent::canonical(RuntimeEvent::Done);
+
+        assert_eq!(
+            store
+                .append_journal_event(turn.turn_id, &first)
+                .await
+                .expect("append first"),
+            1
+        );
+        assert_eq!(
+            store
+                .append_journal_event(turn.turn_id, &second)
+                .await
+                .expect("append second"),
+            2
+        );
+
+        let journal = store
+            .list_journal_events(turn.turn_id)
+            .await
+            .expect("list journal");
+
+        assert_eq!(journal, vec![first, second]);
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "hi".to_string(),
+                },
+                RuntimeEvent::Done,
+            ]
         );
     }
 

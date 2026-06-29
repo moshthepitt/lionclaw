@@ -21,7 +21,8 @@ use lionclaw::{
             RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
             RuntimeEventSender, RuntimeExecutionContext, RuntimeNativeHomeArtifactDir,
             RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
+            RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
+            TurnEvent, WorkspaceAccess,
         },
         Kernel, KernelOptions,
     },
@@ -1562,10 +1563,10 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         run_probe_action(&self.action, &execution.context).await?;
-        drop(events.send(RuntimeEvent::Done));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
         Ok(RuntimeTurnResult::default())
     }
 
@@ -1625,13 +1626,13 @@ impl RuntimeAdapter for DirectSocketProbeRuntime {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         self.observed
             .lock()
             .expect("observed socket lock")
             .push(socket_dir_has_channel_send_socket(&self.socket_dir));
-        drop(events.send(RuntimeEvent::Done));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
         Ok(RuntimeTurnResult::default())
     }
 

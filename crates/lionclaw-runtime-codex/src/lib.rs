@@ -49,19 +49,22 @@ use uuid::Uuid;
 use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
     normalize_terminal_transcript_launch_started_at, safe_relative_path, save_state_value,
-    ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact,
-    RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome,
-    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange,
-    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
+    ConversationDriver, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
+    RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
+    RuntimeExecutionContext, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSession,
+    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
+    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
+    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
     TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
+    TurnEvent,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
+const CODEX_APP_SERVER_DRIVER: &str = "codex-app-server";
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
 const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
@@ -139,6 +142,116 @@ struct CodexTerminalTranscriptExportRequest<'a> {
     hard_timeout: Duration,
 }
 
+struct CodexAppServerConversationDriver<'a> {
+    adapter: &'a CodexRuntimeAdapter,
+    context: RuntimeExecutionContext,
+    executor: Box<dyn RuntimeProgramExecutor>,
+}
+
+#[async_trait]
+impl ConversationDriver for CodexAppServerConversationDriver<'_> {
+    fn protocol_name(&self) -> &'static str {
+        CODEX_APP_SERVER_DRIVER
+    }
+
+    async fn run_turn(
+        &mut self,
+        input: RuntimeTurnInput,
+        journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult> {
+        let network_mode = self.context.network_mode;
+        let thread_state = self.adapter.thread_state_for(&input.runtime_session_id);
+        let transport = self
+            .adapter
+            .start_app_server_transport(self.executor.as_mut())
+            .await?;
+        let mut client =
+            CodexAppServerClient::new_with_runtime_context(transport, self.context.clone());
+        let sink = CodexAppServerEventSink::journal(&journal);
+
+        let result = async {
+            client.initialize(sink, &thread_state).await?;
+            let thread_id = self
+                .adapter
+                .ensure_app_server_thread(
+                    &mut client,
+                    &input.runtime_session_id,
+                    sink,
+                    &thread_state,
+                )
+                .await?;
+            let response = client
+                .request(
+                    "turn/start",
+                    turn_start_params(
+                        &thread_id,
+                        &input.prompt,
+                        self.adapter.config.model.as_deref(),
+                        network_mode,
+                    ),
+                    sink,
+                    &thread_state,
+                )
+                .await?;
+            let turn_id = extract_app_server_turn_id(&response);
+            let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+            client
+                .wait_for_turn_completed(
+                    turn_id.as_deref(),
+                    Some(&thread_id),
+                    Some(interrupt_tx),
+                    sink,
+                    &thread_state,
+                    Some(&mut interrupt_rx),
+                )
+                .await?;
+            Ok(RuntimeTurnResult::default())
+        }
+        .await;
+
+        finish_app_server_session(client, result).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CodexAppServerEventSink<'a> {
+    Runtime(&'a RuntimeEventSender),
+    Journal(&'a RuntimeTurnJournalSender),
+}
+
+impl<'a> CodexAppServerEventSink<'a> {
+    fn runtime(events: &'a RuntimeEventSender) -> Self {
+        Self::Runtime(events)
+    }
+
+    fn journal(journal: &'a RuntimeTurnJournalSender) -> Self {
+        Self::Journal(journal)
+    }
+
+    fn send(self, event: RuntimeEvent, raw_payload: &str) {
+        match self {
+            Self::Runtime(events) => {
+                drop(events.send(event));
+            }
+            Self::Journal(journal) => {
+                drop(journal.send(TurnEvent::with_raw(
+                    event,
+                    RawTurnPayload {
+                        driver: CODEX_APP_SERVER_DRIVER.to_string(),
+                        payload: raw_payload.to_string(),
+                    },
+                )));
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a RuntimeEventSender> for CodexAppServerEventSink<'a> {
+    fn from(events: &'a RuntimeEventSender) -> Self {
+        Self::runtime(events)
+    }
+}
+
 impl CodexRuntimeAdapter {
     pub fn new(config: CodexRuntimeConfig) -> Self {
         Self {
@@ -150,58 +263,19 @@ impl CodexRuntimeAdapter {
     async fn run_app_server_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let RuntimeProgramTurnExecution {
             input,
             context,
-            mut executor,
+            executor,
         } = execution;
-        let network_mode = context.network_mode;
-        let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
-        let mut client = CodexAppServerClient::new_with_runtime_context(transport, context);
-
-        let result = async {
-            client.initialize(&events, &thread_state).await?;
-            let thread_id = self
-                .ensure_app_server_thread(
-                    &mut client,
-                    &input.runtime_session_id,
-                    &events,
-                    &thread_state,
-                )
-                .await?;
-            let response = client
-                .request(
-                    "turn/start",
-                    turn_start_params(
-                        &thread_id,
-                        &input.prompt,
-                        self.config.model.as_deref(),
-                        network_mode,
-                    ),
-                    &events,
-                    &thread_state,
-                )
-                .await?;
-            let turn_id = extract_app_server_turn_id(&response);
-            let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
-            client
-                .wait_for_turn_completed(
-                    turn_id.as_deref(),
-                    Some(&thread_id),
-                    Some(interrupt_tx),
-                    &events,
-                    &thread_state,
-                    Some(&mut interrupt_rx),
-                )
-                .await?;
-            Ok(RuntimeTurnResult::default())
-        }
-        .await;
-
-        finish_app_server_session(client, result).await
+        let mut driver = CodexAppServerConversationDriver {
+            adapter: self,
+            context,
+            executor,
+        };
+        driver.run_turn(input, journal).await
     }
 
     async fn run_app_server_control(
@@ -244,15 +318,16 @@ impl CodexRuntimeAdapter {
         let thread_state = self.thread_state_for(&input.runtime_session_id);
         let transport = self.start_app_server_transport(executor.as_mut()).await?;
         let mut client = CodexAppServerClient::new(transport);
+        let sink = CodexAppServerEventSink::runtime(&events);
         let result = async {
-            client.initialize(&events, &thread_state).await?;
+            client.initialize(sink, &thread_state).await?;
             let response = client
                 .request(
                     "model/list",
                     json!({
                         "includeHidden": include_hidden,
                     }),
-                    &events,
+                    sink,
                     &thread_state,
                 )
                 .await?;
@@ -294,11 +369,12 @@ impl CodexRuntimeAdapter {
         let thread_state = self.thread_state_for(&input.runtime_session_id);
         let transport = self.start_app_server_transport(executor.as_mut()).await?;
         let mut client = CodexAppServerClient::new(transport);
+        let sink = CodexAppServerEventSink::runtime(&events);
 
         let result = async {
-            client.initialize(&events, &thread_state).await?;
+            client.initialize(sink, &thread_state).await?;
             let thread_id = self
-                .resume_app_server_thread(&mut client, &saved_thread_id, &events, &thread_state)
+                .resume_app_server_thread(&mut client, &saved_thread_id, sink, &thread_state)
                 .await?;
 
             let outcome = match input.command_name.as_str() {
@@ -311,7 +387,7 @@ impl CodexRuntimeAdapter {
                                 "threadId": thread_id,
                                 "name": name,
                             }),
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -327,7 +403,7 @@ impl CodexRuntimeAdapter {
                             json!({
                                 "threadId": thread_id,
                             }),
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -336,7 +412,7 @@ impl CodexRuntimeAdapter {
                             &thread_id,
                             interrupt_tx,
                             &mut interrupt_rx,
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -366,19 +442,20 @@ impl CodexRuntimeAdapter {
         Ok(ExecutionSessionTransport::new(session))
     }
 
-    async fn ensure_app_server_thread<T>(
+    async fn ensure_app_server_thread<'a, T>(
         &self,
         client: &mut CodexAppServerClient<T>,
         runtime_session_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<String>
     where
         T: AppServerTransport + Send,
     {
+        let sink = sink.into();
         if let Some(thread_id) = self.current_thread_id(runtime_session_id)? {
             return self
-                .resume_app_server_thread(client, &thread_id, events, thread_state)
+                .resume_app_server_thread(client, &thread_id, sink, thread_state)
                 .await;
         }
 
@@ -386,7 +463,7 @@ impl CodexRuntimeAdapter {
             .request(
                 "thread/start",
                 thread_start_params(self.config.model.as_deref()),
-                events,
+                sink,
                 thread_state,
             )
             .await?;
@@ -400,21 +477,22 @@ impl CodexRuntimeAdapter {
         Ok(thread_id)
     }
 
-    async fn resume_app_server_thread<T>(
+    async fn resume_app_server_thread<'a, T>(
         &self,
         client: &mut CodexAppServerClient<T>,
         thread_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<String>
     where
         T: AppServerTransport + Send,
     {
+        let sink = sink.into();
         let response = client
             .request(
                 "thread/resume",
                 thread_resume_params(thread_id, self.config.model.as_deref()),
-                events,
+                sink,
                 thread_state,
             )
             .await?;
@@ -773,9 +851,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        self.run_app_server_turn(execution, events).await
+        self.run_app_server_turn(execution, journal).await
     }
 
     fn build_terminal_program(
@@ -1330,8 +1408,31 @@ fn codex_app_server_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
 #[async_trait]
 trait AppServerTransport {
     async fn send(&mut self, message: &Value) -> Result<()>;
-    async fn recv(&mut self) -> Result<Option<Value>>;
+    async fn recv(&mut self) -> Result<Option<AppServerMessage>>;
     async fn shutdown(&mut self) -> Result<ExecutionOutput>;
+}
+
+#[derive(Debug, Clone)]
+struct AppServerMessage {
+    raw: String,
+    value: Value,
+}
+
+impl AppServerMessage {
+    fn value(&self) -> &Value {
+        &self.value
+    }
+
+    fn into_value(self) -> Value {
+        self.value
+    }
+}
+
+impl From<Value> for AppServerMessage {
+    fn from(value: Value) -> Self {
+        let raw = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+        Self { raw, value }
+    }
 }
 
 struct ExecutionSessionTransport {
@@ -1356,7 +1457,7 @@ impl AppServerTransport for ExecutionSessionTransport {
         session.write_line(&serde_json::to_string(message)?).await
     }
 
-    async fn recv(&mut self) -> Result<Option<Value>> {
+    async fn recv(&mut self) -> Result<Option<AppServerMessage>> {
         let session = self
             .session
             .as_mut()
@@ -1369,9 +1470,12 @@ impl AppServerTransport for ExecutionSessionTransport {
             if trimmed.is_empty() {
                 continue;
             }
-            return serde_json::from_str(trimmed)
-                .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))
-                .map(Some);
+            let value = serde_json::from_str(trimmed)
+                .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))?;
+            return Ok(Some(AppServerMessage {
+                raw: trimmed.to_string(),
+                value,
+            }));
         }
     }
 
@@ -1438,11 +1542,12 @@ where
         }
     }
 
-    async fn initialize(
+    async fn initialize<'a>(
         &mut self,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         self.request(
             "initialize",
             json!({
@@ -1455,7 +1560,7 @@ where
                     "experimentalApi": true,
                 },
             }),
-            events,
+            sink,
             thread_state,
         )
         .await?;
@@ -1468,13 +1573,14 @@ where
             .await
     }
 
-    async fn request(
+    async fn request<'a>(
         &mut self,
         method: &str,
         params: Value,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<Value> {
+        let sink = sink.into();
         let id = self.next_request_id();
         self.transport
             .send(&app_server_request_message(id, method, params))
@@ -1484,25 +1590,26 @@ where
             let Some(message) = self.transport.recv().await? else {
                 bail!("codex app-server closed before responding to {method}");
             };
-            if response_id(&message).is_some_and(|response_id| response_id == id) {
-                return parse_app_server_response(message, method);
+            if response_id(message.value()).is_some_and(|response_id| response_id == id) {
+                return parse_app_server_response(message.into_value(), method);
             }
-            self.dispatch_message(message, events, thread_state).await?;
+            self.dispatch_message(message, sink, thread_state).await?;
             if let Some(message) = self.turn_failure(None) {
                 bail!("{message}");
             }
         }
     }
 
-    async fn wait_for_turn_completed(
+    async fn wait_for_turn_completed<'a>(
         &mut self,
         turn_id: Option<&str>,
         thread_id: Option<&str>,
         interrupt_tx: Option<mpsc::UnboundedSender<CodexInterruptRequest>>,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
         mut interrupt_rx: Option<&mut mpsc::UnboundedReceiver<CodexInterruptRequest>>,
     ) -> Result<()> {
+        let sink = sink.into();
         if let Some(message) = self.turn_failure(turn_id) {
             bail!("{message}");
         }
@@ -1526,7 +1633,7 @@ where
                             let Some(message) = message? else {
                                 bail!("codex app-server closed before turn completed");
                             };
-                            self.dispatch_message(message, events, thread_state).await?;
+                            self.dispatch_message(message, sink, thread_state).await?;
                         }
                         interrupt = interrupt_rx.recv() => {
                             if let Some(interrupt) = interrupt {
@@ -1534,7 +1641,7 @@ where
                                     thread_id,
                                     registered_turn_id.as_deref().or(turn_id),
                                     interrupt,
-                                    events,
+                                    sink,
                                     thread_state,
                                 )
                                 .await;
@@ -1545,7 +1652,7 @@ where
                     let Some(message) = self.transport.recv().await? else {
                         bail!("codex app-server closed before turn completed");
                     };
-                    self.dispatch_message(message, events, thread_state).await?;
+                    self.dispatch_message(message, sink, thread_state).await?;
                 }
                 self.register_active_wait_turn(
                     thread_id,
@@ -1570,14 +1677,15 @@ where
         result
     }
 
-    async fn wait_for_context_compaction_completed(
+    async fn wait_for_context_compaction_completed<'a>(
         &mut self,
         thread_id: &str,
         interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
         interrupt_rx: &mut mpsc::UnboundedReceiver<CodexInterruptRequest>,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         if let Some(message) = self.turn_failure(None) {
             bail!("{message}");
         }
@@ -1600,7 +1708,7 @@ where
                         let Some(message) = message? else {
                             bail!("codex app-server closed before context compaction completed");
                         };
-                        self.dispatch_message(message, events, thread_state).await?;
+                        self.dispatch_message(message, sink, thread_state).await?;
                     }
                     interrupt = interrupt_rx.recv() => {
                         if let Some(interrupt) = interrupt {
@@ -1608,7 +1716,7 @@ where
                                 Some(thread_id),
                                 registered_turn_id.as_deref(),
                                 interrupt,
-                                events,
+                                sink,
                                 thread_state,
                             )
                             .await;
@@ -1640,17 +1748,18 @@ where
         result
     }
 
-    async fn handle_turn_interrupt(
+    async fn handle_turn_interrupt<'a>(
         &mut self,
         thread_id: Option<&str>,
         turn_id: Option<&str>,
         interrupt: CodexInterruptRequest,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) {
+        let sink = sink.into();
         let result = match (thread_id, turn_id) {
             (Some(thread_id), Some(turn_id)) => {
-                self.interrupt_turn(thread_id, turn_id, events, thread_state)
+                self.interrupt_turn(thread_id, turn_id, sink, thread_state)
                     .await
             }
             _ => Err(anyhow!(
@@ -1660,13 +1769,14 @@ where
         drop(interrupt.ack_tx.send(result));
     }
 
-    async fn interrupt_turn(
+    async fn interrupt_turn<'a>(
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         let method = "turn/interrupt";
         let id = self.next_request_id();
         self.transport
@@ -1684,11 +1794,11 @@ where
             let Some(message) = self.transport.recv().await? else {
                 bail!("codex app-server closed before responding to {method}");
             };
-            if response_id(&message).is_some_and(|response_id| response_id == id) {
-                parse_app_server_response(message, method)?;
+            if response_id(message.value()).is_some_and(|response_id| response_id == id) {
+                parse_app_server_response(message.into_value(), method)?;
                 return Ok(());
             }
-            self.dispatch_message(message, events, thread_state).await?;
+            self.dispatch_message(message, sink, thread_state).await?;
         }
     }
 
@@ -1895,15 +2005,21 @@ where
     }
 
     /// Translate one app-server message and forward its canonical events to the
-    /// live runtime event stream.
-    async fn dispatch_message(
+    /// selected live sink.
+    async fn dispatch_message<'a, M>(
         &mut self,
-        message: Value,
-        events: &RuntimeEventSender,
+        message: M,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
-    ) -> Result<()> {
-        for event in self.handle_message(message, thread_state).await? {
-            drop(events.send(event));
+    ) -> Result<()>
+    where
+        M: Into<AppServerMessage>,
+    {
+        let sink = sink.into();
+        let message = message.into();
+        let raw_payload = message.raw;
+        for event in self.handle_message(message.value, thread_state).await? {
+            sink.send(event, &raw_payload);
         }
         Ok(())
     }
@@ -3124,7 +3240,7 @@ mod tests {
 
     use super::{
         build_codex_app_server_program, build_codex_terminal_program, extract_app_server_turn_id,
-        load_saved_thread_id, response_id, save_thread_id, AppServerTransport,
+        load_saved_thread_id, response_id, save_thread_id, AppServerMessage, AppServerTransport,
         CodexAppServerClient, CodexRuntimeAdapter, CodexRuntimeConfig,
         CodexTerminalTranscriptExportRequest, CODEX_THREAD_ID_STATE_FILE,
     };
@@ -3398,10 +3514,10 @@ mod tests {
             Ok(())
         }
 
-        async fn recv(&mut self) -> Result<Option<Value>> {
+        async fn recv(&mut self) -> Result<Option<AppServerMessage>> {
             let next = self.incoming.lock().expect("incoming lock").pop_front();
             if next.is_some() || !self.hang_when_empty {
-                return Ok(next);
+                return Ok(next.map(AppServerMessage::from));
             }
             pending::<()>().await;
             unreachable!("pending fake app-server transport returned")

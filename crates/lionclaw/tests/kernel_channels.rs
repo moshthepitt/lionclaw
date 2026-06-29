@@ -34,7 +34,8 @@ use lionclaw::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeCapabilityResult,
             RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
             RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+            RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
+            TurnEvent,
         },
         ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelError,
         KernelOptions,
@@ -44,6 +45,12 @@ use lionclaw::{
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::time::{sleep, Duration, Instant};
+
+fn send_turn_event(journal: &RuntimeTurnJournalSender, event: RuntimeEvent) {
+    journal
+        .send(TurnEvent::canonical(event))
+        .expect("send runtime event");
+}
 
 fn expect_blocked_grant(blocked: ChannelPairingBlockResponse) -> ChannelGrantView {
     let grant = blocked.grant.expect("block response should include grant");
@@ -9080,26 +9087,29 @@ impl RuntimeAdapter for PartialFailureAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
-        event_tx
-            .send(RuntimeEvent::MessageDelta {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Reasoning,
                 text: "starting a partial reply before failure".to_string(),
-            })
-            .expect("send reasoning");
-        event_tx
-            .send(RuntimeEvent::MessageDelta {
+            },
+        );
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: self.partial.clone(),
-            })
-            .expect("send partial answer");
-        event_tx
-            .send(RuntimeEvent::Error {
+            },
+        );
+        send_turn_event(
+            &journal,
+            RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
                 text: self.message.clone(),
-            })
-            .expect("send runtime error");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9151,7 +9161,7 @@ impl RuntimeAdapter for FailingSessionStartAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _event_tx: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         unreachable!("session_start fails before turn execution")
     }
@@ -9207,14 +9217,15 @@ impl RuntimeAdapter for ErrorThenCloseFailAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
-        event_tx
-            .send(RuntimeEvent::Error {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::Error {
                 code: Some(self.error_code.clone()),
                 text: self.error_text.clone(),
-            })
-            .expect("send runtime error");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9270,15 +9281,16 @@ impl RuntimeAdapter for SlowAnswerAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         sleep(self.delay).await;
-        event_tx
-            .send(RuntimeEvent::MessageDelta {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: self.answer.clone(),
-            })
-            .expect("send answer");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9392,7 +9404,7 @@ impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         let runtime_state_root = execution
             .context
@@ -9407,15 +9419,16 @@ impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
         let artifact_path = outside_current_state.join("generated-image.png");
         tokio::fs::write(&artifact_path, b"escaped png bytes").await?;
 
-        event_tx
-            .send(RuntimeEvent::Artifact {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::Artifact {
                 artifact: image_runtime_artifact(
                     "artifact:image:program-escape",
                     artifact_path,
                     "generated-image.png",
                 ),
-            })
-            .expect("send artifact");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9478,7 +9491,7 @@ impl RuntimeAdapter for ProgramBackedRuntimeHomeArtifactAdapter {
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         let artifact_path = execution
             .context
@@ -9490,15 +9503,16 @@ impl RuntimeAdapter for ProgramBackedRuntimeHomeArtifactAdapter {
         tokio::fs::create_dir_all(artifact_parent).await?;
         tokio::fs::write(&artifact_path, b"runtime home png bytes").await?;
 
-        event_tx
-            .send(RuntimeEvent::Artifact {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::Artifact {
                 artifact: image_runtime_artifact(
                     "artifact:image:program-home",
                     artifact_path,
                     "generated-image.png",
                 ),
-            })
-            .expect("send artifact");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9549,14 +9563,15 @@ impl RuntimeAdapter for ArtifactOnlyAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         for artifact in &self.artifacts {
-            event_tx
-                .send(RuntimeEvent::Artifact {
+            send_turn_event(
+                &journal,
+                RuntimeEvent::Artifact {
                     artifact: artifact.clone(),
-                })
-                .expect("send artifact");
+                },
+            );
         }
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
@@ -9609,7 +9624,7 @@ impl RuntimeAdapter for RuntimeStateArtifactAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         let runtime_state_root = self
             .runtime_state_root
@@ -9621,17 +9636,19 @@ impl RuntimeAdapter for RuntimeStateArtifactAdapter {
         tokio::fs::create_dir_all(&artifact_dir).await?;
         let artifact_path = artifact_dir.join(&self.filename);
         tokio::fs::write(&artifact_path, &self.contents).await?;
-        event_tx
-            .send(RuntimeEvent::Artifact {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::Artifact {
                 artifact: image_runtime_artifact(&self.artifact_id, artifact_path, &self.filename),
-            })
-            .expect("send artifact");
+            },
+        );
         for artifact in &self.trailing_artifacts {
-            event_tx
-                .send(RuntimeEvent::Artifact {
+            send_turn_event(
+                &journal,
+                RuntimeEvent::Artifact {
                     artifact: artifact.clone(),
-                })
-                .expect("send trailing artifact");
+                },
+            );
         }
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
@@ -9687,19 +9704,20 @@ impl RuntimeAdapter for RecordingEchoAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         let answer = {
             let mut prompts = self.prompts.lock().await;
             prompts.push(input.prompt);
             format!("recorded answer {}", prompts.len())
         };
-        event_tx
-            .send(RuntimeEvent::MessageDelta {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: answer,
-            })
-            .expect("send echoed prompt");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9754,15 +9772,16 @@ impl RuntimeAdapter for PausedEchoAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        event_tx: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         self.release.notified().await;
-        event_tx
-            .send(RuntimeEvent::MessageDelta {
+        send_turn_event(
+            &journal,
+            RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: input.prompt,
-            })
-            .expect("send echoed prompt");
+            },
+        );
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
@@ -9826,7 +9845,7 @@ impl RuntimeAdapter for CancelAwareAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _event_tx: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         self.started.notify_one();
         std::future::pending().await
@@ -9879,7 +9898,7 @@ impl RuntimeAdapter for BlockingCancelAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _event_tx: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
         self.started.notify_one();
         std::future::pending().await

@@ -27,7 +27,8 @@ use lionclaw::{
             ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, RuntimeAdapter,
             RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
+            RuntimeTurnResult, TurnEvent, WorkspaceAccess,
         },
         scheduler::SchedulerEngine,
         Kernel, KernelError, KernelOptions,
@@ -2319,12 +2320,12 @@ impl RuntimeAdapter for AlwaysFailRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::Error {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Error {
             code: Some("runtime.failed".to_string()),
             text: "intentional test failure".to_string(),
-        });
+        }));
         anyhow::bail!("intentional test failure")
     }
 
@@ -2369,10 +2370,10 @@ impl RuntimeAdapter for CountingRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         self.turn_calls.fetch_add(1, Ordering::SeqCst);
-        let _ = events.send(RuntimeEvent::Done);
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
     }
 
@@ -2417,7 +2418,7 @@ impl RuntimeAdapter for BlockingRuntimeAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let observed_prompt = input
             .prompt
@@ -2435,11 +2436,11 @@ impl RuntimeAdapter for BlockingRuntimeAdapter {
             self.release_first_turn.notified().await;
         }
 
-        let _ = events.send(RuntimeEvent::MessageDelta {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: format!("[blocking] {}", input.prompt),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        }));
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
     }
 

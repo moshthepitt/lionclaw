@@ -1011,7 +1011,7 @@ pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeMessageLane {
     Answer,
     Reasoning,
@@ -1026,7 +1026,7 @@ impl RuntimeMessageLane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifact {
     pub artifact_id: String,
     pub path: PathBuf,
@@ -1061,7 +1061,7 @@ impl RuntimeNativeHomeArtifactDir {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeFileChangeStatus {
     Editing,
     Edited,
@@ -1070,7 +1070,7 @@ pub enum RuntimeFileChangeStatus {
     Changed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFileChange {
     pub runtime: String,
     pub operation_id: Option<String>,
@@ -1079,7 +1079,7 @@ pub struct RuntimeFileChange {
     pub total_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     MessageDelta {
         lane: RuntimeMessageLane,
@@ -1108,7 +1108,7 @@ pub enum RuntimeEvent {
 /// Raw, driver-specific payload retained alongside a canonical event for
 /// debugging. Retention is debug-only: it is never parsed back into canonical
 /// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawTurnPayload {
     /// Driver/protocol that produced the payload, e.g. `"codex-app-server"`.
     pub driver: String,
@@ -1116,17 +1116,13 @@ pub struct RawTurnPayload {
     pub payload: String,
 }
 
-// TODO(#159 OpenCode driver): the canonical journal is currently produced only
-// in tests (see the Codex equivalence test). Live program-backed turns and the
-// `ConversationDriver` trait adopt it when the second driver lands; remove this
-// note then.
 /// One record in a runtime turn's canonical journal.
 ///
 /// A protocol driver translates each harness message into journal records.
 /// `event` is the canonical, public output LionClaw persists, replays, and
 /// shows operators. `raw`, when present, retains the originating driver payload
 /// for debugging only and is excluded from every canonical projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEvent {
     pub event: RuntimeEvent,
     pub raw: Option<RawTurnPayload>,
@@ -1154,7 +1150,19 @@ pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeE
     journal.iter().map(|record| &record.event)
 }
 
+pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
+
+#[async_trait]
+pub trait ConversationDriver: Send {
+    fn protocol_name(&self) -> &'static str;
+
+    async fn run_turn(
+        &mut self,
+        input: RuntimeTurnInput,
+        journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult>;
+}
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
     existing.push_str(delta);
@@ -1206,7 +1214,7 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _events: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         Err(anyhow!("runtime does not implement direct turns"))
     }
@@ -1271,16 +1279,16 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: &RuntimeTurnInput,
         _output: &ExecutionOutput,
         _observed_error_text: Option<&str>,
-        _events: &RuntimeEventSender,
+        _journal: &RuntimeTurnJournalSender,
     ) -> Result<bool> {
         Ok(false)
     }
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        execute_program_backed_turn(self, execution, events).await
+        execute_program_backed_turn(self, execution, journal).await
     }
     async fn runtime_control(
         &self,
@@ -1330,7 +1338,7 @@ impl RuntimeRegistry {
 pub async fn execute_program_backed_turn<A>(
     adapter: &A,
     execution: RuntimeProgramTurnExecution,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1341,7 +1349,7 @@ where
         mut executor,
     } = execution;
 
-    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, events)
+    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, journal)
         .await
 }
 
@@ -1350,7 +1358,7 @@ async fn execute_program_backed_turn_with_executor<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1360,16 +1368,17 @@ where
 
     loop {
         let attempt =
-            run_program_backed_attempt(adapter, executor, &current_input, context, &events).await?;
+            run_program_backed_attempt(adapter, executor, &current_input, context, &journal)
+                .await?;
 
         if attempt.output.success() {
-            flush_buffered_program_output_events(&events, attempt.buffered_errors);
+            flush_buffered_program_output_events(&journal, attempt.buffered_errors);
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
                 attempt.last_error_text.as_deref(),
                 attempt.saw_done,
-                &events,
+                &journal,
             );
         }
 
@@ -1378,7 +1387,7 @@ where
                 &current_input,
                 &attempt.output,
                 attempt.last_error_text.as_deref(),
-                &events,
+                &journal,
             )?
         {
             attempted_retry = true;
@@ -1388,13 +1397,13 @@ where
             continue;
         }
 
-        flush_buffered_program_output_events(&events, attempt.buffered_errors);
+        flush_buffered_program_output_events(&journal, attempt.buffered_errors);
         return finish_program_backed_turn(
             adapter,
             attempt.output,
             attempt.last_error_text.as_deref(),
             attempt.saw_done,
-            &events,
+            &journal,
         );
     }
 }
@@ -1411,7 +1420,7 @@ async fn run_program_backed_attempt<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: &RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<ProgramBackedAttemptOutcome>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1433,7 +1442,7 @@ where
                     Some(line) => observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1442,7 +1451,7 @@ where
                     None => {
                         finish_program_output_parser(
                             &mut output_parser,
-                            events,
+                            journal,
                             &mut buffered_errors,
                             &mut saw_done,
                             &mut last_error_text,
@@ -1463,7 +1472,7 @@ where
                     observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1472,7 +1481,7 @@ where
                 }
                 finish_program_output_parser(
                     &mut output_parser,
-                    events,
+                    journal,
                     &mut buffered_errors,
                     &mut saw_done,
                     &mut last_error_text,
@@ -1491,7 +1500,7 @@ where
 fn observe_program_output_line<A>(
     adapter: &A,
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
@@ -1506,7 +1515,7 @@ fn observe_program_output_line<A>(
     };
 
     observe_program_output_events(
-        events,
+        journal,
         buffered_errors,
         parsed_events,
         saw_done,
@@ -1516,14 +1525,14 @@ fn observe_program_output_line<A>(
 
 fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
     if let Some(parser) = output_parser.as_mut() {
         observe_program_output_events(
-            events,
+            journal,
             buffered_errors,
             parser.finish(),
             saw_done,
@@ -1533,7 +1542,7 @@ fn finish_program_output_parser(
 }
 
 fn observe_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
     saw_done: &mut bool,
@@ -1550,21 +1559,21 @@ fn observe_program_output_events(
             if let Some(buffer) = buffered_errors.as_mut() {
                 buffer.push(event);
             } else {
-                drop(events.send(event));
+                drop(journal.send(TurnEvent::canonical(event)));
             }
         } else {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
 
 fn flush_buffered_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: Option<Vec<RuntimeEvent>>,
 ) {
     if let Some(buffered_errors) = buffered_errors {
         for event in buffered_errors {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
@@ -1574,7 +1583,7 @@ fn finish_program_backed_turn<A>(
     output: ExecutionOutput,
     observed_error_text: Option<&str>,
     saw_done: bool,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1586,7 +1595,7 @@ where
     }
 
     if !saw_done {
-        drop(events.send(RuntimeEvent::Done));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
     }
 
     Ok(RuntimeTurnResult {
@@ -1610,8 +1619,8 @@ mod tests {
         RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimePathProjection,
         RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, TurnEvent,
-        RUNTIME_SESSION_READY_MARKER,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
+        TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1733,7 +1742,7 @@ mod tests {
             _input: &RuntimeTurnInput,
             _output: &ExecutionOutput,
             _observed_error_text: Option<&str>,
-            _events: &RuntimeEventSender,
+            _journal: &RuntimeTurnJournalSender,
         ) -> Result<bool> {
             Ok(!self
                 .retry_used
@@ -2051,9 +2060,15 @@ mod tests {
         assert!(result.capability_requests.is_empty());
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "hello"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "hello"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2085,9 +2100,15 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "fresh"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "fresh"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
         assert!(
             event_rx.try_recv().is_err(),
             "stale error should stay buffered"
@@ -2124,7 +2145,7 @@ mod tests {
         assert!(err.to_string().contains("second"));
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::Error { text, .. }) if text == "second"
+            Some(TurnEvent { event: RuntimeEvent::Error { text, .. }, raw: None }) if text == "second"
         ));
         assert!(
             event_rx.try_recv().is_err(),
@@ -2209,7 +2230,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "slow"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "slow"
         ));
     }
 }

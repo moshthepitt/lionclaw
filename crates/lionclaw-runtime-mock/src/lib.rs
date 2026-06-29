@@ -39,7 +39,7 @@ use lionclaw_runtime_api::{
     Capability, HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
     RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
     RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTurnInput, RuntimeTurnResult,
+    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
 };
 
 pub struct MockRuntimeAdapter;
@@ -71,12 +71,12 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        drop(events.send(RuntimeEvent::Status {
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Status {
             code: None,
             text: "mock runtime started turn".to_string(),
-        }));
+        })));
 
         let skill_context = if input.runtime_skill_ids.is_empty() {
             "no runtime skills available".to_string()
@@ -84,10 +84,12 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             format!("runtime skill ids: {}", input.runtime_skill_ids.join(", "))
         };
 
-        drop(events.send(RuntimeEvent::MessageDelta {
-            lane: RuntimeMessageLane::Answer,
-            text: format!("[mock] {} | prompt: {}", skill_context, input.prompt),
-        }));
+        drop(
+            journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: format!("[mock] {} | prompt: {}", skill_context, input.prompt),
+            })),
+        );
 
         let mut capability_requests = Vec::new();
         if let Some(skill_id) = input.runtime_skill_ids.first() {
@@ -106,15 +108,15 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
 
         if capability_requests.is_empty() {
-            drop(events.send(RuntimeEvent::Done));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
         } else {
-            drop(events.send(RuntimeEvent::Status {
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Status {
                 code: None,
                 text: format!(
                     "mock runtime requested {} capability checks",
                     capability_requests.len()
                 ),
-            }));
+            })));
         }
 
         Ok(RuntimeTurnResult {

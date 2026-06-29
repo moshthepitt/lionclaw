@@ -163,7 +163,7 @@ use super::{
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
         RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
@@ -7108,7 +7108,7 @@ impl Kernel {
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let turn_input = RuntimeTurnInput {
             runtime_session_id: handle.runtime_session_id.clone(),
             prompt,
@@ -7123,7 +7123,7 @@ impl Kernel {
         };
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
-                RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter.turn(turn_input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     adapter
                         .program_backed_turn(
@@ -7132,7 +7132,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -7165,8 +7165,8 @@ impl Kernel {
         };
 
         let mut events = Vec::new();
-        while let Some(event) = event_rx.recv().await {
-            events.push(event);
+        while let Some(record) = journal_rx.recv().await {
+            events.push(record.event);
         }
         let close_result = adapter.close(&handle).await;
         outcome?;
@@ -7786,6 +7786,7 @@ mod tests {
     };
     use crate::kernel::runtime::{
         RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+        RuntimeTurnJournalSender,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::kernel::session_turns::SessionTurnStore;
@@ -8206,7 +8207,7 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            _events: RuntimeEventSender,
+            _journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!(
@@ -8264,10 +8265,10 @@ mod tests {
         async fn turn(
             &self,
             input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.prompts.lock().await.push(input.prompt);
-            drop(events.send(RuntimeEvent::Done));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
             Ok(RuntimeTurnResult::default())
         }
 
@@ -8320,13 +8321,15 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
-            drop(events.send(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: self.message.clone(),
-            }));
-            drop(events.send(RuntimeEvent::Done));
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: self.message.clone(),
+                })),
+            );
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
             Ok(RuntimeTurnResult::default())
         }
 
@@ -22326,6 +22329,35 @@ impl Kernel {
         Ok(())
     }
 
+    async fn record_runtime_turn_event(
+        &self,
+        turn_id: Uuid,
+        stream_context: &Option<ChannelStreamContext>,
+        event_sink: &Option<RuntimeEventSink>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), FailedRuntimeTurn> {
+        self.session_turns
+            .append_journal_event(turn_id, &record)
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: events.clone(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+        self.record_runtime_event(
+            turn_id,
+            stream_context,
+            event_sink,
+            record.event,
+            events,
+            checkpoints,
+        )
+        .await
+    }
+
     fn session_key_worker_key(channel_id: &str, session_key: &str) -> String {
         format!("{channel_id}:{session_key}")
     }
@@ -24780,7 +24812,7 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         self.maybe_mount_project_instance_inventory(
             session_id,
@@ -24808,7 +24840,7 @@ impl Kernel {
         let codex_home_override = self.codex_home_override.clone();
         let mut turn_task = tokio::spawn(async move {
             match runtime_turn_mode {
-                RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter_for_task.turn(input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     let runtime_executor = KernelRuntimeProgramExecutor {
                         plan: execution_plan,
@@ -24822,7 +24854,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -24836,18 +24868,18 @@ impl Kernel {
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
-        let mut event_rx_open = true;
+        let mut journal_rx_open = true;
 
         loop {
             tokio::select! {
-                maybe_event = event_rx.recv(), if event_rx_open => {
-                    match maybe_event {
-                        Some(event) => {
-                            self.record_runtime_event(
+                maybe_record = journal_rx.recv(), if journal_rx_open => {
+                    match maybe_record {
+                        Some(record) => {
+                            self.record_runtime_turn_event(
                                 turn_id,
                                 &stream_context,
                                 &event_sink,
-                                event,
+                                record,
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24855,17 +24887,17 @@ impl Kernel {
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
-                            event_rx_open = false;
+                            journal_rx_open = false;
                         }
                     }
                 }
                 output = &mut turn_task => {
-                    while let Some(event) = event_rx.recv().await {
-                        self.record_runtime_event(
+                    while let Some(record) = journal_rx.recv().await {
+                        self.record_runtime_turn_event(
                             turn_id,
                             &stream_context,
                             &event_sink,
-                            event,
+                            record,
                             &mut events,
                             &mut checkpoints,
                         )
@@ -24929,14 +24961,14 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
+                            self.record_runtime_turn_event(
                                 turn_id,
                                 &stream_context,
                                 &event_sink,
-                                RuntimeEvent::Error {
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24968,14 +25000,14 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
+                            self.record_runtime_turn_event(
                                 turn_id,
                                 &stream_context,
                                 &event_sink,
-                                RuntimeEvent::Error {
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -25529,14 +25561,14 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
-        self.record_runtime_event(
+        self.record_runtime_turn_event(
             turn_id,
             stream_context,
             event_sink,
-            RuntimeEvent::Error {
+            TurnEvent::canonical(RuntimeEvent::Error {
                 code: Some(error_code.to_string()),
                 text: reason.clone(),
-            },
+            }),
             &mut events,
             &mut checkpoints,
         )
@@ -25574,11 +25606,11 @@ impl Kernel {
         let mut checkpoints = AssistantCheckpointState::default();
         checkpoints.seed(assistant_text);
         while let Some(event) = event_rx.recv().await {
-            self.record_runtime_event(
+            self.record_runtime_turn_event(
                 turn_id,
                 &stream_context,
                 &event_sink,
-                event,
+                TurnEvent::canonical(event),
                 &mut events,
                 &mut checkpoints,
             )
