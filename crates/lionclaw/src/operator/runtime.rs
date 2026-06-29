@@ -5,10 +5,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use lionclaw_runtime_acp::{AcpRuntimeAdapter, AcpRuntimeConfig};
-use lionclaw_runtime_api::RuntimeAuthProvider;
-use lionclaw_runtime_codex::{CodexRuntimeAdapter, CodexRuntimeConfig};
-use lionclaw_runtime_codex::{CodexRuntimeAuthProvider, CODEX_RUNTIME_AUTH_KIND};
+use lionclaw_runtime_acp::AcpRuntimeDriver;
+use lionclaw_runtime_api::{RuntimeAuthProvider, RuntimeDriverConfig, RuntimeDriverProvider};
+use lionclaw_runtime_codex::CodexRuntimeDriver;
 
 use crate::home::LionClawHome;
 use crate::kernel::{
@@ -30,14 +29,47 @@ use super::runtime_mounts::validate_configured_runtime_mounts;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeExecutionContext {
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_env: Vec<(String, String)>,
     pub runtime_auth_registry: RuntimeAuthRegistry,
     pub runtime_auth_context: RuntimeAuthContext,
     pub daemon_config_fingerprint: String,
     pub execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
 }
 
+#[derive(Clone)]
+struct RuntimeDriverRegistry {
+    drivers: BTreeMap<String, Arc<dyn RuntimeDriverProvider>>,
+}
+
+impl RuntimeDriverRegistry {
+    fn new(drivers: impl IntoIterator<Item = Arc<dyn RuntimeDriverProvider>>) -> Self {
+        Self {
+            drivers: drivers
+                .into_iter()
+                .map(|driver| (driver.driver().to_string(), driver))
+                .collect(),
+        }
+    }
+
+    fn get(&self, driver: &str) -> Option<Arc<dyn RuntimeDriverProvider>> {
+        self.drivers.get(driver).cloned()
+    }
+
+    fn auth_registry(&self) -> RuntimeAuthRegistry {
+        RuntimeAuthRegistry::new(
+            self.drivers
+                .values()
+                .filter_map(|driver| driver.auth_provider()),
+        )
+    }
+
+    fn supported_drivers(&self) -> Vec<&str> {
+        self.drivers.keys().map(String::as_str).collect()
+    }
+}
+
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
+    let drivers = runtime_driver_registry();
     for (id, runtime) in &config.runtimes {
         if let Err(err) = validate_runtime_command(runtime.executable()) {
             warn!(
@@ -47,46 +79,20 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
             );
             continue;
         }
-        match runtime.driver() {
-            "codex" => {
-                kernel
-                    .register_runtime_adapter(
-                        id.clone(),
-                        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
-                            executable: runtime.executable.clone(),
-                            model: runtime.model.clone(),
-                        })),
-                    )
-                    .await;
-            }
-            "acp" => {
-                kernel
-                    .register_runtime_adapter(
-                        id.clone(),
-                        Arc::new(AcpRuntimeAdapter::new(AcpRuntimeConfig {
-                            runtime_id: id.clone(),
-                            executable: runtime.executable.clone(),
-                            args: runtime.args.clone(),
-                            environment: runtime
-                                .environment
-                                .iter()
-                                .map(|(key, value)| (key.clone(), value.clone()))
-                                .collect(),
-                            model: runtime.model.clone(),
-                            mode: runtime.mode.clone(),
-                            auth: runtime.auth.clone(),
-                            session_id_state_file: ".lionclaw-acp-session-id".to_string(),
-                            default_working_dir: "/workspace".to_string(),
-                        })),
-                    )
-                    .await;
-            }
-            other => warn!(
+        let Some(driver) = drivers.get(runtime.driver()) else {
+            warn!(
                 runtime_id = %id,
-                driver = %other,
+                driver = %runtime.driver(),
                 "skipping runtime adapter registration for unsupported runtime driver"
-            ),
-        }
+            );
+            continue;
+        };
+        kernel
+            .register_runtime_adapter(
+                id.clone(),
+                driver.create_adapter(runtime_driver_config(id, runtime)),
+            )
+            .await;
     }
 
     Ok(())
@@ -97,9 +103,9 @@ pub async fn resolve_runtime_execution_context(
     config: &OperatorConfig,
     selected_runtime_id: Option<&str>,
 ) -> Result<ResolvedRuntimeExecutionContext> {
-    let codex_home_override = operator_codex_home_override(home)?;
-    let runtime_auth_context = runtime_auth_context(codex_home_override.clone());
     let runtime_auth_registry = runtime_auth_registry();
+    let runtime_auth_context = runtime_auth_context(home, &runtime_auth_registry)?;
+    let runtime_auth_env = runtime_auth_daemon_env(&runtime_auth_context, &runtime_auth_registry);
     let runtime_image_identities =
         resolve_runtime_image_identities(config, selected_runtime_id).await?;
     let execution_profiles = config
@@ -127,7 +133,7 @@ pub async fn resolve_runtime_execution_context(
     );
 
     Ok(ResolvedRuntimeExecutionContext {
-        codex_home_override,
+        runtime_auth_env,
         runtime_auth_registry,
         runtime_auth_context,
         daemon_config_fingerprint,
@@ -154,13 +160,13 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
     profile
         .validate()
         .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' is invalid: {err}"))?;
-    match profile.driver() {
-        "codex" | "acp" => {}
-        other => {
-            return Err(anyhow!(
-            "configured runtime profile '{runtime_id}' uses unsupported runtime driver '{other}'"
-        ))
-        }
+    let drivers = runtime_driver_registry();
+    if drivers.get(profile.driver()).is_none() {
+        return Err(anyhow!(
+            "configured runtime profile '{runtime_id}' uses unsupported runtime driver '{}'; supported drivers: {}",
+            profile.driver(),
+            supported_runtime_drivers(&drivers)
+        ));
     }
     Ok(())
 }
@@ -187,9 +193,8 @@ pub async fn validate_runtime_launch_prerequisites_for_work_root(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
-    let codex_home_override = operator_codex_home_override(home)?;
-    let runtime_auth_context = runtime_auth_context(codex_home_override);
     let runtime_auth_registry = runtime_auth_registry();
+    let runtime_auth_context = runtime_auth_context(home, &runtime_auth_registry)?;
     validate_runtime_execution_prerequisites(
         runtime_id,
         profile.confinement(),
@@ -199,17 +204,6 @@ pub async fn validate_runtime_launch_prerequisites_for_work_root(
         interactive_network_mode(config)?,
     )
     .await
-}
-
-pub(crate) fn operator_codex_home_override(_home: &LionClawHome) -> Result<Option<PathBuf>> {
-    #[cfg(test)]
-    {
-        Ok(Some(_home.root().join(".codex")))
-    }
-    #[cfg(not(test))]
-    {
-        crate::config::resolve_optional_env_override_path("CODEX_HOME").map_err(Into::into)
-    }
 }
 
 async fn resolve_runtime_image_identities(
@@ -259,13 +253,93 @@ fn runtime_auth_identity(
 }
 
 pub(crate) fn runtime_auth_registry() -> RuntimeAuthRegistry {
-    RuntimeAuthRegistry::new([Arc::new(CodexRuntimeAuthProvider) as Arc<dyn RuntimeAuthProvider>])
+    runtime_driver_registry().auth_registry()
 }
 
-fn runtime_auth_context(codex_home_override: Option<PathBuf>) -> RuntimeAuthContext {
-    match codex_home_override {
-        Some(path) => RuntimeAuthContext::new().with_home_override(CODEX_RUNTIME_AUTH_KIND, path),
-        None => RuntimeAuthContext::new(),
+fn runtime_driver_registry() -> RuntimeDriverRegistry {
+    RuntimeDriverRegistry::new([
+        Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+        Arc::new(AcpRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+    ])
+}
+
+fn runtime_driver_config(runtime_id: &str, runtime: &RuntimeProfileConfig) -> RuntimeDriverConfig {
+    RuntimeDriverConfig {
+        runtime_id: runtime_id.to_string(),
+        executable: runtime.executable.clone(),
+        args: runtime.args.clone(),
+        environment: runtime
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        model: runtime.model.clone(),
+        mode: runtime.mode.clone(),
+        auth: runtime.auth.clone(),
+    }
+}
+
+fn runtime_auth_context(
+    home: &LionClawHome,
+    auth_registry: &RuntimeAuthRegistry,
+) -> Result<RuntimeAuthContext> {
+    let mut context = RuntimeAuthContext::new();
+    for provider in auth_registry.providers() {
+        if let Some(path) = runtime_auth_home_override(home, provider.as_ref())? {
+            context.insert_home_override(provider.kind(), path);
+        }
+    }
+    Ok(context)
+}
+
+fn runtime_auth_home_override(
+    _home: &LionClawHome,
+    provider: &dyn RuntimeAuthProvider,
+) -> Result<Option<PathBuf>> {
+    let Some(env) = provider.host_home_override_env() else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    {
+        let _ = env;
+        Ok(Some(_home.root().join(format!(".{}", provider.kind()))))
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::resolve_optional_env_override_path(env).map_err(Into::into)
+    }
+}
+
+fn runtime_auth_daemon_env(
+    context: &RuntimeAuthContext,
+    auth_registry: &RuntimeAuthRegistry,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for provider in auth_registry.providers() {
+        let Some(var) = provider.host_home_override_env() else {
+            continue;
+        };
+        let Some(path) = context.home_override(provider.kind()) else {
+            continue;
+        };
+        env.push((var.to_string(), path.display().to_string()));
+    }
+    env
+}
+
+fn supported_runtime_drivers(drivers: &RuntimeDriverRegistry) -> String {
+    let drivers = drivers.supported_drivers();
+    match drivers.as_slice() {
+        [] => "none".to_string(),
+        [driver] => format!("'{driver}'"),
+        [head @ .., tail] => {
+            let head = head
+                .iter()
+                .map(|driver| format!("'{driver}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{head} or '{tail}'")
+        }
     }
 }
 

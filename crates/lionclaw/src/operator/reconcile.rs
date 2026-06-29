@@ -73,7 +73,7 @@ pub(crate) struct ManagedDaemonContext<'a> {
     pub work_root: &'a Path,
     pub project_instance: Option<DaemonProjectInstanceSpec<'a>>,
     pub fingerprint: &'a str,
-    pub codex_home_override: Option<&'a Path>,
+    pub runtime_auth_env: &'a [(String, String)],
 }
 
 pub async fn add_skill(
@@ -508,7 +508,7 @@ pub async fn up_for_work_root<M: UnitManager>(
             work_root,
             project_instance,
             fingerprint: &expected_daemon_fingerprint,
-            codex_home_override: runtime_context.codex_home_override.as_deref(),
+            runtime_auth_env: runtime_context.runtime_auth_env.as_slice(),
         },
     )?;
     let next_units = units
@@ -776,7 +776,7 @@ pub(crate) fn build_managed_units(
             project_workspace_root: daemon_context.work_root,
             project_instance: daemon_context.project_instance,
             daemon_fingerprint: daemon_context.fingerprint,
-            codex_home_override: daemon_context.codex_home_override,
+            runtime_auth_env: daemon_context.runtime_auth_env,
         },
     ));
 
@@ -1217,7 +1217,7 @@ mod tests {
                 project_workspace_root: Path::new("/tmp/project"),
                 project_instance: None,
                 daemon_fingerprint: "test-fingerprint",
-                codex_home_override: None,
+                runtime_auth_env: &[],
             },
         );
         let name = unit.name.clone();

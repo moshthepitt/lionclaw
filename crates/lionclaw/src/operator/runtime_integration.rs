@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
-use lionclaw_runtime_codex::codex_runtime_auth_kind;
+use lionclaw_runtime_codex::{
+    codex_runtime_auth_kind, CODEX_DEFAULT_EXECUTABLE, CODEX_RUNTIME_DRIVER,
+    CODEX_SKILL_PROJECTION_ROOT,
+};
 
 use crate::kernel::runtime::{
     ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
@@ -9,8 +12,6 @@ use super::config::{normalize_podman_executable, OperatorConfig, RuntimeProfileC
 use super::runtime::runtime_auth_registry;
 
 pub const CODEX_RUNTIME_ID: &str = "codex";
-pub const CODEX_RUNTIME_DRIVER: &str = "codex";
-pub const CODEX_DEFAULT_EXECUTABLE: &str = "codex";
 pub const DEFAULT_OCI_ENGINE: &str = "podman";
 pub const DEFAULT_RUNTIME_IMAGE: &str = "lionclaw-runtime:v1";
 
@@ -69,7 +70,9 @@ impl ConfigureRuntime {
                 }),
             )
             .with_auth(codex_runtime_auth_kind())
-            .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills")),
+            .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+                CODEX_SKILL_PROJECTION_ROOT,
+            )),
         }
     }
 }
@@ -185,7 +188,7 @@ mod tests {
                 .skill_projection
                 .as_ref()
                 .map(RuntimeSkillProjectionConfig::native_dir_root),
-            Some(".codex/skills")
+            Some(CODEX_SKILL_PROJECTION_ROOT)
         );
         let confinement = &profile.confinement;
         let ConfinementConfig::Oci(oci) = confinement;
@@ -206,7 +209,9 @@ mod tests {
             }),
         )
         .with_auth(codex_runtime_auth_kind())
-        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"));
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+            CODEX_SKILL_PROJECTION_ROOT,
+        ));
         existing_profile.model = Some("gpt-5.2".to_string());
         config
             .runtimes

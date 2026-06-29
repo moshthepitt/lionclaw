@@ -215,6 +215,10 @@ pub trait RuntimeAuthProvider: Send + Sync {
 
     async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>>;
 
+    fn host_home_override_env(&self) -> Option<&'static str> {
+        None
+    }
+
     fn identity(&self, _context: &RuntimeAuthContext) -> Result<Option<String>> {
         Ok(None)
     }
@@ -250,6 +254,10 @@ impl RuntimeAuthRegistry {
 
     pub fn get_kind(&self, kind: &str) -> Option<Arc<dyn RuntimeAuthProvider>> {
         self.providers.get(kind).cloned()
+    }
+
+    pub fn providers(&self) -> impl Iterator<Item = Arc<dyn RuntimeAuthProvider>> + '_ {
+        self.providers.values().cloned()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1288,6 +1296,27 @@ pub trait ConversationDriver: Send {
         input: RuntimeTurnInput,
         journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeDriverConfig {
+    pub runtime_id: String,
+    pub executable: String,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub auth: Option<RuntimeAuthKind>,
+}
+
+pub trait RuntimeDriverProvider: Send + Sync {
+    fn driver(&self) -> &'static str;
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
+
+    fn auth_provider(&self) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        None
+    }
 }
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {

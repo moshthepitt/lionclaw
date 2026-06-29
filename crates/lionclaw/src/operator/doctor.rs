@@ -2997,7 +2997,7 @@ mod tests {
                 project_workspace_root: work_root,
                 project_instance: None,
                 daemon_fingerprint,
-                codex_home_override: None,
+                runtime_auth_env: &[],
             },
         );
         manager

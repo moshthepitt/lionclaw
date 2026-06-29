@@ -11,7 +11,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use cron::Schedule;
-use lionclaw_runtime_codex::codex_runtime_auth_kind;
+use lionclaw_runtime_acp::ACP_PROTOCOL_NAME;
+use lionclaw_runtime_codex::{
+    codex_runtime_auth_kind, CODEX_RUNTIME_DRIVER, CODEX_SKILL_PROJECTION_ROOT,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -2674,11 +2677,11 @@ fn build_runtime_profile(
     executable: String,
 ) -> Result<RuntimeProfileConfig> {
     match args.driver.trim() {
-        "codex" => {
+        CODEX_RUNTIME_DRIVER => {
             validate_codex_profile_args(args)?;
             let confinement = build_confinement_config(args)?;
             Ok(RuntimeProfileConfig {
-                driver: "codex".to_string(),
+                driver: CODEX_RUNTIME_DRIVER.to_string(),
                 executable,
                 args: Vec::new(),
                 environment: BTreeMap::new(),
@@ -2688,15 +2691,15 @@ fn build_runtime_profile(
                 skill_projection: Some(native_skill_projection(
                     args.skill_projection_root
                         .clone()
-                        .unwrap_or_else(|| ".codex/skills".to_string()),
+                        .unwrap_or_else(|| CODEX_SKILL_PROJECTION_ROOT.to_string()),
                 )?),
                 confinement,
             })
         }
-        "acp" => {
+        ACP_PROTOCOL_NAME => {
             let confinement = build_confinement_config(args)?;
             Ok(RuntimeProfileConfig {
-                driver: "acp".to_string(),
+                driver: ACP_PROTOCOL_NAME.to_string(),
                 executable,
                 args: normalize_runtime_args(&args.runtime_args),
                 environment: parse_runtime_environment(&args.environment)?,

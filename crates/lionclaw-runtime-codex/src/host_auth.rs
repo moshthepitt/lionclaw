@@ -56,6 +56,10 @@ impl RuntimeAuthProvider for CodexRuntimeAuthProvider {
         .await
     }
 
+    fn host_home_override_env(&self) -> Option<&'static str> {
+        Some(CODEX_HOME_ENV)
+    }
+
     fn identity(&self, context: &RuntimeAuthContext) -> Result<Option<String>> {
         codex_home_identity(codex_home_override(context))
     }

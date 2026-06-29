@@ -42,11 +42,11 @@ use uuid::Uuid;
 
 use lionclaw_runtime_api::{
     load_ready_state_value, save_state_value, ConversationDriver, ExecutionOutput, RawTurnPayload,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult, TurnEvent,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
@@ -98,6 +98,29 @@ impl AcpRuntimeConfig {
 impl Default for AcpRuntimeConfig {
     fn default() -> Self {
         Self::new("acp", "acp", std::iter::empty::<&str>())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AcpRuntimeDriver;
+
+impl RuntimeDriverProvider for AcpRuntimeDriver {
+    fn driver(&self) -> &'static str {
+        ACP_PROTOCOL_NAME
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        Arc::new(AcpRuntimeAdapter::new(AcpRuntimeConfig {
+            runtime_id: config.runtime_id,
+            executable: config.executable,
+            args: config.args,
+            environment: config.environment,
+            model: config.model,
+            mode: config.mode,
+            auth: config.auth,
+            session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
+            default_working_dir: ACP_DEFAULT_WORKING_DIR.to_string(),
+        }))
     }
 }
 

@@ -58,21 +58,24 @@ use lionclaw_runtime_api::{
     normalize_terminal_transcript_launch_started_at, safe_relative_path, save_state_value,
     ConversationDriver, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
     RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-    RuntimeExecutionContext, RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
-    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTranscript,
-    RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
-    RuntimeTerminalTranscriptWarning, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
-    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
-    TurnEvent,
+    RuntimeControlExecution, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
+    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange,
+    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, RuntimeTurnResult, TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptTimestampPrecision, TurnEvent,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
 const CODEX_APP_SERVER_DRIVER: &str = "codex-app-server";
-pub const CODEX_RUNTIME_AUTH_KIND: &str = "codex";
+pub const CODEX_RUNTIME_DRIVER: &str = "codex";
+pub const CODEX_RUNTIME_AUTH_KIND: &str = CODEX_RUNTIME_DRIVER;
+pub const CODEX_DEFAULT_EXECUTABLE: &str = "codex";
+pub const CODEX_SKILL_PROJECTION_ROOT: &str = ".codex/skills";
 const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
 const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
@@ -90,10 +93,30 @@ pub struct CodexRuntimeConfig {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CodexRuntimeDriver;
+
+impl RuntimeDriverProvider for CodexRuntimeDriver {
+    fn driver(&self) -> &'static str {
+        CODEX_RUNTIME_DRIVER
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
+            executable: config.executable,
+            model: config.model,
+        }))
+    }
+
+    fn auth_provider(&self) -> Option<Arc<dyn lionclaw_runtime_api::RuntimeAuthProvider>> {
+        Some(Arc::new(CodexRuntimeAuthProvider))
+    }
+}
+
 impl Default for CodexRuntimeConfig {
     fn default() -> Self {
         Self {
-            executable: "codex".to_string(),
+            executable: CODEX_DEFAULT_EXECUTABLE.to_string(),
             model: None,
         }
     }
