@@ -141,11 +141,20 @@ path. Direct runtimes and brokered capabilities are useful for tests, narrow
 workers, and future runtimes that do not bring a full harness.
 
 Adapters describe what they need and how to interpret runtime-owned state:
-program invocations, optional runtime auth kind, output parsing, native terminal
-programs, transcript export, and runtime controls. They do not receive the
-kernel execution plan. The kernel gives program-backed adapters a constrained
-executor plus observable runtime context, then still decides launch allowance,
-mounts, secrets, auth materialization, audit, and persistence.
+program invocations, optional runtime auth kind, native terminal programs,
+transcript export, and runtime controls. They do not receive the kernel
+execution plan. The kernel gives program-backed adapters a constrained executor
+plus observable runtime context, then still decides launch allowance, mounts,
+secrets, auth materialization, audit, and persistence.
+
+Side-effecting live protocol translation lives behind `ConversationDriver`.
+Codex's app-server and OpenCode's ACP driver both own their protocol handshakes,
+permission replies, runtime session continuity updates, and JSON-RPC loops.
+Their shared output is a turn journal of `TurnEvent` records: one canonical
+`RuntimeEvent` paired with an optional raw protocol payload retained only for
+debugging. Kernel routing and prompt reconstruction project the journal through
+`canonical_events`, so raw payloads are never replayed into prompts or used to
+build canonical assistant text.
 
 Runtime context may include host projections for runtime-visible paths. A
 directory projection maps a runtime tree such as `/runtime` to the runtime state
@@ -176,11 +185,13 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
    target select ordered context items, byte caps, transcript tail, and current
    input.
 6. The OCI backend launches the runtime in the confined layout.
-7. The adapter maps runtime output into typed stream events. Codex uses its
-   native `app-server` JSON-RPC protocol over stdio inside the confined
-   process; OpenCode uses its configured machine-readable run output.
-8. The kernel persists canonical answer text, terminal turn status, checkpoints,
-   audit, and any continuity changes it owns.
+7. The adapter maps the runtime protocol into a canonical turn journal. Codex
+   uses its native `app-server` JSON-RPC protocol over stdio inside the
+   confined process; OpenCode uses Agent Client Protocol over stdio.
+8. The kernel persists the canonical journal, streams `canonical_events` to live
+   consumers, checkpoints canonical answer text, records terminal turn status,
+   audit, and any continuity changes it owns. Raw protocol payloads are stored
+   only when explicit debug retention is enabled.
 
 Program-backed runtimes stream two message lanes:
 
@@ -210,15 +221,14 @@ reply and lets channel UIs reconcile live deltas against durable turn state
 before the terminal `done` marker. Failed, timed-out, cancelled, and interrupted
 turns publish typed status/error events followed by exactly one `done`.
 
-Configured OpenCode profiles are pinned to machine-readable JSON output so
-LionClaw receives typed events instead of a degraded plain-text stream. Codex
-is launched through its app-server protocol with `externalSandbox` permissions
-inside the outer Podman boundary. LionClaw does not use `codex exec` as a
-fallback path. Codex app-server request/notification assumptions are pinned by
-checked-in protocol fixtures under
-`crates/lionclaw-runtime-codex/tests/fixtures/codex_app_server`, including the
-target Codex CLI version and immutable source commit; update those fixtures
-with the adapter when the target app-server contract changes.
+Codex is launched through its app-server protocol with `externalSandbox`
+permissions inside the outer Podman boundary. LionClaw does not use
+`codex exec` as a fallback path. OpenCode program-backed turns use ACP rather
+than `opencode run --format json`. Codex app-server and OpenCode ACP
+request/notification assumptions are pinned by checked-in protocol fixtures
+under each runtime crate, including the target CLI version and immutable source
+commit; update those fixtures with the adapter when the target protocol
+contract changes.
 
 ## Native Runtime TUI Flow
 
@@ -285,10 +295,10 @@ Codex threads that the app-server reports as not yet materialized before the
 first user message reconcile as empty, non-resumable continuation sources.
 OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
 stored in session-scoped runtime control state. Program-backed OpenCode turns
-learn that id from OpenCode's machine-readable `sessionID` events and then
-resume with `opencode run --session <sessionID>`. Native TUI launches resume
-with `opencode --session <sessionID>` only when that link also has LionClaw's
-ready marker from a proven resumable reconciliation.
+load that id through ACP `session/load`; new ACP sessions persist the returned
+session id back into LionClaw runtime state. Native TUI launches resume with
+`opencode --session <sessionID>` only when that link also has LionClaw's ready
+marker from a proven resumable reconciliation.
 After native TUI exit, LionClaw uses OpenCode's `session list --format json`
 only to identify whether the runtime moved to a newer root session during the
 launch, choosing by exported update timestamp instead of relying on list order.

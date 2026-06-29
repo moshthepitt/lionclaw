@@ -38,25 +38,29 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::time::{timeout_at, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
     choose_terminal_transcript_target, load_ready_state_value, load_state_value,
-    normalize_terminal_transcript_launch_started_at, save_state_value, ExecutionOutput,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramOutputParser, RuntimeProgramSpec,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
+    normalize_terminal_transcript_launch_started_at, save_state_value, ConversationDriver,
+    ExecutionOutput, RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult,
+    RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramExecutor,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+    RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
     RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode,
-    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
+    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, RuntimeTurnResult, TerminalTranscriptCandidate, TerminalTranscriptTarget,
+    TerminalTranscriptTimestampPrecision, TurnEvent,
 };
 
 const OPENCODE_SESSION_ID_STATE_FILE: &str = ".lionclaw-opencode-session-id";
 const OPENCODE_RUNTIME_CONFIG_PATH: &str = "/runtime/opencode.generated.json";
+const OPENCODE_ACP_DRIVER: &str = "opencode-acp";
+const OPENCODE_ACP_WORKSPACE_PATH: &str = "/workspace";
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -134,41 +138,20 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         })
     }
 
-    fn build_turn_program(
+    async fn program_backed_turn(
         &self,
-        input: &RuntimeTurnInput,
-        _context: &RuntimeExecutionContext,
-    ) -> Result<RuntimeProgramSpec> {
-        let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
-
-        Ok(RuntimeProgramSpec {
-            executable: self.config.executable.clone(),
-            args: build_opencode_run_args(
-                &self.config,
-                &input.prompt,
-                session.session_id.as_deref(),
-            ),
-            environment: opencode_runtime_environment(),
-            stdin: String::new(),
-            auth: None,
-        })
-    }
-
-    fn program_output_parser(
-        &self,
-        input: &RuntimeTurnInput,
-    ) -> Option<Box<dyn RuntimeProgramOutputParser>> {
-        Some(Box::new(OpenCodeProgramOutputParser {
+        execution: RuntimeProgramTurnExecution,
+        journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult> {
+        let RuntimeProgramTurnExecution {
+            input, executor, ..
+        } = execution;
+        let mut driver = OpenCodeAcpConversationDriver {
+            config: self.config.clone(),
             sessions: Arc::clone(&self.sessions),
-            runtime_session_id: input.runtime_session_id.clone(),
-            observed_session_id: get_runtime_session(&self.sessions, &input.runtime_session_id)
-                .ok()
-                .and_then(|state| state.session_id),
-        }))
-    }
-
-    fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
-        parse_opencode_output_line(line)
+            executor,
+        };
+        driver.run_turn(input, journal).await
     }
 
     fn build_terminal_program(
@@ -196,35 +179,6 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             hard_timeout,
         )
         .await
-    }
-
-    fn format_program_exit_error(
-        &self,
-        output: &ExecutionOutput,
-        observed_error_text: Option<&str>,
-    ) -> String {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let observed_detail = observed_error_text
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string);
-        let stderr_detail = if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr)
-        };
-        let detail = extract_opencode_error_detail(&output.stdout)
-            .or(observed_detail)
-            .or(stderr_detail);
-
-        if let Some(detail) = detail {
-            format!(
-                "opencode run exited with {}: {detail}",
-                output.status_description()
-            )
-        } else {
-            format!("opencode run exited with {}", output.status_description())
-        }
     }
 
     async fn resolve_capability_requests(
@@ -255,35 +209,554 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     }
 }
 
-fn build_opencode_run_args(
-    config: &OpenCodeRuntimeConfig,
-    prompt: &str,
-    session_id: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec!["run".to_string()];
+struct OpenCodeAcpConversationDriver {
+    config: OpenCodeRuntimeConfig,
+    sessions: Arc<RwLock<HashMap<String, OpenCodeSessionState>>>,
+    executor: Box<dyn RuntimeProgramExecutor>,
+}
 
-    if let Some(session_id) = session_id {
-        args.push("--session".to_string());
-        args.push(session_id.to_string());
+#[async_trait]
+impl ConversationDriver for OpenCodeAcpConversationDriver {
+    fn protocol_name(&self) -> &'static str {
+        OPENCODE_ACP_DRIVER
     }
 
-    args.extend([
-        "--format".to_string(),
-        "json".to_string(),
-        "--thinking".to_string(),
-    ]);
+    async fn run_turn(
+        &mut self,
+        input: RuntimeTurnInput,
+        journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult> {
+        let runtime_session_id = input.runtime_session_id.clone();
+        let session_state = get_runtime_session(&self.sessions, &runtime_session_id)?;
+        let program = build_opencode_acp_program(&self.config);
+        let session = self.executor.spawn(program).await?;
+        let mut client = OpenCodeAcpClient::new(session);
 
-    if let Some(model) = &config.model {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
-    if let Some(agent) = &config.agent {
-        args.push("--agent".to_string());
-        args.push(agent.to_string());
-    }
-    args.push(prompt.to_string());
+        let result = async {
+            client.initialize().await?;
+            let session_id = client
+                .ensure_session(&self.sessions, &runtime_session_id, &session_state)
+                .await?;
+            client.configure_session(&self.config, &session_id).await?;
+            client.prompt(&session_id, &input.prompt, &journal).await?;
+            Ok(RuntimeTurnResult::default())
+        }
+        .await;
 
-    args
+        finish_opencode_acp_session(client, result).await
+    }
+}
+
+fn build_opencode_acp_program(config: &OpenCodeRuntimeConfig) -> RuntimeProgramSpec {
+    RuntimeProgramSpec {
+        executable: config.executable.clone(),
+        args: vec!["acp".to_string()],
+        environment: opencode_runtime_environment(),
+        stdin: String::new(),
+        auth: None,
+    }
+}
+
+struct OpenCodeAcpClient {
+    session: Option<Box<dyn RuntimeProgramSession>>,
+    next_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeAcpMessage {
+    raw: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeAcpResponse {
+    raw: String,
+    result: Value,
+}
+
+impl OpenCodeAcpClient {
+    fn new(session: Box<dyn RuntimeProgramSession>) -> Self {
+        Self {
+            session: Some(session),
+            next_id: 1,
+        }
+    }
+
+    async fn initialize(&mut self) -> Result<()> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": false,
+                        "writeTextFile": false,
+                    },
+                    "terminal": false,
+                },
+            }),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_session(
+        &mut self,
+        sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
+        runtime_session_id: &str,
+        session_state: &OpenCodeSessionState,
+    ) -> Result<String> {
+        if let Some(session_id) = session_state.session_id.as_deref() {
+            self.request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": OPENCODE_ACP_WORKSPACE_PATH,
+                    "mcpServers": [],
+                }),
+                None,
+            )
+            .await?;
+            return Ok(session_id.to_string());
+        }
+
+        let response = self
+            .request(
+                "session/new",
+                json!({
+                    "cwd": OPENCODE_ACP_WORKSPACE_PATH,
+                    "mcpServers": [],
+                }),
+                None,
+            )
+            .await?;
+        let session_id = response
+            .result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .and_then(normalize_opencode_session_id)
+            .context("OpenCode ACP session/new response is missing sessionId")?;
+        remember_opencode_session_id(sessions, runtime_session_id, &session_id)?;
+
+        Ok(session_id)
+    }
+
+    async fn configure_session(
+        &mut self,
+        config: &OpenCodeRuntimeConfig,
+        session_id: &str,
+    ) -> Result<()> {
+        if let Some(model) = config.model.as_deref() {
+            self.request(
+                "session/set_model",
+                json!({
+                    "sessionId": session_id,
+                    "modelId": model,
+                }),
+                None,
+            )
+            .await?;
+        }
+
+        if let Some(agent) = config.agent.as_deref() {
+            self.request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": "mode",
+                    "value": agent,
+                }),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn prompt(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        journal: &RuntimeTurnJournalSender,
+    ) -> Result<()> {
+        let response = self
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{
+                        "type": "text",
+                        "text": prompt,
+                    }],
+                }),
+                Some(journal),
+            )
+            .await?;
+        drop(journal.send(TurnEvent::with_raw(
+            RuntimeEvent::Done,
+            RawTurnPayload {
+                driver: OPENCODE_ACP_DRIVER.to_string(),
+                payload: response.raw,
+            },
+        )));
+        Ok(())
+    }
+
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        journal: Option<&RuntimeTurnJournalSender>,
+    ) -> Result<OpenCodeAcpResponse> {
+        let id = self.next_request_id();
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
+
+        loop {
+            let Some(message) = self.recv().await? else {
+                return Err(anyhow!("OpenCode ACP closed before responding to {method}"));
+            };
+            if opencode_acp_response_id(&message.value).is_some_and(|response_id| response_id == id)
+            {
+                return parse_opencode_acp_response(message, method);
+            }
+            self.dispatch_message(message, journal).await?;
+        }
+    }
+
+    async fn dispatch_message(
+        &mut self,
+        message: OpenCodeAcpMessage,
+        journal: Option<&RuntimeTurnJournalSender>,
+    ) -> Result<()> {
+        if opencode_acp_is_server_request(&message.value) {
+            self.respond_to_server_request(&message.value).await?;
+            return Ok(());
+        }
+
+        if let Some(journal) = journal {
+            for record in opencode_acp_turn_events(&message) {
+                drop(journal.send(record));
+            }
+        }
+        Ok(())
+    }
+
+    async fn respond_to_server_request(&mut self, request: &Value) -> Result<()> {
+        let id = request
+            .get("id")
+            .cloned()
+            .context("OpenCode ACP server request is missing id")?;
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "session/request_permission" => {
+                self.send(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": opencode_acp_permission_denial(request.get("params")),
+                }))
+                .await
+            }
+            "fs/read_text_file" | "fs/write_text_file" => {
+                self.send(&opencode_acp_error_response(
+                    id,
+                    -32000,
+                    "LionClaw disables OpenCode ACP filesystem access",
+                ))
+                .await
+            }
+            _ => {
+                self.send(&opencode_acp_error_response(
+                    id,
+                    -32601,
+                    &format!("LionClaw does not support OpenCode ACP request '{method}'"),
+                ))
+                .await
+            }
+        }
+    }
+
+    async fn send(&mut self, message: &Value) -> Result<()> {
+        let session = self
+            .session
+            .as_mut()
+            .context("OpenCode ACP session is already closed")?;
+        session.write_line(&serde_json::to_string(message)?).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<OpenCodeAcpMessage>> {
+        let session = self
+            .session
+            .as_mut()
+            .context("OpenCode ACP session is already closed")?;
+        loop {
+            let Some(line) = session.read_line().await? else {
+                return Ok(None);
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value = serde_json::from_str(trimmed)
+                .with_context(|| format!("invalid OpenCode ACP JSON-RPC line: {trimmed}"))?;
+            return Ok(Some(OpenCodeAcpMessage {
+                raw: trimmed.to_string(),
+                value,
+            }));
+        }
+    }
+
+    async fn shutdown(mut self) -> Result<ExecutionOutput> {
+        let Some(session) = self.session.take() else {
+            return Ok(ExecutionOutput::default());
+        };
+        session.shutdown().await
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+fn remember_opencode_session_id(
+    sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
+    runtime_session_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let runtime_state_root =
+        update_runtime_session_id(sessions, runtime_session_id, session_id.to_string())?;
+    if let Some(root) = runtime_state_root.as_deref() {
+        save_opencode_session_id(root, session_id)?;
+    }
+    Ok(())
+}
+
+fn opencode_acp_response_id(message: &Value) -> Option<u64> {
+    if message.get("result").is_none() && message.get("error").is_none() {
+        return None;
+    }
+    message.get("id").and_then(Value::as_u64)
+}
+
+fn opencode_acp_is_server_request(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str).is_some()
+        && message.get("id").is_some()
+        && message.get("result").is_none()
+        && message.get("error").is_none()
+}
+
+fn parse_opencode_acp_response(
+    message: OpenCodeAcpMessage,
+    method: &str,
+) -> Result<OpenCodeAcpResponse> {
+    if let Some(error) = message.value.get("error") {
+        return Err(anyhow!(
+            "OpenCode ACP {method} failed: {}",
+            opencode_acp_error_text(error)
+        ));
+    }
+    Ok(OpenCodeAcpResponse {
+        raw: message.raw,
+        result: message.value.get("result").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn opencode_acp_error_text(error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    match code {
+        Some(code) => format!("{code}: {message}"),
+        None => message.to_string(),
+    }
+}
+
+fn opencode_acp_error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+}
+
+fn opencode_acp_permission_denial(params: Option<&Value>) -> Value {
+    let reject_option = params
+        .and_then(|params| params.get("options"))
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options.iter().find_map(|option| {
+                let kind = option
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = option
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if kind.contains("reject")
+                    || kind.contains("deny")
+                    || name.to_ascii_lowercase().contains("reject")
+                    || name.to_ascii_lowercase().contains("deny")
+                {
+                    option
+                        .get("optionId")
+                        .or_else(|| option.get("id"))
+                        .and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+        });
+
+    match reject_option {
+        Some(option_id) => json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            },
+        }),
+        None => json!({
+            "outcome": {
+                "outcome": "cancelled",
+            },
+        }),
+    }
+}
+
+fn opencode_acp_turn_events(message: &OpenCodeAcpMessage) -> Vec<TurnEvent> {
+    if message.value.get("method").and_then(Value::as_str) != Some("session/update") {
+        return Vec::new();
+    }
+    let Some(update) = message
+        .value
+        .pointer("/params/update")
+        .or_else(|| message.value.get("params"))
+    else {
+        return Vec::new();
+    };
+    let Some(session_update) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+
+    let event = match session_update {
+        "agent_message_chunk" => opencode_acp_content_text(update.get("content")).map(|text| {
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text,
+            }
+        }),
+        "agent_thought_chunk" => opencode_acp_content_text(update.get("content")).map(|text| {
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text,
+            }
+        }),
+        "tool_call" | "tool_call_update" => {
+            opencode_acp_tool_status(update).map(|text| RuntimeEvent::Status { code: None, text })
+        }
+        _ => None,
+    };
+
+    event
+        .map(|event| {
+            vec![TurnEvent::with_raw(
+                event,
+                RawTurnPayload {
+                    driver: OPENCODE_ACP_DRIVER.to_string(),
+                    payload: message.raw.clone(),
+                },
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn opencode_acp_content_text(value: Option<&Value>) -> Option<String> {
+    let text = match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| opencode_acp_content_text(Some(item)))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(Value::Object(object)) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| opencode_acp_content_text(object.get("content")))
+            .or_else(|| opencode_acp_content_text(object.get("parts")))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+fn opencode_acp_tool_status(update: &Value) -> Option<String> {
+    let status = update
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| !status.trim().is_empty())
+        .unwrap_or("updated");
+    let title = update
+        .get("title")
+        .or_else(|| update.get("kind"))
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("tool");
+    Some(format!("opencode tool {status}: {title}"))
+}
+
+async fn finish_opencode_acp_session<R>(client: OpenCodeAcpClient, result: Result<R>) -> Result<R> {
+    let shutdown = client
+        .shutdown()
+        .await
+        .and_then(ensure_opencode_acp_exit_success);
+
+    match (result, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(shutdown_err)) => {
+            warn!(
+                error = %shutdown_err,
+                "OpenCode ACP shutdown failed after runtime error"
+            );
+            Err(err)
+        }
+    }
+}
+
+fn ensure_opencode_acp_exit_success(output: ExecutionOutput) -> Result<()> {
+    if output.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        return Err(anyhow!(
+            "OpenCode ACP exited with {}",
+            output.status_description()
+        ));
+    }
+    Err(anyhow!(
+        "OpenCode ACP exited with {}: {stderr}",
+        output.status_description()
+    ))
 }
 
 fn build_opencode_terminal_program(
@@ -937,67 +1410,6 @@ fn normalize_opencode_session_id(session_id: &str) -> Option<String> {
     Some(session_id.to_string())
 }
 
-struct OpenCodeProgramOutputParser {
-    sessions: Arc<RwLock<HashMap<String, OpenCodeSessionState>>>,
-    runtime_session_id: String,
-    observed_session_id: Option<String>,
-}
-
-impl RuntimeProgramOutputParser for OpenCodeProgramOutputParser {
-    fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Vec::new();
-        }
-
-        let Ok(json) = serde_json::from_str::<Value>(line) else {
-            return vec![RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: line.to_string(),
-            }];
-        };
-        self.remember_session_id(&json);
-        parse_opencode_json_event_value(&json)
-    }
-}
-
-impl OpenCodeProgramOutputParser {
-    fn remember_session_id(&mut self, json: &Value) {
-        let Some(session_id) = extract_opencode_session_id(json) else {
-            return;
-        };
-        if self.observed_session_id.as_deref() == Some(session_id.as_str()) {
-            return;
-        }
-
-        let runtime_state_root = match update_runtime_session_id(
-            &self.sessions,
-            &self.runtime_session_id,
-            session_id.clone(),
-        ) {
-            Ok(root) => root,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    runtime_session_id = %self.runtime_session_id,
-                    "failed to remember OpenCode session id"
-                );
-                return;
-            }
-        };
-        if let Some(root) = runtime_state_root.as_deref() {
-            if let Err(err) = save_opencode_session_id(root, &session_id) {
-                warn!(
-                    ?err,
-                    runtime_session_id = %self.runtime_session_id,
-                    "failed to persist OpenCode session id"
-                );
-            }
-        }
-        self.observed_session_id = Some(session_id);
-    }
-}
-
 fn update_runtime_session_id(
     sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
     runtime_session_id: &str,
@@ -1016,254 +1428,33 @@ fn update_runtime_session_id(
 }
 
 #[cfg(test)]
-fn parse_opencode_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
-    let output = String::from_utf8_lossy(stdout);
-    let mut events = Vec::new();
-
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        events.extend(parse_opencode_output_line(line));
-    }
-
-    events
-}
-
-fn parse_opencode_output_line(line: &str) -> Vec<RuntimeEvent> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Vec::new();
-    }
-
-    if let Ok(json) = serde_json::from_str::<Value>(line) {
-        parse_opencode_json_event_value(&json)
-    } else {
-        vec![RuntimeEvent::MessageDelta {
-            lane: RuntimeMessageLane::Answer,
-            text: line.to_string(),
-        }]
-    }
-}
-
-fn parse_opencode_json_event_value(json: &Value) -> Vec<RuntimeEvent> {
-    let mut events = Vec::new();
-    parse_opencode_json_event(&mut events, json);
-    events
-}
-
-fn extract_opencode_session_id(json: &Value) -> Option<String> {
-    json.get("sessionID")
-        .or_else(|| json.get("sessionId"))
-        .and_then(Value::as_str)
-        .and_then(normalize_opencode_session_id)
-}
-
-fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
-    if let Some(message) = extract_error_message(json) {
-        events.push(RuntimeEvent::Error {
-            code: Some("runtime.error".to_string()),
-            text: format!("opencode: {message}"),
-        });
-        return;
-    }
-
-    if let Some((lane, text)) = extract_text_delta(json) {
-        events.push(RuntimeEvent::MessageDelta { lane, text });
-        return;
-    }
-
-    if let Some(text) = describe_opencode_status(json) {
-        events.push(RuntimeEvent::Status { code: None, text });
-    }
-}
-
-fn extract_opencode_error_detail(stdout: &[u8]) -> Option<String> {
-    let output = String::from_utf8_lossy(stdout);
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let Ok(json) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(message) = extract_error_message(&json) {
-            return Some(message);
-        }
-    }
-    None
-}
-
-fn extract_error_message(json: &Value) -> Option<String> {
-    let event_type = json.get("type").and_then(Value::as_str).unwrap_or_default();
-    if !event_type.contains("error") {
-        return None;
-    }
-
-    for pointer in [
-        "/error/data/message",
-        "/error/message",
-        "/data/message",
-        "/message",
-        "/error",
-    ] {
-        if let Some(value) = json.pointer(pointer) {
-            match value {
-                Value::String(message) if !message.trim().is_empty() => {
-                    return Some(message.to_string())
-                }
-                Value::Object(object) => {
-                    if let Some(message) = object.get("message").and_then(Value::as_str) {
-                        if !message.trim().is_empty() {
-                            return Some(message.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Some("opencode error event".to_string())
-}
-
-fn extract_text_delta(json: &Value) -> Option<(RuntimeMessageLane, String)> {
-    let lane = if is_reasoning_event(json) {
-        RuntimeMessageLane::Reasoning
-    } else {
-        RuntimeMessageLane::Answer
-    };
-
-    for pointer in [
-        "/text",
-        "/part/text",
-        "/data/text",
-        "/message/text",
-        "/delta/text",
-    ] {
-        if let Some(text) = json.pointer(pointer).and_then(Value::as_str) {
-            if !text.trim().is_empty() {
-                return Some((lane, text.to_string()));
-            }
-        }
-    }
-
-    for pointer in [
-        "/content",
-        "/part/content",
-        "/data/content",
-        "/message/content",
-        "/parts",
-        "/message/parts",
-    ] {
-        if let Some(value) = json.pointer(pointer) {
-            let texts = collect_texts(value);
-            if !texts.is_empty() {
-                return Some((lane, texts.join("\n")));
-            }
-        }
-    }
-
-    None
-}
-
-fn is_reasoning_event(json: &Value) -> bool {
-    for pointer in ["/type", "/part/type", "/message/type", "/delta/type"] {
-        if let Some(event_type) = json.pointer(pointer).and_then(Value::as_str) {
-            if event_type == "reasoning" || event_type.contains("reasoning") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn describe_opencode_status(json: &Value) -> Option<String> {
-    let event_type = json.get("type").and_then(Value::as_str)?;
-    if matches!(
-        event_type,
-        "text"
-            | "reasoning"
-            | "response.output_text.delta"
-            | "response.reasoning.delta"
-            | "response.completed"
-    ) {
-        return None;
-    }
-
-    Some(format!("opencode event: {event_type}"))
-}
-
-fn collect_texts(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(text) => {
-            if text.trim().is_empty() {
-                Vec::new()
-            } else {
-                vec![text.to_string()]
-            }
-        }
-        Value::Array(items) => items.iter().flat_map(collect_texts).collect(),
-        Value::Object(object) => {
-            let mut out = Vec::new();
-
-            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    out.push(text.to_string());
-                }
-            }
-            if let Some(content) = object.get("content") {
-                out.extend(collect_texts(content));
-            }
-            if let Some(parts) = object.get("parts") {
-                out.extend(collect_texts(parts));
-            }
-            if let Some(delta) = object.get("delta") {
-                out.extend(collect_texts(delta));
-            }
-
-            out
-        }
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::{
         collections::VecDeque,
         future::pending,
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
         time::Duration,
     };
 
     use lionclaw_runtime_api::{
-        ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent, RuntimeExecutionContext,
-        RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurnStatus, RuntimeTurnInput,
-        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeEvent,
+        RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
+        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
+        RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
+        RuntimeTerminalTranscriptInput, RuntimeTerminalTranscriptProgramExecutor,
+        RuntimeTerminalTurnStatus, RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
-        opencode_runtime_environment, opencode_terminal_environment, parse_opencode_session_list,
-        parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        OPENCODE_SESSION_ID_STATE_FILE,
+        opencode_acp_permission_denial, opencode_acp_turn_events, opencode_runtime_environment,
+        opencode_terminal_environment, parse_opencode_session_list, OpenCodeAcpMessage,
+        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, OPENCODE_SESSION_ID_STATE_FILE,
     };
     use chrono::{DateTime, TimeZone, Utc};
+    use serde::Deserialize;
     use serde_json::{json, Value};
     use uuid::Uuid;
-
-    fn execution_context() -> RuntimeExecutionContext {
-        RuntimeExecutionContext {
-            network_mode: NetworkMode::On,
-            environment: Vec::new(),
-            runtime_state_root: None,
-            runtime_path_projections: Vec::new(),
-        }
-    }
 
     fn runtime_not_ready() -> RuntimeSessionReady {
         RuntimeSessionReady::not_ready()
@@ -1342,6 +1533,83 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Deserialize)]
+    struct OpenCodeAcpFixture {
+        raw_in: Vec<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeAcpProgramState {
+        sent: Vec<Value>,
+    }
+
+    #[derive(Debug)]
+    struct FakeAcpProgramExecutor {
+        inbound: VecDeque<String>,
+        state: Arc<Mutex<FakeAcpProgramState>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeProgramExecutor for FakeAcpProgramExecutor {
+        async fn execute_streaming(
+            &mut self,
+            _program: RuntimeProgramSpec,
+            _stdout: RuntimeProgramStdoutSender,
+        ) -> anyhow::Result<ExecutionOutput> {
+            unreachable!("OpenCode ACP driver should spawn an interactive program")
+        }
+
+        async fn execute_captured(
+            &mut self,
+            _program: RuntimeProgramSpec,
+        ) -> anyhow::Result<ExecutionOutput> {
+            unreachable!("OpenCode ACP driver should spawn an interactive program")
+        }
+
+        async fn spawn(
+            &mut self,
+            program: RuntimeProgramSpec,
+        ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
+            assert_eq!(program.executable, "opencode");
+            assert_eq!(program.args, vec!["acp".to_string()]);
+            assert_eq!(program.environment, opencode_runtime_environment());
+            assert!(program.stdin.is_empty());
+            assert!(program.auth.is_none());
+            Ok(Box::new(FakeAcpProgramSession {
+                inbound: std::mem::take(&mut self.inbound),
+                output: ExecutionOutput {
+                    exit_code: Some(0),
+                    ..ExecutionOutput::default()
+                },
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeAcpProgramSession {
+        inbound: VecDeque<String>,
+        output: ExecutionOutput,
+        state: Arc<Mutex<FakeAcpProgramState>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeProgramSession for FakeAcpProgramSession {
+        async fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+            let value = serde_json::from_str::<Value>(line).expect("driver writes JSON-RPC");
+            self.state.lock().expect("fake ACP state").sent.push(value);
+            Ok(())
+        }
+
+        async fn read_line(&mut self) -> anyhow::Result<Option<String>> {
+            Ok(self.inbound.pop_front())
+        }
+
+        async fn shutdown(self: Box<Self>) -> anyhow::Result<ExecutionOutput> {
+            Ok(self.output)
+        }
+    }
+
     fn json_output(value: serde_json::Value) -> ExecutionOutput {
         ExecutionOutput {
             stdout: value.to_string().into_bytes(),
@@ -1366,6 +1634,38 @@ mod tests {
 
     fn opencode_test_precise_timestamp(seconds: i64, nanos: u32) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(seconds, nanos).expect("valid test timestamp")
+    }
+
+    fn opencode_acp_fixture() -> OpenCodeAcpFixture {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/opencode_acp_success_1_17_9.json"
+        ))
+        .expect("OpenCode ACP fixture JSON")
+    }
+
+    fn project_opencode_acp_fixture_events() -> Vec<RuntimeEvent> {
+        opencode_acp_fixture()
+            .raw_in
+            .iter()
+            .flat_map(|raw| {
+                let value = serde_json::from_str(raw).expect("fixture raw JSON-RPC line");
+                let message = OpenCodeAcpMessage {
+                    raw: raw.clone(),
+                    value,
+                };
+                opencode_acp_turn_events(&message)
+            })
+            .map(|record| record.event)
+            .collect()
+    }
+
+    fn opencode_acp_driver_context(runtime_state_root: PathBuf) -> RuntimeExecutionContext {
+        RuntimeExecutionContext {
+            network_mode: NetworkMode::On,
+            environment: Vec::new(),
+            runtime_state_root: Some(runtime_state_root),
+            runtime_path_projections: Vec::new(),
+        }
     }
 
     fn opencode_transcript_input(runtime_state_root: PathBuf) -> RuntimeTerminalTranscriptInput {
@@ -1548,64 +1848,81 @@ mod tests {
         part
     }
 
-    #[tokio::test]
-    async fn opencode_adapter_builds_program_spec_for_registered_session() {
-        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
-            executable: "opencode".to_string(),
-            model: Some("gpt-5".to_string()),
-            agent: Some("builder".to_string()),
-        });
-        assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
+    #[test]
+    fn opencode_acp_fixture_projects_to_canonical_runtime_events() {
+        let events = project_opencode_acp_fixture_events();
 
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: None,
-                runtime_session_ready: runtime_not_ready(),
-            })
-            .await
-            .expect("start");
-
-        let program = adapter
-            .build_turn_program(
-                &RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id,
-                    prompt: "hello".to_string(),
-                    fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
-                },
-                &execution_context(),
-            )
-            .expect("program");
-
-        assert_eq!(program.executable, "opencode");
         assert_eq!(
-            program.args,
+            events,
             vec![
-                "run".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--thinking".to_string(),
-                "--model".to_string(),
-                "gpt-5".to_string(),
-                "--agent".to_string(),
-                "builder".to_string(),
-                "hello".to_string(),
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: "The".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " user".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " is".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " asking".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " me".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " to".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " reply".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " with".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " exactly".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: " \"".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: "OK".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: "\".".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "OK".to_string(),
+                },
             ]
         );
-        assert_eq!(program.environment, opencode_runtime_environment());
-        assert!(program.stdin.is_empty());
     }
 
     #[tokio::test]
-    async fn opencode_program_output_parser_remembers_session_id() {
+    async fn opencode_program_backed_turn_uses_acp_driver_journal() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig::default());
+        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
+            executable: "opencode".to_string(),
+            model: Some("gpt-5".to_string()),
+            agent: Some("plan".to_string()),
+        });
+        assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
+
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -1617,43 +1934,102 @@ mod tests {
             })
             .await
             .expect("start");
-        let input = RuntimeTurnInput {
-            runtime_session_id: handle.runtime_session_id.clone(),
-            prompt: "next".to_string(),
-            fresh_prompt: None,
-            runtime_skill_ids: Vec::new(),
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[]}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_1","content":{"type":"text","text":"thinking"}}}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"answer"}}}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+            ]),
+            state: Arc::clone(&fake_state),
         };
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut parser = adapter.program_output_parser(&input).expect("parser");
-        let events =
-            parser.parse_line(r#"{"type":"text","sessionID":"ses_program","text":"hello"}"#);
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id.clone(),
+                        prompt: "hello".to_string(),
+                        fresh_prompt: None,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context: opencode_acp_driver_context(runtime_state_root.clone()),
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP turn");
 
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
-        ));
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: "thinking".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "answer".to_string(),
+                },
+                RuntimeEvent::Done,
+            ]
+        );
+        assert!(journal.iter().all(|record| record.raw.is_some()));
         assert_eq!(
             std::fs::read_to_string(runtime_state_root.join(OPENCODE_SESSION_ID_STATE_FILE))
                 .expect("saved session id"),
             "ses_program\n"
         );
-
-        let program = adapter
-            .build_turn_program(&input, &execution_context())
-            .expect("program");
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
         assert_eq!(
-            program.args,
+            sent.iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
             vec![
-                "run".to_string(),
-                "--session".to_string(),
-                "ses_program".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--thinking".to_string(),
-                "next".to_string(),
+                "initialize",
+                "session/new",
+                "session/set_model",
+                "session/set_config_option",
+                "session/prompt",
             ]
         );
-        assert_eq!(program.environment, opencode_runtime_environment());
+        assert_eq!(sent[2]["params"]["modelId"], json!("gpt-5"));
+        assert_eq!(sent[3]["params"]["configId"], json!("mode"));
+        assert_eq!(sent[3]["params"]["value"], json!("plan"));
+    }
+
+    #[test]
+    fn opencode_acp_permission_requests_are_denied_by_default() {
+        let response = opencode_acp_permission_denial(Some(&json!({
+            "options": [
+                { "optionId": "once", "kind": "allow_once", "name": "Allow once" },
+                { "optionId": "reject", "kind": "reject_once", "name": "Reject" }
+            ]
+        })));
+
+        assert_eq!(
+            response,
+            json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "reject"
+                }
+            })
+        );
+        assert_eq!(
+            opencode_acp_permission_denial(Some(&json!({ "options": [] }))),
+            json!({ "outcome": { "outcome": "cancelled" } })
+        );
     }
 
     #[tokio::test]
@@ -1681,31 +2057,6 @@ mod tests {
             .await
             .expect("start");
         assert!(handle.resumes_existing_session);
-        let program = adapter
-            .build_turn_program(
-                &RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id,
-                    prompt: "hello".to_string(),
-                    fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
-                },
-                &execution_context(),
-            )
-            .expect("program");
-
-        assert_eq!(
-            program.args,
-            vec![
-                "run".to_string(),
-                "--session".to_string(),
-                "ses_ready".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--thinking".to_string(),
-                "hello".to_string(),
-            ]
-        );
-        assert_eq!(program.environment, opencode_runtime_environment());
     }
 
     #[test]
@@ -2671,91 +3022,6 @@ mod tests {
         assert!(
             message.contains("listing OpenCode sessions through the OpenCode CLI"),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn opencode_adapter_formats_structured_error_message() {
-        let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
-            executable: "opencode".to_string(),
-            ..OpenCodeRuntimeConfig::default()
-        });
-        let message = adapter.format_program_exit_error(
-            &ExecutionOutput {
-                stdout: br#"{"type":"error","error":{"name":"UnknownError","data":{"message":"provider unavailable"}}}"#
-                    .to_vec(),
-                exit_code: Some(7),
-                ..ExecutionOutput::default()
-            },
-            None,
-        );
-
-        assert!(
-            message.contains("provider unavailable"),
-            "structured error detail should be surfaced"
-        );
-    }
-
-    #[test]
-    fn opencode_stdout_falls_back_to_plain_text_when_json_is_invalid() {
-        let events = parse_opencode_stdout(b"plain line\n");
-        assert_eq!(events.len(), 1, "expected one parsed event");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "plain line"
-        ));
-    }
-
-    #[test]
-    fn opencode_stdout_parses_json_text_delta() {
-        let events =
-            parse_opencode_stdout(br#"{"type":"response.output_text.delta","text":"hello"}"#);
-
-        assert_eq!(events.len(), 1, "expected one answer delta");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
-        ));
-    }
-
-    #[test]
-    fn opencode_stdout_parses_reasoning_lane_without_status_spam() {
-        let events = parse_opencode_stdout(br#"{"type":"reasoning","text":"planning next step"}"#);
-
-        assert_eq!(events.len(), 1, "expected one reasoning delta");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "planning next step"
-        ));
-    }
-
-    #[test]
-    fn opencode_run_args_resume_linked_session() {
-        let args = super::build_opencode_run_args(
-            &OpenCodeRuntimeConfig {
-                executable: "opencode".to_string(),
-                model: Some("gpt-5".to_string()),
-                agent: Some("builder".to_string()),
-            },
-            "hello",
-            Some("ses_saved"),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "run".to_string(),
-                "--session".to_string(),
-                "ses_saved".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-                "--thinking".to_string(),
-                "--model".to_string(),
-                "gpt-5".to_string(),
-                "--agent".to_string(),
-                "builder".to_string(),
-                "hello".to_string(),
-            ]
         );
     }
 }
