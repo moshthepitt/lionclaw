@@ -612,12 +612,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     fn build_terminal_program(
         &self,
-        input: RuntimeTerminalProgramInput,
+        _input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
-        Ok(build_codex_terminal_program(
-            &self.config,
-            load_ready_saved_thread_id(&input.runtime_state_root, input.runtime_session_ready)?,
-        ))
+        Ok(build_codex_terminal_program(&self.config))
     }
 
     async fn runtime_control(
@@ -703,10 +700,7 @@ fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgram
     }
 }
 
-fn build_codex_terminal_program(
-    config: &CodexRuntimeConfig,
-    thread_id: Option<String>,
-) -> RuntimeProgramSpec {
+fn build_codex_terminal_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
     let mut args = vec![
         "--sandbox".to_string(),
         "danger-full-access".to_string(),
@@ -717,10 +711,6 @@ fn build_codex_terminal_program(
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.clone());
-    }
-    if let Some(thread_id) = thread_id {
-        args.push("resume".to_string());
-        args.push(thread_id);
     }
 
     RuntimeProgramSpec {
@@ -2727,13 +2717,10 @@ mod tests {
 
     #[test]
     fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
-        let program = build_codex_terminal_program(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
-            },
-            None,
-        );
+        let program = build_codex_terminal_program(&CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+        });
 
         assert_eq!(program.executable, "codex");
         assert_eq!(
@@ -2759,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_terminal_program_resumes_saved_thread_after_global_options() {
+    fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -2769,12 +2756,10 @@ mod tests {
             executable: "codex".to_string(),
             model: Some("gpt-5.5".to_string()),
         });
-        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready,
             })
             .expect("terminal program");
 
@@ -2793,28 +2778,8 @@ mod tests {
                 "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
                 "--model".to_string(),
                 "gpt-5.5".to_string(),
-                "resume".to_string(),
-                "thr_saved".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn codex_terminal_program_ignores_saved_thread_without_ready_marker() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
-
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let program = adapter
-            .build_terminal_program(RuntimeTerminalProgramInput {
-                session_id: Uuid::new_v4(),
-                runtime_state_root,
-                runtime_session_ready: runtime_not_ready(),
-            })
-            .expect("terminal program");
-
         assert!(!program.args.iter().any(|arg| arg == "resume"));
         assert!(!program.args.iter().any(|arg| arg == "thr_saved"));
     }

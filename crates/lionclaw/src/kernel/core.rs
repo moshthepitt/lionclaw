@@ -1089,14 +1089,10 @@ impl Kernel {
             .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
-        let runtime_session_ready =
-            RuntimeSessionReady::from_runtime_state_root(&runtime_state_root)
-                .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id,
                 runtime_state_root,
-                runtime_session_ready,
             })
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;

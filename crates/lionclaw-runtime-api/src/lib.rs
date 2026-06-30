@@ -347,7 +347,6 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
-    pub runtime_session_ready: RuntimeSessionReady,
 }
 
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
@@ -1061,48 +1060,20 @@ pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeE
 pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
-pub const RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER: &str = "{session_id}";
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RuntimeTerminalConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resume_args: Vec<String>,
 }
 
 impl RuntimeTerminalConfig {
     pub fn is_empty(&self) -> bool {
-        self.args.is_empty() && self.resume_args.is_empty()
+        self.args.is_empty()
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !self.resume_args.is_empty()
-            && !self
-                .resume_args
-                .iter()
-                .any(|arg| arg.contains(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER))
-        {
-            return Err(anyhow!(
-                "runtime terminal resume args must include '{RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER}'"
-            ));
-        }
         Ok(())
-    }
-
-    pub fn rendered_resume_args(&self, session_id: &str) -> Result<Vec<String>> {
-        if self.resume_args.is_empty() {
-            return Err(anyhow!(
-                "runtime terminal profile cannot resume saved session without resume args"
-            ));
-        }
-        self.validate()?;
-        Ok(self
-            .resume_args
-            .iter()
-            .map(|arg| arg.replace(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER, session_id))
-            .collect())
     }
 }
 

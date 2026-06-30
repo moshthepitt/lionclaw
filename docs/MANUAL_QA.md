@@ -177,16 +177,17 @@ Expected:
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
 - ACP profiles such as OpenCode launch the profile command as the native UI
-  without ACP protocol args; when the profile declares `terminal.resume-args`,
-  saved ready ACP sessions resume through those args
+  without ACP protocol args or LionClaw saved-session resume args
 - native UI turns are not inserted into LionClaw session history and are not
   available to later `lionclaw run`, `run --plain`, or channel context
-- opening and exiting the native UI does not prime, clear, or otherwise change
-  later program-backed continuation state
+- opening and exiting the native UI does not prime, clear, consume, or otherwise
+  change later program-backed continuation state
 - relaunching the native UI does not run prelaunch recovery work
 - interactive `run` and `run --runtime-tui` resume the latest LionClaw session
-  by default; `--new-session` starts fresh LionClaw control state while keeping
-  runtime-native config and history under `/runtime/home`
+  by default; `run --runtime-tui` still starts the runtime's native UI without
+  consuming driven runtime-session readiness, and `--new-session` starts fresh
+  LionClaw control state while keeping runtime-native config and history under
+  `/runtime/home`
 - a second `run --runtime-tui` targeting the same active native UI reports a
   conflict instead of attaching to the same runtime state concurrently
 

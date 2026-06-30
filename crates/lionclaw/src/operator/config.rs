@@ -632,11 +632,6 @@ fn normalize_runtime_terminal_config(config: &mut RuntimeTerminalConfig) {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect();
-    config.resume_args = std::mem::take(&mut config.resume_args)
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect();
 }
 
 #[allow(
@@ -884,7 +879,6 @@ mod tests {
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, RuntimeAuthContext, RuntimeTerminalConfig, WorkspaceAccess,
-        RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER,
     };
 
     fn runtime_profile(
@@ -942,30 +936,6 @@ executable = "opencode"
         assert!(message.contains("pre-#159 config format"), "{message}");
         assert!(message.contains("kind/executable"), "{message}");
         assert!(message.contains("driver/command"), "{message}");
-    }
-
-    #[test]
-    fn runtime_terminal_resume_args_must_reference_session_id() {
-        let mut profile = RuntimeProfileConfig::new("acp", "opencode", sample_confinement());
-        profile.terminal = RuntimeTerminalConfig {
-            args: Vec::new(),
-            resume_args: vec!["--continue".to_string()],
-        };
-
-        let err = profile
-            .validate()
-            .expect_err("resume args without session id placeholder should fail");
-        assert!(
-            err.to_string()
-                .contains(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER),
-            "{err}"
-        );
-
-        profile.terminal.resume_args = vec![
-            "--session".to_string(),
-            RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
-        ];
-        profile.validate().expect("valid terminal resume args");
     }
 
     #[tokio::test]
@@ -1244,11 +1214,7 @@ executable = "opencode"
         let left = RuntimeProfileConfig::new("acp", "opencode", sample_confinement());
         let mut right = left.clone();
         right.terminal = RuntimeTerminalConfig {
-            args: Vec::new(),
-            resume_args: vec![
-                "--session".to_string(),
-                RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
-            ],
+            args: vec!["--native".to_string()],
         };
 
         assert_eq!(left.compatibility_key(), right.compatibility_key());
@@ -1285,11 +1251,7 @@ executable = "opencode"
         let left_runtime = RuntimeProfileConfig::new("acp", "opencode", sample_confinement());
         let mut right_runtime = left_runtime.clone();
         right_runtime.terminal = RuntimeTerminalConfig {
-            args: Vec::new(),
-            resume_args: vec![
-                "--session".to_string(),
-                RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
-            ],
+            args: vec!["--native".to_string()],
         };
         let mut left = OperatorConfig::default();
         left.upsert_runtime("opencode".to_string(), left_runtime);
