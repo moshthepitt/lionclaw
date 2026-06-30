@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use lionclaw_runtime_api::{RawTurnPayload, RuntimeEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
@@ -206,6 +207,28 @@ pub struct SessionHistoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHistoryResponse {
     pub turns: Vec<SessionTurnView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnJournalRequest {
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    #[serde(default)]
+    pub include_raw: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTurnJournalEventView {
+    pub event: RuntimeEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawTurnPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnJournalResponse {
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    pub events: Vec<SessionTurnJournalEventView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

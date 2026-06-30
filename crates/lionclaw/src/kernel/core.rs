@@ -62,9 +62,10 @@ use crate::contracts::{
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
     SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
-    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
-    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
-    StreamEventKindDto, StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
+    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnJournalEventView,
+    SessionTurnJournalRequest, SessionTurnJournalResponse, SessionTurnKind, SessionTurnRequest,
+    SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto, StreamEventKindDto,
+    StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
@@ -2324,6 +2325,39 @@ impl Kernel {
             .map_err(internal)?;
 
         Ok(SessionHistoryResponse { turns })
+    }
+
+    pub async fn session_turn_journal(
+        &self,
+        req: SessionTurnJournalRequest,
+    ) -> Result<SessionTurnJournalResponse, KernelError> {
+        let session = self.get_scoped_session(req.session_id).await?;
+        let turn = self
+            .session_turns
+            .get(req.turn_id)
+            .await
+            .map_err(internal)?
+            .filter(|turn| turn.session_id == session.session_id)
+            .ok_or_else(|| KernelError::NotFound("session turn not found".to_string()))?;
+
+        let include_raw = req.include_raw && self.retain_runtime_raw_turn_payloads;
+        let events = self
+            .session_turns
+            .list_journal_events(turn.turn_id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|record| SessionTurnJournalEventView {
+                event: record.event,
+                raw: if include_raw { record.raw } else { None },
+            })
+            .collect::<Vec<_>>();
+
+        Ok(SessionTurnJournalResponse {
+            session_id: session.session_id,
+            turn_id: turn.turn_id,
+            events,
+        })
     }
 
     pub async fn find_latest_session_summary(
@@ -8660,7 +8694,18 @@ mod tests {
             .await
     }
 
-    async fn execute_raw_journal_runtime_turn(retain_raw: bool) -> Vec<TurnEvent> {
+    struct RawJournalExecution {
+        _temp_dir: TempDir,
+        kernel: Kernel,
+        session_id: Uuid,
+        turn_id: Uuid,
+        journal: SessionTurnJournalResponse,
+    }
+
+    async fn execute_raw_journal_runtime_turn(
+        retain_raw: bool,
+        include_raw: bool,
+    ) -> RawJournalExecution {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
@@ -8716,11 +8761,21 @@ mod tests {
 
         assert_eq!(response.status, SessionTurnStatus::Completed);
         assert_eq!(response.assistant_text, "raw-backed answer");
-        kernel
-            .session_turns
-            .list_journal_events(turn_id)
+        let journal = kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw,
+            })
             .await
-            .expect("list runtime journal")
+            .expect("list runtime journal");
+        RawJournalExecution {
+            _temp_dir: temp_dir,
+            kernel,
+            session_id,
+            turn_id,
+            journal,
+        }
     }
 
     async fn open_test_session(kernel: &Kernel) -> Uuid {
@@ -10241,36 +10296,84 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_turn_journal_strips_raw_payloads_unless_debug_retention_enabled() {
-        let default_journal = execute_raw_journal_runtime_turn(false).await;
-        assert_eq!(default_journal.len(), 2);
-        assert!(default_journal.iter().all(|record| record.raw.is_none()));
+        let default_journal = execute_raw_journal_runtime_turn(false, true).await.journal;
+        assert_eq!(default_journal.events.len(), 2);
+        assert!(default_journal
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
 
-        let retained_journal = execute_raw_journal_runtime_turn(true).await;
+        let retained_journal_without_raw =
+            execute_raw_journal_runtime_turn(true, false).await.journal;
+        assert_eq!(retained_journal_without_raw.events.len(), 2);
+        assert!(retained_journal_without_raw
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
+
+        let retained_journal = execute_raw_journal_runtime_turn(true, true).await.journal;
         assert_eq!(
             default_journal
+                .events
                 .iter()
                 .map(|record| record.event.clone())
                 .collect::<Vec<_>>(),
             retained_journal
+                .events
                 .iter()
                 .map(|record| record.event.clone())
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            retained_journal[0]
+            retained_journal.events[0]
                 .raw
                 .as_ref()
                 .map(|raw| raw.driver.as_str()),
             Some("test-driver")
         );
         assert_eq!(
-            retained_journal[0]
+            retained_journal.events[0]
                 .raw
                 .as_ref()
                 .map(|raw| raw.payload.as_str()),
             Some("{\"secret\":\"debug-only\"}")
         );
-        assert!(retained_journal[1].raw.is_none());
+        assert!(retained_journal.events[1].raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_requires_owning_session() {
+        let execution = execute_raw_journal_runtime_turn(true, true).await;
+        let other_session = open_prompt_context_session(
+            &execution.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let err = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: other_session.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect_err("other session should not read this journal");
+        assert!(
+            matches!(err, KernelError::NotFound(message) if message == "session turn not found")
+        );
+
+        let own_journal = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: execution.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect("owning session can read journal");
+        assert_eq!(own_journal.events, execution.journal.events);
     }
 
     #[tokio::test]
@@ -10331,11 +10434,15 @@ mod tests {
 
         assert_eq!(response.status, SessionTurnStatus::TimedOut);
         let journal = kernel
-            .session_turns
-            .list_journal_events(turn_id)
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw: true,
+            })
             .await
             .expect("list timeout journal");
         let events = journal
+            .events
             .into_iter()
             .map(|record| record.event)
             .collect::<Vec<_>>();

@@ -152,12 +152,13 @@ Codex's app-server driver and the ACP driver own their protocol handshakes,
 permission replies, runtime session continuity updates, and JSON-RPC loops.
 Their shared output is a turn journal of `TurnEvent` records: one canonical
 `RuntimeEvent` paired with an optional raw protocol payload retained only for
-debugging. Kernel routing and prompt reconstruction project the journal through
-`canonical_events`, so raw payloads are never replayed into prompts or used to
-build canonical assistant text.
-The persisted journal is currently a kernel-owned debug/audit record of the
-driver translation, not the production transcript reader for prompt history;
-canonical session turn state remains the source for user-visible history.
+debugging. Kernel live routing projects the journal through `canonical_events`,
+so raw payloads are never streamed to operators, replayed into prompts, or used
+to build canonical assistant text.
+The persisted journal is a kernel-owned debug/audit record of the driver
+translation, readable through the scoped session-turn journal API. It is not the
+production transcript reader for prompt history; canonical session turn state
+remains the source for user-visible history and prompt reconstruction.
 
 Runtime context may include host projections for runtime-visible paths. A
 directory projection maps a runtime tree such as `/runtime` to the runtime state

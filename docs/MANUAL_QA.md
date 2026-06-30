@@ -148,6 +148,10 @@ Expected:
 
 - piped non-TTY usage avoids the console
 - `--plain` uses the line-oriented prompt even on a TTY
+- the debug-only session-turn journal API can read the completed turn's
+  canonical journal by `session_id` and `turn_id`; raw payloads are omitted
+  unless the request opts in and the kernel is running with raw runtime payload
+  retention enabled
 
 Check the selected runtime's native terminal UI:
 
