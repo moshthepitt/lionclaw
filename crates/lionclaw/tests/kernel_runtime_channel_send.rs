@@ -624,6 +624,88 @@ async fn mcp_channel_send_audits_invalid_tool_arguments_without_outbox_delivery(
 }
 
 #[tokio::test]
+async fn mcp_channel_send_rejects_invalid_json_rpc_id_without_outbox_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-bad-id").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let invalid = json!({
+        "jsonrpc": "2.0",
+        "id": {"not": "valid"},
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "this should not enqueue"
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![invalid],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-bad-id").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send malformed MCP request id".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert!(responses[0]["id"].is_null());
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32600));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("request id")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(outbox.deliveries.is_empty());
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("invalid_json_rpc")
+            && event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
+}
+
+#[tokio::test]
 async fn program_backed_runtime_channel_send_rejects_arbitrary_runtime_home_attachment() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-home").await;

@@ -17939,7 +17939,21 @@ async fn runtime_channel_send_mcp_response(
     context: &RuntimeChannelSendContext,
     request: Value,
 ) -> Option<Value> {
-    let id = request.get("id").cloned();
+    let id = match runtime_channel_send_json_rpc_request_id(&request) {
+        Ok(id) => id,
+        Err(problem) => {
+            return Some(
+                runtime_channel_send_mcp_denied_response(
+                    kernel,
+                    context,
+                    Value::Null,
+                    -32600,
+                    problem,
+                )
+                .await,
+            );
+        }
+    };
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         let problem = RuntimeChannelSendProblem::new(
             "invalid_json_rpc",
@@ -18021,6 +18035,22 @@ async fn runtime_channel_send_mcp_response(
             )
             .await,
         ),
+    }
+}
+
+fn runtime_channel_send_json_rpc_request_id(
+    request: &Value,
+) -> Result<Option<Value>, RuntimeChannelSendProblem> {
+    let Some(id) = request.get("id") else {
+        return Ok(None);
+    };
+    if matches!(id, Value::String(_) | Value::Number(_) | Value::Null) {
+        Ok(Some(id.clone()))
+    } else {
+        Err(RuntimeChannelSendProblem::new(
+            "invalid_json_rpc",
+            "MCP request id must be a string, number, or null",
+        ))
     }
 }
 
