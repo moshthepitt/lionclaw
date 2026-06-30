@@ -18528,10 +18528,6 @@ fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendPr
     }
 }
 
-fn runtime_channel_send_internal_problem(err: anyhow::Error) -> RuntimeChannelSendProblem {
-    RuntimeChannelSendProblem::new("internal_error", err.to_string())
-}
-
 fn runtime_channel_send_bridge_closed_problem() -> RuntimeChannelSendProblem {
     RuntimeChannelSendProblem::new(
         "bridge_closed",
@@ -23007,6 +23003,32 @@ impl Kernel {
             .await
             .map_err(E::from)?;
 
+        if request.idempotent {
+            if let Some(source_fingerprint) = request.source_fingerprint.as_deref() {
+                if let Some(existing) = self
+                    .channel_outbox
+                    .get_delivery_by_source(request.source_kind, &request.source_id)
+                    .await
+                    .map_err(internal)
+                    .map_err(E::from)?
+                {
+                    if existing.source_fingerprint.as_deref() == Some(source_fingerprint) {
+                        return Ok(BrokerChannelSendAccepted {
+                            delivery_id: existing.delivery_id,
+                            channel_id: intent.channel_id,
+                            conversation_ref: intent.conversation_ref,
+                            thread_ref: intent.thread_ref,
+                            reply_to_ref: intent.reply_to_ref,
+                            idempotent: true,
+                        });
+                    }
+                    return Err(E::from(KernelError::Conflict(
+                        "idempotency key was reused with a different payload".to_string(),
+                    )));
+                }
+            }
+        }
+
         let BrokerChannelSendContent {
             delivery: content,
             mut prepared_attachments,
@@ -23191,46 +23213,7 @@ impl Kernel {
             "{}:{}:{idempotency_key}",
             context.session_id, context.turn_id
         );
-        if let Some(existing) = self
-            .channel_outbox
-            .get_delivery_by_source(RUNTIME_CHANNEL_SEND_SOURCE_KIND, &source_id)
-            .await
-            .map_err(runtime_channel_send_internal_problem)?
-        {
-            if existing.source_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": existing.delivery_id,
-                        "idempotent": true,
-                    }),
-                )
-                .await;
-                return Ok(RuntimeChannelSendAccepted {
-                    delivery_id: existing.delivery_id,
-                });
-            }
-            self.audit_runtime_channel_send(
-                "runtime.channel_send.conflict",
-                &context,
-                json!({
-                    "channel_id": channel_id,
-                    "conversation_ref": conversation_ref,
-                    "delivery_id": existing.delivery_id,
-                }),
-            )
-            .await;
-            return Err(RuntimeChannelSendProblem::new(
-                "conflict",
-                "idempotency key was reused with a different payload",
-            ));
-        }
 
-        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
-            .await?;
         let broker_payload = runtime_channel_send_broker_payload(&request, &content);
         let runtime_context = context.clone();
         let runtime_content = content.clone();

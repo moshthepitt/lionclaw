@@ -1248,11 +1248,25 @@ async fn channel_send_bridge_is_idempotent_for_same_payload_and_conflicts_on_cha
             "format_hint": "plain"
         }
     });
+    let unprojected_request = json!({
+        "idempotency_key": "retryable-call",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:intruder",
+        "content": {
+            "text": "different payload",
+            "format_hint": "plain"
+        }
+    });
     kernel
         .register_runtime_adapter(
             "channel-send-runtime",
             Arc::new(ChannelSendProbeRuntime::send_requests(
-                vec![base_request.clone(), base_request, changed_request],
+                vec![
+                    base_request.clone(),
+                    base_request,
+                    changed_request,
+                    unprojected_request,
+                ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
                 ProbeFileSetup::None,
@@ -1274,12 +1288,17 @@ async fn channel_send_bridge_is_idempotent_for_same_payload_and_conflicts_on_cha
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    assert_eq!(responses.len(), 3);
+    assert_eq!(responses.len(), 4);
     assert_eq!(responses[0]["ok"].as_bool(), Some(true));
     assert_eq!(responses[1]["ok"].as_bool(), Some(true));
     assert_eq!(responses[0]["delivery_id"], responses[1]["delivery_id"]);
     assert_eq!(responses[2]["ok"].as_bool(), Some(false));
     assert_eq!(responses[2]["error"]["code"].as_str(), Some("conflict"));
+    assert_eq!(responses[3]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[3]["error"]["code"].as_str(),
+        Some("route_not_allowed")
+    );
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
