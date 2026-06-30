@@ -13054,6 +13054,9 @@ done
             .expect("read generated attached context");
 
         assert!(generated.contains("## Native Runtime TUI Session"));
+        assert!(generated.contains("Native UI turns remain runtime-owned"));
+        assert!(generated.contains("prior LionClaw-managed transcript/history"));
+        assert!(!generated.contains("stores completed native UI turns"));
         assert!(!generated.contains("outside context"));
         for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
             assert_eq!(
@@ -24291,7 +24294,7 @@ impl Kernel {
                 "Continue the existing runtime conversation for this LionClaw session. LionClaw keeps the canonical transcript separately, so prior turns may not be replayed in full on every request.".to_string()
             }
             ContextItemId::NativeTuiSessionNote => {
-                "You are running in the selected runtime's native terminal UI through LionClaw. Treat prompts typed here as part of this LionClaw session. LionClaw stores completed native UI turns after they are written to the runtime's durable transcript, so use the prior turns below for continuity when relevant.".to_string()
+                "You are running in the selected runtime's native terminal UI through LionClaw. LionClaw prepared the boundary, context, and launch audit for this session. Native UI turns remain runtime-owned and are not imported into LionClaw history. LionClaw may include prior LionClaw-managed transcript/history below; use that context when relevant.".to_string()
             }
             ContextItemId::DraftOutputsNote => {
                 if !execution_plan
