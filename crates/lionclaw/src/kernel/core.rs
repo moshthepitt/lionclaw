@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt,
+    future::Future,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
     str::FromStr,
@@ -557,7 +558,6 @@ struct BrokerChannelSendRequest {
     source_kind: &'static str,
     source_id: String,
     source_fingerprint: Option<String>,
-    content: Option<BrokerChannelSendContent>,
     idempotent: bool,
 }
 
@@ -587,6 +587,12 @@ impl RuntimeChannelSendProblem {
             code,
             message: message.into(),
         }
+    }
+}
+
+impl From<KernelError> for RuntimeChannelSendProblem {
+    fn from(err: KernelError) -> Self {
+        runtime_channel_send_kernel_problem(err)
     }
 }
 
@@ -22968,12 +22974,18 @@ impl Kernel {
             .map_err(internal)
     }
 
-    async fn authorize_and_enqueue_channel_send(
+    async fn authorize_and_enqueue_channel_send<E, F, Fut>(
         &self,
         context: CapabilityExecutionContext<'_>,
         payload: Value,
         request: BrokerChannelSendRequest,
-    ) -> Result<BrokerChannelSendAccepted, KernelError> {
+        prepare_content: F,
+    ) -> Result<BrokerChannelSendAccepted, E>
+    where
+        E: From<KernelError>,
+        F: FnOnce(&ChannelSendIntent) -> Fut,
+        Fut: Future<Output = Result<BrokerChannelSendContent, E>>,
+    {
         let broker_output = self
             .capability_broker
             .execute(&context, Capability::ChannelSend, &payload)
@@ -22985,29 +22997,24 @@ impl Kernel {
                 } else {
                     KernelError::BadRequest(format!("broker execution failed: {message}"))
                 }
-            })?;
+            })
+            .map_err(E::from)?;
         let intent = parse_channel_send_intent(&broker_output).map_err(|detail| {
             KernelError::BadRequest(format!("broker execution failed: {detail}"))
         })?;
 
         self.require_active_channel_binding(&intent.channel_id)
-            .await?;
+            .await
+            .map_err(E::from)?;
 
-        let (content, mut prepared_attachments) = match request.content {
-            Some(content) => (content.delivery, content.prepared_attachments),
-            None => (
-                ChannelDeliveryContent {
-                    text: intent.content.clone(),
-                    format_hint: "plain".to_string(),
-                    attachments: Vec::new(),
-                },
-                None,
-            ),
-        };
+        let BrokerChannelSendContent {
+            delivery: content,
+            mut prepared_attachments,
+        } = prepare_content(&intent).await?;
         if content.text.trim().is_empty() && content.attachments.is_empty() {
-            return Err(KernelError::BadRequest(
+            return Err(E::from(KernelError::BadRequest(
                 "channel.send content cannot be empty".to_string(),
-            ));
+            )));
         }
 
         let delivery_request = AuthorizedChannelDelivery {
@@ -23028,29 +23035,35 @@ impl Kernel {
         let (delivery_id, idempotent) = if request.idempotent {
             match self
                 .enqueue_authorized_channel_delivery_idempotent(delivery_request)
-                .await?
+                .await
+                .map_err(E::from)?
             {
                 ChannelOutboxEnqueueResult::Created(delivery) => {
                     let delivery_id = delivery.delivery_id;
                     if let Some(attachments) = prepared_attachments.as_mut() {
                         attachments.mark_persisted();
                     }
-                    self.audit_channel_outbox_created(&delivery).await?;
+                    self.audit_channel_outbox_created(&delivery)
+                        .await
+                        .map_err(E::from)?;
                     (delivery_id, false)
                 }
                 ChannelOutboxEnqueueResult::Existing(delivery) => (delivery.delivery_id, true),
                 ChannelOutboxEnqueueResult::Conflict(_delivery) => {
-                    return Err(KernelError::Conflict(
+                    return Err(E::from(KernelError::Conflict(
                         "idempotency key was reused with a different payload".to_string(),
-                    ));
+                    )));
                 }
             }
         } else {
             let delivery = self
                 .enqueue_authorized_channel_delivery(delivery_request)
-                .await?;
+                .await
+                .map_err(E::from)?;
             let delivery_id = delivery.delivery_id;
-            self.audit_channel_outbox_created(&delivery).await?;
+            self.audit_channel_outbox_created(&delivery)
+                .await
+                .map_err(E::from)?;
             (delivery_id, false)
         };
 
@@ -23216,46 +23229,13 @@ impl Kernel {
             ));
         }
 
-        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &content) {
-            Ok(artifacts) => artifacts,
-            Err(problem) => {
-                return self
-                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                    .await;
-            }
-        };
-        if let Err(problem) =
-            validate_runtime_channel_send_artifacts(&context, &runtime_artifacts).await
-        {
-            return self
-                .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                .await;
-        }
-        let artifact_roots = context.artifact_roots();
-        let attachments = match self
-            .prepare_runtime_artifact_attachments_from_roots(
-                context.turn_id,
-                &artifact_roots,
-                &runtime_artifacts,
-            )
-            .await
-            .map_err(runtime_channel_send_kernel_problem)
-        {
-            Ok(attachments) => attachments,
-            Err(problem) => {
-                return self
-                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                    .await;
-            }
-        };
-        let content = ChannelDeliveryContent {
-            text: content.text.clone(),
-            format_hint: format_hint.to_string(),
-            attachments: attachments.as_slice().to_vec(),
-        };
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
-        let broker_payload = runtime_channel_send_broker_payload(&request, &request.content);
+        let broker_payload = runtime_channel_send_broker_payload(&request, &content);
+        let runtime_context = context.clone();
+        let runtime_content = content.clone();
+        let runtime_format_hint = format_hint.to_string();
+        let kernel = self.clone();
         let accepted = match self
             .authorize_and_enqueue_channel_send(
                 context.capability_execution_context(),
@@ -23266,18 +23246,46 @@ impl Kernel {
                     source_kind: RUNTIME_CHANNEL_SEND_SOURCE_KIND,
                     source_id,
                     source_fingerprint: Some(fingerprint),
-                    content: Some(BrokerChannelSendContent {
-                        delivery: content,
-                        prepared_attachments: Some(attachments),
-                    }),
                     idempotent: true,
+                },
+                move |_intent| {
+                    let runtime_context = runtime_context.clone();
+                    let runtime_content = runtime_content.clone();
+                    let runtime_format_hint = runtime_format_hint.clone();
+                    let kernel = kernel.clone();
+                    async move {
+                        let runtime_artifacts =
+                            runtime_channel_send_artifacts(&runtime_context, &runtime_content)?;
+                        validate_runtime_channel_send_artifacts(
+                            &runtime_context,
+                            &runtime_artifacts,
+                        )
+                        .await?;
+                        let artifact_roots = runtime_context.artifact_roots();
+                        let attachments = kernel
+                            .prepare_runtime_artifact_attachments_from_roots(
+                                runtime_context.turn_id,
+                                &artifact_roots,
+                                &runtime_artifacts,
+                            )
+                            .await
+                            .map_err(runtime_channel_send_kernel_problem)?;
+                        Ok::<_, RuntimeChannelSendProblem>(BrokerChannelSendContent {
+                            delivery: ChannelDeliveryContent {
+                                text: runtime_content.text.clone(),
+                                format_hint: runtime_format_hint,
+                                attachments: attachments.as_slice().to_vec(),
+                            },
+                            prepared_attachments: Some(attachments),
+                        })
+                    }
                 },
             )
             .await
         {
             Ok(accepted) => accepted,
             Err(err) => {
-                let problem = runtime_channel_send_kernel_problem(err);
+                let problem = err;
                 if problem.code == "conflict" {
                     self.audit_runtime_channel_send(
                         "runtime.channel_send.conflict",
@@ -26235,8 +26243,18 @@ impl Kernel {
                                 source_kind: "session_turn",
                                 source_id,
                                 source_fingerprint: None,
-                                content: None,
                                 idempotent: false,
+                            },
+                            |intent| {
+                                let content = BrokerChannelSendContent {
+                                    delivery: ChannelDeliveryContent {
+                                        text: intent.content.clone(),
+                                        format_hint: "plain".to_string(),
+                                        attachments: Vec::new(),
+                                    },
+                                    prepared_attachments: None,
+                                };
+                                async move { Ok::<_, KernelError>(content) }
                             },
                         )
                         .await

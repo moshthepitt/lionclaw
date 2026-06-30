@@ -327,11 +327,16 @@ async fn build_channel_send_intent(
     {
         intent.insert("thread_ref".to_string(), json!(thread_ref));
     }
-    if let Some(reply_to_ref) = route
-        .reply_to_ref
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let reply_to_ref = if context.allow_channel_send_route_selection {
+        request
+            .reply_to_ref
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .or_else(|| route.reply_to_ref.and_then(non_empty_trimmed))
+    } else {
+        route.reply_to_ref.and_then(non_empty_trimmed)
+    };
+    if let Some(reply_to_ref) = reply_to_ref {
         intent.insert("reply_to_ref".to_string(), json!(reply_to_ref));
     }
     Ok(Value::Object(intent))
@@ -390,8 +395,6 @@ fn channel_send_route_matches(
             == non_empty_trimmed(route.conversation_ref)
         && request.thread_ref.as_deref().and_then(non_empty_trimmed)
             == route.thread_ref.and_then(non_empty_trimmed)
-        && request.reply_to_ref.as_deref().and_then(non_empty_trimmed)
-            == route.reply_to_ref.and_then(non_empty_trimmed)
 }
 
 fn non_empty_trimmed(value: &str) -> Option<&str> {

@@ -257,6 +257,7 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
         "channel_id": "local-cli",
         "conversation_ref": "member:reviewer",
         "thread_ref": "design-thread",
+        "reply_to_ref": "source-message",
         "content": {
             "text": "See attached sketch.",
             "format_hint": "markdown",
@@ -315,7 +316,7 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
     assert_eq!(delivery.delivery_id.to_string(), delivery_id);
     assert_eq!(delivery.conversation_ref, "member:reviewer");
     assert_eq!(delivery.thread_ref.as_deref(), Some("design-thread"));
-    assert_eq!(delivery.reply_to_ref.as_deref(), None);
+    assert_eq!(delivery.reply_to_ref.as_deref(), Some("source-message"));
     assert_eq!(delivery.content.text, "See attached sketch.");
     assert_eq!(delivery.content.format_hint, "markdown");
     assert_eq!(delivery.content.attachments.len(), 1);
@@ -387,6 +388,7 @@ async fn mcp_channel_send_allows_audits_and_enqueues_outbox_delivery() {
                     "channel_id": "local-cli",
                     "conversation_ref": "member:reviewer",
                     "thread_ref": "design-thread",
+                    "reply_to_ref": "source-message",
                     "text": "See attached sketch from MCP.",
                     "format_hint": "markdown",
                     "attachments": [{
@@ -450,6 +452,10 @@ async fn mcp_channel_send_allows_audits_and_enqueues_outbox_delivery() {
     assert_eq!(
         outbox.deliveries[0].content.text,
         "See attached sketch from MCP."
+    );
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("source-message")
     );
     assert_eq!(outbox.deliveries[0].content.attachments.len(), 1);
 
