@@ -765,28 +765,44 @@ fn codex_mcp_server_override_args(servers: &[RuntimeMcpServerSpec]) -> Vec<Strin
             "mcp_servers.{name}.args={}",
             codex_toml_string_array(&server.args)
         ));
-        for (key, value) in &server.environment {
-            let key = codex_toml_key_segment(key);
-            args.push("-c".to_string());
-            args.push(format!(
-                "mcp_servers.{name}.env.{key}={}",
-                codex_toml_string(value)
-            ));
-        }
     }
     args
 }
 
 fn codex_toml_key_segment(raw: &str) -> String {
-    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+    codex_toml_string(raw)
 }
 
 fn codex_toml_string(raw: &str) -> String {
-    serde_json::to_string(raw).expect("encoding a string should not fail")
+    let mut encoded = String::with_capacity(raw.len() + 2);
+    encoded.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => encoded.push_str("\\\\"),
+            '"' => encoded.push_str("\\\""),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            '\u{08}' => encoded.push_str("\\b"),
+            '\u{0C}' => encoded.push_str("\\f"),
+            ch if ch.is_control() => encoded.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => encoded.push(ch),
+        }
+    }
+    encoded.push('"');
+    encoded
 }
 
 fn codex_toml_string_array(values: &[String]) -> String {
-    serde_json::to_string(values).expect("encoding a string array should not fail")
+    let mut encoded = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            encoded.push(',');
+        }
+        encoded.push_str(&codex_toml_string(value));
+    }
+    encoded.push(']');
+    encoded
 }
 
 #[async_trait]
@@ -2542,9 +2558,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_codex_app_server_program, build_codex_terminal_program, extract_app_server_turn_id,
-        response_id, save_thread_id, AppServerMessage, AppServerTransport, CodexAppServerClient,
-        CodexRuntimeAdapter, CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
+        build_codex_app_server_program, build_codex_terminal_program,
+        codex_mcp_server_override_args, extract_app_server_turn_id, response_id, save_thread_id,
+        AppServerMessage, AppServerTransport, CodexAppServerClient, CodexRuntimeAdapter,
+        CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
     };
 
     fn runtime_not_ready() -> RuntimeSessionReady {
@@ -2871,7 +2888,6 @@ mod tests {
                     "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
                     "/runtime/lionclaw/channel-send.sock".to_string(),
                 ],
-                environment: vec![("TRACE".to_string(), "1".to_string())],
             }],
         );
 
@@ -2886,9 +2902,29 @@ mod tests {
                 "mcp_servers.\"lionclaw\".command=\"node\"".to_string(),
                 "-c".to_string(),
                 "mcp_servers.\"lionclaw\".args=[\"/runtime/.lionclaw-mcp-stdio-proxy.mjs\",\"/runtime/lionclaw/channel-send.sock\"]".to_string(),
-                "-c".to_string(),
-                "mcp_servers.\"lionclaw\".env.\"TRACE\"=\"1\"".to_string(),
                 "app-server".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_app_server_program_escapes_mcp_server_config_overrides() {
+        let args = codex_mcp_server_override_args(&[RuntimeMcpServerSpec {
+            name: "lion\"claw\\tools".to_string(),
+            command: "node\nruntime".to_string(),
+            args: vec![
+                "/runtime/path with spaces".to_string(),
+                "quote\"arg".to_string(),
+            ],
+        }]);
+
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.\"lion\\\"claw\\\\tools\".command=\"node\\nruntime\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lion\\\"claw\\\\tools\".args=[\"/runtime/path with spaces\",\"quote\\\"arg\"]".to_string(),
             ]
         );
     }

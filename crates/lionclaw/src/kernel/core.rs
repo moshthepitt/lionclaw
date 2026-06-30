@@ -224,7 +224,7 @@ const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
 const RUNTIME_MCP_STDIO_PROXY_JS: &str = r#"import readline from 'node:readline';
 import net from 'node:net';
 
-const socketPath = process.argv[2] || process.env.LIONCLAW_CHANNEL_SEND_SOCKET || '/runtime/lionclaw/channel-send.sock';
+const socketPath = process.argv[2] || '/runtime/lionclaw/channel-send.sock';
 
 function requestId(line) {
   try {
@@ -505,7 +505,7 @@ impl RuntimeChannelSendProblem {
     }
 }
 
-struct AuthorizedChannelSendEnqueue<'a> {
+struct AuthorizedChannelDelivery<'a> {
     route: ChannelDeliveryRoute<'a>,
     session_id: Option<Uuid>,
     turn_id: Option<Uuid>,
@@ -17613,7 +17613,6 @@ fn channel_send_mcp_server_spec() -> RuntimeMcpServerSpec {
             CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH.to_string(),
             CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
         ],
-        environment: Vec::new(),
     }
 }
 
@@ -17852,7 +17851,7 @@ async fn read_bounded_json_line(
 }
 
 fn runtime_channel_send_is_mcp_request(value: &Value) -> bool {
-    value.get("jsonrpc").and_then(Value::as_str) == Some("2.0") || value.get("method").is_some()
+    value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
 }
 
 async fn runtime_channel_send_mcp_response(
@@ -22430,10 +22429,10 @@ impl Kernel {
         format!("{channel_id}:{session_key}")
     }
 
-    async fn enqueue_authorized_channel_send(
+    async fn build_authorized_channel_delivery<'a>(
         &self,
-        input: AuthorizedChannelSendEnqueue<'_>,
-    ) -> Result<ChannelOutboxEnqueueResult, KernelError> {
+        input: AuthorizedChannelDelivery<'a>,
+    ) -> Result<NewChannelDelivery<'a>, KernelError> {
         let channel_id = input.route.channel_id.trim();
         let conversation_ref = input.route.conversation_ref.trim();
         if channel_id.is_empty() || conversation_ref.is_empty() {
@@ -22472,7 +22471,7 @@ impl Kernel {
             .source_fingerprint
             .map(str::trim)
             .filter(|raw| !raw.is_empty());
-        let delivery = NewChannelDelivery {
+        Ok(NewChannelDelivery {
             route: ChannelDeliveryRoute {
                 channel_id,
                 conversation_ref,
@@ -22485,19 +22484,29 @@ impl Kernel {
             source_id,
             source_fingerprint,
             content: input.content,
-        };
-        if source_fingerprint.is_some() {
-            self.channel_outbox
-                .enqueue_delivery_idempotent(delivery)
-                .await
-                .map_err(internal)
-        } else {
-            self.channel_outbox
-                .enqueue_delivery(delivery)
-                .await
-                .map(ChannelOutboxEnqueueResult::Created)
-                .map_err(internal)
-        }
+        })
+    }
+
+    async fn enqueue_authorized_channel_delivery(
+        &self,
+        input: AuthorizedChannelDelivery<'_>,
+    ) -> Result<ChannelDeliveryRecord, KernelError> {
+        let delivery = self.build_authorized_channel_delivery(input).await?;
+        self.channel_outbox
+            .enqueue_delivery(delivery)
+            .await
+            .map_err(internal)
+    }
+
+    async fn enqueue_authorized_channel_delivery_idempotent(
+        &self,
+        input: AuthorizedChannelDelivery<'_>,
+    ) -> Result<ChannelOutboxEnqueueResult, KernelError> {
+        let delivery = self.build_authorized_channel_delivery(input).await?;
+        self.channel_outbox
+            .enqueue_delivery_idempotent(delivery)
+            .await
+            .map_err(internal)
     }
 
     pub(super) async fn enqueue_scheduler_run_delivery(
@@ -22605,81 +22614,22 @@ impl Kernel {
         }
         let source_id = turn_id.to_string();
         let delivery = self
-            .create_channel_delivery_content(
-                ChannelDeliveryRoute {
+            .enqueue_authorized_channel_delivery(AuthorizedChannelDelivery {
+                route: ChannelDeliveryRoute {
                     channel_id: &context.channel_id,
                     conversation_ref: &context.conversation_ref,
                     thread_ref: context.thread_ref.as_deref(),
                     reply_to_ref: context.reply_to_ref.as_deref(),
                 },
-                Some(session_id),
-                Some(turn_id),
-                Some("session_turn"),
-                Some(&source_id),
-                content,
-            )
-            .await?;
-        self.audit_channel_outbox_created(&delivery).await
-    }
-
-    async fn create_channel_delivery_content(
-        &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: ChannelDeliveryContent,
-    ) -> Result<ChannelDeliveryRecord, KernelError> {
-        let channel_id = route.channel_id.trim();
-        let conversation_ref = route.conversation_ref.trim();
-        if channel_id.is_empty() || conversation_ref.is_empty() {
-            return Err(KernelError::BadRequest(
-                "channel_id and conversation_ref are required".to_string(),
-            ));
-        }
-        if content.text.trim().is_empty() && content.attachments.is_empty() {
-            return Err(KernelError::BadRequest(
-                "outbox delivery content is required".to_string(),
-            ));
-        }
-        if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
-            return Err(KernelError::BadRequest(format!(
-                "outbox delivery attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
-            )));
-        }
-        self.require_active_channel_binding(channel_id).await?;
-
-        let thread_ref = route
-            .thread_ref
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty());
-        let reply_to_ref = route
-            .reply_to_ref
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty());
-        let source_kind = source_kind.map(str::trim).filter(|raw| !raw.is_empty());
-        let source_id = source_id.map(str::trim).filter(|raw| !raw.is_empty());
-        let delivery = self
-            .channel_outbox
-            .enqueue_delivery(NewChannelDelivery {
-                route: ChannelDeliveryRoute {
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                    reply_to_ref,
-                },
-                session_id,
-                turn_id,
-                source_kind,
-                source_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                source_kind: Some("session_turn"),
+                source_id: Some(&source_id),
                 source_fingerprint: None,
                 content,
             })
-            .await
-            .map_err(internal)?;
-
-        Ok(delivery)
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await
     }
 
     async fn audit_channel_outbox_created(
@@ -22932,7 +22882,7 @@ impl Kernel {
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
         let delivery = self
-            .enqueue_authorized_channel_send(AuthorizedChannelSendEnqueue {
+            .enqueue_authorized_channel_delivery_idempotent(AuthorizedChannelDelivery {
                 route: ChannelDeliveryRoute {
                     channel_id,
                     conversation_ref,
@@ -23622,17 +23572,16 @@ impl Kernel {
         if let ClassifiedInput::LionClawControl(control) =
             classify_input(&persisted_turn.prompt_user_text)
         {
-            if let Err(err) = self
-                .process_queued_lionclaw_control(
-                    &turn,
-                    &session,
-                    persisted_turn,
-                    control,
-                    stream_context.clone(),
-                    cancellation,
-                )
-                .await
-            {
+            let control_result = Box::pin(self.process_queued_lionclaw_control(
+                &turn,
+                &session,
+                persisted_turn,
+                control,
+                stream_context.clone(),
+                cancellation,
+            ))
+            .await;
+            if let Err(err) = control_result {
                 let code = queued_turn_failure_code(&err);
                 if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
@@ -25924,8 +25873,8 @@ impl Kernel {
                                 Ok(intent) => {
                                     let source_id = turn_id.to_string();
                                     match self
-                                        .enqueue_authorized_channel_send(
-                                            AuthorizedChannelSendEnqueue {
+                                        .enqueue_authorized_channel_delivery(
+                                            AuthorizedChannelDelivery {
                                                 route: ChannelDeliveryRoute {
                                                     channel_id: &intent.channel_id,
                                                     conversation_ref: &intent.conversation_ref,
@@ -25946,7 +25895,7 @@ impl Kernel {
                                         )
                                         .await
                                     {
-                                        Ok(ChannelOutboxEnqueueResult::Created(delivery)) => {
+                                        Ok(delivery) => {
                                             self.audit_channel_outbox_created(&delivery).await?;
                                             let delivery_id = delivery.delivery_id;
                                             output = json!({
@@ -25957,25 +25906,6 @@ impl Kernel {
                                                 "delivery_id": delivery_id,
                                             });
                                             allowed = true;
-                                        }
-                                        Ok(ChannelOutboxEnqueueResult::Existing(delivery)) => {
-                                            output = json!({
-                                                "channel_id": intent.channel_id,
-                                                "conversation_ref": intent.conversation_ref,
-                                                "thread_ref": intent.thread_ref,
-                                                "reply_to_ref": intent.reply_to_ref,
-                                                "delivery_id": delivery.delivery_id,
-                                            });
-                                            allowed = true;
-                                        }
-                                        Ok(ChannelOutboxEnqueueResult::Conflict(delivery)) => {
-                                            let detail = format!(
-                                                "channel.send source conflict with delivery {}",
-                                                delivery.delivery_id
-                                            );
-                                            execution_error = Some(detail.clone());
-                                            reason =
-                                                Some(format!("broker execution failed: {detail}"));
                                         }
                                         Err(err) => {
                                             let detail = err.to_string();

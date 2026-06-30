@@ -163,7 +163,6 @@ async fn program_backed_runtime_with_channel_send_escape_gets_lionclaw_mcp_serve
                 "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
                 "/runtime/lionclaw/channel-send.sock".to_string(),
             ],
-            environment: Vec::new(),
         }]
     );
 }
@@ -357,6 +356,69 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             "channel.send socket root is private"
         );
     }
+}
+
+#[tokio::test]
+async fn legacy_channel_send_request_with_method_field_is_not_mcp() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-method-field").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "legacy-method-field",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "method": "not-json-rpc",
+        "content": {
+            "text": "Legacy channel.send payload with an unrelated method field.",
+            "format_hint": "plain"
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![request],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-method-field").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send legacy channel message with method metadata".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(
+        outbox.deliveries[0].content.text,
+        "Legacy channel.send payload with an unrelated method field."
+    );
 }
 
 #[tokio::test]

@@ -338,15 +338,15 @@ impl AcpTurnRunner {
         let result = async {
             let session_capabilities = client.initialize().await?;
             let opened_session = client
-                .ensure_session(
-                    &self.config,
-                    &self.sessions,
-                    &runtime_session_id,
-                    &session_state,
+                .ensure_session(AcpEnsureSession {
+                    config: &self.config,
+                    sessions: &self.sessions,
+                    runtime_session_id: &runtime_session_id,
+                    session_state: &session_state,
                     session_capabilities,
-                    &self.working_dir,
-                    &self.mcp_servers,
-                )
+                    working_dir: &self.working_dir,
+                    mcp_servers: &self.mcp_servers,
+                })
                 .await?;
             client
                 .configure_session(&self.config, &opened_session.session_id)
@@ -402,21 +402,11 @@ fn acp_mcp_servers(servers: &[RuntimeMcpServerSpec]) -> Value {
         servers
             .iter()
             .map(|server| {
-                let env: Vec<Value> = server
-                    .environment
-                    .iter()
-                    .map(|(key, value)| {
-                        json!({
-                            "name": key,
-                            "value": value,
-                        })
-                    })
-                    .collect();
                 json!({
                     "name": server.name,
                     "command": server.command,
                     "args": server.args,
-                    "env": env,
+                    "env": [],
                 })
             })
             .collect(),
@@ -486,6 +476,16 @@ struct AcpCancelWait<'a> {
     cancel_rx: &'a mut mpsc::UnboundedReceiver<AcpCancelRequest>,
 }
 
+struct AcpEnsureSession<'a> {
+    config: &'a AcpRuntimeConfig,
+    sessions: &'a RwLock<HashMap<String, AcpSessionState>>,
+    runtime_session_id: &'a str,
+    session_state: &'a AcpSessionState,
+    session_capabilities: AcpSessionCapabilities,
+    working_dir: &'a str,
+    mcp_servers: &'a [RuntimeMcpServerSpec],
+}
+
 impl AcpClient {
     fn new(session: Box<dyn RuntimeProgramSession>) -> Self {
         Self {
@@ -516,24 +516,15 @@ impl AcpClient {
         ))
     }
 
-    async fn ensure_session(
-        &mut self,
-        config: &AcpRuntimeConfig,
-        sessions: &RwLock<HashMap<String, AcpSessionState>>,
-        runtime_session_id: &str,
-        session_state: &AcpSessionState,
-        session_capabilities: AcpSessionCapabilities,
-        working_dir: &str,
-        mcp_servers: &[RuntimeMcpServerSpec],
-    ) -> Result<AcpOpenedSession> {
-        let mcp_servers = acp_mcp_servers(mcp_servers);
-        if let Some(session_id) = session_state.session_id.as_deref() {
-            if let Some(reopen_method) = session_capabilities.reopen_method() {
+    async fn ensure_session(&mut self, input: AcpEnsureSession<'_>) -> Result<AcpOpenedSession> {
+        let mcp_servers = acp_mcp_servers(input.mcp_servers);
+        if let Some(session_id) = input.session_state.session_id.as_deref() {
+            if let Some(reopen_method) = input.session_capabilities.reopen_method() {
                 self.request(
                     reopen_method,
                     json!({
                         "sessionId": session_id,
-                        "cwd": working_dir,
+                        "cwd": input.working_dir,
                         "mcpServers": mcp_servers.clone(),
                     }),
                     None,
@@ -544,7 +535,7 @@ impl AcpClient {
                     resumed_existing: true,
                 });
             } else {
-                forget_acp_session_id(config, sessions, runtime_session_id)?;
+                forget_acp_session_id(input.config, input.sessions, input.runtime_session_id)?;
             }
         }
 
@@ -552,7 +543,7 @@ impl AcpClient {
             .request(
                 "session/new",
                 json!({
-                    "cwd": working_dir,
+                    "cwd": input.working_dir,
                     "mcpServers": mcp_servers,
                 }),
                 None,
@@ -564,10 +555,15 @@ impl AcpClient {
             .and_then(Value::as_str)
             .and_then(normalize_acp_session_id)
             .context("ACP session/new response is missing sessionId")?;
-        if session_capabilities.reopen_method().is_some() {
-            remember_acp_session_id(config, sessions, runtime_session_id, &session_id)?;
+        if input.session_capabilities.reopen_method().is_some() {
+            remember_acp_session_id(
+                input.config,
+                input.sessions,
+                input.runtime_session_id,
+                &session_id,
+            )?;
         } else {
-            forget_acp_session_id(config, sessions, runtime_session_id)?;
+            forget_acp_session_id(input.config, input.sessions, input.runtime_session_id)?;
         }
 
         Ok(AcpOpenedSession {
@@ -1849,7 +1845,6 @@ mod tests {
                 "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
                 "/runtime/lionclaw/channel-send.sock".to_string(),
             ],
-            environment: Vec::new(),
         }];
 
         adapter

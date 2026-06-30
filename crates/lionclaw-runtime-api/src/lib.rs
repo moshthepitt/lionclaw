@@ -722,7 +722,6 @@ pub struct RuntimeMcpServerSpec {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    pub environment: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
