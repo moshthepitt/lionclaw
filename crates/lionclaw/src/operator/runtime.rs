@@ -566,6 +566,36 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_launch_prereqs_reject_missing_profile_auth_before_launch() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        let mut profile = codex_runtime_profile(engine);
+        profile.auth = None;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile);
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("Codex profile without auth should fail before launch");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid for runtime driver 'codex'"),
+            "{message}"
+        );
+        assert!(message.contains("requires auth kind 'codex'"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn launch_prereqs_reject_project_metadata_mount_sources() {
         let (_temp_dir, engine) = fake_podman();
         let temp_dir = tempfile::tempdir().expect("temp dir");

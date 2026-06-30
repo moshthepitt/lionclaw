@@ -111,13 +111,20 @@ impl RuntimeDriverProvider for CodexRuntimeDriver {
         if config.mode.is_some() {
             bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime mode");
         }
-        if let Some(auth) = &config.auth {
-            let expected = codex_runtime_auth_kind();
-            if auth != &expected {
+        let expected = codex_runtime_auth_kind();
+        match &config.auth {
+            Some(auth) if auth == &expected => {}
+            Some(auth) => {
                 bail!(
                     "driver '{CODEX_RUNTIME_DRIVER}' requires auth kind '{}', got '{}'",
                     expected.as_str(),
                     auth.as_str()
+                );
+            }
+            None => {
+                bail!(
+                    "driver '{CODEX_RUNTIME_DRIVER}' requires auth kind '{}'",
+                    expected.as_str()
                 );
             }
         }
@@ -3280,12 +3287,13 @@ mod tests {
     use lionclaw_runtime_api::{
         append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
         ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution,
-        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
-        TurnEvent, RUNTIME_SESSION_READY_MARKER,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig,
+        RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
+        RuntimeFileChangeStatus, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus, TurnEvent,
+        RUNTIME_SESSION_READY_MARKER,
     };
 
     use crate::codex_runtime_auth_kind;
@@ -3600,6 +3608,24 @@ mod tests {
             }
         }
         text
+    }
+
+    #[test]
+    fn codex_driver_requires_profile_auth() {
+        let driver = super::CodexRuntimeDriver;
+        let mut config = RuntimeDriverConfig {
+            runtime_id: "codex".to_string(),
+            executable: "codex".to_string(),
+            ..RuntimeDriverConfig::default()
+        };
+
+        let err = RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect_err("Codex profile auth must be explicit");
+        assert!(err.to_string().contains("requires auth kind 'codex'"));
+
+        config.auth = Some(codex_runtime_auth_kind());
+        RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect("Codex profile with codex auth should validate");
     }
 
     #[test]
