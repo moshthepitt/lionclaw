@@ -39,12 +39,10 @@ use std::{
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use lionclaw_durable_fs::write_file_atomically;
 use rustix::{
     fs::{open, openat, unlinkat, AtFlags, Mode, OFlags},
@@ -346,13 +344,6 @@ pub struct RuntimeSessionHandle {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuntimeTerminalTranscriptInput {
-    pub session_id: Uuid,
-    pub runtime_state_root: PathBuf,
-    pub launch_started_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
@@ -382,239 +373,6 @@ impl RuntimeSessionReady {
     pub const fn is_ready(self) -> bool {
         self.marker_present
     }
-}
-
-#[async_trait]
-pub trait RuntimeTerminalTranscriptProgramExecutor: Send {
-    fn hard_timeout(&self) -> Duration {
-        Duration::from_secs(30)
-    }
-
-    async fn execute(&mut self, program: RuntimeProgramSpec) -> Result<ExecutionOutput>;
-
-    async fn spawn(
-        &mut self,
-        _program: RuntimeProgramSpec,
-    ) -> Result<Box<dyn RuntimeProgramSession>> {
-        Err(anyhow!(
-            "runtime transcript executor does not support interactive programs"
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTerminalTurnStatus {
-    Completed,
-    Failed,
-    Interrupted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeTerminalTurn {
-    pub source_id: String,
-    pub display_user_text: String,
-    pub prompt_user_text: String,
-    pub assistant_text: String,
-    pub status: RuntimeTerminalTurnStatus,
-    pub error_code: Option<String>,
-    pub error_text: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscriptWarning {
-    pub source_id: String,
-    pub error: String,
-}
-
-impl RuntimeTerminalTranscriptWarning {
-    pub fn new(source_id: impl Into<String>, error: impl Into<String>) -> Self {
-        Self {
-            source_id: source_id.into(),
-            error: error.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscript {
-    pub turns: Vec<RuntimeTerminalTurn>,
-    pub warnings: Vec<RuntimeTerminalTranscriptWarning>,
-    pub state: RuntimeTerminalTranscriptState,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscriptState {
-    /// True only when the adapter has reconciled its chosen continuation source.
-    reconciled: bool,
-    /// True only when the adapter has verified its own continuation target is valid.
-    resumable: bool,
-}
-
-impl RuntimeTerminalTranscriptState {
-    pub fn new(reconciled: bool, resumable: bool) -> Self {
-        Self {
-            reconciled,
-            resumable: reconciled && resumable,
-        }
-    }
-
-    pub fn is_reconciled(self) -> bool {
-        self.reconciled
-    }
-
-    pub fn is_resumable(self) -> bool {
-        self.resumable
-    }
-}
-
-impl RuntimeTerminalTranscript {
-    pub fn new(
-        turns: Vec<RuntimeTerminalTurn>,
-        warnings: Vec<RuntimeTerminalTranscriptWarning>,
-        state: RuntimeTerminalTranscriptState,
-    ) -> Self {
-        Self {
-            turns,
-            warnings,
-            state,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTranscriptCandidate {
-    pub id: String,
-    pub updated_at: Option<DateTime<Utc>>,
-}
-
-impl TerminalTranscriptCandidate {
-    pub fn new(id: impl Into<String>, updated_at: Option<DateTime<Utc>>) -> Option<Self> {
-        let id = id.into();
-        let id = id.trim();
-        if id.is_empty() {
-            return None;
-        }
-        Some(Self {
-            id: id.to_string(),
-            updated_at,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum TerminalTranscriptTimestampPrecision {
-    Seconds,
-    Milliseconds,
-}
-
-#[derive(Debug, Default)]
-pub struct TerminalTranscriptTarget {
-    id: Option<String>,
-    reconciled: bool,
-    resumable: bool,
-}
-
-impl TerminalTranscriptTarget {
-    pub fn is_empty(&self) -> bool {
-        self.id.is_none()
-    }
-
-    pub fn unreconciled_id(&self) -> Option<&str> {
-        if self.reconciled() {
-            return None;
-        }
-        self.id.as_deref()
-    }
-
-    pub fn choose_if_empty(&mut self, id: &str) -> bool {
-        if self.id.is_some() {
-            return false;
-        }
-        self.id = Some(id.to_string());
-        true
-    }
-
-    pub fn record_reconciliation(&mut self, id: &str, reconciled: bool, resumable: bool) {
-        if self.id.as_deref() == Some(id) {
-            self.reconciled = reconciled;
-            self.resumable = reconciled && resumable;
-        }
-    }
-
-    pub fn resumable(&self) -> bool {
-        self.reconciled && self.resumable
-    }
-
-    pub fn reconciled(&self) -> bool {
-        self.id.is_none() || self.reconciled
-    }
-
-    pub fn transcript_state(
-        &self,
-        source_selection_reconciled: bool,
-    ) -> RuntimeTerminalTranscriptState {
-        RuntimeTerminalTranscriptState::new(
-            source_selection_reconciled && self.reconciled(),
-            self.resumable(),
-        )
-    }
-}
-
-pub fn choose_terminal_transcript_target(
-    linked_id: Option<&str>,
-    latest: Option<&TerminalTranscriptCandidate>,
-    launch_started_at: Option<DateTime<Utc>>,
-) -> Option<String> {
-    if let Some(linked_id) = linked_id.and_then(|id| {
-        let id = id.trim();
-        if id.is_empty() {
-            None
-        } else {
-            Some(id)
-        }
-    }) {
-        if let (Some(latest), Some(launch_started_at)) = (latest, launch_started_at) {
-            if latest.id != linked_id
-                && latest
-                    .updated_at
-                    .is_some_and(|updated_at| updated_at >= launch_started_at)
-            {
-                return Some(latest.id.clone());
-            }
-        }
-        return Some(linked_id.to_string());
-    }
-
-    latest.map(|candidate| candidate.id.clone())
-}
-
-pub fn normalize_terminal_transcript_launch_started_at(
-    launch_started_at: Option<DateTime<Utc>>,
-    precision: TerminalTranscriptTimestampPrecision,
-) -> Option<DateTime<Utc>> {
-    let started_at = launch_started_at?;
-    match precision {
-        TerminalTranscriptTimestampPrecision::Seconds => {
-            DateTime::<Utc>::from_timestamp(started_at.timestamp(), 0)
-        }
-        TerminalTranscriptTimestampPrecision::Milliseconds => {
-            DateTime::<Utc>::from_timestamp_millis(started_at.timestamp_millis())
-        }
-    }
-}
-
-pub fn latest_terminal_turn_is_completed(turns: &[RuntimeTerminalTurn]) -> bool {
-    turns
-        .iter()
-        .max_by(|left, right| {
-            left.finished_at
-                .cmp(&right.finished_at)
-                .then_with(|| left.started_at.cmp(&right.started_at))
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        })
-        .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
 }
 
 pub fn load_ready_state_value(
@@ -1440,15 +1198,6 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not expose a native terminal UI"))
-    }
-    async fn export_terminal_transcript(
-        &self,
-        _input: RuntimeTerminalTranscriptInput,
-        _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<RuntimeTerminalTranscript> {
-        Err(anyhow!(
-            "runtime does not support native terminal transcript export"
-        ))
     }
     fn program_output_parser(
         &self,
