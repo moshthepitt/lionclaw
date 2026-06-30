@@ -178,17 +178,12 @@ Expected:
   audit events
 - ACP profiles such as OpenCode launch the profile command as the native UI
   without ACP protocol args; when the profile declares `terminal.resume-args`,
-  saved ready ACP sessions resume through those args; ACP profiles do not
-  guarantee canonical transcript import
-  unless the ACP driver later implements runtime-owned transcript export
-- completed Codex native UI turns are present in LionClaw session history and
-  are available to later `lionclaw run`, `run --plain`, and channel context
-- opening and exiting the native UI without completing a turn leaves the launch
-  clean but does not prime a later program-backed continuation
-- after a clean exit, relaunching the native UI starts without a prelaunch
-  transcript-export pass
-- after an unclean LionClaw exit, relaunching the native UI reconciles durable
-  runtime transcript state without duplicating already imported turns
+  saved ready ACP sessions resume through those args
+- native UI turns are not inserted into LionClaw session history and are not
+  available to later `lionclaw run`, `run --plain`, or channel context
+- opening and exiting the native UI does not prime, clear, or otherwise change
+  later program-backed continuation state
+- relaunching the native UI does not run prelaunch recovery work
 - interactive `run` and `run --runtime-tui` resume the latest LionClaw session
   by default; `--new-session` starts fresh LionClaw control state while keeping
   runtime-native config and history under `/runtime/home`
