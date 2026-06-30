@@ -228,7 +228,9 @@ const socketPath = process.argv[2] || '/runtime/lionclaw/channel-send.sock';
 function requestId(line) {
   try {
     const message = JSON.parse(line);
-    return Object.prototype.hasOwnProperty.call(message, 'id') ? message.id : null;
+    if (!Object.prototype.hasOwnProperty.call(message, 'id')) return null;
+    const id = message.id;
+    return typeof id === 'string' || typeof id === 'number' ? id : null;
   } catch {
     return null;
   }
@@ -236,6 +238,27 @@ function requestId(line) {
 
 function jsonRpcError(id, code, message) {
   return JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
+}
+
+function correlateKernelResponse(line, response) {
+  const id = requestId(line);
+  if (id === null) return response;
+  try {
+    const message = JSON.parse(response);
+    if (
+      message &&
+      typeof message === 'object' &&
+      message.jsonrpc === '2.0' &&
+      message.id === null &&
+      Object.prototype.hasOwnProperty.call(message, 'error')
+    ) {
+      message.id = id;
+      return JSON.stringify(message);
+    }
+  } catch {
+    // Leave malformed kernel responses untouched so the MCP client sees the real transport fault.
+  }
+  return response;
 }
 
 function kernelCall(line) {
@@ -256,11 +279,11 @@ function kernelCall(line) {
       buffer += chunk.toString('utf8');
       const newline = buffer.indexOf('\n');
       if (newline >= 0) {
-        finish(buffer.slice(0, newline));
+        finish(correlateKernelResponse(line, buffer.slice(0, newline)));
         client.destroy();
       }
     });
-    client.on('end', () => finish(buffer.trim()));
+    client.on('end', () => finish(correlateKernelResponse(line, buffer.trim())));
     client.on('error', (error) => {
       finish(jsonRpcError(requestId(line), -32000, `LionClaw MCP broker is unavailable: ${error.message}`));
     });
@@ -7600,6 +7623,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
+        process::Stdio,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -7706,6 +7730,76 @@ mod tests {
                 & 0o777,
             RUNTIME_STATE_DIR_MODE
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_mcp_stdio_proxy_correlates_idless_kernel_errors() {
+        let node = which::which("node").expect("node is required to validate MCP stdio proxy");
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("proxy.mjs");
+        let socket_path = temp_dir.path().join("kernel.sock");
+        fs::write(&script_path, RUNTIME_MCP_STDIO_PROXY_JS).expect("write proxy script");
+
+        let listener = UnixListener::bind(&socket_path).expect("bind fake kernel socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proxy connection");
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader
+                .read_line(&mut request)
+                .await
+                .expect("read proxy request");
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"busy"}}"#,
+                )
+                .await
+                .expect("write fake kernel response");
+            stream.write_all(b"\n").await.expect("write newline");
+            stream.shutdown().await.expect("shutdown fake socket");
+        });
+
+        let mut child = tokio::process::Command::new(node)
+            .arg(&script_path)
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn MCP stdio proxy");
+
+        let mut stdin = child.stdin.take().expect("proxy stdin");
+        stdin
+            .write_all(br#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call"}"#)
+            .await
+            .expect("write proxy request");
+        stdin.write_all(b"\n").await.expect("write request newline");
+        drop(stdin);
+
+        let stdout = child.stdout.take().expect("proxy stdout");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        let read = timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+            .await
+            .expect("proxy response timed out")
+            .expect("read proxy response");
+        assert!(read > 0, "proxy exited without a response");
+
+        let response: Value = serde_json::from_str(line.trim()).expect("proxy response JSON");
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "call-1");
+        assert_eq!(response["error"]["code"].as_i64(), Some(-32000));
+        assert_eq!(response["error"]["message"].as_str(), Some("busy"));
+
+        server.await.expect("fake kernel server task");
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("proxy exit timed out")
+            .expect("wait for proxy");
+        assert!(status.success(), "proxy exited with {status}");
     }
 
     #[cfg(unix)]
