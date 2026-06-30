@@ -648,6 +648,7 @@ with the CLI.
 - `POST /v0/sessions/open`
 - `GET /v0/sessions/latest`
 - `POST /v0/sessions/history`
+- `POST /v0/sessions/turn/journal`
 - `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
 
