@@ -718,6 +718,13 @@ pub struct RuntimeProgramTurnExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMcpServerSpec {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionContext {
     pub network_mode: NetworkMode,
     /// Runtime-visible current working directory for program-backed turns.
@@ -725,6 +732,7 @@ pub struct RuntimeExecutionContext {
     pub environment: Vec<(String, String)>,
     pub runtime_state_root: Option<PathBuf>,
     pub runtime_path_projections: Vec<RuntimePathProjection>,
+    pub mcp_servers: Vec<RuntimeMcpServerSpec>,
 }
 
 impl RuntimeExecutionContext {
@@ -1787,6 +1795,7 @@ mod tests {
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -1822,6 +1831,7 @@ mod tests {
                 )
                 .expect("valid runtime projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(
@@ -1864,6 +1874,7 @@ mod tests {
                 RuntimePathProjection::directory("/runtime/channel.sock", "/tmp/channel-tree")
                     .expect("valid runtime projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(

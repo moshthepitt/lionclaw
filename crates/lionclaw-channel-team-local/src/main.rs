@@ -35,7 +35,6 @@ mod config;
 mod discovery;
 mod inventory;
 mod protocol;
-mod send;
 mod worker;
 
 use anyhow::Result;
@@ -65,16 +64,6 @@ async fn main() -> Result<ExitCode> {
             let inventory = inventory::ProjectInventory::load(&config.inventory.instances_file)?;
             let summary =
                 inventory.resolve_summary(&config.inventory.self_instance, &config.recipient);
-            let ok = summary.ok;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            if ok {
-                Ok(ExitCode::SUCCESS)
-            } else {
-                Ok(ExitCode::FAILURE)
-            }
-        }
-        config::Command::Send(config) => {
-            let summary = send::run(config)?;
             let ok = summary.ok;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             if ok {

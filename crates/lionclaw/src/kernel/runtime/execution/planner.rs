@@ -297,6 +297,7 @@ impl ExecutionPlanner {
             network_mode: preset.network_mode,
             working_dir,
             environment,
+            mcp_servers: Vec::new(),
             idle_timeout: execution_context.idle_timeout,
             hard_timeout: execution_context.hard_timeout,
             mounts,

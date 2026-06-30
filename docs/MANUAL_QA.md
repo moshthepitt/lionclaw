@@ -213,6 +213,7 @@ Expected:
   the runtime's native exit gesture
 - turn-scoped LionClaw bridges such as runtime `channel.send` are not exposed
   inside `run --runtime-tui`
+- the runtime TUI is not offered the LionClaw MCP `channel_send` tool
 
 ## Phase 3: Instances And Work Roots
 

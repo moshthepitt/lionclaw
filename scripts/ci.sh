@@ -20,7 +20,6 @@ bash -n skills/lionclaw-private-context/scripts/projector
 bash -n skills/lionclaw-private-context/scripts/recorder
 bash -n skills/channel-team-local/runtime/team-local/scripts/list
 bash -n skills/channel-team-local/runtime/team-local/scripts/resolve
-bash -n skills/channel-team-local/runtime/team-local/scripts/send
 test -f skills/channel-email/README.md
 test -f skills/channel-email/runtime/email/SKILL.md
 test -f skills/channel-email/runtime/email/EMAIL_WORKFLOW_GUIDE.md

@@ -19,10 +19,10 @@ use lionclaw::{
         runtime::{
             EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo,
             RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
-            RuntimeEventSender, RuntimeExecutionContext, RuntimeNativeHomeArtifactDir,
-            RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
-            TurnEvent, WorkspaceAccess,
+            RuntimeEventSender, RuntimeExecutionContext, RuntimeMcpServerSpec,
+            RuntimeNativeHomeArtifactDir, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
+            RuntimeTurnResult, TurnEvent, WorkspaceAccess,
         },
         Kernel, KernelOptions,
     },
@@ -40,10 +40,12 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
+const CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH: &str = "/runtime/.lionclaw-mcp-stdio-proxy.mjs";
+const CHANNEL_SEND_MCP_SERVER_NAME: &str = "lionclaw";
+const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const TEST_CHANNEL_SEND_CONNECTION_LIMIT: usize = 16;
 
-type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+type RecordedMcpServers = Arc<Mutex<Vec<Vec<RuntimeMcpServerSpec>>>>;
 
 #[derive(Clone, Copy)]
 enum ProbeFileSetup {
@@ -56,25 +58,25 @@ enum ProbeFileSetup {
 }
 
 #[tokio::test]
-async fn program_backed_runtime_without_channel_send_escape_gets_no_socket_env() {
+async fn program_backed_runtime_without_channel_send_escape_gets_no_mcp_server() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-no-escape").await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-no-mcp").await;
     let kernel = kernel_with_channel_send_preset(&env, false).await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     kernel
         .register_runtime_adapter(
             "probe-runtime",
-            Arc::new(ChannelSendProbeRuntime::record_environment(
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(
                 observed.clone(),
             )),
         )
         .await;
-    let session = open_test_session(&kernel, "runtime-channel-send-no-escape").await;
+    let session = open_test_session(&kernel, "runtime-channel-send-no-mcp").await;
 
     kernel
         .turn_session(SessionTurnRequest {
             session_id: session,
-            user_text: "probe channel send env".to_string(),
+            user_text: "probe channel send mcp servers".to_string(),
             runtime_id: Some("probe-runtime".to_string()),
             runtime_working_dir: None,
             runtime_timeout_ms: None,
@@ -83,12 +85,87 @@ async fn program_backed_runtime_without_channel_send_escape_gets_no_socket_env()
         .await
         .expect("turn should complete");
 
-    let environments = observed.lock().expect("observed env lock");
-    assert_eq!(environments.len(), 1);
-    assert!(
-        env_value(&environments[0], CHANNEL_SEND_SOCKET_ENV).is_none(),
-        "runtime must not receive a channel.send bridge without the escape class"
+    let observed = observed.lock().expect("observed mcp servers lock");
+    assert_eq!(observed.as_slice(), &[Vec::<RuntimeMcpServerSpec>::new()]);
+}
+
+#[tokio::test]
+async fn program_backed_runtime_with_channel_send_escape_gets_lionclaw_mcp_server() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "probe-runtime",
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(
+                observed.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "probe channel send mcp server".to_string(),
+            runtime_id: Some("probe-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let observed = observed.lock().expect("observed mcp servers lock");
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0],
+        vec![RuntimeMcpServerSpec {
+            name: "lionclaw".to_string(),
+            command: "node".to_string(),
+            args: vec![
+                CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH.to_string(),
+                CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
+            ],
+        }]
     );
+}
+
+#[tokio::test]
+async fn program_backed_channel_send_without_route_authority_gets_no_mcp_server() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-no-authority").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_without_project_routes(
+            &env, true,
+        ))
+        .await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "probe-runtime",
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(
+                observed.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-no-authority").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "probe channel send without route authority".to_string(),
+            runtime_id: Some("probe-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let observed = observed.lock().expect("observed mcp servers lock");
+    assert_eq!(observed.as_slice(), &[Vec::<RuntimeMcpServerSpec>::new()]);
 }
 
 #[tokio::test]
@@ -129,7 +206,7 @@ async fn direct_runtime_with_channel_send_escape_does_not_start_bridge() {
 }
 
 #[tokio::test]
-async fn runtime_control_with_channel_send_escape_gets_no_socket_env() {
+async fn runtime_control_with_channel_send_escape_gets_no_mcp_server() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-control").await;
     let kernel = kernel_with_channel_send_preset(&env, true).await;
@@ -137,7 +214,7 @@ async fn runtime_control_with_channel_send_escape_gets_no_socket_env() {
     kernel
         .register_runtime_adapter(
             "channel-send-runtime",
-            Arc::new(ChannelSendProbeRuntime::record_environment(
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(
                 observed.clone(),
             )),
         )
@@ -156,12 +233,8 @@ async fn runtime_control_with_channel_send_escape_gets_no_socket_env() {
         .await
         .expect("runtime control should complete");
 
-    let environments = observed.lock().expect("observed env lock");
-    assert_eq!(environments.len(), 1);
-    assert!(
-        env_value(&environments[0], CHANNEL_SEND_SOCKET_ENV).is_none(),
-        "runtime controls must not receive the program-backed channel.send bridge"
-    );
+    let observed = observed.lock().expect("observed mcp servers lock");
+    assert_eq!(observed.as_slice(), &[Vec::<RuntimeMcpServerSpec>::new()]);
 }
 
 #[tokio::test]
@@ -171,7 +244,12 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
 
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-happy").await;
-    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            channel_send_inventory_for_reviewer_route(Some("design-thread")),
+        ))
+        .await;
     let responses = Arc::new(Mutex::new(Vec::new()));
     let socket_paths = Arc::new(Mutex::new(Vec::new()));
     let request = json!({
@@ -280,6 +358,456 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             "channel.send socket root is private"
         );
     }
+}
+
+#[tokio::test]
+async fn mcp_channel_send_allows_audits_and_enqueues_outbox_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-happy").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            channel_send_inventory_for_reviewer_route(Some("design-thread")),
+        ))
+        .await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let requests = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": "list-tools",
+            "method": "tools/list",
+            "params": {}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "send-design-sketch",
+            "method": "tools/call",
+            "params": {
+                "name": "channel_send",
+                "arguments": {
+                    "channel_id": "local-cli",
+                    "conversation_ref": "member:reviewer",
+                    "thread_ref": "design-thread",
+                    "reply_to_ref": "source-message",
+                    "text": "See attached sketch from MCP.",
+                    "format_hint": "markdown",
+                    "attachments": [{
+                        "path": "/runtime/artifacts/sketch.txt",
+                        "filename": "sketch.txt",
+                        "mime_type": "text/plain"
+                    }]
+                }
+            }
+        }),
+    ];
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                requests,
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::Attachment,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-happy").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send channel message through MCP".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["result"]["tools"][0]["name"], "channel_send");
+    assert_eq!(responses[1]["jsonrpc"], "2.0");
+    assert_eq!(responses[1]["result"]["isError"].as_bool(), Some(false));
+    let tool_response = mcp_tool_text_json(&responses[1]);
+    assert_eq!(tool_response["ok"].as_bool(), Some(true));
+    let delivery_id = tool_response["delivery_id"]
+        .as_str()
+        .expect("delivery id in MCP tool response");
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: Some("design-thread".to_string()),
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].delivery_id.to_string(), delivery_id);
+    assert_eq!(
+        outbox.deliveries[0].content.text,
+        "See attached sketch from MCP."
+    );
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("source-message")
+    );
+    assert_eq!(outbox.deliveries[0].content.attachments.len(), 1);
+
+    let allowed = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.allowed".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query allowed audit events");
+    assert!(allowed.events.iter().any(|event| {
+        event.details["delivery_id"].as_str() == Some(delivery_id)
+            && event.details["channel_id"].as_str() == Some("local-cli")
+            && event.details["conversation_ref"].as_str() == Some("member:reviewer")
+    }));
+    let created = kernel
+        .query_audit(
+            Some(session),
+            Some("channel.outbox.created".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query outbox audit events");
+    assert!(created
+        .events
+        .iter()
+        .any(|event| event.details["delivery_id"].as_str() == Some(delivery_id)));
+}
+
+#[tokio::test]
+async fn mcp_channel_send_denies_unprojected_route_without_outbox_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-deny").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            ProjectInstanceInventory::new_channel_send(
+                Some("main".to_string()),
+                vec![
+                    ProjectInstanceInventoryEntry::identity("main".to_string()),
+                    ProjectInstanceInventoryEntry::with_channel_send(
+                        "reviewer".to_string(),
+                        ProjectInstanceChannelSend::configured(
+                            "local-cli".to_string(),
+                            "member:reviewer".to_string(),
+                            Some("team-thread".to_string()),
+                        ),
+                    ),
+                ],
+            ),
+        ))
+        .await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let blocked = json!({
+        "jsonrpc": "2.0",
+        "id": "blocked-route",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:intruder",
+                "text": "blocked",
+                "format_hint": "markdown"
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![blocked],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-deny").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send blocked channel message through MCP".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["result"]["isError"].as_bool(), Some(true));
+    let tool_response = mcp_tool_text_json(&responses[0]);
+    assert_eq!(tool_response["ok"].as_bool(), Some(false));
+    assert_eq!(
+        tool_response["error"]["code"].as_str(),
+        Some("route_not_allowed")
+    );
+
+    let blocked_outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:intruder".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull blocked outbox");
+    assert!(blocked_outbox.deliveries.is_empty());
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("route_not_allowed")
+            && event.details["channel_id"].as_str() == Some("local-cli")
+            && event.details["conversation_ref"].as_str() == Some("member:intruder")
+    }));
+}
+
+#[tokio::test]
+async fn mcp_channel_send_audits_invalid_tool_arguments_without_outbox_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-invalid").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let invalid = json!({
+        "jsonrpc": "2.0",
+        "id": "invalid-arguments",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "this should not enqueue",
+                "unexpected": true
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![invalid],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-invalid").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send invalid channel message through MCP".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert_eq!(responses[0]["id"], "invalid-arguments");
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32602));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("channel_send arguments are invalid")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(outbox.deliveries.is_empty());
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("invalid_request")
+            && event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
+}
+
+#[tokio::test]
+async fn mcp_channel_send_tools_call_notification_is_audited_denied() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-notification").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "notification should be audited as denied"
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_and_drop_connection(
+                notification,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-notification").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send channel_send notification through MCP".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("invalid_json_rpc")
+            && event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
+}
+
+#[tokio::test]
+async fn mcp_channel_send_rejects_invalid_json_rpc_id_without_outbox_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-bad-id").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let invalid = json!({
+        "jsonrpc": "2.0",
+        "id": {"not": "valid"},
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "this should not enqueue"
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![invalid],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-bad-id").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send malformed MCP request id".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert!(responses[0]["id"].is_null());
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32600));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("request id")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(outbox.deliveries.is_empty());
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("invalid_json_rpc")
+            && event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
 }
 
 #[tokio::test]
@@ -720,11 +1248,25 @@ async fn channel_send_bridge_is_idempotent_for_same_payload_and_conflicts_on_cha
             "format_hint": "plain"
         }
     });
+    let unprojected_request = json!({
+        "idempotency_key": "retryable-call",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:intruder",
+        "content": {
+            "text": "different payload",
+            "format_hint": "plain"
+        }
+    });
     kernel
         .register_runtime_adapter(
             "channel-send-runtime",
             Arc::new(ChannelSendProbeRuntime::send_requests(
-                vec![base_request.clone(), base_request, changed_request],
+                vec![
+                    base_request.clone(),
+                    base_request,
+                    changed_request,
+                    unprojected_request,
+                ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
                 ProbeFileSetup::None,
@@ -746,12 +1288,17 @@ async fn channel_send_bridge_is_idempotent_for_same_payload_and_conflicts_on_cha
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    assert_eq!(responses.len(), 3);
+    assert_eq!(responses.len(), 4);
     assert_eq!(responses[0]["ok"].as_bool(), Some(true));
     assert_eq!(responses[1]["ok"].as_bool(), Some(true));
     assert_eq!(responses[0]["delivery_id"], responses[1]["delivery_id"]);
     assert_eq!(responses[2]["ok"].as_bool(), Some(false));
     assert_eq!(responses[2]["error"]["code"].as_str(), Some("conflict"));
+    assert_eq!(responses[3]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[3]["error"]["code"].as_str(),
+        Some("route_not_allowed")
+    );
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
@@ -904,7 +1451,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
     let expected_codes = [
         "invalid_format",
         "empty_content",
-        "unknown_channel",
+        "route_not_allowed",
         "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
@@ -1001,9 +1548,14 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
 
     let responses = responses.lock().expect("responses lock").clone();
     assert_eq!(responses.len(), 4);
-    for response in &responses {
+    for (response, expected_code) in responses.iter().zip([
+        "invalid_request",
+        "invalid_request",
+        "invalid_request",
+        "empty_content",
+    ]) {
         assert_eq!(response["ok"].as_bool(), Some(false));
-        assert_eq!(response["error"]["code"].as_str(), Some("invalid_request"));
+        assert_eq!(response["error"]["code"].as_str(), Some(expected_code));
     }
     assert!(responses[0]["error"]["message"]
         .as_str()
@@ -1016,7 +1568,7 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
         .is_some_and(|message| message.contains("conversation_ref is required")));
     assert!(responses[3]["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("content is required")));
+        .is_some_and(|message| message.contains("content text or attachments are required")));
 
     let denied = kernel
         .query_audit(
@@ -1032,7 +1584,11 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
         .iter()
         .filter(|event| event.details["reason"].as_str() == Some("invalid_request"))
         .count();
-    assert_eq!(invalid_request_denials, 4);
+    assert_eq!(invalid_request_denials, 3);
+    assert!(denied
+        .events
+        .iter()
+        .any(|event| event.details["reason"].as_str() == Some("empty_content")));
     assert!(denied.events.iter().any(|event| {
         event.details["channel_id"].as_str() == Some("")
             && event.details["conversation_ref"].as_str() == Some("member:reviewer")
@@ -1053,7 +1609,7 @@ async fn channel_send_bridge_audits_setup_failures() {
     kernel
         .register_runtime_adapter(
             "channel-send-runtime",
-            Arc::new(ChannelSendProbeRuntime::record_environment(Arc::new(
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(Arc::new(
                 Mutex::new(Vec::new()),
             ))),
         )
@@ -1172,12 +1728,17 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
         .take()
         .expect("runtime should hold an open socket connection");
     let request = json!({
-        "idempotency_key": "after-turn-complete",
-        "channel_id": "local-cli",
-        "conversation_ref": "member:reviewer",
-        "content": {
-            "text": "this must not enqueue",
-            "format_hint": "plain"
+        "jsonrpc": "2.0",
+        "id": "after-turn-complete",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "this must not enqueue",
+                "format_hint": "plain"
+            }
         }
     });
     let mut line = serde_json::to_vec(&request).expect("serialize request");
@@ -1192,6 +1753,10 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
     {
         if !response.trim().is_empty() {
             let response: Value = serde_json::from_str(response.trim()).expect("decode response");
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], "after-turn-complete");
+            assert_eq!(response["result"]["isError"].as_bool(), Some(true));
+            let response = mcp_tool_text_json(&response);
             assert_eq!(response["ok"].as_bool(), Some(false));
             assert_eq!(response["error"]["code"].as_str(), Some("bridge_closed"));
         }
@@ -1245,11 +1810,12 @@ async fn channel_send_bridge_rejects_excess_connections() {
 
     let responses = responses.lock().expect("responses lock").clone();
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[0]["error"]["code"].as_str(),
-        Some("connection_limit")
-    );
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32000));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("accepts at most")));
 
     let denied = kernel
         .query_audit(
@@ -1398,12 +1964,25 @@ async fn channel_send_bridge_audits_wire_protocol_denials() {
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    let expected_codes = ["invalid_json", "invalid_request", "request_too_large"];
-    assert_eq!(responses.len(), expected_codes.len());
-    for (response, expected_code) in responses.iter().zip(expected_codes) {
-        assert_eq!(response["ok"].as_bool(), Some(false));
-        assert_eq!(response["error"]["code"].as_str(), Some(expected_code));
-    }
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32700));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("valid MCP JSON-RPC")));
+    assert_eq!(responses[1]["jsonrpc"], "2.0");
+    assert_eq!(responses[1]["id"], Value::Null);
+    assert_eq!(responses[1]["error"]["code"].as_i64(), Some(-32600));
+    assert!(responses[1]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("newline")));
+    assert_eq!(responses[2]["jsonrpc"], "2.0");
+    assert_eq!(responses[2]["id"], Value::Null);
+    assert_eq!(responses[2]["error"]["code"].as_i64(), Some(-32000));
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("exceeds")));
 
     let denied = kernel
         .query_audit(
@@ -1414,7 +1993,7 @@ async fn channel_send_bridge_audits_wire_protocol_denials() {
         )
         .await
         .expect("query denied audit events");
-    for expected_code in expected_codes {
+    for expected_code in ["invalid_json", "invalid_request", "request_too_large"] {
         assert!(
             denied.events.iter().any(|event| {
                 event.details["reason"].as_str() == Some(expected_code)
@@ -1428,8 +2007,8 @@ async fn channel_send_bridge_audits_wire_protocol_denials() {
 
 #[derive(Clone)]
 enum RuntimeAction {
-    RecordEnvironment {
-        observed: RecordedEnvironments,
+    RecordMcpServers {
+        observed: RecordedMcpServers,
     },
     SendRequests {
         requests: Vec<Value>,
@@ -1483,8 +2062,8 @@ impl ChannelSendProbeRuntime {
         self
     }
 
-    fn record_environment(observed: RecordedEnvironments) -> Self {
-        Self::new(RuntimeAction::RecordEnvironment { observed })
+    fn record_mcp_servers(observed: RecordedMcpServers) -> Self {
+        Self::new(RuntimeAction::RecordMcpServers { observed })
     }
 
     fn send_requests(
@@ -1660,11 +2239,11 @@ impl RuntimeAdapter for DirectSocketProbeRuntime {
 
 async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionContext) -> Result<()> {
     match action {
-        RuntimeAction::RecordEnvironment { observed } => {
+        RuntimeAction::RecordMcpServers { observed } => {
             observed
                 .lock()
-                .expect("observed env lock")
-                .push(context.environment.clone());
+                .expect("observed mcp servers lock")
+                .push(context.mcp_servers.clone());
             Ok(())
         }
         RuntimeAction::SendRequests {
@@ -1674,13 +2253,19 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
             file_setup,
         } => {
             let runtime_root = runtime_state_root(context)?;
-            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-                .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(context, &socket)?;
+            let host_socket = channel_send_socket_host_path(context)?;
             socket_paths
                 .lock()
                 .expect("socket paths lock")
                 .push(host_socket);
+            let mcp_proxy =
+                host_path_for_runtime_path(context, CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH)?;
+            if !mcp_proxy.is_file() {
+                return Err(anyhow!(
+                    "channel.send MCP stdio proxy '{}' was not written",
+                    mcp_proxy.display()
+                ));
+            }
             prepare_probe_files(context, &runtime_root, *file_setup).await?;
             for request in requests {
                 let response = send_channel_send_request(context, request.clone()).await?;
@@ -1702,9 +2287,7 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
             socket_paths,
             duration,
         } => {
-            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-                .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(context, &socket)?;
+            let host_socket = channel_send_socket_host_path(context)?;
             if !host_socket.exists() {
                 return Err(anyhow!(
                     "channel send socket '{}' was not created",
@@ -1719,9 +2302,7 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
             Ok(())
         }
         RuntimeAction::HoldOpenConnection { held_stream } => {
-            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-                .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(context, &socket)?;
+            let host_socket = channel_send_socket_host_path(context)?;
             let stream = UnixStream::connect(&host_socket)
                 .await
                 .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1755,11 +2336,10 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
             Ok(())
         }
         RuntimeAction::SendAndDropConnection { request } => {
-            let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-                .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(context, &socket)?;
+            let host_socket = channel_send_socket_host_path(context)?;
             let mut stream = connect_channel_send_socket(&host_socket).await?;
-            let mut line = serde_json::to_vec(request).expect("serialize request");
+            let (request, _) = channel_send_probe_wire_request(request.clone());
+            let mut line = serde_json::to_vec(&request).expect("serialize request");
             line.push(b'\n');
             stream.write_all(&line).await.expect("write request");
             drop(stream);
@@ -1772,9 +2352,7 @@ async fn run_probe_action(action: &RuntimeAction, context: &RuntimeExecutionCont
 async fn open_channel_send_connections_to_limit(
     context: &RuntimeExecutionContext,
 ) -> Result<(PathBuf, Vec<UnixStream>)> {
-    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-        .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(context, &socket)?;
+    let host_socket = channel_send_socket_host_path(context)?;
     let mut held_streams = Vec::new();
     for _ in 0..TEST_CHANNEL_SEND_CONNECTION_LIMIT {
         held_streams.push(connect_channel_send_socket(&host_socket).await?);
@@ -1906,9 +2484,8 @@ async fn send_channel_send_request(
     context: &RuntimeExecutionContext,
     request: Value,
 ) -> Result<Value> {
-    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-        .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(context, &socket)?;
+    let (request, unwrap_tool_result) = channel_send_probe_wire_request(request);
+    let host_socket = channel_send_socket_host_path(context)?;
     let mut stream = UnixStream::connect(&host_socket)
         .await
         .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1923,16 +2500,19 @@ async fn send_channel_send_request(
         .read_line(&mut response)
         .await
         .expect("read response");
-    serde_json::from_str(response.trim()).context("decode response")
+    let response: Value = serde_json::from_str(response.trim()).context("decode response")?;
+    if unwrap_tool_result && response.get("result").is_some() {
+        Ok(mcp_tool_text_json(&response))
+    } else {
+        Ok(response)
+    }
 }
 
 async fn send_raw_channel_send_request(
     context: &RuntimeExecutionContext,
     request: &[u8],
 ) -> Result<Value> {
-    let socket = env_value(&context.environment, CHANNEL_SEND_SOCKET_ENV)
-        .context("channel send socket env missing")?;
-    let host_socket = host_path_for_runtime_path(context, &socket)?;
+    let host_socket = channel_send_socket_host_path(context)?;
     let mut stream = UnixStream::connect(&host_socket)
         .await
         .with_context(|| format!("connect {}", host_socket.display()))?;
@@ -1948,11 +2528,67 @@ async fn send_raw_channel_send_request(
     serde_json::from_str(response.trim()).context("decode response")
 }
 
-fn env_value(environment: &[(String, String)], key: &str) -> Option<String> {
-    environment
+fn mcp_tool_text_json(response: &Value) -> Value {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("MCP tool text content");
+    serde_json::from_str(text).expect("MCP tool text should contain JSON")
+}
+
+fn channel_send_probe_wire_request(request: Value) -> (Value, bool) {
+    if request.get("jsonrpc").is_some() {
+        return (request, false);
+    }
+    let id = request
+        .get("idempotency_key")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut arguments = serde_json::Map::new();
+    for key in [
+        "idempotency_key",
+        "channel_id",
+        "conversation_ref",
+        "thread_ref",
+        "reply_to_ref",
+    ] {
+        if let Some(value) = request.get(key) {
+            arguments.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(content) = request.get("content") {
+        if let Some(value) = content.get("text") {
+            arguments.insert("text".to_string(), value.clone());
+        }
+        if let Some(value) = content.get("format_hint") {
+            arguments.insert("format_hint".to_string(), value.clone());
+        }
+        if let Some(value) = content.get("attachments") {
+            arguments.insert("attachments".to_string(), value.clone());
+        }
+    }
+
+    (
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "channel_send",
+                "arguments": Value::Object(arguments),
+            }
+        }),
+        true,
+    )
+}
+
+fn channel_send_socket_host_path(context: &RuntimeExecutionContext) -> Result<PathBuf> {
+    let socket = context
+        .mcp_servers
         .iter()
-        .find(|(candidate, _)| candidate == key)
-        .map(|(_, value)| value.clone())
+        .find(|server| server.name == CHANNEL_SEND_MCP_SERVER_NAME)
+        .and_then(|server| server.args.get(1))
+        .context("channel.send MCP server socket path missing")?;
+    host_path_for_runtime_path(context, socket)
 }
 
 fn socket_dir_has_channel_send_socket(socket_dir: &Path) -> bool {
@@ -1989,6 +2625,25 @@ async fn kernel_with_channel_send_preset(env: &TestHome, enabled: bool) -> Kerne
 }
 
 fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
+    let mut options = base_channel_send_kernel_options(env, enabled);
+    if enabled {
+        apply_project_channel_send_routes(
+            &mut options,
+            env,
+            channel_send_inventory_for_reviewer_route(None),
+        );
+    }
+    options
+}
+
+fn channel_send_kernel_options_without_project_routes(
+    env: &TestHome,
+    enabled: bool,
+) -> KernelOptions {
+    base_channel_send_kernel_options(env, enabled)
+}
+
+fn base_channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
     let mut escape_classes = BTreeSet::new();
     if enabled {
         escape_classes.insert(EscapeClass::ChannelSend);
@@ -2010,11 +2665,37 @@ fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
     }
 }
 
+fn channel_send_inventory_for_reviewer_route(thread_ref: Option<&str>) -> ProjectInstanceInventory {
+    ProjectInstanceInventory::new_channel_send(
+        Some("main".to_string()),
+        vec![
+            ProjectInstanceInventoryEntry::identity("main".to_string()),
+            ProjectInstanceInventoryEntry::with_channel_send(
+                "reviewer".to_string(),
+                ProjectInstanceChannelSend::configured(
+                    "local-cli".to_string(),
+                    "member:reviewer".to_string(),
+                    thread_ref.map(ToString::to_string),
+                ),
+            ),
+        ],
+    )
+}
+
 fn channel_send_kernel_options_with_project_routes(
     env: &TestHome,
     channel_send_inventory: ProjectInstanceInventory,
 ) -> KernelOptions {
-    let mut options = channel_send_kernel_options(env, true);
+    let mut options = base_channel_send_kernel_options(env, true);
+    apply_project_channel_send_routes(&mut options, env, channel_send_inventory);
+    options
+}
+
+fn apply_project_channel_send_routes(
+    options: &mut KernelOptions,
+    env: &TestHome,
+    channel_send_inventory: ProjectInstanceInventory,
+) {
     let project_root = env.temp_dir().to_path_buf();
     let identity_inventory = ProjectInstanceInventory::new(
         Some("main".to_string()),
@@ -2025,7 +2706,6 @@ fn channel_send_kernel_options_with_project_routes(
         ProjectInstanceRuntimeContext::new(project_root, "main".to_string(), identity_inventory)
             .with_channel_send_inventory(channel_send_inventory),
     );
-    options
 }
 
 async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: &str) {
