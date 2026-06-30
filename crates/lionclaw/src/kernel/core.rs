@@ -23248,37 +23248,28 @@ impl Kernel {
                     source_fingerprint: Some(fingerprint),
                     idempotent: true,
                 },
-                move |_intent| {
-                    let runtime_context = runtime_context.clone();
-                    let runtime_content = runtime_content.clone();
-                    let runtime_format_hint = runtime_format_hint.clone();
-                    let kernel = kernel.clone();
-                    async move {
-                        let runtime_artifacts =
-                            runtime_channel_send_artifacts(&runtime_context, &runtime_content)?;
-                        validate_runtime_channel_send_artifacts(
-                            &runtime_context,
+                move |_intent| async move {
+                    let runtime_artifacts =
+                        runtime_channel_send_artifacts(&runtime_context, &runtime_content)?;
+                    validate_runtime_channel_send_artifacts(&runtime_context, &runtime_artifacts)
+                        .await?;
+                    let artifact_roots = runtime_context.artifact_roots();
+                    let attachments = kernel
+                        .prepare_runtime_artifact_attachments_from_roots(
+                            runtime_context.turn_id,
+                            &artifact_roots,
                             &runtime_artifacts,
                         )
-                        .await?;
-                        let artifact_roots = runtime_context.artifact_roots();
-                        let attachments = kernel
-                            .prepare_runtime_artifact_attachments_from_roots(
-                                runtime_context.turn_id,
-                                &artifact_roots,
-                                &runtime_artifacts,
-                            )
-                            .await
-                            .map_err(runtime_channel_send_kernel_problem)?;
-                        Ok::<_, RuntimeChannelSendProblem>(BrokerChannelSendContent {
-                            delivery: ChannelDeliveryContent {
-                                text: runtime_content.text.clone(),
-                                format_hint: runtime_format_hint,
-                                attachments: attachments.as_slice().to_vec(),
-                            },
-                            prepared_attachments: Some(attachments),
-                        })
-                    }
+                        .await
+                        .map_err(runtime_channel_send_kernel_problem)?;
+                    Ok::<_, RuntimeChannelSendProblem>(BrokerChannelSendContent {
+                        delivery: ChannelDeliveryContent {
+                            text: runtime_content.text.clone(),
+                            format_hint: runtime_format_hint,
+                            attachments: attachments.as_slice().to_vec(),
+                        },
+                        prepared_attachments: Some(attachments),
+                    })
                 },
             )
             .await
