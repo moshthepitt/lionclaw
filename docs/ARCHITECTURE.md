@@ -354,21 +354,20 @@ outbox delivery.
 
 ## Program-Backed `channel.send`
 
-Program-backed runtimes use a turn-scoped Unix socket for outbound channel
+Program-backed runtimes use a turn-scoped MCP server for outbound channel
 delivery. When the effective execution preset includes `channel-send`, the
-kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
-at `/runtime/lionclaw/channel-send.sock`. It also writes a small stdio proxy
-under `/runtime` and passes a `lionclaw` MCP server spec to program-backed
-drivers that support MCP. The proxy is transport only: it forwards JSON-RPC
-lines between stdio and the Unix socket. Tool listing, `channel_send` calls,
-authorization, audit, and enqueueing all terminate in the kernel broker outside
-the sandbox.
+kernel mounts a LionClaw-owned socket at `/runtime/lionclaw/channel-send.sock`,
+writes a small stdio proxy under `/runtime`, and passes a `lionclaw` MCP server
+spec to program-backed drivers that support MCP. The proxy is transport only:
+it forwards JSON-RPC lines between stdio and the Unix socket. Tool listing,
+`channel_send` calls, authorization, audit, and enqueueing all terminate in the
+kernel broker outside the sandbox.
 
-Without that escape class, the environment variable, MCP server spec, proxy,
-and usable socket are absent. The bridge is valid only while the runtime turn is
-active; turn completion or timeout removes the socket and invalidates open
-connections. Native runtime controls and native runtime TUI sessions do not
-receive this bridge or MCP tool.
+Without that escape class, the MCP server spec, proxy, and usable socket are
+absent. The bridge is valid only while the runtime turn is active; turn
+completion or timeout removes the socket and invalidates open connections.
+Native runtime controls and native runtime TUI sessions do not receive this
+bridge or MCP tool.
 
 The host socket is created under the operator's short per-user runtime directory
 rather than under the instance home, so long project paths do not exceed Unix
@@ -376,12 +375,12 @@ socket path limits. OCI launches that mount a Unix socket disable Podman's
 SELinux process label for that turn; otherwise SELinux hosts can expose the
 socket inode but deny `connect(2)`.
 
-The socket accepts one request per connection: write one newline-delimited JSON
-object, read one newline-delimited JSON object, then close. The kernel accepts
-both the original channel-send request shape and MCP JSON-RPC requests for
-`initialize`, `tools/list`, and `tools/call channel_send`. `channel_send`
-arguments name a configured channel route, provider-neutral content, and either
-an explicit idempotency key or the JSON-RPC request id as a derived retry key.
+The socket is private transport for the MCP stdio proxy and accepts one MCP
+JSON-RPC request per connection: write one newline-delimited JSON object, read
+one newline-delimited JSON object, then close. The kernel supports `initialize`,
+`tools/list`, and `tools/call channel_send`. `channel_send` arguments name a
+configured channel route, provider-neutral content, and either an explicit
+idempotency key or the JSON-RPC request id as a derived retry key.
 Attachment content is not sent over the socket; the request names files under
 `/runtime` control state or a generated-artifact directory declared by the
 runtime adapter under the persistent native home. The persistent native home

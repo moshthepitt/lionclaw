@@ -17,7 +17,7 @@ use rustix::{
     fs::{flock, FlockOperation},
     io::Errno,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
@@ -207,7 +207,6 @@ const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
 const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
 const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
 const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
-const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
 const CHANNEL_SEND_MCP_SERVER_NAME: &str = "lionclaw";
@@ -421,33 +420,25 @@ impl RuntimeChannelSendContext {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
 struct RuntimeChannelSendRequest {
-    #[serde(default)]
     idempotency_key: String,
-    #[serde(default)]
     channel_id: String,
-    #[serde(default)]
     conversation_ref: String,
-    #[serde(default)]
     thread_ref: Option<String>,
-    #[serde(default)]
     reply_to_ref: Option<String>,
-    #[serde(default)]
-    content: Option<RuntimeChannelSendContent>,
+    content: RuntimeChannelSendContent,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
 struct RuntimeChannelSendContent {
-    #[serde(default)]
     text: String,
-    #[serde(default = "default_runtime_channel_send_format_hint")]
     format_hint: String,
-    #[serde(default)]
     attachments: Vec<RuntimeChannelSendAttachment>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeChannelSendAttachment {
     #[serde(default)]
     path: String,
@@ -458,6 +449,7 @@ struct RuntimeChannelSendAttachment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeMcpChannelSendArguments {
     #[serde(default)]
     idempotency_key: Option<String>,
@@ -13346,12 +13338,6 @@ done
             .await
             .expect("prepare attached runtime launch");
 
-        assert!(launch
-            .request
-            .plan
-            .environment
-            .iter()
-            .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
         assert!(launch.request.plan.escape_classes.is_empty());
         assert!(launch.request.plan.mcp_servers.is_empty());
         assert!(launch
@@ -17738,36 +17724,23 @@ async fn handle_runtime_channel_send_stream(
     .await
     {
         Ok(Ok(())) => match serde_json::from_slice::<Value>(&line) {
-            Ok(value) if runtime_channel_send_is_mcp_request(&value) => {
-                runtime_channel_send_mcp_response(&kernel, &context, value).await
-            }
-            Ok(value) => match serde_json::from_value::<RuntimeChannelSendRequest>(value) {
-                Ok(request) => Some(runtime_channel_send_response(
-                    kernel.send_runtime_channel_message(context, request).await,
-                )),
-                Err(err) => Some(
-                    runtime_channel_send_denied_response(
+            Ok(value) => runtime_channel_send_mcp_response(&kernel, &context, value).await,
+            Err(err) => {
+                let problem = RuntimeChannelSendProblem::new(
+                    "invalid_json",
+                    format!("request is not valid MCP JSON-RPC: {err}"),
+                );
+                Some(
+                    runtime_channel_send_mcp_denied_response(
                         &kernel,
                         &context,
-                        RuntimeChannelSendProblem::new(
-                            "invalid_json",
-                            format!("request is not valid channel.send JSON: {err}"),
-                        ),
+                        Value::Null,
+                        -32700,
+                        problem,
                     )
                     .await,
-                ),
-            },
-            Err(err) => Some(
-                runtime_channel_send_denied_response(
-                    &kernel,
-                    &context,
-                    RuntimeChannelSendProblem::new(
-                        "invalid_json",
-                        format!("request is not valid channel.send JSON: {err}"),
-                    ),
                 )
-                .await,
-            ),
+            }
         },
         Ok(Err(problem)) => {
             Some(runtime_channel_send_denied_response(&kernel, &context, problem).await)
@@ -17850,22 +17823,45 @@ async fn read_bounded_json_line(
     }
 }
 
-fn runtime_channel_send_is_mcp_request(value: &Value) -> bool {
-    value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
-}
-
 async fn runtime_channel_send_mcp_response(
     kernel: &Kernel,
     context: &RuntimeChannelSendContext,
     request: Value,
 ) -> Option<Value> {
     let id = request.get("id").cloned();
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        let problem = RuntimeChannelSendProblem::new(
+            "invalid_json_rpc",
+            "MCP request jsonrpc must be \"2.0\"",
+        );
+        return Some(
+            runtime_channel_send_mcp_denied_response(
+                kernel,
+                context,
+                id.unwrap_or(Value::Null),
+                -32600,
+                problem,
+            )
+            .await,
+        );
+    }
     let method = match request.get("method").and_then(Value::as_str) {
         Some(method) => method,
         None => {
-            return id.map(|id| {
-                runtime_channel_send_json_rpc_error(id, -32600, "MCP request method is required")
-            });
+            let problem = RuntimeChannelSendProblem::new(
+                "invalid_json_rpc",
+                "MCP request method is required",
+            );
+            return Some(
+                runtime_channel_send_mcp_denied_response(
+                    kernel,
+                    context,
+                    id.unwrap_or(Value::Null),
+                    -32600,
+                    problem,
+                )
+                .await,
+            );
         }
     };
     if method == "notifications/initialized" {
@@ -17889,15 +17885,45 @@ async fn runtime_channel_send_mcp_response(
                         .await;
                     runtime_channel_send_mcp_tool_result(id, result)
                 }
-                Err(message) => runtime_channel_send_json_rpc_error(id, -32602, message),
+                Err(message) => {
+                    runtime_channel_send_mcp_denied_response(
+                        kernel,
+                        context,
+                        id,
+                        -32602,
+                        RuntimeChannelSendProblem::new("invalid_request", message),
+                    )
+                    .await
+                }
             },
         ),
-        _ => Some(runtime_channel_send_json_rpc_error(
-            id,
-            -32601,
-            format!("unsupported MCP method '{method}'"),
-        )),
+        _ => Some(
+            runtime_channel_send_mcp_denied_response(
+                kernel,
+                context,
+                id,
+                -32601,
+                RuntimeChannelSendProblem::new(
+                    "unsupported_method",
+                    format!("unsupported MCP method '{method}'"),
+                ),
+            )
+            .await,
+        ),
     }
+}
+
+async fn runtime_channel_send_mcp_denied_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    id: Value,
+    json_rpc_code: i64,
+    problem: RuntimeChannelSendProblem,
+) -> Value {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    runtime_channel_send_json_rpc_error(id, json_rpc_code, problem.message)
 }
 
 fn runtime_channel_send_json_rpc_result(id: Value, result: Value) -> Value {
@@ -18018,8 +18044,7 @@ fn runtime_channel_send_request_from_mcp_call(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .map(Ok)
-        .unwrap_or_else(|| runtime_channel_send_mcp_idempotency_key(request_id))?;
+        .unwrap_or_else(|| runtime_channel_send_mcp_idempotency_key(request_id));
 
     Ok(RuntimeChannelSendRequest {
         idempotency_key,
@@ -18027,22 +18052,19 @@ fn runtime_channel_send_request_from_mcp_call(
         conversation_ref: arguments.conversation_ref,
         thread_ref: arguments.thread_ref,
         reply_to_ref: arguments.reply_to_ref,
-        content: Some(RuntimeChannelSendContent {
+        content: RuntimeChannelSendContent {
             text: arguments.text,
             format_hint: arguments.format_hint,
             attachments: arguments.attachments,
-        }),
+        },
     })
 }
 
-fn runtime_channel_send_mcp_idempotency_key(request_id: &Value) -> Result<String, String> {
+fn runtime_channel_send_mcp_idempotency_key(request_id: &Value) -> String {
     match request_id {
-        Value::String(value) if !value.trim().is_empty() => Ok(format!("mcp:{}", value.trim())),
-        Value::Number(value) => Ok(format!("mcp:{value}")),
-        _ => Err(
-            "channel_send arguments.idempotency_key is required when JSON-RPC id is not a string or number"
-                .to_string(),
-        ),
+        Value::String(value) if !value.trim().is_empty() => format!("mcp:{}", value.trim()),
+        Value::Number(value) => format!("mcp:{value}"),
+        _ => String::new(),
     }
 }
 
@@ -21605,12 +21627,6 @@ impl Kernel {
             access: MountAccess::ReadWrite,
         });
 
-        plan.environment
-            .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
-        plan.environment.push((
-            CHANNEL_SEND_SOCKET_ENV.to_string(),
-            CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
-        ));
         plan.mcp_servers
             .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
         plan.mcp_servers.push(channel_send_mcp_server_spec());
@@ -21651,8 +21667,6 @@ impl Kernel {
         if runtime_turn_mode != RuntimeTurnMode::ProgramBacked
             || !plan.escape_classes.contains(&EscapeClass::ChannelSend)
         {
-            plan.environment
-                .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
             plan.mcp_servers
                 .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
             return Ok(None);
@@ -22704,16 +22718,7 @@ impl Kernel {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let Some(content) = request.content.as_ref() else {
-            return self
-                .deny_runtime_channel_send(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    RuntimeChannelSendProblem::new("invalid_request", "content is required"),
-                )
-                .await;
-        };
+        let content = &request.content;
         let format_hint = content.format_hint.trim();
         if !matches!(format_hint, "plain" | "markdown" | "html") {
             return self

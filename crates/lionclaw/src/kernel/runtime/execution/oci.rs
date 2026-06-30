@@ -1146,17 +1146,13 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_emits_channel_send_socket_mount_and_env() {
+    fn oci_backend_emits_channel_send_socket_mount() {
         let mut request = sample_execution_request();
         request.plan.mounts.push(MountSpec {
             source: "/host/runtime/sockets/channel-send-test.sock".into(),
             target: "/runtime/lionclaw/channel-send.sock".to_string(),
             access: MountAccess::ReadWrite,
         });
-        request.plan.environment.push((
-            "LIONCLAW_CHANNEL_SEND_SOCKET".to_string(),
-            "/runtime/lionclaw/channel-send.sock".to_string(),
-        ));
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request, None).expect("prepare"),
@@ -1170,12 +1166,10 @@ mod tests {
                     .to_string(),
             ]
         }));
-        assert!(invocation.args.windows(2).any(|pair| {
-            pair == [
-                "--env".to_string(),
-                "LIONCLAW_CHANNEL_SEND_SOCKET=/runtime/lionclaw/channel-send.sock".to_string(),
-            ]
-        }));
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("LIONCLAW_CHANNEL_SEND_SOCKET")));
     }
 
     #[cfg(unix)]
