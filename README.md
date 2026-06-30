@@ -101,11 +101,11 @@ For Codex, LionClaw uses the outer container as the sandbox boundary and starts
 the inner Codex UI without Codex's own sandbox/approval layer; launch-time Codex
 config overrides mark the container workspace as trusted and disable update
 checks without rewriting the runtime-owned Codex config. Completed Codex and
-other supported native UI turns are reconciled from durable runtime state into
-LionClaw session history on exit.
-If a prior native launch did not finish cleanly, LionClaw reconciles before the
-next launch; prior LionClaw session history is then included in the generated
-runtime context.
+other native UI turns stay inside the runtime UI; attached mode does not import
+native transcripts into LionClaw session history or alter continuation state
+used by kernel-managed turns, and it does not consume the saved
+runtime-session ready marker that later driven turns use. Prior LionClaw
+session history is still included in the generated runtime context.
 LionClaw does not scrape terminal output.
 Because this is the runtime's own TUI, there is no LionClaw command layer
 inside it. LionClaw slash controls such as `/lionclaw reset` are unavailable
