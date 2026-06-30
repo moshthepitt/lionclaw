@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -19,7 +15,10 @@ use super::{
         ExecutionStdoutSender,
     },
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
-    plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
+    plan::{
+        map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkMode,
+        RuntimeAuthKind,
+    },
     process::{
         run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
         ProcessSession,
@@ -337,9 +336,10 @@ fn prepare_oci_process_launch(
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
         args.push("--workdir".to_string());
-        args.push(map_host_path_into_container(
+        args.push(map_host_path_into_runtime_mount(
             working_dir,
             &request.plan.mounts,
+            "working directory",
         )?);
     }
 
@@ -747,45 +747,6 @@ fn path_to_arg(path: &Path) -> Result<String> {
     path.to_str()
         .map(|value| value.to_string())
         .ok_or_else(|| anyhow!("path '{}' is not valid UTF-8", path.display()))
-}
-
-fn map_host_path_into_container(path: &str, mounts: &[MountSpec]) -> Result<String> {
-    let requested = PathBuf::from(path);
-    let (mount, relative) = longest_mount_prefix(&requested, mounts).ok_or_else(|| {
-        anyhow!(
-            "working directory '{}' is not inside any configured runtime mount",
-            requested.display()
-        )
-    })?;
-
-    let container_root = Path::new(&mount.target);
-    let mapped = if relative.as_os_str().is_empty() {
-        container_root.to_path_buf()
-    } else {
-        container_root.join(relative)
-    };
-
-    Ok(mapped.to_string_lossy().to_string())
-}
-
-fn longest_mount_prefix<'a>(
-    requested: &Path,
-    mounts: &'a [MountSpec],
-) -> Option<(&'a MountSpec, PathBuf)> {
-    mounts
-        .iter()
-        .filter_map(|mount| {
-            strip_mount_prefix(requested, &mount.source).map(|relative| (mount, relative))
-        })
-        .max_by_key(|(mount, _)| mount.source.components().count())
-}
-
-fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
-    if requested == source {
-        return Some(PathBuf::new());
-    }
-
-    requested.strip_prefix(source).ok().map(Path::to_path_buf)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1298,7 +1259,8 @@ mod tests {
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
@@ -1369,7 +1331,8 @@ mod tests {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
@@ -1395,12 +1358,16 @@ mod tests {
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request, None).expect("prepare"),
-            &[("CODEX_HOME".to_string(), "/runtime/home/.codex".to_string())],
+            &[(
+                "RUNTIME_AUTH_HOME".to_string(),
+                "/runtime/home/auth".to_string(),
+            )],
         );
 
         #[cfg(unix)]
@@ -1413,7 +1380,7 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
-                "CODEX_HOME=/runtime/home/.codex".to_string(),
+                "RUNTIME_AUTH_HOME=/runtime/home/auth".to_string(),
             ]
         }));
         assert!(
@@ -1435,7 +1402,8 @@ mod tests {
                 plan,
                 program: RuntimeProgramSpec::default(),
                 runtime_secrets_mount: None,
-                codex_home_override: None,
+                runtime_auth_provider: None,
+                runtime_auth_context: Default::default(),
             },
             None,
         )
@@ -1471,7 +1439,8 @@ mod tests {
                 plan,
                 program: RuntimeProgramSpec::default(),
                 runtime_secrets_mount: None,
-                codex_home_override: None,
+                runtime_auth_provider: None,
+                runtime_auth_context: Default::default(),
             },
             None,
         )
@@ -1531,7 +1500,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
         fs::write(
             request
@@ -1624,7 +1594,8 @@ esac
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         };
         fs::write(
             request
@@ -1671,6 +1642,7 @@ esac
                     pids_limit: Some(256),
                 },
             }),
+            skill_projection: None,
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
             working_dir: Some("/host/workspace/src".to_string()),
@@ -1730,7 +1702,8 @@ esac
                 auth: None,
             },
             runtime_secrets_mount: None,
-            codex_home_override: None,
+            runtime_auth_provider: None,
+            runtime_auth_context: Default::default(),
         }
     }
 

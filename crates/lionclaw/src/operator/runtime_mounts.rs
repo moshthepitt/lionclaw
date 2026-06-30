@@ -247,10 +247,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn profile(engine: String, source: Option<PathBuf>) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+        RuntimeProfileConfig::new(
+            "codex",
+            "codex",
+            ConfinementConfig::Oci(OciConfinementConfig {
                 engine,
                 image: Some("runtime:v1".to_string()),
                 read_only_rootfs: false,
@@ -266,7 +266,7 @@ mod tests {
                     .unwrap_or_default(),
                 limits: ExecutionLimits::default(),
             }),
-        }
+        )
     }
 
     #[test]

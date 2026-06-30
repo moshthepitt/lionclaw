@@ -8,8 +8,12 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use lionclaw_runtime_api::{
+    NetworkMode, RuntimeAuthContext, RuntimeAuthPreparation, RuntimeAuthProvider,
+};
 use reqwest::StatusCode;
 use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,47 @@ const ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::seconds(120);
 const ACCESS_TOKEN_FALLBACK_TTL: Duration = Duration::hours(1);
 const OPENAI_OAUTH_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const OPENAI_OAUTH_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const CONTAINER_CODEX_HOME: &str = "/runtime/home/.codex";
+
+#[derive(Debug, Clone, Copy)]
+pub struct CodexRuntimeAuthProvider;
+
+#[async_trait]
+impl RuntimeAuthProvider for CodexRuntimeAuthProvider {
+    fn kind(&self) -> &'static str {
+        crate::CODEX_RUNTIME_AUTH_KIND
+    }
+
+    async fn validate(&self, context: &RuntimeAuthContext) -> Result<()> {
+        ensure_codex_host_auth_ready(codex_home_override(context)).await
+    }
+
+    async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>> {
+        prepare_codex_runtime_auth(
+            input.runtime_id,
+            input.network_mode == NetworkMode::On,
+            input.runtime_home_root,
+            codex_home_override(input.host_context),
+        )
+        .await
+    }
+
+    fn host_home_override_env(&self) -> Option<&'static str> {
+        Some(CODEX_HOME_ENV)
+    }
+
+    fn identity(&self, context: &RuntimeAuthContext) -> Result<Option<String>> {
+        codex_home_identity(codex_home_override(context))
+    }
+
+    fn guidance(&self) -> Option<&'static str> {
+        Some("Codex auth is checked at launch; run `codex login` on the host if launch reports missing auth.")
+    }
+}
+
+fn codex_home_override(context: &RuntimeAuthContext) -> Option<&Path> {
+    context.home_override(crate::CODEX_RUNTIME_AUTH_KIND)
+}
 
 #[derive(Debug, Clone)]
 struct CodexAuthStore {
@@ -180,6 +225,57 @@ pub async fn sync_codex_home_into_runtime_home(
     )
     .await?;
     Ok(())
+}
+
+pub async fn prepare_codex_runtime_auth(
+    runtime_id: &str,
+    network_enabled: bool,
+    runtime_home_root: Option<&Path>,
+    codex_home_override: Option<&Path>,
+) -> Result<Vec<(String, String)>> {
+    if !network_enabled {
+        bail!(
+            "runtime '{runtime_id}' requires network-mode 'on' when Codex runtime auth is enabled"
+        );
+    }
+
+    let runtime_home_root = runtime_home_root.ok_or_else(|| {
+        anyhow!(
+            "runtime '{runtime_id}' requires a /runtime/home mount when Codex runtime auth is enabled"
+        )
+    })?;
+    sync_codex_home_into_runtime_home(runtime_home_root, codex_home_override).await?;
+
+    Ok(vec![(
+        CODEX_HOME_ENV.to_string(),
+        CONTAINER_CODEX_HOME.to_string(),
+    )])
+}
+
+pub fn codex_home_identity(codex_home_override: Option<&Path>) -> Result<Option<String>> {
+    let path = match codex_home_override {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let Some(home) = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+            else {
+                return Ok(None);
+            };
+            home.join(".codex")
+        }
+    };
+    normalize_identity_path(&path).map(Some)
+}
+
+fn normalize_identity_path(path: &Path) -> Result<String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let normalized = resolved.canonicalize().unwrap_or(resolved);
+    Ok(format!("codex-home:{}", normalized.display()))
 }
 
 #[derive(Debug, Clone)]

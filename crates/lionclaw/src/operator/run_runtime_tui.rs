@@ -107,15 +107,15 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: String::new(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            RuntimeProfileConfig::new(
+                "codex",
+                String::new(),
+                ConfinementConfig::Oci(OciConfinementConfig {
                     engine: "podman".to_string(),
                     image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                     ..OciConfinementConfig::default()
                 }),
-            },
+            ),
         );
         config.save(&home).await.expect("save config");
 

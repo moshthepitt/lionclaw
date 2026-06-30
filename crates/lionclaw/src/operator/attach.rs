@@ -388,7 +388,7 @@ mod tests {
         config::resolve_project_workspace_root,
         contracts::DaemonInfoResponse,
         home::{runtime_project_partition_key, LionClawHome},
-        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig},
         operator::{
             channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
@@ -397,6 +397,7 @@ mod tests {
             runtime::resolve_runtime_execution_context,
         },
     };
+    use lionclaw_runtime_codex::codex_runtime_auth_kind;
 
     fn binaries() -> crate::operator::reconcile::StackBinaryPaths {
         crate::operator::reconcile::StackBinaryPaths {
@@ -522,15 +523,17 @@ mod tests {
         config.daemon.bind = bind;
         config.runtimes = [(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            RuntimeProfileConfig::new(
+                "codex",
+                "codex",
+                ConfinementConfig::Oci(OciConfinementConfig {
                     engine: podman.to_string_lossy().to_string(),
                     image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                     ..OciConfinementConfig::default()
                 }),
-            },
+            )
+            .with_auth(codex_runtime_auth_kind())
+            .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills")),
         )]
         .into_iter()
         .collect();

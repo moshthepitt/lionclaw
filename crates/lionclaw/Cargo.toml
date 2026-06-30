@@ -23,9 +23,9 @@ hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 lionclaw-durable-fs.workspace = true
 lionclaw-runtime-api.workspace = true
+lionclaw-runtime-acp.workspace = true
 lionclaw-runtime-codex.workspace = true
 lionclaw-runtime-mock.workspace = true
-lionclaw-runtime-opencode.workspace = true
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9.1"

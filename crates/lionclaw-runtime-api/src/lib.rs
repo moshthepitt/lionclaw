@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lionclaw_durable_fs::write_file_atomically;
 use rustix::{
-    fs::{open, openat, Mode, OFlags},
+    fs::{open, openat, unlinkat, AtFlags, Mode, OFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -136,9 +136,141 @@ impl fmt::Debug for RuntimeProgramSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeAuthKind {
-    Codex,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeAuthKind(String);
+
+impl RuntimeAuthKind {
+    pub fn new(kind: impl Into<String>) -> Result<Self, String> {
+        let kind = kind.into().trim().to_string();
+        if kind.is_empty() {
+            return Err("runtime auth kind is required".to_string());
+        }
+        Ok(Self(kind))
+    }
+
+    pub fn from_static(kind: &'static str) -> Self {
+        Self(kind.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RuntimeAuthKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthContext {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    home_overrides: BTreeMap<String, PathBuf>,
+}
+
+impl RuntimeAuthContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_home_override(mut self, kind: impl AsRef<str>, path: impl Into<PathBuf>) -> Self {
+        self.insert_home_override(kind, path);
+        self
+    }
+
+    pub fn insert_home_override(&mut self, kind: impl AsRef<str>, path: impl Into<PathBuf>) {
+        let kind = kind.as_ref().trim();
+        if !kind.is_empty() {
+            self.home_overrides.insert(kind.to_string(), path.into());
+        }
+    }
+
+    pub fn home_override(&self, kind: &str) -> Option<&Path> {
+        self.home_overrides.get(kind).map(PathBuf::as_path)
+    }
+
+    pub fn home_overrides(&self) -> &BTreeMap<String, PathBuf> {
+        &self.home_overrides
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.home_overrides.is_empty()
+    }
+}
+
+pub struct RuntimeAuthPreparation<'a> {
+    pub runtime_id: &'a str,
+    pub network_mode: NetworkMode,
+    pub runtime_home_root: Option<&'a Path>,
+    pub host_context: &'a RuntimeAuthContext,
+}
+
+#[async_trait]
+pub trait RuntimeAuthProvider: Send + Sync {
+    fn kind(&self) -> &'static str;
+
+    async fn validate(&self, context: &RuntimeAuthContext) -> Result<()>;
+
+    async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>>;
+
+    fn host_home_override_env(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn identity(&self, _context: &RuntimeAuthContext) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn guidance(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeAuthRegistry {
+    providers: Arc<BTreeMap<String, Arc<dyn RuntimeAuthProvider>>>,
+}
+
+impl RuntimeAuthRegistry {
+    pub fn new(providers: impl IntoIterator<Item = Arc<dyn RuntimeAuthProvider>>) -> Self {
+        let providers = providers
+            .into_iter()
+            .map(|provider| (provider.kind().to_string(), provider))
+            .collect();
+        Self {
+            providers: Arc::new(providers),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, auth: &RuntimeAuthKind) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        self.get_kind(auth.as_str())
+    }
+
+    pub fn get_kind(&self, kind: &str) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        self.providers.get(kind).cloned()
+    }
+
+    pub fn providers(&self) -> impl Iterator<Item = Arc<dyn RuntimeAuthProvider>> + '_ {
+        self.providers.values().cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
+impl fmt::Debug for RuntimeAuthRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeAuthRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -611,6 +743,22 @@ pub fn save_state_value(
     )
 }
 
+pub fn clear_state_value(runtime_state_root: &Path, file_name: &str, label: &str) -> Result<()> {
+    let target_name = state_file_name(file_name)?;
+    let Some(root) = open_existing_state_root(runtime_state_root)? else {
+        return Ok(());
+    };
+    validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
+    match unlinkat(&root, &target_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(anyhow!(
+            "failed to remove {label} state file '{}' in '{}': {err}",
+            file_name,
+            runtime_state_root.display()
+        )),
+    }
+}
+
 fn validate_existing_state_file(
     root: &File,
     runtime_state_root: &Path,
@@ -815,6 +963,8 @@ pub struct RuntimeProgramTurnExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionContext {
     pub network_mode: NetworkMode,
+    /// Runtime-visible current working directory for program-backed turns.
+    pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub runtime_state_root: Option<PathBuf>,
     pub runtime_path_projections: Vec<RuntimePathProjection>,
@@ -1011,7 +1161,7 @@ pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeMessageLane {
     Answer,
     Reasoning,
@@ -1026,7 +1176,7 @@ impl RuntimeMessageLane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifact {
     pub artifact_id: String,
     pub path: PathBuf,
@@ -1061,7 +1211,7 @@ impl RuntimeNativeHomeArtifactDir {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeFileChangeStatus {
     Editing,
     Edited,
@@ -1070,7 +1220,7 @@ pub enum RuntimeFileChangeStatus {
     Changed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFileChange {
     pub runtime: String,
     pub operation_id: Option<String>,
@@ -1079,7 +1229,7 @@ pub struct RuntimeFileChange {
     pub total_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     MessageDelta {
         lane: RuntimeMessageLane,
@@ -1108,25 +1258,21 @@ pub enum RuntimeEvent {
 /// Raw, driver-specific payload retained alongside a canonical event for
 /// debugging. Retention is debug-only: it is never parsed back into canonical
 /// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawTurnPayload {
-    /// Driver/protocol that produced the payload, e.g. `"codex-app-server"`.
+    /// Driver/protocol that produced the payload, e.g. `"driver-protocol"`.
     pub driver: String,
     /// The payload exactly as the driver emitted it (e.g. one JSON-RPC line).
     pub payload: String,
 }
 
-// TODO(#159 OpenCode driver): the canonical journal is currently produced only
-// in tests (see the Codex equivalence test). Live program-backed turns and the
-// `ConversationDriver` trait adopt it when the second driver lands; remove this
-// note then.
 /// One record in a runtime turn's canonical journal.
 ///
 /// A protocol driver translates each harness message into journal records.
 /// `event` is the canonical, public output LionClaw persists, replays, and
 /// shows operators. `raw`, when present, retains the originating driver payload
 /// for debugging only and is excluded from every canonical projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEvent {
     pub event: RuntimeEvent,
     pub raw: Option<RawTurnPayload>,
@@ -1154,7 +1300,79 @@ pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeE
     journal.iter().map(|record| &record.event)
 }
 
+pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
+
+pub const RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER: &str = "{session_id}";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RuntimeTerminalConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_args: Vec<String>,
+}
+
+impl RuntimeTerminalConfig {
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty() && self.resume_args.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.resume_args.is_empty()
+            && !self
+                .resume_args
+                .iter()
+                .any(|arg| arg.contains(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER))
+        {
+            return Err(anyhow!(
+                "runtime terminal resume args must include '{RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER}'"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn rendered_resume_args(&self, session_id: &str) -> Result<Vec<String>> {
+        if self.resume_args.is_empty() {
+            return Err(anyhow!(
+                "runtime terminal profile cannot resume saved session without resume args"
+            ));
+        }
+        self.validate()?;
+        Ok(self
+            .resume_args
+            .iter()
+            .map(|arg| arg.replace(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER, session_id))
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeDriverConfig {
+    pub runtime_id: String,
+    pub executable: String,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub auth: Option<RuntimeAuthKind>,
+    pub terminal: RuntimeTerminalConfig,
+}
+
+pub trait RuntimeDriverProvider: Send + Sync {
+    fn driver(&self) -> &'static str;
+
+    fn validate_config(&self, _config: &RuntimeDriverConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
+
+    fn auth_provider(&self) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        None
+    }
+}
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
     existing.push_str(delta);
@@ -1206,7 +1424,7 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _events: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         Err(anyhow!("runtime does not implement direct turns"))
     }
@@ -1271,16 +1489,16 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: &RuntimeTurnInput,
         _output: &ExecutionOutput,
         _observed_error_text: Option<&str>,
-        _events: &RuntimeEventSender,
+        _journal: &RuntimeTurnJournalSender,
     ) -> Result<bool> {
         Ok(false)
     }
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        execute_program_backed_turn(self, execution, events).await
+        execute_program_backed_turn(self, execution, journal).await
     }
     async fn runtime_control(
         &self,
@@ -1330,7 +1548,7 @@ impl RuntimeRegistry {
 pub async fn execute_program_backed_turn<A>(
     adapter: &A,
     execution: RuntimeProgramTurnExecution,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1341,7 +1559,7 @@ where
         mut executor,
     } = execution;
 
-    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, events)
+    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, journal)
         .await
 }
 
@@ -1350,7 +1568,7 @@ async fn execute_program_backed_turn_with_executor<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1360,16 +1578,17 @@ where
 
     loop {
         let attempt =
-            run_program_backed_attempt(adapter, executor, &current_input, context, &events).await?;
+            run_program_backed_attempt(adapter, executor, &current_input, context, &journal)
+                .await?;
 
         if attempt.output.success() {
-            flush_buffered_program_output_events(&events, attempt.buffered_errors);
+            flush_buffered_program_output_events(&journal, attempt.buffered_errors);
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
                 attempt.last_error_text.as_deref(),
                 attempt.saw_done,
-                &events,
+                &journal,
             );
         }
 
@@ -1378,7 +1597,7 @@ where
                 &current_input,
                 &attempt.output,
                 attempt.last_error_text.as_deref(),
-                &events,
+                &journal,
             )?
         {
             attempted_retry = true;
@@ -1388,13 +1607,13 @@ where
             continue;
         }
 
-        flush_buffered_program_output_events(&events, attempt.buffered_errors);
+        flush_buffered_program_output_events(&journal, attempt.buffered_errors);
         return finish_program_backed_turn(
             adapter,
             attempt.output,
             attempt.last_error_text.as_deref(),
             attempt.saw_done,
-            &events,
+            &journal,
         );
     }
 }
@@ -1411,7 +1630,7 @@ async fn run_program_backed_attempt<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: &RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<ProgramBackedAttemptOutcome>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1433,7 +1652,7 @@ where
                     Some(line) => observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1442,7 +1661,7 @@ where
                     None => {
                         finish_program_output_parser(
                             &mut output_parser,
-                            events,
+                            journal,
                             &mut buffered_errors,
                             &mut saw_done,
                             &mut last_error_text,
@@ -1463,7 +1682,7 @@ where
                     observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1472,7 +1691,7 @@ where
                 }
                 finish_program_output_parser(
                     &mut output_parser,
-                    events,
+                    journal,
                     &mut buffered_errors,
                     &mut saw_done,
                     &mut last_error_text,
@@ -1491,7 +1710,7 @@ where
 fn observe_program_output_line<A>(
     adapter: &A,
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
@@ -1506,7 +1725,7 @@ fn observe_program_output_line<A>(
     };
 
     observe_program_output_events(
-        events,
+        journal,
         buffered_errors,
         parsed_events,
         saw_done,
@@ -1516,14 +1735,14 @@ fn observe_program_output_line<A>(
 
 fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
     if let Some(parser) = output_parser.as_mut() {
         observe_program_output_events(
-            events,
+            journal,
             buffered_errors,
             parser.finish(),
             saw_done,
@@ -1533,7 +1752,7 @@ fn finish_program_output_parser(
 }
 
 fn observe_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
     saw_done: &mut bool,
@@ -1550,21 +1769,21 @@ fn observe_program_output_events(
             if let Some(buffer) = buffered_errors.as_mut() {
                 buffer.push(event);
             } else {
-                drop(events.send(event));
+                drop(journal.send(TurnEvent::canonical(event)));
             }
         } else {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
 
 fn flush_buffered_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: Option<Vec<RuntimeEvent>>,
 ) {
     if let Some(buffered_errors) = buffered_errors {
         for event in buffered_errors {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
@@ -1574,7 +1793,7 @@ fn finish_program_backed_turn<A>(
     output: ExecutionOutput,
     observed_error_text: Option<&str>,
     saw_done: bool,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1586,7 +1805,7 @@ where
     }
 
     if !saw_done {
-        drop(events.send(RuntimeEvent::Done));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
     }
 
     Ok(RuntimeTurnResult {
@@ -1604,14 +1823,14 @@ mod tests {
     };
 
     use super::{
-        canonical_events, execute_program_backed_turn, load_ready_state_value, safe_relative_path,
-        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
-        RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimePathProjection,
-        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
+        safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
+        RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+        RuntimeExecutionContext, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, TurnEvent,
-        RUNTIME_SESSION_READY_MARKER,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
+        TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1629,8 +1848,8 @@ mod tests {
                     text: "hi".to_string(),
                 },
                 RawTurnPayload {
-                    driver: "codex-app-server".to_string(),
-                    payload: "{\"method\":\"item/agentMessage/delta\"}".to_string(),
+                    driver: "test-driver".to_string(),
+                    payload: "{\"method\":\"message/delta\"}".to_string(),
                 },
             ),
             TurnEvent::canonical(RuntimeEvent::Done),
@@ -1733,7 +1952,7 @@ mod tests {
             _input: &RuntimeTurnInput,
             _output: &ExecutionOutput,
             _observed_error_text: Option<&str>,
-            _events: &RuntimeEventSender,
+            _journal: &RuntimeTurnJournalSender,
         ) -> Result<bool> {
             Ok(!self
                 .retry_used
@@ -1835,6 +2054,7 @@ mod tests {
     fn execution_context() -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
@@ -1861,6 +2081,7 @@ mod tests {
     fn runtime_execution_context_resolves_longest_runtime_path_projection() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(PathBuf::from("/host/runtime-root")),
             runtime_path_projections: vec![
@@ -1905,6 +2126,7 @@ mod tests {
     fn runtime_execution_context_keeps_equal_depth_blocks_order_independent() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: vec![
@@ -1972,6 +2194,40 @@ mod tests {
             .expect("load state"),
             Some("session_saved".to_string())
         );
+    }
+
+    #[test]
+    fn clear_state_value_removes_regular_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let state_file = runtime_state_root.join("session-id");
+        std::fs::write(&state_file, "session_saved\n").expect("write state file");
+
+        clear_state_value(runtime_state_root, "session-id", "test session").expect("clear state");
+
+        assert!(
+            !state_file.exists(),
+            "state file should be removed after clear"
+        );
+        clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect("clearing a missing state file is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_state_value_rejects_symlinked_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let outside = temp_dir.path().join("outside");
+        std::fs::write(&outside, "do not remove\n").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, runtime_state_root.join("session-id"))
+            .expect("create state symlink");
+
+        let err = clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect_err("state symlink should be rejected");
+
+        assert!(err.to_string().contains("cannot be a symlink"));
+        assert!(outside.exists(), "clear must not follow state symlinks");
     }
 
     #[test]
@@ -2051,9 +2307,15 @@ mod tests {
         assert!(result.capability_requests.is_empty());
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "hello"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "hello"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2085,9 +2347,15 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "fresh"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "fresh"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
         assert!(
             event_rx.try_recv().is_err(),
             "stale error should stay buffered"
@@ -2124,7 +2392,7 @@ mod tests {
         assert!(err.to_string().contains("second"));
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::Error { text, .. }) if text == "second"
+            Some(TurnEvent { event: RuntimeEvent::Error { text, .. }, raw: None }) if text == "second"
         ));
         assert!(
             event_rx.try_recv().is_err(),
@@ -2209,7 +2477,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "slow"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "slow"
         ));
     }
 }

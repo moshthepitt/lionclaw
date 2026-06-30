@@ -82,6 +82,9 @@ Expected:
 - `main` and `reviewer` instance homes exist and can be targeted independently
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
+- runtime profiles in config use the current `driver`/`command` shape; old
+  `kind`/`executable` profiles intentionally fail to load with an explicit
+  format-break error rather than being migrated
 
 Check explicit runtime mounts:
 
@@ -145,6 +148,10 @@ Expected:
 
 - piped non-TTY usage avoids the console
 - `--plain` uses the line-oriented prompt even on a TTY
+- the debug-only session-turn journal API can read the completed turn's
+  canonical journal by `session_id` and `turn_id`; raw payloads are omitted
+  unless the request opts in and the kernel is running with raw runtime payload
+  retention enabled
 
 Check the selected runtime's native terminal UI:
 
@@ -166,15 +173,16 @@ Expected:
   boundary
 - Codex shows `/workspace` as the directory and no inner Codex sandbox or
   workspace-trust prompt
-- OpenCode native UI loads the generated LionClaw context through the
-  generated config that points at `/runtime/AGENTS.md`, without showing an
-  auto-update prompt
 - the answer is `LIONCLAW_NATIVE_TUI_CONTEXT_OK`
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
-- completed Codex and OpenCode native UI turns are present in LionClaw session
-  history and are available to later `lionclaw run`, `run --plain`, and
-  channel context
+- ACP profiles such as OpenCode launch the profile command as the native UI
+  without ACP protocol args; when the profile declares `terminal.resume-args`,
+  saved ready ACP sessions resume through those args; ACP profiles do not
+  guarantee canonical transcript import
+  unless the ACP driver later implements runtime-owned transcript export
+- completed Codex native UI turns are present in LionClaw session history and
+  are available to later `lionclaw run`, `run --plain`, and channel context
 - opening and exiting the native UI without completing a turn leaves the launch
   clean but does not prime a later program-backed continuation
 - after a clean exit, relaunching the native UI starts without a prelaunch
@@ -361,8 +369,8 @@ export QA_CHANNEL_ENV_FILE=/path/to/channel.env
 
 Expected when credentials are available:
 
-- the default runtime image reports Codex and OpenCode versions matching the
-  `CODEX_VERSION` and `OPENCODE_VERSION` pins in
+- the default runtime image reports the Codex version matching the
+  `CODEX_VERSION` pin in
   `containers/runtime/Containerfile`, and can run common assistant probes such
   as `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`

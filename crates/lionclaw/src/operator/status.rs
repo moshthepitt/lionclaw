@@ -212,8 +212,8 @@ fn push_runtime_status(output: &mut String, config: &OperatorConfig) {
     };
     let facts = runtime_profile_facts(profile);
     output.push_str(&format!(
-        "  runtime: {runtime_id} kind={} bin={} confinement={}\n",
-        facts.kind, facts.executable, facts.confinement
+        "  runtime: {runtime_id} driver={} bin={} confinement={}\n",
+        facts.driver, facts.executable, facts.confinement
     ));
     if let Some(engine) = facts.engine {
         output.push_str(&format!("    engine: {engine}\n"));
@@ -366,7 +366,7 @@ mod tests {
         assert!(output.contains(&format!("project: {}", project.project_root.display())));
         assert!(output.contains("selected instance: main"));
         assert!(output.contains("default runtime: codex"));
-        assert!(output.contains("runtime: codex kind=codex bin=codex"));
+        assert!(output.contains("runtime: codex driver=codex bin=codex"));
         assert!(output.contains("image: lionclaw-runtime:v1"));
         assert!(output.contains("readiness: ready"));
     }

@@ -23,8 +23,9 @@ use super::{
     plan::{
         runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
         ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
-        RuntimeAuthKind, WorkspaceAccess, DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET,
-        RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
+        RuntimeAuthKind, RuntimeSkillProjectionConfig, WorkspaceAccess, DRAFTS_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT,
+        WORKSPACE_MOUNT_TARGET,
     },
 };
 
@@ -38,6 +39,7 @@ pub struct RuntimeExecutionProfile {
     pub compatibility_key: String,
     pub image_identity: Option<String>,
     pub required_runtime_auth: Option<RuntimeAuthKind>,
+    pub skill_projection: Option<RuntimeSkillProjectionConfig>,
 }
 
 impl Default for RuntimeExecutionProfile {
@@ -49,6 +51,7 @@ impl Default for RuntimeExecutionProfile {
             compatibility_base_key,
             image_identity: None,
             required_runtime_auth: None,
+            skill_projection: None,
         }
     }
 }
@@ -68,7 +71,16 @@ impl RuntimeExecutionProfile {
             compatibility_key,
             image_identity,
             required_runtime_auth,
+            skill_projection: None,
         }
+    }
+
+    pub fn with_skill_projection(
+        mut self,
+        skill_projection: Option<RuntimeSkillProjectionConfig>,
+    ) -> Self {
+        self.skill_projection = skill_projection;
+        self
     }
 
     pub fn with_image_identity(mut self, image_identity: String) -> Self {
@@ -280,6 +292,7 @@ impl ExecutionPlanner {
             runtime_id: request.runtime_id,
             preset_name,
             confinement: runtime_profile.confinement,
+            skill_projection: runtime_profile.skill_projection,
             workspace_access: preset.workspace_access,
             network_mode: preset.network_mode,
             working_dir,
@@ -322,7 +335,7 @@ impl ExecutionPlanner {
     pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
         self.runtimes
             .get(runtime_id)
-            .and_then(|profile| profile.required_runtime_auth)
+            .and_then(|profile| profile.required_runtime_auth.clone())
     }
 
     pub fn runtime_profile(&self, runtime_id: &str) -> Option<&RuntimeExecutionProfile> {

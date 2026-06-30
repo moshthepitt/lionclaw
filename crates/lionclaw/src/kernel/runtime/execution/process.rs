@@ -2,7 +2,7 @@ use std::{fmt, io::ErrorKind, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
@@ -89,20 +89,16 @@ where
 
     let mut stdout_reader = BufReader::new(stdout);
     let mut captured_stdout = Vec::new();
-    let mut line = Vec::new();
+    let mut line_buffer = Vec::new();
 
     loop {
-        line.clear();
-        let bytes_read = stdout_reader
-            .read_until(b'\n', &mut line)
-            .await
-            .context("failed to read subprocess stdout")?;
-        if bytes_read == 0 {
+        let Some(line) =
+            read_next_process_line(&mut stdout_reader, &mut line_buffer, &mut captured_stdout)
+                .await?
+        else {
             break;
-        }
-        captured_stdout.extend_from_slice(&line);
-        let text = String::from_utf8_lossy(&line);
-        on_stdout_line(text.as_ref())?;
+        };
+        on_stdout_line(&line)?;
     }
 
     let status = child
@@ -155,6 +151,7 @@ pub struct ProcessSession {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout_reader: BufReader<ChildStdout>,
+    stdout_line_buffer: Vec<u8>,
     stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
     captured_stdout: Vec<u8>,
 }
@@ -181,17 +178,12 @@ impl ProcessSession {
     }
 
     pub async fn read_line(&mut self) -> Result<Option<String>> {
-        let mut line = Vec::new();
-        let bytes_read = self
-            .stdout_reader
-            .read_until(b'\n', &mut line)
-            .await
-            .context("failed to read subprocess stdout")?;
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-        self.captured_stdout.extend_from_slice(&line);
-        Ok(Some(String::from_utf8_lossy(&line).to_string()))
+        read_next_process_line(
+            &mut self.stdout_reader,
+            &mut self.stdout_line_buffer,
+            &mut self.captured_stdout,
+        )
+        .await
     }
 
     pub async fn close_stdin(&mut self) -> Result<()> {
@@ -342,9 +334,32 @@ pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<Pro
         child,
         stdin: Some(stdin),
         stdout_reader: BufReader::new(stdout),
+        stdout_line_buffer: Vec::new(),
         stderr_task: spawn_stderr_reader(stderr),
         captured_stdout: Vec::new(),
     })
+}
+
+async fn read_next_process_line<R>(
+    reader: &mut R,
+    line_buffer: &mut Vec<u8>,
+    captured_stdout: &mut Vec<u8>,
+) -> Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let bytes_read = reader
+        .read_until(b'\n', line_buffer)
+        .await
+        .context("failed to read subprocess stdout")?;
+    if bytes_read == 0 && line_buffer.is_empty() {
+        return Ok(None);
+    }
+
+    captured_stdout.extend_from_slice(line_buffer);
+    let line = String::from_utf8_lossy(line_buffer).to_string();
+    line_buffer.clear();
+    Ok(Some(line))
 }
 
 fn spawn_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHandle<Result<Vec<u8>>> {
@@ -413,8 +428,10 @@ async fn spawn_with_retry(
 #[cfg(test)]
 mod tests {
     use super::{
-        run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
+        read_next_process_line, run_process_attached, run_process_streaming, spawn_process_session,
+        ProcessInvocation,
     };
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -432,6 +449,43 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sensitive stdin"));
+    }
+
+    #[tokio::test]
+    async fn process_line_reader_preserves_partial_line_after_cancelled_read() {
+        let (reader, mut writer) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line_buffer = Vec::new();
+        let mut captured_stdout = Vec::new();
+
+        writer
+            .write_all(b"{\"jsonrpc\"")
+            .await
+            .expect("write partial");
+
+        {
+            let read = read_next_process_line(&mut reader, &mut line_buffer, &mut captured_stdout);
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => panic!("partial line completed unexpectedly: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+
+        assert_eq!(line_buffer, b"{\"jsonrpc\"");
+        assert!(captured_stdout.is_empty());
+
+        writer
+            .write_all(b":\"2.0\"}\n")
+            .await
+            .expect("write line terminator");
+
+        let line = read_next_process_line(&mut reader, &mut line_buffer, &mut captured_stdout)
+            .await
+            .expect("read line")
+            .expect("line");
+        assert_eq!(line, "{\"jsonrpc\":\"2.0\"}\n");
+        assert_eq!(captured_stdout, line.as_bytes());
     }
 
     #[tokio::test]

@@ -84,7 +84,7 @@ pub struct DaemonUnitSpec<'a> {
     pub project_workspace_root: &'a Path,
     pub project_instance: Option<DaemonProjectInstanceSpec<'a>>,
     pub daemon_fingerprint: &'a str,
-    pub codex_home_override: Option<&'a Path>,
+    pub runtime_auth_env: &'a [(String, String)],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -431,12 +431,7 @@ pub fn render_daemon_unit(
             project_instance.instance_name.to_string(),
         ));
     }
-    if let Some(codex_home_override) = spec.codex_home_override {
-        env_lines.push((
-            "CODEX_HOME".to_string(),
-            codex_home_override.display().to_string(),
-        ));
-    }
+    env_lines.extend(spec.runtime_auth_env.iter().cloned());
     let env_content = env_lines
         .iter()
         .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
@@ -1196,6 +1191,10 @@ mod tests {
     #[test]
     fn renders_units_with_expected_execs() {
         let home = crate::home::LionClawHome::new("/tmp/lionclaw-home".into());
+        let runtime_auth_env = vec![(
+            "CODEX_HOME".to_string(),
+            "/tmp/custom-codex-home".to_string(),
+        )];
         let identity = UnitIdentity {
             unit_group_id: "11111111-1111-4111-8111-111111111111".to_string(),
             home_id: "home".to_string(),
@@ -1215,7 +1214,7 @@ mod tests {
                     instance_name: "main",
                 }),
                 daemon_fingerprint: "daemon-state-test",
-                codex_home_override: Some(Path::new("/tmp/custom-codex-home")),
+                runtime_auth_env: &runtime_auth_env,
             },
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));

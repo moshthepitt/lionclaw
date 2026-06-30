@@ -62,9 +62,10 @@ use crate::contracts::{
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
     SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
-    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
-    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
-    StreamEventKindDto, StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
+    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnJournalEventView,
+    SessionTurnJournalRequest, SessionTurnJournalResponse, SessionTurnKind, SessionTurnRequest,
+    SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto, StreamEventKindDto,
+    StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
@@ -147,13 +148,14 @@ use super::{
     },
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
-        execute_captured, execute_streaming, project_runtime_skills,
-        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
-        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
-        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        execute_captured, execute_streaming, map_host_path_into_runtime_mount,
+        project_runtime_skills, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, runtime_native_home_mount_source,
+        runtime_state_mount_source, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeAuthContext,
+        RuntimeAuthRegistry, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
         RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
         RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
@@ -163,7 +165,7 @@ use super::{
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
         RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
         RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
@@ -363,6 +365,7 @@ impl RuntimeChannelSendContext {
     fn host_path_for_runtime_path(&self, runtime_path: impl AsRef<Path>) -> Option<PathBuf> {
         RuntimeExecutionContext {
             network_mode: NetworkMode::None,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(self.runtime_state_root.clone()),
             runtime_path_projections: self.runtime_path_projections.clone(),
@@ -600,7 +603,8 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_registry: RuntimeAuthRegistry,
+    pub runtime_auth_context: RuntimeAuthContext,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -608,6 +612,7 @@ pub struct KernelOptions {
     pub project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub scheduler: SchedulerConfig,
     pub applied_state: AppliedState,
+    pub retain_runtime_raw_turn_payloads: bool,
 }
 
 impl fmt::Debug for KernelOptions {
@@ -628,7 +633,8 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
-            .field("codex_home_override", &self.codex_home_override)
+            .field("runtime_auth_registry", &self.runtime_auth_registry)
+            .field("runtime_auth_context", &self.runtime_auth_context)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -636,6 +642,10 @@ impl fmt::Debug for KernelOptions {
             .field("project_instance_runtime", &self.project_instance_runtime)
             .field("scheduler", &self.scheduler)
             .field("applied_state", &"..")
+            .field(
+                "retain_runtime_raw_turn_payloads",
+                &self.retain_runtime_raw_turn_payloads,
+            )
             .finish()
     }
 }
@@ -653,7 +663,8 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -661,6 +672,7 @@ impl Default for KernelOptions {
             project_instance_runtime: None,
             scheduler: SchedulerConfig::default(),
             applied_state: AppliedState::default(),
+            retain_runtime_raw_turn_payloads: false,
         }
     }
 }
@@ -678,9 +690,6 @@ const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-
 const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const RUNTIME_STATE_DIR_MODE: u32 = 0o700;
 const RUNTIME_STATE_FILE_MODE: u32 = 0o600;
-const OPENCODE_RUNTIME_KIND: &str = "opencode";
-const OPENCODE_GENERATED_CONFIG_FILE: &str = "opencode.generated.json";
-const OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH: &str = "/runtime/AGENTS.md";
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
@@ -693,13 +702,15 @@ struct AttachedRuntimeLaunchLock {
 
 struct AttachedRuntimeTranscriptProgramExecutor {
     plan: EffectiveExecutionPlan,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
 }
 
 struct KernelRuntimeProgramExecutor {
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
 }
 
 #[async_trait::async_trait]
@@ -712,9 +723,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
         execute_streaming(
             ExecutionRequest {
                 plan: self.plan.clone(),
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             stdout,
         )
@@ -727,9 +742,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<ExecutionOutput> {
         execute_captured(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await
     }
@@ -740,9 +759,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
         let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
@@ -754,6 +777,13 @@ fn runtime_execution_context(
 ) -> anyhow::Result<RuntimeExecutionContext> {
     Ok(RuntimeExecutionContext {
         network_mode: plan.network_mode,
+        working_dir: plan
+            .working_dir
+            .as_deref()
+            .map(|working_dir| {
+                map_host_path_into_runtime_mount(working_dir, &plan.mounts, "working directory")
+            })
+            .transpose()?,
         environment: plan.environment.clone(),
         runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
         runtime_path_projections: runtime_path_projections_for_plan(plan)?,
@@ -798,9 +828,13 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
             hard_timeout,
             execute_captured(ExecutionRequest {
                 plan: self.plan.clone(),
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount: None,
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             }),
         )
         .await
@@ -818,9 +852,13 @@ impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgr
     ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
         let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: None,
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
@@ -849,7 +887,8 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -861,6 +900,7 @@ pub struct Kernel {
     private_context_projector: Arc<dyn PrivateContextProjector>,
     private_context_recorder: PrivateContextRecorderService,
     hidden_compaction_turn_timeout: Duration,
+    retain_runtime_raw_turn_payloads: bool,
 }
 
 impl Kernel {
@@ -922,8 +962,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_execution_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                     network_mode,
                 )
                 .await
@@ -932,8 +973,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_launch_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                 )
                 .await
             }
@@ -1020,7 +1062,8 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
-            codex_home_override: options.codex_home_override,
+            runtime_auth_registry: options.runtime_auth_registry,
+            runtime_auth_context: options.runtime_auth_context,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -1032,6 +1075,7 @@ impl Kernel {
             private_context_projector,
             private_context_recorder,
             hidden_compaction_turn_timeout,
+            retain_runtime_raw_turn_payloads: options.retain_runtime_raw_turn_payloads,
         };
 
         kernel.bootstrap().await;
@@ -1114,7 +1158,7 @@ impl Kernel {
             .await;
         self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
-        self.materialize_attached_runtime_plan(&runtime_kind, &execution_plan)
+        self.materialize_attached_runtime_plan(&execution_plan)
             .await?;
         if recover_before_launch {
             self.reconcile_attached_runtime_transcript_best_effort(
@@ -1127,13 +1171,8 @@ impl Kernel {
             )
             .await;
         }
-        self.materialize_attached_runtime_context(
-            session_id,
-            &runtime_id,
-            &runtime_kind,
-            &execution_plan,
-        )
-        .await?;
+        self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
+            .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
         let runtime_session_ready =
@@ -1171,9 +1210,13 @@ impl Kernel {
         Ok(PreparedAttachedRuntimeLaunch {
             request: ExecutionRequest {
                 plan: execution_plan,
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount,
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             _launch_lock: launch_lock,
         })
@@ -1183,7 +1226,6 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?;
@@ -1207,9 +1249,6 @@ impl Kernel {
         {
             remove_attached_runtime_context_files_best_effort(runtime_state_root).await;
             return Err(err);
-        }
-        if runtime_kind == OPENCODE_RUNTIME_KIND {
-            write_opencode_generated_config(runtime_state_root).await?;
         }
         Ok(())
     }
@@ -1341,7 +1380,8 @@ impl Kernel {
         };
         let mut executor = AttachedRuntimeTranscriptProgramExecutor {
             plan: plan.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_registry: self.runtime_auth_registry.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         };
         let RuntimeTerminalTranscript {
             mut turns,
@@ -2285,6 +2325,39 @@ impl Kernel {
             .map_err(internal)?;
 
         Ok(SessionHistoryResponse { turns })
+    }
+
+    pub async fn session_turn_journal(
+        &self,
+        req: SessionTurnJournalRequest,
+    ) -> Result<SessionTurnJournalResponse, KernelError> {
+        let session = self.get_scoped_session(req.session_id).await?;
+        let turn = self
+            .session_turns
+            .get(req.turn_id)
+            .await
+            .map_err(internal)?
+            .filter(|turn| turn.session_id == session.session_id)
+            .ok_or_else(|| KernelError::NotFound("session turn not found".to_string()))?;
+
+        let include_raw = req.include_raw && self.retain_runtime_raw_turn_payloads;
+        let events = self
+            .session_turns
+            .list_journal_events(turn.turn_id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|record| SessionTurnJournalEventView {
+                event: record.event,
+                raw: if include_raw { record.raw } else { None },
+            })
+            .collect::<Vec<_>>();
+
+        Ok(SessionTurnJournalResponse {
+            session_id: session.session_id,
+            turn_id: turn.turn_id,
+            events,
+        })
     }
 
     pub async fn find_latest_session_summary(
@@ -7108,7 +7181,7 @@ impl Kernel {
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let turn_input = RuntimeTurnInput {
             runtime_session_id: handle.runtime_session_id.clone(),
             prompt,
@@ -7119,11 +7192,12 @@ impl Kernel {
         let runtime_executor = KernelRuntimeProgramExecutor {
             plan: execution_plan,
             runtime_secrets_mount,
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_registry: self.runtime_auth_registry.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         };
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
-                RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter.turn(turn_input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     adapter
                         .program_backed_turn(
@@ -7132,7 +7206,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -7165,8 +7239,8 @@ impl Kernel {
         };
 
         let mut events = Vec::new();
-        while let Some(event) = event_rx.recv().await {
-            events.push(event);
+        while let Some(record) = journal_rx.recv().await {
+            events.push(record.event);
         }
         let close_result = adapter.close(&handle).await;
         outcome?;
@@ -7785,7 +7859,8 @@ mod tests {
         PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES, PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
     };
     use crate::kernel::runtime::{
-        RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+        RawTurnPayload, RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+        RuntimeTurnJournalSender,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::kernel::session_turns::SessionTurnStore;
@@ -8007,7 +8082,8 @@ mod tests {
         plan.hard_timeout = ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT * 10;
         let executor = AttachedRuntimeTranscriptProgramExecutor {
             plan,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
         };
         assert_eq!(
             executor.hard_timeout(),
@@ -8018,7 +8094,8 @@ mod tests {
         plan.hard_timeout = Duration::from_secs(5);
         let executor = AttachedRuntimeTranscriptProgramExecutor {
             plan,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
         };
         assert_eq!(executor.hard_timeout(), Duration::from_secs(5));
     }
@@ -8030,6 +8107,7 @@ mod tests {
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
@@ -8041,6 +8119,31 @@ mod tests {
             escape_classes: std::collections::BTreeSet::new(),
             limits: crate::kernel::runtime::ExecutionLimits::default(),
         }
+    }
+
+    #[test]
+    fn runtime_execution_context_uses_runtime_visible_working_dir() {
+        let mut plan = test_execution_plan("opencode");
+        plan.working_dir = Some("/host/workspace/crates/runtime".to_string());
+        plan.mounts = vec![
+            MountSpec {
+                source: "/host/workspace".into(),
+                target: "/workspace".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: "/host/workspace/crates".into(),
+                target: "/workspace/crates".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let context = runtime_execution_context(&plan).expect("runtime context");
+
+        assert_eq!(
+            context.working_dir.as_deref(),
+            Some("/workspace/crates/runtime")
+        );
     }
 
     const TEST_NATIVE_HOME_ARTIFACT_DIR: &str = "generated-artifacts/images";
@@ -8103,6 +8206,8 @@ mod tests {
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
     const TEST_REPLY_RUNTIME_ID: &str = "reply-runtime";
+    const TEST_RAW_JOURNAL_RUNTIME_ID: &str = "raw-journal-runtime";
+    const TEST_TIMEOUT_JOURNAL_RUNTIME_ID: &str = "timeout-journal-runtime";
 
     struct CountingTerminalRuntimeAdapter {
         exports: Arc<AtomicUsize>,
@@ -8206,7 +8311,7 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            _events: RuntimeEventSender,
+            _journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!(
@@ -8264,10 +8369,10 @@ mod tests {
         async fn turn(
             &self,
             input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.prompts.lock().await.push(input.prompt);
-            drop(events.send(RuntimeEvent::Done));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
             Ok(RuntimeTurnResult::default())
         }
 
@@ -8320,13 +8425,137 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
-            drop(events.send(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: self.message.clone(),
-            }));
-            drop(events.send(RuntimeEvent::Done));
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: self.message.clone(),
+                })),
+            );
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RawJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for RawJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_RAW_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("raw-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(journal.send(TurnEvent::with_raw(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "raw-backed answer".to_string(),
+                },
+                RawTurnPayload {
+                    driver: "test-driver".to_string(),
+                    payload: "{\"secret\":\"debug-only\"}".to_string(),
+                },
+            )));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TimeoutJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for TimeoutJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("timeout-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "before timeout".to_string(),
+                })),
+            );
+            sleep(Duration::from_millis(250)).await;
             Ok(RuntimeTurnResult::default())
         }
 
@@ -8463,6 +8692,90 @@ mod tests {
                 },
             )
             .await
+    }
+
+    struct RawJournalExecution {
+        _temp_dir: TempDir,
+        kernel: Kernel,
+        session_id: Uuid,
+        turn_id: Uuid,
+        journal: SessionTurnJournalResponse,
+    }
+
+    async fn execute_raw_journal_runtime_turn(
+        retain_raw: bool,
+        include_raw: bool,
+    ) -> RawJournalExecution {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                retain_runtime_raw_turn_payloads: retain_raw,
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_RAW_JOURNAL_RUNTIME_ID,
+                Arc::new(RawJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "hello".to_string(),
+                    prompt_user_text: "hello".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_RAW_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("raw journal runtime turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        assert_eq!(response.assistant_text, "raw-backed answer");
+        let journal = kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw,
+            })
+            .await
+            .expect("list runtime journal");
+        RawJournalExecution {
+            _temp_dir: temp_dir,
+            kernel,
+            session_id,
+            turn_id,
+            journal,
+        }
     }
 
     async fn open_test_session(kernel: &Kernel) -> Uuid {
@@ -9979,6 +10292,175 @@ mod tests {
                 .text,
             "hello from native tui"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_strips_raw_payloads_unless_debug_retention_enabled() {
+        let default_journal = execute_raw_journal_runtime_turn(false, true).await.journal;
+        assert_eq!(default_journal.events.len(), 2);
+        assert!(default_journal
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
+
+        let retained_journal_without_raw =
+            execute_raw_journal_runtime_turn(true, false).await.journal;
+        assert_eq!(retained_journal_without_raw.events.len(), 2);
+        assert!(retained_journal_without_raw
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
+
+        let retained_journal = execute_raw_journal_runtime_turn(true, true).await.journal;
+        assert_eq!(
+            default_journal
+                .events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            retained_journal
+                .events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            retained_journal.events[0]
+                .raw
+                .as_ref()
+                .map(|raw| raw.driver.as_str()),
+            Some("test-driver")
+        );
+        assert_eq!(
+            retained_journal.events[0]
+                .raw
+                .as_ref()
+                .map(|raw| raw.payload.as_str()),
+            Some("{\"secret\":\"debug-only\"}")
+        );
+        assert!(retained_journal.events[1].raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_requires_owning_session() {
+        let execution = execute_raw_journal_runtime_turn(true, true).await;
+        let other_session = open_prompt_context_session(
+            &execution.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let err = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: other_session.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect_err("other session should not read this journal");
+        assert!(
+            matches!(err, KernelError::NotFound(message) if message == "session turn not found")
+        );
+
+        let own_journal = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: execution.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect("owning session can read journal");
+        assert_eq!(own_journal.events, execution.journal.events);
+    }
+
+    #[tokio::test]
+    async fn timed_out_runtime_turn_flushes_buffered_journal_before_abort() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_turn_idle_timeout: Duration::from_millis(50),
+                runtime_turn_hard_timeout: Duration::from_millis(500),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_TIMEOUT_JOURNAL_RUNTIME_ID,
+                Arc::new(TimeoutJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "timeout".to_string(),
+                    prompt_user_text: "timeout".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("runtime timeout response");
+
+        assert_eq!(response.status, SessionTurnStatus::TimedOut);
+        let journal = kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect("list timeout journal");
+        let events = journal
+            .events
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "before timeout".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::Error {
+                code: Some(code),
+                text,
+            } if code == "runtime.timeout" && text.contains("idle timed out")
+        ));
     }
 
     #[tokio::test]
@@ -12178,7 +12660,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -12250,7 +12732,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -12331,7 +12813,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect_err(
                 "prompt context audit failure should block attached context materialization",
@@ -12380,7 +12862,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect_err("attached context file failure should abort materialization");
 
@@ -12622,14 +13104,17 @@ done
     }
 
     #[tokio::test]
-    async fn materialize_runtime_plan_projects_skills_using_runtime_kind() {
+    async fn materialize_runtime_plan_projects_skills_using_profile_projection() {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let mut plan = test_execution_plan("work-codex");
+        let mut plan = test_execution_plan("work-runtime");
+        plan.skill_projection = Some(
+            crate::kernel::runtime::RuntimeSkillProjectionConfig::native_dir(".native/skills"),
+        );
         plan.mounts = vec![
             MountSpec {
                 source: temp_dir.path().join("workspace"),
@@ -12654,21 +13139,18 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
         assert!(runtime_state_root.exists());
-        let link = runtime_home_root.join(".codex/skills/loopback");
+        let link = runtime_home_root.join(".native/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
         );
-        assert!(!runtime_state_root
-            .join(OPENCODE_GENERATED_CONFIG_FILE)
-            .exists());
     }
 
     #[tokio::test]
@@ -12680,7 +13162,7 @@ done
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
         let legacy_home_root = runtime_state_root.join(crate::home::RUNTIME_NATIVE_HOME_DIR);
-        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let legacy_config = legacy_home_root.join(".native/config.toml");
         tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
             .await
             .expect("create legacy home");
@@ -12702,7 +13184,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -12748,7 +13230,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -12967,30 +13449,6 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn write_opencode_generated_config_points_to_runtime_agents_file() {
-        let temp_dir = tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        create_owner_private_directory_all(None, &runtime_state_root)
-            .await
-            .expect("create runtime state root");
-
-        write_opencode_generated_config(&runtime_state_root)
-            .await
-            .expect("write generated opencode config");
-
-        let generated =
-            tokio::fs::read_to_string(runtime_state_root.join(OPENCODE_GENERATED_CONFIG_FILE))
-                .await
-                .expect("read generated opencode config");
-        let generated: serde_json::Value =
-            serde_json::from_str(&generated).expect("parse generated opencode config");
-        assert_eq!(
-            generated["instructions"],
-            json!([OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH])
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn materialize_runtime_plan_ignores_project_generated_context_cache() {
@@ -13032,7 +13490,7 @@ done
         std::os::unix::fs::symlink(&outside, &generated_agents).expect("generated context symlink");
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("cached generated context is not part of runtime plan materialization");
 
@@ -14235,6 +14693,7 @@ done
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
@@ -18353,15 +18812,6 @@ fn write_runtime_state_file_blocking(
     })
 }
 
-async fn write_opencode_generated_config(runtime_state_root: &Path) -> Result<(), KernelError> {
-    let contents = serde_json::to_vec_pretty(&json!({
-        "$schema": "https://opencode.ai/config.json",
-        "instructions": [OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH],
-    }))
-    .map_err(|err| internal(err.into()))?;
-    write_runtime_state_file(runtime_state_root, OPENCODE_GENERATED_CONFIG_FILE, contents).await
-}
-
 async fn read_runtime_state_file(
     runtime_state_root: &Path,
     file_name: &str,
@@ -19671,6 +20121,53 @@ impl QueuedTurnTerminal {
 
 const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
 const ASSISTANT_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_JOURNAL_FLUSH_RECORDS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeJournalContext<'a> {
+    turn_id: Uuid,
+    session_id: Uuid,
+    runtime_id: &'a str,
+    runtime_session_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeTurnEventDispatch<'a> {
+    stream_context: &'a Option<ChannelStreamContext>,
+    event_sink: &'a Option<RuntimeEventSink>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeJournalPersistence {
+    pending: Vec<TurnEvent>,
+}
+
+impl RuntimeJournalPersistence {
+    fn push(&mut self, record: TurnEvent) {
+        self.pending.push(record);
+    }
+
+    fn flush_due(&self) -> bool {
+        self.pending.len() >= RUNTIME_JOURNAL_FLUSH_RECORDS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pending(&self) -> &[TurnEvent] {
+        &self.pending
+    }
+
+    fn clear_flushed(&mut self) {
+        self.pending.clear();
+    }
+}
+
+struct RecordRuntimeTurnEventOutcome {
+    persisted_record: TurnEvent,
+    checkpointed: bool,
+}
 
 #[derive(Debug, Default)]
 struct AssistantCheckpointState {
@@ -20219,7 +20716,6 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
-        let runtime_kind = adapter.info().await.id;
         let runtime_turn_mode = adapter.turn_mode();
         let RuntimeExecutionSkills {
             skill_ids: runtime_skill_ids,
@@ -20249,8 +20745,7 @@ impl Kernel {
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;
         }
-        self.materialize_runtime_plan(&runtime_kind, &execution_plan)
-            .await?;
+        self.materialize_runtime_plan(&execution_plan).await?;
         if let Some(turn) = &prepared_turn {
             if turn.runtime_id != runtime_id {
                 return Err(KernelError::Internal(
@@ -21711,25 +22206,20 @@ impl Kernel {
 
     async fn materialize_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_attached_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_runtime_mounts_and_skills(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
@@ -21751,9 +22241,13 @@ impl Kernel {
         let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
-            .await
-            .map_err(internal)
+        project_runtime_skills(
+            plan.skill_projection.as_ref(),
+            runtime_home_root,
+            &plan.mounts,
+        )
+        .await
+        .map_err(internal)
     }
 
     async fn reset_runtime_plan_state(
@@ -22268,9 +22762,9 @@ impl Kernel {
         turn_id: Uuid,
         stream_context: &Option<ChannelStreamContext>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), KernelError> {
+    ) -> Result<bool, KernelError> {
         if !checkpoints.checkpoint_due() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.session_turns
@@ -22286,7 +22780,7 @@ impl Kernel {
             }
         }
         checkpoints.mark_checkpointed();
-        Ok(())
+        Ok(true)
     }
 
     async fn record_runtime_event(
@@ -22297,7 +22791,7 @@ impl Kernel {
         event: RuntimeEvent,
         events: &mut Vec<RuntimeEvent>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), FailedRuntimeTurn> {
+    ) -> Result<bool, FailedRuntimeTurn> {
         checkpoints.observe(&event);
         let appended_sequence = if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
             // Durable channel streams get their terminal done after the turn is persisted.
@@ -22314,7 +22808,8 @@ impl Kernel {
                 })?
         };
         checkpoints.observe_sequence(&event, appended_sequence);
-        self.checkpoint_running_turn(turn_id, stream_context, checkpoints)
+        let checkpointed = self
+            .checkpoint_running_turn(turn_id, stream_context, checkpoints)
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
@@ -22323,6 +22818,131 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         events.push(event);
+        Ok(checkpointed)
+    }
+
+    async fn record_runtime_turn_event(
+        &self,
+        turn_id: Uuid,
+        stream_context: &Option<ChannelStreamContext>,
+        event_sink: &Option<RuntimeEventSink>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<RecordRuntimeTurnEventOutcome, FailedRuntimeTurn> {
+        let event = record.event;
+        let persisted_record = if self.retain_runtime_raw_turn_payloads {
+            TurnEvent {
+                event: event.clone(),
+                raw: record.raw,
+            }
+        } else {
+            TurnEvent::canonical(event.clone())
+        };
+        let checkpointed = self
+            .record_runtime_event(
+                turn_id,
+                stream_context,
+                event_sink,
+                event,
+                events,
+                checkpoints,
+            )
+            .await?;
+        Ok(RecordRuntimeTurnEventOutcome {
+            persisted_record,
+            checkpointed,
+        })
+    }
+
+    async fn record_and_buffer_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+        journal: &mut RuntimeJournalPersistence,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let outcome = self
+            .record_runtime_turn_event(
+                journal_context.turn_id,
+                dispatch.stream_context,
+                dispatch.event_sink,
+                record,
+                events,
+                checkpoints,
+            )
+            .await?;
+        journal.push(outcome.persisted_record);
+        if outcome.checkpointed || journal.flush_due() {
+            self.flush_runtime_turn_journal_best_effort(journal_context, journal)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn flush_runtime_turn_journal_best_effort(
+        &self,
+        context: RuntimeJournalContext<'_>,
+        journal: &mut RuntimeJournalPersistence,
+    ) {
+        if journal.is_empty() {
+            return;
+        }
+        let record_count = journal.pending().len();
+        match self
+            .session_turns
+            .append_journal_events(context.turn_id, journal.pending())
+            .await
+        {
+            Ok(_) => journal.clear_flushed(),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    turn_id = %context.turn_id,
+                    runtime_id = context.runtime_id,
+                    runtime_session_id = context.runtime_session_id,
+                    record_count,
+                    "failed to append runtime turn journal batch"
+                );
+                self.append_audit_event_best_effort(
+                    "runtime.turn.journal_append_failed",
+                    Some(context.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": context.turn_id,
+                        "runtime_id": context.runtime_id,
+                        "runtime_session_id": context.runtime_session_id,
+                        "record_count": record_count,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_and_flush_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let mut journal = RuntimeJournalPersistence::default();
+        self.record_and_buffer_runtime_turn_event(
+            journal_context,
+            dispatch,
+            record,
+            events,
+            checkpoints,
+            &mut journal,
+        )
+        .await?;
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal)
+            .await;
         Ok(())
     }
 
@@ -24780,7 +25400,7 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         self.maybe_mount_project_instance_inventory(
             session_id,
@@ -24805,15 +25425,17 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut turn_task = tokio::spawn(async move {
             match runtime_turn_mode {
-                RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter_for_task.turn(input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     let runtime_executor = KernelRuntimeProgramExecutor {
                         plan: execution_plan,
                         runtime_secrets_mount,
-                        codex_home_override,
+                        runtime_auth_registry,
+                        runtime_auth_context,
                     };
                     adapter_for_task
                         .program_backed_turn(
@@ -24822,7 +25444,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -24836,41 +25458,54 @@ impl Kernel {
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
-        let mut event_rx_open = true;
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
+        let mut journal_rx_open = true;
 
         loop {
             tokio::select! {
-                maybe_event = event_rx.recv(), if event_rx_open => {
-                    match maybe_event {
-                        Some(event) => {
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                event,
+                maybe_record = journal_rx.recv(), if journal_rx_open => {
+                    match maybe_record {
+                        Some(record) => {
+                            self.record_and_buffer_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                record,
                                 &mut events,
                                 &mut checkpoints,
+                                &mut journal_persistence,
                             )
                             .await?;
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
-                            event_rx_open = false;
+                            journal_rx_open = false;
                         }
                     }
                 }
                 output = &mut turn_task => {
-                    while let Some(event) = event_rx.recv().await {
-                        self.record_runtime_event(
-                            turn_id,
-                            &stream_context,
-                            &event_sink,
-                            event,
+                    while let Some(record) = journal_rx.recv().await {
+                        self.record_and_buffer_runtime_turn_event(
+                            journal_context,
+                            event_dispatch,
+                            record,
                             &mut events,
                             &mut checkpoints,
+                            &mut journal_persistence,
                         )
                         .await?;
                     }
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return match output {
                         Ok(Ok(result)) => {
                             self.audit
@@ -24929,14 +25564,13 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                RuntimeEvent::Error {
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24968,14 +25602,13 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                RuntimeEvent::Error {
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24994,6 +25627,8 @@ impl Kernel {
                         "Runtime idle timed out after {} with no output.",
                         format_duration(idle_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25018,6 +25653,8 @@ impl Kernel {
                         "Runtime reached the {} safety limit.",
                         format_duration(hard_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25038,6 +25675,8 @@ impl Kernel {
                         .await;
                 }
                 reason = &mut cancel_signal => {
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25127,12 +25766,14 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut control_task = tokio::spawn(async move {
             let runtime_executor = KernelRuntimeProgramExecutor {
                 plan: execution_plan,
                 runtime_secrets_mount,
-                codex_home_override,
+                runtime_auth_registry,
+                runtime_auth_context,
             };
             adapter_for_task
                 .runtime_control(
@@ -25529,14 +26170,21 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
-        self.record_runtime_event(
-            turn_id,
-            stream_context,
-            event_sink,
-            RuntimeEvent::Error {
+        self.record_and_flush_runtime_turn_event(
+            RuntimeJournalContext {
+                turn_id,
+                session_id,
+                runtime_id,
+                runtime_session_id: &handle.runtime_session_id,
+            },
+            RuntimeTurnEventDispatch {
+                stream_context,
+                event_sink,
+            },
+            TurnEvent::canonical(RuntimeEvent::Error {
                 code: Some(error_code.to_string()),
                 text: reason.clone(),
-            },
+            }),
             &mut events,
             &mut checkpoints,
         )
@@ -25573,18 +26221,31 @@ impl Kernel {
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
         checkpoints.seed(assistant_text);
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
         while let Some(event) = event_rx.recv().await {
-            self.record_runtime_event(
-                turn_id,
-                &stream_context,
-                &event_sink,
-                event,
+            self.record_and_buffer_runtime_turn_event(
+                journal_context,
+                event_dispatch,
+                TurnEvent::canonical(event),
                 &mut events,
                 &mut checkpoints,
+                &mut journal_persistence,
             )
             .await
             .map_err(|err| anyhow::anyhow!(err.error_text))?;
         }
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+            .await;
 
         self.audit
             .append(

@@ -17,7 +17,7 @@ use lionclaw::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest, RuntimeCapabilityResult,
             RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
         },
         Kernel,
     },
@@ -581,12 +581,12 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::Status {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Status {
             code: None,
             text: "single capability runtime started turn".to_string(),
-        });
+        }));
         let capability_requests = input
             .runtime_skill_ids
             .first()
