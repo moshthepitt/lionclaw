@@ -415,6 +415,10 @@ When project-instance runtime context is active, `channel.send` requests are
 also checked against the sender-relative `channel_send` projection for that
 selected instance. A project runtime can enqueue only routes that are present as
 configured neighbor routes in its generated inventory.
+Route authorization is intentionally a kernel broker responsibility, not a
+public `ProjectInstanceInventory` helper contract. Consumers should treat the
+inventory as projected data and use kernel `channel.send` surfaces for
+authorization and enqueueing decisions.
 
 Idempotency lives on the outbox row. Runtime channel sends use
 `source_kind = "runtime_channel_send"`, a source id scoped to
