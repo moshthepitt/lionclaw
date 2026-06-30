@@ -397,9 +397,12 @@ session and turn from its own execution context, checks the active channel
 binding, normalizes route fields, enforces `plain`/`markdown`/`html` format
 hints, copies any attachments into LionClaw-owned outbox storage, and creates a
 normal durable channel outbox delivery. Direct/runtime capability
-`channel.send` and MCP `channel_send` share the same kernel authorization and
-enqueue helper instead of maintaining separate outbox paths. Channel workers
-continue to lease and report those deliveries through `/v0/channels/outbox/pull` and
+`channel.send` remains policy-gated and derives its route from the active
+channel session; MCP `channel_send` remains preset/bridge-gated and validates
+the requested route against the turn's projected route inventory. Both paths
+terminate in the kernel and use the same authorized enqueue helper instead of
+maintaining separate outbox paths. Channel workers continue to lease and report
+those deliveries through `/v0/channels/outbox/pull` and
 `/v0/channels/outbox/report`.
 
 Bridge setup, accept-loop, connection-task, and connection I/O failures are
