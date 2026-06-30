@@ -639,7 +639,10 @@ mod tests {
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
-            runtime::{ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig},
+            runtime::{
+                ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
+                RuntimeTerminalConfig, RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER,
+            },
             Kernel, KernelOptions,
         },
         operator::config::{OperatorConfig, RuntimeProfileConfig},
@@ -1796,6 +1799,13 @@ esac
             "OPENCODE_DISABLE_AUTOUPDATE".to_string(),
             "1".to_string(),
         )]);
+        profile.terminal = RuntimeTerminalConfig {
+            args: Vec::new(),
+            resume_args: vec![
+                "--session".to_string(),
+                RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
+            ],
+        };
         profile
     }
 }

@@ -51,8 +51,9 @@ use lionclaw_runtime_api::{
     RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeDriverConfig,
     RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
     RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
-    RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
+    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalConfig,
+    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
+    RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
@@ -69,6 +70,7 @@ pub struct AcpRuntimeConfig {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub auth: Option<RuntimeAuthKind>,
+    pub terminal: RuntimeTerminalConfig,
     pub session_id_state_file: String,
     pub default_working_dir: String,
 }
@@ -92,6 +94,10 @@ impl RuntimeDriverProvider for AcpRuntimeDriver {
         ACP_PROTOCOL_NAME
     }
 
+    fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
+        config.terminal.validate()
+    }
+
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
         Arc::new(AcpRuntimeAdapter::new(AcpRuntimeConfig {
             runtime_id: config.runtime_id,
@@ -101,6 +107,7 @@ impl RuntimeDriverProvider for AcpRuntimeDriver {
             model: config.model,
             mode: config.mode,
             auth: config.auth,
+            terminal: config.terminal,
             session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
             default_working_dir: ACP_DEFAULT_WORKING_DIR.to_string(),
         }))
@@ -183,9 +190,16 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
 
     fn build_terminal_program(
         &self,
-        _input: lionclaw_runtime_api::RuntimeTerminalProgramInput,
+        input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
-        Ok(build_acp_terminal_program(&self.config))
+        build_acp_terminal_program(
+            &self.config,
+            load_ready_acp_session_id(
+                &self.config,
+                &input.runtime_state_root,
+                input.runtime_session_ready,
+            )?,
+        )
     }
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
@@ -373,14 +387,21 @@ fn build_acp_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
     }
 }
 
-fn build_acp_terminal_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
-    RuntimeProgramSpec {
+fn build_acp_terminal_program(
+    config: &AcpRuntimeConfig,
+    resume_session_id: Option<String>,
+) -> Result<RuntimeProgramSpec> {
+    let mut args = config.terminal.args.clone();
+    if let Some(session_id) = resume_session_id {
+        args.extend(config.terminal.rendered_resume_args(&session_id)?);
+    }
+    Ok(RuntimeProgramSpec {
         executable: config.executable.clone(),
-        args: Vec::new(),
+        args,
         environment: config.environment.clone(),
         stdin: String::new(),
         auth: config.auth.clone(),
-    }
+    })
 }
 
 struct AcpClient {
@@ -1096,16 +1117,17 @@ mod tests {
 
     use lionclaw_runtime_api::{
         canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind,
-        RuntimeEvent, RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
-        RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-        RUNTIME_SESSION_READY_MARKER,
+        RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent, RuntimeExecutionContext,
+        RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTerminalProgramInput,
+        RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER,
     };
 
     use super::{
         acp_permission_denial, acp_turn_events, AcpMessage, AcpRuntimeAdapter, AcpRuntimeConfig,
-        ACP_SESSION_ID_STATE_FILE,
+        AcpRuntimeDriver, ACP_SESSION_ID_STATE_FILE,
     };
 
     fn opencode_acp_config(model: Option<String>, mode: Option<String>) -> AcpRuntimeConfig {
@@ -1117,6 +1139,13 @@ mod tests {
             model,
             mode,
             auth: None,
+            terminal: RuntimeTerminalConfig {
+                args: Vec::new(),
+                resume_args: vec![
+                    "--session".to_string(),
+                    RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
+                ],
+            },
             session_id_state_file: ACP_SESSION_ID_STATE_FILE.to_string(),
             default_working_dir: "/workspace".to_string(),
         }
@@ -1640,6 +1669,87 @@ mod tests {
             program.auth,
             Some(RuntimeAuthKind::from_static("test-acp-auth"))
         );
+    }
+
+    #[tokio::test]
+    async fn acp_terminal_program_resumes_saved_ready_session() {
+        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+            "ses_ready\n",
+        )
+        .expect("write saved session id");
+
+        let program = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root: runtime_state_root.clone(),
+                runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            })
+            .expect("terminal program");
+
+        assert_eq!(program.executable, "opencode");
+        assert_eq!(
+            program.args,
+            vec!["--session".to_string(), "ses_ready".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_terminal_program_rejects_saved_session_without_resume_template() {
+        let mut config = opencode_acp_config(None, None);
+        config.terminal.resume_args.clear();
+        let adapter = AcpRuntimeAdapter::new(config);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+            "ses_ready\n",
+        )
+        .expect("write saved session id");
+
+        let err = adapter
+            .build_terminal_program(RuntimeTerminalProgramInput {
+                session_id: Uuid::new_v4(),
+                runtime_state_root: runtime_state_root.clone(),
+                runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            })
+            .expect_err("saved ACP terminal session without resume args should fail");
+
+        assert!(err.to_string().contains("cannot resume saved session"));
+    }
+
+    #[test]
+    fn acp_driver_rejects_invalid_terminal_resume_template() {
+        let driver = AcpRuntimeDriver;
+        let mut config = RuntimeDriverConfig {
+            runtime_id: "opencode".to_string(),
+            executable: "opencode".to_string(),
+            terminal: RuntimeTerminalConfig {
+                args: Vec::new(),
+                resume_args: vec!["--continue".to_string()],
+            },
+            ..RuntimeDriverConfig::default()
+        };
+
+        let err = RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect_err("resume args without session placeholder should fail");
+        assert!(
+            err.to_string()
+                .contains(RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER),
+            "{err}"
+        );
+
+        config.terminal.resume_args = vec![
+            "--session".to_string(),
+            RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
+        ];
+        RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect("valid ACP terminal resume template");
     }
 
     #[tokio::test]

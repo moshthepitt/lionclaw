@@ -229,8 +229,9 @@ Codex is launched through its app-server protocol with `externalSandbox`
 permissions inside the outer Podman boundary. LionClaw does not use
 `codex exec` as a fallback path. ACP runtimes such as OpenCode are configured
 as profiles (`driver = "acp"`, command, args, model/mode, auth, confinement,
-and optional `skill_projection`) served by `lionclaw-runtime-acp`; adding
-another ACP harness is a profile change, not a new Rust crate. Protocol
+optional `skill_projection`, and optional native terminal resume args) served
+by `lionclaw-runtime-acp`; adding another ACP harness is a profile change, not
+a new Rust crate. Protocol
 request/notification assumptions are pinned by checked-in fixtures under the
 protocol crate, including the target CLI version and immutable source commit;
 update those fixtures with the driver when the target protocol contract
@@ -283,7 +284,10 @@ ACP drivers launch the harness's native interactive command from the profile
 command without ACP protocol args, with the same confinement, staged auth,
 skills, and non-privileged runtime layout as other runtime executions; ACP does
 not provide a canonical transcript unless a later adapter explicitly implements
-one. Codex continuity is a LionClaw-owned link to one Codex CLI thread id stored
+one. If an ACP session has saved ready state, the ACP profile must declare
+native terminal `resume-args` using the `{session_id}` placeholder; otherwise
+the driver refuses to launch a disconnected native UI for that saved session.
+Codex continuity is a LionClaw-owned link to one Codex CLI thread id stored
 in session-scoped runtime control state.
 Native TUI launches resume with `codex resume <threadID>` only when that link
 also has LionClaw's ready marker from a proven resumable reconciliation.
@@ -1262,8 +1266,8 @@ Runtime integration is driver-per-protocol, not crate-per-product.
 1. If the runtime speaks an existing conversation protocol, add a runtime
    profile only. For ACP harnesses such as OpenCode, configure
    `driver = "acp"`, `command`, `args`, model/mode, auth, confinement, and any
-   native skill projection data. Do not add a Rust crate for another ACP
-   product.
+   native skill projection or terminal resume data. Do not add a Rust crate for
+   another ACP product.
 2. If the runtime brings a new conversation protocol, add one
    `crates/lionclaw-runtime-<protocol>` crate implementing the protocol driver
    behind the existing adapter and `RuntimeDriverProvider` boundary in
@@ -1273,6 +1277,8 @@ Runtime integration is driver-per-protocol, not crate-per-product.
    canonical `TurnEvent` journals and runtime profile data only.
 4. Declare native skill support as profile data, for example
    `skill_projection = { kind = "native-dir", root = ".config/opencode/skills", format = "skill-md" }`.
+   Declare native terminal resume support as profile data, for example
+   `terminal = { resume-args = ["--session", "{session_id}"] }`.
    The kernel validates and materializes supported projection kinds but must
    not match on runtime product names.
 5. Reuse workspace package versions and `workspace = true` lint settings for a

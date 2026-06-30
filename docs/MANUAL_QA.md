@@ -177,7 +177,9 @@ Expected:
 - exiting the native UI records `runtime.tui.launch` and `runtime.tui.exit`
   audit events
 - ACP profiles such as OpenCode launch the profile command as the native UI
-  without ACP protocol args; they do not guarantee canonical transcript import
+  without ACP protocol args; when the profile declares `terminal.resume-args`,
+  saved ready ACP sessions resume through those args; ACP profiles do not
+  guarantee canonical transcript import
   unless the ACP driver later implements runtime-owned transcript export
 - completed Codex native UI turns are present in LionClaw session history and
   are available to later `lionclaw run`, `run --plain`, and channel context

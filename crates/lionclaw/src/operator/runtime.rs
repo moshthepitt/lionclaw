@@ -290,6 +290,7 @@ fn runtime_driver_config(runtime_id: &str, runtime: &RuntimeProfileConfig) -> Ru
         model: runtime.model.clone(),
         mode: runtime.mode.clone(),
         auth: runtime.auth.clone(),
+        terminal: runtime.terminal.clone(),
     }
 }
 

@@ -5,7 +5,10 @@ use crate::{
 };
 #[cfg(unix)]
 use crate::{
-    kernel::runtime::{ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig},
+    kernel::runtime::{
+        ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
+        RuntimeTerminalConfig, RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER,
+    },
     operator::config::{OperatorConfig, RuntimeProfileConfig},
 };
 use ratatui::backend::TestBackend;
@@ -2280,6 +2283,13 @@ fn test_opencode_runtime(runtime_executable: &Path, podman: &Path) -> RuntimePro
         ".config/opencode/skills",
     ));
     profile.args = vec!["acp".to_string()];
+    profile.terminal = RuntimeTerminalConfig {
+        args: Vec::new(),
+        resume_args: vec![
+            "--session".to_string(),
+            RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
+        ],
+    };
     profile
 }
 

@@ -302,6 +302,13 @@ mod tests {
             ".config/opencode/skills",
         ));
         profile.args = vec!["acp".to_string()];
+        profile.terminal = crate::kernel::runtime::RuntimeTerminalConfig {
+            args: Vec::new(),
+            resume_args: vec![
+                "--session".to_string(),
+                crate::kernel::runtime::RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
+            ],
+        };
         profile
     }
 }

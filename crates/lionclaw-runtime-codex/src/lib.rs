@@ -111,6 +111,9 @@ impl RuntimeDriverProvider for CodexRuntimeDriver {
         if config.mode.is_some() {
             bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime mode");
         }
+        if !config.terminal.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime terminal profile");
+        }
         let expected = codex_runtime_auth_kind();
         match &config.auth {
             Some(auth) if auth == &expected => {}

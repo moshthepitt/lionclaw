@@ -31,7 +31,7 @@ use crate::{
         jobs::normalize_cron_expression,
         runtime::{
             ConfinementConfig, ExecutionLimits, MountAccess, OciConfinementConfig,
-            RuntimeSkillProjectionConfig,
+            RuntimeSkillProjectionConfig, RuntimeTerminalConfig,
         },
         skills::validate_skill_alias,
     },
@@ -2693,6 +2693,7 @@ fn build_runtime_profile(
                         .clone()
                         .unwrap_or_else(|| CODEX_SKILL_PROJECTION_ROOT.to_string()),
                 )?),
+                terminal: RuntimeTerminalConfig::default(),
                 confinement,
             })
         }
@@ -2711,6 +2712,7 @@ fn build_runtime_profile(
                     .clone()
                     .map(native_skill_projection)
                     .transpose()?,
+                terminal: RuntimeTerminalConfig::default(),
                 confinement,
             })
         }
