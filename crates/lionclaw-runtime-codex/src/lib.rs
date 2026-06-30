@@ -57,11 +57,11 @@ use lionclaw_runtime_api::{
     RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
     RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeDriverConfig,
     RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
-    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult, TurnEvent,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
+    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSession,
+    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
@@ -197,7 +197,7 @@ impl CodexAppServerTurnRunner<'_> {
         let thread_state = self.adapter.thread_state_for(&input.runtime_session_id);
         let transport = self
             .adapter
-            .start_app_server_transport(self.executor.as_mut())
+            .start_app_server_transport(self.executor.as_mut(), &self.context.mcp_servers)
             .await?;
         let mut client =
             CodexAppServerClient::new_with_runtime_context(transport, self.context.clone());
@@ -350,7 +350,9 @@ impl CodexRuntimeAdapter {
             Err(outcome) => return Ok(outcome),
         };
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
+        let transport = self
+            .start_app_server_transport(executor.as_mut(), &[])
+            .await?;
         let mut client = CodexAppServerClient::new(transport);
         let sink = CodexAppServerEventSink::runtime(&events);
         let result = async {
@@ -401,7 +403,9 @@ impl CodexRuntimeAdapter {
         }
 
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
+        let transport = self
+            .start_app_server_transport(executor.as_mut(), &[])
+            .await?;
         let mut client = CodexAppServerClient::new(transport);
         let sink = CodexAppServerEventSink::runtime(&events);
 
@@ -469,9 +473,10 @@ impl CodexRuntimeAdapter {
     async fn start_app_server_transport(
         &self,
         executor: &mut dyn RuntimeProgramExecutor,
+        mcp_servers: &[RuntimeMcpServerSpec],
     ) -> Result<ExecutionSessionTransport> {
         let session = executor
-            .spawn(build_codex_app_server_program(&self.config))
+            .spawn(build_codex_app_server_program(&self.config, mcp_servers))
             .await?;
         Ok(ExecutionSessionTransport::new(session))
     }
@@ -687,8 +692,12 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+fn build_codex_app_server_program(
+    config: &CodexRuntimeConfig,
+    mcp_servers: &[RuntimeMcpServerSpec],
+) -> RuntimeProgramSpec {
     let mut args = codex_runtime_config_override_args();
+    args.extend(codex_mcp_server_override_args(mcp_servers));
     args.push("app-server".to_string());
 
     RuntimeProgramSpec {
@@ -740,6 +749,44 @@ fn codex_runtime_config_override_args() -> Vec<String> {
             "projects.\"{CODEX_RUNTIME_WORKSPACE_PATH}\".trust_level=\"{CODEX_TRUSTED_LEVEL}\""
         ),
     ]
+}
+
+fn codex_mcp_server_override_args(servers: &[RuntimeMcpServerSpec]) -> Vec<String> {
+    let mut args = Vec::new();
+    for server in servers {
+        let name = codex_toml_key_segment(&server.name);
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.command={}",
+            codex_toml_string(&server.command)
+        ));
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.args={}",
+            codex_toml_string_array(&server.args)
+        ));
+        for (key, value) in &server.environment {
+            let key = codex_toml_key_segment(key);
+            args.push("-c".to_string());
+            args.push(format!(
+                "mcp_servers.{name}.env.{key}={}",
+                codex_toml_string(value)
+            ));
+        }
+    }
+    args
+}
+
+fn codex_toml_key_segment(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn codex_toml_string(raw: &str) -> String {
+    serde_json::to_string(raw).expect("encoding a string should not fail")
+}
+
+fn codex_toml_string_array(values: &[String]) -> String {
+    serde_json::to_string(values).expect("encoding a string array should not fail")
 }
 
 #[async_trait]
@@ -2484,10 +2531,10 @@ mod tests {
         ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution,
         RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig,
         RuntimeDriverProvider, RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus,
-        RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
-        RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent,
-        RUNTIME_SESSION_READY_MARKER,
+        RuntimeMcpServerSpec, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
 
     use crate::codex_runtime_auth_kind;
@@ -2529,6 +2576,7 @@ mod tests {
                 RuntimePathProjection::directory("/runtime/home", runtime_home_root)
                     .expect("runtime home projection"),
             ],
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -2786,10 +2834,13 @@ mod tests {
 
     #[test]
     fn codex_app_server_program_uses_default_stdio_transport() {
-        let program = build_codex_app_server_program(&CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        });
+        let program = build_codex_app_server_program(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            &[],
+        );
 
         assert_eq!(program.executable, "codex");
         assert_eq!(
@@ -2804,6 +2855,42 @@ mod tests {
         );
         assert_eq!(program.stdin, "");
         assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
+    }
+
+    #[test]
+    fn codex_app_server_program_projects_mcp_servers_as_config_overrides() {
+        let program = build_codex_app_server_program(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: None,
+            },
+            &[RuntimeMcpServerSpec {
+                name: "lionclaw".to_string(),
+                command: "node".to_string(),
+                args: vec![
+                    "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
+                    "/runtime/lionclaw/channel-send.sock".to_string(),
+                ],
+                environment: vec![("TRACE".to_string(), "1".to_string())],
+            }],
+        );
+
+        assert_eq!(
+            program.args,
+            vec![
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+                "-c".to_string(),
+                "projects.\"/workspace\".trust_level=\"trusted\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lionclaw\".command=\"node\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lionclaw\".args=[\"/runtime/.lionclaw-mcp-stdio-proxy.mjs\",\"/runtime/lionclaw/channel-send.sock\"]".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lionclaw\".env.\"TRACE\"=\"1\"".to_string(),
+                "app-server".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3120,6 +3207,7 @@ mod tests {
                         environment: Vec::new(),
                         runtime_state_root: None,
                         runtime_path_projections: Vec::new(),
+                        mcp_servers: Vec::new(),
                     },
                     executor: Box::new(UnusedRuntimeProgramExecutor),
                 },
@@ -3610,6 +3698,7 @@ mod tests {
                 )
                 .expect("channel send socket projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(

@@ -348,6 +348,7 @@ pub struct EffectiveExecutionPlan {
     pub network_mode: NetworkMode,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
+    pub mcp_servers: Vec<lionclaw_runtime_api::RuntimeMcpServerSpec>,
     pub idle_timeout: Duration,
     pub hard_timeout: Duration,
     pub mounts: Vec<MountSpec>,
@@ -367,6 +368,7 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("network_mode", &self.network_mode)
             .field("working_dir", &self.working_dir)
             .field("environment_count", &self.environment.len())
+            .field("mcp_servers", &self.mcp_servers)
             .field("idle_timeout", &self.idle_timeout)
             .field("hard_timeout", &self.hard_timeout)
             .field("mounts", &self.mounts)

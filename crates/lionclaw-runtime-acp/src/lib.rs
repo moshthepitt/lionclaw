@@ -50,10 +50,10 @@ use lionclaw_runtime_api::{
     clear_state_value, load_ready_state_value, save_state_value, ExecutionOutput, RawTurnPayload,
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender,
-    RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
+    RuntimeMcpServerSpec, RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession,
+    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
@@ -235,6 +235,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             working_dir: context
                 .working_dir
                 .unwrap_or_else(|| self.config.default_working_dir.clone()),
+            mcp_servers: context.mcp_servers,
             executor,
         };
         driver.run_turn(input, journal).await
@@ -317,6 +318,7 @@ struct AcpTurnRunner {
     config: AcpRuntimeConfig,
     sessions: Arc<RwLock<HashMap<String, AcpSessionState>>>,
     working_dir: String,
+    mcp_servers: Vec<RuntimeMcpServerSpec>,
     executor: Box<dyn RuntimeProgramExecutor>,
 }
 
@@ -343,6 +345,7 @@ impl AcpTurnRunner {
                     &session_state,
                     session_capabilities,
                     &self.working_dir,
+                    &self.mcp_servers,
                 )
                 .await?;
             client
@@ -392,6 +395,32 @@ fn build_acp_terminal_program(config: &AcpRuntimeConfig) -> RuntimeProgramSpec {
         stdin: String::new(),
         auth: config.auth.clone(),
     }
+}
+
+fn acp_mcp_servers(servers: &[RuntimeMcpServerSpec]) -> Value {
+    Value::Array(
+        servers
+            .iter()
+            .map(|server| {
+                let env: Vec<Value> = server
+                    .environment
+                    .iter()
+                    .map(|(key, value)| {
+                        json!({
+                            "name": key,
+                            "value": value,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "name": server.name,
+                    "command": server.command,
+                    "args": server.args,
+                    "env": env,
+                })
+            })
+            .collect(),
+    )
 }
 
 struct AcpClient {
@@ -495,7 +524,9 @@ impl AcpClient {
         session_state: &AcpSessionState,
         session_capabilities: AcpSessionCapabilities,
         working_dir: &str,
+        mcp_servers: &[RuntimeMcpServerSpec],
     ) -> Result<AcpOpenedSession> {
+        let mcp_servers = acp_mcp_servers(mcp_servers);
         if let Some(session_id) = session_state.session_id.as_deref() {
             if let Some(reopen_method) = session_capabilities.reopen_method() {
                 self.request(
@@ -503,7 +534,7 @@ impl AcpClient {
                     json!({
                         "sessionId": session_id,
                         "cwd": working_dir,
-                        "mcpServers": [],
+                        "mcpServers": mcp_servers.clone(),
                     }),
                     None,
                 )
@@ -522,7 +553,7 @@ impl AcpClient {
                 "session/new",
                 json!({
                     "cwd": working_dir,
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers,
                 }),
                 None,
             )
@@ -1194,11 +1225,11 @@ mod tests {
 
     use lionclaw_runtime_api::{
         canonical_events, ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAuthKind,
-        RuntimeEvent, RuntimeExecutionContext, RuntimeMessageLane, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
-        RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
-        RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-        RUNTIME_SESSION_READY_MARKER,
+        RuntimeEvent, RuntimeExecutionContext, RuntimeMcpServerSpec, RuntimeMessageLane,
+        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramStdoutSender, RuntimeProgramTurnExecution, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTerminalProgramInput,
+        RuntimeTurnInput, RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
     };
 
     use super::{
@@ -1550,6 +1581,7 @@ mod tests {
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root),
             runtime_path_projections: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -1777,6 +1809,79 @@ mod tests {
         assert_eq!(sent[2]["params"]["value"], json!("gpt-5"));
         assert_eq!(sent[3]["params"]["configId"], json!("mode"));
         assert_eq!(sent[3]["params"]["value"], json!("plan"));
+    }
+
+    #[tokio::test]
+    async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: runtime_not_ready(),
+            })
+            .await
+            .expect("start");
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                opencode_initialize_response(1),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[]}}"#
+                    .to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#
+                    .to_string(),
+            ]),
+            expected_auth: None,
+            state: Arc::clone(&fake_state),
+        };
+        let (journal_tx, _journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = acp_driver_context(runtime_state_root);
+        context.mcp_servers = vec![RuntimeMcpServerSpec {
+            name: "lionclaw".to_string(),
+            command: "node".to_string(),
+            args: vec![
+                "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
+                "/runtime/lionclaw/channel-send.sock".to_string(),
+            ],
+            environment: Vec::new(),
+        }];
+
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id,
+                        prompt: "hello".to_string(),
+                        fresh_prompt: None,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context,
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP turn");
+
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+        assert_eq!(
+            sent[1]["params"]["mcpServers"],
+            json!([{
+                "name": "lionclaw",
+                "command": "node",
+                "args": [
+                    "/runtime/.lionclaw-mcp-stdio-proxy.mjs",
+                    "/runtime/lionclaw/channel-send.sock"
+                ],
+                "env": []
+            }])
+        );
     }
 
     #[tokio::test]

@@ -191,6 +191,7 @@ mod tests {
                     network_mode: NetworkMode::On,
                     working_dir: None,
                     environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
+                    mcp_servers: Vec::new(),
                     idle_timeout: Duration::from_secs(30),
                     hard_timeout: Duration::from_secs(90),
                     mounts: Vec::new(),

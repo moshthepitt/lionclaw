@@ -158,7 +158,7 @@ use super::{
         RuntimeAuthRegistry, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
         RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
         RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
         RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
@@ -210,6 +210,9 @@ const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const CHANNEL_SEND_MCP_SERVER_NAME: &str = "lionclaw";
+const CHANNEL_SEND_MCP_PROXY_STATE_FILE: &str = ".lionclaw-mcp-stdio-proxy.mjs";
+const CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH: &str = "/runtime/.lionclaw-mcp-stdio-proxy.mjs";
 const CHANNEL_SEND_HOST_SOCKET_ROOT: &str = "lionclaw";
 const CHANNEL_SEND_HOST_SOCKET_DIR: &str = "channel-send";
 const PROJECT_INSTANCE_PROJECTIONS_DIR: &str = "project-instance-projections";
@@ -218,6 +221,60 @@ const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
+const RUNTIME_MCP_STDIO_PROXY_JS: &str = r#"import readline from 'node:readline';
+import net from 'node:net';
+
+const socketPath = process.argv[2] || process.env.LIONCLAW_CHANNEL_SEND_SOCKET || '/runtime/lionclaw/channel-send.sock';
+
+function requestId(line) {
+  try {
+    const message = JSON.parse(line);
+    return Object.prototype.hasOwnProperty.call(message, 'id') ? message.id : null;
+  } catch {
+    return null;
+  }
+}
+
+function jsonRpcError(id, code, message) {
+  return JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
+}
+
+function kernelCall(line) {
+  return new Promise((resolve) => {
+    const client = net.connect(socketPath);
+    let buffer = '';
+    let resolved = false;
+    const finish = (response) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(response);
+    };
+    client.on('connect', () => {
+      client.write(line + '\n');
+      client.end();
+    });
+    client.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline >= 0) {
+        finish(buffer.slice(0, newline));
+        client.destroy();
+      }
+    });
+    client.on('end', () => finish(buffer.trim()));
+    client.on('error', (error) => {
+      finish(jsonRpcError(requestId(line), -32000, `LionClaw MCP broker is unavailable: ${error.message}`));
+    });
+  });
+}
+
+readline.createInterface({ input: process.stdin }).on('line', async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const response = await kernelCall(trimmed);
+  if (response) process.stdout.write(response + '\n');
+});
+"#;
 
 struct SchedulerRecoveryLeaseRenewal {
     stop_tx: Option<oneshot::Sender<()>>,
@@ -358,6 +415,7 @@ impl RuntimeChannelSendContext {
             environment: Vec::new(),
             runtime_state_root: Some(self.runtime_state_root.clone()),
             runtime_path_projections: self.runtime_path_projections.clone(),
+            mcp_servers: Vec::new(),
         }
         .host_path_for_runtime_path(runtime_path)
     }
@@ -399,6 +457,26 @@ struct RuntimeChannelSendAttachment {
     mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeMcpChannelSendArguments {
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    channel_id: String,
+    #[serde(default)]
+    conversation_ref: String,
+    #[serde(default)]
+    thread_ref: Option<String>,
+    #[serde(default)]
+    reply_to_ref: Option<String>,
+    #[serde(default)]
+    text: String,
+    #[serde(default = "default_runtime_channel_send_format_hint")]
+    format_hint: String,
+    #[serde(default)]
+    attachments: Vec<RuntimeChannelSendAttachment>,
+}
+
 struct PrivateContextRecordAuditStatus {
     eligibility: &'static str,
     status: &'static str,
@@ -425,6 +503,16 @@ impl RuntimeChannelSendProblem {
             message: message.into(),
         }
     }
+}
+
+struct AuthorizedChannelSendEnqueue<'a> {
+    route: ChannelDeliveryRoute<'a>,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    source_kind: Option<&'a str>,
+    source_id: Option<&'a str>,
+    source_fingerprint: Option<&'a str>,
+    content: ChannelDeliveryContent,
 }
 
 struct RuntimeChannelSendBridge {
@@ -766,6 +854,7 @@ fn runtime_execution_context(
         environment: plan.environment.clone(),
         runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
         runtime_path_projections: runtime_path_projections_for_plan(plan)?,
+        mcp_servers: plan.mcp_servers.clone(),
     })
 }
 
@@ -7710,6 +7799,7 @@ mod tests {
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
             environment: Vec::new(),
+            mcp_servers: Vec::new(),
             idle_timeout: Duration::from_secs(30),
             hard_timeout: Duration::from_secs(60),
             mounts: Vec::new(),
@@ -13263,6 +13353,7 @@ done
             .iter()
             .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
         assert!(launch.request.plan.escape_classes.is_empty());
+        assert!(launch.request.plan.mcp_servers.is_empty());
         assert!(launch
             .request
             .plan
@@ -13999,6 +14090,7 @@ done
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
             environment: Vec::new(),
+            mcp_servers: Vec::new(),
             idle_timeout: Duration::from_secs(1),
             hard_timeout: Duration::from_secs(1),
             mounts: Vec::new(),
@@ -17513,6 +17605,18 @@ fn default_runtime_channel_send_format_hint() -> String {
     "plain".to_string()
 }
 
+fn channel_send_mcp_server_spec() -> RuntimeMcpServerSpec {
+    RuntimeMcpServerSpec {
+        name: CHANNEL_SEND_MCP_SERVER_NAME.to_string(),
+        command: "node".to_string(),
+        args: vec![
+            CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH.to_string(),
+            CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
+        ],
+        environment: Vec::new(),
+    }
+}
+
 async fn run_runtime_channel_send_bridge(
     kernel: Kernel,
     context: RuntimeChannelSendContext,
@@ -17599,7 +17703,7 @@ async fn reject_runtime_channel_send_connection(
     let response = runtime_channel_send_error_response(problem.code, problem.message);
     match timeout(
         RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT,
-        write_runtime_channel_send_response(stream, response),
+        write_runtime_channel_send_response(stream, Some(response)),
     )
     .await
     {
@@ -17634,11 +17738,27 @@ async fn handle_runtime_channel_send_stream(
     )
     .await
     {
-        Ok(Ok(())) => match serde_json::from_slice::<RuntimeChannelSendRequest>(&line) {
-            Ok(request) => runtime_channel_send_response(
-                kernel.send_runtime_channel_message(context, request).await,
-            ),
-            Err(err) => {
+        Ok(Ok(())) => match serde_json::from_slice::<Value>(&line) {
+            Ok(value) if runtime_channel_send_is_mcp_request(&value) => {
+                runtime_channel_send_mcp_response(&kernel, &context, value).await
+            }
+            Ok(value) => match serde_json::from_value::<RuntimeChannelSendRequest>(value) {
+                Ok(request) => Some(runtime_channel_send_response(
+                    kernel.send_runtime_channel_message(context, request).await,
+                )),
+                Err(err) => Some(
+                    runtime_channel_send_denied_response(
+                        &kernel,
+                        &context,
+                        RuntimeChannelSendProblem::new(
+                            "invalid_json",
+                            format!("request is not valid channel.send JSON: {err}"),
+                        ),
+                    )
+                    .await,
+                ),
+            },
+            Err(err) => Some(
                 runtime_channel_send_denied_response(
                     &kernel,
                     &context,
@@ -17647,11 +17767,13 @@ async fn handle_runtime_channel_send_stream(
                         format!("request is not valid channel.send JSON: {err}"),
                     ),
                 )
-                .await
-            }
+                .await,
+            ),
         },
-        Ok(Err(problem)) => runtime_channel_send_denied_response(&kernel, &context, problem).await,
-        Err(_) => {
+        Ok(Err(problem)) => {
+            Some(runtime_channel_send_denied_response(&kernel, &context, problem).await)
+        }
+        Err(_) => Some(
             runtime_channel_send_denied_response(
                 &kernel,
                 &context,
@@ -17663,8 +17785,8 @@ async fn handle_runtime_channel_send_stream(
                     ),
                 ),
             )
-            .await
-        }
+            .await,
+        ),
     };
 
     write_runtime_channel_send_response(reader.into_inner(), response).await
@@ -17672,11 +17794,13 @@ async fn handle_runtime_channel_send_stream(
 
 async fn write_runtime_channel_send_response(
     mut stream: UnixStream,
-    response: Value,
+    response: Option<Value>,
 ) -> Result<(), std::io::Error> {
-    let mut encoded = serde_json::to_vec(&response)?;
-    encoded.push(b'\n');
-    stream.write_all(&encoded).await?;
+    if let Some(response) = response {
+        let mut encoded = serde_json::to_vec(&response)?;
+        encoded.push(b'\n');
+        stream.write_all(&encoded).await?;
+    }
     stream.shutdown().await
 }
 
@@ -17725,6 +17849,220 @@ async fn read_bounded_json_line(
         line.extend_from_slice(available);
         reader.consume(consumed);
     }
+}
+
+fn runtime_channel_send_is_mcp_request(value: &Value) -> bool {
+    value.get("jsonrpc").and_then(Value::as_str) == Some("2.0") || value.get("method").is_some()
+}
+
+async fn runtime_channel_send_mcp_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    request: Value,
+) -> Option<Value> {
+    let id = request.get("id").cloned();
+    let method = match request.get("method").and_then(Value::as_str) {
+        Some(method) => method,
+        None => {
+            return id.map(|id| {
+                runtime_channel_send_json_rpc_error(id, -32600, "MCP request method is required")
+            });
+        }
+    };
+    if method == "notifications/initialized" {
+        return None;
+    }
+    let id = id?;
+    match method {
+        "initialize" => Some(runtime_channel_send_json_rpc_result(
+            id,
+            runtime_channel_send_mcp_initialize_result(request.get("params")),
+        )),
+        "tools/list" => Some(runtime_channel_send_json_rpc_result(
+            id,
+            runtime_channel_send_mcp_tools_list_result(),
+        )),
+        "tools/call" => Some(
+            match runtime_channel_send_request_from_mcp_call(request.get("params"), &id) {
+                Ok(channel_send_request) => {
+                    let result = kernel
+                        .send_runtime_channel_message(context.clone(), channel_send_request)
+                        .await;
+                    runtime_channel_send_mcp_tool_result(id, result)
+                }
+                Err(message) => runtime_channel_send_json_rpc_error(id, -32602, message),
+            },
+        ),
+        _ => Some(runtime_channel_send_json_rpc_error(
+            id,
+            -32601,
+            format!("unsupported MCP method '{method}'"),
+        )),
+    }
+}
+
+fn runtime_channel_send_json_rpc_result(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn runtime_channel_send_json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+fn runtime_channel_send_mcp_initialize_result(params: Option<&Value>) -> Value {
+    let protocol_version = params
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .unwrap_or("2025-06-18");
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "tools": {},
+        },
+        "serverInfo": {
+            "name": "lionclaw-kernel",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+fn runtime_channel_send_mcp_tools_list_result() -> Value {
+    json!({
+        "tools": [{
+            "name": "channel_send",
+            "description": "Send an outbound message to a LionClaw channel conversation.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional stable retry key for this tool call."
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Projected LionClaw channel id."
+                    },
+                    "conversation_ref": {
+                        "type": "string",
+                        "description": "Projected channel conversation reference."
+                    },
+                    "thread_ref": {
+                        "type": "string",
+                        "description": "Optional projected thread reference."
+                    },
+                    "reply_to_ref": {
+                        "type": "string",
+                        "description": "Optional channel message to reply to."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Message text."
+                    },
+                    "format_hint": {
+                        "type": "string",
+                        "enum": ["plain", "markdown", "html"],
+                        "default": "plain"
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "path": { "type": "string" },
+                                "filename": { "type": "string" },
+                                "mime_type": { "type": "string" }
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                },
+                "required": ["channel_id", "conversation_ref"]
+            }
+        }]
+    })
+}
+
+fn runtime_channel_send_request_from_mcp_call(
+    params: Option<&Value>,
+    request_id: &Value,
+) -> Result<RuntimeChannelSendRequest, String> {
+    let params = params.ok_or_else(|| "tools/call params are required".to_string())?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call params.name is required".to_string())?;
+    if name != "channel_send" {
+        return Err(format!("unknown MCP tool '{name}'"));
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let arguments: RuntimeMcpChannelSendArguments = serde_json::from_value(arguments)
+        .map_err(|err| format!("channel_send arguments are invalid: {err}"))?;
+    let idempotency_key = arguments
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .map(Ok)
+        .unwrap_or_else(|| runtime_channel_send_mcp_idempotency_key(request_id))?;
+
+    Ok(RuntimeChannelSendRequest {
+        idempotency_key,
+        channel_id: arguments.channel_id,
+        conversation_ref: arguments.conversation_ref,
+        thread_ref: arguments.thread_ref,
+        reply_to_ref: arguments.reply_to_ref,
+        content: Some(RuntimeChannelSendContent {
+            text: arguments.text,
+            format_hint: arguments.format_hint,
+            attachments: arguments.attachments,
+        }),
+    })
+}
+
+fn runtime_channel_send_mcp_idempotency_key(request_id: &Value) -> Result<String, String> {
+    match request_id {
+        Value::String(value) if !value.trim().is_empty() => Ok(format!("mcp:{}", value.trim())),
+        Value::Number(value) => Ok(format!("mcp:{value}")),
+        _ => Err(
+            "channel_send arguments.idempotency_key is required when JSON-RPC id is not a string or number"
+                .to_string(),
+        ),
+    }
+}
+
+fn runtime_channel_send_mcp_tool_result(
+    id: Value,
+    result: Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem>,
+) -> Value {
+    let body = runtime_channel_send_response(result);
+    let is_error = body.get("ok").and_then(Value::as_bool) != Some(true);
+    runtime_channel_send_json_rpc_result(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": body.to_string(),
+            }],
+            "isError": is_error,
+        }),
+    )
 }
 
 fn runtime_channel_send_response(
@@ -21241,6 +21579,17 @@ impl Kernel {
                 .runtime_channel_send_bridge_error(&context, "runtime_socket_dir", err)
                 .await;
         }
+        if let Err(err) = write_runtime_state_file(
+            &context.runtime_state_root,
+            CHANNEL_SEND_MCP_PROXY_STATE_FILE,
+            RUNTIME_MCP_STDIO_PROXY_JS.as_bytes().to_vec(),
+        )
+        .await
+        {
+            return self
+                .runtime_channel_send_bridge_error(&context, "mcp_proxy", err)
+                .await;
+        }
         let socket_owner_id = runtime_channel_send_socket_owner_id(&context.runtime_state_root);
         let (listener, socket_path) =
             match bind_runtime_channel_send_socket(&socket_owner_id, context.turn_id).await {
@@ -21263,6 +21612,9 @@ impl Kernel {
             CHANNEL_SEND_SOCKET_ENV.to_string(),
             CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
         ));
+        plan.mcp_servers
+            .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
+        plan.mcp_servers.push(channel_send_mcp_server_spec());
 
         context.runtime_path_projections = match runtime_path_projections_for_plan(plan) {
             Ok(projections) => projections,
@@ -21302,6 +21654,8 @@ impl Kernel {
         {
             plan.environment
                 .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
+            plan.mcp_servers
+                .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
             return Ok(None);
         }
         let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
@@ -22076,51 +22430,74 @@ impl Kernel {
         format!("{channel_id}:{session_key}")
     }
 
-    pub(super) async fn enqueue_channel_delivery(
+    async fn enqueue_authorized_channel_send(
         &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: &str,
-    ) -> Result<Uuid, KernelError> {
-        self.enqueue_channel_delivery_content(
-            route,
-            session_id,
-            turn_id,
+        input: AuthorizedChannelSendEnqueue<'_>,
+    ) -> Result<ChannelOutboxEnqueueResult, KernelError> {
+        let channel_id = input.route.channel_id.trim();
+        let conversation_ref = input.route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        if input.content.text.trim().is_empty() && input.content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
+        if input.content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+            return Err(KernelError::BadRequest(format!(
+                "outbox delivery attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+            )));
+        }
+        self.require_active_channel_binding(channel_id).await?;
+
+        let thread_ref = input
+            .route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = input
+            .route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_kind = input
+            .source_kind
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_id = input.source_id.map(str::trim).filter(|raw| !raw.is_empty());
+        let source_fingerprint = input
+            .source_fingerprint
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let delivery = NewChannelDelivery {
+            route: ChannelDeliveryRoute {
+                channel_id,
+                conversation_ref,
+                thread_ref,
+                reply_to_ref,
+            },
+            session_id: input.session_id,
+            turn_id: input.turn_id,
             source_kind,
             source_id,
-            ChannelDeliveryContent {
-                text: content.to_string(),
-                format_hint: "plain".to_string(),
-                attachments: Vec::new(),
-            },
-        )
-        .await
-    }
-
-    pub(super) async fn enqueue_channel_delivery_content(
-        &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: ChannelDeliveryContent,
-    ) -> Result<Uuid, KernelError> {
-        let delivery = self
-            .create_channel_delivery_content(
-                route,
-                session_id,
-                turn_id,
-                source_kind,
-                source_id,
-                content,
-            )
-            .await?;
-        self.audit_channel_outbox_created(&delivery).await?;
-        Ok(delivery.delivery_id)
+            source_fingerprint,
+            content: input.content,
+        };
+        if source_fingerprint.is_some() {
+            self.channel_outbox
+                .enqueue_delivery_idempotent(delivery)
+                .await
+                .map_err(internal)
+        } else {
+            self.channel_outbox
+                .enqueue_delivery(delivery)
+                .await
+                .map(ChannelOutboxEnqueueResult::Created)
+                .map_err(internal)
+        }
     }
 
     pub(super) async fn enqueue_scheduler_run_delivery(
@@ -22555,8 +22932,7 @@ impl Kernel {
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
         let delivery = self
-            .channel_outbox
-            .enqueue_delivery_idempotent(NewChannelDelivery {
+            .enqueue_authorized_channel_send(AuthorizedChannelSendEnqueue {
                 route: ChannelDeliveryRoute {
                     channel_id,
                     conversation_ref,
@@ -22571,7 +22947,7 @@ impl Kernel {
                 content,
             })
             .await
-            .map_err(runtime_channel_send_internal_problem)?;
+            .map_err(runtime_channel_send_kernel_problem)?;
 
         match delivery {
             ChannelOutboxEnqueueResult::Created(delivery) => {
@@ -25548,22 +25924,31 @@ impl Kernel {
                                 Ok(intent) => {
                                     let source_id = turn_id.to_string();
                                     match self
-                                        .enqueue_channel_delivery(
-                                            ChannelDeliveryRoute {
-                                                channel_id: &intent.channel_id,
-                                                conversation_ref: &intent.conversation_ref,
-                                                thread_ref: intent.thread_ref.as_deref(),
-                                                reply_to_ref: intent.reply_to_ref.as_deref(),
+                                        .enqueue_authorized_channel_send(
+                                            AuthorizedChannelSendEnqueue {
+                                                route: ChannelDeliveryRoute {
+                                                    channel_id: &intent.channel_id,
+                                                    conversation_ref: &intent.conversation_ref,
+                                                    thread_ref: intent.thread_ref.as_deref(),
+                                                    reply_to_ref: intent.reply_to_ref.as_deref(),
+                                                },
+                                                session_id: Some(session_id),
+                                                turn_id: Some(turn_id),
+                                                source_kind: Some("session_turn"),
+                                                source_id: Some(&source_id),
+                                                source_fingerprint: None,
+                                                content: ChannelDeliveryContent {
+                                                    text: intent.content.clone(),
+                                                    format_hint: "plain".to_string(),
+                                                    attachments: Vec::new(),
+                                                },
                                             },
-                                            Some(session_id),
-                                            Some(turn_id),
-                                            Some("session_turn"),
-                                            Some(&source_id),
-                                            &intent.content,
                                         )
                                         .await
                                     {
-                                        Ok(delivery_id) => {
+                                        Ok(ChannelOutboxEnqueueResult::Created(delivery)) => {
+                                            self.audit_channel_outbox_created(&delivery).await?;
+                                            let delivery_id = delivery.delivery_id;
                                             output = json!({
                                                 "channel_id": intent.channel_id,
                                                 "conversation_ref": intent.conversation_ref,
@@ -25572,6 +25957,25 @@ impl Kernel {
                                                 "delivery_id": delivery_id,
                                             });
                                             allowed = true;
+                                        }
+                                        Ok(ChannelOutboxEnqueueResult::Existing(delivery)) => {
+                                            output = json!({
+                                                "channel_id": intent.channel_id,
+                                                "conversation_ref": intent.conversation_ref,
+                                                "thread_ref": intent.thread_ref,
+                                                "reply_to_ref": intent.reply_to_ref,
+                                                "delivery_id": delivery.delivery_id,
+                                            });
+                                            allowed = true;
+                                        }
+                                        Ok(ChannelOutboxEnqueueResult::Conflict(delivery)) => {
+                                            let detail = format!(
+                                                "channel.send source conflict with delivery {}",
+                                                delivery.delivery_id
+                                            );
+                                            execution_error = Some(detail.clone());
+                                            reason =
+                                                Some(format!("broker execution failed: {detail}"));
                                         }
                                         Err(err) => {
                                             let detail = err.to_string();
