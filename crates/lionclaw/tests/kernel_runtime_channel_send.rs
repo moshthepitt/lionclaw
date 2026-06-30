@@ -1522,12 +1522,17 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
         .take()
         .expect("runtime should hold an open socket connection");
     let request = json!({
-        "idempotency_key": "after-turn-complete",
-        "channel_id": "local-cli",
-        "conversation_ref": "member:reviewer",
-        "content": {
-            "text": "this must not enqueue",
-            "format_hint": "plain"
+        "jsonrpc": "2.0",
+        "id": "after-turn-complete",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "this must not enqueue",
+                "format_hint": "plain"
+            }
         }
     });
     let mut line = serde_json::to_vec(&request).expect("serialize request");
@@ -1542,6 +1547,10 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
     {
         if !response.trim().is_empty() {
             let response: Value = serde_json::from_str(response.trim()).expect("decode response");
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], "after-turn-complete");
+            assert_eq!(response["result"]["isError"].as_bool(), Some(true));
+            let response = mcp_tool_text_json(&response);
             assert_eq!(response["ok"].as_bool(), Some(false));
             assert_eq!(response["error"]["code"].as_str(), Some("bridge_closed"));
         }

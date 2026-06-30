@@ -77,10 +77,10 @@ MCP call:
 
 - `format_hint` may be `plain`, `markdown`, or `html`; use `markdown` unless
   there is a reason to choose another format.
-- `attachments` names files written under `/runtime`. Attachment paths are
-  path-only: LionClaw derives the delivered filename and media type from the
-  runtime file, so write or rename the file under `/runtime` first when the
-  name matters.
+- `attachments` names files written under `/runtime`. A bare `path` is usually
+  enough: LionClaw derives the delivered filename and media type from the
+  runtime file. Optional `filename` and `mime_type` fields are accepted when the
+  delivered metadata must differ from the runtime path.
 - `idempotency_key` is optional. Set it only when intentionally retrying the
   same send with identical content.
 

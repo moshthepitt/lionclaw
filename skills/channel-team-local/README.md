@@ -18,9 +18,9 @@ computing the installed skill hash.
 The same binary backs the runtime-facing `runtime/team-local/scripts/list` and
 `runtime/team-local/scripts/resolve` helpers for sender-side team discovery.
 Runtime sends use the LionClaw-projected `channel_send` MCP tool with routes
-from the projected inventory. Attachments are path-only; the kernel derives the
-delivered filename and media type from the runtime file when it prepares the
-channel-send attachment.
+from the projected inventory. Attachments name runtime-visible paths; when
+filename or media type are omitted, the kernel derives delivered metadata from
+the runtime file while preparing the channel-send attachment.
 
 The worker is a separate Rust workspace crate named
 `lionclaw-channel-team-local`; it does not depend on the `lionclaw` crate.
