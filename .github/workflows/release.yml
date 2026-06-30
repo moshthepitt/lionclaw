@@ -115,7 +115,6 @@ jobs:
           test -f "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/SKILL.md"
           test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/list"
           test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/resolve"
-          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/send"
           test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/context"
           test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/projector"
           test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/recorder"
