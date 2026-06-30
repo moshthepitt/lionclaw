@@ -1019,12 +1019,11 @@ impl Kernel {
         let session_lock = self.session_lock(session_id).await;
         let _guard = session_lock.lock().await;
         let prepared = self.prepare_attached_runtime_launch(input).await?;
-        let plan = prepared.request.plan.clone();
         let output = match execute_attached(prepared.request.clone()).await {
             Ok(output) => output,
             Err(err) => {
                 if let Err(finish_err) = self
-                    .finish_attached_runtime_launch(session_id, &runtime_id, &plan, None, None)
+                    .finish_attached_runtime_launch(session_id, &runtime_id, None, None)
                     .await
                 {
                     return Err(KernelError::Runtime(format!(
@@ -1037,7 +1036,6 @@ impl Kernel {
         self.finish_attached_runtime_launch(
             session_id,
             &runtime_id,
-            &plan,
             output.exit_code,
             output.exit_signal,
         )
@@ -1165,7 +1163,6 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
-        _plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> Result<(), KernelError> {
@@ -9777,7 +9774,7 @@ mod tests {
         )
         .await;
 
-        let launch = kernel
+        let _launch = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session.session_id))
             .await
             .expect("prepare attached runtime launch");
@@ -9785,7 +9782,6 @@ mod tests {
             .finish_attached_runtime_launch(
                 session.session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
                 Some(0),
                 None,
             )
@@ -13141,18 +13137,12 @@ done
             .await
             .expect("list initial session turns");
 
-        let launch = kernel
+        let _launch = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare launch");
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
-                Some(0),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(0), None)
             .await
             .expect("finish launch");
 
@@ -13210,13 +13200,7 @@ done
         .expect("seed ready marker");
 
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
-                Some(1),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(1), None)
             .await
             .expect("finish launch");
 
@@ -13347,18 +13331,12 @@ done
         ));
 
         drop(first_launch);
-        let second_launch = second_kernel
+        let _second_launch = second_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare attached launch after lock release");
         second_kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &second_launch.request.plan,
-                Some(0),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(0), None)
             .await
             .expect("finish second launch");
     }
@@ -13414,7 +13392,7 @@ done
         ));
 
         drop(first_launch);
-        let second_launch = second_kernel
+        let _second_launch = second_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
             .await
             .expect("prepare attached launch after native home lock release");
@@ -13422,7 +13400,6 @@ done
             .finish_attached_runtime_launch(
                 second_session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &second_launch.request.plan,
                 Some(0),
                 None,
             )
@@ -13619,13 +13596,7 @@ done
             .to_path_buf();
 
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
-                None,
-                Some(2),
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, None, Some(2))
             .await
             .expect("finish signal launch");
 
