@@ -355,19 +355,21 @@ outbox delivery.
 ## Program-Backed `channel.send`
 
 Program-backed runtimes use a turn-scoped MCP server for outbound channel
-delivery. When the effective execution preset includes `channel-send`, the
-kernel mounts a LionClaw-owned socket at `/runtime/lionclaw/channel-send.sock`,
-writes a small stdio proxy under `/runtime`, and passes a `lionclaw` MCP server
-spec to program-backed drivers that support MCP. The proxy is transport only:
-it forwards JSON-RPC lines between stdio and the Unix socket. Tool listing,
-`channel_send` calls, authorization, audit, and enqueueing all terminate in the
-kernel broker outside the sandbox.
+delivery. When the effective execution preset includes `channel-send` and the
+kernel can derive an active channel route or projected project-instance route
+for the turn, the kernel mounts a LionClaw-owned socket at
+`/runtime/lionclaw/channel-send.sock`, writes a small stdio proxy under
+`/runtime`, and passes a `lionclaw` MCP server spec to program-backed drivers
+that support MCP. The proxy is transport only: it forwards JSON-RPC lines
+between stdio and the Unix socket. Tool listing, `channel_send` calls,
+authorization, audit, and enqueueing all terminate in the kernel broker outside
+the sandbox.
 
-Without that escape class, the MCP server spec, proxy, and usable socket are
-absent. The bridge is valid only while the runtime turn is active; turn
-completion or timeout removes the socket and invalidates open connections.
-Native runtime controls and native runtime TUI sessions do not receive this
-bridge or MCP tool.
+Without that escape class, or without kernel-derived route authority for the
+turn, the MCP server spec, proxy, and usable socket are absent. The bridge is
+valid only while the runtime turn is active; turn completion or timeout removes
+the socket and invalidates open connections. Native runtime controls and native
+runtime TUI sessions do not receive this bridge or MCP tool.
 
 The host socket is created under the operator's short per-user runtime directory
 rather than under the instance home, so long project paths do not exceed Unix
@@ -398,11 +400,11 @@ hints, copies any attachments into LionClaw-owned outbox storage, and creates a
 normal durable channel outbox delivery. Direct/runtime capability
 `channel.send` remains policy-gated and derives its route from the active
 channel session; MCP `channel_send` remains preset/bridge-gated and validates
-the requested route against the turn's projected route inventory. Both paths
-terminate in the kernel and use the same authorized enqueue helper instead of
-maintaining separate outbox paths. Channel workers continue to lease and report
-those deliveries through `/v0/channels/outbox/pull` and
-`/v0/channels/outbox/report`.
+the requested route against the active turn route and projected route
+inventory. Both paths terminate in the kernel broker and use the same
+authorized enqueue helper instead of maintaining separate outbox paths. Channel
+workers continue to lease and report those deliveries through
+`/v0/channels/outbox/pull` and `/v0/channels/outbox/report`.
 
 Bridge setup, accept-loop, connection-task, and connection I/O failures are
 audited under `runtime.channel_send.bridge_error`. Request denials, including

@@ -74,8 +74,9 @@ use crate::{
         RUNTIME_PROJECTS_DIR, RUNTIME_SESSION_READY_MARKER,
     },
     project_inventory::{
-        ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
-        PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
+        ProjectInstanceChannelSendStatus, ProjectInstanceRuntimeContext,
+        PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME, PROJECT_INSTANCES_FILE_PATH,
+        PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
     },
     runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
     workspace::{read_workspace_section, AGENTS_FILE, GENERATED_AGENTS_FILE},
@@ -85,7 +86,10 @@ use lionclaw_durable_fs::{remove_file_if_exists, write_file_atomically};
 use super::{
     audit::AuditLog,
     cancellation::{normalize_cancel_reason, TurnCancellation},
-    capability_broker::{CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext},
+    capability_broker::{
+        CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext,
+        CHANNEL_SEND_ROUTE_NOT_PROJECTED,
+    },
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
         ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
@@ -330,11 +334,38 @@ struct RuntimeChannelSendContext {
     session_id: Uuid,
     turn_id: Uuid,
     runtime_id: String,
+    active_channel_route: Option<RuntimeChannelSendRoute>,
+    projected_channel_routes: Vec<RuntimeChannelSendRoute>,
     runtime_state_root: PathBuf,
     runtime_native_home_root: Option<PathBuf>,
     runtime_native_home_artifact_dirs: Vec<RuntimeNativeHomeArtifactDir>,
     runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeChannelSendRoute {
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RuntimeChannelSendRoutes {
+    active: Option<RuntimeChannelSendRoute>,
+    projected: Vec<RuntimeChannelSendRoute>,
+}
+
+impl RuntimeChannelSendRoute {
+    fn as_capability_route(&self) -> CapabilityChannelSendRoute<'_> {
+        CapabilityChannelSendRoute {
+            channel_id: self.channel_id.as_str(),
+            conversation_ref: self.conversation_ref.as_str(),
+            thread_ref: self.thread_ref.as_deref(),
+            reply_to_ref: self.reply_to_ref.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +442,21 @@ impl RuntimePathAccessError {
 impl RuntimeChannelSendContext {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    fn capability_execution_context(&self) -> CapabilityExecutionContext<'_> {
+        CapabilityExecutionContext {
+            channel_send_route: self
+                .active_channel_route
+                .as_ref()
+                .map(RuntimeChannelSendRoute::as_capability_route),
+            projected_channel_send_routes: self
+                .projected_channel_routes
+                .iter()
+                .map(RuntimeChannelSendRoute::as_capability_route)
+                .collect(),
+            allow_channel_send_route_selection: true,
+        }
     }
 
     fn artifact_roots(&self) -> Vec<RuntimeArtifactRoot> {
@@ -503,6 +549,30 @@ struct PrivateContextRecordAuditStatus {
 #[derive(Debug, Clone)]
 struct RuntimeChannelSendAccepted {
     delivery_id: Uuid,
+}
+
+struct BrokerChannelSendRequest {
+    session_id: Uuid,
+    turn_id: Uuid,
+    source_kind: &'static str,
+    source_id: String,
+    source_fingerprint: Option<String>,
+    content: Option<BrokerChannelSendContent>,
+    idempotent: bool,
+}
+
+struct BrokerChannelSendContent {
+    delivery: ChannelDeliveryContent,
+    prepared_attachments: Option<PreparedChannelDeliveryAttachments>,
+}
+
+struct BrokerChannelSendAccepted {
+    delivery_id: Uuid,
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+    idempotent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -17992,7 +18062,14 @@ async fn runtime_channel_send_mcp_response(
     if method == "notifications/initialized" {
         return None;
     }
-    let id = id?;
+    let Some(id) = id else {
+        if method == "tools/call" {
+            kernel
+                .audit_runtime_channel_send_denied(context, "", "", "invalid_json_rpc")
+                .await;
+        }
+        return None;
+    };
     match method {
         "initialize" => Some(runtime_channel_send_json_rpc_result(
             id,
@@ -18428,20 +18505,11 @@ fn runtime_channel_send_host_path(
     Ok(host_path)
 }
 
-fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
-    match err {
-        KernelError::NotFound(message) => {
-            RuntimeChannelSendProblem::new("unknown_channel", message)
-        }
-        KernelError::Conflict(message) => {
-            RuntimeChannelSendProblem::new("channel_unavailable", message)
-        }
-        other => runtime_channel_send_kernel_problem(other),
-    }
-}
-
 fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendProblem {
     match err {
+        KernelError::BadRequest(message) if message == CHANNEL_SEND_ROUTE_NOT_PROJECTED => {
+            RuntimeChannelSendProblem::new("route_not_allowed", message)
+        }
         KernelError::BadRequest(message) => {
             RuntimeChannelSendProblem::new("invalid_request", message)
         }
@@ -18484,6 +18552,20 @@ fn normalize_runtime_channel_send_content(
     normalized
 }
 
+fn runtime_channel_send_broker_payload(
+    request: &RuntimeChannelSendRequest,
+    content: &RuntimeChannelSendContent,
+) -> Value {
+    json!({
+        "channel_id": request.channel_id,
+        "conversation_ref": request.conversation_ref,
+        "thread_ref": request.thread_ref,
+        "reply_to_ref": request.reply_to_ref,
+        "content": content.text,
+        "attachment_count": content.attachments.len(),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct ChannelSendIntent {
     channel_id: String,
@@ -18522,9 +18604,6 @@ fn parse_channel_send_intent(value: &serde_json::Value) -> Result<ChannelSendInt
         .get("content")
         .and_then(|raw| raw.as_str())
         .ok_or_else(|| "channel.send broker output missing content".to_string())?;
-    if content.trim().is_empty() {
-        return Err("channel.send broker output missing content".to_string());
-    }
 
     Ok(ChannelSendIntent {
         channel_id: channel_id.to_string(),
@@ -21726,6 +21805,84 @@ impl Kernel {
         Ok(())
     }
 
+    async fn runtime_channel_send_authorized_routes(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<RuntimeChannelSendRoutes, KernelError> {
+        let session = self.sessions.get(session_id).await.map_err(internal)?;
+        let active_channel_route = if let Some(session) =
+            session.filter(|session| self.applied_channel(&session.channel_id).is_some())
+        {
+            let route = self
+                .resolved_channel_route_for_session(&session.channel_id, &session.peer_id, turn_id)
+                .await?;
+            Some(RuntimeChannelSendRoute {
+                channel_id: session.channel_id,
+                conversation_ref: route.conversation_ref,
+                thread_ref: route.thread_ref,
+                reply_to_ref: route.reply_to_ref,
+            })
+        } else {
+            None
+        };
+        let mut projected_channel_routes = self
+            .project_instance_runtime
+            .as_ref()
+            .map(Self::projected_runtime_channel_send_routes)
+            .unwrap_or_default();
+        projected_channel_routes.retain(|route| self.applied_channel(&route.channel_id).is_some());
+
+        Ok(RuntimeChannelSendRoutes {
+            active: active_channel_route,
+            projected: projected_channel_routes,
+        })
+    }
+
+    fn projected_runtime_channel_send_routes(
+        context: &ProjectInstanceRuntimeContext,
+    ) -> Vec<RuntimeChannelSendRoute> {
+        context
+            .channel_send_inventory
+            .instances
+            .iter()
+            .filter(|instance| instance.name != context.instance_name)
+            .filter_map(|instance| {
+                let channel_send = instance.channel_send.as_ref()?;
+                if channel_send.status != ProjectInstanceChannelSendStatus::Configured {
+                    return None;
+                }
+                let channel_id = channel_send
+                    .channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                let conversation_ref = channel_send
+                    .conversation_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                let thread_ref = match channel_send.thread_ref.as_ref() {
+                    Some(Some(thread_ref)) => {
+                        let thread_ref = thread_ref.trim();
+                        if thread_ref.is_empty() {
+                            None
+                        } else {
+                            Some(thread_ref.to_string())
+                        }
+                    }
+                    _ => None,
+                };
+                Some(RuntimeChannelSendRoute {
+                    channel_id: channel_id.to_string(),
+                    conversation_ref: conversation_ref.to_string(),
+                    thread_ref,
+                    reply_to_ref: None,
+                })
+            })
+            .collect()
+    }
+
     async fn start_runtime_channel_send_bridge(
         &self,
         context: RuntimeChannelSendContext,
@@ -21825,6 +21982,14 @@ impl Kernel {
                 .await;
         };
         let runtime_native_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let routes = self
+            .runtime_channel_send_authorized_routes(session_id, turn_id)
+            .await?;
+        if routes.active.is_none() && routes.projected.is_empty() {
+            plan.mcp_servers
+                .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
+            return Ok(None);
+        }
         let runtime_native_home_artifact_dirs = if runtime_native_home_root.is_some() {
             Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?
         } else {
@@ -21835,6 +22000,8 @@ impl Kernel {
                 session_id,
                 turn_id,
                 runtime_id: runtime_id.to_string(),
+                active_channel_route: routes.active,
+                projected_channel_routes: routes.projected,
                 runtime_state_root,
                 runtime_native_home_root,
                 runtime_native_home_artifact_dirs,
@@ -22801,6 +22968,102 @@ impl Kernel {
             .map_err(internal)
     }
 
+    async fn authorize_and_enqueue_channel_send(
+        &self,
+        context: CapabilityExecutionContext<'_>,
+        payload: Value,
+        request: BrokerChannelSendRequest,
+    ) -> Result<BrokerChannelSendAccepted, KernelError> {
+        let broker_output = self
+            .capability_broker
+            .execute(&context, Capability::ChannelSend, &payload)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                if message == CHANNEL_SEND_ROUTE_NOT_PROJECTED {
+                    KernelError::BadRequest(message)
+                } else {
+                    KernelError::BadRequest(format!("broker execution failed: {message}"))
+                }
+            })?;
+        let intent = parse_channel_send_intent(&broker_output).map_err(|detail| {
+            KernelError::BadRequest(format!("broker execution failed: {detail}"))
+        })?;
+
+        self.require_active_channel_binding(&intent.channel_id)
+            .await?;
+
+        let (content, mut prepared_attachments) = match request.content {
+            Some(content) => (content.delivery, content.prepared_attachments),
+            None => (
+                ChannelDeliveryContent {
+                    text: intent.content.clone(),
+                    format_hint: "plain".to_string(),
+                    attachments: Vec::new(),
+                },
+                None,
+            ),
+        };
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel.send content cannot be empty".to_string(),
+            ));
+        }
+
+        let delivery_request = AuthorizedChannelDelivery {
+            route: ChannelDeliveryRoute {
+                channel_id: &intent.channel_id,
+                conversation_ref: &intent.conversation_ref,
+                thread_ref: intent.thread_ref.as_deref(),
+                reply_to_ref: intent.reply_to_ref.as_deref(),
+            },
+            session_id: Some(request.session_id),
+            turn_id: Some(request.turn_id),
+            source_kind: Some(request.source_kind),
+            source_id: Some(&request.source_id),
+            source_fingerprint: request.source_fingerprint.as_deref(),
+            content,
+        };
+
+        let (delivery_id, idempotent) = if request.idempotent {
+            match self
+                .enqueue_authorized_channel_delivery_idempotent(delivery_request)
+                .await?
+            {
+                ChannelOutboxEnqueueResult::Created(delivery) => {
+                    let delivery_id = delivery.delivery_id;
+                    if let Some(attachments) = prepared_attachments.as_mut() {
+                        attachments.mark_persisted();
+                    }
+                    self.audit_channel_outbox_created(&delivery).await?;
+                    (delivery_id, false)
+                }
+                ChannelOutboxEnqueueResult::Existing(delivery) => (delivery.delivery_id, true),
+                ChannelOutboxEnqueueResult::Conflict(_delivery) => {
+                    return Err(KernelError::Conflict(
+                        "idempotency key was reused with a different payload".to_string(),
+                    ));
+                }
+            }
+        } else {
+            let delivery = self
+                .enqueue_authorized_channel_delivery(delivery_request)
+                .await?;
+            let delivery_id = delivery.delivery_id;
+            self.audit_channel_outbox_created(&delivery).await?;
+            (delivery_id, false)
+        };
+
+        Ok(BrokerChannelSendAccepted {
+            delivery_id,
+            channel_id: intent.channel_id,
+            conversation_ref: intent.conversation_ref,
+            thread_ref: intent.thread_ref,
+            reply_to_ref: intent.reply_to_ref,
+            idempotent,
+        })
+    }
+
     async fn send_runtime_channel_message(
         &self,
         context: RuntimeChannelSendContext,
@@ -22902,40 +23165,6 @@ impl Kernel {
                 .await;
         }
 
-        if let Err(err) = self.require_active_channel_binding(channel_id).await {
-            return self
-                .deny_runtime_channel_send(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    runtime_channel_send_channel_problem(err),
-                )
-                .await;
-        }
-        if let Some(project_context) = &self.project_instance_runtime {
-            let route_allowed = project_context
-                .channel_send_inventory
-                .contains_channel_send_route(
-                    &project_context.instance_name,
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                );
-            if !route_allowed {
-                return self
-                    .deny_runtime_channel_send(
-                        &context,
-                        channel_id,
-                        conversation_ref,
-                        RuntimeChannelSendProblem::new(
-                            "route_not_allowed",
-                            "channel.send route is not projected for this project instance",
-                        ),
-                    )
-                    .await;
-            }
-        }
-
         let content = normalize_runtime_channel_send_content(content);
         let fingerprint = runtime_channel_send_fingerprint(
             channel_id,
@@ -23003,7 +23232,7 @@ impl Kernel {
                 .await;
         }
         let artifact_roots = context.artifact_roots();
-        let mut attachments = match self
+        let attachments = match self
             .prepare_runtime_artifact_attachments_from_roots(
                 context.turn_id,
                 &artifact_roots,
@@ -23026,78 +23255,61 @@ impl Kernel {
         };
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
-        let delivery = self
-            .enqueue_authorized_channel_delivery_idempotent(AuthorizedChannelDelivery {
-                route: ChannelDeliveryRoute {
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                    reply_to_ref,
+        let broker_payload = runtime_channel_send_broker_payload(&request, &request.content);
+        let accepted = match self
+            .authorize_and_enqueue_channel_send(
+                context.capability_execution_context(),
+                broker_payload,
+                BrokerChannelSendRequest {
+                    session_id: context.session_id,
+                    turn_id: context.turn_id,
+                    source_kind: RUNTIME_CHANNEL_SEND_SOURCE_KIND,
+                    source_id,
+                    source_fingerprint: Some(fingerprint),
+                    content: Some(BrokerChannelSendContent {
+                        delivery: content,
+                        prepared_attachments: Some(attachments),
+                    }),
+                    idempotent: true,
                 },
-                session_id: Some(context.session_id),
-                turn_id: Some(context.turn_id),
-                source_kind: Some(RUNTIME_CHANNEL_SEND_SOURCE_KIND),
-                source_id: Some(&source_id),
-                source_fingerprint: Some(&fingerprint),
-                content,
-            })
+            )
             .await
-            .map_err(runtime_channel_send_kernel_problem)?;
+        {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let problem = runtime_channel_send_kernel_problem(err);
+                if problem.code == "conflict" {
+                    self.audit_runtime_channel_send(
+                        "runtime.channel_send.conflict",
+                        &context,
+                        json!({
+                            "channel_id": channel_id,
+                            "conversation_ref": conversation_ref,
+                        }),
+                    )
+                    .await;
+                    return Err(problem);
+                }
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
+            }
+        };
 
-        match delivery {
-            ChannelOutboxEnqueueResult::Created(delivery) => {
-                attachments.mark_persisted();
-                self.audit_channel_outbox_created(&delivery)
-                    .await
-                    .map_err(runtime_channel_send_kernel_problem)?;
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                        "idempotent": false,
-                    }),
-                )
-                .await;
-                Ok(RuntimeChannelSendAccepted {
-                    delivery_id: delivery.delivery_id,
-                })
-            }
-            ChannelOutboxEnqueueResult::Existing(delivery) => {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                        "idempotent": true,
-                    }),
-                )
-                .await;
-                Ok(RuntimeChannelSendAccepted {
-                    delivery_id: delivery.delivery_id,
-                })
-            }
-            ChannelOutboxEnqueueResult::Conflict(delivery) => {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.conflict",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                    }),
-                )
-                .await;
-                Err(RuntimeChannelSendProblem::new(
-                    "conflict",
-                    "idempotency key was reused with a different payload",
-                ))
-            }
-        }
+        self.audit_runtime_channel_send(
+            "runtime.channel_send.allowed",
+            &context,
+            json!({
+                "channel_id": accepted.channel_id,
+                "conversation_ref": accepted.conversation_ref,
+                "delivery_id": accepted.delivery_id,
+                "idempotent": accepted.idempotent,
+            }),
+        )
+        .await;
+        Ok(RuntimeChannelSendAccepted {
+            delivery_id: accepted.delivery_id,
+        })
     }
 
     async fn require_runtime_channel_send_bridge_open(
@@ -26005,75 +26217,65 @@ impl Kernel {
                             thread_ref: route.thread_ref.as_deref(),
                             reply_to_ref: route.reply_to_ref.as_deref(),
                         });
-                let context = CapabilityExecutionContext { channel_send_route };
+                let context = CapabilityExecutionContext {
+                    channel_send_route,
+                    projected_channel_send_routes: Vec::new(),
+                    allow_channel_send_route_selection: false,
+                };
                 executed = true;
-                match self
-                    .capability_broker
-                    .execute(&context, capability, &payload)
-                    .await
-                {
-                    Ok(value) => {
-                        if capability == Capability::ChannelSend {
-                            match parse_channel_send_intent(&value) {
-                                Ok(intent) => {
-                                    let source_id = turn_id.to_string();
-                                    match self
-                                        .enqueue_authorized_channel_delivery(
-                                            AuthorizedChannelDelivery {
-                                                route: ChannelDeliveryRoute {
-                                                    channel_id: &intent.channel_id,
-                                                    conversation_ref: &intent.conversation_ref,
-                                                    thread_ref: intent.thread_ref.as_deref(),
-                                                    reply_to_ref: intent.reply_to_ref.as_deref(),
-                                                },
-                                                session_id: Some(session_id),
-                                                turn_id: Some(turn_id),
-                                                source_kind: Some("session_turn"),
-                                                source_id: Some(&source_id),
-                                                source_fingerprint: None,
-                                                content: ChannelDeliveryContent {
-                                                    text: intent.content.clone(),
-                                                    format_hint: "plain".to_string(),
-                                                    attachments: Vec::new(),
-                                                },
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        Ok(delivery) => {
-                                            self.audit_channel_outbox_created(&delivery).await?;
-                                            let delivery_id = delivery.delivery_id;
-                                            output = json!({
-                                                "channel_id": intent.channel_id,
-                                                "conversation_ref": intent.conversation_ref,
-                                                "thread_ref": intent.thread_ref,
-                                                "reply_to_ref": intent.reply_to_ref,
-                                                "delivery_id": delivery_id,
-                                            });
-                                            allowed = true;
-                                        }
-                                        Err(err) => {
-                                            let detail = err.to_string();
-                                            execution_error = Some(detail.clone());
-                                            reason =
-                                                Some(format!("broker execution failed: {detail}"));
-                                        }
-                                    }
-                                }
-                                Err(detail) => {
-                                    execution_error = Some(detail.clone());
-                                    reason = Some(format!("broker execution failed: {detail}"));
-                                }
-                            }
-                        } else {
+                if capability == Capability::ChannelSend {
+                    let source_id = turn_id.to_string();
+                    match self
+                        .authorize_and_enqueue_channel_send(
+                            context,
+                            payload.clone(),
+                            BrokerChannelSendRequest {
+                                session_id,
+                                turn_id,
+                                source_kind: "session_turn",
+                                source_id,
+                                source_fingerprint: None,
+                                content: None,
+                                idempotent: false,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(accepted) => {
+                            output = json!({
+                                "channel_id": accepted.channel_id,
+                                "conversation_ref": accepted.conversation_ref,
+                                "thread_ref": accepted.thread_ref,
+                                "reply_to_ref": accepted.reply_to_ref,
+                                "delivery_id": accepted.delivery_id,
+                            });
+                            allowed = true;
+                        }
+                        Err(err) => {
+                            let detail = err.to_string();
+                            execution_error = Some(detail.clone());
+                            reason = Some(if detail.starts_with("broker execution failed:") {
+                                detail
+                            } else {
+                                format!("broker execution failed: {detail}")
+                            });
+                        }
+                    }
+                } else {
+                    match self
+                        .capability_broker
+                        .execute(&context, capability, &payload)
+                        .await
+                    {
+                        Ok(value) => {
                             output = value;
                             allowed = true;
                         }
-                    }
-                    Err(err) => {
-                        let detail = err.to_string();
-                        execution_error = Some(detail.clone());
-                        reason = Some(format!("broker execution failed: {detail}"));
+                        Err(err) => {
+                            let detail = err.to_string();
+                            execution_error = Some(detail.clone());
+                            reason = Some(format!("broker execution failed: {detail}"));
+                        }
                     }
                 }
             }

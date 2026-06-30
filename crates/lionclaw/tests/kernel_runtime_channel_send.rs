@@ -133,6 +133,42 @@ async fn program_backed_runtime_with_channel_send_escape_gets_lionclaw_mcp_serve
 }
 
 #[tokio::test]
+async fn program_backed_channel_send_without_route_authority_gets_no_mcp_server() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-no-authority").await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_without_project_routes(
+            &env, true,
+        ))
+        .await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "probe-runtime",
+            Arc::new(ChannelSendProbeRuntime::record_mcp_servers(
+                observed.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-no-authority").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "probe channel send without route authority".to_string(),
+            runtime_id: Some("probe-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let observed = observed.lock().expect("observed mcp servers lock");
+    assert_eq!(observed.as_slice(), &[Vec::<RuntimeMcpServerSpec>::new()]);
+}
+
+#[tokio::test]
 async fn direct_runtime_with_channel_send_escape_does_not_start_bridge() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-direct").await;
@@ -208,7 +244,12 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
 
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-happy").await;
-    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            channel_send_inventory_for_reviewer_route(Some("design-thread")),
+        ))
+        .await;
     let responses = Arc::new(Mutex::new(Vec::new()));
     let socket_paths = Arc::new(Mutex::new(Vec::new()));
     let request = json!({
@@ -216,7 +257,6 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
         "channel_id": "local-cli",
         "conversation_ref": "member:reviewer",
         "thread_ref": "design-thread",
-        "reply_to_ref": "source-message",
         "content": {
             "text": "See attached sketch.",
             "format_hint": "markdown",
@@ -275,7 +315,7 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
     assert_eq!(delivery.delivery_id.to_string(), delivery_id);
     assert_eq!(delivery.conversation_ref, "member:reviewer");
     assert_eq!(delivery.thread_ref.as_deref(), Some("design-thread"));
-    assert_eq!(delivery.reply_to_ref.as_deref(), Some("source-message"));
+    assert_eq!(delivery.reply_to_ref.as_deref(), None);
     assert_eq!(delivery.content.text, "See attached sketch.");
     assert_eq!(delivery.content.format_hint, "markdown");
     assert_eq!(delivery.content.attachments.len(), 1);
@@ -323,7 +363,12 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
 async fn mcp_channel_send_allows_audits_and_enqueues_outbox_delivery() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-happy").await;
-    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let kernel = env
+        .kernel_with_options(channel_send_kernel_options_with_project_routes(
+            &env,
+            channel_send_inventory_for_reviewer_route(Some("design-thread")),
+        ))
+        .await;
     let responses = Arc::new(Mutex::new(Vec::new()));
     let requests = vec![
         json!({
@@ -342,7 +387,6 @@ async fn mcp_channel_send_allows_audits_and_enqueues_outbox_delivery() {
                     "channel_id": "local-cli",
                     "conversation_ref": "member:reviewer",
                     "thread_ref": "design-thread",
-                    "reply_to_ref": "source-message",
                     "text": "See attached sketch from MCP.",
                     "format_hint": "markdown",
                     "attachments": [{
@@ -618,6 +662,61 @@ async fn mcp_channel_send_audits_invalid_tool_arguments_without_outbox_delivery(
         .expect("query denied audit events");
     assert!(denied.events.iter().any(|event| {
         event.details["reason"].as_str() == Some("invalid_request")
+            && event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
+}
+
+#[tokio::test]
+async fn mcp_channel_send_tools_call_notification_is_audited_denied() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-mcp-notification").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "channel_send",
+            "arguments": {
+                "channel_id": "local-cli",
+                "conversation_ref": "member:reviewer",
+                "text": "notification should be audited as denied"
+            }
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_and_drop_connection(
+                notification,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-mcp-notification").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send channel_send notification through MCP".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("invalid_json_rpc")
             && event.details["channel_id"].as_str() == Some("")
             && event.details["conversation_ref"].as_str() == Some("")
     }));
@@ -1327,7 +1426,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
     let expected_codes = [
         "invalid_format",
         "empty_content",
-        "unknown_channel",
+        "route_not_allowed",
         "invalid_attachment",
         "invalid_attachment",
         "invalid_attachment",
@@ -2501,6 +2600,25 @@ async fn kernel_with_channel_send_preset(env: &TestHome, enabled: bool) -> Kerne
 }
 
 fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
+    let mut options = base_channel_send_kernel_options(env, enabled);
+    if enabled {
+        apply_project_channel_send_routes(
+            &mut options,
+            env,
+            channel_send_inventory_for_reviewer_route(None),
+        );
+    }
+    options
+}
+
+fn channel_send_kernel_options_without_project_routes(
+    env: &TestHome,
+    enabled: bool,
+) -> KernelOptions {
+    base_channel_send_kernel_options(env, enabled)
+}
+
+fn base_channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
     let mut escape_classes = BTreeSet::new();
     if enabled {
         escape_classes.insert(EscapeClass::ChannelSend);
@@ -2522,11 +2640,37 @@ fn channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOptions {
     }
 }
 
+fn channel_send_inventory_for_reviewer_route(thread_ref: Option<&str>) -> ProjectInstanceInventory {
+    ProjectInstanceInventory::new_channel_send(
+        Some("main".to_string()),
+        vec![
+            ProjectInstanceInventoryEntry::identity("main".to_string()),
+            ProjectInstanceInventoryEntry::with_channel_send(
+                "reviewer".to_string(),
+                ProjectInstanceChannelSend::configured(
+                    "local-cli".to_string(),
+                    "member:reviewer".to_string(),
+                    thread_ref.map(ToString::to_string),
+                ),
+            ),
+        ],
+    )
+}
+
 fn channel_send_kernel_options_with_project_routes(
     env: &TestHome,
     channel_send_inventory: ProjectInstanceInventory,
 ) -> KernelOptions {
-    let mut options = channel_send_kernel_options(env, true);
+    let mut options = base_channel_send_kernel_options(env, true);
+    apply_project_channel_send_routes(&mut options, env, channel_send_inventory);
+    options
+}
+
+fn apply_project_channel_send_routes(
+    options: &mut KernelOptions,
+    env: &TestHome,
+    channel_send_inventory: ProjectInstanceInventory,
+) {
     let project_root = env.temp_dir().to_path_buf();
     let identity_inventory = ProjectInstanceInventory::new(
         Some("main".to_string()),
@@ -2537,7 +2681,6 @@ fn channel_send_kernel_options_with_project_routes(
         ProjectInstanceRuntimeContext::new(project_root, "main".to_string(), identity_inventory)
             .with_channel_send_inventory(channel_send_inventory),
     );
-    options
 }
 
 async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: &str) {

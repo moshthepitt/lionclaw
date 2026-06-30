@@ -7,10 +7,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const FS_READ_MAX_BYTES: u64 = 64 * 1024;
+pub const CHANNEL_SEND_ROUTE_NOT_PROJECTED: &str =
+    "channel.send route is not projected for this turn";
 
 #[derive(Debug, Clone)]
 pub struct CapabilityExecutionContext<'a> {
     pub channel_send_route: Option<CapabilityChannelSendRoute<'a>>,
+    pub projected_channel_send_routes: Vec<CapabilityChannelSendRoute<'a>>,
+    pub allow_channel_send_route_selection: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,7 +251,10 @@ struct ChannelSendRequest {
     thread_ref: Option<String>,
     #[serde(default)]
     reply_to_ref: Option<String>,
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    attachment_count: usize,
 }
 
 impl ChannelSendRequest {
@@ -279,18 +286,22 @@ async fn build_channel_send_intent(
     payload: &Value,
 ) -> Result<Value> {
     let request: ChannelSendRequest = parse_payload(payload, Capability::ChannelSend)?;
-    let route = context
-        .channel_send_route
-        .ok_or_else(|| anyhow!("channel.send is only available in channel sessions"))?;
     let override_fields = request.route_override_fields();
-    if !override_fields.is_empty() {
+    let route = resolve_channel_send_route(context, &request, &override_fields)?;
+    if !context.allow_channel_send_route_selection && !override_fields.is_empty() {
         return Err(anyhow!(
             "channel.send route is derived from the current channel session; remove {}",
             override_fields.join(", ")
         ));
     }
 
-    if request.content.trim().is_empty() {
+    let content = request.content.unwrap_or_default();
+    let attachment_count = if context.allow_channel_send_route_selection {
+        request.attachment_count
+    } else {
+        0
+    };
+    if content.trim().is_empty() && attachment_count == 0 {
         return Err(anyhow!("channel.send content cannot be empty"));
     }
 
@@ -307,7 +318,7 @@ async fn build_channel_send_intent(
     let mut intent = serde_json::Map::from_iter([
         ("channel_id".to_string(), json!(channel_id)),
         ("conversation_ref".to_string(), json!(conversation_ref)),
-        ("content".to_string(), json!(request.content)),
+        ("content".to_string(), json!(content)),
     ]);
     if let Some(thread_ref) = route
         .thread_ref
@@ -324,6 +335,72 @@ async fn build_channel_send_intent(
         intent.insert("reply_to_ref".to_string(), json!(reply_to_ref));
     }
     Ok(Value::Object(intent))
+}
+
+fn resolve_channel_send_route<'a>(
+    context: &CapabilityExecutionContext<'a>,
+    request: &ChannelSendRequest,
+    override_fields: &[&str],
+) -> Result<CapabilityChannelSendRoute<'a>> {
+    if override_fields.is_empty() {
+        return context
+            .channel_send_route
+            .ok_or_else(|| anyhow!("channel.send is only available in channel sessions"));
+    }
+
+    if !context.allow_channel_send_route_selection {
+        return context
+            .channel_send_route
+            .ok_or_else(|| anyhow!("channel.send is only available in channel sessions"));
+    }
+
+    if request
+        .channel_id
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .is_none()
+        || request
+            .conversation_ref
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .is_none()
+    {
+        return Err(anyhow!(
+            "channel.send route selection requires channel_id and conversation_ref"
+        ));
+    }
+
+    context
+        .channel_send_route
+        .into_iter()
+        .chain(context.projected_channel_send_routes.iter().copied())
+        .find(|route| channel_send_route_matches(*route, request))
+        .ok_or_else(|| anyhow!(CHANNEL_SEND_ROUTE_NOT_PROJECTED))
+}
+
+fn channel_send_route_matches(
+    route: CapabilityChannelSendRoute<'_>,
+    request: &ChannelSendRequest,
+) -> bool {
+    request.channel_id.as_deref().and_then(non_empty_trimmed) == non_empty_trimmed(route.channel_id)
+        && request
+            .conversation_ref
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            == non_empty_trimmed(route.conversation_ref)
+        && request.thread_ref.as_deref().and_then(non_empty_trimmed)
+            == route.thread_ref.and_then(non_empty_trimmed)
+        && request.reply_to_ref.as_deref().and_then(non_empty_trimmed)
+            == route.reply_to_ref.and_then(non_empty_trimmed)
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn parse_payload<T>(payload: &Value, capability: Capability) -> Result<T>
