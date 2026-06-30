@@ -1595,11 +1595,12 @@ async fn channel_send_bridge_rejects_excess_connections() {
 
     let responses = responses.lock().expect("responses lock").clone();
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[0]["error"]["code"].as_str(),
-        Some("connection_limit")
-    );
+    assert_eq!(responses[0]["jsonrpc"], "2.0");
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"].as_i64(), Some(-32000));
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("accepts at most")));
 
     let denied = kernel
         .query_audit(
@@ -1755,13 +1756,18 @@ async fn channel_send_bridge_audits_wire_protocol_denials() {
     assert!(responses[0]["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("valid MCP JSON-RPC")));
-    for (response, expected_code) in responses[1..]
-        .iter()
-        .zip(["invalid_request", "request_too_large"])
-    {
-        assert_eq!(response["ok"].as_bool(), Some(false));
-        assert_eq!(response["error"]["code"].as_str(), Some(expected_code));
-    }
+    assert_eq!(responses[1]["jsonrpc"], "2.0");
+    assert_eq!(responses[1]["id"], Value::Null);
+    assert_eq!(responses[1]["error"]["code"].as_i64(), Some(-32600));
+    assert!(responses[1]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("newline")));
+    assert_eq!(responses[2]["jsonrpc"], "2.0");
+    assert_eq!(responses[2]["id"], Value::Null);
+    assert_eq!(responses[2]["error"]["code"].as_i64(), Some(-32000));
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("exceeds")));
 
     let denied = kernel
         .query_audit(

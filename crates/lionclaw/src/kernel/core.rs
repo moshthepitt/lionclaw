@@ -17682,10 +17682,15 @@ async fn reject_runtime_channel_send_connection(
     stream: UnixStream,
     problem: RuntimeChannelSendProblem,
 ) {
-    kernel
-        .audit_runtime_channel_send_denied(context, "", "", problem.code)
-        .await;
-    let response = runtime_channel_send_error_response(problem.code, problem.message);
+    let json_rpc_code = runtime_channel_send_json_rpc_code_for_problem(problem.code);
+    let response = runtime_channel_send_mcp_denied_response(
+        kernel,
+        context,
+        Value::Null,
+        json_rpc_code,
+        problem,
+    )
+    .await;
     match timeout(
         RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT,
         write_runtime_channel_send_response(stream, Some(response)),
@@ -17742,13 +17747,22 @@ async fn handle_runtime_channel_send_stream(
                 )
             }
         },
-        Ok(Err(problem)) => {
-            Some(runtime_channel_send_denied_response(&kernel, &context, problem).await)
-        }
-        Err(_) => Some(
-            runtime_channel_send_denied_response(
+        Ok(Err(problem)) => Some(
+            runtime_channel_send_mcp_denied_response(
                 &kernel,
                 &context,
+                Value::Null,
+                runtime_channel_send_json_rpc_code_for_problem(problem.code),
+                problem,
+            )
+            .await,
+        ),
+        Err(_) => Some(
+            runtime_channel_send_mcp_denied_response(
+                &kernel,
+                &context,
+                Value::Null,
+                -32000,
                 RuntimeChannelSendProblem::new(
                     "request_timeout",
                     format!(
@@ -17945,6 +17959,16 @@ fn runtime_channel_send_json_rpc_error(id: Value, code: i64, message: impl Into<
     })
 }
 
+fn runtime_channel_send_json_rpc_code_for_problem(code: &str) -> i64 {
+    match code {
+        "invalid_json" => -32700,
+        "invalid_json_rpc" | "invalid_request" => -32600,
+        "unsupported_method" => -32601,
+        "internal_error" => -32603,
+        _ => -32000,
+    }
+}
+
 fn runtime_channel_send_mcp_initialize_result(params: Option<&Value>) -> Value {
     let protocol_version = params
         .and_then(|params| params.get("protocolVersion"))
@@ -18107,17 +18131,6 @@ fn runtime_channel_send_error_response(code: &str, message: impl Into<String>) -
             "message": message.into(),
         },
     })
-}
-
-async fn runtime_channel_send_denied_response(
-    kernel: &Kernel,
-    context: &RuntimeChannelSendContext,
-    problem: RuntimeChannelSendProblem,
-) -> Value {
-    kernel
-        .audit_runtime_channel_send_denied(context, "", "", problem.code)
-        .await;
-    runtime_channel_send_error_response(problem.code, problem.message)
 }
 
 fn runtime_channel_send_fingerprint(
