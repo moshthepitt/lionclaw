@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn context_item_specs_keep_attached_tui_transcript_after_runtime_notes() {
+    fn context_item_specs_keep_attached_tui_history_after_runtime_notes() {
         let items = context_item_specs(PromptContextMode::AttachedNativeTui);
         assert_eq!(
             items.last().map(|item| item.id),

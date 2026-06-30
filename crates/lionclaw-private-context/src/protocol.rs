@@ -55,8 +55,6 @@ pub(crate) struct PrivateContextRecordRequest {
 pub(crate) enum PrivateContextRecordSurface {
     #[serde(rename = "program_turn")]
     Program,
-    #[serde(rename = "attached_native_tui_turn")]
-    AttachedNativeTui,
     #[serde(rename = "channel_turn")]
     Channel,
 }

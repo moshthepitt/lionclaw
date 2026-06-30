@@ -641,7 +641,7 @@ mod tests {
             db::Db,
             runtime::{
                 ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
-                RuntimeTerminalConfig, RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER,
+                RuntimeTerminalConfig,
             },
             Kernel, KernelOptions,
         },
@@ -1802,13 +1802,7 @@ esac
             "OPENCODE_DISABLE_AUTOUPDATE".to_string(),
             "1".to_string(),
         )]);
-        profile.terminal = RuntimeTerminalConfig {
-            args: Vec::new(),
-            resume_args: vec![
-                "--session".to_string(),
-                RUNTIME_TERMINAL_SESSION_ID_PLACEHOLDER.to_string(),
-            ],
-        };
+        profile.terminal = RuntimeTerminalConfig { args: Vec::new() };
         profile
     }
 }
