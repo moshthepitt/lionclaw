@@ -8787,11 +8787,11 @@ mod tests {
         .await
         .expect("write runtime skill md");
         tokio::fs::write(
-            runtime_skill_dir.join("scripts/send"),
+            runtime_skill_dir.join("scripts/tool"),
             "#!/usr/bin/env bash\n",
         )
         .await
-        .expect("write runtime send helper");
+        .expect("write runtime helper");
         runtime_skill_dir
     }
 
@@ -12640,7 +12640,7 @@ done
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert!(mounts[0].source.ends_with("runtime/team-local"));
         assert!(mounts[0].source.join("SKILL.md").exists());
-        assert!(mounts[0].source.join("scripts/send").exists());
+        assert!(mounts[0].source.join("scripts/tool").exists());
         assert!(!mounts[0].source.join("lionclaw.toml").exists());
         assert!(!mounts[0].source.join("scripts/worker").exists());
     }

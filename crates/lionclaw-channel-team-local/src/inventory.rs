@@ -77,12 +77,6 @@ pub struct RecipientRoute {
     pub thread_ref: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct RecipientPlan {
-    pub recipient: String,
-    pub route: RecipientRoute,
-}
-
 impl ProjectInventory {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -140,29 +134,6 @@ impl ProjectInventory {
             ));
         };
         entry.route(recipient)
-    }
-
-    pub fn plan(
-        &self,
-        self_instance: &str,
-        recipients: &[String],
-    ) -> std::result::Result<Vec<RecipientPlan>, Vec<(String, RouteError)>> {
-        let mut plans = Vec::with_capacity(recipients.len());
-        let mut errors = Vec::new();
-        for recipient in recipients {
-            match self.route_for(self_instance, recipient) {
-                Ok(route) => plans.push(RecipientPlan {
-                    recipient: recipient.clone(),
-                    route,
-                }),
-                Err(error) => errors.push((recipient.clone(), error)),
-            }
-        }
-        if errors.is_empty() {
-            Ok(plans)
-        } else {
-            Err(errors)
-        }
     }
 }
 

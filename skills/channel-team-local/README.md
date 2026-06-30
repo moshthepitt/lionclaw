@@ -15,13 +15,12 @@ The installed snapshot is self-contained. `scripts/worker` execs
 and install plumbing copies the compiled worker binary into that snapshot before
 computing the installed skill hash.
 
-The same binary backs the runtime-facing `runtime/team-local/scripts/list`,
-`runtime/team-local/scripts/resolve`, and `runtime/team-local/scripts/send`
-helpers for sender-side team discovery and messages. The send helper resolves
-routes from the projected inventory and forwards provider-neutral text, format
-hints, and `/runtime` attachments to the audited `channel.send` bridge. Its
-attachment option is path-only; the kernel derives the delivered filename and
-media type from the runtime file when it prepares the channel-send attachment.
+The same binary backs the runtime-facing `runtime/team-local/scripts/list` and
+`runtime/team-local/scripts/resolve` helpers for sender-side team discovery.
+Runtime sends use the LionClaw-projected `channel_send` MCP tool with routes
+from the projected inventory. Attachments are path-only; the kernel derives the
+delivered filename and media type from the runtime file when it prepares the
+channel-send attachment.
 
 The worker is a separate Rust workspace crate named
 `lionclaw-channel-team-local`; it does not depend on the `lionclaw` crate.
@@ -71,11 +70,9 @@ project instance:
 test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
 test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/list"
 test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/resolve"
-test -x "$PROJ_A/.lionclaw/instances/main/skills/team-local/runtime/team-local/scripts/send"
 test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/bin/lionclaw-channel-team-local"
 test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/list"
 test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/resolve"
-test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-local/scripts/send"
 "$LIONCLAW_BIN" --instance main channel pairing list --channel-id team-local
 "$LIONCLAW_BIN" --instance reviewer channel pairing list --channel-id team-local
 ```
@@ -83,8 +80,8 @@ test -x "$PROJ_A/.lionclaw/instances/reviewer/skills/team-local/runtime/team-loc
 Expected:
 
 - `main` and `reviewer` have the bundled `team-local` channel installed with an
-  embedded Rust worker/sender binary
-- runtime `list`, `resolve`, and `send` helpers are present and executable
+  embedded Rust worker and inventory helper binary
+- runtime `list` and `resolve` helpers are present and executable
 - direct sibling grants exist for local project-instance communication
 - fresh setup creates a `team-local` preset with `channel-send`
 - with that preset active and a configured neighbor contact, the runtime
