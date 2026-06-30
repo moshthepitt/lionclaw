@@ -47,13 +47,13 @@ use tracing::warn;
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    load_ready_state_value, save_state_value, ExecutionOutput, RawTurnPayload, RuntimeAdapter,
-    RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult, RuntimeDriverConfig,
-    RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult, TurnEvent,
+    clear_state_value, load_ready_state_value, save_state_value, ExecutionOutput, RawTurnPayload,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeDriverConfig, RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 pub const ACP_PROTOCOL_NAME: &str = "acp";
@@ -345,26 +345,34 @@ impl AcpTurnRunner {
         let mut active_turn = None;
 
         let result = async {
-            client.initialize().await?;
-            let session_id = client
+            let session_capabilities = client.initialize().await?;
+            let opened_session = client
                 .ensure_session(
                     &self.config,
                     &self.sessions,
                     &runtime_session_id,
                     &session_state,
+                    session_capabilities,
                     &self.working_dir,
                 )
                 .await?;
-            client.configure_session(&self.config, &session_id).await?;
+            client
+                .configure_session(&self.config, &opened_session.session_id)
+                .await?;
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
                 &self.sessions,
                 &runtime_session_id,
-                &session_id,
+                &opened_session.session_id,
                 cancel_tx,
             )?);
+            let prompt = if opened_session.resumed_existing {
+                &input.prompt
+            } else {
+                input.fresh_prompt.as_deref().unwrap_or(&input.prompt)
+            };
             let prompt_result = client
-                .prompt(&session_id, &input.prompt, &journal, &mut cancel_rx)
+                .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
                 .await;
             prompt_result?;
             Ok(RuntimeTurnResult::default())
@@ -409,6 +417,47 @@ struct AcpClient {
     next_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpOpenedSession {
+    session_id: String,
+    resumed_existing: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AcpSessionCapabilities {
+    load_session: bool,
+    resume_session: bool,
+}
+
+impl AcpSessionCapabilities {
+    fn from_initialize_result(result: &Value) -> Self {
+        let agent_capabilities = result.get("agentCapabilities");
+        Self {
+            load_session: agent_capabilities
+                .and_then(|capabilities| capabilities.get("loadSession"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            resume_session: agent_capabilities
+                .and_then(|capabilities| capabilities.pointer("/sessionCapabilities/resume"))
+                .is_some_and(acp_capability_object_enabled),
+        }
+    }
+
+    fn reopen_method(self) -> Option<&'static str> {
+        if self.load_session {
+            Some("session/load")
+        } else if self.resume_session {
+            Some("session/resume")
+        } else {
+            None
+        }
+    }
+}
+
+fn acp_capability_object_enabled(value: &Value) -> bool {
+    value.as_object().is_some() || value.as_bool() == Some(true)
+}
+
 #[derive(Debug, Clone)]
 struct AcpMessage {
     raw: String,
@@ -434,23 +483,26 @@ impl AcpClient {
         }
     }
 
-    async fn initialize(&mut self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {
-                        "readTextFile": false,
-                        "writeTextFile": false,
+    async fn initialize(&mut self) -> Result<AcpSessionCapabilities> {
+        let response = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {
+                            "readTextFile": false,
+                            "writeTextFile": false,
+                        },
+                        "terminal": false,
                     },
-                    "terminal": false,
-                },
-            }),
-            None,
-        )
-        .await?;
-        Ok(())
+                }),
+                None,
+            )
+            .await?;
+        Ok(AcpSessionCapabilities::from_initialize_result(
+            &response.result,
+        ))
     }
 
     async fn ensure_session(
@@ -459,20 +511,28 @@ impl AcpClient {
         sessions: &RwLock<HashMap<String, AcpSessionState>>,
         runtime_session_id: &str,
         session_state: &AcpSessionState,
+        session_capabilities: AcpSessionCapabilities,
         working_dir: &str,
-    ) -> Result<String> {
+    ) -> Result<AcpOpenedSession> {
         if let Some(session_id) = session_state.session_id.as_deref() {
-            self.request(
-                "session/load",
-                json!({
-                    "sessionId": session_id,
-                    "cwd": working_dir,
-                    "mcpServers": [],
-                }),
-                None,
-            )
-            .await?;
-            return Ok(session_id.to_string());
+            if let Some(reopen_method) = session_capabilities.reopen_method() {
+                self.request(
+                    reopen_method,
+                    json!({
+                        "sessionId": session_id,
+                        "cwd": working_dir,
+                        "mcpServers": [],
+                    }),
+                    None,
+                )
+                .await?;
+                return Ok(AcpOpenedSession {
+                    session_id: session_id.to_string(),
+                    resumed_existing: true,
+                });
+            } else {
+                forget_acp_session_id(config, sessions, runtime_session_id)?;
+            }
         }
 
         let response = self
@@ -491,9 +551,16 @@ impl AcpClient {
             .and_then(Value::as_str)
             .and_then(normalize_acp_session_id)
             .context("ACP session/new response is missing sessionId")?;
-        remember_acp_session_id(config, sessions, runtime_session_id, &session_id)?;
+        if session_capabilities.reopen_method().is_some() {
+            remember_acp_session_id(config, sessions, runtime_session_id, &session_id)?;
+        } else {
+            forget_acp_session_id(config, sessions, runtime_session_id)?;
+        }
 
-        Ok(session_id)
+        Ok(AcpOpenedSession {
+            session_id,
+            resumed_existing: false,
+        })
     }
 
     async fn configure_session(
@@ -794,6 +861,18 @@ fn remember_acp_session_id(
     Ok(())
 }
 
+fn forget_acp_session_id(
+    config: &AcpRuntimeConfig,
+    sessions: &RwLock<HashMap<String, AcpSessionState>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let runtime_state_root = clear_runtime_session_id(sessions, runtime_session_id)?;
+    if let Some(root) = runtime_state_root.as_deref() {
+        clear_state_value(root, &config.session_id_state_file, "ACP session id")?;
+    }
+    Ok(())
+}
+
 fn update_runtime_session_id(
     sessions: &RwLock<HashMap<String, AcpSessionState>>,
     runtime_session_id: &str,
@@ -806,6 +885,22 @@ fn update_runtime_session_id(
         .get_mut(runtime_session_id)
         .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
     state.session_id = Some(session_id);
+    let runtime_state_root = state.runtime_state_root.clone();
+    drop(sessions);
+    Ok(runtime_state_root)
+}
+
+fn clear_runtime_session_id(
+    sessions: &RwLock<HashMap<String, AcpSessionState>>,
+    runtime_session_id: &str,
+) -> Result<Option<PathBuf>> {
+    let mut sessions = sessions
+        .write()
+        .map_err(|_| anyhow!("ACP runtime session state lock poisoned"))?;
+    let state = sessions
+        .get_mut(runtime_session_id)
+        .ok_or_else(|| anyhow!("unknown ACP runtime session '{runtime_session_id}'"))?;
+    state.session_id = None;
     let runtime_state_root = state.runtime_state_root.clone();
     drop(sessions);
     Ok(runtime_state_root)
@@ -1165,6 +1260,73 @@ mod tests {
             .expect("runtime ready marker should be valid")
     }
 
+    fn opencode_initialize_response(id: u64) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "mcpCapabilities": {
+                        "http": true,
+                        "sse": true,
+                    },
+                    "promptCapabilities": {
+                        "embeddedContext": true,
+                        "image": true,
+                    },
+                    "sessionCapabilities": {
+                        "close": {},
+                        "fork": {},
+                        "list": {},
+                        "resume": {},
+                    },
+                },
+                "agentInfo": {
+                    "name": "OpenCode",
+                    "version": "1.17.9",
+                },
+            },
+        })
+        .to_string()
+    }
+
+    fn resume_only_initialize_response(id: u64) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "sessionCapabilities": {
+                        "resume": {},
+                    },
+                },
+                "agentInfo": {
+                    "name": "ResumeOnly",
+                    "version": "1.0.0",
+                },
+            },
+        })
+        .to_string()
+    }
+
+    fn no_reopen_initialize_response(id: u64) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": 1,
+                "agentInfo": {
+                    "name": "NoResume",
+                    "version": "1.0.0",
+                },
+            },
+        })
+        .to_string()
+    }
+
     #[derive(Debug, Deserialize)]
     struct AcpFixture {
         raw_in: Vec<String>,
@@ -1269,7 +1431,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 inbound: Mutex::new(VecDeque::from([
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                    opencode_initialize_response(1),
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_cancel","configOptions":[]}}"#.to_string(),
                 ])),
                 sent: Mutex::new(Vec::new()),
@@ -1566,7 +1728,7 @@ mod tests {
         let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
         let executor = FakeAcpProgramExecutor {
             inbound: VecDeque::from([
-                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                opencode_initialize_response(1),
                 r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[]}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string(),
@@ -1917,9 +2079,10 @@ mod tests {
         let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
         let executor = FakeAcpProgramExecutor {
             inbound: VecDeque::from([
-                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}"#.to_string(),
+                opencode_initialize_response(1),
                 r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.to_string(),
-                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#
+                    .to_string(),
             ]),
             expected_auth: None,
             state: Arc::clone(&fake_state),
@@ -1964,6 +2127,237 @@ mod tests {
         assert_eq!(
             sent[1]["params"]["cwd"],
             json!("/workspace/packages/runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+            "ses_ready\n",
+        )
+        .expect("write session id");
+        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            })
+            .await
+            .expect("start");
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                resume_only_initialize_response(1),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#
+                    .to_string(),
+            ]),
+            expected_auth: None,
+            state: Arc::clone(&fake_state),
+        };
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = acp_driver_context(runtime_state_root);
+        context.working_dir = Some("/workspace/packages/runtime".to_string());
+
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id,
+                        prompt: "continue".to_string(),
+                        fresh_prompt: None,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context,
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP resume turn");
+
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![RuntimeEvent::Done]
+        );
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+        assert_eq!(
+            sent.iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "session/resume", "session/prompt"]
+        );
+        assert_eq!(sent[1]["params"]["sessionId"], json!("ses_ready"));
+        assert_eq!(
+            sent[1]["params"]["cwd"],
+            json!("/workspace/packages/runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+            "ses_stale\n",
+        )
+        .expect("write stale session id");
+        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: runtime_not_ready(),
+            })
+            .await
+            .expect("start");
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                no_reopen_initialize_response(1),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_ephemeral","configOptions":[]}}"#
+                    .to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#
+                    .to_string(),
+            ]),
+            expected_auth: None,
+            state: Arc::clone(&fake_state),
+        };
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id,
+                        prompt: "hello".to_string(),
+                        fresh_prompt: None,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context: acp_driver_context(runtime_state_root.clone()),
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP turn");
+
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![RuntimeEvent::Done]
+        );
+        assert!(
+            !runtime_state_root.join(ACP_SESSION_ID_STATE_FILE).exists(),
+            "unreopenable ACP sessions must not be advertised as resumable state"
+        );
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+        assert_eq!(
+            sent.iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "session/new", "session/prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(ACP_SESSION_ID_STATE_FILE),
+            "ses_stale\n",
+        )
+        .expect("write stale session id");
+        let adapter = AcpRuntimeAdapter::new(opencode_acp_config(None, None));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+                runtime_session_ready: mark_runtime_ready(&runtime_state_root),
+            })
+            .await
+            .expect("start");
+        assert!(handle.resumes_existing_session);
+        let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+        let executor = FakeAcpProgramExecutor {
+            inbound: VecDeque::from([
+                no_reopen_initialize_response(1),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_fresh","configOptions":[]}}"#
+                    .to_string(),
+                r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}"#
+                    .to_string(),
+            ]),
+            expected_auth: None,
+            state: Arc::clone(&fake_state),
+        };
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        adapter
+            .program_backed_turn(
+                RuntimeProgramTurnExecution {
+                    input: RuntimeTurnInput {
+                        runtime_session_id: handle.runtime_session_id,
+                        prompt: "resume prompt".to_string(),
+                        fresh_prompt: Some("fresh prompt".to_string()),
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    context: acp_driver_context(runtime_state_root.clone()),
+                    executor: Box::new(executor),
+                },
+                journal_tx,
+            )
+            .await
+            .expect("ACP turn");
+
+        let mut journal = Vec::new();
+        while let Some(record) = journal_rx.recv().await {
+            journal.push(record);
+        }
+        assert_eq!(
+            canonical_events(&journal).cloned().collect::<Vec<_>>(),
+            vec![RuntimeEvent::Done]
+        );
+        assert!(
+            !runtime_state_root.join(ACP_SESSION_ID_STATE_FILE).exists(),
+            "stale ACP session ids must be cleared when the agent cannot reopen them"
+        );
+        let sent = fake_state.lock().expect("fake ACP state").sent.clone();
+        assert_eq!(
+            sent.iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "session/new", "session/prompt"]
+        );
+        assert_eq!(sent[1]["params"]["cwd"], json!("/workspace"));
+        assert_eq!(sent[2]["params"]["sessionId"], json!("ses_fresh"));
+        assert_eq!(
+            sent[2]["params"]["prompt"][0]["text"],
+            json!("fresh prompt")
         );
     }
 }

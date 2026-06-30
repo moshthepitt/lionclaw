@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lionclaw_durable_fs::write_file_atomically;
 use rustix::{
-    fs::{open, openat, Mode, OFlags},
+    fs::{open, openat, unlinkat, AtFlags, Mode, OFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -741,6 +741,22 @@ pub fn save_state_value(
         None,
         &format!("{label} state file"),
     )
+}
+
+pub fn clear_state_value(runtime_state_root: &Path, file_name: &str, label: &str) -> Result<()> {
+    let target_name = state_file_name(file_name)?;
+    let Some(root) = open_existing_state_root(runtime_state_root)? else {
+        return Ok(());
+    };
+    validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
+    match unlinkat(&root, &target_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(anyhow!(
+            "failed to remove {label} state file '{}' in '{}': {err}",
+            file_name,
+            runtime_state_root.display()
+        )),
+    }
 }
 
 fn validate_existing_state_file(
@@ -1807,11 +1823,11 @@ mod tests {
     };
 
     use super::{
-        canonical_events, execute_program_backed_turn, load_ready_state_value, safe_relative_path,
-        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
-        RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimePathProjection,
-        RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
+        safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
+        RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+        RuntimeExecutionContext, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
         RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
         TurnEvent, RUNTIME_SESSION_READY_MARKER,
@@ -2178,6 +2194,40 @@ mod tests {
             .expect("load state"),
             Some("session_saved".to_string())
         );
+    }
+
+    #[test]
+    fn clear_state_value_removes_regular_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let state_file = runtime_state_root.join("session-id");
+        std::fs::write(&state_file, "session_saved\n").expect("write state file");
+
+        clear_state_value(runtime_state_root, "session-id", "test session").expect("clear state");
+
+        assert!(
+            !state_file.exists(),
+            "state file should be removed after clear"
+        );
+        clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect("clearing a missing state file is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_state_value_rejects_symlinked_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let outside = temp_dir.path().join("outside");
+        std::fs::write(&outside, "do not remove\n").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, runtime_state_root.join("session-id"))
+            .expect("create state symlink");
+
+        let err = clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect_err("state symlink should be rejected");
+
+        assert!(err.to_string().contains("cannot be a symlink"));
+        assert!(outside.exists(), "clear must not follow state symlinks");
     }
 
     #[test]

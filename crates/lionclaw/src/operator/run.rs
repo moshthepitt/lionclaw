@@ -1610,12 +1610,15 @@ set -euo pipefail
 while IFS= read -r line; do
   case "${line}" in
     *'"method":"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"embeddedContext":true,"image":true},"sessionCapabilities":{"close":{},"fork":{},"list":{},"resume":{}}},"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}'
       ;;
     *'"method":"session/new"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_test","configOptions":[]}}'
       ;;
     *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}'
+      ;;
+    *'"method":"session/resume"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}'
       ;;
     *'"method":"session/prompt"'*)
