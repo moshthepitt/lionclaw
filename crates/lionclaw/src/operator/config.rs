@@ -572,7 +572,6 @@ impl RuntimeProfileConfig {
         if let Some(skill_projection) = &self.skill_projection {
             skill_projection.validate()?;
         }
-        self.terminal.validate()?;
 
         match self.confinement() {
             ConfinementConfig::Oci(config) => {

@@ -94,10 +94,6 @@ impl RuntimeDriverProvider for AcpRuntimeDriver {
         ACP_PROTOCOL_NAME
     }
 
-    fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
-        config.terminal.validate()
-    }
-
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
         Arc::new(AcpRuntimeAdapter::new(AcpRuntimeConfig {
             runtime_id: config.runtime_id,

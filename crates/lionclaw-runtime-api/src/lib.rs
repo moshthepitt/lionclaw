@@ -1071,10 +1071,6 @@ impl RuntimeTerminalConfig {
     pub fn is_empty(&self) -> bool {
         self.args.is_empty()
     }
-
-    pub fn validate(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
