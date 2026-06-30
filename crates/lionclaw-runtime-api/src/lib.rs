@@ -1061,7 +1061,7 @@ pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct RuntimeTerminalConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
@@ -1549,8 +1549,8 @@ mod tests {
         RuntimeExecutionContext, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
         RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-        TurnEvent, RUNTIME_SESSION_READY_MARKER,
+        RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTurnInput,
+        RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1586,6 +1586,19 @@ mod tests {
                 },
                 RuntimeEvent::Done,
             ],
+        );
+    }
+
+    #[test]
+    fn runtime_terminal_config_rejects_removed_resume_args() {
+        let err = serde_json::from_value::<RuntimeTerminalConfig>(serde_json::json!({
+            "resume-args": ["--session", "{session_id}"]
+        }))
+        .expect_err("removed terminal resume args should not be ignored");
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
         );
     }
 

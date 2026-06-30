@@ -283,10 +283,10 @@ ACP drivers launch the harness's native interactive command from the profile
 command without ACP protocol args, with the same confinement, staged auth,
 skills, and non-privileged runtime layout as other runtime executions. Attached
 launches do not consume LionClaw's program-backed runtime-session ready proof:
-the kernel passes a not-ready state to `build_terminal_program()` while leaving
-any existing ready marker intact for later kernel-managed turns. Program-backed
-Codex and ACP continuity remain LionClaw-owned links in session-scoped runtime
-control state, but native UI turns stay runtime-owned and cannot mutate the
+`RuntimeTerminalProgramInput` has no readiness field, and existing ready
+markers remain intact for later kernel-managed turns. Program-backed Codex and
+ACP continuity remain LionClaw-owned links in session-scoped runtime control
+state, but native UI turns stay runtime-owned and cannot mutate the
 runtime-native session that later driven turns resume. The attached native UI
 itself is not a LionClaw turn, so LionClaw turn timeout overrides do not wrap
 the runtime's own interactive session. Future terminal export APIs, if added,
