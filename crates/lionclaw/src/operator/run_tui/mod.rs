@@ -744,10 +744,10 @@ impl ControlPane {
 struct ReadyInstance {
     summary: InstanceSummary,
     runtime_id: String,
-    runtime_kind: String,
+    runtime_driver: String,
     runtime_executable: String,
     runtime_model: Option<String>,
-    runtime_agent: Option<String>,
+    runtime_mode: Option<String>,
     runtime_override: Option<String>,
     boundary: BoundarySummary,
     kernel: Kernel,

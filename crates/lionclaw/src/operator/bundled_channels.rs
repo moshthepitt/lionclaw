@@ -144,10 +144,6 @@ mod tests {
             "../../../../skills/channel-team-local/runtime/team-local/scripts/resolve"
         )
         .contains("bin/lionclaw-channel-team-local"));
-        assert!(include_str!(
-            "../../../../skills/channel-team-local/runtime/team-local/scripts/send"
-        )
-        .contains("bin/lionclaw-channel-team-local"));
 
         let private_context = BUNDLED_SKILL_BINARIES
             .iter()

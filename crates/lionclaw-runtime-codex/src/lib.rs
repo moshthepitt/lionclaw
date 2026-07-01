@@ -30,6 +30,8 @@
     )
 )]
 
+mod host_auth;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -37,37 +39,46 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{timeout, timeout_at, Instant},
+    time::timeout,
 };
 use tracing::warn;
 use uuid::Uuid;
 
+pub use host_auth::{
+    codex_home_identity, ensure_codex_host_auth_ready, prepare_codex_runtime_auth,
+    sync_codex_home_into_runtime_home, CodexRuntimeAuthProvider,
+};
+
 use lionclaw_runtime_api::{
-    choose_terminal_transcript_target, load_ready_state_value, load_state_value,
-    normalize_terminal_transcript_launch_started_at, safe_relative_path, save_state_value,
-    ExecutionOutput, NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact,
-    RuntimeAuthKind, RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome,
-    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeFileChange,
-    RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
-    RuntimeTerminalProgramInput, RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-    RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTranscriptWarning,
-    RuntimeTerminalTurn, RuntimeTerminalTurnStatus, RuntimeTurnMode, RuntimeTurnResult,
-    TerminalTranscriptCandidate, TerminalTranscriptTarget, TerminalTranscriptTimestampPrecision,
+    load_ready_state_value, safe_relative_path, save_state_value, ExecutionOutput, NetworkMode,
+    RawTurnPayload, RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind,
+    RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeDriverConfig,
+    RuntimeDriverProvider, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
+    RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSession,
+    RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TurnEvent,
 };
 
 const FILE_CHANGE_PATH_EVENT_LIMIT: usize = 50;
-const CODEX_APP_SERVER_MAX_PAGE_LIMIT: u32 = 100;
+const CODEX_APP_SERVER_DRIVER: &str = "codex-app-server";
+pub const CODEX_RUNTIME_DRIVER: &str = "codex";
+pub const CODEX_RUNTIME_AUTH_KIND: &str = CODEX_RUNTIME_DRIVER;
+pub const CODEX_DEFAULT_EXECUTABLE: &str = "codex";
+pub const CODEX_SKILL_PROJECTION_ROOT: &str = ".codex/skills";
 const LIONCLAW_RUNTIME_CONTEXT_PATH: &str = "/runtime/AGENTS.generated.md";
 const CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR: &str = ".codex/generated_images";
 const CODEX_GENERATED_IMAGES_RUNTIME_DIR: &str = "/runtime/home/.codex/generated_images";
 const CODEX_RUNTIME_WORKSPACE_PATH: &str = "/workspace";
 const CODEX_TRUSTED_LEVEL: &str = "trusted";
+
+pub fn codex_runtime_auth_kind() -> RuntimeAuthKind {
+    RuntimeAuthKind::from_static(CODEX_RUNTIME_AUTH_KIND)
+}
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -75,10 +86,63 @@ pub struct CodexRuntimeConfig {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CodexRuntimeDriver;
+
+impl RuntimeDriverProvider for CodexRuntimeDriver {
+    fn driver(&self) -> &'static str {
+        CODEX_RUNTIME_DRIVER
+    }
+
+    fn validate_config(&self, config: &RuntimeDriverConfig) -> Result<()> {
+        if !config.args.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime args");
+        }
+        if !config.environment.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime environment");
+        }
+        if config.mode.is_some() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime mode");
+        }
+        if !config.terminal.is_empty() {
+            bail!("driver '{CODEX_RUNTIME_DRIVER}' does not support runtime terminal profile");
+        }
+        let expected = codex_runtime_auth_kind();
+        match &config.auth {
+            Some(auth) if auth == &expected => {}
+            Some(auth) => {
+                bail!(
+                    "driver '{CODEX_RUNTIME_DRIVER}' requires auth kind '{}', got '{}'",
+                    expected.as_str(),
+                    auth.as_str()
+                );
+            }
+            None => {
+                bail!(
+                    "driver '{CODEX_RUNTIME_DRIVER}' requires auth kind '{}'",
+                    expected.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter> {
+        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
+            executable: config.executable,
+            model: config.model,
+        }))
+    }
+
+    fn auth_provider(&self) -> Option<Arc<dyn lionclaw_runtime_api::RuntimeAuthProvider>> {
+        Some(Arc::new(CodexRuntimeAuthProvider))
+    }
+}
+
 impl Default for CodexRuntimeConfig {
     fn default() -> Self {
         Self {
-            executable: "codex".to_string(),
+            executable: CODEX_DEFAULT_EXECUTABLE.to_string(),
             model: None,
         }
     }
@@ -111,32 +175,115 @@ struct CodexInterruptRequest {
     ack_tx: oneshot::Sender<Result<()>>,
 }
 
-struct CodexTranscriptSessionGuard<'a> {
-    adapter: &'a CodexRuntimeAdapter,
-    runtime_session_id: String,
-}
-
-impl Drop for CodexTranscriptSessionGuard<'_> {
-    fn drop(&mut self) {
-        self.adapter
-            .remove_transcript_session(&self.runtime_session_id);
-    }
-}
-
 #[derive(Clone)]
 struct CodexThreadState {
     sessions: Arc<RwLock<HashMap<String, CodexSessionState>>>,
     runtime_session_id: String,
 }
 
-struct CodexTerminalTranscriptExportRequest<'a> {
-    events: &'a RuntimeEventSender,
-    thread_state: &'a CodexThreadState,
-    runtime_state_root: &'a Path,
-    resume_thread_id: Option<&'a str>,
-    launch_started_at: Option<DateTime<Utc>>,
-    deadline: Instant,
-    hard_timeout: Duration,
+struct CodexAppServerTurnRunner<'a> {
+    adapter: &'a CodexRuntimeAdapter,
+    context: RuntimeExecutionContext,
+    executor: Box<dyn RuntimeProgramExecutor>,
+}
+
+impl CodexAppServerTurnRunner<'_> {
+    async fn run_turn(
+        &mut self,
+        input: RuntimeTurnInput,
+        journal: RuntimeTurnJournalSender,
+    ) -> Result<RuntimeTurnResult> {
+        let network_mode = self.context.network_mode;
+        let thread_state = self.adapter.thread_state_for(&input.runtime_session_id);
+        let transport = self
+            .adapter
+            .start_app_server_transport(self.executor.as_mut(), &self.context.mcp_servers)
+            .await?;
+        let mut client =
+            CodexAppServerClient::new_with_runtime_context(transport, self.context.clone());
+        let sink = CodexAppServerEventSink::journal(&journal);
+
+        let result = async {
+            client.initialize(sink, &thread_state).await?;
+            let thread_id = self
+                .adapter
+                .ensure_app_server_thread(
+                    &mut client,
+                    &input.runtime_session_id,
+                    sink,
+                    &thread_state,
+                )
+                .await?;
+            let response = client
+                .request(
+                    "turn/start",
+                    turn_start_params(
+                        &thread_id,
+                        &input.prompt,
+                        self.adapter.config.model.as_deref(),
+                        network_mode,
+                    ),
+                    sink,
+                    &thread_state,
+                )
+                .await?;
+            let turn_id = extract_app_server_turn_id(&response);
+            let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
+            client
+                .wait_for_turn_completed(
+                    turn_id.as_deref(),
+                    Some(&thread_id),
+                    Some(interrupt_tx),
+                    sink,
+                    &thread_state,
+                    Some(&mut interrupt_rx),
+                )
+                .await?;
+            Ok(RuntimeTurnResult::default())
+        }
+        .await;
+
+        finish_app_server_session(client, result).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CodexAppServerEventSink<'a> {
+    Runtime(&'a RuntimeEventSender),
+    Journal(&'a RuntimeTurnJournalSender),
+}
+
+impl<'a> CodexAppServerEventSink<'a> {
+    fn runtime(events: &'a RuntimeEventSender) -> Self {
+        Self::Runtime(events)
+    }
+
+    fn journal(journal: &'a RuntimeTurnJournalSender) -> Self {
+        Self::Journal(journal)
+    }
+
+    fn send(self, event: RuntimeEvent, raw_payload: &str) {
+        match self {
+            Self::Runtime(events) => {
+                drop(events.send(event));
+            }
+            Self::Journal(journal) => {
+                drop(journal.send(TurnEvent::with_raw(
+                    event,
+                    RawTurnPayload {
+                        driver: CODEX_APP_SERVER_DRIVER.to_string(),
+                        payload: raw_payload.to_string(),
+                    },
+                )));
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a RuntimeEventSender> for CodexAppServerEventSink<'a> {
+    fn from(events: &'a RuntimeEventSender) -> Self {
+        Self::runtime(events)
+    }
 }
 
 impl CodexRuntimeAdapter {
@@ -150,58 +297,19 @@ impl CodexRuntimeAdapter {
     async fn run_app_server_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let RuntimeProgramTurnExecution {
             input,
             context,
-            mut executor,
+            executor,
         } = execution;
-        let network_mode = context.network_mode;
-        let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
-        let mut client = CodexAppServerClient::new_with_runtime_context(transport, context);
-
-        let result = async {
-            client.initialize(&events, &thread_state).await?;
-            let thread_id = self
-                .ensure_app_server_thread(
-                    &mut client,
-                    &input.runtime_session_id,
-                    &events,
-                    &thread_state,
-                )
-                .await?;
-            let response = client
-                .request(
-                    "turn/start",
-                    turn_start_params(
-                        &thread_id,
-                        &input.prompt,
-                        self.config.model.as_deref(),
-                        network_mode,
-                    ),
-                    &events,
-                    &thread_state,
-                )
-                .await?;
-            let turn_id = extract_app_server_turn_id(&response);
-            let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
-            client
-                .wait_for_turn_completed(
-                    turn_id.as_deref(),
-                    Some(&thread_id),
-                    Some(interrupt_tx),
-                    &events,
-                    &thread_state,
-                    Some(&mut interrupt_rx),
-                )
-                .await?;
-            Ok(RuntimeTurnResult::default())
-        }
-        .await;
-
-        finish_app_server_session(client, result).await
+        let mut driver = CodexAppServerTurnRunner {
+            adapter: self,
+            context,
+            executor,
+        };
+        driver.run_turn(input, journal).await
     }
 
     async fn run_app_server_control(
@@ -242,17 +350,20 @@ impl CodexRuntimeAdapter {
             Err(outcome) => return Ok(outcome),
         };
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
+        let transport = self
+            .start_app_server_transport(executor.as_mut(), &[])
+            .await?;
         let mut client = CodexAppServerClient::new(transport);
+        let sink = CodexAppServerEventSink::runtime(&events);
         let result = async {
-            client.initialize(&events, &thread_state).await?;
+            client.initialize(sink, &thread_state).await?;
             let response = client
                 .request(
                     "model/list",
                     json!({
                         "includeHidden": include_hidden,
                     }),
-                    &events,
+                    sink,
                     &thread_state,
                 )
                 .await?;
@@ -292,13 +403,16 @@ impl CodexRuntimeAdapter {
         }
 
         let thread_state = self.thread_state_for(&input.runtime_session_id);
-        let transport = self.start_app_server_transport(executor.as_mut()).await?;
+        let transport = self
+            .start_app_server_transport(executor.as_mut(), &[])
+            .await?;
         let mut client = CodexAppServerClient::new(transport);
+        let sink = CodexAppServerEventSink::runtime(&events);
 
         let result = async {
-            client.initialize(&events, &thread_state).await?;
+            client.initialize(sink, &thread_state).await?;
             let thread_id = self
-                .resume_app_server_thread(&mut client, &saved_thread_id, &events, &thread_state)
+                .resume_app_server_thread(&mut client, &saved_thread_id, sink, &thread_state)
                 .await?;
 
             let outcome = match input.command_name.as_str() {
@@ -311,7 +425,7 @@ impl CodexRuntimeAdapter {
                                 "threadId": thread_id,
                                 "name": name,
                             }),
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -327,7 +441,7 @@ impl CodexRuntimeAdapter {
                             json!({
                                 "threadId": thread_id,
                             }),
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -336,7 +450,7 @@ impl CodexRuntimeAdapter {
                             &thread_id,
                             interrupt_tx,
                             &mut interrupt_rx,
-                            &events,
+                            sink,
                             &thread_state,
                         )
                         .await?;
@@ -359,26 +473,28 @@ impl CodexRuntimeAdapter {
     async fn start_app_server_transport(
         &self,
         executor: &mut dyn RuntimeProgramExecutor,
+        mcp_servers: &[RuntimeMcpServerSpec],
     ) -> Result<ExecutionSessionTransport> {
         let session = executor
-            .spawn(build_codex_app_server_program(&self.config))
+            .spawn(build_codex_app_server_program(&self.config, mcp_servers))
             .await?;
         Ok(ExecutionSessionTransport::new(session))
     }
 
-    async fn ensure_app_server_thread<T>(
+    async fn ensure_app_server_thread<'a, T>(
         &self,
         client: &mut CodexAppServerClient<T>,
         runtime_session_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<String>
     where
         T: AppServerTransport + Send,
     {
+        let sink = sink.into();
         if let Some(thread_id) = self.current_thread_id(runtime_session_id)? {
             return self
-                .resume_app_server_thread(client, &thread_id, events, thread_state)
+                .resume_app_server_thread(client, &thread_id, sink, thread_state)
                 .await;
         }
 
@@ -386,7 +502,7 @@ impl CodexRuntimeAdapter {
             .request(
                 "thread/start",
                 thread_start_params(self.config.model.as_deref()),
-                events,
+                sink,
                 thread_state,
             )
             .await?;
@@ -400,21 +516,22 @@ impl CodexRuntimeAdapter {
         Ok(thread_id)
     }
 
-    async fn resume_app_server_thread<T>(
+    async fn resume_app_server_thread<'a, T>(
         &self,
         client: &mut CodexAppServerClient<T>,
         thread_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<String>
     where
         T: AppServerTransport + Send,
     {
+        let sink = sink.into();
         let response = client
             .request(
                 "thread/resume",
                 thread_resume_params(thread_id, self.config.model.as_deref()),
-                events,
+                sink,
                 thread_state,
             )
             .await?;
@@ -433,286 +550,6 @@ impl CodexRuntimeAdapter {
 
     fn current_thread_id(&self, runtime_session_id: &str) -> Result<Option<String>> {
         Ok(self.session_state(runtime_session_id)?.thread_id)
-    }
-
-    async fn export_terminal_transcript_from_app_server(
-        &self,
-        input: RuntimeTerminalTranscriptInput,
-        executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-        deadline: Instant,
-        hard_timeout: Duration,
-    ) -> Result<RuntimeTerminalTranscript> {
-        let runtime_session_id = format!("codex-terminal-{}", input.session_id);
-        let resume_thread_id = load_saved_thread_id(&input.runtime_state_root)?;
-        let _session_guard =
-            self.transcript_session_guard(&runtime_session_id, input.runtime_state_root.clone())?;
-        let session = timeout_at(
-            deadline,
-            executor.spawn(build_codex_app_server_program(&self.config)),
-        )
-        .await
-        .map_err(|_| codex_app_server_deadline_error(hard_timeout, "starting app-server"))?;
-        let result = match session {
-            Ok(session) => {
-                let transport = ExecutionSessionTransport::new(session);
-                let mut client = CodexAppServerClient::new(transport);
-                let thread_state = self.thread_state_for(&runtime_session_id);
-                let (events, _event_rx) = mpsc::unbounded_channel();
-                let export = {
-                    timeout_at(deadline, client.initialize(&events, &thread_state))
-                        .await
-                        .map_err(|_| {
-                            codex_app_server_deadline_error(hard_timeout, "initializing app-server")
-                        })??;
-                    self.export_terminal_transcript_from_app_server_client(
-                        &mut client,
-                        CodexTerminalTranscriptExportRequest {
-                            events: &events,
-                            thread_state: &thread_state,
-                            runtime_state_root: &input.runtime_state_root,
-                            resume_thread_id: resume_thread_id.as_deref(),
-                            launch_started_at: input.launch_started_at,
-                            deadline,
-                            hard_timeout,
-                        },
-                    )
-                    .await
-                };
-                finish_app_server_transcript_session(client, export, deadline, hard_timeout).await
-            }
-            Err(err) => Err(err),
-        };
-        result
-    }
-
-    async fn export_terminal_transcript_from_app_server_client<T>(
-        &self,
-        client: &mut CodexAppServerClient<T>,
-        request: CodexTerminalTranscriptExportRequest<'_>,
-    ) -> Result<RuntimeTerminalTranscript>
-    where
-        T: AppServerTransport + Send,
-    {
-        let mut cursor = None;
-        let mut seen_cursors = HashSet::new();
-        let mut turns = Vec::new();
-        let mut warnings = Vec::new();
-        let mut target = TerminalTranscriptTarget::default();
-        let mut seen_thread_ids = HashSet::new();
-        let mut source_selection_reconciled = true;
-
-        loop {
-            let response_result = codex_app_server_request_until(
-                client,
-                "thread/list",
-                codex_thread_list_params(cursor.as_deref()),
-                request.events,
-                request.thread_state,
-                request.deadline,
-            )
-            .await;
-            let response = match response_result {
-                Ok(Some(response)) => response,
-                Ok(None) => {
-                    warnings.push(RuntimeTerminalTranscriptWarning::new(
-                        "codex-app-server",
-                        codex_app_server_deadline_warning(request.hard_timeout, "listing threads"),
-                    ));
-                    source_selection_reconciled = false;
-                    break;
-                }
-                Err(err) if request.resume_thread_id.is_some() => {
-                    warnings.push(RuntimeTerminalTranscriptWarning::new(
-                        "codex-app-server",
-                        format!("{err:#}"),
-                    ));
-                    source_selection_reconciled = false;
-                    break;
-                }
-                Err(err) => {
-                    return Err(err).context("failed to list Codex app-server threads");
-                }
-            };
-            let listed_threads = match codex_app_server_threads(&response) {
-                Ok(threads) => threads,
-                Err(err) if request.resume_thread_id.is_some() => {
-                    warnings.push(RuntimeTerminalTranscriptWarning::new(
-                        "codex-app-server",
-                        format!("{err:#}"),
-                    ));
-                    source_selection_reconciled = false;
-                    break;
-                }
-                Err(err) => {
-                    return Err(err).context("failed to list Codex app-server threads");
-                }
-            };
-            let mut deadline_reached = false;
-            for thread in listed_threads {
-                if !seen_thread_ids.insert(thread.id.clone()) {
-                    continue;
-                }
-                if target.is_empty() {
-                    let latest = TerminalTranscriptCandidate::new(
-                        thread.id.clone(),
-                        codex_listed_thread_updated_at(&thread),
-                    );
-                    if let Some(thread_id) = choose_terminal_transcript_target(
-                        request.resume_thread_id,
-                        latest.as_ref(),
-                        normalize_terminal_transcript_launch_started_at(
-                            request.launch_started_at,
-                            TerminalTranscriptTimestampPrecision::Seconds,
-                        ),
-                    ) {
-                        if target.choose_if_empty(&thread_id) {
-                            save_thread_id(request.runtime_state_root, &thread_id)?;
-                        }
-                    }
-                }
-                match codex_app_server_thread_terminal_transcript(
-                    client,
-                    request.events,
-                    request.thread_state,
-                    &thread,
-                    request.deadline,
-                )
-                .await
-                {
-                    Ok(thread_transcript) => {
-                        if codex_record_app_server_thread_transcript(
-                            &mut target,
-                            &thread,
-                            thread_transcript,
-                            &mut turns,
-                        ) {
-                            warnings.push(RuntimeTerminalTranscriptWarning::new(
-                                format!("codex-app-server:{}", thread.id),
-                                codex_app_server_deadline_warning(
-                                    request.hard_timeout,
-                                    "listing thread turns",
-                                ),
-                            ));
-                            deadline_reached = true;
-                        }
-                        if deadline_reached {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        warnings.push(RuntimeTerminalTranscriptWarning::new(
-                            format!("codex-app-server:{}", thread.id),
-                            format!("{err:#}"),
-                        ));
-                        continue;
-                    }
-                }
-            }
-            if deadline_reached {
-                break;
-            }
-
-            let next_cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .and_then(non_empty);
-            let Some(next_cursor) = next_cursor else {
-                break;
-            };
-            if !seen_cursors.insert(next_cursor.clone()) {
-                bail!("codex app-server repeated thread/list cursor {next_cursor}");
-            }
-            cursor = Some(next_cursor);
-        }
-
-        let fallback_thread_id = target.unreconciled_id().map(str::to_string).or_else(|| {
-            request
-                .resume_thread_id
-                .filter(|_| target.is_empty())
-                .map(str::to_string)
-        });
-
-        if let Some(thread_id) = fallback_thread_id {
-            if !seen_thread_ids.contains(&thread_id) {
-                let thread = CodexListedThread {
-                    id: thread_id,
-                    started_at: None,
-                    finished_at: None,
-                };
-                if target.choose_if_empty(&thread.id) {
-                    save_thread_id(request.runtime_state_root, &thread.id)?;
-                }
-                match codex_app_server_thread_terminal_transcript(
-                    client,
-                    request.events,
-                    request.thread_state,
-                    &thread,
-                    request.deadline,
-                )
-                .await
-                {
-                    Ok(thread_transcript) => {
-                        if codex_record_app_server_thread_transcript(
-                            &mut target,
-                            &thread,
-                            thread_transcript,
-                            &mut turns,
-                        ) {
-                            warnings.push(RuntimeTerminalTranscriptWarning::new(
-                                format!("codex-app-server:{}", thread.id),
-                                codex_app_server_deadline_warning(
-                                    request.hard_timeout,
-                                    "listing thread turns",
-                                ),
-                            ));
-                        }
-                    }
-                    Err(err) => warnings.push(RuntimeTerminalTranscriptWarning::new(
-                        format!("codex-app-server:{}", thread.id),
-                        format!("{err:#}"),
-                    )),
-                }
-            }
-        }
-
-        turns.sort_by(|left, right| {
-            left.started_at
-                .cmp(&right.started_at)
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        });
-        Ok(RuntimeTerminalTranscript::new(
-            turns,
-            warnings,
-            target.transcript_state(source_selection_reconciled),
-        ))
-    }
-
-    fn transcript_session_guard(
-        &self,
-        runtime_session_id: &str,
-        runtime_state_root: PathBuf,
-    ) -> Result<CodexTranscriptSessionGuard<'_>> {
-        self.sessions
-            .write()
-            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-            .insert(
-                runtime_session_id.to_string(),
-                CodexSessionState {
-                    runtime_state_root: Some(runtime_state_root),
-                    thread_id: None,
-                    active_turn: None,
-                },
-            );
-        Ok(CodexTranscriptSessionGuard {
-            adapter: self,
-            runtime_session_id: runtime_session_id.to_string(),
-        })
-    }
-
-    fn remove_transcript_session(&self, runtime_session_id: &str) {
-        if let Ok(mut sessions) = self.sessions.write() {
-            sessions.remove(runtime_session_id);
-        }
     }
 
     fn session_state(&self, runtime_session_id: &str) -> Result<CodexSessionState> {
@@ -773,31 +610,16 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        self.run_app_server_turn(execution, events).await
+        self.run_app_server_turn(execution, journal).await
     }
 
     fn build_terminal_program(
         &self,
-        input: RuntimeTerminalProgramInput,
+        _input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
-        Ok(build_codex_terminal_program(
-            &self.config,
-            load_ready_saved_thread_id(&input.runtime_state_root, input.runtime_session_ready)?,
-        ))
-    }
-
-    async fn export_terminal_transcript(
-        &self,
-        input: RuntimeTerminalTranscriptInput,
-        executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<RuntimeTerminalTranscript> {
-        let hard_timeout = executor.hard_timeout();
-        let deadline = Instant::now() + hard_timeout;
-        self.export_terminal_transcript_from_app_server(input, executor, deadline, hard_timeout)
-            .await
-            .context("failed to export Codex native TUI transcript through app-server")
+        Ok(build_codex_terminal_program(&self.config))
     }
 
     async fn runtime_control(
@@ -870,20 +692,12 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn codex_record_app_server_thread_transcript(
-    target: &mut TerminalTranscriptTarget,
-    thread: &CodexListedThread,
-    transcript: CodexThreadTerminalTranscript,
-    turns: &mut Vec<RuntimeTerminalTurn>,
-) -> bool {
-    let deadline_reached = transcript.deadline_reached;
-    target.record_reconciliation(&thread.id, !deadline_reached, transcript.resumable);
-    turns.extend(transcript.turns);
-    deadline_reached
-}
-
-fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+fn build_codex_app_server_program(
+    config: &CodexRuntimeConfig,
+    mcp_servers: &[RuntimeMcpServerSpec],
+) -> RuntimeProgramSpec {
     let mut args = codex_runtime_config_override_args();
+    args.extend(codex_mcp_server_override_args(mcp_servers));
     args.push("app-server".to_string());
 
     RuntimeProgramSpec {
@@ -891,14 +705,11 @@ fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgram
         args,
         environment: Vec::new(),
         stdin: String::new(),
-        auth: Some(RuntimeAuthKind::Codex),
+        auth: Some(codex_runtime_auth_kind()),
     }
 }
 
-fn build_codex_terminal_program(
-    config: &CodexRuntimeConfig,
-    thread_id: Option<String>,
-) -> RuntimeProgramSpec {
+fn build_codex_terminal_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
     let mut args = vec![
         "--sandbox".to_string(),
         "danger-full-access".to_string(),
@@ -910,17 +721,13 @@ fn build_codex_terminal_program(
         args.push("--model".to_string());
         args.push(model.clone());
     }
-    if let Some(thread_id) = thread_id {
-        args.push("resume".to_string());
-        args.push(thread_id);
-    }
 
     RuntimeProgramSpec {
         executable: config.executable.clone(),
         args,
         environment: Vec::new(),
         stdin: String::new(),
-        auth: Some(RuntimeAuthKind::Codex),
+        auth: Some(codex_runtime_auth_kind()),
     }
 }
 
@@ -944,394 +751,88 @@ fn codex_runtime_config_override_args() -> Vec<String> {
     ]
 }
 
-fn codex_thread_list_params(cursor: Option<&str>) -> Value {
-    json!({
-        "cursor": cursor,
-        "limit": CODEX_APP_SERVER_MAX_PAGE_LIMIT,
-        "sortKey": "updated_at",
-        "sortDirection": "desc",
-        "sourceKinds": ["cli"],
-        "archived": false,
-    })
-}
-
-fn codex_thread_turns_list_params(thread_id: &str, cursor: Option<&str>) -> Value {
-    json!({
-        "threadId": thread_id,
-        "cursor": cursor,
-        "limit": CODEX_APP_SERVER_MAX_PAGE_LIMIT,
-        "sortDirection": "desc",
-        "itemsView": "full",
-    })
-}
-
-#[derive(Debug, Clone)]
-struct CodexListedThread {
-    id: String,
-    started_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
-}
-
-fn codex_listed_thread_updated_at(thread: &CodexListedThread) -> Option<DateTime<Utc>> {
-    thread
-        .finished_at
-        .as_ref()
-        .or(thread.started_at.as_ref())
-        .cloned()
-}
-
-#[derive(Debug, Clone)]
-struct CodexThreadTerminalTranscript {
-    turns: Vec<RuntimeTerminalTurn>,
-    resumable: bool,
-    deadline_reached: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CodexTerminalTurnPage {
-    turns: Vec<RuntimeTerminalTurn>,
-    newest_turn_resumable: Option<bool>,
-}
-
-fn codex_app_server_threads(response: &Value) -> Result<Vec<CodexListedThread>> {
-    let threads = response
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("codex thread/list response missing data"))?;
-    Ok(threads
-        .iter()
-        .filter_map(|thread| {
-            let id = thread
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(non_empty)?;
-            Some(CodexListedThread {
-                id,
-                started_at: codex_app_server_timestamp(thread.get("createdAt")),
-                finished_at: codex_app_server_timestamp(thread.get("updatedAt")),
-            })
-        })
-        .collect())
-}
-
-async fn codex_app_server_thread_terminal_transcript<T>(
-    client: &mut CodexAppServerClient<T>,
-    events: &RuntimeEventSender,
-    thread_state: &CodexThreadState,
-    thread: &CodexListedThread,
-    deadline: Instant,
-) -> Result<CodexThreadTerminalTranscript>
-where
-    T: AppServerTransport + Send,
-{
-    let mut cursor = None;
-    let mut seen_cursors = HashSet::new();
-    let mut turns = Vec::new();
-    let mut newest_turn_resumable = None;
-
-    loop {
-        let response = codex_app_server_request_until(
-            client,
-            "thread/turns/list",
-            codex_thread_turns_list_params(&thread.id, cursor.as_deref()),
-            events,
-            thread_state,
-            deadline,
-        )
-        .await;
-        let response = match response {
-            Ok(Some(response)) => response,
-            Ok(None) => {
-                return Ok(CodexThreadTerminalTranscript {
-                    turns,
-                    resumable: newest_turn_resumable.unwrap_or(false),
-                    deadline_reached: true,
-                });
-            }
-            Err(err) if codex_thread_turns_unmaterialized_error(&err) => {
-                return Ok(CodexThreadTerminalTranscript {
-                    turns,
-                    resumable: false,
-                    deadline_reached: false,
-                });
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to list Codex app-server turns for thread {}",
-                        thread.id
-                    )
-                });
-            }
-        };
-        let page = codex_app_server_terminal_turn_page(thread, &response)?;
-        if newest_turn_resumable.is_none() {
-            newest_turn_resumable = page.newest_turn_resumable;
-        }
-        turns.extend(page.turns);
-
-        let next_cursor = response
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .and_then(non_empty);
-        let Some(next_cursor) = next_cursor else {
-            break;
-        };
-        if !seen_cursors.insert(next_cursor.clone()) {
-            bail!(
-                "codex app-server repeated thread/turns/list cursor {next_cursor} for thread {}",
-                thread.id
-            );
-        }
-        cursor = Some(next_cursor);
+fn codex_mcp_server_override_args(servers: &[RuntimeMcpServerSpec]) -> Vec<String> {
+    let mut args = Vec::new();
+    for server in servers {
+        let name = codex_toml_key_segment(&server.name);
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.command={}",
+            codex_toml_string(&server.command)
+        ));
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{name}.args={}",
+            codex_toml_string_array(&server.args)
+        ));
     }
-
-    Ok(CodexThreadTerminalTranscript {
-        turns,
-        resumable: newest_turn_resumable.unwrap_or(false),
-        deadline_reached: false,
-    })
+    args
 }
 
-async fn codex_app_server_request_until<T>(
-    client: &mut CodexAppServerClient<T>,
-    method: &str,
-    params: Value,
-    events: &RuntimeEventSender,
-    thread_state: &CodexThreadState,
-    deadline: Instant,
-) -> Result<Option<Value>>
-where
-    T: AppServerTransport + Send,
-{
-    if Instant::now() >= deadline {
-        return Ok(None);
-    }
-    match timeout_at(
-        deadline,
-        client.request(method, params, events, thread_state),
-    )
-    .await
-    {
-        Ok(response) => response.map(Some),
-        Err(_) => Ok(None),
-    }
+fn codex_toml_key_segment(raw: &str) -> String {
+    codex_toml_string(raw)
 }
 
-fn codex_app_server_deadline_error(hard_timeout: Duration, action: &str) -> anyhow::Error {
-    anyhow!(
-        "timed out after {}s while {action} for Codex native TUI transcript through app-server",
-        hard_timeout.as_secs_f32()
-    )
-}
-
-fn codex_app_server_deadline_warning(hard_timeout: Duration, action: &str) -> String {
-    format!(
-        "timed out after {}s while {action} for Codex native TUI transcript through app-server; returning partial transcript",
-        hard_timeout.as_secs_f32()
-    )
-}
-
-fn codex_thread_turns_unmaterialized_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<CodexAppServerResponseError>()
-            .is_some_and(|err| {
-                err.method == "thread/turns/list"
-                    && err
-                        .message
-                        .contains("thread/turns/list is unavailable before first user message")
-            })
-    })
-}
-
-fn codex_app_server_terminal_turn_page(
-    thread: &CodexListedThread,
-    response: &Value,
-) -> Result<CodexTerminalTurnPage> {
-    let page = response
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("codex thread/turns/list response missing data"))?;
-    let mut turns = Vec::new();
-    let mut newest_turn_resumable = None;
-    for (index, turn) in page.iter().enumerate() {
-        let terminal_turn =
-            codex_app_server_terminal_turn(&thread.id, thread.started_at, thread.finished_at, turn);
-        if index == 0 {
-            newest_turn_resumable = Some(codex_app_server_turn_is_successful_for_resume(
-                turn,
-                terminal_turn.as_ref(),
-            ));
-        }
-        if let Some(turn) = terminal_turn {
-            turns.push(turn);
+fn codex_toml_string(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len() + 2);
+    encoded.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => encoded.push_str("\\\\"),
+            '"' => encoded.push_str("\\\""),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            '\u{08}' => encoded.push_str("\\b"),
+            '\u{0C}' => encoded.push_str("\\f"),
+            ch if ch.is_control() => encoded.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => encoded.push(ch),
         }
     }
-    Ok(CodexTerminalTurnPage {
-        turns,
-        newest_turn_resumable,
-    })
+    encoded.push('"');
+    encoded
 }
 
-fn codex_app_server_terminal_turn(
-    thread_id: &str,
-    thread_started_at: Option<DateTime<Utc>>,
-    thread_finished_at: Option<DateTime<Utc>>,
-    turn: &Value,
-) -> Option<RuntimeTerminalTurn> {
-    let turn_id = turn.get("id").and_then(Value::as_str).and_then(non_empty)?;
-    let user_text = codex_app_server_turn_user_text(turn)?;
-    let assistant_text = codex_app_server_turn_assistant_text(turn)?;
-    let (started_at, finished_at) =
-        codex_app_server_turn_times(turn, thread_started_at, thread_finished_at)?;
-    let (status, error_code, error_text) = codex_app_server_turn_status(turn);
-
-    Some(RuntimeTerminalTurn {
-        source_id: format!("codex-app-server:{thread_id}:{turn_id}"),
-        display_user_text: user_text.clone(),
-        prompt_user_text: user_text,
-        assistant_text,
-        status,
-        error_code,
-        error_text,
-        started_at,
-        finished_at,
-    })
-}
-
-fn codex_app_server_turn_times(
-    turn: &Value,
-    thread_started_at: Option<DateTime<Utc>>,
-    thread_finished_at: Option<DateTime<Utc>>,
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let turn_started_at = codex_app_server_timestamp(turn.get("startedAt"));
-    let turn_finished_at = codex_app_server_timestamp(turn.get("completedAt"));
-    let started_at = turn_started_at
-        .or(thread_started_at)
-        .or(turn_finished_at)
-        .or(thread_finished_at)?;
-    let finished_at = turn_finished_at
-        .or(thread_finished_at)
-        .unwrap_or(started_at);
-    Some((started_at, finished_at))
-}
-
-fn codex_app_server_turn_user_text(turn: &Value) -> Option<String> {
-    let parts = codex_app_server_turn_items(turn)
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
-        .flat_map(|item| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(codex_app_server_user_input_text)
-        .collect::<Vec<_>>();
-    non_empty(&parts.join("\n\n"))
-}
-
-fn codex_app_server_turn_assistant_text(turn: &Value) -> Option<String> {
-    let mut final_or_unknown = Vec::new();
-    let mut commentary = Vec::new();
-    for item in codex_app_server_turn_items(turn)
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
-    {
-        let Some(text) = item.get("text").and_then(Value::as_str).and_then(non_empty) else {
-            continue;
-        };
-        match item.get("phase").and_then(Value::as_str) {
-            Some("commentary") => commentary.push(text),
-            _ => final_or_unknown.push(text),
+fn codex_toml_string_array(values: &[String]) -> String {
+    let mut encoded = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            encoded.push(',');
         }
+        encoded.push_str(&codex_toml_string(value));
     }
-    if final_or_unknown.is_empty() {
-        non_empty(&commentary.join("\n\n"))
-    } else {
-        non_empty(&final_or_unknown.join("\n\n"))
-    }
-}
-
-fn codex_app_server_turn_items(turn: &Value) -> impl Iterator<Item = &Value> {
-    turn.get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-}
-
-fn codex_app_server_user_input_text(input: &Value) -> Option<String> {
-    match input.get("type").and_then(Value::as_str) {
-        Some("text") => input
-            .get("text")
-            .and_then(Value::as_str)
-            .and_then(non_empty),
-        _ => None,
-    }
-}
-
-fn codex_app_server_turn_status(
-    turn: &Value,
-) -> (RuntimeTerminalTurnStatus, Option<String>, Option<String>) {
-    let status = codex_app_server_terminal_turn_status(turn.get("status").and_then(Value::as_str));
-    let error_text = codex_app_server_turn_error_text(turn);
-    let status = if status == RuntimeTerminalTurnStatus::Completed && error_text.is_some() {
-        RuntimeTerminalTurnStatus::Failed
-    } else {
-        status
-    };
-    let error_code = error_text
-        .as_ref()
-        .map(|_| "runtime.codex.turn_failed".to_string());
-    (status, error_code, error_text)
-}
-
-fn codex_app_server_turn_is_successful_for_resume(
-    raw_turn: &Value,
-    imported_turn: Option<&RuntimeTerminalTurn>,
-) -> bool {
-    codex_app_server_turn_has_completed_status(raw_turn)
-        && codex_app_server_turn_error_text(raw_turn).is_none()
-        && imported_turn.is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
-}
-
-fn codex_app_server_turn_has_completed_status(turn: &Value) -> bool {
-    turn.get("status")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|status| !status.is_empty())
-        .is_some_and(|status| status.eq_ignore_ascii_case("completed"))
-}
-
-fn codex_app_server_turn_error_text(turn: &Value) -> Option<String> {
-    turn.get("error")
-        .filter(|error| !error.is_null())
-        .map(app_server_error_text)
-}
-
-fn codex_app_server_terminal_turn_status(status: Option<&str>) -> RuntimeTerminalTurnStatus {
-    let Some(status) = status.map(str::trim).filter(|status| !status.is_empty()) else {
-        return RuntimeTerminalTurnStatus::Completed;
-    };
-    if status.eq_ignore_ascii_case("completed") {
-        RuntimeTerminalTurnStatus::Completed
-    } else if status.eq_ignore_ascii_case("failed") {
-        RuntimeTerminalTurnStatus::Failed
-    } else {
-        RuntimeTerminalTurnStatus::Interrupted
-    }
-}
-
-fn codex_app_server_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
-    value
-        .and_then(Value::as_i64)
-        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+    encoded.push(']');
+    encoded
 }
 
 #[async_trait]
 trait AppServerTransport {
     async fn send(&mut self, message: &Value) -> Result<()>;
-    async fn recv(&mut self) -> Result<Option<Value>>;
+    async fn recv(&mut self) -> Result<Option<AppServerMessage>>;
     async fn shutdown(&mut self) -> Result<ExecutionOutput>;
+}
+
+#[derive(Debug, Clone)]
+struct AppServerMessage {
+    raw: String,
+    value: Value,
+}
+
+impl AppServerMessage {
+    fn value(&self) -> &Value {
+        &self.value
+    }
+
+    fn into_value(self) -> Value {
+        self.value
+    }
+}
+
+impl From<Value> for AppServerMessage {
+    fn from(value: Value) -> Self {
+        let raw = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+        Self { raw, value }
+    }
 }
 
 struct ExecutionSessionTransport {
@@ -1356,7 +857,7 @@ impl AppServerTransport for ExecutionSessionTransport {
         session.write_line(&serde_json::to_string(message)?).await
     }
 
-    async fn recv(&mut self) -> Result<Option<Value>> {
+    async fn recv(&mut self) -> Result<Option<AppServerMessage>> {
         let session = self
             .session
             .as_mut()
@@ -1369,9 +870,12 @@ impl AppServerTransport for ExecutionSessionTransport {
             if trimmed.is_empty() {
                 continue;
             }
-            return serde_json::from_str(trimmed)
-                .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))
-                .map(Some);
+            let value = serde_json::from_str(trimmed)
+                .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))?;
+            return Ok(Some(AppServerMessage {
+                raw: trimmed.to_string(),
+                value,
+            }));
         }
     }
 
@@ -1438,11 +942,12 @@ where
         }
     }
 
-    async fn initialize(
+    async fn initialize<'a>(
         &mut self,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         self.request(
             "initialize",
             json!({
@@ -1455,7 +960,7 @@ where
                     "experimentalApi": true,
                 },
             }),
-            events,
+            sink,
             thread_state,
         )
         .await?;
@@ -1468,13 +973,14 @@ where
             .await
     }
 
-    async fn request(
+    async fn request<'a>(
         &mut self,
         method: &str,
         params: Value,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<Value> {
+        let sink = sink.into();
         let id = self.next_request_id();
         self.transport
             .send(&app_server_request_message(id, method, params))
@@ -1484,25 +990,26 @@ where
             let Some(message) = self.transport.recv().await? else {
                 bail!("codex app-server closed before responding to {method}");
             };
-            if response_id(&message).is_some_and(|response_id| response_id == id) {
-                return parse_app_server_response(message, method);
+            if response_id(message.value()).is_some_and(|response_id| response_id == id) {
+                return parse_app_server_response(message.into_value(), method);
             }
-            self.handle_message(message, events, thread_state).await?;
+            self.dispatch_message(message, sink, thread_state).await?;
             if let Some(message) = self.turn_failure(None) {
                 bail!("{message}");
             }
         }
     }
 
-    async fn wait_for_turn_completed(
+    async fn wait_for_turn_completed<'a>(
         &mut self,
         turn_id: Option<&str>,
         thread_id: Option<&str>,
         interrupt_tx: Option<mpsc::UnboundedSender<CodexInterruptRequest>>,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
         mut interrupt_rx: Option<&mut mpsc::UnboundedReceiver<CodexInterruptRequest>>,
     ) -> Result<()> {
+        let sink = sink.into();
         if let Some(message) = self.turn_failure(turn_id) {
             bail!("{message}");
         }
@@ -1526,7 +1033,7 @@ where
                             let Some(message) = message? else {
                                 bail!("codex app-server closed before turn completed");
                             };
-                            self.handle_message(message, events, thread_state).await?;
+                            self.dispatch_message(message, sink, thread_state).await?;
                         }
                         interrupt = interrupt_rx.recv() => {
                             if let Some(interrupt) = interrupt {
@@ -1534,7 +1041,7 @@ where
                                     thread_id,
                                     registered_turn_id.as_deref().or(turn_id),
                                     interrupt,
-                                    events,
+                                    sink,
                                     thread_state,
                                 )
                                 .await;
@@ -1545,7 +1052,7 @@ where
                     let Some(message) = self.transport.recv().await? else {
                         bail!("codex app-server closed before turn completed");
                     };
-                    self.handle_message(message, events, thread_state).await?;
+                    self.dispatch_message(message, sink, thread_state).await?;
                 }
                 self.register_active_wait_turn(
                     thread_id,
@@ -1570,14 +1077,15 @@ where
         result
     }
 
-    async fn wait_for_context_compaction_completed(
+    async fn wait_for_context_compaction_completed<'a>(
         &mut self,
         thread_id: &str,
         interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
         interrupt_rx: &mut mpsc::UnboundedReceiver<CodexInterruptRequest>,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         if let Some(message) = self.turn_failure(None) {
             bail!("{message}");
         }
@@ -1600,7 +1108,7 @@ where
                         let Some(message) = message? else {
                             bail!("codex app-server closed before context compaction completed");
                         };
-                        self.handle_message(message, events, thread_state).await?;
+                        self.dispatch_message(message, sink, thread_state).await?;
                     }
                     interrupt = interrupt_rx.recv() => {
                         if let Some(interrupt) = interrupt {
@@ -1608,7 +1116,7 @@ where
                                 Some(thread_id),
                                 registered_turn_id.as_deref(),
                                 interrupt,
-                                events,
+                                sink,
                                 thread_state,
                             )
                             .await;
@@ -1640,17 +1148,18 @@ where
         result
     }
 
-    async fn handle_turn_interrupt(
+    async fn handle_turn_interrupt<'a>(
         &mut self,
         thread_id: Option<&str>,
         turn_id: Option<&str>,
         interrupt: CodexInterruptRequest,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) {
+        let sink = sink.into();
         let result = match (thread_id, turn_id) {
             (Some(thread_id), Some(turn_id)) => {
-                self.interrupt_turn(thread_id, turn_id, events, thread_state)
+                self.interrupt_turn(thread_id, turn_id, sink, thread_state)
                     .await
             }
             _ => Err(anyhow!(
@@ -1660,13 +1169,14 @@ where
         drop(interrupt.ack_tx.send(result));
     }
 
-    async fn interrupt_turn(
+    async fn interrupt_turn<'a>(
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        events: &RuntimeEventSender,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        let sink = sink.into();
         let method = "turn/interrupt";
         let id = self.next_request_id();
         self.transport
@@ -1684,11 +1194,11 @@ where
             let Some(message) = self.transport.recv().await? else {
                 bail!("codex app-server closed before responding to {method}");
             };
-            if response_id(&message).is_some_and(|response_id| response_id == id) {
-                parse_app_server_response(message, method)?;
+            if response_id(message.value()).is_some_and(|response_id| response_id == id) {
+                parse_app_server_response(message.into_value(), method)?;
                 return Ok(());
             }
-            self.handle_message(message, events, thread_state).await?;
+            self.dispatch_message(message, sink, thread_state).await?;
         }
     }
 
@@ -1778,46 +1288,50 @@ where
                 .contains(thread_id)
     }
 
+    /// Translate one app-server message into the canonical `RuntimeEvent`s it
+    /// produces, in order. Protocol side effects (responding to server-initiated
+    /// requests, persisting the thread id, recording turn state) happen here;
+    /// emitting the returned events to a sender or journal is the caller's job.
     async fn handle_message(
         &mut self,
         message: Value,
-        events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
-    ) -> Result<()> {
+    ) -> Result<Vec<RuntimeEvent>> {
+        let mut events = Vec::new();
         if message.get("id").is_some() && message.get("method").is_some() {
             self.respond_to_server_request(&message).await?;
-            return Ok(());
+            return Ok(events);
         }
 
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             if let Some(artifact) =
                 self.generated_artifact_for_message(None, &message, thread_state)?
             {
-                drop(events.send(RuntimeEvent::Artifact { artifact }));
+                events.push(RuntimeEvent::Artifact { artifact });
             }
-            return Ok(());
+            return Ok(events);
         };
         let params = message.get("params").unwrap_or(&Value::Null);
         if let Some(artifact) =
             self.generated_artifact_for_message(Some(method), params, thread_state)?
         {
-            drop(events.send(RuntimeEvent::Artifact { artifact }));
+            events.push(RuntimeEvent::Artifact { artifact });
         }
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
                     thread_state.persist_thread_id(&thread_id)?;
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: None,
                         text: format!("codex thread started: {thread_id}"),
-                    }));
+                    });
                 }
             }
             "thread/name/updated" => {
-                drop(events.send(RuntimeEvent::Status {
+                events.push(RuntimeEvent::Status {
                     code: None,
                     text: "codex thread renamed".to_string(),
-                }));
+                });
             }
             "turn/started" => {
                 self.reset_turn_message_state();
@@ -1827,10 +1341,10 @@ where
                 ) {
                     self.started_thread_turns.insert(thread_id, turn_id);
                 }
-                drop(events.send(RuntimeEvent::Status {
+                events.push(RuntimeEvent::Status {
                     code: None,
                     text: "codex turn started".to_string(),
-                }));
+                });
             }
             "turn/completed" => {
                 self.reset_turn_message_state();
@@ -1845,47 +1359,67 @@ where
                     } else {
                         self.unmatched_turn_completed = true;
                     }
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: None,
                         text: "codex turn completed".to_string(),
-                    }));
-                    drop(events.send(RuntimeEvent::Done));
+                    });
+                    events.push(RuntimeEvent::Done);
                 }
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
                     let lane = self.agent_message_lane(params);
                     if lane == RuntimeMessageLane::Answer {
-                        self.record_answer_delta_boundary(params, events);
+                        if let Some(boundary) = self.record_answer_delta_boundary(params) {
+                            events.push(boundary);
+                        }
                     }
-                    drop(events.send(RuntimeEvent::MessageDelta { lane, text }));
+                    events.push(RuntimeEvent::MessageDelta { lane, text });
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    drop(events.send(RuntimeEvent::MessageDelta {
+                    events.push(RuntimeEvent::MessageDelta {
                         lane: RuntimeMessageLane::Reasoning,
                         text,
-                    }));
+                    });
                 }
             }
             "item/started" | "item/completed" | "item/updated" => {
-                for event in self.record_app_server_item(method, params) {
-                    drop(events.send(event));
-                }
+                events.extend(self.record_app_server_item(method, params));
             }
             "error" => {
                 let message = app_server_error_text(params);
                 if error_notification_will_retry(params) {
-                    drop(events.send(RuntimeEvent::Status {
+                    events.push(RuntimeEvent::Status {
                         code: Some("runtime.retrying".to_string()),
                         text: message,
-                    }));
+                    });
                 } else {
                     self.remember_turn_failure(params, message);
                 }
             }
             _ => {}
+        }
+        Ok(events)
+    }
+
+    /// Translate one app-server message and forward its canonical events to the
+    /// selected live sink.
+    async fn dispatch_message<'a, M>(
+        &mut self,
+        message: M,
+        sink: impl Into<CodexAppServerEventSink<'a>>,
+        thread_state: &CodexThreadState,
+    ) -> Result<()>
+    where
+        M: Into<AppServerMessage>,
+    {
+        let sink = sink.into();
+        let message = message.into();
+        let raw_payload = message.raw;
+        for event in self.handle_message(message.value, thread_state).await? {
+            sink.send(event, &raw_payload);
         }
         Ok(())
     }
@@ -1975,11 +1509,9 @@ where
         }
     }
 
-    fn record_answer_delta_boundary(&mut self, params: &Value, events: &RuntimeEventSender) {
-        let Some(item_id) = self.agent_message_item_id(params) else {
-            return;
-        };
-        self.begin_answer_item(item_id, events);
+    fn record_answer_delta_boundary(&mut self, params: &Value) -> Option<RuntimeEvent> {
+        let item_id = self.agent_message_item_id(params)?;
+        self.begin_answer_item(item_id)
     }
 
     fn record_answer_item_completion(&mut self, method: &str, params: &Value) {
@@ -2001,18 +1533,21 @@ where
         self.agent_message_lanes.remove(&item_id);
     }
 
-    fn begin_answer_item(&mut self, item_id: String, events: &RuntimeEventSender) {
-        if self.active_answer_item_ids.insert(item_id.clone())
+    fn begin_answer_item(&mut self, item_id: String) -> Option<RuntimeEvent> {
+        let boundary = if self.active_answer_item_ids.insert(item_id.clone())
             && self
                 .last_answer_item_id
                 .as_deref()
                 .is_some_and(|last_item_id| last_item_id != item_id)
         {
-            drop(events.send(RuntimeEvent::MessageBoundary {
+            Some(RuntimeEvent::MessageBoundary {
                 lane: RuntimeMessageLane::Answer,
-            }));
-        }
+            })
+        } else {
+            None
+        };
         self.last_answer_item_id = Some(item_id);
+        boundary
     }
 
     fn reset_turn_message_state(&mut self) {
@@ -2183,81 +1718,6 @@ where
             Err(err)
         }
     }
-}
-
-async fn finish_app_server_transcript_session<T>(
-    client: CodexAppServerClient<T>,
-    result: Result<RuntimeTerminalTranscript>,
-    deadline: Instant,
-    hard_timeout: Duration,
-) -> Result<RuntimeTerminalTranscript>
-where
-    T: AppServerTransport + Send,
-{
-    let shutdown = timeout_at(deadline, client.shutdown()).await;
-    match (result, shutdown) {
-        (Ok(transcript), Ok(Ok(output))) => Ok(transcript_with_shutdown_result(
-            transcript,
-            ensure_app_server_exit_success(output),
-        )),
-        (Ok(mut transcript), Ok(Err(err))) => {
-            transcript
-                .warnings
-                .push(codex_app_server_shutdown_warning(err));
-            Ok(transcript)
-        }
-        (Ok(mut transcript), Err(_)) => {
-            transcript
-                .warnings
-                .push(codex_app_server_shutdown_warning(anyhow!(
-                    "timed out after {}s while shutting down Codex app-server",
-                    hard_timeout.as_secs_f32()
-                )));
-            Ok(transcript)
-        }
-        (Err(err), Ok(Ok(output))) => {
-            if let Err(shutdown_err) = ensure_app_server_exit_success(output) {
-                warn!(
-                    error = %shutdown_err,
-                    "codex app-server shutdown failed after runtime error"
-                );
-            }
-            Err(err)
-        }
-        (Err(err), Ok(Err(shutdown_err))) => {
-            warn!(
-                error = %shutdown_err,
-                "codex app-server shutdown failed after runtime error"
-            );
-            Err(err)
-        }
-        (Err(err), Err(_)) => {
-            warn!(
-                timeout_secs = hard_timeout.as_secs_f32(),
-                "codex app-server shutdown timed out after runtime error"
-            );
-            Err(err)
-        }
-    }
-}
-
-fn transcript_with_shutdown_result(
-    mut transcript: RuntimeTerminalTranscript,
-    shutdown: Result<()>,
-) -> RuntimeTerminalTranscript {
-    if let Err(err) = shutdown {
-        transcript
-            .warnings
-            .push(codex_app_server_shutdown_warning(err));
-    }
-    transcript
-}
-
-fn codex_app_server_shutdown_warning(err: anyhow::Error) -> RuntimeTerminalTranscriptWarning {
-    RuntimeTerminalTranscriptWarning::new(
-        "codex-app-server",
-        format!("Codex app-server shutdown after transcript export failed: {err:#}"),
-    )
 }
 
 fn thread_start_params(model: Option<&str>) -> Value {
@@ -2918,10 +2378,6 @@ fn model_display_name(value: &Value) -> Option<String> {
         .map(|name| name.trim().to_string())
 }
 
-fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
-    load_state_value(root, CODEX_THREAD_ID_STATE_FILE, "codex thread")
-}
-
 fn load_ready_saved_thread_id(
     root: &Path,
     runtime_session_ready: RuntimeSessionReady,
@@ -3077,36 +2533,35 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
 mod tests {
     use std::{
         collections::VecDeque,
-        future::pending,
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
     };
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
     use lionclaw_runtime_api::{
-        append_streamed_text_boundary, append_streamed_text_delta, ExecutionOutput, NetworkMode,
-        RuntimeAdapter, RuntimeAuthKind, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
-        RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMessageLane,
-        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-        RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-        RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTerminalTurnStatus,
-        RUNTIME_SESSION_READY_MARKER,
+        append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
+        ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter, RuntimeControlExecution,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig,
+        RuntimeDriverProvider, RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus,
+        RuntimeMcpServerSpec, RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor,
+        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
+        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+        RuntimeTerminalProgramInput, TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
+
+    use crate::codex_runtime_auth_kind;
     use serde_json::{json, Value};
-    use tokio::time::Instant;
     use uuid::Uuid;
 
     use super::{
-        build_codex_app_server_program, build_codex_terminal_program, load_saved_thread_id,
-        save_thread_id, AppServerTransport, CodexAppServerClient, CodexRuntimeAdapter,
-        CodexRuntimeConfig, CodexTerminalTranscriptExportRequest, CODEX_THREAD_ID_STATE_FILE,
+        build_codex_app_server_program, build_codex_terminal_program,
+        codex_mcp_server_override_args, extract_app_server_turn_id, response_id, save_thread_id,
+        AppServerMessage, AppServerTransport, CodexAppServerClient, CodexRuntimeAdapter,
+        CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
     };
 
     fn runtime_not_ready() -> RuntimeSessionReady {
@@ -3129,6 +2584,7 @@ mod tests {
     ) -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_path_projections: vec![
@@ -3137,6 +2593,7 @@ mod tests {
                 RuntimePathProjection::directory("/runtime/home", runtime_home_root)
                     .expect("runtime home projection"),
             ],
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -3146,7 +2603,6 @@ mod tests {
         sent: Arc<Mutex<Vec<Value>>>,
         shutdowns: Arc<AtomicUsize>,
         output: ExecutionOutput,
-        hang_when_empty: bool,
     }
 
     impl FakeAppServerTransport {
@@ -3159,14 +2615,6 @@ mod tests {
                     exit_code: Some(0),
                     ..ExecutionOutput::default()
                 },
-                hang_when_empty: false,
-            }
-        }
-
-        fn hanging_after(incoming: Vec<Value>) -> Self {
-            Self {
-                hang_when_empty: true,
-                ..Self::new(incoming)
             }
         }
     }
@@ -3246,6 +2694,9 @@ mod tests {
             "turn_interrupt_v2" => {
                 include_str!("../tests/fixtures/codex_app_server/turn_interrupt_v2.json")
             }
+            "successful_turn_v2" => {
+                include_str!("../tests/fixtures/codex_app_server/successful_turn_v2.json")
+            }
             other => panic!("unknown Codex protocol fixture: {other}"),
         };
         serde_json::from_str(raw).expect("Codex protocol fixture is valid JSON")
@@ -3276,98 +2727,6 @@ mod tests {
             .clone()
     }
 
-    fn codex_completed_app_server_turn(
-        turn_id: &str,
-        user_text: &str,
-        assistant_text: &str,
-        started_at: i64,
-        completed_at: i64,
-    ) -> Value {
-        json!({
-            "id": turn_id,
-            "itemsView": "full",
-            "status": "completed",
-            "startedAt": started_at,
-            "completedAt": completed_at,
-            "items": [
-                {
-                    "type": "userMessage",
-                    "id": format!("{turn_id}_user"),
-                    "content": [{"type": "text", "text": user_text}]
-                },
-                {
-                    "type": "agentMessage",
-                    "id": format!("{turn_id}_answer"),
-                    "phase": "final_answer",
-                    "text": assistant_text
-                }
-            ]
-        })
-    }
-
-    fn codex_interrupted_app_server_turn(turn_id: &str, user_text: &str, started_at: i64) -> Value {
-        json!({
-            "id": turn_id,
-            "itemsView": "full",
-            "status": "inProgress",
-            "startedAt": started_at,
-            "completedAt": null,
-            "items": [{
-                "type": "userMessage",
-                "id": format!("{turn_id}_user"),
-                "content": [{"type": "text", "text": user_text}]
-            }]
-        })
-    }
-
-    fn codex_test_deadline() -> (Instant, Duration) {
-        let hard_timeout = Duration::from_secs(30);
-        (Instant::now() + hard_timeout, hard_timeout)
-    }
-
-    fn codex_test_timestamp(seconds: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from_timestamp(seconds, 0).expect("valid test timestamp")
-    }
-
-    fn codex_transcript_export_request<'a>(
-        events: &'a RuntimeEventSender,
-        thread_state: &'a super::CodexThreadState,
-        runtime_state_root: &'a Path,
-        resume_thread_id: Option<&'a str>,
-        deadline: Instant,
-        hard_timeout: Duration,
-    ) -> CodexTerminalTranscriptExportRequest<'a> {
-        codex_transcript_export_request_after(
-            events,
-            thread_state,
-            runtime_state_root,
-            resume_thread_id,
-            None,
-            deadline,
-            hard_timeout,
-        )
-    }
-
-    fn codex_transcript_export_request_after<'a>(
-        events: &'a RuntimeEventSender,
-        thread_state: &'a super::CodexThreadState,
-        runtime_state_root: &'a Path,
-        resume_thread_id: Option<&'a str>,
-        launch_started_at: Option<DateTime<Utc>>,
-        deadline: Instant,
-        hard_timeout: Duration,
-    ) -> CodexTerminalTranscriptExportRequest<'a> {
-        CodexTerminalTranscriptExportRequest {
-            events,
-            thread_state,
-            runtime_state_root,
-            resume_thread_id,
-            launch_started_at,
-            deadline,
-            hard_timeout,
-        }
-    }
-
     #[async_trait]
     impl AppServerTransport for FakeAppServerTransport {
         async fn send(&mut self, message: &Value) -> Result<()> {
@@ -3375,13 +2734,9 @@ mod tests {
             Ok(())
         }
 
-        async fn recv(&mut self) -> Result<Option<Value>> {
+        async fn recv(&mut self) -> Result<Option<AppServerMessage>> {
             let next = self.incoming.lock().expect("incoming lock").pop_front();
-            if next.is_some() || !self.hang_when_empty {
-                return Ok(next);
-            }
-            pending::<()>().await;
-            unreachable!("pending fake app-server transport returned")
+            Ok(next.map(AppServerMessage::from))
         }
 
         async fn shutdown(&mut self) -> Result<ExecutionOutput> {
@@ -3408,14 +2763,29 @@ mod tests {
     }
 
     #[test]
+    fn codex_driver_requires_profile_auth() {
+        let driver = super::CodexRuntimeDriver;
+        let mut config = RuntimeDriverConfig {
+            runtime_id: "codex".to_string(),
+            executable: "codex".to_string(),
+            ..RuntimeDriverConfig::default()
+        };
+
+        let err = RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect_err("Codex profile auth must be explicit");
+        assert!(err.to_string().contains("requires auth kind 'codex'"));
+
+        config.auth = Some(codex_runtime_auth_kind());
+        RuntimeDriverProvider::validate_config(&driver, &config)
+            .expect("Codex profile with codex auth should validate");
+    }
+
+    #[test]
     fn codex_terminal_program_uses_lionclaw_context_and_outer_boundary() {
-        let program = build_codex_terminal_program(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
-            },
-            None,
-        );
+        let program = build_codex_terminal_program(&CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.5".to_string()),
+        });
 
         assert_eq!(program.executable, "codex");
         assert_eq!(
@@ -3435,13 +2805,13 @@ mod tests {
                 "gpt-5.5".to_string(),
             ]
         );
-        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
+        assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
         assert!(program.environment.is_empty());
         assert!(program.stdin.is_empty());
     }
 
     #[test]
-    fn codex_terminal_program_resumes_saved_thread_after_global_options() {
+    fn codex_terminal_program_uses_global_options_without_saved_thread_resume() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
@@ -3451,12 +2821,10 @@ mod tests {
             executable: "codex".to_string(),
             model: Some("gpt-5.5".to_string()),
         });
-        let runtime_session_ready = mark_runtime_ready(&runtime_state_root);
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id: Uuid::new_v4(),
                 runtime_state_root,
-                runtime_session_ready,
             })
             .expect("terminal program");
 
@@ -3475,1176 +2843,21 @@ mod tests {
                 "model_instructions_file=\"/runtime/AGENTS.generated.md\"".to_string(),
                 "--model".to_string(),
                 "gpt-5.5".to_string(),
-                "resume".to_string(),
-                "thr_saved".to_string(),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_export_pages_app_server_thread_history() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{
-                        "id": "thr_cli",
-                        "createdAt": 1780000000,
-                        "updatedAt": 1780000018
-                    }],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_2",
-                        "again",
-                        "second answer",
-                        1780000010,
-                        1780000017,
-                    )],
-                    "nextCursor": "turns-page-2",
-                    "backwardsCursor": "turns-page-1"
-                }
-            }),
-            json!({
-                "id": 4,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_1",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": "turns-page-2"
-                }
-            }),
-        ]);
-        let sent = transport.sent.clone();
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    None,
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(transcript.warnings.is_empty());
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_cli".to_string())
-        );
-        let turns = transcript.turns;
-        assert_eq!(turns.len(), 2);
-        let turn = &turns[0];
-        assert_eq!(turn.source_id, "codex-app-server:thr_cli:turn_1");
-        assert_eq!(turn.display_user_text, "hello");
-        assert_eq!(turn.prompt_user_text, "hello");
-        assert_eq!(turn.assistant_text, "answer");
-        assert_eq!(turn.status, RuntimeTerminalTurnStatus::Completed);
-        assert_eq!(turns[1].source_id, "codex-app-server:thr_cli:turn_2");
-        assert_eq!(turns[1].display_user_text, "again");
-        assert_eq!(turns[1].assistant_text, "second answer");
-
-        let sent = sent.lock().expect("sent lock").clone();
-        assert_eq!(
-            sent[2].get("method").and_then(Value::as_str),
-            Some("thread/list")
-        );
-        assert_eq!(
-            sent[2]
-                .pointer("/params/sourceKinds/0")
-                .and_then(Value::as_str),
-            Some("cli")
-        );
-        assert_eq!(
-            sent[2]
-                .pointer("/params/sortDirection")
-                .and_then(Value::as_str),
-            Some("desc")
-        );
-        assert_eq!(
-            sent[2].pointer("/params/sortKey").and_then(Value::as_str),
-            Some("updated_at")
-        );
-        assert_eq!(
-            sent[3].get("method").and_then(Value::as_str),
-            Some("thread/turns/list")
-        );
-        assert_eq!(
-            sent[3].pointer("/params/itemsView").and_then(Value::as_str),
-            Some("full")
-        );
-        assert_eq!(
-            sent[3]
-                .pointer("/params/sortDirection")
-                .and_then(Value::as_str),
-            Some("desc")
-        );
-        assert_eq!(
-            sent[4].pointer("/params/cursor").and_then(Value::as_str),
-            Some("turns-page-2")
-        );
-    }
-
-    #[test]
-    fn codex_terminal_program_ignores_saved_thread_without_ready_marker() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        save_thread_id(&runtime_state_root, "thr_saved").expect("save thread");
-
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let program = adapter
-            .build_terminal_program(RuntimeTerminalProgramInput {
-                session_id: Uuid::new_v4(),
-                runtime_state_root,
-                runtime_session_ready: runtime_not_ready(),
-            })
-            .expect("terminal program");
-
         assert!(!program.args.iter().any(|arg| arg == "resume"));
         assert!(!program.args.iter().any(|arg| arg == "thr_saved"));
     }
 
-    #[tokio::test]
-    async fn codex_terminal_transcript_follows_newest_cli_thread() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [
-                        {
-                            "id": "thr_other",
-                            "createdAt": 1780000010,
-                            "updatedAt": 1780000018
-                        },
-                        {
-                            "id": "thr_saved",
-                            "createdAt": 1780000001,
-                            "updatedAt": 1780000007
-                        }
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_other",
-                        "newer",
-                        "newer answer",
-                        1780000010,
-                        1780000017,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 4,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_saved",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request_after(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_saved"),
-                    Some(codex_test_timestamp(1780000009)),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_other".to_string())
-        );
-        assert_eq!(transcript.turns.len(), 2);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_saved:turn_saved"
-        );
-        assert_eq!(
-            transcript.turns[1].source_id,
-            "codex-app-server:thr_other:turn_other"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_keeps_saved_thread_when_latest_predates_launch() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{
-                        "id": "thr_stale",
-                        "createdAt": 1780000001,
-                        "updatedAt": 1780000009
-                    }],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_stale",
-                        "stale",
-                        "stale answer",
-                        1780000002,
-                        1780000008,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 4,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_saved",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request_after(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_saved"),
-                    Some(codex_test_timestamp(1780000010)),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_saved".to_string())
-        );
-        assert_eq!(transcript.turns.len(), 2);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_saved:turn_saved"
-        );
-        assert_eq!(
-            transcript.turns[1].source_id,
-            "codex-app-server:thr_stale:turn_stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_tracks_failed_current_thread_without_resumability() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        save_thread_id(temp_dir.path(), "thr_good").expect("save thread");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [
-                        {
-                            "id": "thr_bad",
-                            "createdAt": 1780000010,
-                            "updatedAt": 1780000020
-                        },
-                        {
-                            "id": "thr_good",
-                            "createdAt": 1780000001,
-                            "updatedAt": 1780000007
-                        }
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "error": {
-                    "code": -32000,
-                    "message": "thread storage is corrupt"
-                }
-            }),
-            json!({
-                "id": 4,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_good",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request_after(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_good"),
-                    Some(codex_test_timestamp(1780000009)),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert_eq!(transcript.turns.len(), 1);
-        assert!(!transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_good:turn_good"
-        );
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_bad".to_string())
-        );
-        assert_eq!(transcript.warnings.len(), 1);
-        assert_eq!(transcript.warnings[0].source_id, "codex-app-server:thr_bad");
-        assert!(
-            transcript.warnings[0]
-                .error
-                .contains("thread storage is corrupt"),
-            "unexpected warning: {}",
-            transcript.warnings[0].error
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_list_failure_fallback_imports_without_reconciling() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "error": {
-                    "code": -32000,
-                    "message": "thread list unavailable"
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_saved",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_saved"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(!transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert_eq!(transcript.turns.len(), 1);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_saved:turn_saved"
-        );
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_saved".to_string())
-        );
-        assert_eq!(transcript.warnings.len(), 1);
-        assert_eq!(transcript.warnings[0].source_id, "codex-app-server");
-        assert!(
-            transcript.warnings[0]
-                .error
-                .contains("thread list unavailable"),
-            "unexpected warning: {}",
-            transcript.warnings[0].error
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_malformed_list_fallback_imports_without_reconciling() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        save_thread_id(temp_dir.path(), "thr_saved").expect("save thread");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({"id": 2, "result": {"unexpected": true}}),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_saved",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_saved"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(!transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert_eq!(transcript.turns.len(), 1);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_saved:turn_saved"
-        );
-        assert_eq!(transcript.warnings.len(), 1);
-        assert_eq!(transcript.warnings[0].source_id, "codex-app-server");
-        assert!(
-            transcript.warnings[0].error.contains("missing data"),
-            "unexpected warning: {}",
-            transcript.warnings[0].error
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_treats_unmaterialized_thread_as_empty() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{
-                        "id": "thr_empty",
-                        "createdAt": 1780000000,
-                        "updatedAt": 1780000001
-                    }],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "error": {
-                    "code": -32602,
-                    "message": "thread thr_empty is not materialized yet; thread/turns/list is unavailable before first user message"
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    None,
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(transcript.turns.is_empty());
-        assert!(transcript.warnings.is_empty());
-        assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert_eq!(
-            load_saved_thread_id(temp_dir.path()).expect("saved thread"),
-            Some("thr_empty".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_deduplicates_overlapping_thread_pages() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": "threads-page-2",
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_done",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 4,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let sent = transport.sent.clone();
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    None,
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert!(transcript.state.is_reconciled());
-        assert!(transcript.state.is_resumable());
-        assert_eq!(transcript.turns.len(), 1);
-        let sent = sent.lock().expect("sent lock");
-        let turn_list_requests = sent
-            .iter()
-            .filter(|message| {
-                message.get("method").and_then(Value::as_str) == Some("thread/turns/list")
-            })
-            .count();
-        assert_eq!(turn_list_requests, 1);
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_resumability_uses_latest_raw_turn_status() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [
-                        codex_interrupted_app_server_turn(
-                            "turn_pending",
-                            "unfinished prompt",
-                            1780000010,
-                        ),
-                        codex_completed_app_server_turn(
-                            "turn_done",
-                            "hello",
-                            "answer",
-                            1780000001,
-                            1780000007,
-                        )
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_cli"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert_eq!(transcript.turns.len(), 1);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_cli:turn_done"
-        );
-        assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert!(transcript.warnings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_resumability_requires_importable_latest_turn() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let mut latest = codex_completed_app_server_turn(
-            "turn_missing_time",
-            "new prompt",
-            "new answer",
-            1780000010,
-            1780000017,
-        );
-        latest["startedAt"] = Value::Null;
-        latest["completedAt"] = Value::Null;
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [
-                        latest,
-                        codex_completed_app_server_turn(
-                            "turn_done",
-                            "hello",
-                            "answer",
-                            1780000001,
-                            1780000007,
-                        )
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_cli"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert_eq!(transcript.turns.len(), 1);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_cli:turn_done"
-        );
-        assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert!(transcript.warnings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_resumability_requires_explicit_completed_status() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let mut latest = codex_completed_app_server_turn(
-            "turn_missing_status",
-            "new prompt",
-            "new answer",
-            1780000010,
-            1780000017,
-        );
-        latest
-            .as_object_mut()
-            .expect("turn object")
-            .remove("status");
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [
-                        latest,
-                        codex_completed_app_server_turn(
-                            "turn_done",
-                            "hello",
-                            "answer",
-                            1780000001,
-                            1780000007,
-                        )
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_cli"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert_eq!(transcript.turns.len(), 2);
-        assert_eq!(
-            transcript.turns[1].source_id,
-            "codex-app-server:thr_cli:turn_missing_status"
-        );
-        assert_eq!(
-            transcript.turns[1].status,
-            RuntimeTerminalTurnStatus::Completed
-        );
-        assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert!(transcript.warnings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_resumability_rejects_completed_turn_with_error() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let mut latest = codex_completed_app_server_turn(
-            "turn_error",
-            "new prompt",
-            "new answer",
-            1780000010,
-            1780000017,
-        );
-        latest["error"] = json!({"message": "boom"});
-        let transport = FakeAppServerTransport::new(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [
-                        latest,
-                        codex_completed_app_server_turn(
-                            "turn_done",
-                            "hello",
-                            "answer",
-                            1780000001,
-                            1780000007,
-                        )
-                    ],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let (deadline, hard_timeout) = codex_test_deadline();
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_cli"),
-                    deadline,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("transcript");
-
-        assert_eq!(transcript.turns.len(), 2);
-        let latest = transcript
-            .turns
-            .iter()
-            .find(|turn| turn.source_id == "codex-app-server:thr_cli:turn_error")
-            .expect("latest turn imported");
-        assert_eq!(latest.status, RuntimeTerminalTurnStatus::Failed);
-        assert_eq!(
-            latest.error_code,
-            Some("runtime.codex.turn_failed".to_string())
-        );
-        assert_eq!(latest.error_text, Some("boom".to_string()));
-        assert!(transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert!(transcript.warnings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn codex_terminal_transcript_timeout_returns_partial_transcript() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (adapter, _handle, thread_state) =
-            start_codex_test_session(Some(temp_dir.path().to_path_buf())).await;
-        let transport = FakeAppServerTransport::hanging_after(vec![
-            json!({"id": 1, "result": {}}),
-            json!({
-                "id": 2,
-                "result": {
-                    "data": [{"id": "thr_cli"}],
-                    "nextCursor": null,
-                    "backwardsCursor": null
-                }
-            }),
-            json!({
-                "id": 3,
-                "result": {
-                    "data": [codex_completed_app_server_turn(
-                        "turn_done",
-                        "hello",
-                        "answer",
-                        1780000001,
-                        1780000007,
-                    )],
-                    "nextCursor": "more-turns",
-                    "backwardsCursor": null
-                }
-            }),
-        ]);
-        let mut client = CodexAppServerClient::new(transport);
-        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        client
-            .initialize(&events, &thread_state)
-            .await
-            .expect("initialize");
-        let hard_timeout = Duration::from_millis(100);
-        let transcript = adapter
-            .export_terminal_transcript_from_app_server_client(
-                &mut client,
-                codex_transcript_export_request(
-                    &events,
-                    &thread_state,
-                    temp_dir.path(),
-                    Some("thr_cli"),
-                    Instant::now() + hard_timeout,
-                    hard_timeout,
-                ),
-            )
-            .await
-            .expect("partial transcript");
-
-        assert_eq!(transcript.turns.len(), 1);
-        assert_eq!(
-            transcript.turns[0].source_id,
-            "codex-app-server:thr_cli:turn_done"
-        );
-        assert!(!transcript.state.is_reconciled());
-        assert!(!transcript.state.is_resumable());
-        assert_eq!(transcript.warnings.len(), 1);
-        assert_eq!(transcript.warnings[0].source_id, "codex-app-server:thr_cli");
-        assert!(
-            transcript.warnings[0].error.contains("timed out"),
-            "unexpected warning: {}",
-            transcript.warnings[0].error
-        );
-    }
-
-    #[test]
-    fn codex_app_server_turns_use_thread_time_when_turn_time_is_missing() {
-        let mut turn = codex_completed_app_server_turn("turn_done", "hello", "answer", 1, 2);
-        turn["startedAt"] = Value::Null;
-        turn["completedAt"] = Value::Null;
-
-        let turn = super::codex_app_server_terminal_turn(
-            "thr_cli",
-            Some(codex_test_timestamp(1780000010)),
-            Some(codex_test_timestamp(1780000020)),
-            &turn,
-        )
-        .expect("turn");
-
-        assert_eq!(turn.started_at, codex_test_timestamp(1780000010));
-        assert_eq!(turn.finished_at, codex_test_timestamp(1780000020));
-    }
-
-    #[test]
-    fn codex_app_server_turns_skip_turns_without_deterministic_time() {
-        let mut turn = codex_completed_app_server_turn("turn_done", "hello", "answer", 1, 2);
-        turn["startedAt"] = Value::Null;
-        turn["completedAt"] = Value::Null;
-
-        assert!(super::codex_app_server_terminal_turn("thr_cli", None, None, &turn).is_none());
-    }
-
-    #[test]
-    fn codex_app_server_turn_status_preserves_terminal_state() {
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "completed"
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Completed);
-        assert_eq!(error_code, None);
-        assert_eq!(error_text, None);
-
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "completed",
-            "error": {"message": "quota exceeded"}
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Failed);
-        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
-        assert_eq!(error_text, Some("quota exceeded".to_string()));
-
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "failed",
-            "error": {"message": "quota exceeded"}
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Failed);
-        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
-        assert_eq!(error_text, Some("quota exceeded".to_string()));
-
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "interrupted"
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
-        assert_eq!(error_code, None);
-        assert_eq!(error_text, None);
-
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "interrupted",
-            "error": {"message": "cancelled"}
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
-        assert_eq!(error_code, Some("runtime.codex.turn_failed".to_string()));
-        assert_eq!(error_text, Some("cancelled".to_string()));
-
-        let (status, error_code, error_text) = super::codex_app_server_turn_status(&json!({
-            "status": "inProgress"
-        }));
-        assert_eq!(status, RuntimeTerminalTurnStatus::Interrupted);
-        assert_eq!(error_code, None);
-        assert_eq!(error_text, None);
-    }
-
     #[test]
     fn codex_app_server_program_uses_default_stdio_transport() {
-        let program = build_codex_app_server_program(&CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        });
+        let program = build_codex_app_server_program(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            &[],
+        );
 
         assert_eq!(program.executable, "codex");
         assert_eq!(
@@ -4658,7 +2871,62 @@ mod tests {
             ]
         );
         assert_eq!(program.stdin, "");
-        assert_eq!(program.auth, Some(RuntimeAuthKind::Codex));
+        assert_eq!(program.auth, Some(codex_runtime_auth_kind()));
+    }
+
+    #[test]
+    fn codex_app_server_program_projects_mcp_servers_as_config_overrides() {
+        let program = build_codex_app_server_program(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: None,
+            },
+            &[RuntimeMcpServerSpec {
+                name: "lionclaw".to_string(),
+                command: "node".to_string(),
+                args: vec![
+                    "/runtime/.lionclaw-mcp-stdio-proxy.mjs".to_string(),
+                    "/runtime/lionclaw/channel-send.sock".to_string(),
+                ],
+            }],
+        );
+
+        assert_eq!(
+            program.args,
+            vec![
+                "-c".to_string(),
+                "check_for_update_on_startup=false".to_string(),
+                "-c".to_string(),
+                "projects.\"/workspace\".trust_level=\"trusted\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lionclaw\".command=\"node\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lionclaw\".args=[\"/runtime/.lionclaw-mcp-stdio-proxy.mjs\",\"/runtime/lionclaw/channel-send.sock\"]".to_string(),
+                "app-server".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_app_server_program_escapes_mcp_server_config_overrides() {
+        let args = codex_mcp_server_override_args(&[RuntimeMcpServerSpec {
+            name: "lion\"claw\\tools".to_string(),
+            command: "node\nruntime".to_string(),
+            args: vec![
+                "/runtime/path with spaces".to_string(),
+                "quote\"arg".to_string(),
+            ],
+        }]);
+
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.\"lion\\\"claw\\\\tools\".command=\"node\\nruntime\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.\"lion\\\"claw\\\\tools\".args=[\"/runtime/path with spaces\",\"quote\\\"arg\"]".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -4818,7 +3086,7 @@ mod tests {
             json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_final", "delta": "Final answer."}}),
         ] {
             client
-                .handle_message(message, &event_tx, &thread_state)
+                .dispatch_message(message, &event_tx, &thread_state)
                 .await
                 .expect("handle message");
         }
@@ -4876,7 +3144,7 @@ mod tests {
             json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_body", "delta": "**Project**"}}),
         ] {
             client
-                .handle_message(message, &event_tx, &thread_state)
+                .dispatch_message(message, &event_tx, &thread_state)
                 .await
                 .expect("handle message");
         }
@@ -4971,9 +3239,11 @@ mod tests {
                     },
                     context: RuntimeExecutionContext {
                         network_mode: NetworkMode::On,
+                        working_dir: None,
                         environment: Vec::new(),
                         runtime_state_root: None,
                         runtime_path_projections: Vec::new(),
+                        mcp_servers: Vec::new(),
                     },
                     executor: Box::new(UnusedRuntimeProgramExecutor),
                 },
@@ -5452,6 +3722,7 @@ mod tests {
         let runtime_state_root = PathBuf::from("/host/runtime-state");
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_path_projections: vec![
@@ -5463,6 +3734,7 @@ mod tests {
                 )
                 .expect("channel send socket projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(
@@ -5815,6 +4087,165 @@ mod tests {
         adapter.close(&handle).await.expect("close");
     }
 
+    /// Translate a fixture's server notifications into a canonical turn journal,
+    /// tagging every event with the raw app-server message it came from. The
+    /// JSON-RPC response is consumed by `request` in the real flow, not
+    /// translated, so it is skipped here. Returns the client too, so callers can
+    /// inspect recorded turn state (e.g. failures) the journal does not carry.
+    async fn codex_fixture_canonical_journal(
+        fixture_name: &str,
+    ) -> (Vec<TurnEvent>, CodexAppServerClient<FakeAppServerTransport>) {
+        let fixture = codex_protocol_fixture(fixture_name);
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let mut journal = Vec::new();
+        for message in fixture_server_messages(&fixture) {
+            if response_id(&message).is_some() {
+                continue;
+            }
+            let raw = RawTurnPayload {
+                driver: "codex-app-server".to_string(),
+                payload: message.to_string(),
+            };
+            let events = client
+                .handle_message(message, &thread_state)
+                .await
+                .expect("handle message");
+            journal.extend(
+                events
+                    .into_iter()
+                    .map(|event| TurnEvent::with_raw(event, raw.clone())),
+            );
+        }
+        (journal, client)
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_turn_journals_project_to_canonical_events() {
+        let (successful, _) = codex_fixture_canonical_journal("successful_turn_v2").await;
+        assert_eq!(
+            canonical_events(&successful).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "Hello ".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "world!".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+        assert!(successful.iter().all(|record| record
+            .raw
+            .as_ref()
+            .is_some_and(|raw| raw.driver == "codex-app-server")));
+
+        let (compaction, _) =
+            codex_fixture_canonical_journal("compact_context_compaction_v2").await;
+        assert_eq!(
+            canonical_events(&compaction).cloned().collect::<Vec<_>>(),
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compaction started".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex context compacted".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+
+        // An interrupted turn records a failure instead of emitting events, so
+        // its canonical journal is empty and the interruption is recorded as a
+        // turn failure (an empty journal alone would not distinguish a recorded
+        // interruption from the notification being ignored).
+        let (interrupted, client) = codex_fixture_canonical_journal("turn_interrupt_v2").await;
+        assert!(interrupted.is_empty());
+        assert_eq!(
+            client.turn_failure(Some("turn_1")),
+            Some("codex turn interrupted")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_successful_turn_uses_contract_fixture() {
+        let fixture = codex_protocol_fixture("successful_turn_v2");
+        let (method, params) = fixture_client_request(&fixture);
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(fixture_server_messages(&fixture));
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request(method, params, &event_tx, &thread_state)
+            .await
+            .expect("turn/start request");
+        let turn_id = extract_app_server_turn_id(&response);
+        assert_eq!(turn_id.as_deref(), Some("turn_1"));
+        client
+            .wait_for_turn_completed(
+                turn_id.as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn should complete through notifications");
+
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent, vec![fixture_client_message(&fixture)]);
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "Hello ".to_string(),
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "world!".to_string(),
+                },
+                RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+        assert_eq!(answer_text_from_events(events), "Hello world!");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
     #[tokio::test]
     async fn codex_app_server_turn_interrupt_uses_contract_fixture() {
         let fixture = codex_protocol_fixture("turn_interrupt_v2");
@@ -5867,7 +4298,7 @@ mod tests {
         let mut registered_turn_id = None;
 
         client
-            .handle_message(
+            .dispatch_message(
                 json!({
                     "method": "turn/started",
                     "params": {

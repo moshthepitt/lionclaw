@@ -39,15 +39,13 @@ use std::{
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use lionclaw_durable_fs::write_file_atomically;
 use rustix::{
-    fs::{open, openat, Mode, OFlags},
+    fs::{open, openat, unlinkat, AtFlags, Mode, OFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -136,9 +134,141 @@ impl fmt::Debug for RuntimeProgramSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeAuthKind {
-    Codex,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuntimeAuthKind(String);
+
+impl RuntimeAuthKind {
+    pub fn new(kind: impl Into<String>) -> Result<Self, String> {
+        let kind = kind.into().trim().to_string();
+        if kind.is_empty() {
+            return Err("runtime auth kind is required".to_string());
+        }
+        Ok(Self(kind))
+    }
+
+    pub fn from_static(kind: &'static str) -> Self {
+        Self(kind.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RuntimeAuthKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthContext {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    home_overrides: BTreeMap<String, PathBuf>,
+}
+
+impl RuntimeAuthContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_home_override(mut self, kind: impl AsRef<str>, path: impl Into<PathBuf>) -> Self {
+        self.insert_home_override(kind, path);
+        self
+    }
+
+    pub fn insert_home_override(&mut self, kind: impl AsRef<str>, path: impl Into<PathBuf>) {
+        let kind = kind.as_ref().trim();
+        if !kind.is_empty() {
+            self.home_overrides.insert(kind.to_string(), path.into());
+        }
+    }
+
+    pub fn home_override(&self, kind: &str) -> Option<&Path> {
+        self.home_overrides.get(kind).map(PathBuf::as_path)
+    }
+
+    pub fn home_overrides(&self) -> &BTreeMap<String, PathBuf> {
+        &self.home_overrides
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.home_overrides.is_empty()
+    }
+}
+
+pub struct RuntimeAuthPreparation<'a> {
+    pub runtime_id: &'a str,
+    pub network_mode: NetworkMode,
+    pub runtime_home_root: Option<&'a Path>,
+    pub host_context: &'a RuntimeAuthContext,
+}
+
+#[async_trait]
+pub trait RuntimeAuthProvider: Send + Sync {
+    fn kind(&self) -> &'static str;
+
+    async fn validate(&self, context: &RuntimeAuthContext) -> Result<()>;
+
+    async fn prepare(&self, input: RuntimeAuthPreparation<'_>) -> Result<Vec<(String, String)>>;
+
+    fn host_home_override_env(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn identity(&self, _context: &RuntimeAuthContext) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn guidance(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeAuthRegistry {
+    providers: Arc<BTreeMap<String, Arc<dyn RuntimeAuthProvider>>>,
+}
+
+impl RuntimeAuthRegistry {
+    pub fn new(providers: impl IntoIterator<Item = Arc<dyn RuntimeAuthProvider>>) -> Self {
+        let providers = providers
+            .into_iter()
+            .map(|provider| (provider.kind().to_string(), provider))
+            .collect();
+        Self {
+            providers: Arc::new(providers),
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, auth: &RuntimeAuthKind) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        self.get_kind(auth.as_str())
+    }
+
+    pub fn get_kind(&self, kind: &str) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        self.providers.get(kind).cloned()
+    }
+
+    pub fn providers(&self) -> impl Iterator<Item = Arc<dyn RuntimeAuthProvider>> + '_ {
+        self.providers.values().cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
+impl fmt::Debug for RuntimeAuthRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeAuthRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,17 +344,9 @@ pub struct RuntimeSessionHandle {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuntimeTerminalTranscriptInput {
-    pub session_id: Uuid,
-    pub runtime_state_root: PathBuf,
-    pub launch_started_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RuntimeTerminalProgramInput {
     pub session_id: Uuid,
     pub runtime_state_root: PathBuf,
-    pub runtime_session_ready: RuntimeSessionReady,
 }
 
 pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
@@ -250,239 +372,6 @@ impl RuntimeSessionReady {
     pub const fn is_ready(self) -> bool {
         self.marker_present
     }
-}
-
-#[async_trait]
-pub trait RuntimeTerminalTranscriptProgramExecutor: Send {
-    fn hard_timeout(&self) -> Duration {
-        Duration::from_secs(30)
-    }
-
-    async fn execute(&mut self, program: RuntimeProgramSpec) -> Result<ExecutionOutput>;
-
-    async fn spawn(
-        &mut self,
-        _program: RuntimeProgramSpec,
-    ) -> Result<Box<dyn RuntimeProgramSession>> {
-        Err(anyhow!(
-            "runtime transcript executor does not support interactive programs"
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTerminalTurnStatus {
-    Completed,
-    Failed,
-    Interrupted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeTerminalTurn {
-    pub source_id: String,
-    pub display_user_text: String,
-    pub prompt_user_text: String,
-    pub assistant_text: String,
-    pub status: RuntimeTerminalTurnStatus,
-    pub error_code: Option<String>,
-    pub error_text: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscriptWarning {
-    pub source_id: String,
-    pub error: String,
-}
-
-impl RuntimeTerminalTranscriptWarning {
-    pub fn new(source_id: impl Into<String>, error: impl Into<String>) -> Self {
-        Self {
-            source_id: source_id.into(),
-            error: error.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscript {
-    pub turns: Vec<RuntimeTerminalTurn>,
-    pub warnings: Vec<RuntimeTerminalTranscriptWarning>,
-    pub state: RuntimeTerminalTranscriptState,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RuntimeTerminalTranscriptState {
-    /// True only when the adapter has reconciled its chosen continuation source.
-    reconciled: bool,
-    /// True only when the adapter has verified its own continuation target is valid.
-    resumable: bool,
-}
-
-impl RuntimeTerminalTranscriptState {
-    pub fn new(reconciled: bool, resumable: bool) -> Self {
-        Self {
-            reconciled,
-            resumable: reconciled && resumable,
-        }
-    }
-
-    pub fn is_reconciled(self) -> bool {
-        self.reconciled
-    }
-
-    pub fn is_resumable(self) -> bool {
-        self.resumable
-    }
-}
-
-impl RuntimeTerminalTranscript {
-    pub fn new(
-        turns: Vec<RuntimeTerminalTurn>,
-        warnings: Vec<RuntimeTerminalTranscriptWarning>,
-        state: RuntimeTerminalTranscriptState,
-    ) -> Self {
-        Self {
-            turns,
-            warnings,
-            state,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTranscriptCandidate {
-    pub id: String,
-    pub updated_at: Option<DateTime<Utc>>,
-}
-
-impl TerminalTranscriptCandidate {
-    pub fn new(id: impl Into<String>, updated_at: Option<DateTime<Utc>>) -> Option<Self> {
-        let id = id.into();
-        let id = id.trim();
-        if id.is_empty() {
-            return None;
-        }
-        Some(Self {
-            id: id.to_string(),
-            updated_at,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum TerminalTranscriptTimestampPrecision {
-    Seconds,
-    Milliseconds,
-}
-
-#[derive(Debug, Default)]
-pub struct TerminalTranscriptTarget {
-    id: Option<String>,
-    reconciled: bool,
-    resumable: bool,
-}
-
-impl TerminalTranscriptTarget {
-    pub fn is_empty(&self) -> bool {
-        self.id.is_none()
-    }
-
-    pub fn unreconciled_id(&self) -> Option<&str> {
-        if self.reconciled() {
-            return None;
-        }
-        self.id.as_deref()
-    }
-
-    pub fn choose_if_empty(&mut self, id: &str) -> bool {
-        if self.id.is_some() {
-            return false;
-        }
-        self.id = Some(id.to_string());
-        true
-    }
-
-    pub fn record_reconciliation(&mut self, id: &str, reconciled: bool, resumable: bool) {
-        if self.id.as_deref() == Some(id) {
-            self.reconciled = reconciled;
-            self.resumable = reconciled && resumable;
-        }
-    }
-
-    pub fn resumable(&self) -> bool {
-        self.reconciled && self.resumable
-    }
-
-    pub fn reconciled(&self) -> bool {
-        self.id.is_none() || self.reconciled
-    }
-
-    pub fn transcript_state(
-        &self,
-        source_selection_reconciled: bool,
-    ) -> RuntimeTerminalTranscriptState {
-        RuntimeTerminalTranscriptState::new(
-            source_selection_reconciled && self.reconciled(),
-            self.resumable(),
-        )
-    }
-}
-
-pub fn choose_terminal_transcript_target(
-    linked_id: Option<&str>,
-    latest: Option<&TerminalTranscriptCandidate>,
-    launch_started_at: Option<DateTime<Utc>>,
-) -> Option<String> {
-    if let Some(linked_id) = linked_id.and_then(|id| {
-        let id = id.trim();
-        if id.is_empty() {
-            None
-        } else {
-            Some(id)
-        }
-    }) {
-        if let (Some(latest), Some(launch_started_at)) = (latest, launch_started_at) {
-            if latest.id != linked_id
-                && latest
-                    .updated_at
-                    .is_some_and(|updated_at| updated_at >= launch_started_at)
-            {
-                return Some(latest.id.clone());
-            }
-        }
-        return Some(linked_id.to_string());
-    }
-
-    latest.map(|candidate| candidate.id.clone())
-}
-
-pub fn normalize_terminal_transcript_launch_started_at(
-    launch_started_at: Option<DateTime<Utc>>,
-    precision: TerminalTranscriptTimestampPrecision,
-) -> Option<DateTime<Utc>> {
-    let started_at = launch_started_at?;
-    match precision {
-        TerminalTranscriptTimestampPrecision::Seconds => {
-            DateTime::<Utc>::from_timestamp(started_at.timestamp(), 0)
-        }
-        TerminalTranscriptTimestampPrecision::Milliseconds => {
-            DateTime::<Utc>::from_timestamp_millis(started_at.timestamp_millis())
-        }
-    }
-}
-
-pub fn latest_terminal_turn_is_completed(turns: &[RuntimeTerminalTurn]) -> bool {
-    turns
-        .iter()
-        .max_by(|left, right| {
-            left.finished_at
-                .cmp(&right.finished_at)
-                .then_with(|| left.started_at.cmp(&right.started_at))
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        })
-        .is_some_and(|turn| turn.status == RuntimeTerminalTurnStatus::Completed)
 }
 
 pub fn load_ready_state_value(
@@ -609,6 +498,22 @@ pub fn save_state_value(
         None,
         &format!("{label} state file"),
     )
+}
+
+pub fn clear_state_value(runtime_state_root: &Path, file_name: &str, label: &str) -> Result<()> {
+    let target_name = state_file_name(file_name)?;
+    let Some(root) = open_existing_state_root(runtime_state_root)? else {
+        return Ok(());
+    };
+    validate_existing_state_file(&root, runtime_state_root, file_name, &target_name, label)?;
+    match unlinkat(&root, &target_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(anyhow!(
+            "failed to remove {label} state file '{}' in '{}': {err}",
+            file_name,
+            runtime_state_root.display()
+        )),
+    }
 }
 
 fn validate_existing_state_file(
@@ -813,11 +718,21 @@ pub struct RuntimeProgramTurnExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMcpServerSpec {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionContext {
     pub network_mode: NetworkMode,
+    /// Runtime-visible current working directory for program-backed turns.
+    pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub runtime_state_root: Option<PathBuf>,
     pub runtime_path_projections: Vec<RuntimePathProjection>,
+    pub mcp_servers: Vec<RuntimeMcpServerSpec>,
 }
 
 impl RuntimeExecutionContext {
@@ -1011,7 +926,7 @@ pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeMessageLane {
     Answer,
     Reasoning,
@@ -1026,7 +941,7 @@ impl RuntimeMessageLane {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifact {
     pub artifact_id: String,
     pub path: PathBuf,
@@ -1061,7 +976,7 @@ impl RuntimeNativeHomeArtifactDir {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeFileChangeStatus {
     Editing,
     Edited,
@@ -1070,7 +985,7 @@ pub enum RuntimeFileChangeStatus {
     Changed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFileChange {
     pub runtime: String,
     pub operation_id: Option<String>,
@@ -1079,7 +994,7 @@ pub struct RuntimeFileChange {
     pub total_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
     MessageDelta {
         lane: RuntimeMessageLane,
@@ -1105,7 +1020,92 @@ pub enum RuntimeEvent {
     },
 }
 
+/// Raw, driver-specific payload retained alongside a canonical event for
+/// debugging. Retention is debug-only: it is never parsed back into canonical
+/// text or replayed into a prompt. Only the paired [`RuntimeEvent`] is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawTurnPayload {
+    /// Driver/protocol that produced the payload, e.g. `"driver-protocol"`.
+    pub driver: String,
+    /// The payload exactly as the driver emitted it (e.g. one JSON-RPC line).
+    pub payload: String,
+}
+
+/// One record in a runtime turn's canonical journal.
+///
+/// A protocol driver translates each harness message into journal records.
+/// `event` is the canonical, public output LionClaw persists, replays, and
+/// shows operators. `raw`, when present, retains the originating driver payload
+/// for debugging only and is excluded from every canonical projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEvent {
+    pub event: RuntimeEvent,
+    pub raw: Option<RawTurnPayload>,
+}
+
+impl TurnEvent {
+    /// A record for a kernel-synthesized event with no retained raw payload.
+    pub fn canonical(event: RuntimeEvent) -> Self {
+        Self { event, raw: None }
+    }
+
+    /// A record retaining the raw driver payload the event was derived from.
+    pub fn with_raw(event: RuntimeEvent, raw: RawTurnPayload) -> Self {
+        Self {
+            event,
+            raw: Some(raw),
+        }
+    }
+}
+
+/// Project a canonical journal to its public [`RuntimeEvent`] stream, dropping
+/// every retained raw payload. This is the only sanctioned way to derive
+/// operator-visible output from a journal: raw retention never contributes.
+pub fn canonical_events(journal: &[TurnEvent]) -> impl Iterator<Item = &RuntimeEvent> {
+    journal.iter().map(|record| &record.event)
+}
+
+pub type RuntimeTurnJournalSender = mpsc::UnboundedSender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RuntimeTerminalConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl RuntimeTerminalConfig {
+    pub fn is_empty(&self) -> bool {
+        self.args.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeDriverConfig {
+    pub runtime_id: String,
+    pub executable: String,
+    pub args: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub auth: Option<RuntimeAuthKind>,
+    pub terminal: RuntimeTerminalConfig,
+}
+
+pub trait RuntimeDriverProvider: Send + Sync {
+    fn driver(&self) -> &'static str;
+
+    fn validate_config(&self, _config: &RuntimeDriverConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
+
+    fn auth_provider(&self) -> Option<Arc<dyn RuntimeAuthProvider>> {
+        None
+    }
+}
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
     existing.push_str(delta);
@@ -1157,7 +1157,7 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _events: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         Err(anyhow!("runtime does not implement direct turns"))
     }
@@ -1173,15 +1173,6 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: RuntimeTerminalProgramInput,
     ) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not expose a native terminal UI"))
-    }
-    async fn export_terminal_transcript(
-        &self,
-        _input: RuntimeTerminalTranscriptInput,
-        _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-    ) -> Result<RuntimeTerminalTranscript> {
-        Err(anyhow!(
-            "runtime does not support native terminal transcript export"
-        ))
     }
     fn program_output_parser(
         &self,
@@ -1222,16 +1213,16 @@ pub trait RuntimeAdapter: Send + Sync {
         _input: &RuntimeTurnInput,
         _output: &ExecutionOutput,
         _observed_error_text: Option<&str>,
-        _events: &RuntimeEventSender,
+        _journal: &RuntimeTurnJournalSender,
     ) -> Result<bool> {
         Ok(false)
     }
     async fn program_backed_turn(
         &self,
         execution: RuntimeProgramTurnExecution,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        execute_program_backed_turn(self, execution, events).await
+        execute_program_backed_turn(self, execution, journal).await
     }
     async fn runtime_control(
         &self,
@@ -1281,7 +1272,7 @@ impl RuntimeRegistry {
 pub async fn execute_program_backed_turn<A>(
     adapter: &A,
     execution: RuntimeProgramTurnExecution,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1292,7 +1283,7 @@ where
         mut executor,
     } = execution;
 
-    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, events)
+    execute_program_backed_turn_with_executor(adapter, executor.as_mut(), input, &context, journal)
         .await
 }
 
@@ -1301,7 +1292,7 @@ async fn execute_program_backed_turn_with_executor<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: RuntimeEventSender,
+    journal: RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1311,16 +1302,17 @@ where
 
     loop {
         let attempt =
-            run_program_backed_attempt(adapter, executor, &current_input, context, &events).await?;
+            run_program_backed_attempt(adapter, executor, &current_input, context, &journal)
+                .await?;
 
         if attempt.output.success() {
-            flush_buffered_program_output_events(&events, attempt.buffered_errors);
+            flush_buffered_program_output_events(&journal, attempt.buffered_errors);
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
                 attempt.last_error_text.as_deref(),
                 attempt.saw_done,
-                &events,
+                &journal,
             );
         }
 
@@ -1329,7 +1321,7 @@ where
                 &current_input,
                 &attempt.output,
                 attempt.last_error_text.as_deref(),
-                &events,
+                &journal,
             )?
         {
             attempted_retry = true;
@@ -1339,13 +1331,13 @@ where
             continue;
         }
 
-        flush_buffered_program_output_events(&events, attempt.buffered_errors);
+        flush_buffered_program_output_events(&journal, attempt.buffered_errors);
         return finish_program_backed_turn(
             adapter,
             attempt.output,
             attempt.last_error_text.as_deref(),
             attempt.saw_done,
-            &events,
+            &journal,
         );
     }
 }
@@ -1362,7 +1354,7 @@ async fn run_program_backed_attempt<A>(
     executor: &mut dyn RuntimeProgramExecutor,
     input: &RuntimeTurnInput,
     context: &RuntimeExecutionContext,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<ProgramBackedAttemptOutcome>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1384,7 +1376,7 @@ where
                     Some(line) => observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1393,7 +1385,7 @@ where
                     None => {
                         finish_program_output_parser(
                             &mut output_parser,
-                            events,
+                            journal,
                             &mut buffered_errors,
                             &mut saw_done,
                             &mut last_error_text,
@@ -1414,7 +1406,7 @@ where
                     observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        events,
+                        journal,
                         &mut buffered_errors,
                         &line,
                         &mut saw_done,
@@ -1423,7 +1415,7 @@ where
                 }
                 finish_program_output_parser(
                     &mut output_parser,
-                    events,
+                    journal,
                     &mut buffered_errors,
                     &mut saw_done,
                     &mut last_error_text,
@@ -1442,7 +1434,7 @@ where
 fn observe_program_output_line<A>(
     adapter: &A,
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
@@ -1457,7 +1449,7 @@ fn observe_program_output_line<A>(
     };
 
     observe_program_output_events(
-        events,
+        journal,
         buffered_errors,
         parsed_events,
         saw_done,
@@ -1467,14 +1459,14 @@ fn observe_program_output_line<A>(
 
 fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
     if let Some(parser) = output_parser.as_mut() {
         observe_program_output_events(
-            events,
+            journal,
             buffered_errors,
             parser.finish(),
             saw_done,
@@ -1484,7 +1476,7 @@ fn finish_program_output_parser(
 }
 
 fn observe_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
     saw_done: &mut bool,
@@ -1501,21 +1493,21 @@ fn observe_program_output_events(
             if let Some(buffer) = buffered_errors.as_mut() {
                 buffer.push(event);
             } else {
-                drop(events.send(event));
+                drop(journal.send(TurnEvent::canonical(event)));
             }
         } else {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
 
 fn flush_buffered_program_output_events(
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
     buffered_errors: Option<Vec<RuntimeEvent>>,
 ) {
     if let Some(buffered_errors) = buffered_errors {
         for event in buffered_errors {
-            drop(events.send(event));
+            drop(journal.send(TurnEvent::canonical(event)));
         }
     }
 }
@@ -1525,7 +1517,7 @@ fn finish_program_backed_turn<A>(
     output: ExecutionOutput,
     observed_error_text: Option<&str>,
     saw_done: bool,
-    events: &RuntimeEventSender,
+    journal: &RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
     A: RuntimeAdapter + Send + Sync + ?Sized,
@@ -1537,7 +1529,7 @@ where
     }
 
     if !saw_done {
-        drop(events.send(RuntimeEvent::Done));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
     }
 
     Ok(RuntimeTurnResult {
@@ -1555,13 +1547,14 @@ mod tests {
     };
 
     use super::{
-        execute_program_backed_turn, load_ready_state_value, safe_relative_path, ExecutionOutput,
-        NetworkMode, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
-        RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-        RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RUNTIME_SESSION_READY_MARKER,
+        canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
+        safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
+        RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+        RuntimeExecutionContext, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
+        RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
+        RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
+        RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTurnInput,
+        RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent, RUNTIME_SESSION_READY_MARKER,
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
@@ -1569,6 +1562,49 @@ mod tests {
         sync::mpsc,
         time::{sleep, timeout},
     };
+
+    #[test]
+    fn canonical_events_drops_retained_raw_payloads() {
+        let journal = vec![
+            TurnEvent::with_raw(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "hi".to_string(),
+                },
+                RawTurnPayload {
+                    driver: "test-driver".to_string(),
+                    payload: "{\"method\":\"message/delta\"}".to_string(),
+                },
+            ),
+            TurnEvent::canonical(RuntimeEvent::Done),
+        ];
+
+        let events: Vec<RuntimeEvent> = canonical_events(&journal).cloned().collect();
+
+        assert_eq!(
+            events,
+            vec![
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "hi".to_string(),
+                },
+                RuntimeEvent::Done,
+            ],
+        );
+    }
+
+    #[test]
+    fn runtime_terminal_config_rejects_removed_resume_args() {
+        let err = serde_json::from_value::<RuntimeTerminalConfig>(serde_json::json!({
+            "resume-args": ["--session", "{session_id}"]
+        }))
+        .expect_err("removed terminal resume args should not be ignored");
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[derive(Clone)]
     struct StubAttempt {
@@ -1653,7 +1689,7 @@ mod tests {
             _input: &RuntimeTurnInput,
             _output: &ExecutionOutput,
             _observed_error_text: Option<&str>,
-            _events: &RuntimeEventSender,
+            _journal: &RuntimeTurnJournalSender,
         ) -> Result<bool> {
             Ok(!self
                 .retry_used
@@ -1755,9 +1791,11 @@ mod tests {
     fn execution_context() -> RuntimeExecutionContext {
         RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -1781,6 +1819,7 @@ mod tests {
     fn runtime_execution_context_resolves_longest_runtime_path_projection() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(PathBuf::from("/host/runtime-root")),
             runtime_path_projections: vec![
@@ -1792,6 +1831,7 @@ mod tests {
                 )
                 .expect("valid runtime projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(
@@ -1825,6 +1865,7 @@ mod tests {
     fn runtime_execution_context_keeps_equal_depth_blocks_order_independent() {
         let context = RuntimeExecutionContext {
             network_mode: NetworkMode::On,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: None,
             runtime_path_projections: vec![
@@ -1833,6 +1874,7 @@ mod tests {
                 RuntimePathProjection::directory("/runtime/channel.sock", "/tmp/channel-tree")
                     .expect("valid runtime projection"),
             ],
+            mcp_servers: Vec::new(),
         };
 
         assert_eq!(
@@ -1892,6 +1934,40 @@ mod tests {
             .expect("load state"),
             Some("session_saved".to_string())
         );
+    }
+
+    #[test]
+    fn clear_state_value_removes_regular_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let state_file = runtime_state_root.join("session-id");
+        std::fs::write(&state_file, "session_saved\n").expect("write state file");
+
+        clear_state_value(runtime_state_root, "session-id", "test session").expect("clear state");
+
+        assert!(
+            !state_file.exists(),
+            "state file should be removed after clear"
+        );
+        clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect("clearing a missing state file is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_state_value_rejects_symlinked_state_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path();
+        let outside = temp_dir.path().join("outside");
+        std::fs::write(&outside, "do not remove\n").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, runtime_state_root.join("session-id"))
+            .expect("create state symlink");
+
+        let err = clear_state_value(runtime_state_root, "session-id", "test session")
+            .expect_err("state symlink should be rejected");
+
+        assert!(err.to_string().contains("cannot be a symlink"));
+        assert!(outside.exists(), "clear must not follow state symlinks");
     }
 
     #[test]
@@ -1971,9 +2047,15 @@ mod tests {
         assert!(result.capability_requests.is_empty());
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "hello"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "hello"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2005,9 +2087,15 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "fresh"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "fresh"
         ));
-        assert!(matches!(event_rx.recv().await, Some(RuntimeEvent::Done)));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent {
+                event: RuntimeEvent::Done,
+                raw: None
+            })
+        ));
         assert!(
             event_rx.try_recv().is_err(),
             "stale error should stay buffered"
@@ -2044,7 +2132,7 @@ mod tests {
         assert!(err.to_string().contains("second"));
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::Error { text, .. }) if text == "second"
+            Some(TurnEvent { event: RuntimeEvent::Error { text, .. }, raw: None }) if text == "second"
         ));
         assert!(
             event_rx.try_recv().is_err(),
@@ -2129,7 +2217,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(RuntimeEvent::MessageDelta { text, .. }) if text == "slow"
+            Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "slow"
         ));
     }
 }

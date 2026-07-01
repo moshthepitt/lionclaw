@@ -25,7 +25,8 @@ use lionclaw::{
         runtime::{
             HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
             RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
-            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+            RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
         },
         Kernel, KernelOptions,
     },
@@ -2428,7 +2429,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         let current_prompt = input.prompt;
         self.prompts
@@ -2462,7 +2463,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
             } else {
                 Vec::new()
             };
-            let _ = events.send(RuntimeEvent::MessageDelta {
+            let _ = journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: json!({
                     "goal": first_user,
@@ -2478,8 +2479,8 @@ impl RuntimeAdapter for CapturePromptAdapter {
                     "open_loops": open_loops
                 })
                 .to_string(),
-            });
-            let _ = events.send(RuntimeEvent::Done);
+            }));
+            let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
             return Ok(RuntimeTurnResult::default());
         }
 
@@ -2500,11 +2501,11 @@ impl RuntimeAdapter for CapturePromptAdapter {
             });
         }
 
-        let _ = events.send(RuntimeEvent::MessageDelta {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: self.reply.clone(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        }));
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
     }
 
@@ -2566,7 +2567,7 @@ impl RuntimeAdapter for HangingHiddenCompactionAdapter {
     async fn turn(
         &self,
         input: RuntimeTurnInput,
-        events: RuntimeEventSender,
+        journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         if input.runtime_skill_ids.is_empty()
             && input.prompt.contains("lionclaw_compaction_handoff_v1")
@@ -2574,11 +2575,11 @@ impl RuntimeAdapter for HangingHiddenCompactionAdapter {
             std::future::pending::<()>().await;
         }
 
-        let _ = events.send(RuntimeEvent::MessageDelta {
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: "captured".to_string(),
-        });
-        let _ = events.send(RuntimeEvent::Done);
+        }));
+        let _ = journal.send(TurnEvent::canonical(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
     }
 
@@ -2645,7 +2646,7 @@ impl RuntimeAdapter for FailingRuntimeAdapter {
     async fn turn(
         &self,
         _input: RuntimeTurnInput,
-        _events: RuntimeEventSender,
+        _journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
         Err(anyhow!("boom"))
     }

@@ -112,8 +112,8 @@ Shared crate primitives:
 ## Runtime Adapter Contract
 
 The shared Rust contract lives in `crates/lionclaw-runtime-api`. Concrete
-runtime adapters live in their own crates, currently
-`crates/lionclaw-runtime-codex`, `crates/lionclaw-runtime-opencode`, and
+conversation drivers live in crates by protocol, not by product: currently
+`crates/lionclaw-runtime-acp`, `crates/lionclaw-runtime-codex`, and
 `crates/lionclaw-runtime-mock`.
 
 Runtime adapters implement:
@@ -123,7 +123,6 @@ Runtime adapters implement:
 - `turn()`
 - `program_backed_turn()`
 - `build_terminal_program()`
-- `export_terminal_transcript()`
 - `runtime_control()`
 - `resolve_capability_requests()`
 - `cancel()`
@@ -132,7 +131,7 @@ Runtime adapters implement:
 Adapters also declare a turn mode:
 
 - `ProgramBacked`: LionClaw launches a real agent CLI inside the compiled
-  execution plan. Codex and OpenCode are the first supported examples.
+  execution plan. Codex and ACP profiles are the first supported examples.
 - `Direct`: the runtime may return explicit `RuntimeCapabilityRequest` items
   for the kernel to broker.
 
@@ -141,11 +140,24 @@ path. Direct runtimes and brokered capabilities are useful for tests, narrow
 workers, and future runtimes that do not bring a full harness.
 
 Adapters describe what they need and how to interpret runtime-owned state:
-program invocations, optional runtime auth kind, output parsing, native terminal
-programs, transcript export, and runtime controls. They do not receive the
-kernel execution plan. The kernel gives program-backed adapters a constrained
-executor plus observable runtime context, then still decides launch allowance,
-mounts, secrets, auth materialization, audit, and persistence.
+program invocations, optional runtime auth kind, native terminal programs,
+saved runtime session state, and runtime controls. They do not receive the kernel
+execution plan. The kernel gives program-backed adapters a constrained executor
+plus observable runtime context, then still decides launch allowance, mounts,
+secrets, auth materialization, audit, and persistence.
+
+Side-effecting live protocol translation lives inside each protocol adapter.
+Codex's app-server driver and the ACP driver own their protocol handshakes,
+permission replies, runtime session continuity updates, and JSON-RPC loops.
+Their shared output is a turn journal of `TurnEvent` records: one canonical
+`RuntimeEvent` paired with an optional raw protocol payload retained only for
+debugging. Kernel live routing projects the journal through `canonical_events`,
+so raw payloads are never streamed to operators, replayed into prompts, or used
+to build canonical assistant text.
+The persisted journal is a kernel-owned debug/audit record of the driver
+translation, readable through the scoped session-turn journal API. It is not the
+production transcript reader for prompt history; canonical session turn state
+remains the source for user-visible history and prompt reconstruction.
 
 Runtime context may include host projections for runtime-visible paths. A
 directory projection maps a runtime tree such as `/runtime` to the runtime state
@@ -156,10 +168,11 @@ kernel exposes them to adapters. Shared helpers in `lionclaw-runtime-api`
 normalize relative runtime paths and reject parent traversal before adapters
 turn runtime protocol fields into host paths.
 
-Native terminal resume readiness is a typed adapter input, not a raw boolean.
+Program-backed resume readiness is a typed adapter input, not a raw boolean.
 The only positive `RuntimeSessionReady` value is derived from the hardened
 LionClaw ready-marker check in `lionclaw-runtime-api`; adapters use it only to
-gate loading runtime-private continuation state.
+gate loading runtime-private continuation state for kernel-managed turns.
+Native terminal launches have no runtime-session readiness input.
 
 ## Program-Backed Runtime Flow
 
@@ -176,11 +189,13 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
    target select ordered context items, byte caps, transcript tail, and current
    input.
 6. The OCI backend launches the runtime in the confined layout.
-7. The adapter maps runtime output into typed stream events. Codex uses its
-   native `app-server` JSON-RPC protocol over stdio inside the confined
-   process; OpenCode uses its configured machine-readable run output.
-8. The kernel persists canonical answer text, terminal turn status, checkpoints,
-   audit, and any continuity changes it owns.
+7. The adapter maps the runtime protocol into a canonical turn journal. Codex
+   uses its native `app-server` JSON-RPC protocol over stdio inside the
+   confined process; OpenCode uses Agent Client Protocol over stdio.
+8. The kernel persists the canonical journal, streams `canonical_events` to live
+   consumers, checkpoints canonical answer text, records terminal turn status,
+   audit, and any continuity changes it owns. Raw protocol payloads are stored
+   only when explicit debug retention is enabled.
 
 Program-backed runtimes stream two message lanes:
 
@@ -210,15 +225,19 @@ reply and lets channel UIs reconcile live deltas against durable turn state
 before the terminal `done` marker. Failed, timed-out, cancelled, and interrupted
 turns publish typed status/error events followed by exactly one `done`.
 
-Configured OpenCode profiles are pinned to machine-readable JSON output so
-LionClaw receives typed events instead of a degraded plain-text stream. Codex
-is launched through its app-server protocol with `externalSandbox` permissions
-inside the outer Podman boundary. LionClaw does not use `codex exec` as a
-fallback path. Codex app-server request/notification assumptions are pinned by
-checked-in protocol fixtures under
-`crates/lionclaw-runtime-codex/tests/fixtures/codex_app_server`, including the
-target Codex CLI version and immutable source commit; update those fixtures
-with the adapter when the target app-server contract changes.
+Codex is launched through its app-server protocol with `externalSandbox`
+permissions inside the outer Podman boundary. LionClaw does not use
+`codex exec` as a fallback path. ACP runtimes such as OpenCode are configured
+as profiles (`driver = "acp"`, command, args, model/mode, auth, confinement,
+and optional `skill_projection`) served by `lionclaw-runtime-acp`; adding
+another ACP harness is a profile change, not a new Rust crate. Protocol
+request/notification assumptions are pinned by checked-in fixtures under the
+protocol crate, including the target CLI version and immutable source commit;
+update those fixtures with the driver when the target protocol contract
+changes.
+The runtime profile format is intentionally pre-v1 breaking: profiles use
+`driver` and `command`; the removed `kind`/`executable` shape fails to load with
+an explicit operator-facing error.
 
 ## Native Runtime TUI Flow
 
@@ -240,8 +259,8 @@ Flow:
    network mode, and secret policy used by the selected runtime preset.
 5. The OCI backend attaches the operator's terminal to the runtime process with
    a TTY.
-6. On launch and exit, the kernel writes `runtime.tui.launch`,
-   `runtime.tui.exit`, and transcript reconciliation audit events.
+6. On launch and exit, the kernel writes `runtime.tui.launch` and
+   `runtime.tui.exit` audit events.
 
 For Codex, the attached terminal program runs the real Codex CLI in
 danger-full-access mode with approval disabled. That is intentional: LionClaw's
@@ -256,82 +275,23 @@ own workspace prompt inside the container while keeping runtime updates under
 LionClaw's runtime image/update path. Those overrides do not rewrite
 `/runtime/home/.codex/config.toml`, and the host Codex home is not mutated.
 
-For OpenCode native TUI launches, LionClaw lets HOME/XDG point at
-`/runtime/home`, sets `OPENCODE_DISABLE_AUTOUPDATE=1`, and points
-`OPENCODE_CONFIG` at `/runtime/opencode.generated.json`. That session-scoped
-config file loads `/runtime/AGENTS.md` as global runtime instructions while
-project-level `.opencode` and `AGENTS.md` files remain project-owned. Program
-turns carry LionClaw context through the normal prompt envelope. Runtime updates
-stay under LionClaw's runtime image/update path.
-
-LionClaw does not scrape terminal output. Native TUI transcript import is an
-adapter contract over runtime-owned durable state. Codex continuity is a
-LionClaw-owned link to one Codex CLI thread id stored in session-scoped runtime
-control state.
-Native TUI launches resume with `codex resume <threadID>` only when that link
-also has LionClaw's ready marker from a proven resumable reconciliation.
-Before launching an attached native TUI, LionClaw records a launch timestamp in
-session-scoped runtime control state. After exit, adapters keep the saved
-continuation link authoritative unless the runtime's public session/thread list
-shows a different newest target updated during that launch; when no link
-exists, the newest public target starts the link.
-After native TUI exit, Codex exports completed turns through Codex's app-server
-`thread/list` and paged `thread/turns/list` protocol inside the same runtime
-boundary, enumerating newest history first, recording the chosen CLI thread as
-the native UI continuation link, proving program-backed resumability separately
-from that thread's exported turn state, falling back to the saved link when
-listing cannot produce a current thread, and sorting before canonical import.
-Codex threads that the app-server reports as not yet materialized before the
-first user message reconcile as empty, non-resumable continuation sources.
-OpenCode continuity is a LionClaw-owned link to one OpenCode root session id
-stored in session-scoped runtime control state. Program-backed OpenCode turns
-learn that id from OpenCode's machine-readable `sessionID` events and then
-resume with `opencode run --session <sessionID>`. Native TUI launches resume
-with `opencode --session <sessionID>` only when that link also has LionClaw's
-ready marker from a proven resumable reconciliation.
-After native TUI exit, LionClaw uses OpenCode's `session list --format json`
-only to identify whether the runtime moved to a newer root session during the
-launch, choosing by exported update timestamp instead of relying on list order.
-It records the chosen root session as the native UI continuation link, then
-imports through `export <sessionID>` for that current linked session and, when
-different, the previously linked session. Program-backed OpenCode resumability
-is proved separately from the current linked session's exported message state.
-LionClaw does not depend on a private OpenCode SQLite schema and does not try to
-backfill an arbitrary session-list window.
-The kernel imports those turns into canonical `session_turns` with deterministic
-source-derived ids, so reconciliation is idempotent. Reconciliation runs after
-process exit. Before launch, it runs only when LionClaw-owned runtime TUI state
-shows the prior attached launch did not complete its after-exit pass; that keeps
-normal startup fast while still recovering completed runtime turns already
-written by the harness after an unclean LionClaw exit. Per-source export/read
-failures are audited as `runtime.tui.reconcile_source_warning` and skipped, so
-one stale runtime thread cannot block valid completed turns from import.
-Enumeration failures are audited as source warnings when a previously linked
-continuation target can still be exported, but fallback export of that saved
-target does not prove the current continuation source; otherwise they are
-audited as `runtime.tui.reconcile_error`.
-A clean native TUI exit clears LionClaw's dirty launch marker only when the
-adapter proves its chosen continuation source was reconciled; partial exports of
-that continuation source keep the marker dirty so the next native launch retries
-before rendering context.
-It marks the runtime session resumable only when that reconciled continuation
-target is valid from runtime-owned state and the latest continuation turn can be
-represented in LionClaw's canonical transcript. For Codex, the saved
-continuation thread must export cleanly far enough to prove its newest turn is
-explicitly completed, importable, and free of a non-null app-server error. For
-OpenCode, the linked continuation session must export cleanly and its raw
-message state must have an assistant finish reason that OpenCode's own prompt
-loop treats as terminal, answering the latest user message with no unresolved
-non-provider-executed tool part; older good sessions do not make the next
-`opencode run --session` safe.
-Transcript export passes are bounded by a kernel native-export timeout no greater
-than the runtime plan's hard timeout, so a stuck runtime CLI cannot make native
-TUI exit handling unbounded. Adapters may return partial transcripts with source
-warnings when the deadline is reached; resumability remains adapter-owned but is
-not accepted until the adapter has reconciled the continuation source. The
-attached native UI itself is not a LionClaw turn, so
-LionClaw turn timeout overrides do not wrap the runtime's own interactive
-session.
+LionClaw does not scrape terminal output or import native TUI transcripts.
+Attached mode is a bounded launcher: it never inserts canonical
+`session_turns`, never updates prompt or session history, and never changes the
+continuation, retry, or resumability state used by kernel-managed turns.
+ACP drivers launch the harness's native interactive command from the profile
+command without ACP protocol args, with the same confinement, staged auth,
+skills, and non-privileged runtime layout as other runtime executions. Attached
+launches do not consume LionClaw's program-backed runtime-session ready proof:
+`RuntimeTerminalProgramInput` has no readiness field, and existing ready
+markers remain intact for later kernel-managed turns. Program-backed Codex and
+ACP continuity remain LionClaw-owned links in session-scoped runtime control
+state, but native UI turns stay runtime-owned and cannot mutate the
+runtime-native session that later driven turns resume. The attached native UI
+itself is not a LionClaw turn, so LionClaw turn timeout overrides do not wrap
+the runtime's own interactive session. Future terminal export APIs, if added,
+are debug/display/audit surfaces only; canonical conversation state remains
+owned by kernel-managed turns.
 Each native TUI launch also holds a LionClaw-owned file lock in the session's
 runtime state root, preventing separate operator processes from attaching two
 native UIs to the same LionClaw session state at once.
@@ -350,8 +310,7 @@ runtime's own interface; operators exit through the runtime's normal exit
 gesture, such as Codex's Ctrl-D. This avoids terminal-editor proxying and keeps
 runtime command semantics out of the kernel.
 Terminal-generated interrupts and quits remain runtime-owned; LionClaw keeps
-the parent process alive so it can reconcile durable runtime state after the
-native UI exits.
+the parent process alive so it can audit native UI exit.
 
 ## Runtime Control Commands
 
@@ -395,14 +354,22 @@ outbox delivery.
 
 ## Program-Backed `channel.send`
 
-Program-backed runtimes use a turn-scoped Unix socket for outbound channel
-delivery. When the effective execution preset includes `channel-send`, the
-kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
-at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
-environment variable and usable socket are absent. The bridge is valid only
-while the runtime turn is active; turn completion or timeout removes the socket
-and invalidates open connections. Native runtime controls and native runtime
-TUI sessions do not receive this bridge.
+Program-backed runtimes use a turn-scoped MCP server for outbound channel
+delivery. When the effective execution preset includes `channel-send` and the
+kernel can derive an active channel route or projected project-instance route
+for the turn, the kernel mounts a LionClaw-owned socket at
+`/runtime/lionclaw/channel-send.sock`, writes a small stdio proxy under
+`/runtime`, and passes a `lionclaw` MCP server spec to program-backed drivers
+that support MCP. The proxy is transport only: it forwards JSON-RPC lines
+between stdio and the Unix socket. Tool listing, `channel_send` calls,
+authorization, audit, and enqueueing all terminate in the kernel broker outside
+the sandbox.
+
+Without that escape class, or without kernel-derived route authority for the
+turn, the MCP server spec, proxy, and usable socket are absent. The bridge is
+valid only while the runtime turn is active; turn completion or timeout removes
+the socket and invalidates open connections. Native runtime controls and native
+runtime TUI sessions do not receive this bridge or MCP tool.
 
 The host socket is created under the operator's short per-user runtime directory
 rather than under the instance home, so long project paths do not exceed Unix
@@ -410,9 +377,12 @@ socket path limits. OCI launches that mount a Unix socket disable Podman's
 SELinux process label for that turn; otherwise SELinux hosts can expose the
 socket inode but deny `connect(2)`.
 
-The protocol is one request per connection: write one newline-delimited JSON
-object, read one newline-delimited JSON object, then close. The request names a
-configured channel route, provider-neutral content, and an idempotency key.
+The socket is private transport for the MCP stdio proxy and accepts one MCP
+JSON-RPC request per connection: write one newline-delimited JSON object, read
+one newline-delimited JSON object, then close. The kernel supports `initialize`,
+`tools/list`, and `tools/call channel_send`. `channel_send` arguments name a
+configured channel route, provider-neutral content, and either an explicit
+idempotency key or the JSON-RPC request id as a derived retry key.
 Attachment content is not sent over the socket; the request names files under
 `/runtime` control state or a generated-artifact directory declared by the
 runtime adapter under the persistent native home. The persistent native home
@@ -423,13 +393,18 @@ the current runtime path projections; parent-directory and symlink escapes are
 rejected. Attachment-only sends are valid; text-only sends must carry non-empty
 text.
 
-The bridge is transport only. The kernel validates the current session and turn
-from its own execution context, checks the active channel binding, normalizes
-route fields, enforces `plain`/`markdown`/`html` format hints, copies any
-attachments into LionClaw-owned outbox storage, and creates a normal durable
-channel outbox delivery. Channel workers continue to lease and report those
-deliveries through `/v0/channels/outbox/pull` and
-`/v0/channels/outbox/report`.
+The bridge and MCP proxy are transport only. The kernel validates the current
+session and turn from its own execution context, checks the active channel
+binding, normalizes route fields, enforces `plain`/`markdown`/`html` format
+hints, copies any attachments into LionClaw-owned outbox storage, and creates a
+normal durable channel outbox delivery. Direct/runtime capability
+`channel.send` remains policy-gated and derives its route from the active
+channel session; MCP `channel_send` remains preset/bridge-gated and validates
+the requested route against the active turn route and projected route
+inventory. Both paths terminate in the kernel broker and use the same
+authorized enqueue helper instead of maintaining separate outbox paths. Channel
+workers continue to lease and report those deliveries through
+`/v0/channels/outbox/pull` and `/v0/channels/outbox/report`.
 
 Bridge setup, accept-loop, connection-task, and connection I/O failures are
 audited under `runtime.channel_send.bridge_error`. Request denials, including
@@ -440,6 +415,10 @@ When project-instance runtime context is active, `channel.send` requests are
 also checked against the sender-relative `channel_send` projection for that
 selected instance. A project runtime can enqueue only routes that are present as
 configured neighbor routes in its generated inventory.
+Route authorization is intentionally a kernel broker responsibility, not a
+public `ProjectInstanceInventory` helper contract. Consumers should treat the
+inventory as projected data and use kernel `channel.send` surfaces for
+authorization and enqueueing decisions.
 
 Idempotency lives on the outbox row. Runtime channel sends use
 `source_kind = "runtime_channel_send"`, a source id scoped to
@@ -649,6 +628,7 @@ with the CLI.
 - `POST /v0/sessions/open`
 - `GET /v0/sessions/latest`
 - `POST /v0/sessions/history`
+- `POST /v0/sessions/turn/journal`
 - `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
 
@@ -1100,7 +1080,7 @@ does not write audit events.
 The recorder is a one-shot host process, not a resident protocol. After a session
 turn has been durably finalized and `sessions.record_turn(...)` has committed,
 the kernel may invoke the recorder for Main, Interactive sessions on the
-`program_turn`, `attached_native_tui_turn`, and `channel_turn` surfaces. Failed,
+`program_turn` and `channel_turn` surfaces. Failed,
 timed-out, cancelled, interrupted, Untrusted, Conservative-history, and empty
 transcript turns finalized through those surfaces do not send a recorder request;
 when a recorder is configured, they produce only metadata skip audit. Bootstrap
@@ -1219,9 +1199,9 @@ home.
 
 1. Policy checks deny unless an explicit grant exists.
 2. No default external channel is built into the core.
-3. Runtime adapters registered by default: local `mock` only. `codex` and
-   `opencode` are configured runtime profiles bound at startup.
-4. Configured Codex/OpenCode profiles run through the shared execution planner
+3. Runtime adapters registered by default: local `mock` only. `codex` and ACP
+   profiles such as `opencode` are configured runtime profiles bound at startup.
+4. Configured Codex/ACP profiles run through the shared execution planner
    and Podman backend, then map runtime output into kernel events.
 5. Runtime idle timeout, hard timeout, and cancellation are kernel-enforced and
    audited. Local interactive runs default to a 30 minute idle timeout and a 2
@@ -1257,14 +1237,30 @@ home.
 
 ## Adding A Runtime
 
-1. Add a `crates/lionclaw-runtime-<id>` crate implementing `RuntimeAdapter`
-   from `lionclaw-runtime-api`.
-2. Choose `ProgramBacked` or `Direct` turn mode deliberately.
-3. Reuse workspace package versions and `workspace = true` lint settings.
-4. Wire configured registration in `operator/runtime.rs` and kernel runtime
-   re-exports only as needed.
-5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
+Runtime integration is driver-per-protocol, not crate-per-product.
+
+1. If the runtime speaks an existing conversation protocol, add a runtime
+   profile only. For ACP harnesses such as OpenCode, configure
+   `driver = "acp"`, `command`, `args`, model/mode, auth, confinement, and any
+   native skill projection data. Do not add a Rust crate for another ACP
+   product.
+2. If the runtime brings a new conversation protocol, add one
+   `crates/lionclaw-runtime-<protocol>` crate implementing the protocol driver
+   behind the existing adapter and `RuntimeDriverProvider` boundary in
+   `lionclaw-runtime-api`.
+3. Keep protocol-specific auth staging, session ids, resume data, parsing, and
+   raw protocol retention in that protocol crate. Core/kernel code consumes
+   canonical `TurnEvent` journals and runtime profile data only.
+4. Declare native skill support as profile data, for example
+   `skill_projection = { kind = "native-dir", root = ".config/opencode/skills", format = "skill-md" }`.
+   The kernel validates and materializes supported projection kinds but must
+   not match on runtime product names.
+5. Reuse workspace package versions and `workspace = true` lint settings for a
+   new protocol crate. Only touch `kernel/runtime/builtins.rs` for intentional
    builtin test/kernel scaffolding.
-6. Add unit tests in the adapter module plus one kernel-level integration case.
-7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime
-   introduces new auth, state, or confinement behavior.
+6. Add protocol fixture tests proving canonical `RuntimeEvent` equivalence and
+   at least one kernel-level integration case for live journal persistence and
+   streaming behavior.
+7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime or
+   protocol introduces new auth, state, confinement, or operator workflow
+   behavior.

@@ -639,12 +639,16 @@ mod tests {
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
-            runtime::{ConfinementConfig, OciConfinementConfig},
+            runtime::{
+                ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
+                RuntimeTerminalConfig,
+            },
             Kernel, KernelOptions,
         },
         operator::config::{OperatorConfig, RuntimeProfileConfig},
         runtime_timeouts::RuntimeTurnTimeouts,
     };
+    use lionclaw_runtime_codex::codex_runtime_auth_kind;
 
     #[tokio::test]
     async fn render_streaming_future_waits_after_event_stream_closes() {
@@ -745,15 +749,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.display().to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.display().to_string(),
-                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile(stub.display().to_string(), engine.display().to_string()),
         );
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
@@ -1155,19 +1151,14 @@ sleep 1
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: temp_dir
-                        .path()
-                        .join("missing-podman")
-                        .to_string_lossy()
-                        .to_string(),
-                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile(
+                "codex".to_string(),
+                temp_dir
+                    .path()
+                    .join("missing-podman")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
         );
         save_prepared_config(&home, &config).await;
 
@@ -1292,12 +1283,12 @@ exit 0
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -1324,12 +1315,12 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
         let healthy_dir = temp_dir.path().join("healthy-runtime");
         fs::create_dir_all(&healthy_dir).expect("healthy runtime dir");
         let opencode_stub = healthy_dir.join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &opencode_stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
         let broken_podman = temp_dir.path().join("podman");
         write_script(
@@ -1346,15 +1337,10 @@ exit 0
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: broken_podman.to_string_lossy().to_string(),
-                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile(
+                "codex".to_string(),
+                broken_podman.to_string_lossy().to_string(),
+            ),
         );
         config.upsert_runtime(
             "opencode".to_string(),
@@ -1382,13 +1368,13 @@ exit 0
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"reasoning","text":"planning next step"}'
-echo '{"type":"text","text":"hello from opencode"}'
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_test","content":{"type":"text","text":"planning next step"}}}}"#,
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_test","content":{"type":"text","text":"hello from opencode"}}}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -1414,13 +1400,12 @@ echo '{"type":"text","text":"hello from opencode"}'
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("opencode-stub.sh");
-        write_script(
+        write_opencode_acp_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"reasoning","text":"checking the workspace"}'
-exit 7
-"#,
+            &[
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_test","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_test","content":{"type":"text","text":"checking the workspace"}}}}"#,
+            ],
+            7,
         );
 
         let mut config = OperatorConfig::default();
@@ -1618,6 +1603,62 @@ done
     }
 
     #[cfg(unix)]
+    fn write_opencode_acp_stub(path: &std::path::Path, turn_events: &[&str], exit_code: i32) {
+        let mut script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+while IFS= read -r line; do
+  case "${line}" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"embeddedContext":true,"image":true},"sessionCapabilities":{"close":{},"fork":{},"list":{},"resume":{}}},"agentInfo":{"name":"OpenCode","version":"1.17.9"}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_test","configOptions":[]}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}'
+      ;;
+    *'"method":"session/resume"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"configOptions":[]}}'
+      ;;
+    *'"method":"session/prompt"'*)
+"#
+        .to_string();
+
+        for event in turn_events {
+            assert!(
+                !event.contains('\''),
+                "test event JSON cannot contain single quotes"
+            );
+            script.push_str("      printf '%s\\n' '");
+            script.push_str(event);
+            script.push_str("'\n");
+        }
+
+        if exit_code == 0 {
+            script.push_str(
+                r#"      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{}}}'
+      ;;
+"#,
+            );
+        } else {
+            script.push_str(&format!(
+                r#"      exit {exit_code}
+      ;;
+"#
+            ));
+        }
+
+        script.push_str(
+            r#"  esac
+done
+"#,
+        );
+
+        write_script(path, &script);
+    }
+
+    #[cfg(unix)]
     fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
         let engine = reference.parent().expect("stub parent").join("podman");
         if !engine.exists() {
@@ -1707,16 +1748,25 @@ esac
         );
     }
 
-    fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Codex {
-            executable: executable.display().to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
+    fn codex_runtime_profile(executable: String, engine: String) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::new(
+            "codex",
+            executable,
+            ConfinementConfig::Oci(OciConfinementConfig {
+                engine,
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),
-        }
+        )
+        .with_auth(codex_runtime_auth_kind())
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"))
+    }
+
+    fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
+        codex_runtime_profile(
+            executable.display().to_string(),
+            ensure_fake_podman(executable).to_string_lossy().to_string(),
+        )
     }
 
     async fn write_codex_runtime_auth(home: &LionClawHome) {
@@ -1735,15 +1785,24 @@ esac
     }
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::OpenCode {
-            executable: executable.display().to_string(),
-            model: None,
-            agent: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+        let mut profile = RuntimeProfileConfig::new(
+            "acp",
+            executable.display().to_string(),
+            ConfinementConfig::Oci(OciConfinementConfig {
                 engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),
-        }
+        )
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+            ".config/opencode/skills",
+        ));
+        profile.args = vec!["acp".to_string()];
+        profile.environment = std::collections::BTreeMap::from([(
+            "OPENCODE_DISABLE_AUTOUPDATE".to_string(),
+            "1".to_string(),
+        )]);
+        profile.terminal = RuntimeTerminalConfig { args: Vec::new() };
+        profile
     }
 }

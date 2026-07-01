@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt,
-    io::{ErrorKind, Read},
+    future::Future,
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
@@ -17,7 +18,7 @@ use rustix::{
     fs::{flock, FlockOperation},
     io::Errno,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
@@ -62,19 +63,21 @@ use crate::contracts::{
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
     SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
-    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
-    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
-    StreamEventKindDto, StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
+    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnJournalEventView,
+    SessionTurnJournalRequest, SessionTurnJournalResponse, SessionTurnKind, SessionTurnRequest,
+    SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto, StreamEventKindDto,
+    StreamFileChangeDto, StreamFileChangeStatusDto, StreamLaneDto, TrustTier,
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_partition_key, LionClawHome,
-        RUNTIME_PROJECTS_DIR, RUNTIME_SESSION_READY_MARKER, RUNTIME_TUI_STATE_MARKER,
+        RUNTIME_PROJECTS_DIR, RUNTIME_SESSION_READY_MARKER,
     },
     project_inventory::{
-        ProjectInstanceRuntimeContext, PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME,
-        PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
+        ProjectInstanceChannelSendStatus, ProjectInstanceRuntimeContext,
+        PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_NAME, PROJECT_INSTANCES_FILE_PATH,
+        PROJECT_INSTANCE_ENV, PROJECT_INSTANCE_INVENTORY_DIR,
     },
     runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
     workspace::{read_workspace_section, AGENTS_FILE, GENERATED_AGENTS_FILE},
@@ -84,7 +87,10 @@ use lionclaw_durable_fs::{remove_file_if_exists, write_file_atomically};
 use super::{
     audit::AuditLog,
     cancellation::{normalize_cancel_reason, TurnCancellation},
-    capability_broker::{CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext},
+    capability_broker::{
+        CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext,
+        CHANNEL_SEND_ROUTE_NOT_PROJECTED,
+    },
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
         ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
@@ -147,23 +153,22 @@ use super::{
     },
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, execute_attached,
-        execute_captured, execute_streaming, project_runtime_skills,
-        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        runtime_native_home_mount_source, runtime_state_mount_source, skill_mount_target,
-        spawn_interactive, EffectiveExecutionPlan, EscapeClass, ExecutionOutput,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode,
-        RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        execute_captured, execute_streaming, map_host_path_into_runtime_mount,
+        project_runtime_skills, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, runtime_native_home_mount_source,
+        runtime_state_mount_source, skill_mount_target, spawn_interactive, EffectiveExecutionPlan,
+        EscapeClass, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeAuthContext,
+        RuntimeAuthRegistry, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
         RuntimeEvent, RuntimeExecutionContext, RuntimeExecutionProfile, RuntimeExecutionSession,
-        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane,
+        RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMcpServerSpec, RuntimeMessageLane,
         RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
         RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
-        RuntimeTerminalTranscript, RuntimeTerminalTranscriptInput,
-        RuntimeTerminalTranscriptProgramExecutor, RuntimeTerminalTurn, RuntimeTerminalTurnStatus,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, DRAFTS_MOUNT_TARGET,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
         RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
@@ -177,8 +182,8 @@ use super::{
         turns_to_history_views, CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{
-        ImportedSessionTurn, InterruptedSessionTurn, NewSessionTurn, SessionTurnCompletion,
-        SessionTurnRecord, SessionTurnStore,
+        InterruptedSessionTurn, NewSessionTurn, SessionTurnCompletion, SessionTurnRecord,
+        SessionTurnStore,
     },
     sessions::SessionStore,
     skills::validate_skill_alias,
@@ -207,9 +212,11 @@ const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
 const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
 const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
 const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
-const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const CHANNEL_SEND_MCP_SERVER_NAME: &str = "lionclaw";
+const CHANNEL_SEND_MCP_PROXY_STATE_FILE: &str = ".lionclaw-mcp-stdio-proxy.mjs";
+const CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH: &str = "/runtime/.lionclaw-mcp-stdio-proxy.mjs";
 const CHANNEL_SEND_HOST_SOCKET_ROOT: &str = "lionclaw";
 const CHANNEL_SEND_HOST_SOCKET_DIR: &str = "channel-send";
 const PROJECT_INSTANCE_PROJECTIONS_DIR: &str = "project-instance-projections";
@@ -218,15 +225,83 @@ const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
+const RUNTIME_MCP_STDIO_PROXY_JS: &str = r#"import readline from 'node:readline';
+import net from 'node:net';
 
-#[derive(Debug, Clone, Copy)]
-struct AttachedRuntimeReconciliation {
-    exported_turn_count: usize,
-    imported_turn_count: usize,
-    warning_count: usize,
-    reconciled: bool,
-    resumable: bool,
+const socketPath = process.argv[2] || '/runtime/lionclaw/channel-send.sock';
+
+function requestId(line) {
+  try {
+    const message = JSON.parse(line);
+    if (!Object.prototype.hasOwnProperty.call(message, 'id')) return null;
+    const id = message.id;
+    return typeof id === 'string' || typeof id === 'number' ? id : null;
+  } catch {
+    return null;
+  }
 }
+
+function jsonRpcError(id, code, message) {
+  return JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
+}
+
+function correlateKernelResponse(line, response) {
+  const id = requestId(line);
+  if (id === null) return response;
+  try {
+    const message = JSON.parse(response);
+    if (
+      message &&
+      typeof message === 'object' &&
+      message.jsonrpc === '2.0' &&
+      message.id === null &&
+      Object.prototype.hasOwnProperty.call(message, 'error')
+    ) {
+      message.id = id;
+      return JSON.stringify(message);
+    }
+  } catch {
+    // Leave malformed kernel responses untouched so the MCP client sees the real transport fault.
+  }
+  return response;
+}
+
+function kernelCall(line) {
+  return new Promise((resolve) => {
+    const client = net.connect(socketPath);
+    let buffer = '';
+    let resolved = false;
+    const finish = (response) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(response);
+    };
+    client.on('connect', () => {
+      client.write(line + '\n');
+      client.end();
+    });
+    client.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline >= 0) {
+        finish(correlateKernelResponse(line, buffer.slice(0, newline)));
+        client.destroy();
+      }
+    });
+    client.on('end', () => finish(correlateKernelResponse(line, buffer.trim())));
+    client.on('error', (error) => {
+      finish(jsonRpcError(requestId(line), -32000, `LionClaw MCP broker is unavailable: ${error.message}`));
+    });
+  });
+}
+
+readline.createInterface({ input: process.stdin }).on('line', async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const response = await kernelCall(trimmed);
+  if (response) process.stdout.write(response + '\n');
+});
+"#;
 
 struct SchedulerRecoveryLeaseRenewal {
     stop_tx: Option<oneshot::Sender<()>>,
@@ -260,11 +335,38 @@ struct RuntimeChannelSendContext {
     session_id: Uuid,
     turn_id: Uuid,
     runtime_id: String,
+    active_channel_route: Option<RuntimeChannelSendRoute>,
+    projected_channel_routes: Vec<RuntimeChannelSendRoute>,
     runtime_state_root: PathBuf,
     runtime_native_home_root: Option<PathBuf>,
     runtime_native_home_artifact_dirs: Vec<RuntimeNativeHomeArtifactDir>,
     runtime_path_projections: Vec<RuntimePathProjection>,
     active: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeChannelSendRoute {
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RuntimeChannelSendRoutes {
+    active: Option<RuntimeChannelSendRoute>,
+    projected: Vec<RuntimeChannelSendRoute>,
+}
+
+impl RuntimeChannelSendRoute {
+    fn as_capability_route(&self) -> CapabilityChannelSendRoute<'_> {
+        CapabilityChannelSendRoute {
+            channel_id: self.channel_id.as_str(),
+            conversation_ref: self.conversation_ref.as_str(),
+            thread_ref: self.thread_ref.as_deref(),
+            reply_to_ref: self.reply_to_ref.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +445,21 @@ impl RuntimeChannelSendContext {
         self.active.load(Ordering::Acquire)
     }
 
+    fn capability_execution_context(&self) -> CapabilityExecutionContext<'_> {
+        CapabilityExecutionContext {
+            channel_send_route: self
+                .active_channel_route
+                .as_ref()
+                .map(RuntimeChannelSendRoute::as_capability_route),
+            projected_channel_send_routes: self
+                .projected_channel_routes
+                .iter()
+                .map(RuntimeChannelSendRoute::as_capability_route)
+                .collect(),
+            allow_channel_send_route_selection: true,
+        }
+    }
+
     fn artifact_roots(&self) -> Vec<RuntimeArtifactRoot> {
         let mut roots = vec![RuntimeArtifactRoot::directory(
             self.runtime_state_root.clone(),
@@ -363,18 +480,49 @@ impl RuntimeChannelSendContext {
     fn host_path_for_runtime_path(&self, runtime_path: impl AsRef<Path>) -> Option<PathBuf> {
         RuntimeExecutionContext {
             network_mode: NetworkMode::None,
+            working_dir: None,
             environment: Vec::new(),
             runtime_state_root: Some(self.runtime_state_root.clone()),
             runtime_path_projections: self.runtime_path_projections.clone(),
+            mcp_servers: Vec::new(),
         }
         .host_path_for_runtime_path(runtime_path)
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
 struct RuntimeChannelSendRequest {
-    #[serde(default)]
     idempotency_key: String,
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+    content: RuntimeChannelSendContent,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeChannelSendContent {
+    text: String,
+    format_hint: String,
+    attachments: Vec<RuntimeChannelSendAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeChannelSendAttachment {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeMcpChannelSendArguments {
+    #[serde(default)]
+    idempotency_key: Option<String>,
     #[serde(default)]
     channel_id: String,
     #[serde(default)]
@@ -384,27 +532,11 @@ struct RuntimeChannelSendRequest {
     #[serde(default)]
     reply_to_ref: Option<String>,
     #[serde(default)]
-    content: Option<RuntimeChannelSendContent>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct RuntimeChannelSendContent {
-    #[serde(default)]
     text: String,
     #[serde(default = "default_runtime_channel_send_format_hint")]
     format_hint: String,
     #[serde(default)]
     attachments: Vec<RuntimeChannelSendAttachment>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct RuntimeChannelSendAttachment {
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    filename: Option<String>,
-    #[serde(default)]
-    mime_type: Option<String>,
 }
 
 struct PrivateContextRecordAuditStatus {
@@ -420,6 +552,29 @@ struct RuntimeChannelSendAccepted {
     delivery_id: Uuid,
 }
 
+struct BrokerChannelSendRequest {
+    session_id: Uuid,
+    turn_id: Uuid,
+    source_kind: &'static str,
+    source_id: String,
+    source_fingerprint: Option<String>,
+    idempotent: bool,
+}
+
+struct BrokerChannelSendContent {
+    delivery: ChannelDeliveryContent,
+    prepared_attachments: Option<PreparedChannelDeliveryAttachments>,
+}
+
+struct BrokerChannelSendAccepted {
+    delivery_id: Uuid,
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+    idempotent: bool,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeChannelSendProblem {
     code: &'static str,
@@ -433,6 +588,22 @@ impl RuntimeChannelSendProblem {
             message: message.into(),
         }
     }
+}
+
+impl From<KernelError> for RuntimeChannelSendProblem {
+    fn from(err: KernelError) -> Self {
+        runtime_channel_send_kernel_problem(err)
+    }
+}
+
+struct AuthorizedChannelDelivery<'a> {
+    route: ChannelDeliveryRoute<'a>,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    source_kind: Option<&'a str>,
+    source_id: Option<&'a str>,
+    source_fingerprint: Option<&'a str>,
+    content: ChannelDeliveryContent,
 }
 
 struct RuntimeChannelSendBridge {
@@ -600,7 +771,8 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_registry: RuntimeAuthRegistry,
+    pub runtime_auth_context: RuntimeAuthContext,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -608,6 +780,7 @@ pub struct KernelOptions {
     pub project_instance_runtime: Option<ProjectInstanceRuntimeContext>,
     pub scheduler: SchedulerConfig,
     pub applied_state: AppliedState,
+    pub retain_runtime_raw_turn_payloads: bool,
 }
 
 impl fmt::Debug for KernelOptions {
@@ -628,7 +801,8 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
-            .field("codex_home_override", &self.codex_home_override)
+            .field("runtime_auth_registry", &self.runtime_auth_registry)
+            .field("runtime_auth_context", &self.runtime_auth_context)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -636,6 +810,10 @@ impl fmt::Debug for KernelOptions {
             .field("project_instance_runtime", &self.project_instance_runtime)
             .field("scheduler", &self.scheduler)
             .field("applied_state", &"..")
+            .field(
+                "retain_runtime_raw_turn_payloads",
+                &self.retain_runtime_raw_turn_payloads,
+            )
             .finish()
     }
 }
@@ -653,7 +831,8 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
-            codex_home_override: None,
+            runtime_auth_registry: RuntimeAuthRegistry::default(),
+            runtime_auth_context: RuntimeAuthContext::default(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -661,6 +840,7 @@ impl Default for KernelOptions {
             project_instance_runtime: None,
             scheduler: SchedulerConfig::default(),
             applied_state: AppliedState::default(),
+            retain_runtime_raw_turn_payloads: false,
         }
     }
 }
@@ -671,16 +851,9 @@ pub struct AttachedRuntimeLaunchInput {
     pub runtime_id: String,
 }
 
-const RUNTIME_TUI_STATE_RUNNING: &str = "running";
-const RUNTIME_TUI_STATE_CLEAN: &str = "clean";
 const RUNTIME_TUI_LOCK_FILE: &str = ".lionclaw-runtime-tui.lock";
-const RUNTIME_TUI_LAUNCH_STARTED_AT_FILE: &str = ".lionclaw-runtime-tui-started-at";
-const ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const RUNTIME_STATE_DIR_MODE: u32 = 0o700;
 const RUNTIME_STATE_FILE_MODE: u32 = 0o600;
-const OPENCODE_RUNTIME_KIND: &str = "opencode";
-const OPENCODE_GENERATED_CONFIG_FILE: &str = "opencode.generated.json";
-const OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH: &str = "/runtime/AGENTS.md";
 
 struct PreparedAttachedRuntimeLaunch {
     request: ExecutionRequest,
@@ -691,15 +864,11 @@ struct AttachedRuntimeLaunchLock {
     _files: Vec<std::fs::File>,
 }
 
-struct AttachedRuntimeTranscriptProgramExecutor {
-    plan: EffectiveExecutionPlan,
-    codex_home_override: Option<PathBuf>,
-}
-
 struct KernelRuntimeProgramExecutor {
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
 }
 
 #[async_trait::async_trait]
@@ -712,9 +881,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
         execute_streaming(
             ExecutionRequest {
                 plan: self.plan.clone(),
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             stdout,
         )
@@ -727,9 +900,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<ExecutionOutput> {
         execute_captured(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await
     }
@@ -740,9 +917,13 @@ impl RuntimeProgramExecutor for KernelRuntimeProgramExecutor {
     ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
         let session = spawn_interactive(ExecutionRequest {
             plan: self.plan.clone(),
+            runtime_auth_provider: program
+                .auth
+                .as_ref()
+                .and_then(|auth| self.runtime_auth_registry.get(auth)),
             program,
             runtime_secrets_mount: self.runtime_secrets_mount.clone(),
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         })
         .await?;
         Ok(Box::new(RuntimeExecutionSession::new(session)))
@@ -754,9 +935,17 @@ fn runtime_execution_context(
 ) -> anyhow::Result<RuntimeExecutionContext> {
     Ok(RuntimeExecutionContext {
         network_mode: plan.network_mode,
+        working_dir: plan
+            .working_dir
+            .as_deref()
+            .map(|working_dir| {
+                map_host_path_into_runtime_mount(working_dir, &plan.mounts, "working directory")
+            })
+            .transpose()?,
         environment: plan.environment.clone(),
         runtime_state_root: Kernel::runtime_state_root(plan).map(Path::to_path_buf),
         runtime_path_projections: runtime_path_projections_for_plan(plan)?,
+        mcp_servers: plan.mcp_servers.clone(),
     })
 }
 
@@ -784,49 +973,6 @@ fn runtime_path_projections_for_plan(
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-#[async_trait::async_trait]
-impl RuntimeTerminalTranscriptProgramExecutor for AttachedRuntimeTranscriptProgramExecutor {
-    fn hard_timeout(&self) -> std::time::Duration {
-        self.plan
-            .hard_timeout
-            .min(ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT)
-    }
-
-    async fn execute(&mut self, program: RuntimeProgramSpec) -> anyhow::Result<ExecutionOutput> {
-        let hard_timeout = self.hard_timeout();
-        timeout(
-            hard_timeout,
-            execute_captured(ExecutionRequest {
-                plan: self.plan.clone(),
-                program,
-                runtime_secrets_mount: None,
-                codex_home_override: self.codex_home_override.clone(),
-            }),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out after {}s while exporting native runtime transcript",
-                hard_timeout.as_secs_f32()
-            )
-        })?
-    }
-
-    async fn spawn(
-        &mut self,
-        program: RuntimeProgramSpec,
-    ) -> anyhow::Result<Box<dyn RuntimeProgramSession>> {
-        let session = spawn_interactive(ExecutionRequest {
-            plan: self.plan.clone(),
-            program,
-            runtime_secrets_mount: None,
-            codex_home_override: self.codex_home_override.clone(),
-        })
-        .await?;
-        Ok(Box::new(RuntimeExecutionSession::new(session)))
-    }
-}
-
 #[derive(Clone)]
 pub struct Kernel {
     sessions: SessionStore,
@@ -849,7 +995,8 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
-    codex_home_override: Option<PathBuf>,
+    runtime_auth_registry: RuntimeAuthRegistry,
+    runtime_auth_context: RuntimeAuthContext,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -861,6 +1008,7 @@ pub struct Kernel {
     private_context_projector: Arc<dyn PrivateContextProjector>,
     private_context_recorder: PrivateContextRecorderService,
     hidden_compaction_turn_timeout: Duration,
+    retain_runtime_raw_turn_payloads: bool,
 }
 
 impl Kernel {
@@ -922,8 +1070,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_execution_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                     network_mode,
                 )
                 .await
@@ -932,8 +1081,9 @@ impl Kernel {
                 crate::kernel::runtime::validate_runtime_launch_prerequisites(
                     runtime_id,
                     &profile.confinement,
-                    profile.required_runtime_auth,
-                    self.codex_home_override.as_deref(),
+                    profile.required_runtime_auth.clone(),
+                    &self.runtime_auth_registry,
+                    &self.runtime_auth_context,
                 )
                 .await
             }
@@ -1020,7 +1170,8 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
-            codex_home_override: options.codex_home_override,
+            runtime_auth_registry: options.runtime_auth_registry,
+            runtime_auth_context: options.runtime_auth_context,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -1032,6 +1183,7 @@ impl Kernel {
             private_context_projector,
             private_context_recorder,
             hidden_compaction_turn_timeout,
+            retain_runtime_raw_turn_payloads: options.retain_runtime_raw_turn_payloads,
         };
 
         kernel.bootstrap().await;
@@ -1047,12 +1199,11 @@ impl Kernel {
         let session_lock = self.session_lock(session_id).await;
         let _guard = session_lock.lock().await;
         let prepared = self.prepare_attached_runtime_launch(input).await?;
-        let plan = prepared.request.plan.clone();
         let output = match execute_attached(prepared.request.clone()).await {
             Ok(output) => output,
             Err(err) => {
                 if let Err(finish_err) = self
-                    .finish_attached_runtime_launch(session_id, &runtime_id, &plan, None, None)
+                    .finish_attached_runtime_launch(session_id, &runtime_id, None, None)
                     .await
                 {
                     return Err(KernelError::Runtime(format!(
@@ -1065,7 +1216,6 @@ impl Kernel {
         self.finish_attached_runtime_launch(
             session_id,
             &runtime_id,
-            &plan,
             output.exit_code,
             output.exit_signal,
         )
@@ -1109,41 +1259,18 @@ impl Kernel {
         let launch_lock = self
             .acquire_attached_runtime_launch_lock(&execution_plan)
             .await?;
-        let recover_before_launch = self
-            .attached_runtime_needs_prelaunch_reconcile(&execution_plan)
-            .await;
         self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
-        self.materialize_attached_runtime_plan(&runtime_kind, &execution_plan)
+        self.materialize_attached_runtime_plan(&execution_plan)
             .await?;
-        if recover_before_launch {
-            self.reconcile_attached_runtime_transcript_best_effort(
-                session_id,
-                &runtime_id,
-                &execution_plan,
-                None,
-                None,
-                "before_launch",
-            )
-            .await;
-        }
-        self.materialize_attached_runtime_context(
-            session_id,
-            &runtime_id,
-            &runtime_kind,
-            &execution_plan,
-        )
-        .await?;
+        self.materialize_attached_runtime_context(session_id, &runtime_id, &execution_plan)
+            .await?;
         let runtime_state_root =
             Self::require_runtime_tui_state_root(&execution_plan)?.to_path_buf();
-        let runtime_session_ready =
-            RuntimeSessionReady::from_runtime_state_root(&runtime_state_root)
-                .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let program = adapter
             .build_terminal_program(RuntimeTerminalProgramInput {
                 session_id,
                 runtime_state_root,
-                runtime_session_ready,
             })
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
@@ -1165,15 +1292,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.mark_attached_runtime_launch_started(&execution_plan)
-            .await?;
 
         Ok(PreparedAttachedRuntimeLaunch {
             request: ExecutionRequest {
                 plan: execution_plan,
+                runtime_auth_provider: program
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| self.runtime_auth_registry.get(auth)),
                 program,
                 runtime_secrets_mount,
-                codex_home_override: self.codex_home_override.clone(),
+                runtime_auth_context: self.runtime_auth_context.clone(),
             },
             _launch_lock: launch_lock,
         })
@@ -1183,7 +1312,6 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         let runtime_state_root = Self::require_runtime_tui_state_root(plan)?;
@@ -1208,9 +1336,6 @@ impl Kernel {
             remove_attached_runtime_context_files_best_effort(runtime_state_root).await;
             return Err(err);
         }
-        if runtime_kind == OPENCODE_RUNTIME_KIND {
-            write_opencode_generated_config(runtime_state_root).await?;
-        }
         Ok(())
     }
 
@@ -1218,36 +1343,9 @@ impl Kernel {
         &self,
         session_id: Uuid,
         runtime_id: &str,
-        plan: &EffectiveExecutionPlan,
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> Result<(), KernelError> {
-        let reconciliation = self
-            .reconcile_attached_runtime_transcript_best_effort(
-                session_id,
-                runtime_id,
-                plan,
-                exit_code,
-                exit_signal,
-                "after_exit",
-            )
-            .await;
-        if reconciliation
-            .as_ref()
-            .is_some_and(|summary| summary.reconciled)
-        {
-            self.mark_attached_runtime_launch_clean(plan).await;
-        }
-        if exit_code == Some(0)
-            && exit_signal.is_none()
-            && reconciliation
-                .as_ref()
-                .is_some_and(|summary| summary.reconciled && summary.resumable)
-        {
-            self.mark_runtime_session_ready(plan).await;
-        } else {
-            self.clear_runtime_session_ready(plan).await;
-        }
         self.audit
             .append(
                 "runtime.tui.exit",
@@ -1263,191 +1361,6 @@ impl Kernel {
             .await
             .map_err(internal)?;
         Ok(())
-    }
-
-    async fn reconcile_attached_runtime_transcript_best_effort(
-        &self,
-        session_id: Uuid,
-        runtime_id: &str,
-        plan: &EffectiveExecutionPlan,
-        exit_code: Option<i32>,
-        exit_signal: Option<i32>,
-        phase: &'static str,
-    ) -> Option<AttachedRuntimeReconciliation> {
-        match self
-            .reconcile_attached_runtime_transcript(session_id, runtime_id, plan)
-            .await
-        {
-            Ok(summary) => {
-                self.append_audit_event_best_effort(
-                    "runtime.tui.reconcile",
-                    Some(session_id),
-                    "kernel",
-                    json!({
-                        "runtime_id": runtime_id,
-                        "phase": phase,
-                        "exit_code": exit_code,
-                        "exit_signal": exit_signal,
-                        "exported_turn_count": summary.exported_turn_count,
-                        "imported_turn_count": summary.imported_turn_count,
-                        "source_warning_count": summary.warning_count,
-                        "reconciled": summary.reconciled,
-                        "resumable": summary.resumable,
-                    }),
-                )
-                .await;
-                Some(summary)
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    runtime_id,
-                    session_id = %session_id,
-                    phase,
-                    "failed to reconcile attached runtime transcript"
-                );
-                self.append_audit_event_best_effort(
-                    "runtime.tui.reconcile_error",
-                    Some(session_id),
-                    "kernel",
-                    json!({
-                        "runtime_id": runtime_id,
-                        "phase": phase,
-                        "exit_code": exit_code,
-                        "exit_signal": exit_signal,
-                        "error": err.to_string(),
-                    }),
-                )
-                .await;
-                None
-            }
-        }
-    }
-
-    async fn reconcile_attached_runtime_transcript(
-        &self,
-        session_id: Uuid,
-        runtime_id: &str,
-        plan: &EffectiveExecutionPlan,
-    ) -> Result<AttachedRuntimeReconciliation, KernelError> {
-        let runtime_state_root = Self::require_runtime_tui_state_root(plan)?.to_path_buf();
-        let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
-            KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
-        })?;
-        let transcript_input = RuntimeTerminalTranscriptInput {
-            session_id,
-            runtime_state_root,
-            launch_started_at: self.attached_runtime_launch_started_at(plan).await,
-        };
-        let mut executor = AttachedRuntimeTranscriptProgramExecutor {
-            plan: plan.clone(),
-            codex_home_override: self.codex_home_override.clone(),
-        };
-        let RuntimeTerminalTranscript {
-            mut turns,
-            warnings,
-            state,
-        } = adapter
-            .export_terminal_transcript(transcript_input, &mut executor)
-            .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
-        let warning_count = warnings.len();
-        for warning in warnings {
-            self.append_audit_event_best_effort(
-                "runtime.tui.reconcile_source_warning",
-                Some(session_id),
-                "kernel",
-                json!({
-                    "runtime_id": runtime_id,
-                    "source_id": warning.source_id,
-                    "error": warning.error,
-                }),
-            )
-            .await;
-        }
-        let exported_turn_count = turns.len();
-        turns.sort_by(|left, right| {
-            left.started_at
-                .cmp(&right.started_at)
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        });
-
-        let mut imported_count = 0usize;
-        let mut imported_session = None;
-        for turn in turns {
-            let Some(imported) = self
-                .insert_attached_runtime_turn(session_id, runtime_id, turn)
-                .await?
-            else {
-                continue;
-            };
-            imported_count += 1;
-            if imported_session.is_none() {
-                imported_session = Some(self.get_scoped_session(session_id).await?);
-            }
-            let session = imported_session.as_ref().ok_or_else(|| {
-                KernelError::Internal(
-                    "attached import session was not loaded after first import".to_string(),
-                )
-            })?;
-            self.post_commit_session_turn(
-                session,
-                &imported,
-                PrivateContextRecordSurface::AttachedNativeTui,
-            )
-            .await?;
-        }
-        if imported_count > 0 {
-            let session = self.get_scoped_session(session_id).await?;
-            self.maybe_compact_session_transcript_best_effort(&session)
-                .await;
-        }
-
-        Ok(AttachedRuntimeReconciliation {
-            exported_turn_count,
-            imported_turn_count: imported_count,
-            warning_count,
-            reconciled: state.is_reconciled(),
-            resumable: state.is_resumable(),
-        })
-    }
-
-    async fn insert_attached_runtime_turn(
-        &self,
-        session_id: Uuid,
-        runtime_id: &str,
-        turn: RuntimeTerminalTurn,
-    ) -> Result<Option<SessionTurnRecord>, KernelError> {
-        if turn.display_user_text.trim().is_empty()
-            || turn.prompt_user_text.trim().is_empty()
-            || turn.assistant_text.trim().is_empty()
-        {
-            return Ok(None);
-        }
-        let status = match turn.status {
-            RuntimeTerminalTurnStatus::Completed => SessionTurnStatus::Completed,
-            RuntimeTerminalTurnStatus::Failed => SessionTurnStatus::Failed,
-            RuntimeTerminalTurnStatus::Interrupted => SessionTurnStatus::Interrupted,
-        };
-        let turn_id = attached_runtime_turn_id(session_id, runtime_id, &turn.source_id);
-        self.session_turns
-            .insert_imported_turn_if_absent(ImportedSessionTurn {
-                turn_id,
-                session_id,
-                kind: SessionTurnKind::Normal,
-                status,
-                display_user_text: turn.display_user_text,
-                prompt_user_text: turn.prompt_user_text,
-                assistant_text: turn.assistant_text,
-                error_code: turn.error_code,
-                error_text: turn.error_text,
-                attachment_source_turn_id: None,
-                runtime_id: runtime_id.to_string(),
-                started_at: turn.started_at,
-                finished_at: Some(turn.finished_at),
-            })
-            .await
-            .map_err(internal)
     }
 
     async fn bootstrap(&self) {
@@ -2285,6 +2198,39 @@ impl Kernel {
             .map_err(internal)?;
 
         Ok(SessionHistoryResponse { turns })
+    }
+
+    pub async fn session_turn_journal(
+        &self,
+        req: SessionTurnJournalRequest,
+    ) -> Result<SessionTurnJournalResponse, KernelError> {
+        let session = self.get_scoped_session(req.session_id).await?;
+        let turn = self
+            .session_turns
+            .get(req.turn_id)
+            .await
+            .map_err(internal)?
+            .filter(|turn| turn.session_id == session.session_id)
+            .ok_or_else(|| KernelError::NotFound("session turn not found".to_string()))?;
+
+        let include_raw = req.include_raw && self.retain_runtime_raw_turn_payloads;
+        let events = self
+            .session_turns
+            .list_journal_events(turn.turn_id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|record| SessionTurnJournalEventView {
+                event: record.event,
+                raw: if include_raw { record.raw } else { None },
+            })
+            .collect::<Vec<_>>();
+
+        Ok(SessionTurnJournalResponse {
+            session_id: session.session_id,
+            turn_id: turn.turn_id,
+            events,
+        })
     }
 
     pub async fn find_latest_session_summary(
@@ -6881,18 +6827,6 @@ impl Kernel {
         }
     }
 
-    async fn post_commit_session_turn(
-        &self,
-        session: &super::sessions::Session,
-        turn: &SessionTurnRecord,
-        surface: PrivateContextRecordSurface,
-    ) -> Result<(), KernelError> {
-        self.touch_committed_session_turn(session).await?;
-        self.record_private_context_turn_best_effort(session, turn, surface)
-            .await;
-        Ok(())
-    }
-
     async fn touch_committed_session_turn(
         &self,
         session: &super::sessions::Session,
@@ -7108,7 +7042,7 @@ impl Kernel {
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let turn_input = RuntimeTurnInput {
             runtime_session_id: handle.runtime_session_id.clone(),
             prompt,
@@ -7119,11 +7053,12 @@ impl Kernel {
         let runtime_executor = KernelRuntimeProgramExecutor {
             plan: execution_plan,
             runtime_secrets_mount,
-            codex_home_override: self.codex_home_override.clone(),
+            runtime_auth_registry: self.runtime_auth_registry.clone(),
+            runtime_auth_context: self.runtime_auth_context.clone(),
         };
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
-                RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter.turn(turn_input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     adapter
                         .program_backed_turn(
@@ -7132,7 +7067,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -7165,8 +7100,8 @@ impl Kernel {
         };
 
         let mut events = Vec::new();
-        while let Some(event) = event_rx.recv().await {
-            events.push(event);
+        while let Some(record) = journal_rx.recv().await {
+            events.push(record.event);
         }
         let close_result = adapter.close(&handle).await;
         outcome?;
@@ -7764,6 +7699,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
+        process::Stdio,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -7785,7 +7721,7 @@ mod tests {
         PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES, PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
     };
     use crate::kernel::runtime::{
-        RuntimeAdapterInfo, RuntimeEventSender, RuntimeTerminalTranscriptState,
+        RawTurnPayload, RuntimeAdapterInfo, RuntimeEventSender, RuntimeTurnJournalSender,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::kernel::session_turns::SessionTurnStore;
@@ -7874,6 +7810,79 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn runtime_mcp_stdio_proxy_correlates_idless_kernel_errors() {
+        let Ok(node) = which::which("node") else {
+            eprintln!("skipping MCP stdio proxy regression: node executable not found");
+            return;
+        };
+        let temp_dir = tempdir().expect("temp dir");
+        let script_path = temp_dir.path().join("proxy.mjs");
+        let socket_path = temp_dir.path().join("kernel.sock");
+        fs::write(&script_path, RUNTIME_MCP_STDIO_PROXY_JS).expect("write proxy script");
+
+        let listener = UnixListener::bind(&socket_path).expect("bind fake kernel socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proxy connection");
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader
+                .read_line(&mut request)
+                .await
+                .expect("read proxy request");
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"busy"}}"#,
+                )
+                .await
+                .expect("write fake kernel response");
+            stream.write_all(b"\n").await.expect("write newline");
+            stream.shutdown().await.expect("shutdown fake socket");
+        });
+
+        let mut child = tokio::process::Command::new(node)
+            .arg(&script_path)
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn MCP stdio proxy");
+
+        let mut stdin = child.stdin.take().expect("proxy stdin");
+        stdin
+            .write_all(br#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call"}"#)
+            .await
+            .expect("write proxy request");
+        stdin.write_all(b"\n").await.expect("write request newline");
+        drop(stdin);
+
+        let stdout = child.stdout.take().expect("proxy stdout");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        let read = timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+            .await
+            .expect("proxy response timed out")
+            .expect("read proxy response");
+        assert!(read > 0, "proxy exited without a response");
+
+        let response: Value = serde_json::from_str(line.trim()).expect("proxy response JSON");
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "call-1");
+        assert_eq!(response["error"]["code"].as_i64(), Some(-32000));
+        assert_eq!(response["error"]["message"].as_str(), Some("busy"));
+
+        server.await.expect("fake kernel server task");
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("proxy exit timed out")
+            .expect("wait for proxy");
+        assert!(status.success(), "proxy exited with {status}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn runtime_state_file_write_rejects_symlinked_root() {
         let temp_dir = tempdir().expect("temp dir");
         let real_root = temp_dir.path().join("real-runtime-state");
@@ -7917,64 +7926,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn attached_runtime_prelaunch_state_rejects_symlinked_root() {
-        let temp_dir = tempdir().expect("temp dir");
-        let real_root = temp_dir.path().join("real-runtime-state");
-        let linked_root = temp_dir.path().join("linked-runtime-state");
-        fs::create_dir(&real_root).expect("real root");
-        fs::write(real_root.join(RUNTIME_TUI_STATE_MARKER), "clean\n").expect("write state");
-        std::os::unix::fs::symlink(&real_root, &linked_root).expect("symlink root");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let mut plan = test_execution_plan("codex");
-        plan.mounts = vec![MountSpec {
-            source: linked_root,
-            target: "/runtime".to_string(),
-            access: MountAccess::ReadWrite,
-        }];
-
-        assert!(
-            kernel
-                .attached_runtime_needs_prelaunch_reconcile(&plan)
-                .await,
-            "symlinked runtime roots should not be trusted as clean runtime TUI state"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn attached_runtime_prelaunch_state_rejects_symlinked_marker() {
-        let temp_dir = tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        let outside_state = temp_dir.path().join("outside-state");
-        fs::create_dir(&runtime_state_root).expect("runtime root");
-        fs::write(&outside_state, "clean\n").expect("outside state");
-        std::os::unix::fs::symlink(
-            &outside_state,
-            runtime_state_root.join(RUNTIME_TUI_STATE_MARKER),
-        )
-        .expect("symlink state marker");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let mut plan = test_execution_plan("codex");
-        plan.mounts = vec![MountSpec {
-            source: runtime_state_root,
-            target: "/runtime".to_string(),
-            access: MountAccess::ReadWrite,
-        }];
-
-        assert!(
-            kernel
-                .attached_runtime_needs_prelaunch_reconcile(&plan)
-                .await,
-            "symlinked runtime TUI state markers should not be trusted as clean state"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn runtime_session_ready_clear_rejects_symlinked_root() {
         let temp_dir = tempdir().expect("temp dir");
         let real_root = temp_dir.path().join("real-runtime-state");
@@ -8001,28 +7952,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attached_runtime_transcript_export_timeout_is_capped() {
-        let mut plan = test_execution_plan("codex");
-        plan.hard_timeout = ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT * 10;
-        let executor = AttachedRuntimeTranscriptProgramExecutor {
-            plan,
-            codex_home_override: None,
-        };
-        assert_eq!(
-            executor.hard_timeout(),
-            ATTACHED_RUNTIME_TRANSCRIPT_EXPORT_TIMEOUT
-        );
-
-        let mut plan = test_execution_plan("codex");
-        plan.hard_timeout = Duration::from_secs(5);
-        let executor = AttachedRuntimeTranscriptProgramExecutor {
-            plan,
-            codex_home_override: None,
-        };
-        assert_eq!(executor.hard_timeout(), Duration::from_secs(5));
-    }
-
     fn test_execution_plan(runtime_id: &str) -> EffectiveExecutionPlan {
         EffectiveExecutionPlan {
             runtime_id: runtime_id.to_string(),
@@ -8030,10 +7959,12 @@ mod tests {
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
             environment: Vec::new(),
+            mcp_servers: Vec::new(),
             idle_timeout: Duration::from_secs(30),
             hard_timeout: Duration::from_secs(60),
             mounts: Vec::new(),
@@ -8041,6 +7972,31 @@ mod tests {
             escape_classes: std::collections::BTreeSet::new(),
             limits: crate::kernel::runtime::ExecutionLimits::default(),
         }
+    }
+
+    #[test]
+    fn runtime_execution_context_uses_runtime_visible_working_dir() {
+        let mut plan = test_execution_plan("opencode");
+        plan.working_dir = Some("/host/workspace/crates/runtime".to_string());
+        plan.mounts = vec![
+            MountSpec {
+                source: "/host/workspace".into(),
+                target: "/workspace".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+            MountSpec {
+                source: "/host/workspace/crates".into(),
+                target: "/workspace/crates".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let context = runtime_execution_context(&plan).expect("runtime context");
+
+        assert_eq!(
+            context.working_dir.as_deref(),
+            Some("/workspace/crates/runtime")
+        );
     }
 
     const TEST_NATIVE_HOME_ARTIFACT_DIR: &str = "generated-artifacts/images";
@@ -8103,13 +8059,10 @@ mod tests {
     const TEST_PRE_TURN_FAILURE_RUNTIME_ID: &str = "pre-turn-failure";
     const TEST_CAPTURE_PROMPT_RUNTIME_ID: &str = "capture-prompt";
     const TEST_REPLY_RUNTIME_ID: &str = "reply-runtime";
+    const TEST_RAW_JOURNAL_RUNTIME_ID: &str = "raw-journal-runtime";
+    const TEST_TIMEOUT_JOURNAL_RUNTIME_ID: &str = "timeout-journal-runtime";
 
-    struct CountingTerminalRuntimeAdapter {
-        exports: Arc<AtomicUsize>,
-        turns: Vec<RuntimeTerminalTurn>,
-        resumable: bool,
-        reconciled: bool,
-    }
+    struct CountingTerminalRuntimeAdapter;
 
     #[async_trait::async_trait]
     impl RuntimeAdapter for CountingTerminalRuntimeAdapter {
@@ -8139,19 +8092,6 @@ mod tests {
                 executable: TEST_TERMINAL_RUNTIME_ID.to_string(),
                 ..RuntimeProgramSpec::default()
             })
-        }
-
-        async fn export_terminal_transcript(
-            &self,
-            _input: RuntimeTerminalTranscriptInput,
-            _executor: &mut dyn RuntimeTerminalTranscriptProgramExecutor,
-        ) -> anyhow::Result<RuntimeTerminalTranscript> {
-            self.exports.fetch_add(1, Ordering::SeqCst);
-            Ok(RuntimeTerminalTranscript::new(
-                self.turns.clone(),
-                Vec::new(),
-                RuntimeTerminalTranscriptState::new(self.reconciled, self.resumable),
-            ))
         }
 
         async fn resolve_capability_requests(
@@ -8206,7 +8146,7 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            _events: RuntimeEventSender,
+            _journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!(
@@ -8264,10 +8204,10 @@ mod tests {
         async fn turn(
             &self,
             input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
             self.prompts.lock().await.push(input.prompt);
-            drop(events.send(RuntimeEvent::Done));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
             Ok(RuntimeTurnResult::default())
         }
 
@@ -8320,13 +8260,137 @@ mod tests {
         async fn turn(
             &self,
             _input: RuntimeTurnInput,
-            events: RuntimeEventSender,
+            journal: RuntimeTurnJournalSender,
         ) -> anyhow::Result<RuntimeTurnResult> {
-            drop(events.send(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: self.message.clone(),
-            }));
-            drop(events.send(RuntimeEvent::Done));
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: self.message.clone(),
+                })),
+            );
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RawJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for RawJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_RAW_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("raw-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(journal.send(TurnEvent::with_raw(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "raw-backed answer".to_string(),
+                },
+                RawTurnPayload {
+                    driver: "test-driver".to_string(),
+                    payload: "{\"secret\":\"debug-only\"}".to_string(),
+                },
+            )));
+            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+            Ok(RuntimeTurnResult::default())
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TimeoutJournalRuntimeAdapter;
+
+    #[async_trait::async_trait]
+    impl RuntimeAdapter for TimeoutJournalRuntimeAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string(),
+                version: "test".to_string(),
+                healthy: true,
+            }
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> anyhow::Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: format!("timeout-journal-{}", Uuid::new_v4()),
+                resumes_existing_session: false,
+            })
+        }
+
+        async fn turn(
+            &self,
+            _input: RuntimeTurnInput,
+            journal: RuntimeTurnJournalSender,
+        ) -> anyhow::Result<RuntimeTurnResult> {
+            drop(
+                journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: "before timeout".to_string(),
+                })),
+            );
+            sleep(Duration::from_millis(250)).await;
             Ok(RuntimeTurnResult::default())
         }
 
@@ -8465,6 +8529,90 @@ mod tests {
             .await
     }
 
+    struct RawJournalExecution {
+        _temp_dir: TempDir,
+        kernel: Kernel,
+        session_id: Uuid,
+        turn_id: Uuid,
+        journal: SessionTurnJournalResponse,
+    }
+
+    async fn execute_raw_journal_runtime_turn(
+        retain_raw: bool,
+        include_raw: bool,
+    ) -> RawJournalExecution {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                retain_runtime_raw_turn_payloads: retain_raw,
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_RAW_JOURNAL_RUNTIME_ID,
+                Arc::new(RawJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "hello".to_string(),
+                    prompt_user_text: "hello".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_RAW_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("raw journal runtime turn");
+
+        assert_eq!(response.status, SessionTurnStatus::Completed);
+        assert_eq!(response.assistant_text, "raw-backed answer");
+        let journal = kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw,
+            })
+            .await
+            .expect("list runtime journal");
+        RawJournalExecution {
+            _temp_dir: temp_dir,
+            kernel,
+            session_id,
+            turn_id,
+            journal,
+        }
+    }
+
     async fn open_test_session(kernel: &Kernel) -> Uuid {
         kernel
             .open_session(SessionOpenRequest {
@@ -8478,28 +8626,7 @@ mod tests {
             .session_id
     }
 
-    async fn kernel_with_counting_terminal_runtime(
-        temp_dir: &tempfile::TempDir,
-    ) -> (Kernel, Arc<AtomicUsize>) {
-        let (kernel, exports) =
-            kernel_with_counting_terminal_runtime_and_transcript(temp_dir, Vec::new(), false).await;
-        (kernel, exports)
-    }
-
-    async fn kernel_with_counting_terminal_runtime_and_transcript(
-        temp_dir: &tempfile::TempDir,
-        turns: Vec<RuntimeTerminalTurn>,
-        resumable: bool,
-    ) -> (Kernel, Arc<AtomicUsize>) {
-        kernel_with_counting_terminal_runtime_and_state(temp_dir, turns, resumable, true).await
-    }
-
-    async fn kernel_with_counting_terminal_runtime_and_state(
-        temp_dir: &tempfile::TempDir,
-        turns: Vec<RuntimeTerminalTurn>,
-        resumable: bool,
-        reconciled: bool,
-    ) -> (Kernel, Arc<AtomicUsize>) {
+    async fn kernel_with_counting_terminal_runtime(temp_dir: &tempfile::TempDir) -> Kernel {
         let runtime_root = temp_dir.path().join("runtime");
         let workspace_root = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_root)
@@ -8516,37 +8643,13 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let exports = Arc::new(AtomicUsize::new(0));
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter {
-                    exports: Arc::clone(&exports),
-                    turns,
-                    resumable,
-                    reconciled,
-                }),
+                Arc::new(CountingTerminalRuntimeAdapter),
             )
             .await;
-        (kernel, exports)
-    }
-
-    fn test_terminal_turn(source_id: &str) -> RuntimeTerminalTurn {
-        RuntimeTerminalTurn {
-            source_id: source_id.to_string(),
-            display_user_text: "hello native tui".to_string(),
-            prompt_user_text: "hello native tui".to_string(),
-            assistant_text: "hello from native tui".to_string(),
-            status: RuntimeTerminalTurnStatus::Completed,
-            error_code: None,
-            error_text: None,
-            started_at: DateTime::<Utc>::from(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
-            ),
-            finished_at: DateTime::<Utc>::from(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(2),
-            ),
-        }
+        kernel
     }
 
     fn test_attached_runtime_launch_input(session_id: Uuid) -> AttachedRuntimeLaunchInput {
@@ -8554,25 +8657,6 @@ mod tests {
             session_id,
             runtime_id: TEST_TERMINAL_RUNTIME_ID.to_string(),
         }
-    }
-
-    async fn assert_runtime_tui_state(runtime_state_root: &Path, expected: &str) {
-        assert_eq!(
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_STATE_MARKER))
-                .await
-                .expect("read runtime TUI state"),
-            format!("{expected}\n")
-        );
-    }
-
-    async fn read_runtime_tui_launch_started_at(runtime_state_root: &Path) -> DateTime<Utc> {
-        let contents =
-            tokio::fs::read_to_string(runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE))
-                .await
-                .expect("read runtime TUI launch timestamp");
-        DateTime::parse_from_rfc3339(contents.trim())
-            .expect("parse runtime TUI launch timestamp")
-            .with_timezone(&Utc)
     }
 
     #[tokio::test]
@@ -8876,11 +8960,11 @@ mod tests {
         .await
         .expect("write runtime skill md");
         tokio::fs::write(
-            runtime_skill_dir.join("scripts/send"),
+            runtime_skill_dir.join("scripts/tool"),
             "#!/usr/bin/env bash\n",
         )
         .await
-        .expect("write runtime send helper");
+        .expect("write runtime helper");
         runtime_skill_dir
     }
 
@@ -9239,9 +9323,12 @@ mod tests {
             .expect("complete private context record test turn")
             .expect("completed private context record test turn");
         kernel
-            .post_commit_session_turn(session, &completed, surface)
+            .touch_committed_session_turn(session)
             .await
-            .expect("post-commit private context record test turn");
+            .expect("touch private context record test session");
+        kernel
+            .record_private_context_turn_best_effort(session, &completed, surface)
+            .await;
         completed
     }
 
@@ -9927,14 +10014,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_native_tui_import_invokes_private_context_recorder() {
+    async fn attached_native_tui_exit_does_not_invoke_private_context_recorder() {
         let temp_dir = tempdir().expect("temp dir");
-        let (mut kernel, _exports) = kernel_with_counting_terminal_runtime_and_transcript(
-            &temp_dir,
-            vec![test_terminal_turn("native-recorder-source")],
-            true,
-        )
-        .await;
+        let mut kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let requests = install_test_private_context_recorder(
             &mut kernel,
             PrivateContextRecordOutcome::completed(1),
@@ -9947,7 +10029,7 @@ mod tests {
         )
         .await;
 
-        let launch = kernel
+        let _launch = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session.session_id))
             .await
             .expect("prepare attached runtime launch");
@@ -9955,7 +10037,6 @@ mod tests {
             .finish_attached_runtime_launch(
                 session.session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
                 Some(0),
                 None,
             )
@@ -9963,22 +10044,180 @@ mod tests {
             .expect("finish attached runtime launch");
 
         let requests = requests.lock().expect("private context recorder requests");
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
         assert_eq!(
-            request.surface,
-            PrivateContextRecordSurface::AttachedNativeTui
+            requests.len(),
+            0,
+            "attached native TUI exit must not create post-commit recording work"
         );
-        assert_eq!(request.runtime_id, TEST_TERMINAL_RUNTIME_ID);
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_strips_raw_payloads_unless_debug_retention_enabled() {
+        let default_journal = execute_raw_journal_runtime_turn(false, true).await.journal;
+        assert_eq!(default_journal.events.len(), 2);
+        assert!(default_journal
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
+
+        let retained_journal_without_raw =
+            execute_raw_journal_runtime_turn(true, false).await.journal;
+        assert_eq!(retained_journal_without_raw.events.len(), 2);
+        assert!(retained_journal_without_raw
+            .events
+            .iter()
+            .all(|record| record.raw.is_none()));
+
+        let retained_journal = execute_raw_journal_runtime_turn(true, true).await.journal;
         assert_eq!(
-            request
-                .transcript
-                .assistant
+            default_journal
+                .events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            retained_journal
+                .events
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            retained_journal.events[0]
+                .raw
                 .as_ref()
-                .expect("assistant text")
-                .text,
-            "hello from native tui"
+                .map(|raw| raw.driver.as_str()),
+            Some("test-driver")
         );
+        assert_eq!(
+            retained_journal.events[0]
+                .raw
+                .as_ref()
+                .map(|raw| raw.payload.as_str()),
+            Some("{\"secret\":\"debug-only\"}")
+        );
+        assert!(retained_journal.events[1].raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_journal_requires_owning_session() {
+        let execution = execute_raw_journal_runtime_turn(true, true).await;
+        let other_session = open_prompt_context_session(
+            &execution.kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+
+        let err = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: other_session.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect_err("other session should not read this journal");
+        assert!(
+            matches!(err, KernelError::NotFound(message) if message == "session turn not found")
+        );
+
+        let own_journal = execution
+            .kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id: execution.session_id,
+                turn_id: execution.turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect("owning session can read journal");
+        assert_eq!(own_journal.events, execution.journal.events);
+    }
+
+    #[tokio::test]
+    async fn timed_out_runtime_turn_flushes_buffered_journal_before_abort() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_turn_idle_timeout: Duration::from_millis(50),
+                runtime_turn_hard_timeout: Duration::from_millis(500),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        kernel
+            .register_runtime_adapter(
+                TEST_TIMEOUT_JOURNAL_RUNTIME_ID,
+                Arc::new(TimeoutJournalRuntimeAdapter),
+            )
+            .await;
+        let session = open_prompt_context_session(
+            &kernel,
+            TrustTier::Main,
+            SessionHistoryPolicy::Interactive,
+        )
+        .await;
+        let session_id = session.session_id;
+        let turn_id = Uuid::new_v4();
+
+        let response = kernel
+            .execute_session_turn_serialized(
+                session,
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: "timeout".to_string(),
+                    prompt_user_text: "timeout".to_string(),
+                    runtime_prompt_user_text: None,
+                    attachment_source_turn_id: None,
+                    prepared_turn: None,
+                    scheduler_run_id: None,
+                    requested_runtime_id: Some(TEST_TIMEOUT_JOURNAL_RUNTIME_ID.to_string()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: Vec::new(),
+                    default_policy_scope: Scope::Session(session_id),
+                    sink: None,
+                    emit_channel_stream_done: true,
+                    audit_actor: "test".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancellation: TurnCancellation::new(),
+                },
+            )
+            .await
+            .expect("runtime timeout response");
+
+        assert_eq!(response.status, SessionTurnStatus::TimedOut);
+        let journal = kernel
+            .session_turn_journal(SessionTurnJournalRequest {
+                session_id,
+                turn_id,
+                include_raw: true,
+            })
+            .await
+            .expect("list timeout journal");
+        let events = journal
+            .events
+            .into_iter()
+            .map(|record| record.event)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "before timeout".to_string(),
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::Error {
+                code: Some(code),
+                text,
+            } if code == "runtime.timeout" && text.contains("idle timed out")
+        ));
     }
 
     #[tokio::test]
@@ -12178,7 +12417,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -12250,7 +12489,7 @@ done
 
         fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect("materialize attached context");
 
@@ -12331,7 +12570,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect_err(
                 "prompt context audit failure should block attached context materialization",
@@ -12380,7 +12619,7 @@ done
 
         let err = fixture
             .kernel
-            .materialize_attached_runtime_context(session.session_id, "mock", "mock", &plan)
+            .materialize_attached_runtime_context(session.session_id, "mock", &plan)
             .await
             .expect_err("attached context file failure should abort materialization");
 
@@ -12574,7 +12813,7 @@ done
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert!(mounts[0].source.ends_with("runtime/team-local"));
         assert!(mounts[0].source.join("SKILL.md").exists());
-        assert!(mounts[0].source.join("scripts/send").exists());
+        assert!(mounts[0].source.join("scripts/tool").exists());
         assert!(!mounts[0].source.join("lionclaw.toml").exists());
         assert!(!mounts[0].source.join("scripts/worker").exists());
     }
@@ -12622,14 +12861,17 @@ done
     }
 
     #[tokio::test]
-    async fn materialize_runtime_plan_projects_skills_using_runtime_kind() {
+    async fn materialize_runtime_plan_projects_skills_using_profile_projection() {
         let temp_dir = tempdir().expect("temp dir");
         let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
             .await
             .expect("kernel init");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
-        let mut plan = test_execution_plan("work-codex");
+        let mut plan = test_execution_plan("work-runtime");
+        plan.skill_projection = Some(
+            crate::kernel::runtime::RuntimeSkillProjectionConfig::native_dir(".native/skills"),
+        );
         plan.mounts = vec![
             MountSpec {
                 source: temp_dir.path().join("workspace"),
@@ -12654,21 +12896,18 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
         assert!(runtime_state_root.exists());
-        let link = runtime_home_root.join(".codex/skills/loopback");
+        let link = runtime_home_root.join(".native/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
                 .expect("read runtime skill link"),
             PathBuf::from("/lionclaw/skills/loopback")
         );
-        assert!(!runtime_state_root
-            .join(OPENCODE_GENERATED_CONFIG_FILE)
-            .exists());
     }
 
     #[tokio::test]
@@ -12680,7 +12919,7 @@ done
         let runtime_state_root = temp_dir.path().join("runtime-state");
         let runtime_home_root = temp_dir.path().join("runtime-home");
         let legacy_home_root = runtime_state_root.join(crate::home::RUNTIME_NATIVE_HOME_DIR);
-        let legacy_config = legacy_home_root.join(".codex/config.toml");
+        let legacy_config = legacy_home_root.join(".native/config.toml");
         tokio::fs::create_dir_all(legacy_config.parent().expect("legacy config parent"))
             .await
             .expect("create legacy home");
@@ -12702,7 +12941,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -12748,7 +12987,7 @@ done
         ];
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("materialize runtime plan");
 
@@ -12967,30 +13206,6 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn write_opencode_generated_config_points_to_runtime_agents_file() {
-        let temp_dir = tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        create_owner_private_directory_all(None, &runtime_state_root)
-            .await
-            .expect("create runtime state root");
-
-        write_opencode_generated_config(&runtime_state_root)
-            .await
-            .expect("write generated opencode config");
-
-        let generated =
-            tokio::fs::read_to_string(runtime_state_root.join(OPENCODE_GENERATED_CONFIG_FILE))
-                .await
-                .expect("read generated opencode config");
-        let generated: serde_json::Value =
-            serde_json::from_str(&generated).expect("parse generated opencode config");
-        assert_eq!(
-            generated["instructions"],
-            json!([OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH])
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn materialize_runtime_plan_ignores_project_generated_context_cache() {
@@ -13032,7 +13247,7 @@ done
         std::os::unix::fs::symlink(&outside, &generated_agents).expect("generated context symlink");
 
         kernel
-            .materialize_runtime_plan("codex", &plan)
+            .materialize_runtime_plan(&plan)
             .await
             .expect("cached generated context is not part of runtime plan materialization");
 
@@ -13048,7 +13263,7 @@ done
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempdir().expect("temp dir");
-        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let runtime_root = temp_dir.path().join("runtime");
         let generated_agents = crate::home::runtime_project_dir_from_parts(
             &runtime_root,
@@ -13086,6 +13301,9 @@ done
             .expect("read generated attached context");
 
         assert!(generated.contains("## Native Runtime TUI Session"));
+        assert!(generated.contains("Native UI turns remain runtime-owned"));
+        assert!(generated.contains("prior LionClaw-managed transcript/history"));
+        assert!(!generated.contains("stores completed native UI turns"));
         assert!(!generated.contains("outside context"));
         for file_name in [GENERATED_AGENTS_FILE, AGENTS_FILE] {
             assert_eq!(
@@ -13140,16 +13358,10 @@ done
         )
         .await
         .expect("kernel init");
-        let exports = Arc::new(AtomicUsize::new(0));
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter {
-                    exports,
-                    turns: Vec::new(),
-                    resumable: false,
-                    reconciled: true,
-                }),
+                Arc::new(CountingTerminalRuntimeAdapter),
             )
             .await;
         let session_id = open_test_session(&kernel).await;
@@ -13170,67 +13382,61 @@ done
     }
 
     #[tokio::test]
-    async fn attached_runtime_skips_prelaunch_reconcile_for_clean_state() {
+    async fn attached_runtime_launch_does_not_import_native_tui_turns() {
         let temp_dir = tempdir().expect("temp dir");
-        let (kernel, exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let session_id = open_test_session(&kernel).await;
+        let initial_turns = kernel
+            .session_turns
+            .list_recent(session_id, 10)
+            .await
+            .expect("list initial session turns");
 
-        let first = kernel
+        let _launch = kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
-            .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
-            .expect("runtime state root")
-            .to_path_buf();
-
-        assert_eq!(exports.load(Ordering::SeqCst), 0);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        read_runtime_tui_launch_started_at(&runtime_state_root).await;
-
+            .expect("prepare launch");
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &first.request.plan,
-                Some(0),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(0), None)
             .await
-            .expect("finish first launch");
+            .expect("finish launch");
 
-        assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_CLEAN).await;
-        assert!(!runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .exists());
-        drop(first);
-
-        let second = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
+        let final_turns = kernel
+            .session_turns
+            .list_recent(session_id, 10)
             .await
-            .expect("prepare clean relaunch");
-
-        assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        read_runtime_tui_launch_started_at(&runtime_state_root).await;
-        assert!(!runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .exists());
+            .expect("list final session turns");
         assert_eq!(
-            Kernel::runtime_state_root(&second.request.plan),
-            Some(runtime_state_root.as_path())
+            final_turns.len(),
+            initial_turns.len(),
+            "attached native TUI launches must not insert canonical session turns"
+        );
+        let runtime_tui_events = kernel
+            .query_audit(Some(session_id), None, None, Some(10))
+            .await
+            .expect("query attached runtime audit")
+            .events
+            .into_iter()
+            .filter_map(|event| {
+                event
+                    .event_type
+                    .starts_with("runtime.tui.")
+                    .then_some(event.event_type)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            runtime_tui_events,
+            BTreeSet::from([
+                "runtime.tui.exit".to_string(),
+                "runtime.tui.launch".to_string(),
+            ])
         );
     }
 
     #[tokio::test]
-    async fn attached_runtime_does_not_mark_ready_without_adapter_resume_proof() {
+    async fn attached_runtime_launch_preserves_existing_ready_marker() {
         let temp_dir = tempdir().expect("temp dir");
-        let (kernel, _exports) = kernel_with_counting_terminal_runtime_and_transcript(
-            &temp_dir,
-            vec![test_terminal_turn("native-source-1")],
-            false,
-        )
-        .await;
+        let kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let session_id = open_test_session(&kernel).await;
 
         let launch = kernel
@@ -13240,189 +13446,24 @@ done
         let runtime_state_root = Kernel::runtime_state_root(&launch.request.plan)
             .expect("runtime state root")
             .to_path_buf();
+        write_runtime_state_file(
+            &runtime_state_root,
+            RUNTIME_SESSION_READY_MARKER,
+            b"ready\n".to_vec(),
+        )
+        .await
+        .expect("seed ready marker");
 
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
-                Some(0),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(1), None)
             .await
             .expect("finish launch");
 
-        assert!(!runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .exists());
-    }
-
-    #[tokio::test]
-    async fn attached_runtime_keeps_dirty_state_until_target_reconciles() {
-        let temp_dir = tempdir().expect("temp dir");
-        let (kernel, exports) = kernel_with_counting_terminal_runtime_and_state(
-            &temp_dir,
-            vec![test_terminal_turn("native-source-1")],
-            true,
-            false,
-        )
-        .await;
-        let session_id = open_test_session(&kernel).await;
-
-        let first = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
-            .expect("runtime state root")
-            .to_path_buf();
-
-        kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &first.request.plan,
-                Some(0),
-                None,
-            )
-            .await
-            .expect("finish first launch");
-
-        assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        assert!(!runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .exists());
-        drop(first);
-
-        let second = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare recovery launch");
-
-        assert_eq!(exports.load(Ordering::SeqCst), 2);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        assert_eq!(
-            Kernel::runtime_state_root(&second.request.plan),
-            Some(runtime_state_root.as_path())
-        );
-    }
-
-    #[tokio::test]
-    async fn attached_runtime_marks_ready_with_adapter_resume_proof() {
-        let temp_dir = tempdir().expect("temp dir");
-        let (kernel, exports) = kernel_with_counting_terminal_runtime_and_transcript(
-            &temp_dir,
-            vec![test_terminal_turn("native-source-1")],
-            true,
-        )
-        .await;
-        let session_id = open_test_session(&kernel).await;
-
-        let first = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
-            .expect("runtime state root")
-            .to_path_buf();
-
-        kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &first.request.plan,
-                Some(0),
-                None,
-            )
-            .await
-            .expect("finish first launch");
-
-        assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert!(runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .is_file());
-        drop(first);
-
-        let second = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare second launch");
-
-        kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &second.request.plan,
-                Some(0),
-                None,
-            )
-            .await
-            .expect("finish second launch");
-
-        assert_eq!(
-            exports.load(Ordering::SeqCst),
-            2,
-            "second clean exit should export again"
-        );
-        assert!(runtime_state_root
-            .join(RUNTIME_SESSION_READY_MARKER)
-            .is_file());
-
-        let events = kernel
-            .query_audit(
-                Some(session_id),
-                Some("runtime.tui.reconcile".to_string()),
-                None,
-                Some(2),
-            )
-            .await
-            .expect("query reconcile audit")
-            .events;
-        assert_eq!(events.len(), 2);
-        assert!(events
-            .iter()
-            .all(|event| event.details["exported_turn_count"] == 1));
-        let mut imported_counts = events
-            .iter()
-            .map(|event| {
-                event.details["imported_turn_count"]
-                    .as_u64()
-                    .expect("imported count")
-            })
-            .collect::<Vec<_>>();
-        imported_counts.sort_unstable();
-        assert_eq!(imported_counts, vec![0, 1]);
-    }
-
-    #[tokio::test]
-    async fn attached_runtime_recovers_dirty_state_before_relaunch() {
-        let temp_dir = tempdir().expect("temp dir");
-        let (kernel, exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
-        let session_id = open_test_session(&kernel).await;
-
-        let first = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare first launch");
-        let runtime_state_root = Kernel::runtime_state_root(&first.request.plan)
-            .expect("runtime state root")
-            .to_path_buf();
-
-        assert_eq!(exports.load(Ordering::SeqCst), 0);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        drop(first);
-
-        let second = kernel
-            .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
-            .await
-            .expect("prepare recovery launch");
-
-        assert_eq!(exports.load(Ordering::SeqCst), 1);
-        assert_runtime_tui_state(&runtime_state_root, RUNTIME_TUI_STATE_RUNNING).await;
-        assert_eq!(
-            Kernel::runtime_state_root(&second.request.plan),
-            Some(runtime_state_root.as_path())
+        assert!(
+            runtime_state_root
+                .join(RUNTIME_SESSION_READY_MARKER)
+                .is_file(),
+            "attached native TUI exit must not clear program-backed runtime readiness"
         );
     }
 
@@ -13457,16 +13498,10 @@ done
         )
         .await
         .expect("kernel init");
-        let exports = Arc::new(AtomicUsize::new(0));
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter {
-                    exports,
-                    turns: Vec::new(),
-                    resumable: false,
-                    reconciled: true,
-                }),
+                Arc::new(CountingTerminalRuntimeAdapter),
             )
             .await;
         let session_id = open_test_session(&kernel).await;
@@ -13476,13 +13511,8 @@ done
             .await
             .expect("prepare attached runtime launch");
 
-        assert!(launch
-            .request
-            .plan
-            .environment
-            .iter()
-            .all(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV));
         assert!(launch.request.plan.escape_classes.is_empty());
+        assert!(launch.request.plan.mcp_servers.is_empty());
         assert!(launch
             .request
             .plan
@@ -13529,14 +13559,13 @@ done
     #[tokio::test]
     async fn attached_runtime_launch_lock_is_shared_between_kernel_instances() {
         let temp_dir = tempdir().expect("temp dir");
-        let (first_kernel, _first_exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let first_kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let session_id = open_test_session(&first_kernel).await;
         let first_launch = first_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare first attached launch");
-        let (second_kernel, _second_exports) =
-            kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let second_kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
 
         let err = match second_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
@@ -13552,18 +13581,12 @@ done
         ));
 
         drop(first_launch);
-        let second_launch = second_kernel
+        let _second_launch = second_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(session_id))
             .await
             .expect("prepare attached launch after lock release");
         second_kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &second_launch.request.plan,
-                Some(0),
-                None,
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, Some(0), None)
             .await
             .expect("finish second launch");
     }
@@ -13571,7 +13594,7 @@ done
     #[tokio::test]
     async fn attached_runtime_launch_lock_is_shared_by_runtime_home_across_sessions() {
         let temp_dir = tempdir().expect("temp dir");
-        let (first_kernel, _first_exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let first_kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let first_session_id = open_test_session(&first_kernel).await;
         let first_launch = first_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(first_session_id))
@@ -13593,8 +13616,7 @@ done
             b"runtime-owned file",
         )
         .expect("runtime can mutate similarly-named home file");
-        let (second_kernel, _second_exports) =
-            kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let second_kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let second_session_id = second_kernel
             .open_session(SessionOpenRequest {
                 channel_id: "terminal".to_string(),
@@ -13620,7 +13642,7 @@ done
         ));
 
         drop(first_launch);
-        let second_launch = second_kernel
+        let _second_launch = second_kernel
             .prepare_attached_runtime_launch(test_attached_runtime_launch_input(second_session_id))
             .await
             .expect("prepare attached launch after native home lock release");
@@ -13628,7 +13650,6 @@ done
             .finish_attached_runtime_launch(
                 second_session_id,
                 TEST_TERMINAL_RUNTIME_ID,
-                &second_launch.request.plan,
                 Some(0),
                 None,
             )
@@ -13703,16 +13724,10 @@ done
         )
         .await
         .expect("kernel init");
-        let exports = Arc::new(AtomicUsize::new(0));
         kernel
             .register_runtime_adapter(
                 TEST_TERMINAL_RUNTIME_ID,
-                Arc::new(CountingTerminalRuntimeAdapter {
-                    exports,
-                    turns: Vec::new(),
-                    resumable: false,
-                    reconciled: true,
-                }),
+                Arc::new(CountingTerminalRuntimeAdapter),
             )
             .await;
         let session_id = open_test_session(&kernel).await;
@@ -13746,7 +13761,7 @@ done
         fs::create_dir_all(&outside_root).expect("outside root");
         std::os::unix::fs::symlink(&outside_root, runtime_id_root.join("main"))
             .expect("symlink runtime workspace parent");
-        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let session_id = open_test_session(&kernel).await;
 
         let err = match kernel
@@ -13819,7 +13834,7 @@ done
     #[tokio::test]
     async fn attached_runtime_exit_audit_records_signal_status() {
         let temp_dir = tempdir().expect("temp dir");
-        let (kernel, _exports) = kernel_with_counting_terminal_runtime(&temp_dir).await;
+        let kernel = kernel_with_counting_terminal_runtime(&temp_dir).await;
         let session_id = open_test_session(&kernel).await;
 
         let launch = kernel
@@ -13831,13 +13846,7 @@ done
             .to_path_buf();
 
         kernel
-            .finish_attached_runtime_launch(
-                session_id,
-                TEST_TERMINAL_RUNTIME_ID,
-                &launch.request.plan,
-                None,
-                Some(2),
-            )
+            .finish_attached_runtime_launch(session_id, TEST_TERMINAL_RUNTIME_ID, None, Some(2))
             .await
             .expect("finish signal launch");
 
@@ -14235,10 +14244,12 @@ done
             confinement: crate::kernel::runtime::ConfinementConfig::Oci(
                 crate::kernel::runtime::OciConfinementConfig::default(),
             ),
+            skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
             working_dir: None,
             environment: Vec::new(),
+            mcp_servers: Vec::new(),
             idle_timeout: Duration::from_secs(1),
             hard_timeout: Duration::from_secs(1),
             mounts: Vec::new(),
@@ -17753,6 +17764,17 @@ fn default_runtime_channel_send_format_hint() -> String {
     "plain".to_string()
 }
 
+fn channel_send_mcp_server_spec() -> RuntimeMcpServerSpec {
+    RuntimeMcpServerSpec {
+        name: CHANNEL_SEND_MCP_SERVER_NAME.to_string(),
+        command: "node".to_string(),
+        args: vec![
+            CHANNEL_SEND_MCP_PROXY_CONTAINER_PATH.to_string(),
+            CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
+        ],
+    }
+}
+
 async fn run_runtime_channel_send_bridge(
     kernel: Kernel,
     context: RuntimeChannelSendContext,
@@ -17833,13 +17855,18 @@ async fn reject_runtime_channel_send_connection(
     stream: UnixStream,
     problem: RuntimeChannelSendProblem,
 ) {
-    kernel
-        .audit_runtime_channel_send_denied(context, "", "", problem.code)
-        .await;
-    let response = runtime_channel_send_error_response(problem.code, problem.message);
+    let json_rpc_code = runtime_channel_send_json_rpc_code_for_problem(problem.code);
+    let response = runtime_channel_send_mcp_denied_response(
+        kernel,
+        context,
+        Value::Null,
+        json_rpc_code,
+        problem,
+    )
+    .await;
     match timeout(
         RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT,
-        write_runtime_channel_send_response(stream, response),
+        write_runtime_channel_send_response(stream, Some(response)),
     )
     .await
     {
@@ -17874,27 +17901,41 @@ async fn handle_runtime_channel_send_stream(
     )
     .await
     {
-        Ok(Ok(())) => match serde_json::from_slice::<RuntimeChannelSendRequest>(&line) {
-            Ok(request) => runtime_channel_send_response(
-                kernel.send_runtime_channel_message(context, request).await,
-            ),
+        Ok(Ok(())) => match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => runtime_channel_send_mcp_response(&kernel, &context, value).await,
             Err(err) => {
-                runtime_channel_send_denied_response(
-                    &kernel,
-                    &context,
-                    RuntimeChannelSendProblem::new(
-                        "invalid_json",
-                        format!("request is not valid channel.send JSON: {err}"),
-                    ),
+                let problem = RuntimeChannelSendProblem::new(
+                    "invalid_json",
+                    format!("request is not valid MCP JSON-RPC: {err}"),
+                );
+                Some(
+                    runtime_channel_send_mcp_denied_response(
+                        &kernel,
+                        &context,
+                        Value::Null,
+                        -32700,
+                        problem,
+                    )
+                    .await,
                 )
-                .await
             }
         },
-        Ok(Err(problem)) => runtime_channel_send_denied_response(&kernel, &context, problem).await,
-        Err(_) => {
-            runtime_channel_send_denied_response(
+        Ok(Err(problem)) => Some(
+            runtime_channel_send_mcp_denied_response(
                 &kernel,
                 &context,
+                Value::Null,
+                runtime_channel_send_json_rpc_code_for_problem(problem.code),
+                problem,
+            )
+            .await,
+        ),
+        Err(_) => Some(
+            runtime_channel_send_mcp_denied_response(
+                &kernel,
+                &context,
+                Value::Null,
+                -32000,
                 RuntimeChannelSendProblem::new(
                     "request_timeout",
                     format!(
@@ -17903,8 +17944,8 @@ async fn handle_runtime_channel_send_stream(
                     ),
                 ),
             )
-            .await
-        }
+            .await,
+        ),
     };
 
     write_runtime_channel_send_response(reader.into_inner(), response).await
@@ -17912,11 +17953,13 @@ async fn handle_runtime_channel_send_stream(
 
 async fn write_runtime_channel_send_response(
     mut stream: UnixStream,
-    response: Value,
+    response: Option<Value>,
 ) -> Result<(), std::io::Error> {
-    let mut encoded = serde_json::to_vec(&response)?;
-    encoded.push(b'\n');
-    stream.write_all(&encoded).await?;
+    if let Some(response) = response {
+        let mut encoded = serde_json::to_vec(&response)?;
+        encoded.push(b'\n');
+        stream.write_all(&encoded).await?;
+    }
     stream.shutdown().await
 }
 
@@ -17967,6 +18010,316 @@ async fn read_bounded_json_line(
     }
 }
 
+async fn runtime_channel_send_mcp_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    request: Value,
+) -> Option<Value> {
+    let id = match runtime_channel_send_json_rpc_request_id(&request) {
+        Ok(id) => id,
+        Err(problem) => {
+            return Some(
+                runtime_channel_send_mcp_denied_response(
+                    kernel,
+                    context,
+                    Value::Null,
+                    -32600,
+                    problem,
+                )
+                .await,
+            );
+        }
+    };
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        let problem = RuntimeChannelSendProblem::new(
+            "invalid_json_rpc",
+            "MCP request jsonrpc must be \"2.0\"",
+        );
+        return Some(
+            runtime_channel_send_mcp_denied_response(
+                kernel,
+                context,
+                id.unwrap_or(Value::Null),
+                -32600,
+                problem,
+            )
+            .await,
+        );
+    }
+    let method = match request.get("method").and_then(Value::as_str) {
+        Some(method) => method,
+        None => {
+            let problem = RuntimeChannelSendProblem::new(
+                "invalid_json_rpc",
+                "MCP request method is required",
+            );
+            return Some(
+                runtime_channel_send_mcp_denied_response(
+                    kernel,
+                    context,
+                    id.unwrap_or(Value::Null),
+                    -32600,
+                    problem,
+                )
+                .await,
+            );
+        }
+    };
+    if method == "notifications/initialized" {
+        return None;
+    }
+    let Some(id) = id else {
+        if method == "tools/call" {
+            kernel
+                .audit_runtime_channel_send_denied(context, "", "", "invalid_json_rpc")
+                .await;
+        }
+        return None;
+    };
+    match method {
+        "initialize" => Some(runtime_channel_send_json_rpc_result(
+            id,
+            runtime_channel_send_mcp_initialize_result(request.get("params")),
+        )),
+        "tools/list" => Some(runtime_channel_send_json_rpc_result(
+            id,
+            runtime_channel_send_mcp_tools_list_result(),
+        )),
+        "tools/call" => Some(
+            match runtime_channel_send_request_from_mcp_call(request.get("params"), &id) {
+                Ok(channel_send_request) => {
+                    let result = kernel
+                        .send_runtime_channel_message(context.clone(), channel_send_request)
+                        .await;
+                    runtime_channel_send_mcp_tool_result(id, result)
+                }
+                Err(message) => {
+                    runtime_channel_send_mcp_denied_response(
+                        kernel,
+                        context,
+                        id,
+                        -32602,
+                        RuntimeChannelSendProblem::new("invalid_request", message),
+                    )
+                    .await
+                }
+            },
+        ),
+        _ => Some(
+            runtime_channel_send_mcp_denied_response(
+                kernel,
+                context,
+                id,
+                -32601,
+                RuntimeChannelSendProblem::new(
+                    "unsupported_method",
+                    format!("unsupported MCP method '{method}'"),
+                ),
+            )
+            .await,
+        ),
+    }
+}
+
+fn runtime_channel_send_json_rpc_request_id(
+    request: &Value,
+) -> Result<Option<Value>, RuntimeChannelSendProblem> {
+    let Some(id) = request.get("id") else {
+        return Ok(None);
+    };
+    if matches!(id, Value::String(_) | Value::Number(_) | Value::Null) {
+        Ok(Some(id.clone()))
+    } else {
+        Err(RuntimeChannelSendProblem::new(
+            "invalid_json_rpc",
+            "MCP request id must be a string, number, or null",
+        ))
+    }
+}
+
+async fn runtime_channel_send_mcp_denied_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    id: Value,
+    json_rpc_code: i64,
+    problem: RuntimeChannelSendProblem,
+) -> Value {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    runtime_channel_send_json_rpc_error(id, json_rpc_code, problem.message)
+}
+
+fn runtime_channel_send_json_rpc_result(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn runtime_channel_send_json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+fn runtime_channel_send_json_rpc_code_for_problem(code: &str) -> i64 {
+    match code {
+        "invalid_json" => -32700,
+        "invalid_json_rpc" | "invalid_request" => -32600,
+        "unsupported_method" => -32601,
+        "internal_error" => -32603,
+        _ => -32000,
+    }
+}
+
+fn runtime_channel_send_mcp_initialize_result(params: Option<&Value>) -> Value {
+    let protocol_version = params
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .unwrap_or("2025-06-18");
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "tools": {},
+        },
+        "serverInfo": {
+            "name": "lionclaw-kernel",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+fn runtime_channel_send_mcp_tools_list_result() -> Value {
+    json!({
+        "tools": [{
+            "name": "channel_send",
+            "description": "Send an outbound message to a LionClaw channel conversation.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional stable retry key for this tool call."
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Projected LionClaw channel id."
+                    },
+                    "conversation_ref": {
+                        "type": "string",
+                        "description": "Projected channel conversation reference."
+                    },
+                    "thread_ref": {
+                        "type": "string",
+                        "description": "Optional projected thread reference."
+                    },
+                    "reply_to_ref": {
+                        "type": "string",
+                        "description": "Optional channel message to reply to."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Message text."
+                    },
+                    "format_hint": {
+                        "type": "string",
+                        "enum": ["plain", "markdown", "html"],
+                        "default": "plain"
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "path": { "type": "string" },
+                                "filename": { "type": "string" },
+                                "mime_type": { "type": "string" }
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                },
+                "required": ["channel_id", "conversation_ref"]
+            }
+        }]
+    })
+}
+
+fn runtime_channel_send_request_from_mcp_call(
+    params: Option<&Value>,
+    request_id: &Value,
+) -> Result<RuntimeChannelSendRequest, String> {
+    let params = params.ok_or_else(|| "tools/call params are required".to_string())?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call params.name is required".to_string())?;
+    if name != "channel_send" {
+        return Err(format!("unknown MCP tool '{name}'"));
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let arguments: RuntimeMcpChannelSendArguments = serde_json::from_value(arguments)
+        .map_err(|err| format!("channel_send arguments are invalid: {err}"))?;
+    let idempotency_key = arguments
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| runtime_channel_send_mcp_idempotency_key(request_id));
+
+    Ok(RuntimeChannelSendRequest {
+        idempotency_key,
+        channel_id: arguments.channel_id,
+        conversation_ref: arguments.conversation_ref,
+        thread_ref: arguments.thread_ref,
+        reply_to_ref: arguments.reply_to_ref,
+        content: RuntimeChannelSendContent {
+            text: arguments.text,
+            format_hint: arguments.format_hint,
+            attachments: arguments.attachments,
+        },
+    })
+}
+
+fn runtime_channel_send_mcp_idempotency_key(request_id: &Value) -> String {
+    match request_id {
+        Value::String(value) if !value.trim().is_empty() => format!("mcp:{}", value.trim()),
+        Value::Number(value) => format!("mcp:{value}"),
+        _ => String::new(),
+    }
+}
+
+fn runtime_channel_send_mcp_tool_result(
+    id: Value,
+    result: Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem>,
+) -> Value {
+    let body = runtime_channel_send_response(result);
+    let is_error = body.get("ok").and_then(Value::as_bool) != Some(true);
+    runtime_channel_send_json_rpc_result(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": body.to_string(),
+            }],
+            "isError": is_error,
+        }),
+    )
+}
+
 fn runtime_channel_send_response(
     result: Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem>,
 ) -> Value {
@@ -17988,17 +18341,6 @@ fn runtime_channel_send_error_response(code: &str, message: impl Into<String>) -
             "message": message.into(),
         },
     })
-}
-
-async fn runtime_channel_send_denied_response(
-    kernel: &Kernel,
-    context: &RuntimeChannelSendContext,
-    problem: RuntimeChannelSendProblem,
-) -> Value {
-    kernel
-        .audit_runtime_channel_send_denied(context, "", "", problem.code)
-        .await;
-    runtime_channel_send_error_response(problem.code, problem.message)
 }
 
 fn runtime_channel_send_fingerprint(
@@ -18169,20 +18511,11 @@ fn runtime_channel_send_host_path(
     Ok(host_path)
 }
 
-fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
-    match err {
-        KernelError::NotFound(message) => {
-            RuntimeChannelSendProblem::new("unknown_channel", message)
-        }
-        KernelError::Conflict(message) => {
-            RuntimeChannelSendProblem::new("channel_unavailable", message)
-        }
-        other => runtime_channel_send_kernel_problem(other),
-    }
-}
-
 fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendProblem {
     match err {
+        KernelError::BadRequest(message) if message == CHANNEL_SEND_ROUTE_NOT_PROJECTED => {
+            RuntimeChannelSendProblem::new("route_not_allowed", message)
+        }
         KernelError::BadRequest(message) => {
             RuntimeChannelSendProblem::new("invalid_request", message)
         }
@@ -18193,10 +18526,6 @@ fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendPr
         }
         KernelError::Internal(message) => RuntimeChannelSendProblem::new("internal_error", message),
     }
-}
-
-fn runtime_channel_send_internal_problem(err: anyhow::Error) -> RuntimeChannelSendProblem {
-    RuntimeChannelSendProblem::new("internal_error", err.to_string())
 }
 
 fn runtime_channel_send_bridge_closed_problem() -> RuntimeChannelSendProblem {
@@ -18223,6 +18552,20 @@ fn normalize_runtime_channel_send_content(
         normalized.text.clear();
     }
     normalized
+}
+
+fn runtime_channel_send_broker_payload(
+    request: &RuntimeChannelSendRequest,
+    content: &RuntimeChannelSendContent,
+) -> Value {
+    json!({
+        "channel_id": request.channel_id,
+        "conversation_ref": request.conversation_ref,
+        "thread_ref": request.thread_ref,
+        "reply_to_ref": request.reply_to_ref,
+        "content": content.text,
+        "attachment_count": content.attachments.len(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -18263,9 +18606,6 @@ fn parse_channel_send_intent(value: &serde_json::Value) -> Result<ChannelSendInt
         .get("content")
         .and_then(|raw| raw.as_str())
         .ok_or_else(|| "channel.send broker output missing content".to_string())?;
-    if content.trim().is_empty() {
-        return Err("channel.send broker output missing content".to_string());
-    }
 
     Ok(ChannelSendIntent {
         channel_id: channel_id.to_string(),
@@ -18351,66 +18691,6 @@ fn write_runtime_state_file_blocking(
             runtime_state_root.display()
         ))
     })
-}
-
-async fn write_opencode_generated_config(runtime_state_root: &Path) -> Result<(), KernelError> {
-    let contents = serde_json::to_vec_pretty(&json!({
-        "$schema": "https://opencode.ai/config.json",
-        "instructions": [OPENCODE_GENERATED_CONFIG_INSTRUCTIONS_PATH],
-    }))
-    .map_err(|err| internal(err.into()))?;
-    write_runtime_state_file(runtime_state_root, OPENCODE_GENERATED_CONFIG_FILE, contents).await
-}
-
-async fn read_runtime_state_file(
-    runtime_state_root: &Path,
-    file_name: &str,
-) -> Result<Option<String>, KernelError> {
-    let runtime_state_root = runtime_state_root.to_path_buf();
-    let file_name = file_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        read_runtime_state_file_blocking(&runtime_state_root, &file_name)
-    })
-    .await
-    .map_err(|err| internal(err.into()))?
-}
-
-fn read_runtime_state_file_blocking(
-    runtime_state_root: &Path,
-    file_name: &str,
-) -> Result<Option<String>, KernelError> {
-    use rustix::fs::{openat, Mode, OFlags};
-
-    let target_name = runtime_state_file_name(file_name)?;
-    let Some(root) = open_existing_runtime_state_root_blocking(runtime_state_root)? else {
-        return Ok(None);
-    };
-    let file = match openat(
-        &root,
-        &target_name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(file) => file,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(err) => {
-            return Err(internal(anyhow::anyhow!(
-                "failed to open runtime state file '{}' in '{}': {err}",
-                file_name,
-                runtime_state_root.display()
-            )))
-        }
-    };
-    let mut file = std::fs::File::from(file);
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).map_err(|err| {
-        internal(anyhow::anyhow!(
-            "failed to read runtime state file '{}' in '{}': {err}",
-            file_name,
-            runtime_state_root.display()
-        ))
-    })?;
-    Ok(Some(contents))
 }
 
 async fn remove_runtime_state_file(
@@ -18540,11 +18820,6 @@ fn generate_pairing_code() -> String {
 
 fn generate_pairing_token() -> String {
     format!("lc_{}", Uuid::new_v4().simple())
-}
-
-fn attached_runtime_turn_id(session_id: Uuid, runtime_id: &str, source_id: &str) -> Uuid {
-    let material = format!("lionclaw:runtime-tui-turn:{session_id}:{runtime_id}:{source_id}");
-    Uuid::new_v5(&Uuid::NAMESPACE_OID, material.as_bytes())
 }
 
 fn runtime_native_home_private_permissions(
@@ -19671,6 +19946,53 @@ impl QueuedTurnTerminal {
 
 const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
 const ASSISTANT_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_JOURNAL_FLUSH_RECORDS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeJournalContext<'a> {
+    turn_id: Uuid,
+    session_id: Uuid,
+    runtime_id: &'a str,
+    runtime_session_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeTurnEventDispatch<'a> {
+    stream_context: &'a Option<ChannelStreamContext>,
+    event_sink: &'a Option<RuntimeEventSink>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeJournalPersistence {
+    pending: Vec<TurnEvent>,
+}
+
+impl RuntimeJournalPersistence {
+    fn push(&mut self, record: TurnEvent) {
+        self.pending.push(record);
+    }
+
+    fn flush_due(&self) -> bool {
+        self.pending.len() >= RUNTIME_JOURNAL_FLUSH_RECORDS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn pending(&self) -> &[TurnEvent] {
+        &self.pending
+    }
+
+    fn clear_flushed(&mut self) {
+        self.pending.clear();
+    }
+}
+
+struct RecordRuntimeTurnEventOutcome {
+    persisted_record: TurnEvent,
+    checkpointed: bool,
+}
 
 #[derive(Debug, Default)]
 struct AssistantCheckpointState {
@@ -20219,7 +20541,6 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
-        let runtime_kind = adapter.info().await.id;
         let runtime_turn_mode = adapter.turn_mode();
         let RuntimeExecutionSkills {
             skill_ids: runtime_skill_ids,
@@ -20249,8 +20570,7 @@ impl Kernel {
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;
         }
-        self.materialize_runtime_plan(&runtime_kind, &execution_plan)
-            .await?;
+        self.materialize_runtime_plan(&execution_plan).await?;
         if let Some(turn) = &prepared_turn {
             if turn.runtime_id != runtime_id {
                 return Err(KernelError::Internal(
@@ -21487,6 +21807,84 @@ impl Kernel {
         Ok(())
     }
 
+    async fn runtime_channel_send_authorized_routes(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+    ) -> Result<RuntimeChannelSendRoutes, KernelError> {
+        let session = self.sessions.get(session_id).await.map_err(internal)?;
+        let active_channel_route = if let Some(session) =
+            session.filter(|session| self.applied_channel(&session.channel_id).is_some())
+        {
+            let route = self
+                .resolved_channel_route_for_session(&session.channel_id, &session.peer_id, turn_id)
+                .await?;
+            Some(RuntimeChannelSendRoute {
+                channel_id: session.channel_id,
+                conversation_ref: route.conversation_ref,
+                thread_ref: route.thread_ref,
+                reply_to_ref: route.reply_to_ref,
+            })
+        } else {
+            None
+        };
+        let mut projected_channel_routes = self
+            .project_instance_runtime
+            .as_ref()
+            .map(Self::projected_runtime_channel_send_routes)
+            .unwrap_or_default();
+        projected_channel_routes.retain(|route| self.applied_channel(&route.channel_id).is_some());
+
+        Ok(RuntimeChannelSendRoutes {
+            active: active_channel_route,
+            projected: projected_channel_routes,
+        })
+    }
+
+    fn projected_runtime_channel_send_routes(
+        context: &ProjectInstanceRuntimeContext,
+    ) -> Vec<RuntimeChannelSendRoute> {
+        context
+            .channel_send_inventory
+            .instances
+            .iter()
+            .filter(|instance| instance.name != context.instance_name)
+            .filter_map(|instance| {
+                let channel_send = instance.channel_send.as_ref()?;
+                if channel_send.status != ProjectInstanceChannelSendStatus::Configured {
+                    return None;
+                }
+                let channel_id = channel_send
+                    .channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                let conversation_ref = channel_send
+                    .conversation_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                let thread_ref = match channel_send.thread_ref.as_ref() {
+                    Some(Some(thread_ref)) => {
+                        let thread_ref = thread_ref.trim();
+                        if thread_ref.is_empty() {
+                            None
+                        } else {
+                            Some(thread_ref.to_string())
+                        }
+                    }
+                    _ => None,
+                };
+                Some(RuntimeChannelSendRoute {
+                    channel_id: channel_id.to_string(),
+                    conversation_ref: conversation_ref.to_string(),
+                    thread_ref,
+                    reply_to_ref: None,
+                })
+            })
+            .collect()
+    }
+
     async fn start_runtime_channel_send_bridge(
         &self,
         context: RuntimeChannelSendContext,
@@ -21499,6 +21897,17 @@ impl Kernel {
         {
             return self
                 .runtime_channel_send_bridge_error(&context, "runtime_socket_dir", err)
+                .await;
+        }
+        if let Err(err) = write_runtime_state_file(
+            &context.runtime_state_root,
+            CHANNEL_SEND_MCP_PROXY_STATE_FILE,
+            RUNTIME_MCP_STDIO_PROXY_JS.as_bytes().to_vec(),
+        )
+        .await
+        {
+            return self
+                .runtime_channel_send_bridge_error(&context, "mcp_proxy", err)
                 .await;
         }
         let socket_owner_id = runtime_channel_send_socket_owner_id(&context.runtime_state_root);
@@ -21517,12 +21926,9 @@ impl Kernel {
             access: MountAccess::ReadWrite,
         });
 
-        plan.environment
-            .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
-        plan.environment.push((
-            CHANNEL_SEND_SOCKET_ENV.to_string(),
-            CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
-        ));
+        plan.mcp_servers
+            .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
+        plan.mcp_servers.push(channel_send_mcp_server_spec());
 
         context.runtime_path_projections = match runtime_path_projections_for_plan(plan) {
             Ok(projections) => projections,
@@ -21560,8 +21966,8 @@ impl Kernel {
         if runtime_turn_mode != RuntimeTurnMode::ProgramBacked
             || !plan.escape_classes.contains(&EscapeClass::ChannelSend)
         {
-            plan.environment
-                .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
+            plan.mcp_servers
+                .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
             return Ok(None);
         }
         let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
@@ -21578,6 +21984,14 @@ impl Kernel {
                 .await;
         };
         let runtime_native_home_root = Self::runtime_native_home_root(plan).map(Path::to_path_buf);
+        let routes = self
+            .runtime_channel_send_authorized_routes(session_id, turn_id)
+            .await?;
+        if routes.active.is_none() && routes.projected.is_empty() {
+            plan.mcp_servers
+                .retain(|server| server.name != CHANNEL_SEND_MCP_SERVER_NAME);
+            return Ok(None);
+        }
         let runtime_native_home_artifact_dirs = if runtime_native_home_root.is_some() {
             Self::runtime_declared_native_home_artifact_dirs(adapter, runtime_id)?
         } else {
@@ -21588,6 +22002,8 @@ impl Kernel {
                 session_id,
                 turn_id,
                 runtime_id: runtime_id.to_string(),
+                active_channel_route: routes.active,
+                projected_channel_routes: routes.projected,
                 runtime_state_root,
                 runtime_native_home_root,
                 runtime_native_home_artifact_dirs,
@@ -21711,25 +22127,20 @@ impl Kernel {
 
     async fn materialize_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_attached_runtime_plan(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
-        self.materialize_runtime_mounts_and_skills(runtime_kind, plan)
-            .await
+        self.materialize_runtime_mounts_and_skills(plan).await
     }
 
     async fn materialize_runtime_mounts_and_skills(
         &self,
-        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
@@ -21751,9 +22162,13 @@ impl Kernel {
         let Some(runtime_home_root) = Self::runtime_native_home_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_kind, runtime_home_root, &plan.mounts)
-            .await
-            .map_err(internal)
+        project_runtime_skills(
+            plan.skill_projection.as_ref(),
+            runtime_home_root,
+            &plan.mounts,
+        )
+        .await
+        .map_err(internal)
     }
 
     async fn reset_runtime_plan_state(
@@ -21799,125 +22214,6 @@ impl Kernel {
         })
         .await
         .map_err(|err| internal(err.into()))?
-    }
-
-    async fn attached_runtime_needs_prelaunch_reconcile(
-        &self,
-        plan: &EffectiveExecutionPlan,
-    ) -> bool {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
-            return false;
-        };
-        match read_runtime_state_file(runtime_state_root, RUNTIME_TUI_STATE_MARKER).await {
-            Ok(Some(contents)) => match contents.trim() {
-                RUNTIME_TUI_STATE_RUNNING => true,
-                RUNTIME_TUI_STATE_CLEAN => false,
-                other => {
-                    warn!(
-                        path = %runtime_state_root.join(RUNTIME_TUI_STATE_MARKER).display(),
-                        state = other,
-                        "unknown runtime TUI state; reconciling before launch"
-                    );
-                    true
-                }
-            },
-            Ok(None) => false,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    path = %runtime_state_root.join(RUNTIME_TUI_STATE_MARKER).display(),
-                    "failed to read runtime TUI state; reconciling before launch"
-                );
-                true
-            }
-        }
-    }
-
-    async fn mark_attached_runtime_launch_started(
-        &self,
-        plan: &EffectiveExecutionPlan,
-    ) -> Result<(), KernelError> {
-        self.clear_runtime_session_ready(plan).await;
-        self.write_runtime_tui_launch_started_at(plan, Utc::now())
-            .await?;
-        self.write_runtime_tui_state(plan, RUNTIME_TUI_STATE_RUNNING)
-            .await
-    }
-
-    async fn mark_attached_runtime_launch_clean(&self, plan: &EffectiveExecutionPlan) {
-        if let Err(err) = self
-            .write_runtime_tui_state(plan, RUNTIME_TUI_STATE_CLEAN)
-            .await
-        {
-            warn!(?err, "failed to mark runtime TUI state clean");
-        }
-    }
-
-    async fn write_runtime_tui_state(
-        &self,
-        plan: &EffectiveExecutionPlan,
-        state: &'static str,
-    ) -> Result<(), KernelError> {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
-            return Ok(());
-        };
-        write_runtime_state_file(
-            runtime_state_root,
-            RUNTIME_TUI_STATE_MARKER,
-            format!("{state}\n").into_bytes(),
-        )
-        .await
-    }
-
-    async fn write_runtime_tui_launch_started_at(
-        &self,
-        plan: &EffectiveExecutionPlan,
-        started_at: DateTime<Utc>,
-    ) -> Result<(), KernelError> {
-        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
-            return Ok(());
-        };
-        write_runtime_state_file(
-            runtime_state_root,
-            RUNTIME_TUI_LAUNCH_STARTED_AT_FILE,
-            format!("{}\n", started_at.to_rfc3339()).into_bytes(),
-        )
-        .await
-    }
-
-    async fn attached_runtime_launch_started_at(
-        &self,
-        plan: &EffectiveExecutionPlan,
-    ) -> Option<DateTime<Utc>> {
-        let runtime_state_root = Self::runtime_state_root(plan)?;
-        let contents = match read_runtime_state_file(
-            runtime_state_root,
-            RUNTIME_TUI_LAUNCH_STARTED_AT_FILE,
-        )
-        .await
-        {
-            Ok(Some(contents)) => contents,
-            Ok(None) => return None,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    path = %runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE).display(),
-                    "failed to read runtime TUI launch timestamp"
-                );
-                return None;
-            }
-        };
-        match DateTime::parse_from_rfc3339(contents.trim()) {
-            Ok(started_at) => Some(started_at.with_timezone(&Utc)),
-            Err(err) => {
-                warn!(
-                    ?err,
-                    path = %runtime_state_root.join(RUNTIME_TUI_LAUNCH_STARTED_AT_FILE).display(),
-                    "failed to parse runtime TUI launch timestamp"
-                );
-                None
-            }
-        }
     }
 
     async fn mark_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
@@ -22268,9 +22564,9 @@ impl Kernel {
         turn_id: Uuid,
         stream_context: &Option<ChannelStreamContext>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), KernelError> {
+    ) -> Result<bool, KernelError> {
         if !checkpoints.checkpoint_due() {
-            return Ok(());
+            return Ok(false);
         }
 
         self.session_turns
@@ -22286,7 +22582,7 @@ impl Kernel {
             }
         }
         checkpoints.mark_checkpointed();
-        Ok(())
+        Ok(true)
     }
 
     async fn record_runtime_event(
@@ -22297,7 +22593,7 @@ impl Kernel {
         event: RuntimeEvent,
         events: &mut Vec<RuntimeEvent>,
         checkpoints: &mut AssistantCheckpointState,
-    ) -> Result<(), FailedRuntimeTurn> {
+    ) -> Result<bool, FailedRuntimeTurn> {
         checkpoints.observe(&event);
         let appended_sequence = if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
             // Durable channel streams get their terminal done after the turn is persisted.
@@ -22314,7 +22610,8 @@ impl Kernel {
                 })?
         };
         checkpoints.observe_sequence(&event, appended_sequence);
-        self.checkpoint_running_turn(turn_id, stream_context, checkpoints)
+        let checkpointed = self
+            .checkpoint_running_turn(turn_id, stream_context, checkpoints)
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
@@ -22323,6 +22620,131 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         events.push(event);
+        Ok(checkpointed)
+    }
+
+    async fn record_runtime_turn_event(
+        &self,
+        turn_id: Uuid,
+        stream_context: &Option<ChannelStreamContext>,
+        event_sink: &Option<RuntimeEventSink>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<RecordRuntimeTurnEventOutcome, FailedRuntimeTurn> {
+        let event = record.event;
+        let persisted_record = if self.retain_runtime_raw_turn_payloads {
+            TurnEvent {
+                event: event.clone(),
+                raw: record.raw,
+            }
+        } else {
+            TurnEvent::canonical(event.clone())
+        };
+        let checkpointed = self
+            .record_runtime_event(
+                turn_id,
+                stream_context,
+                event_sink,
+                event,
+                events,
+                checkpoints,
+            )
+            .await?;
+        Ok(RecordRuntimeTurnEventOutcome {
+            persisted_record,
+            checkpointed,
+        })
+    }
+
+    async fn record_and_buffer_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+        journal: &mut RuntimeJournalPersistence,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let outcome = self
+            .record_runtime_turn_event(
+                journal_context.turn_id,
+                dispatch.stream_context,
+                dispatch.event_sink,
+                record,
+                events,
+                checkpoints,
+            )
+            .await?;
+        journal.push(outcome.persisted_record);
+        if outcome.checkpointed || journal.flush_due() {
+            self.flush_runtime_turn_journal_best_effort(journal_context, journal)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn flush_runtime_turn_journal_best_effort(
+        &self,
+        context: RuntimeJournalContext<'_>,
+        journal: &mut RuntimeJournalPersistence,
+    ) {
+        if journal.is_empty() {
+            return;
+        }
+        let record_count = journal.pending().len();
+        match self
+            .session_turns
+            .append_journal_events(context.turn_id, journal.pending())
+            .await
+        {
+            Ok(_) => journal.clear_flushed(),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    turn_id = %context.turn_id,
+                    runtime_id = context.runtime_id,
+                    runtime_session_id = context.runtime_session_id,
+                    record_count,
+                    "failed to append runtime turn journal batch"
+                );
+                self.append_audit_event_best_effort(
+                    "runtime.turn.journal_append_failed",
+                    Some(context.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": context.turn_id,
+                        "runtime_id": context.runtime_id,
+                        "runtime_session_id": context.runtime_session_id,
+                        "record_count": record_count,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_and_flush_runtime_turn_event(
+        &self,
+        journal_context: RuntimeJournalContext<'_>,
+        dispatch: RuntimeTurnEventDispatch<'_>,
+        record: TurnEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), FailedRuntimeTurn> {
+        let mut journal = RuntimeJournalPersistence::default();
+        self.record_and_buffer_runtime_turn_event(
+            journal_context,
+            dispatch,
+            record,
+            events,
+            checkpoints,
+            &mut journal,
+        )
+        .await?;
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal)
+            .await;
         Ok(())
     }
 
@@ -22330,51 +22752,84 @@ impl Kernel {
         format!("{channel_id}:{session_key}")
     }
 
-    pub(super) async fn enqueue_channel_delivery(
+    async fn build_authorized_channel_delivery<'a>(
         &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: &str,
-    ) -> Result<Uuid, KernelError> {
-        self.enqueue_channel_delivery_content(
-            route,
-            session_id,
-            turn_id,
+        input: AuthorizedChannelDelivery<'a>,
+    ) -> Result<NewChannelDelivery<'a>, KernelError> {
+        let channel_id = input.route.channel_id.trim();
+        let conversation_ref = input.route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        if input.content.text.trim().is_empty() && input.content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
+        if input.content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+            return Err(KernelError::BadRequest(format!(
+                "outbox delivery attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+            )));
+        }
+        self.require_active_channel_binding(channel_id).await?;
+
+        let thread_ref = input
+            .route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = input
+            .route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_kind = input
+            .source_kind
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_id = input.source_id.map(str::trim).filter(|raw| !raw.is_empty());
+        let source_fingerprint = input
+            .source_fingerprint
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        Ok(NewChannelDelivery {
+            route: ChannelDeliveryRoute {
+                channel_id,
+                conversation_ref,
+                thread_ref,
+                reply_to_ref,
+            },
+            session_id: input.session_id,
+            turn_id: input.turn_id,
             source_kind,
             source_id,
-            ChannelDeliveryContent {
-                text: content.to_string(),
-                format_hint: "plain".to_string(),
-                attachments: Vec::new(),
-            },
-        )
-        .await
+            source_fingerprint,
+            content: input.content,
+        })
     }
 
-    pub(super) async fn enqueue_channel_delivery_content(
+    async fn enqueue_authorized_channel_delivery(
         &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: ChannelDeliveryContent,
-    ) -> Result<Uuid, KernelError> {
-        let delivery = self
-            .create_channel_delivery_content(
-                route,
-                session_id,
-                turn_id,
-                source_kind,
-                source_id,
-                content,
-            )
-            .await?;
-        self.audit_channel_outbox_created(&delivery).await?;
-        Ok(delivery.delivery_id)
+        input: AuthorizedChannelDelivery<'_>,
+    ) -> Result<ChannelDeliveryRecord, KernelError> {
+        let delivery = self.build_authorized_channel_delivery(input).await?;
+        self.channel_outbox
+            .enqueue_delivery(delivery)
+            .await
+            .map_err(internal)
+    }
+
+    async fn enqueue_authorized_channel_delivery_idempotent(
+        &self,
+        input: AuthorizedChannelDelivery<'_>,
+    ) -> Result<ChannelOutboxEnqueueResult, KernelError> {
+        let delivery = self.build_authorized_channel_delivery(input).await?;
+        self.channel_outbox
+            .enqueue_delivery_idempotent(delivery)
+            .await
+            .map_err(internal)
     }
 
     pub(super) async fn enqueue_scheduler_run_delivery(
@@ -22482,81 +22937,22 @@ impl Kernel {
         }
         let source_id = turn_id.to_string();
         let delivery = self
-            .create_channel_delivery_content(
-                ChannelDeliveryRoute {
+            .enqueue_authorized_channel_delivery(AuthorizedChannelDelivery {
+                route: ChannelDeliveryRoute {
                     channel_id: &context.channel_id,
                     conversation_ref: &context.conversation_ref,
                     thread_ref: context.thread_ref.as_deref(),
                     reply_to_ref: context.reply_to_ref.as_deref(),
                 },
-                Some(session_id),
-                Some(turn_id),
-                Some("session_turn"),
-                Some(&source_id),
-                content,
-            )
-            .await?;
-        self.audit_channel_outbox_created(&delivery).await
-    }
-
-    async fn create_channel_delivery_content(
-        &self,
-        route: ChannelDeliveryRoute<'_>,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        source_kind: Option<&str>,
-        source_id: Option<&str>,
-        content: ChannelDeliveryContent,
-    ) -> Result<ChannelDeliveryRecord, KernelError> {
-        let channel_id = route.channel_id.trim();
-        let conversation_ref = route.conversation_ref.trim();
-        if channel_id.is_empty() || conversation_ref.is_empty() {
-            return Err(KernelError::BadRequest(
-                "channel_id and conversation_ref are required".to_string(),
-            ));
-        }
-        if content.text.trim().is_empty() && content.attachments.is_empty() {
-            return Err(KernelError::BadRequest(
-                "outbox delivery content is required".to_string(),
-            ));
-        }
-        if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
-            return Err(KernelError::BadRequest(format!(
-                "outbox delivery attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
-            )));
-        }
-        self.require_active_channel_binding(channel_id).await?;
-
-        let thread_ref = route
-            .thread_ref
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty());
-        let reply_to_ref = route
-            .reply_to_ref
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty());
-        let source_kind = source_kind.map(str::trim).filter(|raw| !raw.is_empty());
-        let source_id = source_id.map(str::trim).filter(|raw| !raw.is_empty());
-        let delivery = self
-            .channel_outbox
-            .enqueue_delivery(NewChannelDelivery {
-                route: ChannelDeliveryRoute {
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                    reply_to_ref,
-                },
-                session_id,
-                turn_id,
-                source_kind,
-                source_id,
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                source_kind: Some("session_turn"),
+                source_id: Some(&source_id),
                 source_fingerprint: None,
                 content,
             })
-            .await
-            .map_err(internal)?;
-
-        Ok(delivery)
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await
     }
 
     async fn audit_channel_outbox_created(
@@ -22572,6 +22968,135 @@ impl Kernel {
             )
             .await
             .map_err(internal)
+    }
+
+    async fn authorize_and_enqueue_channel_send<E, F, Fut>(
+        &self,
+        context: CapabilityExecutionContext<'_>,
+        payload: Value,
+        request: BrokerChannelSendRequest,
+        prepare_content: F,
+    ) -> Result<BrokerChannelSendAccepted, E>
+    where
+        E: From<KernelError>,
+        F: FnOnce(&ChannelSendIntent) -> Fut,
+        Fut: Future<Output = Result<BrokerChannelSendContent, E>>,
+    {
+        let broker_output = self
+            .capability_broker
+            .execute(&context, Capability::ChannelSend, &payload)
+            .await
+            .map_err(|err| {
+                let message = err.to_string();
+                if message == CHANNEL_SEND_ROUTE_NOT_PROJECTED {
+                    KernelError::BadRequest(message)
+                } else {
+                    KernelError::BadRequest(format!("broker execution failed: {message}"))
+                }
+            })
+            .map_err(E::from)?;
+        let intent = parse_channel_send_intent(&broker_output).map_err(|detail| {
+            KernelError::BadRequest(format!("broker execution failed: {detail}"))
+        })?;
+
+        self.require_active_channel_binding(&intent.channel_id)
+            .await
+            .map_err(E::from)?;
+
+        if request.idempotent {
+            if let Some(source_fingerprint) = request.source_fingerprint.as_deref() {
+                if let Some(existing) = self
+                    .channel_outbox
+                    .get_delivery_by_source(request.source_kind, &request.source_id)
+                    .await
+                    .map_err(internal)
+                    .map_err(E::from)?
+                {
+                    if existing.source_fingerprint.as_deref() == Some(source_fingerprint) {
+                        return Ok(BrokerChannelSendAccepted {
+                            delivery_id: existing.delivery_id,
+                            channel_id: intent.channel_id,
+                            conversation_ref: intent.conversation_ref,
+                            thread_ref: intent.thread_ref,
+                            reply_to_ref: intent.reply_to_ref,
+                            idempotent: true,
+                        });
+                    }
+                    return Err(E::from(KernelError::Conflict(
+                        "idempotency key was reused with a different payload".to_string(),
+                    )));
+                }
+            }
+        }
+
+        let BrokerChannelSendContent {
+            delivery: content,
+            mut prepared_attachments,
+        } = prepare_content(&intent).await?;
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return Err(E::from(KernelError::BadRequest(
+                "channel.send content cannot be empty".to_string(),
+            )));
+        }
+
+        let delivery_request = AuthorizedChannelDelivery {
+            route: ChannelDeliveryRoute {
+                channel_id: &intent.channel_id,
+                conversation_ref: &intent.conversation_ref,
+                thread_ref: intent.thread_ref.as_deref(),
+                reply_to_ref: intent.reply_to_ref.as_deref(),
+            },
+            session_id: Some(request.session_id),
+            turn_id: Some(request.turn_id),
+            source_kind: Some(request.source_kind),
+            source_id: Some(&request.source_id),
+            source_fingerprint: request.source_fingerprint.as_deref(),
+            content,
+        };
+
+        let (delivery_id, idempotent) = if request.idempotent {
+            match self
+                .enqueue_authorized_channel_delivery_idempotent(delivery_request)
+                .await
+                .map_err(E::from)?
+            {
+                ChannelOutboxEnqueueResult::Created(delivery) => {
+                    let delivery_id = delivery.delivery_id;
+                    if let Some(attachments) = prepared_attachments.as_mut() {
+                        attachments.mark_persisted();
+                    }
+                    self.audit_channel_outbox_created(&delivery)
+                        .await
+                        .map_err(E::from)?;
+                    (delivery_id, false)
+                }
+                ChannelOutboxEnqueueResult::Existing(delivery) => (delivery.delivery_id, true),
+                ChannelOutboxEnqueueResult::Conflict(_delivery) => {
+                    return Err(E::from(KernelError::Conflict(
+                        "idempotency key was reused with a different payload".to_string(),
+                    )));
+                }
+            }
+        } else {
+            let delivery = self
+                .enqueue_authorized_channel_delivery(delivery_request)
+                .await
+                .map_err(E::from)?;
+            let delivery_id = delivery.delivery_id;
+            self.audit_channel_outbox_created(&delivery)
+                .await
+                .map_err(E::from)?;
+            (delivery_id, false)
+        };
+
+        Ok(BrokerChannelSendAccepted {
+            delivery_id,
+            channel_id: intent.channel_id,
+            conversation_ref: intent.conversation_ref,
+            thread_ref: intent.thread_ref,
+            reply_to_ref: intent.reply_to_ref,
+            idempotent,
+        })
     }
 
     async fn send_runtime_channel_message(
@@ -22631,16 +23156,7 @@ impl Kernel {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let Some(content) = request.content.as_ref() else {
-            return self
-                .deny_runtime_channel_send(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    RuntimeChannelSendProblem::new("invalid_request", "content is required"),
-                )
-                .await;
-        };
+        let content = &request.content;
         let format_hint = content.format_hint.trim();
         if !matches!(format_hint, "plain" | "markdown" | "html") {
             return self
@@ -22684,40 +23200,6 @@ impl Kernel {
                 .await;
         }
 
-        if let Err(err) = self.require_active_channel_binding(channel_id).await {
-            return self
-                .deny_runtime_channel_send(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    runtime_channel_send_channel_problem(err),
-                )
-                .await;
-        }
-        if let Some(project_context) = &self.project_instance_runtime {
-            let route_allowed = project_context
-                .channel_send_inventory
-                .contains_channel_send_route(
-                    &project_context.instance_name,
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                );
-            if !route_allowed {
-                return self
-                    .deny_runtime_channel_send(
-                        &context,
-                        channel_id,
-                        conversation_ref,
-                        RuntimeChannelSendProblem::new(
-                            "route_not_allowed",
-                            "channel.send route is not projected for this project instance",
-                        ),
-                    )
-                    .await;
-            }
-        }
-
         let content = normalize_runtime_channel_send_content(content);
         let fingerprint = runtime_channel_send_fingerprint(
             channel_id,
@@ -22731,156 +23213,85 @@ impl Kernel {
             "{}:{}:{idempotency_key}",
             context.session_id, context.turn_id
         );
-        if let Some(existing) = self
-            .channel_outbox
-            .get_delivery_by_source(RUNTIME_CHANNEL_SEND_SOURCE_KIND, &source_id)
-            .await
-            .map_err(runtime_channel_send_internal_problem)?
-        {
-            if existing.source_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": existing.delivery_id,
-                        "idempotent": true,
-                    }),
-                )
-                .await;
-                return Ok(RuntimeChannelSendAccepted {
-                    delivery_id: existing.delivery_id,
-                });
-            }
-            self.audit_runtime_channel_send(
-                "runtime.channel_send.conflict",
-                &context,
-                json!({
-                    "channel_id": channel_id,
-                    "conversation_ref": conversation_ref,
-                    "delivery_id": existing.delivery_id,
-                }),
-            )
-            .await;
-            return Err(RuntimeChannelSendProblem::new(
-                "conflict",
-                "idempotency key was reused with a different payload",
-            ));
-        }
 
-        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &content) {
-            Ok(artifacts) => artifacts,
-            Err(problem) => {
-                return self
-                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                    .await;
-            }
-        };
-        if let Err(problem) =
-            validate_runtime_channel_send_artifacts(&context, &runtime_artifacts).await
-        {
-            return self
-                .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                .await;
-        }
-        let artifact_roots = context.artifact_roots();
-        let mut attachments = match self
-            .prepare_runtime_artifact_attachments_from_roots(
-                context.turn_id,
-                &artifact_roots,
-                &runtime_artifacts,
-            )
-            .await
-            .map_err(runtime_channel_send_kernel_problem)
-        {
-            Ok(attachments) => attachments,
-            Err(problem) => {
-                return self
-                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
-                    .await;
-            }
-        };
-        let content = ChannelDeliveryContent {
-            text: content.text.clone(),
-            format_hint: format_hint.to_string(),
-            attachments: attachments.as_slice().to_vec(),
-        };
-        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
-            .await?;
-        let delivery = self
-            .channel_outbox
-            .enqueue_delivery_idempotent(NewChannelDelivery {
-                route: ChannelDeliveryRoute {
-                    channel_id,
-                    conversation_ref,
-                    thread_ref,
-                    reply_to_ref,
+        let broker_payload = runtime_channel_send_broker_payload(&request, &content);
+        let runtime_context = context.clone();
+        let runtime_content = content.clone();
+        let runtime_format_hint = format_hint.to_string();
+        let kernel = self.clone();
+        let accepted = match self
+            .authorize_and_enqueue_channel_send(
+                context.capability_execution_context(),
+                broker_payload,
+                BrokerChannelSendRequest {
+                    session_id: context.session_id,
+                    turn_id: context.turn_id,
+                    source_kind: RUNTIME_CHANNEL_SEND_SOURCE_KIND,
+                    source_id,
+                    source_fingerprint: Some(fingerprint),
+                    idempotent: true,
                 },
-                session_id: Some(context.session_id),
-                turn_id: Some(context.turn_id),
-                source_kind: Some(RUNTIME_CHANNEL_SEND_SOURCE_KIND),
-                source_id: Some(&source_id),
-                source_fingerprint: Some(&fingerprint),
-                content,
-            })
+                move |_intent| async move {
+                    let runtime_artifacts =
+                        runtime_channel_send_artifacts(&runtime_context, &runtime_content)?;
+                    validate_runtime_channel_send_artifacts(&runtime_context, &runtime_artifacts)
+                        .await?;
+                    let artifact_roots = runtime_context.artifact_roots();
+                    let attachments = kernel
+                        .prepare_runtime_artifact_attachments_from_roots(
+                            runtime_context.turn_id,
+                            &artifact_roots,
+                            &runtime_artifacts,
+                        )
+                        .await
+                        .map_err(runtime_channel_send_kernel_problem)?;
+                    Ok::<_, RuntimeChannelSendProblem>(BrokerChannelSendContent {
+                        delivery: ChannelDeliveryContent {
+                            text: runtime_content.text.clone(),
+                            format_hint: runtime_format_hint,
+                            attachments: attachments.as_slice().to_vec(),
+                        },
+                        prepared_attachments: Some(attachments),
+                    })
+                },
+            )
             .await
-            .map_err(runtime_channel_send_internal_problem)?;
+        {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let problem = err;
+                if problem.code == "conflict" {
+                    self.audit_runtime_channel_send(
+                        "runtime.channel_send.conflict",
+                        &context,
+                        json!({
+                            "channel_id": channel_id,
+                            "conversation_ref": conversation_ref,
+                        }),
+                    )
+                    .await;
+                    return Err(problem);
+                }
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
+            }
+        };
 
-        match delivery {
-            ChannelOutboxEnqueueResult::Created(delivery) => {
-                attachments.mark_persisted();
-                self.audit_channel_outbox_created(&delivery)
-                    .await
-                    .map_err(runtime_channel_send_kernel_problem)?;
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                        "idempotent": false,
-                    }),
-                )
-                .await;
-                Ok(RuntimeChannelSendAccepted {
-                    delivery_id: delivery.delivery_id,
-                })
-            }
-            ChannelOutboxEnqueueResult::Existing(delivery) => {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.allowed",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                        "idempotent": true,
-                    }),
-                )
-                .await;
-                Ok(RuntimeChannelSendAccepted {
-                    delivery_id: delivery.delivery_id,
-                })
-            }
-            ChannelOutboxEnqueueResult::Conflict(delivery) => {
-                self.audit_runtime_channel_send(
-                    "runtime.channel_send.conflict",
-                    &context,
-                    json!({
-                        "channel_id": channel_id,
-                        "conversation_ref": conversation_ref,
-                        "delivery_id": delivery.delivery_id,
-                    }),
-                )
-                .await;
-                Err(RuntimeChannelSendProblem::new(
-                    "conflict",
-                    "idempotency key was reused with a different payload",
-                ))
-            }
-        }
+        self.audit_runtime_channel_send(
+            "runtime.channel_send.allowed",
+            &context,
+            json!({
+                "channel_id": accepted.channel_id,
+                "conversation_ref": accepted.conversation_ref,
+                "delivery_id": accepted.delivery_id,
+                "idempotent": accepted.idempotent,
+            }),
+        )
+        .await;
+        Ok(RuntimeChannelSendAccepted {
+            delivery_id: accepted.delivery_id,
+        })
     }
 
     async fn require_runtime_channel_send_bridge_open(
@@ -23500,17 +23911,16 @@ impl Kernel {
         if let ClassifiedInput::LionClawControl(control) =
             classify_input(&persisted_turn.prompt_user_text)
         {
-            if let Err(err) = self
-                .process_queued_lionclaw_control(
-                    &turn,
-                    &session,
-                    persisted_turn,
-                    control,
-                    stream_context.clone(),
-                    cancellation,
-                )
-                .await
-            {
+            let control_result = Box::pin(self.process_queued_lionclaw_control(
+                &turn,
+                &session,
+                persisted_turn,
+                control,
+                stream_context.clone(),
+                cancellation,
+            ))
+            .await;
+            if let Err(err) = control_result {
                 let code = queued_turn_failure_code(&err);
                 if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
@@ -24515,7 +24925,7 @@ impl Kernel {
                 "Continue the existing runtime conversation for this LionClaw session. LionClaw keeps the canonical transcript separately, so prior turns may not be replayed in full on every request.".to_string()
             }
             ContextItemId::NativeTuiSessionNote => {
-                "You are running in the selected runtime's native terminal UI through LionClaw. Treat prompts typed here as part of this LionClaw session. LionClaw stores completed native UI turns after they are written to the runtime's durable transcript, so use the prior turns below for continuity when relevant.".to_string()
+                "You are running in the selected runtime's native terminal UI through LionClaw. LionClaw prepared the boundary, context, and launch audit for this session. Native UI turns remain runtime-owned and are not imported into LionClaw history. LionClaw may include prior LionClaw-managed transcript/history below; use that context when relevant.".to_string()
             }
             ContextItemId::DraftOutputsNote => {
                 if !execution_plan
@@ -24780,7 +25190,7 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         self.maybe_mount_project_instance_inventory(
             session_id,
@@ -24805,15 +25215,17 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut turn_task = tokio::spawn(async move {
             match runtime_turn_mode {
-                RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
+                RuntimeTurnMode::Direct => adapter_for_task.turn(input, journal_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     let runtime_executor = KernelRuntimeProgramExecutor {
                         plan: execution_plan,
                         runtime_secrets_mount,
-                        codex_home_override,
+                        runtime_auth_registry,
+                        runtime_auth_context,
                     };
                     adapter_for_task
                         .program_backed_turn(
@@ -24822,7 +25234,7 @@ impl Kernel {
                                 context: runtime_execution_context(&runtime_executor.plan)?,
                                 executor: Box::new(runtime_executor),
                             },
-                            event_tx,
+                            journal_tx,
                         )
                         .await
                 }
@@ -24836,41 +25248,54 @@ impl Kernel {
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
-        let mut event_rx_open = true;
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
+        let mut journal_rx_open = true;
 
         loop {
             tokio::select! {
-                maybe_event = event_rx.recv(), if event_rx_open => {
-                    match maybe_event {
-                        Some(event) => {
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                event,
+                maybe_record = journal_rx.recv(), if journal_rx_open => {
+                    match maybe_record {
+                        Some(record) => {
+                            self.record_and_buffer_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                record,
                                 &mut events,
                                 &mut checkpoints,
+                                &mut journal_persistence,
                             )
                             .await?;
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
-                            event_rx_open = false;
+                            journal_rx_open = false;
                         }
                     }
                 }
                 output = &mut turn_task => {
-                    while let Some(event) = event_rx.recv().await {
-                        self.record_runtime_event(
-                            turn_id,
-                            &stream_context,
-                            &event_sink,
-                            event,
+                    while let Some(record) = journal_rx.recv().await {
+                        self.record_and_buffer_runtime_turn_event(
+                            journal_context,
+                            event_dispatch,
+                            record,
                             &mut events,
                             &mut checkpoints,
+                            &mut journal_persistence,
                         )
                         .await?;
                     }
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return match output {
                         Ok(Ok(result)) => {
                             self.audit
@@ -24929,14 +25354,13 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                RuntimeEvent::Error {
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24968,14 +25392,13 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.record_runtime_event(
-                                turn_id,
-                                &stream_context,
-                                &event_sink,
-                                RuntimeEvent::Error {
+                            self.record_and_flush_runtime_turn_event(
+                                journal_context,
+                                event_dispatch,
+                                TurnEvent::canonical(RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
-                                },
+                                }),
                                 &mut events,
                                 &mut checkpoints,
                             )
@@ -24994,6 +25417,8 @@ impl Kernel {
                         "Runtime idle timed out after {} with no output.",
                         format_duration(idle_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25018,6 +25443,8 @@ impl Kernel {
                         "Runtime reached the {} safety limit.",
                         format_duration(hard_timeout)
                     );
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25038,6 +25465,8 @@ impl Kernel {
                         .await;
                 }
                 reason = &mut cancel_signal => {
+                    self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+                        .await;
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -25127,12 +25556,14 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let codex_home_override = self.codex_home_override.clone();
+        let runtime_auth_registry = self.runtime_auth_registry.clone();
+        let runtime_auth_context = self.runtime_auth_context.clone();
         let mut control_task = tokio::spawn(async move {
             let runtime_executor = KernelRuntimeProgramExecutor {
                 plan: execution_plan,
                 runtime_secrets_mount,
-                codex_home_override,
+                runtime_auth_registry,
+                runtime_auth_context,
             };
             adapter_for_task
                 .runtime_control(
@@ -25529,14 +25960,21 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
-        self.record_runtime_event(
-            turn_id,
-            stream_context,
-            event_sink,
-            RuntimeEvent::Error {
+        self.record_and_flush_runtime_turn_event(
+            RuntimeJournalContext {
+                turn_id,
+                session_id,
+                runtime_id,
+                runtime_session_id: &handle.runtime_session_id,
+            },
+            RuntimeTurnEventDispatch {
+                stream_context,
+                event_sink,
+            },
+            TurnEvent::canonical(RuntimeEvent::Error {
                 code: Some(error_code.to_string()),
                 text: reason.clone(),
-            },
+            }),
             &mut events,
             &mut checkpoints,
         )
@@ -25573,18 +26011,31 @@ impl Kernel {
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
         checkpoints.seed(assistant_text);
+        let journal_context = RuntimeJournalContext {
+            turn_id,
+            session_id,
+            runtime_id,
+            runtime_session_id: &handle.runtime_session_id,
+        };
+        let event_dispatch = RuntimeTurnEventDispatch {
+            stream_context: &stream_context,
+            event_sink: &event_sink,
+        };
+        let mut journal_persistence = RuntimeJournalPersistence::default();
         while let Some(event) = event_rx.recv().await {
-            self.record_runtime_event(
-                turn_id,
-                &stream_context,
-                &event_sink,
-                event,
+            self.record_and_buffer_runtime_turn_event(
+                journal_context,
+                event_dispatch,
+                TurnEvent::canonical(event),
                 &mut events,
                 &mut checkpoints,
+                &mut journal_persistence,
             )
             .await
             .map_err(|err| anyhow::anyhow!(err.error_text))?;
         }
+        self.flush_runtime_turn_journal_best_effort(journal_context, &mut journal_persistence)
+            .await;
 
         self.audit
             .append(
@@ -25748,66 +26199,75 @@ impl Kernel {
                             thread_ref: route.thread_ref.as_deref(),
                             reply_to_ref: route.reply_to_ref.as_deref(),
                         });
-                let context = CapabilityExecutionContext { channel_send_route };
+                let context = CapabilityExecutionContext {
+                    channel_send_route,
+                    projected_channel_send_routes: Vec::new(),
+                    allow_channel_send_route_selection: false,
+                };
                 executed = true;
-                match self
-                    .capability_broker
-                    .execute(&context, capability, &payload)
-                    .await
-                {
-                    Ok(value) => {
-                        if capability == Capability::ChannelSend {
-                            match parse_channel_send_intent(&value) {
-                                Ok(intent) => {
-                                    let source_id = turn_id.to_string();
-                                    match self
-                                        .enqueue_channel_delivery(
-                                            ChannelDeliveryRoute {
-                                                channel_id: &intent.channel_id,
-                                                conversation_ref: &intent.conversation_ref,
-                                                thread_ref: intent.thread_ref.as_deref(),
-                                                reply_to_ref: intent.reply_to_ref.as_deref(),
-                                            },
-                                            Some(session_id),
-                                            Some(turn_id),
-                                            Some("session_turn"),
-                                            Some(&source_id),
-                                            &intent.content,
-                                        )
-                                        .await
-                                    {
-                                        Ok(delivery_id) => {
-                                            output = json!({
-                                                "channel_id": intent.channel_id,
-                                                "conversation_ref": intent.conversation_ref,
-                                                "thread_ref": intent.thread_ref,
-                                                "reply_to_ref": intent.reply_to_ref,
-                                                "delivery_id": delivery_id,
-                                            });
-                                            allowed = true;
-                                        }
-                                        Err(err) => {
-                                            let detail = err.to_string();
-                                            execution_error = Some(detail.clone());
-                                            reason =
-                                                Some(format!("broker execution failed: {detail}"));
-                                        }
-                                    }
-                                }
-                                Err(detail) => {
-                                    execution_error = Some(detail.clone());
-                                    reason = Some(format!("broker execution failed: {detail}"));
-                                }
-                            }
-                        } else {
+                if capability == Capability::ChannelSend {
+                    let source_id = turn_id.to_string();
+                    match self
+                        .authorize_and_enqueue_channel_send(
+                            context,
+                            payload.clone(),
+                            BrokerChannelSendRequest {
+                                session_id,
+                                turn_id,
+                                source_kind: "session_turn",
+                                source_id,
+                                source_fingerprint: None,
+                                idempotent: false,
+                            },
+                            |intent| {
+                                let content = BrokerChannelSendContent {
+                                    delivery: ChannelDeliveryContent {
+                                        text: intent.content.clone(),
+                                        format_hint: "plain".to_string(),
+                                        attachments: Vec::new(),
+                                    },
+                                    prepared_attachments: None,
+                                };
+                                async move { Ok::<_, KernelError>(content) }
+                            },
+                        )
+                        .await
+                    {
+                        Ok(accepted) => {
+                            output = json!({
+                                "channel_id": accepted.channel_id,
+                                "conversation_ref": accepted.conversation_ref,
+                                "thread_ref": accepted.thread_ref,
+                                "reply_to_ref": accepted.reply_to_ref,
+                                "delivery_id": accepted.delivery_id,
+                            });
+                            allowed = true;
+                        }
+                        Err(err) => {
+                            let detail = err.to_string();
+                            execution_error = Some(detail.clone());
+                            reason = Some(if detail.starts_with("broker execution failed:") {
+                                detail
+                            } else {
+                                format!("broker execution failed: {detail}")
+                            });
+                        }
+                    }
+                } else {
+                    match self
+                        .capability_broker
+                        .execute(&context, capability, &payload)
+                        .await
+                    {
+                        Ok(value) => {
                             output = value;
                             allowed = true;
                         }
-                    }
-                    Err(err) => {
-                        let detail = err.to_string();
-                        execution_error = Some(detail.clone());
-                        reason = Some(format!("broker execution failed: {detail}"));
+                        Err(err) => {
+                            let detail = err.to_string();
+                            execution_error = Some(detail.clone());
+                            reason = Some(format!("broker execution failed: {detail}"));
+                        }
                     }
                 }
             }

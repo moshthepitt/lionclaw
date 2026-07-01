@@ -2423,11 +2423,15 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     use axum::{http::StatusCode, routing::get, Json, Router};
+    use lionclaw_runtime_codex::codex_runtime_auth_kind;
 
     use super::*;
     use crate::applied::compute_daemon_fingerprint;
     use crate::contracts::DaemonInfoResponse;
-    use crate::kernel::runtime::{ConfinementConfig, MountAccess, MountSpec, OciConfinementConfig};
+    use crate::kernel::runtime::{
+        ConfinementConfig, MountAccess, MountSpec, OciConfinementConfig,
+        RuntimeSkillProjectionConfig,
+    };
     use crate::operator::config::{daemon_compat_fingerprint, RuntimeProfileConfig};
     use crate::operator::managed_units::{
         channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
@@ -2454,6 +2458,12 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.daemon.bind_configured = true;
         (temp_dir, home, work_root, commands, config)
+    }
+
+    fn codex_profile(confinement: ConfinementConfig) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::new("codex", "codex", confinement)
+            .with_auth(codex_runtime_auth_kind())
+            .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"))
     }
 
     fn fake_podman(root: &Path) -> PathBuf {
@@ -2987,7 +2997,7 @@ mod tests {
                 project_workspace_root: work_root,
                 project_instance: None,
                 daemon_fingerprint,
-                codex_home_override: None,
+                runtime_auth_env: &[],
             },
         );
         manager
@@ -3213,20 +3223,16 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
-                    image: Some("lionclaw-runtime:v1".to_string()),
-                    additional_mounts: vec![MountSpec {
-                        source: private,
-                        target: "/mnt/private".to_string(),
-                        access: MountAccess::ReadOnly,
-                    }],
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_profile(ConfinementConfig::Oci(OciConfinementConfig {
+                engine: engine.to_string_lossy().to_string(),
+                image: Some("lionclaw-runtime:v1".to_string()),
+                additional_mounts: vec![MountSpec {
+                    source: private,
+                    target: "/mnt/private".to_string(),
+                    access: MountAccess::ReadOnly,
+                }],
+                ..OciConfinementConfig::default()
+            })),
         );
         let commands = DoctorCommands::for_target(Some(project_root), "main", &home);
         let mut findings = Vec::new();
@@ -3268,15 +3274,11 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
-                    image: Some("lionclaw-runtime:v1".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_profile(ConfinementConfig::Oci(OciConfinementConfig {
+                engine: engine.to_string_lossy().to_string(),
+                image: Some("lionclaw-runtime:v1".to_string()),
+                ..OciConfinementConfig::default()
+            })),
         );
         let mut reviewer = config.runtimes.get("codex").expect("codex").clone();
         let ConfinementConfig::Oci(oci) = reviewer.confinement_mut();
@@ -3644,14 +3646,10 @@ mod tests {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    image: None,
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_profile(ConfinementConfig::Oci(OciConfinementConfig {
+                image: None,
+                ..OciConfinementConfig::default()
+            })),
         );
         let home_id = home.ensure_home_id().await.expect("home id");
         let project_scope = runtime_project_partition_key(Some(&work_root));
@@ -4239,15 +4237,11 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
-                    image: Some("lionclaw-runtime:v1".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_profile(ConfinementConfig::Oci(OciConfinementConfig {
+                engine: engine.to_string_lossy().to_string(),
+                image: Some("lionclaw-runtime:v1".to_string()),
+                ..OciConfinementConfig::default()
+            })),
         );
         let commands = DoctorCommands::for_target(None, "main", temp_dir.path());
         let mut findings = Vec::new();

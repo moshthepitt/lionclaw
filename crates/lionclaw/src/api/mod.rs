@@ -35,7 +35,8 @@ use crate::{
         JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
         PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest, SessionActionResponse,
         SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
-        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+        SessionOpenRequest, SessionOpenResponse, SessionTurnJournalRequest,
+        SessionTurnJournalResponse, SessionTurnRequest, SessionTurnResponse,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -65,6 +66,7 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/sessions/open", post(open_session))
         .route("/v0/sessions/latest", get(latest_session))
         .route("/v0/sessions/history", post(session_history))
+        .route("/v0/sessions/turn/journal", post(session_turn_journal))
         .route("/v0/sessions/action", post(session_action))
         .route("/v0/sessions/turn", post(turn_session))
         .route("/v0/channels/list", get(list_channels))
@@ -166,6 +168,14 @@ async fn session_history(
     Json(req): Json<SessionHistoryRequest>,
 ) -> Result<Json<SessionHistoryResponse>, ApiError> {
     let result = state.kernel.session_history(req).await?;
+    Ok(Json(result))
+}
+
+async fn session_turn_journal(
+    State(state): State<ApiState>,
+    Json(req): Json<SessionTurnJournalRequest>,
+) -> Result<Json<SessionTurnJournalResponse>, ApiError> {
+    let result = state.kernel.session_turn_journal(req).await?;
     Ok(Json(result))
 }
 

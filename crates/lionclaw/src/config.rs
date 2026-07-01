@@ -25,7 +25,6 @@ pub struct Config {
     pub workspace_root: PathBuf,
     pub project_workspace_root: Option<PathBuf>,
     pub project_instance: Option<ConfiguredProjectInstance>,
-    pub codex_home_override: Option<PathBuf>,
 }
 
 impl Config {
@@ -65,8 +64,6 @@ impl Config {
             None => resolve_project_workspace_root().ok(),
         };
         let project_instance = resolve_configured_project_instance()?;
-        let codex_home_override = resolve_optional_env_override_path("CODEX_HOME")?;
-
         Ok(Self {
             bind_addr,
             home,
@@ -77,7 +74,6 @@ impl Config {
             workspace_root,
             project_workspace_root,
             project_instance,
-            codex_home_override,
         })
     }
 }
@@ -322,16 +318,17 @@ mod tests {
     fn resolve_optional_env_override_path_absolutizes_relative_values() {
         let temp_dir = tempdir().expect("temp dir");
         let project_root = temp_dir.path().join("project");
-        std::fs::create_dir_all(project_root.join(".codex")).expect("create codex home");
+        std::fs::create_dir_all(project_root.join(".runtime-auth"))
+            .expect("create runtime auth home");
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&project_root).expect("set cwd");
 
-        let resolved =
-            resolve_optional_override_path(Some(".codex".into())).expect("resolve env override");
+        let resolved = resolve_optional_override_path(Some(".runtime-auth".into()))
+            .expect("resolve env override");
 
         std::env::set_current_dir(original_dir).expect("restore cwd");
 
-        assert_eq!(resolved, Some(project_root.join(".codex")));
+        assert_eq!(resolved, Some(project_root.join(".runtime-auth")));
     }
 
     #[test]

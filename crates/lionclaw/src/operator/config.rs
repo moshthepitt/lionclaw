@@ -9,7 +9,8 @@ use crate::home::{
 };
 use crate::kernel::runtime::{
     execution::mount_validation::{normalize_runtime_mount_target, validate_configured_mounts},
-    ConfinementConfig, ExecutionPreset, RuntimeAuthKind, RuntimeExecutionProfile,
+    ConfinementConfig, ExecutionPreset, RuntimeAuthContext, RuntimeAuthKind,
+    RuntimeExecutionProfile, RuntimeSkillProjectionConfig, RuntimeTerminalConfig,
 };
 use crate::kernel::skills::sanitize_skill_name;
 use crate::operator::command_display::shell_quote_arg;
@@ -43,8 +44,15 @@ impl OperatorConfig {
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut config: Self = match toml::from_str(&content) {
+            Ok(config) => config,
+            Err(err) => {
+                if let Some(message) = legacy_runtime_profile_config_error(&content) {
+                    return Err(anyhow!("failed to parse {}: {message}", path.display()));
+                }
+                return Err(err).with_context(|| format!("failed to parse {}", path.display()));
+            }
+        };
         config.normalize();
         Ok(config)
     }
@@ -251,7 +259,7 @@ struct DaemonCompatConfig {
     workspace_name: String,
     default_runtime_id: Option<String>,
     default_preset_name: Option<String>,
-    codex_home_override: Option<String>,
+    runtime_auth_context: RuntimeAuthContext,
     execution_presets: BTreeMap<String, ExecutionPreset>,
     runtime_profiles: BTreeMap<String, RuntimeProfileConfig>,
     runtime_image_identities: BTreeMap<String, String>,
@@ -265,12 +273,16 @@ struct RuntimeCompatConfig {
 }
 
 pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
-    daemon_compat_fingerprint_with_runtime_context(config, None, &BTreeMap::new())
+    daemon_compat_fingerprint_with_runtime_context(
+        config,
+        &RuntimeAuthContext::default(),
+        &BTreeMap::new(),
+    )
 }
 
 pub fn daemon_compat_fingerprint_with_runtime_context(
     config: &OperatorConfig,
-    codex_home_override: Option<&Path>,
+    runtime_auth_context: &RuntimeAuthContext,
     runtime_image_identities: &BTreeMap<String, String>,
 ) -> String {
     let mut normalized = config.clone();
@@ -280,7 +292,7 @@ pub fn daemon_compat_fingerprint_with_runtime_context(
         workspace_name: normalized.daemon.workspace.clone(),
         default_runtime_id: normalized.defaults.runtime.clone(),
         default_preset_name: normalized.defaults.preset.clone(),
-        codex_home_override: codex_home_override.map(|path| path.display().to_string()),
+        runtime_auth_context: runtime_auth_context.clone(),
         execution_presets: normalized.presets,
         runtime_profiles: normalized.runtimes,
         runtime_image_identities: runtime_image_identities.clone(),
@@ -396,6 +408,22 @@ impl std::str::FromStr for ChannelLaunchMode {
     }
 }
 
+fn legacy_runtime_profile_config_error(content: &str) -> Option<String> {
+    let value = toml::from_str::<toml::Value>(content).ok()?;
+    let runtimes = value.get("runtimes")?.as_table()?;
+    for (runtime_id, runtime) in runtimes {
+        let Some(profile) = runtime.as_table() else {
+            continue;
+        };
+        if profile.contains_key("kind") || profile.contains_key("executable") {
+            return Some(format!(
+                "runtime profile '{runtime_id}' uses the removed pre-#159 config format (kind/executable); update it to driver/command, for example driver = \"acp\" and command = \"opencode\""
+            ));
+        }
+    }
+    None
+}
+
 pub fn default_bind() -> String {
     "127.0.0.1:8979".to_string()
 }
@@ -409,60 +437,75 @@ pub fn default_channel_worker() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum RuntimeProfileConfig {
-    #[serde(rename = "codex")]
-    Codex {
-        executable: String,
-        #[serde(default)]
-        model: Option<String>,
-        confinement: ConfinementConfig,
-    },
-    #[serde(rename = "opencode")]
-    OpenCode {
-        executable: String,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        agent: Option<String>,
-        confinement: ConfinementConfig,
-    },
+pub struct RuntimeProfileConfig {
+    pub driver: String,
+    #[serde(rename = "command")]
+    pub executable: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RuntimeAuthKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_projection: Option<RuntimeSkillProjectionConfig>,
+    #[serde(default, skip_serializing_if = "RuntimeTerminalConfig::is_empty")]
+    pub terminal: RuntimeTerminalConfig,
+    pub confinement: ConfinementConfig,
 }
 
 impl RuntimeProfileConfig {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Codex { .. } => "codex",
-            Self::OpenCode { .. } => "opencode",
+    pub fn new(
+        driver: impl Into<String>,
+        executable: impl Into<String>,
+        confinement: ConfinementConfig,
+    ) -> Self {
+        Self {
+            driver: driver.into(),
+            executable: executable.into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            model: None,
+            mode: None,
+            auth: None,
+            skill_projection: None,
+            terminal: RuntimeTerminalConfig::default(),
+            confinement,
         }
+    }
+
+    pub fn with_auth(mut self, auth: RuntimeAuthKind) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_skill_projection(mut self, projection: RuntimeSkillProjectionConfig) -> Self {
+        self.skill_projection = Some(projection);
+        self
+    }
+
+    pub fn driver(&self) -> &str {
+        &self.driver
     }
 
     pub fn executable(&self) -> &str {
-        match self {
-            Self::Codex { executable, .. } | Self::OpenCode { executable, .. } => executable,
-        }
+        &self.executable
     }
 
     pub fn confinement(&self) -> &ConfinementConfig {
-        match self {
-            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
-        }
+        &self.confinement
     }
 
     pub fn confinement_mut(&mut self) -> &mut ConfinementConfig {
-        match self {
-            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
-        }
+        &mut self.confinement
     }
 
     pub fn required_runtime_auth(&self) -> Option<RuntimeAuthKind> {
-        match self {
-            Self::Codex {
-                confinement: ConfinementConfig::Oci(_),
-                ..
-            } => Some(RuntimeAuthKind::Codex),
-            Self::OpenCode { .. } => None,
-        }
+        self.auth.clone()
     }
 
     pub fn execution_profile(&self) -> RuntimeExecutionProfile {
@@ -482,11 +525,12 @@ impl RuntimeProfileConfig {
         runtime_auth_identity: Option<&str>,
     ) -> RuntimeExecutionProfile {
         RuntimeExecutionProfile::new(
-            self.confinement().clone(),
+            self.confinement.clone(),
             self.compatibility_base_key(runtime_auth_identity),
             image_identity.map(str::to_string),
             self.required_runtime_auth(),
         )
+        .with_skill_projection(self.skill_projection.clone())
     }
 
     pub fn compatibility_key(&self) -> String {
@@ -509,6 +553,9 @@ impl RuntimeProfileConfig {
     fn compatibility_base_key(&self, runtime_auth_identity: Option<&str>) -> String {
         let mut normalized = self.clone();
         normalized.normalize();
+        // Native terminal argv changes how an operator attaches to an existing
+        // runtime state root; it must not repartition that state root.
+        normalized.terminal = RuntimeTerminalConfig::default();
         let encoded = compatibility_digest_bytes(&RuntimeCompatConfig {
             version: 1,
             profile: normalized,
@@ -518,7 +565,13 @@ impl RuntimeProfileConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.driver.trim().is_empty() {
+            return Err(anyhow!("runtime driver is required"));
+        }
         validate_runtime_command(self.executable())?;
+        if let Some(skill_projection) = &self.skill_projection {
+            skill_projection.validate()?;
+        }
 
         match self.confinement() {
             ConfinementConfig::Oci(config) => {
@@ -541,38 +594,43 @@ impl RuntimeProfileConfig {
     }
 
     fn normalize(&mut self) {
-        match self {
-            Self::Codex {
-                executable,
-                model,
-                confinement,
-            } => {
-                *executable = executable.trim().to_string();
-                *model = model
-                    .as_ref()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                normalize_confinement_config(confinement);
-            }
-            Self::OpenCode {
-                executable,
-                model,
-                agent,
-                confinement,
-            } => {
-                *executable = executable.trim().to_string();
-                *model = model
-                    .as_ref()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                *agent = agent
-                    .as_ref()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                normalize_confinement_config(confinement);
-            }
+        self.driver = self.driver.trim().to_string();
+        self.executable = self.executable.trim().to_string();
+        self.args = self
+            .args
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.environment = std::mem::take(&mut self.environment)
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        self.model = self
+            .model
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.mode = self
+            .mode
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(skill_projection) = &mut self.skill_projection {
+            skill_projection.normalize();
         }
+        normalize_runtime_terminal_config(&mut self.terminal);
+        normalize_confinement_config(&mut self.confinement);
     }
+}
+
+fn normalize_runtime_terminal_config(config: &mut RuntimeTerminalConfig) {
+    config.args = std::mem::take(&mut config.args)
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
 }
 
 #[allow(
@@ -819,8 +877,18 @@ mod tests {
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
-        OciConfinementConfig, WorkspaceAccess,
+        OciConfinementConfig, RuntimeAuthContext, RuntimeTerminalConfig, WorkspaceAccess,
     };
+
+    fn runtime_profile(
+        executable: impl Into<String>,
+        model: Option<&str>,
+        confinement: ConfinementConfig,
+    ) -> RuntimeProfileConfig {
+        let mut profile = RuntimeProfileConfig::new("codex", executable, confinement);
+        profile.model = model.map(str::to_string);
+        profile
+    }
 
     #[test]
     fn derives_channel_alias_from_source_path() {
@@ -840,6 +908,33 @@ mod tests {
         assert!(config.runtimes.is_empty());
         assert!(config.presets.is_empty());
         assert!(config.private_context.projector_skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_runtime_profile_shape_reports_explicit_break() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        tokio::fs::create_dir_all(home.config_dir())
+            .await
+            .expect("config dir");
+        tokio::fs::write(
+            home.config_path(),
+            r#"
+[runtimes.opencode]
+kind = "opencode"
+executable = "opencode"
+"#,
+        )
+        .await
+        .expect("write config");
+
+        let err = OperatorConfig::load(&home)
+            .await
+            .expect_err("legacy runtime profile shape should fail clearly");
+        let message = err.to_string();
+        assert!(message.contains("pre-#159 config format"), "{message}");
+        assert!(message.contains("kind/executable"), "{message}");
+        assert!(message.contains("driver/command"), "{message}");
     }
 
     #[tokio::test]
@@ -1056,11 +1151,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: sample_confinement(),
-            },
+            runtime_profile("codex", None, sample_confinement()),
         );
 
         assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
@@ -1071,11 +1162,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: sample_confinement(),
-            },
+            runtime_profile("codex", None, sample_confinement()),
         );
 
         assert!(config.remove_runtime("codex"));
@@ -1096,21 +1183,9 @@ mod tests {
 
     #[test]
     fn runtime_compatibility_key_changes_when_profile_changes() {
-        let left = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: Some("gpt-5".to_string()),
-            confinement: sample_confinement(),
-        };
-        let right = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: Some("gpt-5.1".to_string()),
-            confinement: sample_confinement(),
-        };
-        let normalized = RuntimeProfileConfig::Codex {
-            executable: " codex ".to_string(),
-            model: Some(" gpt-5 ".to_string()),
-            confinement: sample_confinement(),
-        };
+        let left = runtime_profile("codex", Some("gpt-5"), sample_confinement());
+        let right = runtime_profile("codex", Some("gpt-5.1"), sample_confinement());
+        let normalized = runtime_profile(" codex ", Some(" gpt-5 "), sample_confinement());
 
         assert_ne!(left.compatibility_key(), right.compatibility_key());
         assert_eq!(left.compatibility_key(), normalized.compatibility_key());
@@ -1127,27 +1202,26 @@ mod tests {
             access: MountAccess::ReadOnly,
         });
 
-        let left = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: Some("gpt-5".to_string()),
-            confinement: left_confinement,
-        };
-        let right = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: Some("gpt-5".to_string()),
-            confinement: right_confinement,
-        };
+        let left = runtime_profile("codex", Some("gpt-5"), left_confinement);
+        let right = runtime_profile("codex", Some("gpt-5"), right_confinement);
 
         assert_ne!(left.compatibility_key(), right.compatibility_key());
     }
 
     #[test]
-    fn runtime_compatibility_key_changes_when_image_identity_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
+    fn runtime_compatibility_key_ignores_native_terminal_profile() {
+        let left = RuntimeProfileConfig::new("acp", "opencode", sample_confinement());
+        let mut right = left.clone();
+        right.terminal = RuntimeTerminalConfig {
+            args: vec!["--native".to_string()],
         };
+
+        assert_eq!(left.compatibility_key(), right.compatibility_key());
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_image_identity_changes() {
+        let runtime = runtime_profile("codex", None, sample_confinement());
 
         assert_ne!(
             runtime.compatibility_key_with_image_identity(Some("sha256:left")),
@@ -1157,11 +1231,7 @@ mod tests {
 
     #[test]
     fn runtime_compatibility_key_changes_when_codex_home_identity_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
-        };
+        let runtime = runtime_profile("codex", None, sample_confinement());
 
         assert_ne!(
             runtime.compatibility_key_with_runtime_context(
@@ -1176,12 +1246,26 @@ mod tests {
     }
 
     #[test]
-    fn daemon_compat_fingerprint_changes_when_default_runtime_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
+    fn daemon_compat_fingerprint_tracks_native_terminal_profile() {
+        let left_runtime = RuntimeProfileConfig::new("acp", "opencode", sample_confinement());
+        let mut right_runtime = left_runtime.clone();
+        right_runtime.terminal = RuntimeTerminalConfig {
+            args: vec!["--native".to_string()],
         };
+        let mut left = OperatorConfig::default();
+        left.upsert_runtime("opencode".to_string(), left_runtime);
+        let mut right = OperatorConfig::default();
+        right.upsert_runtime("opencode".to_string(), right_runtime);
+
+        assert_ne!(
+            daemon_compat_fingerprint(&left),
+            daemon_compat_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_default_runtime_changes() {
+        let runtime = runtime_profile("codex", None, sample_confinement());
         let mut left = OperatorConfig::default();
         left.upsert_runtime("codex".to_string(), runtime.clone());
         left.upsert_runtime("opencode".to_string(), runtime);
@@ -1201,11 +1285,7 @@ mod tests {
 
     #[test]
     fn daemon_compat_fingerprint_changes_when_workspace_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
-        };
+        let runtime = runtime_profile("codex", None, sample_confinement());
         let mut left = OperatorConfig::default();
         left.upsert_runtime("codex".to_string(), runtime);
         left.set_default_runtime("codex")
@@ -1221,24 +1301,22 @@ mod tests {
     }
 
     #[test]
-    fn daemon_compat_fingerprint_changes_when_codex_home_override_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
-        };
+    fn daemon_compat_fingerprint_changes_when_runtime_auth_context_changes() {
+        let runtime = runtime_profile("codex", None, sample_confinement());
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), runtime);
+        let left_context = RuntimeAuthContext::new().with_home_override("codex", "/tmp/codex-a");
+        let right_context = RuntimeAuthContext::new().with_home_override("codex", "/tmp/codex-b");
 
         assert_ne!(
             daemon_compat_fingerprint_with_runtime_context(
                 &config,
-                Some(Path::new("/tmp/codex-a")),
+                &left_context,
                 &BTreeMap::new(),
             ),
             daemon_compat_fingerprint_with_runtime_context(
                 &config,
-                Some(Path::new("/tmp/codex-b")),
+                &right_context,
                 &BTreeMap::new(),
             )
         );
@@ -1246,11 +1324,7 @@ mod tests {
 
     #[test]
     fn daemon_compat_fingerprint_changes_when_runtime_image_identity_changes() {
-        let runtime = RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: sample_confinement(),
-        };
+        let runtime = runtime_profile("codex", None, sample_confinement());
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), runtime);
 
@@ -1260,8 +1334,16 @@ mod tests {
         right.insert("codex".to_string(), "sha256:right".to_string());
 
         assert_ne!(
-            daemon_compat_fingerprint_with_runtime_context(&config, None, &left),
-            daemon_compat_fingerprint_with_runtime_context(&config, None, &right)
+            daemon_compat_fingerprint_with_runtime_context(
+                &config,
+                &RuntimeAuthContext::default(),
+                &left
+            ),
+            daemon_compat_fingerprint_with_runtime_context(
+                &config,
+                &RuntimeAuthContext::default(),
+                &right
+            )
         );
     }
 

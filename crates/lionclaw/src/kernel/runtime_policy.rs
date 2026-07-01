@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn policy_rejects_reserved_lionclaw_passthrough_keys() {
         let mut allowed = BTreeSet::new();
-        allowed.insert("LIONCLAW_CHANNEL_SEND_SOCKET".to_string());
+        allowed.insert("LIONCLAW_RESERVED_RUNTIME_VALUE".to_string());
         let rule = RuntimeExecutionRule {
             allowed_env_passthrough_keys: allowed,
             ..RuntimeExecutionRule::default()
@@ -313,7 +313,7 @@ mod tests {
                 "mock",
                 RuntimeExecutionRequest::new(
                     None,
-                    vec!["LIONCLAW_CHANNEL_SEND_SOCKET".to_string()],
+                    vec!["LIONCLAW_RESERVED_RUNTIME_VALUE".to_string()],
                     Some(300),
                 ),
                 Duration::from_millis(300),

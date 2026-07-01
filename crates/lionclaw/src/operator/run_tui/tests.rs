@@ -5,7 +5,10 @@ use crate::{
 };
 #[cfg(unix)]
 use crate::{
-    kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+    kernel::runtime::{
+        ConfinementConfig, OciConfinementConfig, RuntimeSkillProjectionConfig,
+        RuntimeTerminalConfig,
+    },
     operator::config::{OperatorConfig, RuntimeProfileConfig},
 };
 use ratatui::backend::TestBackend;
@@ -777,10 +780,10 @@ async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
         selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
             summary: main,
             runtime_id: "codex".to_string(),
-            runtime_kind: "codex".to_string(),
+            runtime_driver: "codex".to_string(),
             runtime_executable: "codex".to_string(),
             runtime_model: Some("gpt-5".to_string()),
-            runtime_agent: None,
+            runtime_mode: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),
@@ -1459,10 +1462,10 @@ async fn project_objects_load_real_sessions() {
     let selected = SelectedInstanceState::Ready(Box::new(ReadyInstance {
         summary,
         runtime_id: "codex".to_string(),
-        runtime_kind: "codex".to_string(),
+        runtime_driver: "codex".to_string(),
         runtime_executable: "codex".to_string(),
         runtime_model: Some("gpt-5".to_string()),
-        runtime_agent: None,
+        runtime_mode: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -2121,10 +2124,10 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempD
     let selected = SelectedInstanceState::Ready(Box::new(ReadyInstance {
         summary: summary.clone(),
         runtime_id: "codex".to_string(),
-        runtime_kind: "codex".to_string(),
+        runtime_driver: "codex".to_string(),
         runtime_executable: "codex".to_string(),
         runtime_model: Some("gpt-5".to_string()),
-        runtime_agent: None,
+        runtime_mode: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -2267,16 +2270,21 @@ async fn save_project_runtime_config(
 
 #[cfg(unix)]
 fn test_opencode_runtime(runtime_executable: &Path, podman: &Path) -> RuntimeProfileConfig {
-    RuntimeProfileConfig::OpenCode {
-        executable: runtime_executable.display().to_string(),
-        model: None,
-        agent: None,
-        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+    let mut profile = RuntimeProfileConfig::new(
+        "acp",
+        runtime_executable.display().to_string(),
+        ConfinementConfig::Oci(OciConfinementConfig {
             engine: podman.display().to_string(),
             image: Some("ghcr.io/lionclaw/operator-console-test-runtime:latest".to_string()),
             ..OciConfinementConfig::default()
         }),
-    }
+    )
+    .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(
+        ".config/opencode/skills",
+    ));
+    profile.args = vec!["acp".to_string()];
+    profile.terminal = RuntimeTerminalConfig { args: Vec::new() };
+    profile
 }
 
 #[cfg(unix)]
@@ -2338,10 +2346,10 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
             summary: main,
             runtime_id: "codex".to_string(),
-            runtime_kind: "codex".to_string(),
+            runtime_driver: "codex".to_string(),
             runtime_executable: "codex".to_string(),
             runtime_model: Some("gpt-5".to_string()),
-            runtime_agent: None,
+            runtime_mode: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),

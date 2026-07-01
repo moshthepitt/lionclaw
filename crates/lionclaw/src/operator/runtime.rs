@@ -5,14 +5,17 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use lionclaw_runtime_acp::AcpRuntimeDriver;
+use lionclaw_runtime_api::{RuntimeAuthProvider, RuntimeDriverConfig, RuntimeDriverProvider};
+use lionclaw_runtime_codex::CodexRuntimeDriver;
 
 use crate::home::LionClawHome;
 use crate::kernel::{
     runtime::execution::planner::resolve_execution_network_mode,
     runtime::{
         resolve_oci_image_compatibility_identity, validate_runtime_execution_prerequisites,
-        CodexRuntimeAdapter, CodexRuntimeConfig, ExecutionPlanPurpose, NetworkMode,
-        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeAuthKind, RuntimeExecutionProfile,
+        ExecutionPlanPurpose, NetworkMode, RuntimeAuthContext, RuntimeAuthRegistry,
+        RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -26,12 +29,47 @@ use super::runtime_mounts::validate_configured_runtime_mounts;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeExecutionContext {
-    pub codex_home_override: Option<PathBuf>,
+    pub runtime_auth_env: Vec<(String, String)>,
+    pub runtime_auth_registry: RuntimeAuthRegistry,
+    pub runtime_auth_context: RuntimeAuthContext,
     pub daemon_config_fingerprint: String,
     pub execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
 }
 
+#[derive(Clone)]
+struct RuntimeDriverRegistry {
+    drivers: BTreeMap<String, Arc<dyn RuntimeDriverProvider>>,
+}
+
+impl RuntimeDriverRegistry {
+    fn new(drivers: impl IntoIterator<Item = Arc<dyn RuntimeDriverProvider>>) -> Self {
+        Self {
+            drivers: drivers
+                .into_iter()
+                .map(|driver| (driver.driver().to_string(), driver))
+                .collect(),
+        }
+    }
+
+    fn get(&self, driver: &str) -> Option<Arc<dyn RuntimeDriverProvider>> {
+        self.drivers.get(driver).cloned()
+    }
+
+    fn auth_registry(&self) -> RuntimeAuthRegistry {
+        RuntimeAuthRegistry::new(
+            self.drivers
+                .values()
+                .filter_map(|driver| driver.auth_provider()),
+        )
+    }
+
+    fn supported_drivers(&self) -> Vec<&str> {
+        self.drivers.keys().map(String::as_str).collect()
+    }
+}
+
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
+    let drivers = runtime_driver_registry();
     for (id, runtime) in &config.runtimes {
         if let Err(err) = validate_runtime_command(runtime.executable()) {
             warn!(
@@ -41,40 +79,27 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
             );
             continue;
         }
-        match runtime {
-            RuntimeProfileConfig::Codex {
-                executable,
-                model,
-                confinement: _,
-            } => {
-                kernel
-                    .register_runtime_adapter(
-                        id.clone(),
-                        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
-                            executable: executable.clone(),
-                            model: model.clone(),
-                        })),
-                    )
-                    .await;
-            }
-            RuntimeProfileConfig::OpenCode {
-                executable,
-                model,
-                agent,
-                confinement: _,
-            } => {
-                kernel
-                    .register_runtime_adapter(
-                        id.clone(),
-                        Arc::new(OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
-                            executable: executable.clone(),
-                            model: model.clone(),
-                            agent: agent.clone(),
-                        })),
-                    )
-                    .await;
-            }
+        let Some(driver) = drivers.get(runtime.driver()) else {
+            warn!(
+                runtime_id = %id,
+                driver = %runtime.driver(),
+                "skipping runtime adapter registration for unsupported runtime driver"
+            );
+            continue;
+        };
+        let driver_config = runtime_driver_config(id, runtime);
+        if let Err(err) = driver.validate_config(&driver_config) {
+            warn!(
+                ?err,
+                runtime_id = %id,
+                driver = %runtime.driver(),
+                "skipping runtime adapter registration for invalid driver config"
+            );
+            continue;
         }
+        kernel
+            .register_runtime_adapter(id.clone(), driver.create_adapter(driver_config))
+            .await;
     }
 
     Ok(())
@@ -85,7 +110,9 @@ pub async fn resolve_runtime_execution_context(
     config: &OperatorConfig,
     selected_runtime_id: Option<&str>,
 ) -> Result<ResolvedRuntimeExecutionContext> {
-    let codex_home_override = operator_codex_home_override(home)?;
+    let runtime_auth_registry = runtime_auth_registry();
+    let runtime_auth_context = runtime_auth_context(home, &runtime_auth_registry)?;
+    let runtime_auth_env = runtime_auth_daemon_env(&runtime_auth_context, &runtime_auth_registry);
     let runtime_image_identities =
         resolve_runtime_image_identities(config, selected_runtime_id).await?;
     let execution_profiles = config
@@ -93,7 +120,7 @@ pub async fn resolve_runtime_execution_context(
         .iter()
         .map(|(id, runtime)| {
             let runtime_auth_identity =
-                runtime_auth_identity(runtime, codex_home_override.as_deref())?;
+                runtime_auth_identity(runtime, &runtime_auth_registry, &runtime_auth_context)?;
             let profile = if selected_runtime_id == Some(id.as_str()) {
                 runtime.execution_profile_with_runtime_context(
                     runtime_image_identities.get(id).map(String::as_str),
@@ -108,12 +135,14 @@ pub async fn resolve_runtime_execution_context(
         .collect::<Result<BTreeMap<_, _>>>()?;
     let daemon_config_fingerprint = daemon_compat_fingerprint_with_runtime_context(
         config,
-        codex_home_override.as_deref(),
+        &runtime_auth_context,
         &runtime_image_identities,
     );
 
     Ok(ResolvedRuntimeExecutionContext {
-        codex_home_override,
+        runtime_auth_env,
+        runtime_auth_registry,
+        runtime_auth_context,
         daemon_config_fingerprint,
         execution_profiles,
     })
@@ -138,6 +167,21 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
     profile
         .validate()
         .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' is invalid: {err}"))?;
+    let drivers = runtime_driver_registry();
+    let Some(driver) = drivers.get(profile.driver()) else {
+        return Err(anyhow!(
+            "configured runtime profile '{runtime_id}' uses unsupported runtime driver '{}'; supported drivers: {}",
+            profile.driver(),
+            supported_runtime_drivers(&drivers)
+        ));
+    };
+    let driver_config = runtime_driver_config(runtime_id, profile);
+    driver.validate_config(&driver_config).map_err(|err| {
+        anyhow!(
+            "configured runtime profile '{runtime_id}' is invalid for runtime driver '{}': {err}",
+            profile.driver()
+        )
+    })?;
     Ok(())
 }
 
@@ -163,26 +207,17 @@ pub async fn validate_runtime_launch_prerequisites_for_work_root(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
-    let codex_home_override = operator_codex_home_override(home)?;
+    let runtime_auth_registry = runtime_auth_registry();
+    let runtime_auth_context = runtime_auth_context(home, &runtime_auth_registry)?;
     validate_runtime_execution_prerequisites(
         runtime_id,
         profile.confinement(),
         profile.required_runtime_auth(),
-        codex_home_override.as_deref(),
+        &runtime_auth_registry,
+        &runtime_auth_context,
         interactive_network_mode(config)?,
     )
     .await
-}
-
-pub(crate) fn operator_codex_home_override(_home: &LionClawHome) -> Result<Option<PathBuf>> {
-    #[cfg(test)]
-    {
-        Ok(Some(_home.root().join(".codex")))
-    }
-    #[cfg(not(test))]
-    {
-        crate::config::resolve_optional_env_override_path("CODEX_HOME").map_err(Into::into)
-    }
 }
 
 async fn resolve_runtime_image_identities(
@@ -214,38 +249,113 @@ async fn resolve_runtime_image_identities(
 
 fn runtime_auth_identity(
     runtime: &RuntimeProfileConfig,
-    codex_home_override: Option<&Path>,
+    auth_registry: &RuntimeAuthRegistry,
+    auth_context: &RuntimeAuthContext,
 ) -> Result<Option<String>> {
     match runtime.required_runtime_auth() {
-        Some(RuntimeAuthKind::Codex) => codex_home_identity(codex_home_override),
+        Some(auth) => {
+            let provider = auth_registry.get(&auth).ok_or_else(|| {
+                anyhow!(
+                    "configured runtime requires unsupported runtime auth kind '{}'",
+                    auth.as_str()
+                )
+            })?;
+            provider.identity(auth_context)
+        }
         None => Ok(None),
     }
 }
 
-fn codex_home_identity(codex_home_override: Option<&Path>) -> Result<Option<String>> {
-    let path = match codex_home_override {
-        Some(path) => path.to_path_buf(),
-        None => {
-            let Some(home) = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-            else {
-                return Ok(None);
-            };
-            home.join(".codex")
-        }
-    };
-    normalize_identity_path(&path).map(Some)
+pub(crate) fn runtime_auth_registry() -> RuntimeAuthRegistry {
+    runtime_driver_registry().auth_registry()
 }
 
-fn normalize_identity_path(path: &Path) -> Result<String> {
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
+fn runtime_driver_registry() -> RuntimeDriverRegistry {
+    RuntimeDriverRegistry::new([
+        Arc::new(CodexRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+        Arc::new(AcpRuntimeDriver) as Arc<dyn RuntimeDriverProvider>,
+    ])
+}
+
+fn runtime_driver_config(runtime_id: &str, runtime: &RuntimeProfileConfig) -> RuntimeDriverConfig {
+    RuntimeDriverConfig {
+        runtime_id: runtime_id.to_string(),
+        executable: runtime.executable.clone(),
+        args: runtime.args.clone(),
+        environment: runtime
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        model: runtime.model.clone(),
+        mode: runtime.mode.clone(),
+        auth: runtime.auth.clone(),
+        terminal: runtime.terminal.clone(),
+    }
+}
+
+fn runtime_auth_context(
+    home: &LionClawHome,
+    auth_registry: &RuntimeAuthRegistry,
+) -> Result<RuntimeAuthContext> {
+    let mut context = RuntimeAuthContext::new();
+    for provider in auth_registry.providers() {
+        if let Some(path) = runtime_auth_home_override(home, provider.as_ref())? {
+            context.insert_home_override(provider.kind(), path);
+        }
+    }
+    Ok(context)
+}
+
+fn runtime_auth_home_override(
+    _home: &LionClawHome,
+    provider: &dyn RuntimeAuthProvider,
+) -> Result<Option<PathBuf>> {
+    let Some(env) = provider.host_home_override_env() else {
+        return Ok(None);
     };
-    let normalized = resolved.canonicalize().unwrap_or(resolved);
-    Ok(format!("codex-home:{}", normalized.display()))
+    #[cfg(test)]
+    {
+        let _ = env;
+        Ok(Some(_home.root().join(format!(".{}", provider.kind()))))
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::resolve_optional_env_override_path(env).map_err(Into::into)
+    }
+}
+
+fn runtime_auth_daemon_env(
+    context: &RuntimeAuthContext,
+    auth_registry: &RuntimeAuthRegistry,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for provider in auth_registry.providers() {
+        let Some(var) = provider.host_home_override_env() else {
+            continue;
+        };
+        let Some(path) = context.home_override(provider.kind()) else {
+            continue;
+        };
+        env.push((var.to_string(), path.display().to_string()));
+    }
+    env
+}
+
+fn supported_runtime_drivers(drivers: &RuntimeDriverRegistry) -> String {
+    let drivers = drivers.supported_drivers();
+    match drivers.as_slice() {
+        [] => "none".to_string(),
+        [driver] => format!("'{driver}'"),
+        [head @ .., tail] => {
+            let head = head
+                .iter()
+                .map(|driver| format!("'{driver}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{head} or '{tail}'")
+        }
+    }
 }
 
 fn interactive_network_mode(config: &OperatorConfig) -> Result<NetworkMode> {
@@ -262,6 +372,7 @@ fn interactive_network_mode(config: &OperatorConfig) -> Result<NetworkMode> {
 mod tests {
     use base64::Engine as _;
     use chrono::{Duration as ChronoDuration, Utc};
+    use lionclaw_runtime_codex::codex_runtime_auth_kind;
     use serde_json::json;
 
     use super::{
@@ -273,7 +384,7 @@ mod tests {
     use crate::kernel::{
         runtime::{
             ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
-            OciConfinementConfig, WorkspaceAccess,
+            OciConfinementConfig, RuntimeSkillProjectionConfig, WorkspaceAccess,
         },
         Kernel,
     };
@@ -310,15 +421,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: path.to_string_lossy().to_string(),
-                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile(path.to_string_lossy().to_string()),
         );
 
         let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
@@ -330,18 +433,7 @@ mod tests {
     fn configured_runtime_profile_accepts_container_command_with_valid_engine() {
         let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine,
-                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
 
         validate_runtime_availability(&config, "codex").expect("runtime command should validate");
     }
@@ -353,15 +445,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine,
-                    image: None,
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile_with_image(engine, None),
         );
 
         let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
@@ -373,29 +457,10 @@ mod tests {
     fn configured_runtime_validation_rejects_any_invalid_profile() {
         let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.clone(),
-                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine.clone()));
         config.upsert_runtime(
             "broken".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine,
-                    image: None,
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile_with_image(engine, None),
         );
 
         let err = validate_configured_runtimes(&config).expect_err("should fail");
@@ -416,15 +481,7 @@ mod tests {
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine.clone()));
         config.upsert_runtime(
             "broken".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine,
-                    image: None,
-                    ..OciConfinementConfig::default()
-                }),
-            },
+            codex_runtime_profile_with_image(engine, None),
         );
 
         register_configured_runtimes(&kernel, &config)
@@ -432,16 +489,50 @@ mod tests {
             .expect("non-launchable profile should not block kernel registration");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_runtime_profile_rejects_ignored_driver_fields() {
+        let (_temp_dir, engine) = fake_podman();
+        let mut config = OperatorConfig::default();
+        let mut profile = codex_runtime_profile(engine);
+        profile.args = vec!["acp".to_string()];
+        profile
+            .environment
+            .insert("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string());
+        profile.mode = Some("plan".to_string());
+        config.upsert_runtime("codex".to_string(), profile);
+
+        let err = validate_runtime_availability(&config, "codex")
+            .expect_err("Codex should reject driver fields it does not honor");
+
+        assert!(
+            err.to_string().contains("does not support runtime args"),
+            "{err}"
+        );
+    }
+
     fn codex_runtime_profile(engine: String) -> RuntimeProfileConfig {
-        RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
-            model: None,
-            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+        codex_runtime_profile_with_image(
+            engine,
+            Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+        )
+    }
+
+    fn codex_runtime_profile_with_image(
+        engine: String,
+        image: Option<String>,
+    ) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::new(
+            "codex",
+            "codex",
+            ConfinementConfig::Oci(OciConfinementConfig {
                 engine,
-                image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                image,
                 ..OciConfinementConfig::default()
             }),
-        }
+        )
+        .with_auth(codex_runtime_auth_kind())
+        .with_skill_projection(RuntimeSkillProjectionConfig::native_dir(".codex/skills"))
     }
 
     async fn write_test_codex_auth(home: &LionClawHome, auth: serde_json::Value) {
@@ -472,6 +563,36 @@ mod tests {
             .expect_err("missing host Codex auth should fail");
         assert!(err.to_string().contains("codex login"));
         assert!(err.to_string().contains("auth.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_reject_missing_profile_auth_before_launch() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        let mut profile = codex_runtime_profile(engine);
+        profile.auth = None;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile);
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("Codex profile without auth should fail before launch");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid for runtime driver 'codex'"),
+            "{message}"
+        );
+        assert!(message.contains("requires auth kind 'codex'"), "{message}");
     }
 
     #[cfg(unix)]

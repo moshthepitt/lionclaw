@@ -23,8 +23,6 @@ pub(crate) struct PrivateContextRecordRequest {
 pub(crate) enum PrivateContextRecordSurface {
     #[serde(rename = "program_turn")]
     Program,
-    #[serde(rename = "attached_native_tui_turn")]
-    AttachedNativeTui,
     #[serde(rename = "channel_turn")]
     Channel,
 }
@@ -33,7 +31,6 @@ impl PrivateContextRecordSurface {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Program => "program_turn",
-            Self::AttachedNativeTui => "attached_native_tui_turn",
             Self::Channel => "channel_turn",
         }
     }
