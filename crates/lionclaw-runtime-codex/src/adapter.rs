@@ -30,6 +30,7 @@ use crate::state::{
     load_ready_saved_thread_id, CodexInterruptRequest, CodexSessionState, CodexThreadState,
 };
 
+#[derive(Debug)]
 pub struct CodexRuntimeAdapter {
     pub(crate) config: CodexRuntimeConfig,
     sessions: Arc<RwLock<HashMap<String, CodexSessionState>>>,
