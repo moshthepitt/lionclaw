@@ -88,6 +88,7 @@ const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mo
 struct PreparedOciProcessLaunch {
     engine: String,
     args: Vec<String>,
+    root_in_userns: bool,
     network_mode: NetworkMode,
     environment: Vec<(String, String)>,
     image: String,
@@ -398,6 +399,7 @@ fn prepare_oci_process_launch(
     Ok(PreparedOciProcessLaunch {
         engine: config.engine.clone(),
         args,
+        root_in_userns: request.plan.root_in_userns,
         network_mode: request.plan.network_mode,
         environment,
         image: image.to_string(),
@@ -407,9 +409,14 @@ fn prepare_oci_process_launch(
     })
 }
 
-fn append_bind_mount_identity_args(args: &mut Vec<String>) {
+fn append_bind_mount_identity_args(args: &mut Vec<String>, root_in_userns: bool) {
     #[cfg(unix)]
     {
+        if root_in_userns {
+            args.push("--user".to_string());
+            args.push("0:0".to_string());
+            return;
+        }
         // LionClaw bind-mounts host workspace/runtime paths into confined
         // containers. Under rootless Podman, leaving user namespaces implicit
         // can make those mounts unreadable or unwritable to a non-root image
@@ -420,6 +427,10 @@ fn append_bind_mount_identity_args(args: &mut Vec<String>) {
         args.push("keep-id".to_string());
         args.push("--user".to_string());
         args.push(format!("{}:{}", getuid().as_raw(), getgid().as_raw()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (args, root_in_userns);
     }
 }
 
@@ -545,7 +556,7 @@ fn build_oci_process_invocation_with_terminal(
         args.push("--tty".to_string());
     }
 
-    append_bind_mount_identity_args(&mut args);
+    append_bind_mount_identity_args(&mut args, prepared.root_in_userns);
 
     match prepared.network_mode {
         NetworkMode::None => {
@@ -902,8 +913,9 @@ mod tests {
         ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
     };
     use crate::kernel::runtime::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
-        OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest,
+        InstallPolicy, NetworkMode, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,
+        WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
     use crate::project_inventory::{
@@ -1089,6 +1101,72 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_policy_user_keeps_keep_id_identity_args() {
+        let mut request = sample_execution_request();
+        request.plan.install_policy = InstallPolicy::User;
+        request.plan.root_in_userns = false;
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert_keep_id_with_host_user(&invocation.args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_policy_none_keeps_keep_id_identity_args() {
+        let mut request = sample_execution_request();
+        request.plan.install_policy = InstallPolicy::None;
+        request.plan.root_in_userns = false;
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert_keep_id_with_host_user(&invocation.args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_policy_system_root_posture_uses_root_identity_args() {
+        let mut request = sample_execution_request();
+        request.plan.install_policy = InstallPolicy::System;
+        request.plan.root_in_userns = true;
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert!(!invocation.args.iter().any(|arg| arg == "--userns"));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--user".to_string(), "0:0".to_string()]));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--network".to_string(), "private".to_string()]));
+    }
+
+    #[cfg(unix)]
+    fn assert_keep_id_with_host_user(args: &[String]) {
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--userns".to_string(), "keep-id".to_string()]));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--user".to_string(),
+                format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
+            ]
+        }));
     }
 
     #[test]
@@ -1639,6 +1717,8 @@ esac
             skill_projection: None,
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
+            install_policy: InstallPolicy::User,
+            root_in_userns: false,
             working_dir: Some("/host/workspace/src".to_string()),
             environment: vec![("FOO".to_string(), "from-plan".to_string())],
             mcp_servers: Vec::new(),

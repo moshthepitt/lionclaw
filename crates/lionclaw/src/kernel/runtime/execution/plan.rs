@@ -17,6 +17,9 @@ pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 pub const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
 pub const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
+pub const RUNTIME_INSTALL_ENV_DIR: &str = ".lionclaw";
+pub const RUNTIME_INSTALL_ENV_FILE: &str = "install-env.sh";
+pub const RUNTIME_INSTALL_ENV_PATH: &str = "/runtime/home/.lionclaw/install-env.sh";
 
 pub fn skill_mount_target(alias: &str) -> String {
     format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
@@ -176,6 +179,8 @@ pub struct ExecutionPreset {
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     #[serde(default)]
+    pub install_policy: InstallPolicy,
+    #[serde(default)]
     pub mount_runtime_secrets: bool,
     #[serde(default)]
     pub escape_classes: BTreeSet<EscapeClass>,
@@ -186,9 +191,33 @@ impl Default for ExecutionPreset {
         Self {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
+            install_policy: InstallPolicy::User,
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallPolicy {
+    None,
+    #[default]
+    User,
+    System,
+}
+
+impl InstallPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+
+    pub fn uses_user_install_helpers(self) -> bool {
+        matches!(self, Self::User | Self::System)
     }
 }
 
@@ -346,6 +375,8 @@ pub struct EffectiveExecutionPlan {
     pub skill_projection: Option<RuntimeSkillProjectionConfig>,
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
+    pub install_policy: InstallPolicy,
+    pub root_in_userns: bool,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub mcp_servers: Vec<lionclaw_runtime_api::RuntimeMcpServerSpec>,
@@ -366,6 +397,8 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("skill_projection", &self.skill_projection)
             .field("workspace_access", &self.workspace_access)
             .field("network_mode", &self.network_mode)
+            .field("install_policy", &self.install_policy)
+            .field("root_in_userns", &self.root_in_userns)
             .field("working_dir", &self.working_dir)
             .field("environment_count", &self.environment.len())
             .field("mcp_servers", &self.mcp_servers)
@@ -384,8 +417,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        runtime_skill_mount_target_alias, ConfinementConfig, EscapeClass, ExecutionPreset,
-        NetworkMode, WorkspaceAccess,
+        runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
+        ExecutionLimits, ExecutionPreset, InstallPolicy, NetworkMode, OciConfinementConfig,
+        WorkspaceAccess,
     };
 
     #[test]
@@ -421,6 +455,7 @@ mod tests {
         let preset = ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
+            install_policy: InstallPolicy::User,
             mount_runtime_secrets: true,
             escape_classes: [EscapeClass::SecretRequest].into_iter().collect(),
         };
@@ -487,6 +522,49 @@ mod tests {
     }
 
     #[test]
+    fn install_policy_defaults_to_user_and_uses_kebab_case_values() {
+        let defaulted: ExecutionPreset = serde_json::from_value(json!({
+            "workspace-access": "read-write",
+            "network-mode": "on",
+            "mount-runtime-secrets": false
+        }))
+        .expect("deserialize preset without install policy");
+        assert_eq!(defaulted.install_policy, InstallPolicy::User);
+
+        for (raw, expected) in [
+            ("none", InstallPolicy::None),
+            ("user", InstallPolicy::User),
+            ("system", InstallPolicy::System),
+        ] {
+            let preset = ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+                install_policy: expected,
+            };
+            let value = serde_json::to_value(&preset).expect("serialize preset");
+            assert_eq!(
+                value.get("install-policy").and_then(|raw| raw.as_str()),
+                Some(raw)
+            );
+
+            let round_trip: ExecutionPreset =
+                serde_json::from_value(value).expect("deserialize preset");
+            assert_eq!(round_trip.install_policy, expected);
+        }
+
+        let err = serde_json::from_value::<ExecutionPreset>(json!({
+            "workspace-access": "read-write",
+            "network-mode": "on",
+            "install-policy": "global"
+        }))
+        .expect_err("invalid install policy should be rejected");
+        assert!(err.to_string().contains("unknown variant"));
+        assert!(err.to_string().contains("global"));
+    }
+
+    #[test]
     fn runtime_program_spec_debug_redacts_environment_and_stdin_values() {
         let debug = format!(
             "{:?}",
@@ -502,6 +580,38 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("hello"));
+    }
+
+    #[test]
+    fn install_policy_effective_execution_plan_debug_redacts_environment_values() {
+        let debug = format!(
+            "{:?}",
+            EffectiveExecutionPlan {
+                runtime_id: "codex".to_string(),
+                preset_name: "team-local".to_string(),
+                confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                skill_projection: None,
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                install_policy: InstallPolicy::User,
+                root_in_userns: false,
+                working_dir: None,
+                environment: vec![("SECRET_ENV".to_string(), "sensitive-value".to_string())],
+                mcp_servers: Vec::new(),
+                idle_timeout: std::time::Duration::from_secs(1),
+                hard_timeout: std::time::Duration::from_secs(1),
+                mounts: Vec::new(),
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+                limits: ExecutionLimits::default(),
+            }
+        );
+
+        assert!(debug.contains("install_policy"));
+        assert!(debug.contains("root_in_userns"));
+        assert!(debug.contains("environment_count"));
+        assert!(!debug.contains("SECRET_ENV"));
+        assert!(!debug.contains("sensitive-value"));
     }
 
     #[test]

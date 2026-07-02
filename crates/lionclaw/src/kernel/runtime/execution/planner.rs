@@ -22,15 +22,19 @@ use super::{
     },
     plan::{
         runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
-        ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
+        ExecutionPreset, InstallPolicy, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
         RuntimeAuthKind, RuntimeSkillProjectionConfig, WorkspaceAccess, DRAFTS_MOUNT_TARGET,
-        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT,
-        WORKSPACE_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_INSTALL_ENV_PATH, RUNTIME_MOUNT_TARGET,
+        SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
     },
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
 pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
+const RUNTIME_IMAGE_BASE_PATH: &str = concat!(
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ":/usr/local/games:/usr/games"
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -192,6 +196,14 @@ struct BuildMountsRequest<'a> {
     purpose: ExecutionPlanPurpose,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedExecutionPresetAuditContext {
+    pub preset_name: String,
+    pub install_policy: InstallPolicy,
+    pub workspace_access: WorkspaceAccess,
+    pub network_mode: NetworkMode,
+}
+
 impl fmt::Debug for ExecutionPlanner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecutionPlanner")
@@ -251,6 +263,8 @@ impl ExecutionPlanner {
         )?;
         let (preset_name, preset) =
             self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
+        validate_install_policy_for_plan(&preset, &runtime_profile)?;
+        let root_in_userns = root_in_userns_for_install_policy(preset.install_policy);
         let escape_classes =
             escape_classes_for_purpose(request.purpose, preset.escape_classes.clone());
         let mounts = self.build_mounts(BuildMountsRequest {
@@ -283,6 +297,7 @@ impl ExecutionPlanner {
             has_runtime_home_mount,
             has_drafts_mount,
             has_skills_mount,
+            preset.install_policy,
         );
         let working_dir = execution_context
             .working_dir
@@ -295,6 +310,8 @@ impl ExecutionPlanner {
             skill_projection: runtime_profile.skill_projection,
             workspace_access: preset.workspace_access,
             network_mode: preset.network_mode,
+            install_policy: preset.install_policy,
+            root_in_userns,
             working_dir,
             environment,
             mcp_servers: Vec::new(),
@@ -331,6 +348,25 @@ impl ExecutionPlanner {
             self.default_preset_name.as_deref(),
             &self.presets,
         )
+    }
+
+    pub(crate) fn resolve_preset_audit_context(
+        &self,
+        requested_name: Option<&str>,
+        purpose: ExecutionPlanPurpose,
+    ) -> Result<ResolvedExecutionPresetAuditContext, String> {
+        let (preset_name, preset) = resolve_execution_preset(
+            purpose,
+            requested_name,
+            self.default_preset_name.as_deref(),
+            &self.presets,
+        )?;
+        Ok(ResolvedExecutionPresetAuditContext {
+            preset_name,
+            install_policy: preset.install_policy,
+            workspace_access: preset.workspace_access,
+            network_mode: preset.network_mode,
+        })
     }
 
     pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
@@ -488,6 +524,39 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
     }
 }
 
+fn validate_install_policy_for_plan(
+    preset: &ExecutionPreset,
+    runtime_profile: &RuntimeExecutionProfile,
+) -> Result<(), String> {
+    if preset.install_policy != InstallPolicy::System {
+        return Ok(());
+    }
+
+    if preset.workspace_access == WorkspaceAccess::ReadOnly {
+        return Err(
+            "install-policy=system requires workspace-access=read-write; got workspace-access=read-only"
+                .to_string(),
+        );
+    }
+
+    if preset.network_mode == NetworkMode::None {
+        return Err(
+            "install-policy=system requires network-mode=on; got network-mode=none".to_string(),
+        );
+    }
+
+    match &runtime_profile.confinement {
+        ConfinementConfig::Oci(config) if config.read_only_rootfs => Err(
+            "install-policy=system requires writable rootfs; got read-only-rootfs=true".to_string(),
+        ),
+        ConfinementConfig::Oci(_) => Ok(()),
+    }
+}
+
+fn root_in_userns_for_install_policy(policy: InstallPolicy) -> bool {
+    policy == InstallPolicy::System
+}
+
 fn has_mount_target(mounts: &[MountSpec], target: &str) -> bool {
     mounts.iter().any(|mount| mount.target == target)
 }
@@ -557,14 +626,15 @@ fn runtime_session_shape_key(
     escape_classes: &BTreeSet<EscapeClass>,
 ) -> String {
     let base_key = format!(
-        "workspace-{}__network-{}__secrets-{}",
+        "workspace-{}__network-{}__secrets-{}__install-policy-{}",
         preset.workspace_access.as_str(),
         preset.network_mode.as_str(),
         if preset.mount_runtime_secrets {
             "on"
         } else {
             "off"
-        }
+        },
+        preset.install_policy.as_str()
     );
     if escape_classes.is_empty() {
         return base_key;
@@ -610,6 +680,7 @@ fn hidden_compaction_preset() -> ExecutionPreset {
     ExecutionPreset {
         workspace_access: WorkspaceAccess::ReadOnly,
         network_mode: super::plan::NetworkMode::None,
+        install_policy: InstallPolicy::None,
         mount_runtime_secrets: false,
         escape_classes: Default::default(),
     }
@@ -648,6 +719,7 @@ fn build_runtime_environment(
     has_runtime_home_mount: bool,
     has_drafts_mount: bool,
     has_skills_mount: bool,
+    install_policy: InstallPolicy,
 ) -> Vec<(String, String)> {
     if has_workspace_mount {
         set_environment_value(
@@ -680,6 +752,9 @@ fn build_runtime_environment(
             "XDG_STATE_HOME",
             format!("{runtime_home}/.local/state"),
         );
+        if install_policy.uses_user_install_helpers() {
+            set_user_install_environment(&mut environment, &runtime_home);
+        }
     }
 
     if has_runtime_mount {
@@ -704,6 +779,54 @@ fn build_runtime_environment(
 
     set_environment_value(&mut environment, "TMPDIR", "/tmp");
     environment
+}
+
+fn set_user_install_environment(environment: &mut Vec<(String, String)>, runtime_home: &str) {
+    set_environment_value(
+        environment,
+        "PYTHONUSERBASE",
+        format!("{runtime_home}/.local"),
+    );
+    set_environment_value(environment, "PIP_BREAK_SYSTEM_PACKAGES", "1");
+    set_environment_value(
+        environment,
+        "NPM_CONFIG_PREFIX",
+        format!("{runtime_home}/.npm-global"),
+    );
+    set_environment_value(environment, "CARGO_HOME", format!("{runtime_home}/.cargo"));
+    set_environment_value(environment, "GOBIN", format!("{runtime_home}/go/bin"));
+    set_environment_value(environment, "BASH_ENV", RUNTIME_INSTALL_ENV_PATH);
+    prepend_environment_path(
+        environment,
+        [
+            format!("{runtime_home}/.local/bin"),
+            format!("{runtime_home}/.npm-global/bin"),
+            format!("{runtime_home}/.cargo/bin"),
+            format!("{runtime_home}/go/bin"),
+        ],
+    );
+}
+
+fn prepend_environment_path(
+    environment: &mut Vec<(String, String)>,
+    prefix_entries: impl IntoIterator<Item = String>,
+) {
+    let prefix = prefix_entries.into_iter().collect::<Vec<_>>().join(":");
+    if let Some((_, existing_value)) = environment
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == "PATH")
+    {
+        if existing_value.is_empty() {
+            *existing_value = format!("{prefix}:{RUNTIME_IMAGE_BASE_PATH}");
+        } else {
+            *existing_value = format!("{prefix}:{existing_value}");
+        }
+    } else {
+        environment.push((
+            "PATH".to_string(),
+            format!("{prefix}:{RUNTIME_IMAGE_BASE_PATH}"),
+        ));
+    }
 }
 
 fn set_environment_value(
@@ -736,16 +859,17 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
+        EffectiveExecutionPlan, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+        ExecutionPlannerConfig, RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY,
+        BUILTIN_PRESET_HIDDEN_COMPACTION, RUNTIME_IMAGE_BASE_PATH, RUNTIME_INSTALL_ENV_PATH,
     };
     use crate::home::{
         runtime_project_partition_key, RUNTIME_NATIVE_HOMES_DIR, RUNTIME_NATIVE_HOME_DIR,
         RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
     };
     use crate::kernel::runtime::{
-        ConfinementConfig, EscapeClass, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
-        OciConfinementConfig, WorkspaceAccess,
+        ConfinementConfig, EscapeClass, ExecutionPreset, InstallPolicy, MountAccess, MountSpec,
+        NetworkMode, OciConfinementConfig, WorkspaceAccess,
     };
     use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};
 
@@ -857,7 +981,7 @@ mod tests {
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off")
+                .join("workspace-read-write__network-on__secrets-off__install-policy-user")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
         assert!(
@@ -876,7 +1000,7 @@ mod tests {
                 .join(&project_key)
                 .join(RUNTIME_NATIVE_HOMES_DIR)
                 .join("runtime-codex-v1")
-                .join("workspace-read-write__network-on__secrets-off")
+                .join("workspace-read-write__network-on__secrets-off__install-policy-user")
                 .join(RUNTIME_NATIVE_HOME_DIR)
         );
         assert_eq!(plan.mounts[2].target, "/runtime/home");
@@ -922,6 +1046,27 @@ mod tests {
                     "XDG_STATE_HOME".to_string(),
                     "/runtime/home/.local/state".to_string()
                 ),
+                (
+                    "PYTHONUSERBASE".to_string(),
+                    "/runtime/home/.local".to_string()
+                ),
+                ("PIP_BREAK_SYSTEM_PACKAGES".to_string(), "1".to_string()),
+                (
+                    "NPM_CONFIG_PREFIX".to_string(),
+                    "/runtime/home/.npm-global".to_string()
+                ),
+                ("CARGO_HOME".to_string(), "/runtime/home/.cargo".to_string()),
+                ("GOBIN".to_string(), "/runtime/home/go/bin".to_string()),
+                (
+                    "BASH_ENV".to_string(),
+                    RUNTIME_INSTALL_ENV_PATH.to_string()
+                ),
+                (
+                    "PATH".to_string(),
+                    format!(
+                        "/runtime/home/.local/bin:/runtime/home/.npm-global/bin:/runtime/home/.cargo/bin:/runtime/home/go/bin:{RUNTIME_IMAGE_BASE_PATH}"
+                    )
+                ),
                 ("LIONCLAW_RUNTIME_DIR".to_string(), "/runtime".to_string()),
                 ("LIONCLAW_DRAFTS_DIR".to_string(), "/drafts".to_string()),
                 ("TMPDIR".to_string(), "/tmp".to_string()),
@@ -959,6 +1104,7 @@ mod tests {
                 ExecutionPreset {
                     workspace_access: WorkspaceAccess::ReadWrite,
                     network_mode: NetworkMode::On,
+                    install_policy: InstallPolicy::User,
                     mount_runtime_secrets: false,
                     escape_classes: BTreeSet::new(),
                 },
@@ -968,6 +1114,7 @@ mod tests {
                 ExecutionPreset {
                     workspace_access: WorkspaceAccess::ReadWrite,
                     network_mode: NetworkMode::On,
+                    install_policy: InstallPolicy::User,
                     mount_runtime_secrets: false,
                     escape_classes: BTreeSet::from([EscapeClass::ChannelSend]),
                 },
@@ -1022,7 +1169,7 @@ mod tests {
         assert!(plain_plan.mounts[2]
             .source
             .to_string_lossy()
-            .ends_with("workspace-read-write__network-on__secrets-off/home"));
+            .ends_with("workspace-read-write__network-on__secrets-off__install-policy-user/home"));
         assert!(channel_send_plan.mounts[2]
             .source
             .to_string_lossy()
@@ -1043,6 +1190,7 @@ mod tests {
             true,
             false,
             false,
+            InstallPolicy::None,
         );
 
         assert_eq!(
@@ -1061,6 +1209,256 @@ mod tests {
     }
 
     #[test]
+    fn install_policy_default_user_wires_user_prefixes_and_non_root_posture() {
+        let sandbox = tempdir().expect("temp dir");
+        let planner = planner_for_install_policy_tests(
+            sandbox.path(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            true,
+        );
+
+        let plan = planner
+            .plan(install_policy_plan_request(None))
+            .expect("default user plan");
+
+        assert_eq!(plan.install_policy, InstallPolicy::User);
+        assert!(!plan.root_in_userns);
+        assert_user_install_environment(&plan.environment, None);
+    }
+
+    #[test]
+    fn install_policy_explicit_user_preserves_existing_path_after_prefix() {
+        let environment = super::build_runtime_environment(
+            vec![("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string())],
+            true,
+            true,
+            true,
+            false,
+            false,
+            InstallPolicy::User,
+        );
+
+        assert_user_install_environment(&environment, Some("/usr/local/bin:/usr/bin"));
+    }
+
+    #[test]
+    fn install_policy_user_omits_install_helpers_without_runtime_home() {
+        let sandbox = tempdir().expect("temp dir");
+        let planner = planner_for_install_policy_tests(
+            sandbox.path(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            false,
+        );
+
+        let plan = planner
+            .plan(install_policy_plan_request(None))
+            .expect("default user plan without runtime home");
+
+        assert_eq!(plan.install_policy, InstallPolicy::User);
+        assert!(!plan.root_in_userns);
+        assert_no_install_helper_environment(&plan.environment);
+    }
+
+    #[test]
+    fn install_policy_none_omits_install_helpers_and_keeps_non_root_posture() {
+        let sandbox = tempdir().expect("temp dir");
+        let presets = [(
+            "locked".to_string(),
+            preset_with_install_policy(InstallPolicy::None),
+        )]
+        .into_iter()
+        .collect();
+        let planner =
+            planner_for_install_policy_tests(sandbox.path(), presets, BTreeMap::new(), true);
+
+        let plan = planner
+            .plan(install_policy_plan_request(Some("locked")))
+            .expect("none policy plan");
+
+        assert_eq!(plan.install_policy, InstallPolicy::None);
+        assert!(!plan.root_in_userns);
+        assert_no_install_helper_environment(&plan.environment);
+    }
+
+    #[test]
+    fn install_policy_system_sets_root_posture_and_user_install_environment() {
+        let sandbox = tempdir().expect("temp dir");
+        let presets = [(
+            "system".to_string(),
+            preset_with_install_policy(InstallPolicy::System),
+        )]
+        .into_iter()
+        .collect();
+        let planner =
+            planner_for_install_policy_tests(sandbox.path(), presets, BTreeMap::new(), true);
+
+        let plan = planner
+            .plan(install_policy_plan_request(Some("system")))
+            .expect("system policy plan");
+
+        assert_eq!(plan.install_policy, InstallPolicy::System);
+        assert!(plan.root_in_userns);
+        assert_eq!(plan.network_mode, NetworkMode::On);
+        assert!(!plan.confinement.oci().read_only_rootfs);
+        assert_user_install_environment(&plan.environment, None);
+    }
+
+    #[test]
+    fn install_policy_fallback_path_includes_debian_games_dirs() {
+        let sandbox = tempdir().expect("temp dir");
+        let presets = [(
+            "system".to_string(),
+            preset_with_install_policy(InstallPolicy::System),
+        )]
+        .into_iter()
+        .collect();
+        let planner =
+            planner_for_install_policy_tests(sandbox.path(), presets, BTreeMap::new(), true);
+
+        for (preset_name, expected_policy) in [
+            (None, InstallPolicy::User),
+            (Some("system"), InstallPolicy::System),
+        ] {
+            let plan = planner
+                .plan(install_policy_plan_request(preset_name))
+                .expect("install policy plan");
+
+            assert_eq!(plan.install_policy, expected_policy);
+            let path = single_environment_value(&plan.environment, "PATH");
+            let entries = path.split(':').collect::<Vec<_>>();
+            assert!(
+                entries.contains(&"/usr/local/games"),
+                "{expected_policy:?} fallback PATH missing /usr/local/games: {path}"
+            );
+            assert!(
+                entries.contains(&"/usr/games"),
+                "{expected_policy:?} fallback PATH missing /usr/games: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_policy_system_rejects_unsafe_plan_combinations() {
+        let sandbox = tempdir().expect("temp dir");
+
+        let read_only_rootfs_runtime = RuntimeExecutionProfile::new(
+            ConfinementConfig::Oci(OciConfinementConfig {
+                read_only_rootfs: true,
+                ..OciConfinementConfig::default()
+            }),
+            "runtime-codex-v1".to_string(),
+            None,
+            None,
+        );
+
+        for (name, preset, runtimes, expected) in [
+            (
+                "read-only-rootfs",
+                preset_with_install_policy(InstallPolicy::System),
+                [("codex".to_string(), read_only_rootfs_runtime.clone())]
+                    .into_iter()
+                    .collect(),
+                "install-policy=system requires writable rootfs; got read-only-rootfs=true",
+            ),
+            (
+                "offline",
+                ExecutionPreset {
+                    install_policy: InstallPolicy::System,
+                    network_mode: NetworkMode::None,
+                    ..ExecutionPreset::default()
+                },
+                BTreeMap::new(),
+                "install-policy=system requires network-mode=on; got network-mode=none",
+            ),
+            (
+                "read-only-workspace",
+                ExecutionPreset {
+                    install_policy: InstallPolicy::System,
+                    workspace_access: WorkspaceAccess::ReadOnly,
+                    ..ExecutionPreset::default()
+                },
+                BTreeMap::new(),
+                "install-policy=system requires workspace-access=read-write; got workspace-access=read-only",
+            ),
+        ] {
+            let presets = [(name.to_string(), preset)].into_iter().collect();
+            let planner = planner_for_install_policy_tests(sandbox.path(), presets, runtimes, true);
+            let err = planner
+                .plan(install_policy_plan_request(Some(name)))
+                .expect_err("unsafe system policy combination should be rejected");
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in planner error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_policy_partitions_runtime_state_and_native_home_paths() {
+        let sandbox = tempdir().expect("temp dir");
+        let presets = [
+            (
+                "none".to_string(),
+                preset_with_install_policy(InstallPolicy::None),
+            ),
+            (
+                "user".to_string(),
+                preset_with_install_policy(InstallPolicy::User),
+            ),
+            (
+                "system".to_string(),
+                preset_with_install_policy(InstallPolicy::System),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let planner =
+            planner_for_install_policy_tests(sandbox.path(), presets, BTreeMap::new(), true);
+
+        let none = planner
+            .plan(install_policy_plan_request(Some("none")))
+            .expect("none plan");
+        let user = planner
+            .plan(install_policy_plan_request(Some("user")))
+            .expect("user plan");
+        let system = planner
+            .plan(install_policy_plan_request(Some("system")))
+            .expect("system plan");
+
+        for target in ["/runtime", "/runtime/home"] {
+            let none_source = mount_source(&none, target);
+            let user_source = mount_source(&user, target);
+            let system_source = mount_source(&system, target);
+            assert_ne!(none_source, user_source, "{target} none/user partition");
+            assert_ne!(none_source, system_source, "{target} none/system partition");
+            assert_ne!(user_source, system_source, "{target} user/system partition");
+            assert!(
+                none_source
+                    .to_string_lossy()
+                    .contains("install-policy-none"),
+                "{target} none source should include install policy: {}",
+                none_source.display()
+            );
+            assert!(
+                user_source
+                    .to_string_lossy()
+                    .contains("install-policy-user"),
+                "{target} user source should include install policy: {}",
+                user_source.display()
+            );
+            assert!(
+                system_source
+                    .to_string_lossy()
+                    .contains("install-policy-system"),
+                "{target} system source should include install policy: {}",
+                system_source.display()
+            );
+        }
+    }
+
+    #[test]
     fn attached_runtime_tui_preserves_execution_shape_without_turn_scoped_escapes() {
         let sandbox = tempdir().expect("temp dir");
         let workspace_root = sandbox.path().join("project");
@@ -1070,6 +1468,7 @@ mod tests {
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
+                install_policy: InstallPolicy::User,
                 mount_runtime_secrets: true,
                 escape_classes: BTreeSet::from([EscapeClass::ChannelSend]),
             },
@@ -1913,6 +2312,108 @@ mod tests {
 
         let debug = format!("{planner:?}");
         assert!(!debug.contains("ghp_secret"));
+    }
+
+    fn planner_for_install_policy_tests(
+        root: &std::path::Path,
+        presets: BTreeMap<String, ExecutionPreset>,
+        runtimes: BTreeMap<String, RuntimeExecutionProfile>,
+        include_runtime_home: bool,
+    ) -> ExecutionPlanner {
+        ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets,
+            runtimes,
+            workspace_root: Some(root.join("workspace")),
+            project_workspace_root: Some(root.join("project")),
+            runtime_root: include_runtime_home.then(|| root.join("runtime")),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        })
+    }
+
+    fn install_policy_plan_request(preset_name: Option<&str>) -> ExecutionPlanRequest {
+        ExecutionPlanRequest {
+            session_id: Some(Uuid::nil()),
+            runtime_id: "codex".to_string(),
+            purpose: ExecutionPlanPurpose::Interactive,
+            preset_name: preset_name.map(str::to_string),
+            working_dir: None,
+            env_passthrough_keys: Vec::new(),
+            skill_mounts: Vec::new(),
+            extra_mounts: Vec::new(),
+            timeout_ms: None,
+        }
+    }
+
+    fn preset_with_install_policy(install_policy: InstallPolicy) -> ExecutionPreset {
+        ExecutionPreset {
+            install_policy,
+            ..ExecutionPreset::default()
+        }
+    }
+
+    fn assert_user_install_environment(
+        environment: &[(String, String)],
+        existing_path_suffix: Option<&str>,
+    ) {
+        assert_eq!(
+            single_environment_value(environment, "PYTHONUSERBASE"),
+            "/runtime/home/.local"
+        );
+        assert_eq!(
+            single_environment_value(environment, "PIP_BREAK_SYSTEM_PACKAGES"),
+            "1"
+        );
+        assert_eq!(
+            single_environment_value(environment, "NPM_CONFIG_PREFIX"),
+            "/runtime/home/.npm-global"
+        );
+        assert_eq!(
+            single_environment_value(environment, "CARGO_HOME"),
+            "/runtime/home/.cargo"
+        );
+        assert_eq!(
+            single_environment_value(environment, "GOBIN"),
+            "/runtime/home/go/bin"
+        );
+        assert_eq!(
+            single_environment_value(environment, "BASH_ENV"),
+            RUNTIME_INSTALL_ENV_PATH
+        );
+        let expected_prefix = "/runtime/home/.local/bin:/runtime/home/.npm-global/bin:/runtime/home/.cargo/bin:/runtime/home/go/bin";
+        let expected_path = existing_path_suffix.map_or_else(
+            || format!("{expected_prefix}:{RUNTIME_IMAGE_BASE_PATH}"),
+            |existing| format!("{expected_prefix}:{existing}"),
+        );
+        assert_eq!(single_environment_value(environment, "PATH"), expected_path);
+    }
+
+    fn assert_no_install_helper_environment(environment: &[(String, String)]) {
+        for key in [
+            "PYTHONUSERBASE",
+            "PIP_BREAK_SYSTEM_PACKAGES",
+            "NPM_CONFIG_PREFIX",
+            "CARGO_HOME",
+            "GOBIN",
+            "BASH_ENV",
+        ] {
+            assert!(
+                !environment.iter().any(|(candidate, _)| candidate == key),
+                "{key} should not be present"
+            );
+        }
+    }
+
+    fn mount_source<'a>(plan: &'a EffectiveExecutionPlan, target: &str) -> &'a std::path::Path {
+        plan.mounts
+            .iter()
+            .find(|mount| mount.target == target)
+            .unwrap_or_else(|| panic!("{target} mount should exist"))
+            .source
+            .as_path()
     }
 
     fn single_environment_value<'a>(environment: &'a [(String, String)], key: &str) -> &'a str {

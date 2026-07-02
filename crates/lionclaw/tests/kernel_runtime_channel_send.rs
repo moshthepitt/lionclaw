@@ -2657,6 +2657,7 @@ fn base_channel_send_kernel_options(env: &TestHome, enabled: bool) -> KernelOpti
                 network_mode: NetworkMode::On,
                 mount_runtime_secrets: false,
                 escape_classes,
+                ..ExecutionPreset::default()
             },
         )]),
         runtime_root: Some(env.home().runtime_dir()),

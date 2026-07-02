@@ -9,8 +9,9 @@ use crate::home::{
 };
 use crate::kernel::runtime::{
     execution::mount_validation::{normalize_runtime_mount_target, validate_configured_mounts},
-    ConfinementConfig, ExecutionPreset, RuntimeAuthContext, RuntimeAuthKind,
-    RuntimeExecutionProfile, RuntimeSkillProjectionConfig, RuntimeTerminalConfig,
+    ConfinementConfig, ExecutionPreset, InstallPolicy, NetworkMode, RuntimeAuthContext,
+    RuntimeAuthKind, RuntimeExecutionProfile, RuntimeSkillProjectionConfig, RuntimeTerminalConfig,
+    WorkspaceAccess,
 };
 use crate::kernel::skills::sanitize_skill_name;
 use crate::operator::command_display::shell_quote_arg;
@@ -54,6 +55,9 @@ impl OperatorConfig {
             }
         };
         config.normalize();
+        config
+            .validate_presets()
+            .with_context(|| format!("failed to validate {}", path.display()))?;
         Ok(config)
     }
 
@@ -67,6 +71,9 @@ impl OperatorConfig {
 
         let mut normalized = self.clone();
         normalized.normalize();
+        normalized
+            .validate_presets()
+            .context("failed to validate operator config presets")?;
         let content =
             toml::to_string_pretty(&normalized).context("failed to encode operator config")?;
         tokio::fs::write(&path, content)
@@ -137,6 +144,14 @@ impl OperatorConfig {
 
     pub fn preset(&self, id: &str) -> Option<&ExecutionPreset> {
         self.presets.get(id)
+    }
+
+    pub fn validate_presets(&self) -> Result<()> {
+        for (id, preset) in &self.presets {
+            validate_execution_preset(id, preset)
+                .with_context(|| format!("configured preset '{id}' is invalid"))?;
+        }
+        Ok(())
     }
 
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
@@ -643,6 +658,26 @@ fn compatibility_digest_bytes<T: Serialize>(value: &T) -> Vec<u8> {
 
 fn normalize_execution_preset(_preset: &mut ExecutionPreset) {}
 
+fn validate_execution_preset(id: &str, preset: &ExecutionPreset) -> Result<()> {
+    if preset.install_policy != InstallPolicy::System {
+        return Ok(());
+    }
+
+    if preset.network_mode == NetworkMode::None {
+        return Err(anyhow!(
+            "install-policy=system on preset '{id}' requires network-mode=on; got network-mode=none"
+        ));
+    }
+
+    if preset.workspace_access == WorkspaceAccess::ReadOnly {
+        return Err(anyhow!(
+            "install-policy=system on preset '{id}' requires workspace-access=read-write; got workspace-access=read-only"
+        ));
+    }
+
+    Ok(())
+}
+
 fn normalize_confinement_config(config: &mut ConfinementConfig) {
     match config {
         ConfinementConfig::Oci(oci) => {
@@ -876,7 +911,7 @@ mod tests {
         RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
+        ConfinementConfig, ExecutionPreset, InstallPolicy, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, RuntimeAuthContext, RuntimeTerminalConfig, WorkspaceAccess,
     };
 
@@ -1350,15 +1385,7 @@ executable = "opencode"
     #[test]
     fn first_preset_becomes_default() {
         let mut config = OperatorConfig::default();
-        config.upsert_preset(
-            "everyday".to_string(),
-            ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
-            },
-        );
+        config.upsert_preset("everyday".to_string(), ExecutionPreset::default());
 
         assert_eq!(config.defaults.preset.as_deref(), Some("everyday"));
     }
@@ -1366,15 +1393,7 @@ executable = "opencode"
     #[test]
     fn removing_default_preset_clears_default() {
         let mut config = OperatorConfig::default();
-        config.upsert_preset(
-            "everyday".to_string(),
-            ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
-            },
-        );
+        config.upsert_preset("everyday".to_string(), ExecutionPreset::default());
 
         assert!(config.remove_preset("everyday"));
         assert!(config.defaults.preset.is_none());
@@ -1386,16 +1405,83 @@ executable = "opencode"
         config.upsert_preset(
             "  everyday  ".to_string(),
             ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
                 mount_runtime_secrets: true,
-                escape_classes: Default::default(),
+                ..ExecutionPreset::default()
             },
         );
 
         assert!(config.preset("  everyday  ").is_none());
         let preset = config.preset("everyday").expect("normalized preset");
         assert!(preset.mount_runtime_secrets);
+    }
+
+    #[test]
+    fn install_policy_system_preset_validation_rejects_offline_network() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "offline-system".to_string(),
+            ExecutionPreset {
+                install_policy: InstallPolicy::System,
+                network_mode: NetworkMode::None,
+                ..ExecutionPreset::default()
+            },
+        );
+
+        let err = config
+            .validate_presets()
+            .expect_err("system installs require network on");
+        let message = format!("{err:#}");
+        assert!(message.contains("offline-system"), "{message}");
+        assert!(message.contains("install-policy=system"), "{message}");
+        assert!(message.contains("network-mode=on"), "{message}");
+        assert!(message.contains("network-mode=none"), "{message}");
+    }
+
+    #[test]
+    fn install_policy_system_preset_validation_rejects_read_only_workspace() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "read-only-system".to_string(),
+            ExecutionPreset {
+                install_policy: InstallPolicy::System,
+                workspace_access: WorkspaceAccess::ReadOnly,
+                ..ExecutionPreset::default()
+            },
+        );
+
+        let err = config
+            .validate_presets()
+            .expect_err("system installs require writable workspace");
+        let message = format!("{err:#}");
+        assert!(message.contains("read-only-system"), "{message}");
+        assert!(message.contains("install-policy=system"), "{message}");
+        assert!(message.contains("workspace-access=read-write"), "{message}");
+        assert!(message.contains("workspace-access=read-only"), "{message}");
+    }
+
+    #[test]
+    fn install_policy_is_part_of_daemon_compat_fingerprint() {
+        let mut user = OperatorConfig::default();
+        user.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                install_policy: InstallPolicy::User,
+                ..ExecutionPreset::default()
+            },
+        );
+        let mut system = user.clone();
+        system.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                install_policy: InstallPolicy::System,
+                ..ExecutionPreset::default()
+            },
+        );
+
+        assert_ne!(
+            daemon_compat_fingerprint(&user),
+            daemon_compat_fingerprint(&system)
+        );
     }
 
     #[cfg(unix)]

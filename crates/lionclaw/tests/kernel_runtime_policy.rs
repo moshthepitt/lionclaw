@@ -1,8 +1,15 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use lionclaw::{
     contracts::{SessionOpenRequest, SessionTurnRequest, TrustTier},
-    kernel::{Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy, RuntimeExecutionRule},
+    kernel::{
+        runtime::{ExecutionPreset, InstallPolicy, NetworkMode},
+        Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy, RuntimeExecutionRule,
+    },
 };
 use tempfile::TempDir;
 
@@ -134,6 +141,143 @@ async fn runtime_policy_denies_unallowed_env_passthrough() {
             .contains("not allowed by policy"),
         "audit should capture deny reason"
     );
+}
+
+#[tokio::test]
+async fn install_policy_system_allow_audit_records_effective_policy_and_root_posture() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            default_preset_name: Some("system-installs".to_string()),
+            execution_presets: BTreeMap::from([(
+                "system-installs".to_string(),
+                ExecutionPreset {
+                    install_policy: InstallPolicy::System,
+                    ..ExecutionPreset::default()
+                },
+            )]),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "runtime-policy-system-allow".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("open session");
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "run with system install policy".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should succeed");
+
+    let policy_events = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.plan.allow".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query plan audit");
+
+    assert_eq!(policy_events.events.len(), 1);
+    let details = &policy_events.events[0].details;
+    assert_eq!(
+        details["effective_preset_name"].as_str(),
+        Some("system-installs")
+    );
+    assert_eq!(details["effective_install_policy"].as_str(), Some("system"));
+    assert_eq!(details["effective_root_in_userns"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn install_policy_system_deny_audit_records_requested_policy_context() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            default_preset_name: Some("offline-system".to_string()),
+            execution_presets: BTreeMap::from([(
+                "offline-system".to_string(),
+                ExecutionPreset {
+                    install_policy: InstallPolicy::System,
+                    network_mode: NetworkMode::None,
+                    ..ExecutionPreset::default()
+                },
+            )]),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "runtime-policy-system-deny".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("open session");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "deny unsafe system install policy".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("turn should be denied before runtime launch");
+
+    match err {
+        KernelError::BadRequest(message) => {
+            assert!(message.contains("install-policy=system"), "{message}");
+            assert!(message.contains("network-mode=none"), "{message}");
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let deny_events = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.plan.deny".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query deny audit");
+
+    assert_eq!(deny_events.events.len(), 1);
+    let details = &deny_events.events[0].details;
+    assert_eq!(
+        details["requested_effective_preset_name"].as_str(),
+        Some("offline-system")
+    );
+    assert_eq!(details["requested_install_policy"].as_str(), Some("system"));
+    assert_eq!(details["requested_network_mode"].as_str(), Some("none"));
+    assert!(details["reason"]
+        .as_str()
+        .expect("deny reason")
+        .contains("install-policy=system"));
 }
 
 #[tokio::test]

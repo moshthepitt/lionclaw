@@ -169,7 +169,8 @@ use super::{
         RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
         RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalProgramInput,
         RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, TurnEvent, DRAFTS_MOUNT_TARGET,
-        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+        RUNTIME_HOME_MOUNT_TARGET, RUNTIME_INSTALL_ENV_DIR, RUNTIME_INSTALL_ENV_FILE,
+        RUNTIME_MOUNT_TARGET,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -7721,7 +7722,8 @@ mod tests {
         PRIVATE_CONTEXT_RECORD_MAX_ASSISTANT_TEXT_BYTES, PRIVATE_CONTEXT_RECORD_MAX_USER_TEXT_BYTES,
     };
     use crate::kernel::runtime::{
-        RawTurnPayload, RuntimeAdapterInfo, RuntimeEventSender, RuntimeTurnJournalSender,
+        InstallPolicy, RawTurnPayload, RuntimeAdapterInfo, RuntimeEventSender,
+        RuntimeTurnJournalSender,
     };
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
     use crate::kernel::session_turns::SessionTurnStore;
@@ -7962,6 +7964,8 @@ mod tests {
             skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
+            install_policy: crate::kernel::runtime::InstallPolicy::User,
+            root_in_userns: false,
             working_dir: None,
             environment: Vec::new(),
             mcp_servers: Vec::new(),
@@ -12995,6 +12999,63 @@ done
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
+    #[tokio::test]
+    async fn materialize_runtime_plan_writes_install_shell_env_for_install_policy() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let mut plan = test_execution_plan("codex");
+        plan.install_policy = InstallPolicy::System;
+        plan.mounts = vec![MountSpec {
+            source: runtime_home_root.clone(),
+            target: "/runtime/home".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        kernel
+            .materialize_runtime_plan(&plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let install_env = runtime_home_root
+            .join(RUNTIME_INSTALL_ENV_DIR)
+            .join(RUNTIME_INSTALL_ENV_FILE);
+        let contents = tokio::fs::read_to_string(&install_env)
+            .await
+            .expect("read install env");
+        assert!(contents.contains("/runtime/home/.local/bin"));
+        assert!(contents.contains("/usr/games"));
+        assert!(contents.contains("export PATH"));
+    }
+
+    #[tokio::test]
+    async fn materialize_runtime_plan_omits_install_shell_env_for_install_policy_none() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_home_root = temp_dir.path().join("runtime-home");
+        let mut plan = test_execution_plan("codex");
+        plan.install_policy = InstallPolicy::None;
+        plan.mounts = vec![MountSpec {
+            source: runtime_home_root.clone(),
+            target: "/runtime/home".to_string(),
+            access: MountAccess::ReadWrite,
+        }];
+
+        kernel
+            .materialize_runtime_plan(&plan)
+            .await
+            .expect("materialize runtime plan");
+
+        assert!(!runtime_home_root
+            .join(RUNTIME_INSTALL_ENV_DIR)
+            .join(RUNTIME_INSTALL_ENV_FILE)
+            .exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn direct_runtime_artifacts_reject_retargeted_declared_native_home_dir_after_root_check()
@@ -13488,6 +13549,7 @@ done
                         escape_classes: BTreeSet::from([
                             crate::kernel::runtime::EscapeClass::ChannelSend,
                         ]),
+                        ..crate::kernel::runtime::ExecutionPreset::default()
                     },
                 )]),
                 runtime_root: Some(runtime_root),
@@ -14247,6 +14309,8 @@ done
             skill_projection: None,
             workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
             network_mode: crate::kernel::runtime::NetworkMode::On,
+            install_policy: crate::kernel::runtime::InstallPolicy::User,
+            root_in_userns: false,
             working_dir: None,
             environment: Vec::new(),
             mcp_servers: Vec::new(),
@@ -16740,6 +16804,85 @@ async fn ensure_existing_runtime_native_home_is_safe(
         )));
     }
     set_runtime_native_home_private_permissions(path, metadata.permissions()).await
+}
+
+const RUNTIME_INSTALL_ENV_SCRIPT: &str = r#"# Generated by LionClaw for runtime install policy.
+_lionclaw_path_prepend() {
+  case ":${PATH:-}:" in
+    *":$1:"*) ;;
+    *) PATH="$1${PATH:+:$PATH}" ;;
+  esac
+}
+
+_lionclaw_path_append() {
+  case ":${PATH:-}:" in
+    *":$1:"*) ;;
+    *) PATH="${PATH:+$PATH:}$1" ;;
+  esac
+}
+
+_lionclaw_path_prepend "/runtime/home/go/bin"
+_lionclaw_path_prepend "/runtime/home/.cargo/bin"
+_lionclaw_path_prepend "/runtime/home/.npm-global/bin"
+_lionclaw_path_prepend "/runtime/home/.local/bin"
+
+_lionclaw_path_append "/usr/local/sbin"
+_lionclaw_path_append "/usr/local/bin"
+_lionclaw_path_append "/usr/sbin"
+_lionclaw_path_append "/usr/bin"
+_lionclaw_path_append "/sbin"
+_lionclaw_path_append "/bin"
+_lionclaw_path_append "/usr/local/games"
+_lionclaw_path_append "/usr/games"
+
+export PATH
+unset -f _lionclaw_path_prepend _lionclaw_path_append
+"#;
+
+async fn write_runtime_install_env_file(runtime_home_root: &Path) -> Result<(), KernelError> {
+    let install_env_dir =
+        ensure_safe_child_directory(runtime_home_root, &[RUNTIME_INSTALL_ENV_DIR]).await?;
+    tokio::task::spawn_blocking(move || write_runtime_install_env_file_blocking(&install_env_dir))
+        .await
+        .map_err(|err| internal(err.into()))?
+}
+
+fn write_runtime_install_env_file_blocking(install_env_dir: &Path) -> Result<(), KernelError> {
+    let dir = open_runtime_install_env_dir_blocking(install_env_dir)?;
+    write_file_atomically(
+        &dir,
+        install_env_dir,
+        std::ffi::OsStr::new(RUNTIME_INSTALL_ENV_FILE),
+        RUNTIME_INSTALL_ENV_SCRIPT.as_bytes(),
+        RUNTIME_STATE_FILE_MODE,
+        None,
+        "runtime install environment file",
+    )
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to write runtime install environment file in '{}': {err}",
+            install_env_dir.display()
+        ))
+    })
+}
+
+fn open_runtime_install_env_dir_blocking(
+    install_env_dir: &Path,
+) -> Result<std::fs::File, KernelError> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let dir = open(
+        install_env_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        internal(anyhow::anyhow!(
+            "failed to open runtime install environment directory '{}': {err}",
+            install_env_dir.display()
+        ))
+    })?;
+    Ok(std::fs::File::from(dir))
 }
 
 async fn set_runtime_native_home_private_permissions(
@@ -22168,7 +22311,13 @@ impl Kernel {
             &plan.mounts,
         )
         .await
-        .map_err(internal)
+        .map_err(internal)?;
+
+        if plan.install_policy.uses_user_install_helpers() {
+            write_runtime_install_env_file(runtime_home_root).await?;
+        }
+
+        Ok(())
     }
 
     async fn reset_runtime_plan_state(
@@ -24995,6 +25144,10 @@ impl Kernel {
         let request_working_dir = request.working_dir.clone();
         let request_timeout_ms = request.timeout_ms;
         let request_env = request.env_passthrough_keys.clone();
+        let request_preset_context = self
+            .execution_planner
+            .resolve_preset_audit_context(request_preset.as_deref(), request.purpose)
+            .ok();
         let runtime_profile = self
             .resolve_runtime_execution_profile_for_launch(runtime_id)
             .await?;
@@ -25016,6 +25169,8 @@ impl Kernel {
                             "requested_timeout_ms": request_timeout_ms,
                             "requested_env_passthrough": request_env,
                             "effective_preset_name": plan.preset_name.clone(),
+                            "effective_install_policy": plan.install_policy.as_str(),
+                            "effective_root_in_userns": plan.root_in_userns,
                             "confinement_backend": plan.confinement.backend().as_str(),
                             "effective_working_dir": plan.working_dir.clone(),
                             "effective_timeout_ms": plan.idle_timeout.as_millis() as u64,
@@ -25047,6 +25202,10 @@ impl Kernel {
                         json!({
                             "runtime_id": runtime_id,
                             "requested_preset_name": request_preset,
+                            "requested_effective_preset_name": request_preset_context.as_ref().map(|context| context.preset_name.clone()),
+                            "requested_install_policy": request_preset_context.as_ref().map(|context| context.install_policy.as_str()),
+                            "requested_workspace_access": request_preset_context.as_ref().map(|context| context.workspace_access.as_str()),
+                            "requested_network_mode": request_preset_context.as_ref().map(|context| context.network_mode.as_str()),
                             "requested_working_dir": request_working_dir,
                             "requested_timeout_ms": request_timeout_ms,
                             "requested_env_passthrough": request_env,
