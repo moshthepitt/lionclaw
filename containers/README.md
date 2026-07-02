@@ -51,6 +51,6 @@ container-owned cargo and uv caches under `/runtime` writable.
 Use the dev image for this checkout with:
 
 ```bash
-lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime-dev:v1
+lionclaw runtime add codex --driver codex --bin codex --image lionclaw-runtime-dev:v1
 lionclaw runtime set-default codex
 ```

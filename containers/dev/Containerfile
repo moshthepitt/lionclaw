@@ -1,5 +1,5 @@
 ARG RUNTIME_IMAGE=lionclaw-runtime:v1
-ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
+ARG RUST_IMAGE=docker.io/library/rust:1.96.1-bookworm
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.22
 
 FROM ${RUST_IMAGE} AS rust-toolchain
@@ -85,7 +85,7 @@ USER lionclaw
 WORKDIR /workspace
 
 RUN uv python install 3.12 \
-    && rustc --version | grep '1.96.0' \
+    && rustc --version | grep '1.96.1' \
     && npm ls -g @openai/codex opencode-ai --depth=0 --json \
         | jq -e \
             '.dependencies["@openai/codex"].version and .dependencies["opencode-ai"].version' \
