@@ -18,10 +18,13 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 ## LionClaw Dev Image
 
-`containers/dev/Containerfile` layers Rust tooling on top of the runtime image
-for working on LionClaw itself. It includes the pinned Rust toolchain,
-`rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, native build dependencies,
-SQLite development headers, and basic debugging tools.
+`containers/dev/Containerfile` layers LionClaw development tooling on top of
+the runtime image. It includes the pinned Rust toolchain from
+`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, `uv`,
+Python 3.12 for the Python skill checks, native build dependencies, SQLite
+development headers, and basic debugging tools.
+The managed Python install is kept in the image outside `/runtime`, while cargo
+and uv caches remain under `/runtime` for writable runtime state.
 
 ```bash
 podman build \
@@ -29,6 +32,21 @@ podman build \
   -t lionclaw-runtime-dev:v1 \
   -f containers/dev/Containerfile .
 ```
+
+Run the repository gate in the dev image with:
+
+```bash
+podman run --rm -it \
+  --userns=keep-id:uid=1001,gid=1001 \
+  -v "$PWD:/workspace:Z" \
+  -w /workspace \
+  lionclaw-runtime-dev:v1 \
+  bash ./scripts/ci.sh
+```
+
+The `keep-id` mapping targets the image's `lionclaw` user so rootless Podman
+can write build outputs into the host-owned checkout while keeping the
+container-owned cargo and uv caches under `/runtime` writable.
 
 Use the dev image for this checkout with:
 
