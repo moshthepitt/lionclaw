@@ -215,6 +215,104 @@ Expected:
   inside `run --runtime-tui`
 - the runtime TUI is not offered the LionClaw MCP `channel_send` tool
 
+### Install Policy Spot Checks
+
+Run these only when the local machine has Podman, the configured runtime image,
+host runtime auth, and network access for package downloads. Use the selected
+instance operator config at
+`.lionclaw/instances/main/config/lionclaw.toml`; preserve and restore it after
+the check:
+
+```bash
+cd "$PROJ_A"
+CONFIG=.lionclaw/instances/main/config/lionclaw.toml
+cp "$CONFIG" "$CONFIG.qa-bak"
+```
+
+Add temporary presets equivalent to:
+
+```toml
+[presets.user-installs]
+workspace-access = "read-write"
+network-mode = "on"
+install-policy = "user"
+mount-runtime-secrets = false
+
+[presets.system-installs]
+workspace-access = "read-write"
+network-mode = "on"
+install-policy = "system"
+mount-runtime-secrets = false
+
+[defaults]
+preset = "user-installs"
+```
+
+With `user-installs` selected, run two real turns:
+
+```bash
+"$LIONCLAW_BIN" run --plain
+```
+
+Prompt 1:
+
+```text
+Run `python3 -m pip install --user cowsay && python3 -m cowsay -t ok`. Reply with exactly USER_INSTALL_OK if it succeeds, otherwise include the exact command failure.
+```
+
+Prompt 2:
+
+```text
+Run `python3 -m cowsay -t still-here`. Reply with exactly USER_INSTALL_PERSISTED if it succeeds, otherwise include the exact command failure.
+```
+
+Expected:
+
+- `pip --user` uses `/runtime/home/.local` and does not fail on PEP 668
+- the installed user package is visible in a second turn, proving persistence
+  through `/runtime/home`
+- failures name the blocker, such as missing runtime image, missing host auth,
+  no network, or a runtime image without `python3`/`pip`
+
+Switch `[defaults].preset` to `system-installs`, then run:
+
+```bash
+"$LIONCLAW_BIN" run --plain
+```
+
+Prompt:
+
+```text
+Run `apt-get update && apt-get install -y sl && command -v sl && touch system-root-posture.txt && stat -c '%u:%g' system-root-posture.txt`. Reply with SYSTEM_INSTALL_OK plus the command path and ownership if it succeeds, otherwise include the exact command failure.
+```
+
+Expected:
+
+- the `system-installs` preset launches with root-in-userns posture
+- network fetch works under `network-mode = "on"`
+- the system package is usable in that turn, with `sl` typically resolved from
+  `/usr/games/sl`
+- the file written under `/workspace` has sane host ownership after the turn
+- the system package is treated as ephemeral; durable system dependencies
+  should be baked into the runtime image or project `Containerfile`
+
+Also check the rejected preset cases by temporarily setting
+`install-policy = "system"` with either `network-mode = "none"` or
+`workspace-access = "read-only"` and running `"$LIONCLAW_BIN" status` or
+`"$LIONCLAW_BIN" run --plain`. Expected: the operator config or planner rejects
+the preset with a message naming the invalid `install-policy=system`
+combination. A runtime profile with `read-only-rootfs = true` and
+`install-policy = "system"` must be rejected before runtime launch.
+
+Restore the original config:
+
+```bash
+mv "$CONFIG.qa-bak" "$CONFIG"
+```
+
+Skip this subsection with exact scenario-specific blockers when any local
+prerequisite is unavailable.
+
 ## Phase 3: Instances And Work Roots
 
 Create two more instances in project A:

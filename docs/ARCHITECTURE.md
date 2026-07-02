@@ -570,6 +570,42 @@ and caches across LionClaw sessions without sharing them across different
 projects or materially different secret/network/workspace/escape capability
 shapes.
 
+Execution presets also include `install-policy = "none" | "user" | "system"`.
+Omitted values default to `user`. With `user`, the planner makes common
+user-level install tools land under the persistent runtime home when
+`/runtime/home` is mounted:
+`PYTHONUSERBASE=/runtime/home/.local`, `PIP_BREAK_SYSTEM_PACKAGES=1`,
+`NPM_CONFIG_PREFIX=/runtime/home/.npm-global`,
+`CARGO_HOME=/runtime/home/.cargo`, `GOBIN=/runtime/home/go/bin`,
+`BASH_ENV=/runtime/home/.lionclaw/install-env.sh`, and `PATH` with
+`/runtime/home/.local/bin`, `/runtime/home/.npm-global/bin`,
+`/runtime/home/.cargo/bin`, and `/runtime/home/go/bin` prepended. When there is
+no incoming `PATH`, LionClaw keeps standard Debian image executable locations
+after those prefixes, including `/usr/local/games` and `/usr/games`.
+LionClaw also materializes the `BASH_ENV` fragment under its runtime-home
+`.lionclaw` directory so noninteractive login shells re-apply user-install
+prefixes and Debian executable locations after image or shell startup files
+reset `PATH`. When `/runtime/home` is absent, these helper variables are omitted
+instead of pointing at an unavailable path. `none` omits the install helpers and
+keeps the normal non-root OCI posture.
+
+`system` is opt-in for in-turn package-manager work. It still receives the
+user-install helper environment, but the effective execution plan marks
+root-in-userns posture. The Podman backend then omits `--userns keep-id` and
+the explicit host uid/gid `--user`, and instead passes `--user 0:0` for that
+launch only so image-level non-root `USER` declarations do not block package
+manager writes. Rootless Podman maps container root back to the unprivileged
+operator uid outside the container.
+System installs are ephemeral for the current runtime process because the
+container root filesystem is not persisted across turns. Durable system
+dependencies belong in the runtime image or project-specific `Containerfile`.
+The planner rejects `install-policy = "system"` with `read-only-rootfs = true`,
+`network-mode = "none"`, or `workspace-access = "read-only"`. The install
+policy is part of the runtime state/native-home shape key, and
+`runtime.plan.allow` audit details include the effective install policy and
+root posture. `runtime.plan.deny` records the requested preset/policy context
+and denial reason when a plan is rejected.
+
 Interactive program-backed turns launch a fresh confined process for each
 request. They receive the current LionClaw session's `/runtime` control state
 and the matching persistent `/runtime/home` native home.
