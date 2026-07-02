@@ -10,6 +10,8 @@ lionclaw.db-shm
 lionclaw.db-wal
 .lionclaw-telegram-offset
 /.codex
+/.mcp.json
+/.agents/skills/lionclaw/
 /.lionclaw/
 /.worktrees/
 # roborev snapshots

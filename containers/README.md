@@ -18,16 +18,27 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 ## LionClaw Dev Image
 
-`containers/dev/Containerfile` layers Rust tooling on top of the runtime image
-for working on LionClaw itself. It includes the pinned Rust toolchain,
-`rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, native build dependencies,
-SQLite development headers, and basic debugging tools.
+`containers/dev/Containerfile` layers LionClaw development tooling on top of
+the runtime image. It includes the pinned Rust toolchain from
+`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, `uv`,
+Python 3.12 for the Python skill checks, native build dependencies, SQLite
+development headers, and basic debugging tools.
 
 ```bash
 podman build \
   --build-arg RUNTIME_IMAGE=lionclaw-runtime:v1 \
   -t lionclaw-runtime-dev:v1 \
   -f containers/dev/Containerfile .
+```
+
+Run the repository gate in the dev image with:
+
+```bash
+podman run --rm -it \
+  -v "$PWD:/workspace:Z" \
+  -w /workspace \
+  lionclaw-runtime-dev:v1 \
+  bash ./scripts/ci.sh
 ```
 
 Use the dev image for this checkout with:
