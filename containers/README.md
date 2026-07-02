@@ -35,11 +35,16 @@ Run the repository gate in the dev image with:
 
 ```bash
 podman run --rm -it \
+  --userns=keep-id:uid=1001,gid=1001 \
   -v "$PWD:/workspace:Z" \
   -w /workspace \
   lionclaw-runtime-dev:v1 \
   bash ./scripts/ci.sh
 ```
+
+The `keep-id` mapping targets the image's `lionclaw` user so rootless Podman
+can write build outputs into the host-owned checkout while keeping the
+container-owned cargo and uv caches under `/runtime` writable.
 
 Use the dev image for this checkout with:
 
