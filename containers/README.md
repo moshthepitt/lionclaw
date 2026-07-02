@@ -23,6 +23,8 @@ the runtime image. It includes the pinned Rust toolchain from
 `rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, `uv`,
 Python 3.12 for the Python skill checks, native build dependencies, SQLite
 development headers, and basic debugging tools.
+The managed Python install is kept in the image outside `/runtime`, while cargo
+and uv caches remain under `/runtime` for writable runtime state.
 
 ```bash
 podman build \
