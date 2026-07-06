@@ -8,6 +8,7 @@
 //! Intelligent Internet) — see LICENSE-zenith.
 
 pub mod authority;
+pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod model;

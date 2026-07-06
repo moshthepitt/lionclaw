@@ -13,6 +13,7 @@ testing = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
 hex.workspace = true
 lionclaw-confinement.workspace = true
 lionclaw-durable-fs.workspace = true

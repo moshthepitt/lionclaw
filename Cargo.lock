@@ -1834,6 +1834,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "clap",
  "hex",
  "lionclaw-confinement",
  "lionclaw-durable-fs",

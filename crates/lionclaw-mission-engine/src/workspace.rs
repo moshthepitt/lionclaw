@@ -84,6 +84,8 @@ pub async fn create_worker_clone(
     // clone-local config is belt and braces for host-side git operations.
     git(dest, &["config", "user.name", "LionClaw Mission"]).await?;
     git(dest, &["config", "user.email", "mission@lionclaw.local"]).await?;
+    // The agent commits inside the container; never require a signing key.
+    git(dest, &["config", "commit.gpgsign", "false"]).await?;
     Ok(WorkerClone {
         dir: dest.to_path_buf(),
         branch,

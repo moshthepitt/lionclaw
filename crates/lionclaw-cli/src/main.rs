@@ -1,14 +1,14 @@
 use clap::Parser;
-
-#[derive(Parser)]
-#[command(name = "lionclaw", about = "LionClaw mission engine")]
-enum Command {
-    /// Mission engine commands (placeholder; filled in as the engine lands).
-    Mission,
-}
+use lionclaw_mission_engine::cli::{run, Cli};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let _command = Command::parse();
-    Ok(())
+async fn main() -> anyhow::Result<std::process::ExitCode> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    run(Cli::parse()).await
 }
