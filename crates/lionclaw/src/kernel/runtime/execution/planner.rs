@@ -804,7 +804,7 @@ fn set_user_install_environment(environment: &mut Vec<(String, String)>, runtime
 }
 
 fn prepend_environment_path(
-    environment: &mut Vec<(String, String)>,
+    environment: &mut [(String, String)],
     prefix_entries: impl IntoIterator<Item = String>,
 ) {
     let prefix = prefix_entries.into_iter().collect::<Vec<_>>().join(":");
