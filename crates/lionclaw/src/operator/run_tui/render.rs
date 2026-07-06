@@ -1103,7 +1103,7 @@ fn render_boundary_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     }
 
     let boundary = app.boundary_summary();
-    let mut lines = vec![section_line("▱", "Boundary"), Line::raw("")];
+    let mut lines = Vec::new();
     for row in boundary_display_rows(&boundary) {
         lines.push(kv_line(row.label, &row.value));
     }
@@ -1543,6 +1543,8 @@ pub(super) fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryD
         BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
         BoundaryDisplayRow::new("network", boundary.network.clone()),
         BoundaryDisplayRow::new("secrets", boundary.secrets.clone()),
+        BoundaryDisplayRow::new("install policy", boundary.install_policy.clone()),
+        BoundaryDisplayRow::new("root posture", boundary.root_posture.clone()),
         BoundaryDisplayRow::new("turn timeout", boundary.turn_timeout.clone()),
         BoundaryDisplayRow::new("runtime home", "private"),
         BoundaryDisplayRow::new("skills", "read-only"),

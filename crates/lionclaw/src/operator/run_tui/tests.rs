@@ -870,6 +870,10 @@ async fn runtime_boundary_and_audit_inspectors_render_real_context() {
     assert!(boundary.contains("Boundary"));
     assert!(boundary.contains("workspace"));
     assert!(boundary.contains("read-write"));
+    assert!(boundary.contains("install policy"));
+    assert!(boundary.contains("user"));
+    assert!(boundary.contains("root posture"));
+    assert!(boundary.contains("non-root"));
     assert!(boundary.contains("skills"));
     assert!(boundary.contains("read-only"));
     assert!(boundary.contains("turn timeout"));
@@ -1781,6 +1785,8 @@ fn boundary_rows_use_product_terms() {
             ("workspace", "read-write".to_string()),
             ("network", "off".to_string()),
             ("secrets", "off".to_string()),
+            ("install policy", "system".to_string()),
+            ("root posture", "root-in-userns".to_string()),
             ("turn timeout", "30m/2h".to_string()),
             ("runtime home", "private".to_string()),
             ("skills", "read-only".to_string()),
