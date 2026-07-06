@@ -14,7 +14,7 @@ use crate::engine::{AdvanceOutcome, Engine};
 use crate::model::{fold, MissionConfig, MissionId, MissionPhase};
 use crate::oracle::OciOracleRunner;
 use crate::plugin::load_plugin;
-use crate::ports::SystemClock;
+use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::MissionStore;
 use crate::workspace;
@@ -45,6 +45,12 @@ pub enum MissionCommand {
     Status(StatusArgs),
     /// Print a mission's event log.
     Log(LogArgs),
+    /// List missions parked on open attention (durable interrupts).
+    Inbox(InboxArgs),
+    /// Approve the plan at the ratification gate.
+    Ratify(RatifyArgs),
+    /// Resolve an open attention item.
+    Decide(DecideArgs),
     /// Validate a plugin directory (loader + moat) without starting anything.
     Plugin(PluginArgs),
 }
@@ -62,8 +68,41 @@ pub struct StartArgs {
     pub objective: String,
     #[arg(long, default_value = "codex")]
     pub runtime: String,
+    /// Skip the default-on ratification gate (auto-approve the plan).
+    #[arg(long)]
+    pub yes: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args)]
+pub struct InboxArgs {
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct RatifyArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long, default_value = "approved")]
+    pub justification: String,
+}
+
+#[derive(Args)]
+pub struct DecideArgs {
+    pub mission_id: String,
+    /// The attention item id (see `mission status`/`inbox`).
+    pub item: String,
+    /// One of: ratify | retry | continue | abort.
+    pub action: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long, default_value = "")]
+    pub justification: String,
 }
 
 #[derive(Args)]
@@ -132,6 +171,9 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Advance(args) => cmd_advance(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Plugin(args) => cmd_plugin(args).await,
     }
 }
@@ -173,8 +215,8 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
             &args.objective,
             &base_sha,
             MissionConfig {
-                // Ratification gate lands in Slice 4; skip for the skeleton.
-                ratification_gate: false,
+                // Default-on ratification gate; `--yes` auto-approves.
+                ratification_gate: !args.yes,
                 ..Default::default()
             },
         )
@@ -188,6 +230,87 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
         println!("started mission {mission_id} at {base_sha}");
         println!("submit a plan, then: lionclaw mission advance {mission_id} --repo {} --plugin {}", repo.display(), args.plugin.display());
     }
+    Ok(())
+}
+
+async fn cmd_inbox(args: InboxArgs) -> Result<()> {
+    let store = MissionStore::open(&args.repo.canonicalize().context("repo path")?).await?;
+    let mut parked = Vec::new();
+    for summary in store.list_missions().await? {
+        let events = store.load(&summary.mission_id).await?;
+        let Some(state) = fold(events) else { continue };
+        if !state.open_attention.is_empty() {
+            parked.push((summary.mission_id, state));
+        }
+    }
+    if args.json {
+        let items: Vec<_> = parked
+            .iter()
+            .map(|(id, state)| {
+                serde_json::json!({
+                    "mission_id": id.as_str(),
+                    "objective": state.objective,
+                    "attention": state.open_attention.values().map(|a| {
+                        serde_json::json!({ "id": a.id, "kind": format!("{:?}", a.kind).to_lowercase(), "report": a.report })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "parked": items }));
+    } else if parked.is_empty() {
+        println!("inbox empty: no missions awaiting attention");
+    } else {
+        for (id, state) in &parked {
+            println!("{id}: {}", state.objective);
+            for item in state.open_attention.values() {
+                println!("  [{}] {}", item.id, item.report);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let store = MissionStore::open(&repo).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    // The ratification item id is stable ("ratify:mission").
+    crate::engine::record_decision(
+        &store,
+        SystemClock.now_ms(),
+        &mission_id,
+        "ratify:mission",
+        crate::model::DecisionAction::Ratify,
+        &args.justification,
+        "cli",
+    )
+    .await?;
+    println!("ratified mission {mission_id}");
+    Ok(())
+}
+
+async fn cmd_decide(args: DecideArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let store = MissionStore::open(&repo).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let action = match args.action.as_str() {
+        "ratify" => crate::model::DecisionAction::Ratify,
+        "retry" => crate::model::DecisionAction::Retry,
+        "continue" => crate::model::DecisionAction::Continue,
+        "abort" => crate::model::DecisionAction::Abort,
+        other => bail!("unknown action '{other}' (ratify|retry|continue|abort)"),
+    };
+    crate::engine::record_decision(
+        &store,
+        SystemClock.now_ms(),
+        &mission_id,
+        &args.item,
+        action,
+        &args.justification,
+        "cli",
+    )
+    .await?;
+    println!("recorded decision on '{}' for mission {mission_id}", args.item);
     Ok(())
 }
 

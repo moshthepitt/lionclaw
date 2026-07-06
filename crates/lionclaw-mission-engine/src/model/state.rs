@@ -69,8 +69,13 @@ pub struct AssertionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
+    /// The default-on ratification gate: approve the plan before work runs.
+    Ratify,
     NodeFailed,
     NodeAttention,
+    /// An oracle failed to *run* (infrastructure), distinct from a nonzero
+    /// exit (which is a valid verdict).
+    OracleFailed,
     GateFailed,
     GateCheckpoint,
     TerminalReview,
@@ -78,10 +83,15 @@ pub enum AttentionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionItem {
-    /// Stable across refolds: embeds the triggering sequence number.
+    /// Stable across refolds: `{kind}:{anchor}` where the anchor is the task,
+    /// oracle, or "mission".
     pub id: String,
     pub kind: AttentionKind,
+    /// The task this item is about, if any.
     pub task_id: Option<TaskId>,
+    /// The oracle this item is about, if any (oracle infra failures).
+    #[serde(default)]
+    pub oracle: Option<OracleName>,
     pub report: String,
 }
 
@@ -199,7 +209,21 @@ pub struct MissionState {
     /// Outcome of the latest terminal review, if any.
     pub terminal_review_done: Option<bool>,
     pub inflight: BTreeMap<String, InflightEffect>,
+    /// Derived each fold from failed nodes, gate results, and the
+    /// ratification gate, minus anything a decision has resolved.
     pub open_attention: BTreeMap<String, AttentionItem>,
+    /// The plan was ratified (the durable ratification gate was answered).
+    pub ratified: bool,
+    /// Gate checkpoints the human confirmed (`continue`) — the mission
+    /// proceeds past them without re-raising the checkpoint.
+    pub acknowledged_gates: std::collections::BTreeSet<TaskId>,
+    /// Nodes whose handoff asked for a human look (`request_attention`),
+    /// until a decision clears them.
+    pub flagged_nodes: std::collections::BTreeSet<TaskId>,
+    /// Oracles that failed to *run* (infrastructure failure, distinct from a
+    /// nonzero exit) → mapped to the failure detail, until a decision clears
+    /// them. Prevents a broken oracle from re-requesting forever.
+    pub oracle_failures: BTreeMap<OracleName, String>,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
 }

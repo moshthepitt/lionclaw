@@ -218,6 +218,31 @@ pub enum MissionEvent {
         reason: String,
         actor: String,
     },
+    /// A human/orchestrator decision resolving an open attention item (a
+    /// durable interrupt). The fold applies the action and marks the item
+    /// resolved. Ported from Zenith's `decide_attention` (Apache-2.0,
+    /// Intelligent Internet, `controller.py`).
+    DecisionRecorded {
+        attention_id: String,
+        action: DecisionAction,
+        justification: String,
+        actor: String,
+    },
+}
+
+/// The actions a decision can take on an open attention item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DecisionAction {
+    /// Approve the plan/contract at the ratification gate.
+    Ratify,
+    /// Re-dispatch a failed node (valid only for `node_failed`).
+    Retry,
+    /// Accept the current situation and proceed (accept a node failure, or
+    /// confirm a cleared gate checkpoint).
+    Continue,
+    /// Abort the mission.
+    Abort,
 }
 
 /// Idempotency role of an event within a two-event (request/outcome) pair.
@@ -242,6 +267,7 @@ impl MissionEvent {
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
             Self::MissionAborted { .. } => "mission_aborted",
+            Self::DecisionRecorded { .. } => "decision_recorded",
         }
     }
 

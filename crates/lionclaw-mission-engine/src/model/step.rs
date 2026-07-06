@@ -116,13 +116,17 @@ fn step_running(state: &MissionState) -> StepDecision {
     }
 
     // No work left to start: settle oracle obligations against the current
-    // artifact commit, batched per oracle.
+    // artifact commit, batched per oracle. Skip oracles that failed to run —
+    // they park for a human (see `oracle_failures`) rather than loop.
     if oracle_obligation_outstanding(state) {
         let mut by_oracle: BTreeMap<OracleName, Vec<AssertionId>> = BTreeMap::new();
         for (id, assertion) in &state.contract {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
+            if state.oracle_failures.contains_key(oracle) {
+                continue;
+            }
             let fresh = assertion
                 .last_authoritative
                 .as_ref()
@@ -240,7 +244,7 @@ mod tests {
             plugin_name: "software-dev".to_string(),
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
-            config: MissionConfig::default(),
+            config: MissionConfig { ratification_gate: false, ..Default::default() },
         }
     }
 

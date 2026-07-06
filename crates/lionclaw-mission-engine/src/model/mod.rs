@@ -5,6 +5,7 @@
 //! and `thiserror` (error derives). No I/O, no clock, no RNG, no async — the
 //! fold-litmus test depends on it.
 
+pub mod decision;
 pub mod event;
 pub mod fold;
 pub mod gate;
@@ -15,9 +16,10 @@ pub mod state;
 pub mod step;
 pub mod verdict;
 
+pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    ArtifactOutcome, BlobRef, EventEnvelope, Handoff, IdemClass, MissionConfig, MissionEvent,
-    PayloadRef, RunErrorKind, StopBar, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Handoff, IdemClass, MissionConfig,
+    MissionEvent, PayloadRef, RunErrorKind, StopBar, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};

@@ -141,6 +141,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Record a decision resolving an open attention item (a durable
+    /// interrupt). Validated fail-closed: an illegal decision records nothing.
+    pub async fn decide(
+        &self,
+        mission_id: &MissionId,
+        attention_id: &str,
+        action: crate::model::DecisionAction,
+        justification: &str,
+        actor: &str,
+    ) -> Result<()> {
+        record_decision(
+            &self.store,
+            self.clock.now_ms(),
+            mission_id,
+            attention_id,
+            action,
+            justification,
+            actor,
+        )
+        .await
+    }
+
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
         self.store
             .load_state_snapshotted(mission_id)
@@ -519,4 +541,31 @@ impl Engine {
 /// logical effect.
 fn idem_key(parts: &[&str]) -> String {
     hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes()))
+}
+
+/// Record a decision without a full engine (the CLI's `ratify`/`decide` need
+/// only the store). Folds current state, validates fail-closed, appends.
+pub async fn record_decision(
+    store: &MissionStore,
+    now_ms: i64,
+    mission_id: &MissionId,
+    attention_id: &str,
+    action: crate::model::DecisionAction,
+    justification: &str,
+    actor: &str,
+) -> Result<()> {
+    let state = store
+        .load_state_snapshotted(mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+    crate::model::validate_decision(&state, attention_id, &action)
+        .map_err(|e| anyhow::anyhow!("decision rejected: {e}"))?;
+    let event = NewEvent::new(MissionEvent::DecisionRecorded {
+        attention_id: attention_id.to_string(),
+        action,
+        justification: justification.to_string(),
+        actor: actor.to_string(),
+    });
+    store.append(mission_id, state.head, &[event], now_ms).await?;
+    Ok(())
 }

@@ -8,7 +8,10 @@
 //! task that isn't `done` fails and raises attention; a validate task always
 //! clears and folds its per-assertion verdicts in with sticky passes.
 
+use std::collections::BTreeMap;
+
 use super::event::{EventEnvelope, Handoff, MissionEvent};
+use super::ids::TaskId;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, TaskRuntimeState, TaskStatus,
@@ -59,6 +62,10 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         terminal_review_done: None,
         inflight: Default::default(),
         open_attention: Default::default(),
+        ratified: false,
+        acknowledged_gates: Default::default(),
+        flagged_nodes: Default::default(),
+        oracle_failures: Default::default(),
         head: envelope.sequence_no,
     })
 }
@@ -115,26 +122,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             if let Some(artifact) = artifact {
                 state.current_sha = artifact.head_sha.clone();
             }
-            apply_handoff(state, task_id, handoff, seq);
+            apply_handoff(state, task_id, handoff);
         }
-        MissionEvent::RoleRunFailed {
-            task_id,
-            idempotency_key,
-            error_kind,
-            detail,
-            ..
-        } => {
+        MissionEvent::RoleRunFailed { task_id, idempotency_key, .. } => {
             state.inflight.remove(idempotency_key);
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
             }
-            push_attention(
-                state,
-                AttentionKind::NodeFailed,
-                Some(task_id.clone()),
-                format!("role run failed ({error_kind:?}): {detail}"),
-                seq,
-            );
         }
         MissionEvent::OracleRunRequested {
             oracle, attempt_no, ..
@@ -154,6 +148,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             state.inflight.remove(idempotency_key);
+            state.oracle_failures.remove(oracle); // the oracle ran; recovered
             let verdict = AuthoritativeVerdict::from_oracle_outcome(
                 oracle.clone(),
                 judged_sha.clone(),
@@ -176,13 +171,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             state.inflight.remove(idempotency_key);
-            push_attention(
-                state,
-                AttentionKind::NodeFailed,
-                None,
-                format!("oracle '{oracle}' failed to run: {detail}"),
-                seq,
-            );
+            state.oracle_failures.insert(oracle.clone(), detail.clone());
         }
         MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
             state.terminal_review_attempts = *attempt_no;
@@ -201,9 +190,15 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 reason: reason.clone(),
             };
         }
+        MissionEvent::DecisionRecorded {
+            attention_id, action, ..
+        } => {
+            apply_decision(state, attention_id, action);
+        }
     }
     state.head = seq;
     derive_gates(state);
+    derive_attention(state);
     derive_phase(state);
 }
 
@@ -231,34 +226,161 @@ fn derive_gates(state: &mut MissionState) {
         if !deps_cleared {
             continue;
         }
-        let (new_status, kind, report) =
-            match super::gate::evaluate_gate(state, &plan, &task.id) {
-                super::gate::GateResult::Cleared => (
-                    TaskStatus::Cleared,
-                    AttentionKind::GateCheckpoint,
-                    format!("gate '{}' cleared; confirm to proceed", task.id),
-                ),
-                super::gate::GateResult::Blocked { reason } => (
-                    TaskStatus::Failed,
-                    AttentionKind::GateFailed,
-                    format!("gate '{}' blocked: {reason}", task.id),
-                ),
-            };
+        let new_status = match super::gate::evaluate_gate(state, &plan, &task.id) {
+            super::gate::GateResult::Cleared => TaskStatus::Cleared,
+            super::gate::GateResult::Blocked { .. } => TaskStatus::Failed,
+        };
         if let Some(entry) = state.tasks.get_mut(&task.id) {
             entry.status = new_status;
         }
-        // Stable, gate-scoped attention id (one per gate, not per fold step).
-        let id = format!("{kind:?}:{}", task.id).to_lowercase();
-        state.open_attention.insert(
-            id.clone(),
-            AttentionItem {
-                id,
-                kind,
-                task_id: Some(task.id.clone()),
-                report,
-            },
+    }
+}
+
+/// Apply a decision to the state it resolves. Reads the *previous* fold's
+/// derived attention (still in `open_attention` at this point) to learn the
+/// item's kind and node, so no id parsing is needed. Invalid (action, kind)
+/// pairs are rejected before recording (see `decision::validate_decision`);
+/// here they are no-ops.
+fn apply_decision(
+    state: &mut MissionState,
+    attention_id: &str,
+    action: &super::event::DecisionAction,
+) {
+    use super::event::DecisionAction;
+    let Some(item) = state.open_attention.get(attention_id).cloned() else {
+        return; // unknown or already-resolved item
+    };
+    match (action, item.kind) {
+        (DecisionAction::Ratify, AttentionKind::Ratify) => state.ratified = true,
+        (DecisionAction::Retry, AttentionKind::NodeFailed) => {
+            if let Some(task_id) = &item.task_id {
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Pending;
+                }
+                state.flagged_nodes.remove(task_id);
+            }
+        }
+        (DecisionAction::Continue, AttentionKind::NodeFailed) => {
+            if let Some(task_id) = &item.task_id {
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Cleared; // accept the failure
+                }
+            }
+        }
+        (DecisionAction::Continue, AttentionKind::NodeAttention) => {
+            if let Some(task_id) = &item.task_id {
+                state.flagged_nodes.remove(task_id);
+            }
+        }
+        (DecisionAction::Continue, AttentionKind::GateCheckpoint | AttentionKind::GateFailed) => {
+            if let Some(task_id) = &item.task_id {
+                state.acknowledged_gates.insert(task_id.clone());
+            }
+        }
+        (DecisionAction::Retry | DecisionAction::Continue, AttentionKind::OracleFailed) => {
+            // Retry re-opens the obligation (step re-requests); continue
+            // accepts the infra failure. Both clear the failure record.
+            if let Some(oracle) = &item.oracle {
+                state.oracle_failures.remove(oracle);
+            }
+        }
+        (DecisionAction::Abort, _) => {
+            state.phase = MissionPhase::Aborted {
+                reason: "aborted by decision".to_string(),
+            };
+        }
+        _ => {}
+    }
+}
+
+/// Rebuild the open-attention set from scratch: the ratification gate, failed
+/// nodes, human-flagged nodes, and gate results — minus anything a decision
+/// resolved. Attention is a pure function of state, so a decision that
+/// changed a task's status or set a flag removes its item automatically.
+fn derive_attention(state: &mut MissionState) {
+    let mut attention: BTreeMap<String, AttentionItem> = BTreeMap::new();
+    let mut raise =
+        |kind: AttentionKind, task_id: Option<TaskId>, oracle: Option<super::ids::OracleName>, report: String| {
+            let anchor = task_id
+                .as_ref()
+                .map(|id| id.to_string())
+                .or_else(|| oracle.as_ref().map(|o| o.to_string()))
+                .unwrap_or_else(|| "mission".to_string());
+            let id = format!("{kind:?}:{anchor}").to_lowercase();
+            attention.insert(
+                id.clone(),
+                AttentionItem {
+                    id,
+                    kind,
+                    task_id,
+                    oracle,
+                    report,
+                },
+            );
+        };
+
+    // Ratification gate: park before any work until the plan is approved.
+    if state.plan.is_some() && state.config.ratification_gate && !state.ratified {
+        raise(
+            AttentionKind::Ratify,
+            None,
+            None,
+            "ratify the plan and contract before work begins".to_string(),
         );
     }
+
+    // Oracle infrastructure failures: park rather than re-request forever.
+    for (oracle, detail) in &state.oracle_failures {
+        raise(
+            AttentionKind::OracleFailed,
+            None,
+            Some(oracle.clone()),
+            format!("oracle '{oracle}' failed to run: {detail}"),
+        );
+    }
+
+    let Some(plan) = state.plan.clone() else {
+        state.open_attention = attention;
+        return;
+    };
+    for task in &plan.tasks {
+        let status = state.tasks.get(&task.id).map(|t| t.status);
+        match task.kind {
+            super::plan::TaskKind::Gate => match status {
+                Some(TaskStatus::Cleared) if !state.acknowledged_gates.contains(&task.id) => raise(
+                    AttentionKind::GateCheckpoint,
+                    Some(task.id.clone()),
+                    None,
+                    format!("gate '{}' cleared; confirm to proceed", task.id),
+                ),
+                Some(TaskStatus::Failed) if !state.acknowledged_gates.contains(&task.id) => raise(
+                    AttentionKind::GateFailed,
+                    Some(task.id.clone()),
+                    None,
+                    format!("gate '{}' is blocked by dissenting or missing verdicts", task.id),
+                ),
+                _ => {}
+            },
+            super::plan::TaskKind::Work | super::plan::TaskKind::Validate => {
+                if status == Some(TaskStatus::Failed) {
+                    raise(
+                        AttentionKind::NodeFailed,
+                        Some(task.id.clone()),
+                        None,
+                        format!("task '{}' failed", task.id),
+                    );
+                } else if state.flagged_nodes.contains(&task.id) {
+                    raise(
+                        AttentionKind::NodeAttention,
+                        Some(task.id.clone()),
+                        None,
+                        format!("task '{}' asked for a human look", task.id),
+                    );
+                }
+            }
+        }
+    }
+    state.open_attention = attention;
 }
 
 fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
@@ -267,17 +389,12 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
     }
 }
 
-fn apply_handoff(
-    state: &mut MissionState,
-    task_id: &super::ids::TaskId,
-    handoff: &Handoff,
-    seq: u64,
-) {
+fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
     match handoff {
         Handoff::Work {
             done,
-            report,
             request_attention,
+            ..
         } => {
             let status = if *done {
                 TaskStatus::Cleared
@@ -287,28 +404,16 @@ fn apply_handoff(
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = status;
             }
-            if !*done {
-                push_attention(
-                    state,
-                    AttentionKind::NodeFailed,
-                    Some(task_id.clone()),
-                    format!("work task reported not done: {}", summarize(report)),
-                    seq,
-                );
-            } else if *request_attention {
-                push_attention(
-                    state,
-                    AttentionKind::NodeAttention,
-                    Some(task_id.clone()),
-                    summarize(report),
-                    seq,
-                );
+            // A done task that asks for a look is flagged (derived into a
+            // node_attention item); a not-done task is Failed (derived into a
+            // node_failed item).
+            if *done && *request_attention {
+                state.flagged_nodes.insert(task_id.clone());
             }
         }
         Handoff::Validate {
             items,
             request_attention,
-            report,
             ..
         } => {
             // Validators always clear — they ran; their verdicts are data.
@@ -326,40 +431,10 @@ fn apply_handoff(
                 }
             }
             if *request_attention {
-                push_attention(
-                    state,
-                    AttentionKind::NodeAttention,
-                    Some(task_id.clone()),
-                    summarize(report),
-                    seq,
-                );
+                state.flagged_nodes.insert(task_id.clone());
             }
         }
     }
-}
-
-fn summarize(report: &super::event::PayloadRef) -> String {
-    match report {
-        super::event::PayloadRef::Inline { text } => text.clone(),
-        super::event::PayloadRef::Blob(blob) => format!("(report blob {})", blob.hex),
-    }
-}
-
-fn push_attention(
-    state: &mut MissionState,
-    kind: AttentionKind,
-    task_id: Option<super::ids::TaskId>,
-    report: String,
-    seq: u64,
-) {
-    let anchor = task_id
-        .as_ref()
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "engine".to_string());
-    let id = format!("{kind:?}:{anchor}:{seq}").to_lowercase();
-    state
-        .open_attention
-        .insert(id.clone(), AttentionItem { id, kind, task_id, report });
 }
 
 /// Re-derive the phase from scratch. Abort is the one sticky, event-anchored
@@ -454,7 +529,7 @@ mod tests {
             plugin_name: "plugin".into(),
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
-            config: MissionConfig::default(),
+            config: MissionConfig { ratification_gate: false, ..Default::default() },
         }
     }
 
@@ -829,7 +904,7 @@ mod tests {
         let item = state.open_attention.values().next().expect("attention item");
         assert_eq!(item.kind, AttentionKind::NodeFailed);
         assert_eq!(item.task_id, Some(tid("t1")));
-        assert!(item.report.contains("Timeout"), "{}", item.report);
+        assert!(item.report.contains("t1"), "{}", item.report);
         assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     }
 
@@ -920,8 +995,9 @@ mod tests {
         assert!(state.inflight.is_empty());
         assert!(state.contract[&aid("TESTS-PASS")].last_authoritative.is_none());
         let item = state.open_attention.values().next().expect("attention item");
-        assert_eq!(item.kind, AttentionKind::NodeFailed);
-        assert_eq!(item.task_id, None, "oracle failures anchor to the engine");
+        assert_eq!(item.kind, AttentionKind::OracleFailed);
+        assert_eq!(item.task_id, None);
+        assert_eq!(item.oracle, Some(oracle("cargo-test")));
         assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     }
 
@@ -949,16 +1025,18 @@ mod tests {
     }
 
     #[test]
-    fn attention_ids_embed_seq_and_are_stable_across_refolds() {
+    fn attention_ids_are_kind_and_anchor_scoped_and_stable_across_refolds() {
         let events = vec![
             created(),
             plan_submitted(vec![], vec![work_task("t1")]),
-            role_completed("t1", "k1", work_handoff(false, false), None), // seq 2
+            role_completed("t1", "k1", work_handoff(false, false), None),
         ];
         let once = fold_log(events.clone()).expect("first fold");
         let twice = fold_log(events).expect("second fold");
         let keys: Vec<&str> = once.open_attention.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["nodefailed:t1:2"]);
+        // Derived ids are stable (kind:anchor), not seq-embedded, so a
+        // decision can name them across resumes.
+        assert_eq!(keys, vec!["nodefailed:t1"]);
         assert_eq!(
             keys,
             twice.open_attention.keys().map(String::as_str).collect::<Vec<_>>()
@@ -986,11 +1064,11 @@ mod tests {
         ])
         .expect("state");
         // No panics and no phantom rows: outcomes only touch declared ids.
+        // Because attention is derived from the declared plan, an outcome for
+        // an undeclared task raises nothing (it cannot, and should not).
         assert!(state.tasks.is_empty());
         assert_eq!(state.contract.len(), 1);
         assert_eq!(state.contract[&aid("KNOWN-1")].advisory, AdvisoryStatus::Pending);
-        // The failure still parks the mission even though the task is unknown.
-        assert!(state.open_attention.keys().any(|k| k.contains("specter")));
-        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+        assert!(state.open_attention.is_empty());
     }
 }
