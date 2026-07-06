@@ -292,3 +292,323 @@ fn check_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     }
     errors
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ids::AssertionId;
+    use crate::model::plan::{Assertion, Task};
+
+    fn aid(raw: &str) -> AssertionId {
+        AssertionId::new(raw).expect("valid assertion id")
+    }
+
+    fn tid(raw: &str) -> TaskId {
+        TaskId::new(raw).expect("valid task id")
+    }
+
+    fn assertion(id: &str) -> Assertion {
+        Assertion {
+            id: aid(id),
+            prose: format!("claim {id}"),
+            oracle: None,
+        }
+    }
+
+    fn assertion_with_oracle(id: &str, oracle: &str) -> Assertion {
+        Assertion {
+            id: aid(id),
+            prose: format!("claim {id}"),
+            oracle: Some(OracleName::new(oracle).expect("valid oracle name")),
+        }
+    }
+
+    fn task(
+        id: &str,
+        kind: TaskKind,
+        role: Option<&str>,
+        body: &str,
+        targets: &[&str],
+        deps: &[&str],
+    ) -> Task {
+        Task {
+            id: tid(id),
+            kind,
+            body: body.to_string(),
+            targets: targets.iter().map(|t| aid(t)).collect(),
+            role: role.map(|r| RoleName::new(r).expect("valid role name")),
+            depends_on: deps.iter().map(|d| tid(d)).collect(),
+        }
+    }
+
+    fn work(id: &str, targets: &[&str], deps: &[&str]) -> Task {
+        task(id, TaskKind::Work, Some("implementer"), "produce it", targets, deps)
+    }
+
+    fn validate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
+        task(id, TaskKind::Validate, Some("checker"), "check it", targets, deps)
+    }
+
+    fn gate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
+        task(id, TaskKind::Gate, None, "", targets, deps)
+    }
+
+    fn inventory() -> PluginInventory {
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            RoleName::new("implementer").expect("valid role name"),
+            OutputSemantics::ProducesArtifact,
+        );
+        roles.insert(
+            RoleName::new("checker").expect("valid role name"),
+            OutputSemantics::EmitsVerdict,
+        );
+        roles.insert(
+            RoleName::new("planner").expect("valid role name"),
+            OutputSemantics::Plans,
+        );
+        roles.insert(
+            RoleName::new("courier").expect("valid role name"),
+            OutputSemantics::Egresses,
+        );
+        PluginInventory {
+            roles,
+            oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
+        }
+    }
+
+    fn submission(assertions: Vec<Assertion>, tasks: Vec<Task>) -> PlanSubmission {
+        PlanSubmission { assertions, tasks }
+    }
+
+    fn codes(submission: &PlanSubmission) -> Vec<&'static str> {
+        validate_plan_submission(submission, &inventory())
+            .into_iter()
+            .map(|e| e.code)
+            .collect()
+    }
+
+    const CLEAN: Vec<&str> = Vec::new();
+
+    #[test]
+    fn empty_contract_returned_alone() {
+        // Even with an empty task list...
+        let sub = submission(vec![], vec![]);
+        assert_eq!(codes(&sub), vec!["empty_contract"]);
+        // ...or a task list full of shape errors, only empty_contract returns.
+        let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &["g1"]);
+        let sub = submission(vec![], vec![bad_gate]);
+        assert_eq!(codes(&sub), vec!["empty_contract"]);
+    }
+
+    #[test]
+    fn empty_task_list_rejected() {
+        let sub = submission(vec![assertion("A1")], vec![]);
+        assert_eq!(codes(&sub), vec!["empty_task_list"]);
+    }
+
+    #[test]
+    fn duplicate_ids_accumulate_within_the_group() {
+        let sub = submission(
+            vec![assertion("A1"), assertion("A1")],
+            vec![work("w1", &["A1"], &[]), work("w1", &["A1"], &[])],
+        );
+        assert_eq!(codes(&sub), vec!["duplicate_assertion_id", "duplicate_task_id"]);
+    }
+
+    #[test]
+    fn shape_errors() {
+        let cases: Vec<(&str, PlanSubmission, Vec<&str>)> = vec![
+            (
+                "gate_with_role",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("g1", TaskKind::Gate, Some("implementer"), "", &["A1"], &[])],
+                ),
+                vec!["gate_with_role"],
+            ),
+            (
+                "gate_with_body",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("g1", TaskKind::Gate, None, "not empty", &["A1"], &[])],
+                ),
+                vec!["gate_with_body"],
+            ),
+            (
+                "gate_empty_targets",
+                submission(vec![assertion("A1")], vec![gate("g1", &[], &[])]),
+                vec!["empty_targets"],
+            ),
+            (
+                "validate_empty_targets",
+                submission(vec![assertion("A1")], vec![validate("v1", &[], &[])]),
+                vec!["empty_targets"],
+            ),
+            (
+                "missing_body",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("w1", TaskKind::Work, Some("implementer"), "", &["A1"], &[])],
+                ),
+                vec!["missing_body"],
+            ),
+            (
+                "missing_role",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("w1", TaskKind::Work, None, "body", &["A1"], &[])],
+                ),
+                vec!["missing_role"],
+            ),
+            (
+                "unknown_role",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("w1", TaskKind::Work, Some("stranger"), "body", &["A1"], &[])],
+                ),
+                vec!["unknown_role"],
+            ),
+            (
+                "verdict_role_on_work_task",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("w1", TaskKind::Work, Some("checker"), "body", &["A1"], &[])],
+                ),
+                vec!["role_output_mismatch"],
+            ),
+            (
+                "artifact_role_on_validate_task",
+                submission(
+                    vec![assertion("A1")],
+                    vec![task("v1", TaskKind::Validate, Some("implementer"), "body", &["A1"], &[])],
+                ),
+                vec!["role_output_mismatch"],
+            ),
+            (
+                "unknown_oracle",
+                submission(
+                    vec![assertion_with_oracle("A1", "psychic")],
+                    vec![work("w1", &["A1"], &[])],
+                ),
+                vec!["unknown_oracle"],
+            ),
+            (
+                "task_targets_unknown_assertion",
+                submission(vec![assertion("A1")], vec![work("w1", &["A2"], &[])]),
+                vec!["task_targets_unknown_assertion"],
+            ),
+        ];
+        for (name, sub, expected) in cases {
+            assert_eq!(codes(&sub), expected, "case '{name}'");
+        }
+    }
+
+    #[test]
+    fn work_tasks_may_have_empty_targets() {
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![work("w1", &["A1"], &[]), work("w2", &[], &["w1"])],
+        );
+        assert_eq!(codes(&sub), CLEAN);
+    }
+
+    #[test]
+    fn dependency_errors() {
+        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &["w1"])]);
+        assert_eq!(codes(&sub), vec!["self_loop"]);
+
+        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &["ghost"])]);
+        assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
+    }
+
+    #[test]
+    fn cycles_detected() {
+        // 2-cycle.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
+        );
+        assert_eq!(codes(&sub), vec!["cycle_detected"]);
+
+        // 3-cycle alongside an acyclic task.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![
+                work("w0", &["A1"], &[]),
+                work("w1", &[], &["w3"]),
+                work("w2", &[], &["w1"]),
+                work("w3", &[], &["w2"]),
+            ],
+        );
+        assert_eq!(codes(&sub), vec!["cycle_detected"]);
+    }
+
+    #[test]
+    fn coverage_errors() {
+        // A validate task targeting an assertion does not count as coverage.
+        let sub = submission(
+            vec![assertion("A1"), assertion("A2")],
+            vec![work("w1", &["A1"], &[]), validate("v1", &["A2"], &[])],
+        );
+        assert_eq!(codes(&sub), vec!["uncovered_assertion"]);
+
+        // Two work coverers is one too many.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![work("w1", &["A1"], &[]), work("w2", &["A1"], &[])],
+        );
+        assert_eq!(codes(&sub), vec!["over_covered_assertion"]);
+
+        // Exactly one work coverer is the happy case.
+        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
+        assert_eq!(codes(&sub), CLEAN);
+    }
+
+    #[test]
+    fn groups_short_circuit_in_order() {
+        // Id duplication suppresses shape errors.
+        let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &[]);
+        let sub = submission(vec![assertion("A1")], vec![bad_gate.clone(), bad_gate]);
+        assert_eq!(codes(&sub), vec!["duplicate_task_id"]);
+
+        // Shape errors suppress dep errors.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![task("w1", TaskKind::Work, None, "body", &["A1"], &["ghost"])],
+        );
+        assert_eq!(codes(&sub), vec!["missing_role"]);
+
+        // Dep errors suppress cycle detection.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![
+                work("w1", &["A1"], &["ghost"]),
+                work("w2", &[], &["w3"]),
+                work("w3", &[], &["w2"]),
+            ],
+        );
+        assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
+
+        // Cycle detection suppresses coverage (A2 is uncovered).
+        let sub = submission(
+            vec![assertion("A1"), assertion("A2")],
+            vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
+        );
+        assert_eq!(codes(&sub), vec!["cycle_detected"]);
+    }
+
+    #[test]
+    fn rich_valid_submission_passes() {
+        let sub = submission(
+            vec![assertion_with_oracle("A1", "cargo-test"), assertion("A2")],
+            vec![
+                work("w1", &["A1"], &[]),
+                work("w2", &["A2"], &["w1"]),
+                validate("v1", &["A1", "A2"], &["w1", "w2"]),
+                gate("g1", &["A1", "A2"], &["v1"]),
+            ],
+        );
+        assert_eq!(codes(&sub), CLEAN);
+    }
+}

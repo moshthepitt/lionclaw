@@ -69,6 +69,9 @@ impl ParseTask for str {
     }
 }
 
+// Fields are read by some test binaries and not others; each compiles this
+// module independently, so unused-field warnings are expected and harmless.
+#[allow(dead_code)]
 pub struct TestHarness {
     pub engine: Engine,
     pub role_runner: Arc<MockRoleRunner>,

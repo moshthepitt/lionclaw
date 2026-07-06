@@ -27,6 +27,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 lionclaw-mission-engine = { path = ".", features = ["testing"] }

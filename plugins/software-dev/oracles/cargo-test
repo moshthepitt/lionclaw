@@ -1,0 +1,6 @@
+#!/bin/sh
+# Authoritative oracle: the project's tests must pass at the judged commit.
+# Runs read-only over /workspace with a writable /scratch for build output.
+set -e
+cd /workspace
+exec cargo test --locked

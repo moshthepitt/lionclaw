@@ -10,6 +10,11 @@
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
+mod frontmatter;
+mod loader;
+
+pub use loader::{load_plugin, PluginError};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
