@@ -789,6 +789,8 @@ async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
                 workspace: "rw".to_string(),
                 network: "none".to_string(),
                 secrets: "staged".to_string(),
+                install_policy: "user".to_string(),
+                root_posture: "non-root".to_string(),
                 turn_timeout: "2h".to_string(),
                 preset: "everyday".to_string(),
             },
@@ -838,6 +840,8 @@ async fn reference_sized_layout_renders_ribbon_run_surface_and_footer() {
     assert!(rendered.contains("No file changes reported"));
     assert!(rendered.contains("Please review the changes"));
     assert!(rendered.contains("Looks good overall"));
+    assert!(rendered.contains("install:user"));
+    assert!(rendered.contains("root:non-root"));
     assert!(rendered.contains("turn:2h"));
     assert!(!rendered.contains("/lionclaw/skills"));
     assert!(!rendered.contains("runtime.plan.allow"));
@@ -866,6 +870,10 @@ async fn runtime_boundary_and_audit_inspectors_render_real_context() {
     assert!(boundary.contains("Boundary"));
     assert!(boundary.contains("workspace"));
     assert!(boundary.contains("read-write"));
+    assert!(boundary.contains("install policy"));
+    assert!(boundary.contains("user"));
+    assert!(boundary.contains("root posture"));
+    assert!(boundary.contains("non-root"));
     assert!(boundary.contains("skills"));
     assert!(boundary.contains("read-only"));
     assert!(boundary.contains("turn timeout"));
@@ -1471,6 +1479,8 @@ async fn project_objects_load_real_sessions() {
             workspace: "rw".to_string(),
             network: "none".to_string(),
             secrets: "off".to_string(),
+            install_policy: "user".to_string(),
+            root_posture: "non-root".to_string(),
             turn_timeout: "2h".to_string(),
             preset: "test".to_string(),
         },
@@ -1759,6 +1769,8 @@ fn boundary_rows_use_product_terms() {
         workspace: "rw".to_string(),
         network: "off".to_string(),
         secrets: "off".to_string(),
+        install_policy: "system".to_string(),
+        root_posture: "root-in-userns".to_string(),
         turn_timeout: "30m/2h".to_string(),
         preset: "everyday".to_string(),
     };
@@ -1773,12 +1785,32 @@ fn boundary_rows_use_product_terms() {
             ("workspace", "read-write".to_string()),
             ("network", "off".to_string()),
             ("secrets", "off".to_string()),
+            ("install policy", "system".to_string()),
+            ("root posture", "root-in-userns".to_string()),
+            ("turn timeout", "30m/2h".to_string()),
             ("runtime home", "private".to_string()),
             ("skills", "read-only".to_string()),
             ("preset", "everyday".to_string()),
-            ("turn timeout", "30m/2h".to_string()),
         ]
     );
+}
+
+#[test]
+fn boundary_summary_reports_install_policy_and_root_posture() {
+    let mut config = OperatorConfig::default();
+    config.upsert_preset(
+        "system".to_string(),
+        ExecutionPreset {
+            install_policy: InstallPolicy::System,
+            ..ExecutionPreset::default()
+        },
+    );
+
+    let boundary = resolve_boundary_summary(&config, RuntimeTurnTimeouts::interactive())
+        .expect("boundary summary");
+
+    assert_eq!(boundary.install_policy, "system");
+    assert_eq!(boundary.root_posture, "root-in-userns");
 }
 
 #[test]
@@ -2133,6 +2165,8 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid, tempfile::TempD
             workspace: "rw".to_string(),
             network: "none".to_string(),
             secrets: "off".to_string(),
+            install_policy: "user".to_string(),
+            root_posture: "non-root".to_string(),
             turn_timeout: "2h".to_string(),
             preset: "test".to_string(),
         },
@@ -2355,6 +2389,8 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
                 workspace: "rw".to_string(),
                 network: "none".to_string(),
                 secrets: "off".to_string(),
+                install_policy: "user".to_string(),
+                root_posture: "non-root".to_string(),
                 turn_timeout: "2h".to_string(),
                 preset: "test".to_string(),
             },

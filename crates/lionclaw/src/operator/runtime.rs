@@ -384,7 +384,7 @@ mod tests {
     use crate::kernel::{
         runtime::{
             ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
-            OciConfinementConfig, RuntimeSkillProjectionConfig, WorkspaceAccess,
+            OciConfinementConfig, RuntimeSkillProjectionConfig,
         },
         Kernel,
     };
@@ -755,10 +755,8 @@ mod tests {
         config.upsert_preset(
             "offline".to_string(),
             ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::None,
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
+                ..ExecutionPreset::default()
             },
         );
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));

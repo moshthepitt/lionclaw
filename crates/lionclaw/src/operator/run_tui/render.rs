@@ -39,6 +39,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
 
     let boundary = app.boundary_summary();
     let workspace = boundary.workspace_compact().to_string();
+    let root_posture_is_system = boundary.root_posture.as_str() == "root-in-userns";
     let line = Line::from(vec![
         Span::styled(
             "LionClaw",
@@ -65,6 +66,21 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         ),
         Span::raw("    "),
         Span::styled(workspace, Style::default().fg(PANEL_TEXT)),
+        Span::raw("    "),
+        Span::styled("install:", Style::default().fg(PANEL_MUTED)),
+        Span::styled(boundary.install_policy, Style::default().fg(PANEL_TEXT)),
+        Span::raw("    "),
+        Span::styled("root:", Style::default().fg(PANEL_MUTED)),
+        Span::styled(
+            boundary.root_posture,
+            Style::default().fg(if root_posture_is_system {
+                PANEL_WARN
+            } else if app.selected.is_ready() {
+                PANEL_TEXT
+            } else {
+                PANEL_ERROR
+            }),
+        ),
         Span::raw("    "),
         Span::styled("turn:", Style::default().fg(PANEL_MUTED)),
         Span::styled(boundary.turn_timeout, Style::default().fg(PANEL_TEXT)),
@@ -1087,7 +1103,7 @@ fn render_boundary_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     }
 
     let boundary = app.boundary_summary();
-    let mut lines = vec![section_line("▱", "Boundary"), Line::raw("")];
+    let mut lines = Vec::new();
     for row in boundary_display_rows(&boundary) {
         lines.push(kv_line(row.label, &row.value));
     }
@@ -1527,10 +1543,12 @@ pub(super) fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryD
         BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
         BoundaryDisplayRow::new("network", boundary.network.clone()),
         BoundaryDisplayRow::new("secrets", boundary.secrets.clone()),
+        BoundaryDisplayRow::new("install policy", boundary.install_policy.clone()),
+        BoundaryDisplayRow::new("root posture", boundary.root_posture.clone()),
+        BoundaryDisplayRow::new("turn timeout", boundary.turn_timeout.clone()),
         BoundaryDisplayRow::new("runtime home", "private"),
         BoundaryDisplayRow::new("skills", "read-only"),
         BoundaryDisplayRow::new("preset", boundary.preset.clone()),
-        BoundaryDisplayRow::new("turn timeout", boundary.turn_timeout.clone()),
     ]
 }
 

@@ -225,7 +225,7 @@ async fn try_open_selected_instance(
     })
 }
 
-fn resolve_boundary_summary(
+pub(super) fn resolve_boundary_summary(
     config: &OperatorConfig,
     timeouts: RuntimeTurnTimeouts,
 ) -> Result<BoundarySummary> {
@@ -244,6 +244,8 @@ fn resolve_boundary_summary(
         } else {
             "off".to_string()
         },
+        install_policy: preset.install_policy.as_str().to_string(),
+        root_posture: root_posture_for_install_policy(preset.install_policy).to_string(),
         turn_timeout: if timeouts.idle == timeouts.hard {
             crate::runtime_timeouts::format_duration(timeouts.hard)
         } else {
@@ -255,6 +257,13 @@ fn resolve_boundary_summary(
         },
         preset: preset_name,
     })
+}
+
+fn root_posture_for_install_policy(policy: InstallPolicy) -> &'static str {
+    match policy {
+        InstallPolicy::System => "root-in-userns",
+        InstallPolicy::None | InstallPolicy::User => "non-root",
+    }
 }
 
 pub(super) fn push_history_turn(transcript: &mut Vec<TranscriptLine>, turn: &SessionTurnView) {

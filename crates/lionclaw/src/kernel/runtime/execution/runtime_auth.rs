@@ -95,6 +95,8 @@ mod tests {
                 skill_projection: None,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode,
+                install_policy: crate::kernel::runtime::InstallPolicy::User,
+                root_in_userns: false,
                 working_dir: None,
                 environment: Vec::new(),
                 mcp_servers: Vec::new(),

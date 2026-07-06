@@ -28,7 +28,7 @@ use lionclaw::{
             RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnJournalSender,
-            RuntimeTurnResult, TurnEvent, WorkspaceAccess,
+            RuntimeTurnResult, TurnEvent,
         },
         scheduler::SchedulerEngine,
         Kernel, KernelError, KernelOptions,
@@ -2728,10 +2728,8 @@ fn offline_kernel_options() -> KernelOptions {
         execution_presets: BTreeMap::from([(
             "offline".to_string(),
             ExecutionPreset {
-                workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::None,
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
+                ..ExecutionPreset::default()
             },
         )]),
         ..KernelOptions::default()

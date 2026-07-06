@@ -189,6 +189,8 @@ mod tests {
                     skill_projection: None,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     network_mode: NetworkMode::On,
+                    install_policy: crate::kernel::runtime::InstallPolicy::User,
+                    root_in_userns: false,
                     working_dir: None,
                     environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
                     mcp_servers: Vec::new(),
