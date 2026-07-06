@@ -37,11 +37,10 @@ impl MissionRuntimeProfile {
                 read_only_rootfs: true,
                 tmpfs: vec!["/tmp:rw,size=512m".to_string()],
                 additional_mounts: Vec::new(),
-                limits: ExecutionLimits {
-                    memory_limit: Some("4g".to_string()),
-                    cpu_limit: Some("2".to_string()),
-                    pids_limit: Some(1024),
-                },
+                // Resource ceilings are left unset by default: enforcing
+                // `--memory` needs cgroup swap accounting the host may lack.
+                // Operators tune these per deployment.
+                limits: ExecutionLimits::default(),
             }),
             hard_timeout: Duration::from_secs(30 * 60),
             idle_timeout: Duration::from_secs(10 * 60),
