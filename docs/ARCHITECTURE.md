@@ -577,17 +577,19 @@ user-level install tools land under the persistent runtime home when
 `PYTHONUSERBASE=/runtime/home/.local`, `PIP_BREAK_SYSTEM_PACKAGES=1`,
 `NPM_CONFIG_PREFIX=/runtime/home/.npm-global`,
 `CARGO_HOME=/runtime/home/.cargo`, `GOBIN=/runtime/home/go/bin`,
-`BASH_ENV=/runtime/home/.lionclaw/install-env.sh`, and `PATH` with
-`/runtime/home/.local/bin`, `/runtime/home/.npm-global/bin`,
-`/runtime/home/.cargo/bin`, and `/runtime/home/go/bin` prepended. When there is
-no incoming `PATH`, LionClaw keeps standard Debian image executable locations
-after those prefixes, including `/usr/local/games` and `/usr/games`.
+and `BASH_ENV=/runtime/home/.lionclaw/install-env.sh`. If an incoming `PATH` is
+explicitly passed through, LionClaw prepends `/runtime/home/.local/bin`,
+`/runtime/home/.npm-global/bin`, `/runtime/home/.cargo/bin`, and
+`/runtime/home/go/bin`. When no incoming `PATH` is passed through, LionClaw does
+not synthesize one in the OCI launch environment, so image-configured defaults
+remain in force.
 LionClaw also materializes the `BASH_ENV` fragment under its runtime-home
 `.lionclaw` directory so noninteractive login shells re-apply user-install
-prefixes and Debian executable locations after image or shell startup files
-reset `PATH`. When `/runtime/home` is absent, these helper variables are omitted
-instead of pointing at an unavailable path. `none` omits the install helpers and
-keeps the normal non-root OCI posture.
+prefixes and append standard Debian executable locations, including
+`/usr/local/games` and `/usr/games`, after image or shell startup files reset
+`PATH`. When `/runtime/home` is absent, these helper variables are omitted instead
+of pointing at an unavailable path. `none` omits the install helpers and keeps the
+normal non-root OCI posture.
 
 `system` is opt-in for in-turn package-manager work. It still receives the
 user-install helper environment, but the effective execution plan marks
