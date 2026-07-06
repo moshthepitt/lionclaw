@@ -1713,6 +1713,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lionclaw-confinement",
  "lionclaw-durable-fs",
  "lionclaw-runtime-acp",
  "lionclaw-runtime-api",
@@ -1786,6 +1787,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "lionclaw-cli"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "lionclaw-mission-engine",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "lionclaw-confinement"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "lionclaw-runtime-api",
+ "nix 0.31.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lionclaw-durable-fs"
 version = "0.8.0"
 dependencies = [
@@ -1793,6 +1826,31 @@ dependencies = [
  "rustix",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "lionclaw-mission-engine"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "lionclaw-confinement",
+ "lionclaw-durable-fs",
+ "lionclaw-mission-engine",
+ "lionclaw-runtime-acp",
+ "lionclaw-runtime-api",
+ "lionclaw-runtime-codex",
+ "lionclaw-runtime-mock",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

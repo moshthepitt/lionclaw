@@ -8,7 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::kernel::skills::validate_skill_alias;
+use crate::skill_alias::validate_skill_alias;
 
 pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
 

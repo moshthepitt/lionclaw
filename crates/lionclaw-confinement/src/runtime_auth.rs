@@ -51,7 +51,7 @@ mod tests {
     use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthProvider};
 
     use super::*;
-    use crate::kernel::runtime::{
+    use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, MountAccess, MountSpec,
         NetworkMode, OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess,
     };
@@ -95,7 +95,7 @@ mod tests {
                 skill_projection: None,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode,
-                install_policy: crate::kernel::runtime::InstallPolicy::User,
+                install_policy: crate::InstallPolicy::User,
                 root_in_userns: false,
                 working_dir: None,
                 environment: Vec::new(),

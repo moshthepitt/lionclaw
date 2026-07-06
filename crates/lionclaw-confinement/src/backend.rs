@@ -171,10 +171,12 @@ pub async fn execute_attached(request: ExecutionRequest) -> Result<ExecutionOutp
 mod tests {
     use std::time::Duration;
 
+    use lionclaw_runtime_api::RuntimeAuthContext;
+
     use super::{ExecutionRequest, RuntimeSecretsMount, RUNTIME_SECRETS_NAME_PREFIX};
-    use crate::kernel::runtime::{
+    use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkMode,
-        OciConfinementConfig, RuntimeAuthContext, RuntimeProgramSpec, WorkspaceAccess,
+        OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
     };
 
     #[test]
@@ -189,7 +191,7 @@ mod tests {
                     skill_projection: None,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     network_mode: NetworkMode::On,
-                    install_policy: crate::kernel::runtime::InstallPolicy::User,
+                    install_policy: crate::InstallPolicy::User,
                     root_in_userns: false,
                     working_dir: None,
                     environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],

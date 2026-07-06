@@ -241,7 +241,7 @@ fn path_is_or_under(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::runtime::{MountAccess, MountSpec};
+    use crate::{MountAccess, MountSpec};
 
     #[test]
     fn normalizes_absolute_mount_targets() {

@@ -1,0 +1,34 @@
+[package]
+name = "lionclaw-mission-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+lionclaw-confinement.workspace = true
+lionclaw-durable-fs.workspace = true
+lionclaw-runtime-api.workspace = true
+lionclaw-runtime-acp.workspace = true
+lionclaw-runtime-codex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "sync", "time"] }
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+lionclaw-mission-engine = { path = ".", features = ["testing"] }
+lionclaw-runtime-mock.workspace = true
+tempfile.workspace = true

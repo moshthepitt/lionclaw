@@ -1,0 +1,166 @@
+//! Identifier newtypes with zenith-compatible validation.
+//!
+//! Validation rules ported from Zenith (Apache-2.0, Intelligent Internet)
+//! `models.py` — `ASSERTION_ID_REGEX`, `TASK_ID_REGEX`, `SKILL_NAME_REGEX` —
+//! hand-rolled as charset checks so the model stays regex-free.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+macro_rules! id_type {
+    ($name:ident, $validate:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(raw: impl Into<String>) -> Result<Self, IdError> {
+                let raw = raw.into();
+                $validate(&raw)?;
+                Ok(Self(raw))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct IdError(String);
+
+/// `^[A-Z][A-Z0-9-]+$` — uppercase-first, then uppercase/digit/hyphen, len >= 2.
+fn validate_assertion_id(raw: &str) -> Result<(), IdError> {
+    let mut chars = raw.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_uppercase());
+    let rest: Vec<char> = chars.collect();
+    if !first_ok
+        || rest.is_empty()
+        || !rest
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
+    {
+        return Err(IdError(format!(
+            "assertion id '{raw}' must match ^[A-Z][A-Z0-9-]+$"
+        )));
+    }
+    Ok(())
+}
+
+/// `^[A-Za-z][A-Za-z0-9_-]*$`.
+fn validate_task_id(raw: &str) -> Result<(), IdError> {
+    let mut chars = raw.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    if !first_ok
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(IdError(format!(
+            "task id '{raw}' must match ^[A-Za-z][A-Za-z0-9_-]*$"
+        )));
+    }
+    Ok(())
+}
+
+/// `^[a-z][a-z0-9_-]*$` — role and oracle names (zenith skill names).
+fn validate_component_name(raw: &str) -> Result<(), IdError> {
+    let mut chars = raw.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    if !first_ok
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(IdError(format!(
+            "name '{raw}' must match ^[a-z][a-z0-9_-]*$"
+        )));
+    }
+    Ok(())
+}
+
+id_type!(AssertionId, validate_assertion_id, "Contract assertion id.");
+id_type!(TaskId, validate_task_id, "Plan task id.");
+id_type!(RoleName, validate_component_name, "Plugin role name.");
+id_type!(OracleName, validate_component_name, "Plugin oracle name.");
+
+/// Mission id: `m` + 12 hex chars, derived by the shell from
+/// (workspace, objective, creation time) — no RNG in this crate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MissionId(String);
+
+impl MissionId {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, IdError> {
+        let raw = raw.into();
+        let hex = raw.strip_prefix('m').unwrap_or("");
+        if hex.len() != 12 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(IdError(format!(
+                "mission id '{raw}' must be 'm' + 12 hex chars"
+            )));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn from_digest_prefix(digest_hex: &str) -> Self {
+        Self(format!("m{}", &digest_hex[..12]))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MissionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assertion_id_rules() {
+        assert!(AssertionId::new("TESTS-PASS").is_ok());
+        assert!(AssertionId::new("A1").is_ok());
+        assert!(AssertionId::new("A").is_err()); // len >= 2
+        assert!(AssertionId::new("a-lower").is_err());
+        assert!(AssertionId::new("1ST").is_err());
+        assert!(AssertionId::new("HAS SPACE").is_err());
+        assert!(AssertionId::new("").is_err());
+    }
+
+    #[test]
+    fn task_id_rules() {
+        assert!(TaskId::new("fix").is_ok());
+        assert!(TaskId::new("Fix_bug-2").is_ok());
+        assert!(TaskId::new("f").is_ok()); // single char allowed
+        assert!(TaskId::new("2fix").is_err());
+        assert!(TaskId::new("fix.bug").is_err());
+        assert!(TaskId::new("").is_err());
+    }
+
+    #[test]
+    fn component_name_rules() {
+        assert!(RoleName::new("implementer").is_ok());
+        assert!(OracleName::new("cargo-test").is_ok());
+        assert!(RoleName::new("Implementer").is_err());
+        assert!(OracleName::new("-x").is_err());
+    }
+
+    #[test]
+    fn mission_id_roundtrip() {
+        let id = MissionId::from_digest_prefix("abcdef0123456789");
+        assert_eq!(id.as_str(), "mabcdef012345");
+        assert!(MissionId::parse(id.as_str()).is_ok());
+        assert!(MissionId::parse("nope").is_err());
+    }
+}

@@ -26,7 +26,7 @@ use super::{
     runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
-use crate::kernel::runtime::RuntimeSecretsMount;
+use crate::RuntimeSecretsMount;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
@@ -909,19 +909,21 @@ mod tests {
         prepare_oci_process_launch, private_network_probe_reached_process_exec,
         OciExecutionBackend,
     };
-    use crate::kernel::runtime::execution::backend::{
+    use crate::backend::{
         ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
     };
-    use crate::kernel::runtime::{
+    use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest,
         InstallPolicy, NetworkMode, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,
         WorkspaceAccess,
     };
-    use crate::kernel::runtime::{MountAccess, MountSpec};
-    use crate::project_inventory::{
-        PROJECT_INSTANCES_FILE_ENV, PROJECT_INSTANCES_FILE_PATH, PROJECT_INSTANCE_ENV,
-        PROJECT_INSTANCE_INVENTORY_DIR,
-    };
+    use crate::{MountAccess, MountSpec};
+    // Mirrors crate `lionclaw`'s project_inventory constants; tests only need the
+    // literal values to exercise env/mount pass-through.
+    const PROJECT_INSTANCE_ENV: &str = "LIONCLAW_PROJECT_INSTANCE";
+    const PROJECT_INSTANCES_FILE_ENV: &str = "LIONCLAW_PROJECT_INSTANCES_FILE";
+    const PROJECT_INSTANCE_INVENTORY_DIR: &str = "/lionclaw/project";
+    const PROJECT_INSTANCES_FILE_PATH: &str = "/lionclaw/project/instances.json";
     #[cfg(unix)]
     use rustix::process::{getgid, getuid};
     use tempfile::tempdir;

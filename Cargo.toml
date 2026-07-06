@@ -3,6 +3,9 @@ members = [
     "crates/lionclaw",
     "crates/lionclaw-channel-email",
     "crates/lionclaw-channel-team-local",
+    "crates/lionclaw-cli",
+    "crates/lionclaw-confinement",
+    "crates/lionclaw-mission-engine",
     "crates/lionclaw-private-context",
     "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
@@ -25,7 +28,9 @@ base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
+lionclaw-confinement = { path = "crates/lionclaw-confinement" }
 lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
+lionclaw-mission-engine = { path = "crates/lionclaw-mission-engine" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
 lionclaw-runtime-acp = { path = "crates/lionclaw-runtime-acp" }
 lionclaw-runtime-codex = { path = "crates/lionclaw-runtime-codex" }
@@ -37,6 +42,7 @@ serde_json = "1.0"
 sha2 = "0.11"
 sqlx = "0.8"
 tempfile = "3.27"
+thiserror = "2.0"
 tokio = "1.50"
 toml = "1.1"
 tracing = "0.1"
