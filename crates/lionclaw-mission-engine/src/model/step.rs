@@ -83,28 +83,34 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     }
 
-    // Runnable = non-gate, pending, all deps cleared — in plan order
-    // (zenith `_all_runnable_tasks`; list order is the topo tie-break).
+    // Runnable = pending, all deps cleared — in plan order (zenith
+    // `_all_runnable_tasks`; list order is the topo tie-break). Work tasks
+    // (writers) go first and serialize; a runnable validator (read-only
+    // judge) dispatches once no work is runnable. Gates are never
+    // "runnable" — their status is fold-derived (see `derive_gates`).
     let status_of = |id: &TaskId| state.tasks.get(id).map(|t| t.status);
-    let mut runnable_work = plan.tasks.iter().filter(|task| {
-        task.kind == TaskKind::Work
-            && status_of(&task.id) == Some(TaskStatus::Pending)
-            && task
-                .depends_on
-                .iter()
-                .all(|dep| status_of(dep) == Some(TaskStatus::Cleared))
-    });
-    if let Some(task) = runnable_work.next() {
+    let runnable = |kind: TaskKind| {
+        plan.tasks.iter().find(move |task| {
+            task.kind == kind
+                && status_of(&task.id) == Some(TaskStatus::Pending)
+                && task
+                    .depends_on
+                    .iter()
+                    .all(|dep| status_of(dep) == Some(TaskStatus::Cleared))
+        })
+    };
+    if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {
         let attempt_no = state.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
         return StepDecision::DispatchRole(RoleDispatchIntent {
             task_id: task.id.clone(),
             role: task
                 .role
                 .clone()
-                .expect("plan validation guarantees work tasks carry a role"),
+                .expect("plan validation guarantees work/validate tasks carry a role"),
             attempt_no,
             body: task.body.clone(),
             targets: task.targets.clone(),
+            // Work stacks on the latest artifact; a validator judges it.
             base_sha: state.current_sha.clone(),
         });
     }
@@ -476,17 +482,53 @@ mod tests {
     }
 
     #[test]
-    fn only_work_tasks_dispatch() {
-        // A pending gate and validator declared earlier never dispatch (and
-        // never block) via the work path.
+    fn work_is_preferred_over_a_runnable_validator() {
+        // Both a work task and a validator are runnable; the writer goes
+        // first (writers serialize), the validator waits its turn.
         let state = fold_log(vec![
             created("sha-0"),
             plan(
                 vec![assertion("A1")],
-                vec![gate("g1"), validate("v1", &["A1"]), work("w1", &[], &[])],
+                vec![validate("v1", &["A1"]), work("w1", &["A1"], &[])],
             ),
         ]);
         assert_eq!(dispatched(&state).task_id, tid("w1"));
+    }
+
+    #[test]
+    fn a_pending_gate_awaiting_its_validators_does_not_dispatch() {
+        // The gate depends on a validator that hasn't run; the gate is not
+        // "runnable" (gates never dispatch) and nothing else is ready, so
+        // the loop idles waiting for the validator lane.
+        let g = {
+            let mut g = gate("g1");
+            g.targets = vec![aid("A1")];
+            g.depends_on = vec![tid("v1")];
+            g
+        };
+        let state = fold_log(vec![
+            created("sha-0"),
+            plan(vec![assertion("A1")], vec![validate("v1", &["A1"]), g]),
+            role_requested("v1", 1, "k-v1-1"),
+        ]);
+        // v1 is running (inflight), so the step idles rather than dispatching.
+        assert_eq!(step(&state), StepDecision::Idle);
+    }
+
+    #[test]
+    fn runnable_validator_dispatches_once_no_work_remains() {
+        // A validator whose dependency has cleared dispatches (read-only
+        // judge). Gates are never dispatched — their status is derived.
+        let state = fold_log(vec![
+            created("sha-0"),
+            plan(
+                vec![assertion("A1")],
+                vec![work("w1", &["A1"], &[]), validate("v1", &["A1"])],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
+        ]);
+        assert_eq!(dispatched(&state).task_id, tid("v1"));
     }
 
     // --- dispatch intent fields ---

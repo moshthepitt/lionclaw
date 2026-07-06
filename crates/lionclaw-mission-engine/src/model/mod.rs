@@ -7,6 +7,7 @@
 
 pub mod event;
 pub mod fold;
+pub mod gate;
 pub mod ids;
 pub mod plan;
 pub mod plan_validation;
@@ -19,6 +20,7 @@ pub use event::{
     PayloadRef, RunErrorKind, StopBar, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
+pub use gate::{evaluate_gate, GateResult};
 pub use ids::{AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
 pub use plan::{derive_kind, Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
 pub use plan_validation::{validate_plan_submission, PlanValidationError, PluginInventory};

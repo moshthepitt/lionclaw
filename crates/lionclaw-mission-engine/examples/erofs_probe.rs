@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             },
             extras: Vec::new(),
         },
-        judged_roots: &[snapshot.clone()],
+        judged_roots: std::slice::from_ref(&snapshot),
         environment: Vec::new(),
         idle_timeout: Duration::from_secs(60),
         hard_timeout: Duration::from_secs(60),

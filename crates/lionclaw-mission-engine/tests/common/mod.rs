@@ -1,5 +1,10 @@
 //! Shared harness for engine integration tests: tempdir-backed store, a
 //! hand-built plugin (loading is exercised elsewhere), scripted mock ports.
+//!
+//! Each integration test binary compiles this module independently, so any
+//! given test uses only a subset of these helpers — dead-code warnings for
+//! the rest are expected.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,19 +30,63 @@ pub fn test_plugin() -> LoadedPlugin {
         stop: StopBar::Verified,
         root: "/nonexistent-plugin".into(),
         playbook: None,
-        roles: BTreeMap::from([(
-            implementer.clone(),
-            RoleDefinition {
-                name: implementer,
-                output: OutputSemantics::ProducesArtifact,
-                runtime: None,
-                network: false,
-                secrets: false,
-                skills: Vec::new(),
-                prompt_body: "Fix the code.".to_string(),
-            },
-        )]),
+        roles: BTreeMap::from([
+            (
+                implementer.clone(),
+                RoleDefinition {
+                    name: implementer,
+                    output: OutputSemantics::ProducesArtifact,
+                    runtime: None,
+                    network: false,
+                    secrets: false,
+                    skills: Vec::new(),
+                    prompt_body: "Fix the code.".to_string(),
+                },
+            ),
+            (
+                RoleName::new("reviewer").expect("role name"),
+                RoleDefinition {
+                    name: RoleName::new("reviewer").expect("role name"),
+                    output: OutputSemantics::EmitsVerdict,
+                    runtime: None,
+                    network: false,
+                    secrets: false,
+                    skills: Vec::new(),
+                    prompt_body: "Judge the code.".to_string(),
+                },
+            ),
+        ]),
         oracles: BTreeMap::from([(cargo_test, "/nonexistent-plugin/oracles/cargo-test".into())]),
+    }
+}
+
+/// A plan with a work task and a read-only reviewer over one oracle-less
+/// assertion — advisory-only, so it can never verify.
+pub fn advisory_plan() -> PlanSubmission {
+    PlanSubmission {
+        assertions: vec![Assertion {
+            id: AssertionId::new("STYLE-OK").expect("assertion id"),
+            prose: "the code reads cleanly".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![
+            Task {
+                id: "write".parse_task(),
+                kind: TaskKind::Work,
+                body: "Write the code.".to_string(),
+                targets: vec![AssertionId::new("STYLE-OK").expect("assertion id")],
+                role: Some(RoleName::new("implementer").expect("role name")),
+                depends_on: Vec::new(),
+            },
+            Task {
+                id: "review".parse_task(),
+                kind: TaskKind::Validate,
+                body: "Review the code.".to_string(),
+                targets: vec![AssertionId::new("STYLE-OK").expect("assertion id")],
+                role: Some(RoleName::new("reviewer").expect("role name")),
+                depends_on: vec!["write".parse_task()],
+            },
+        ],
     }
 }
 

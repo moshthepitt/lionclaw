@@ -1,0 +1,115 @@
+//! Slice 2: a read-only validator produces advisory verdicts alongside (or
+//! instead of) an oracle. Advisory verdicts route and rank; they never mark
+//! a mission verified — that requires authoritative oracle coverage.
+
+mod common;
+
+use std::sync::Arc;
+
+use common::{advisory_plan, test_plugin, BASE_SHA, HEAD_SHA};
+use lionclaw_mission_engine::engine::Engine;
+use lionclaw_mission_engine::model::{
+    AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
+};
+use lionclaw_mission_engine::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw_mission_engine::store::MissionStore;
+use lionclaw_mission_engine::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+
+/// A role-aware mock: verdict roles return a ValidateHandoff, others a work
+/// handoff that "commits" HEAD_SHA.
+fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
+    MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
+        use lionclaw_mission_engine::model::OutputSemantics;
+        let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
+            Handoff::Validate {
+                done: true,
+                report: PayloadRef::inline("reviewed"),
+                items: vec![ValidationItem {
+                    item_id: lionclaw_mission_engine::model::AssertionId::new("STYLE-OK").unwrap(),
+                    passed: reviewer_passes,
+                }],
+                passed: reviewer_passes,
+                request_attention: false,
+            }
+        } else {
+            Handoff::Work {
+                done: true,
+                report: PayloadRef::inline("wrote it"),
+                request_attention: false,
+            }
+        };
+        let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
+            lionclaw_mission_engine::model::ArtifactOutcome {
+                base_sha: req.base_sha.clone(),
+                head_sha: HEAD_SHA.to_string(),
+            }
+        });
+        Ok(RoleRunOutcome {
+            handoff,
+            artifact,
+            model_id: None,
+        })
+    }))
+}
+
+async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = MissionStore::open(dir.path()).await.expect("store");
+    let engine = Engine::new(
+        store,
+        test_plugin(),
+        Arc::new(role_aware_runner(reviewer_passes)),
+        Arc::new(MockOracleRunner::exiting(0)),
+        Arc::new(MockClock::default()),
+    );
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "advisory-only mission",
+            BASE_SHA,
+            lionclaw_mission_engine::model::MissionConfig {
+                ratification_gate: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create");
+    engine
+        .submit_plan(&mission_id, advisory_plan())
+        .await
+        .expect("submit");
+    engine.advance(&mission_id).await.expect("advance");
+    let state = engine.load_state(&mission_id).await.expect("state");
+    let advisory = state
+        .contract
+        .get(&lionclaw_mission_engine::model::AssertionId::new("STYLE-OK").unwrap())
+        .expect("assertion")
+        .advisory;
+    (state.phase, advisory)
+}
+
+#[tokio::test]
+async fn advisory_pass_is_internally_consistent_never_verified() {
+    let (phase, advisory) = run(true).await;
+    assert_eq!(advisory, AdvisoryStatus::Passed);
+    // All-green advisory with no authoritative coverage: internally
+    // consistent, NOT verified.
+    assert_eq!(
+        phase,
+        MissionPhase::Done {
+            finish: FinishClass::InternallyConsistent
+        }
+    );
+}
+
+#[tokio::test]
+async fn advisory_fail_is_unverified() {
+    let (phase, advisory) = run(false).await;
+    assert_eq!(advisory, AdvisoryStatus::Failed);
+    assert_eq!(
+        phase,
+        MissionPhase::Done {
+            finish: FinishClass::Unverified
+        }
+    );
+}

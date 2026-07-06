@@ -203,7 +203,62 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         }
     }
     state.head = seq;
+    derive_gates(state);
     derive_phase(state);
+}
+
+/// Gate status is derived, never an event: a gate whose dependencies are all
+/// cleared evaluates its upstream validators (AND semantics). A cleared gate
+/// still raises a checkpoint (zenith's discipline — a human confirms before
+/// the mission proceeds past it); a failed gate raises `gate_failed`. Both
+/// pause the mission until Slice 4's decision surface resolves them.
+fn derive_gates(state: &mut MissionState) {
+    let Some(plan) = state.plan.clone() else {
+        return;
+    };
+    for task in &plan.tasks {
+        if task.kind != super::plan::TaskKind::Gate {
+            continue;
+        }
+        let status = state.tasks.get(&task.id).map(|t| t.status);
+        if status != Some(TaskStatus::Pending) {
+            continue; // already resolved this fold-run or superseded
+        }
+        let deps_cleared = task
+            .depends_on
+            .iter()
+            .all(|dep| state.tasks.get(dep).map(|t| t.status) == Some(TaskStatus::Cleared));
+        if !deps_cleared {
+            continue;
+        }
+        let (new_status, kind, report) =
+            match super::gate::evaluate_gate(state, &plan, &task.id) {
+                super::gate::GateResult::Cleared => (
+                    TaskStatus::Cleared,
+                    AttentionKind::GateCheckpoint,
+                    format!("gate '{}' cleared; confirm to proceed", task.id),
+                ),
+                super::gate::GateResult::Blocked { reason } => (
+                    TaskStatus::Failed,
+                    AttentionKind::GateFailed,
+                    format!("gate '{}' blocked: {reason}", task.id),
+                ),
+            };
+        if let Some(entry) = state.tasks.get_mut(&task.id) {
+            entry.status = new_status;
+        }
+        // Stable, gate-scoped attention id (one per gate, not per fold step).
+        let id = format!("{kind:?}:{}", task.id).to_lowercase();
+        state.open_attention.insert(
+            id.clone(),
+            AttentionItem {
+                id,
+                kind,
+                task_id: Some(task.id.clone()),
+                report,
+            },
+        );
+    }
 }
 
 fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
