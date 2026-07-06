@@ -1,0 +1,9 @@
+# Purity guard: wall-clock, monotonic time, and RNG are banned crate-wide.
+# All time flows through the `Clock` port; the single permitted call site is
+# `SystemClock` in ports.rs (marked #[expect(clippy::disallowed_methods)]).
+disallowed-methods = [
+    "std::time::SystemTime::now",
+    "std::time::Instant::now",
+    "chrono::Utc::now",
+    "uuid::Uuid::new_v4",
+]

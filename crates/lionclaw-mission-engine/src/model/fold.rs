@@ -94,12 +94,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             state.plan = Some(plan.clone());
         }
         MissionEvent::RoleRunRequested {
-            task_id,
-            attempt_no,
-            idempotency_key,
-            role,
-            prompt,
-            base_sha,
+            task_id, attempt_no, ..
         } => {
             let task = state.tasks.entry(task_id.clone()).or_insert(TaskRuntimeState {
                 status: TaskStatus::Pending,
@@ -107,17 +102,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             });
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
-            state.inflight.insert(
-                idempotency_key.clone(),
-                InflightEffect::RoleRun {
-                    task_id: task_id.clone(),
-                    attempt_no: *attempt_no,
-                    role: role.clone(),
-                    prompt: prompt.clone(),
-                    base_sha: base_sha.clone(),
-                    requested_seq: seq,
-                },
-            );
+            track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::RoleRunCompleted {
             task_id,
@@ -152,23 +137,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             );
         }
         MissionEvent::OracleRunRequested {
-            assertion_ids,
-            oracle,
-            judged_sha,
-            attempt_no,
-            idempotency_key,
+            oracle, attempt_no, ..
         } => {
             state.oracle_attempts.insert(oracle.clone(), *attempt_no);
-            state.inflight.insert(
-                idempotency_key.clone(),
-                InflightEffect::OracleRun {
-                    assertion_ids: assertion_ids.clone(),
-                    oracle: oracle.clone(),
-                    judged_sha: judged_sha.clone(),
-                    attempt_no: *attempt_no,
-                    requested_seq: seq,
-                },
-            );
+            track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::OracleRunCompleted {
             assertion_ids,
@@ -212,18 +184,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 seq,
             );
         }
-        MissionEvent::TerminalReviewRequested {
-            attempt_no,
-            idempotency_key,
-        } => {
+        MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
             state.terminal_review_attempts = *attempt_no;
-            state.inflight.insert(
-                idempotency_key.clone(),
-                InflightEffect::TerminalReview {
-                    attempt_no: *attempt_no,
-                    requested_seq: seq,
-                },
-            );
+            track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::TerminalReviewCompleted {
             idempotency_key,
@@ -241,6 +204,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     }
     state.head = seq;
     derive_phase(state);
+}
+
+fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
+    if let Some((key, effect)) = InflightEffect::from_request(event, seq) {
+        state.inflight.insert(key, effect);
+    }
 }
 
 fn apply_handoff(
@@ -373,9 +342,9 @@ fn tasks_active(state: &MissionState) -> bool {
 pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
     state.contract.values().any(|assertion| {
         assertion.oracle.is_some()
-            && !assertion
+            && assertion
                 .last_authoritative
                 .as_ref()
-                .is_some_and(|v| v.judged_sha() == state.current_sha)
+                .is_none_or(|v| v.judged_sha() != state.current_sha)
     })
 }

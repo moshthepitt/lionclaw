@@ -12,7 +12,7 @@ macro_rules! id_type {
     ($name:ident, $validate:ident, $doc:literal) => {
         #[doc = $doc]
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
+        #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
         impl $name {
@@ -24,6 +24,20 @@ macro_rules! id_type {
 
             pub fn as_str(&self) -> &str {
                 &self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdError;
+
+            fn try_from(raw: String) -> Result<Self, IdError> {
+                Self::new(raw)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> String {
+                id.0
             }
         }
 
@@ -93,8 +107,22 @@ id_type!(OracleName, validate_component_name, "Plugin oracle name.");
 /// Mission id: `m` + 12 hex chars, derived by the shell from
 /// (workspace, objective, creation time) — no RNG in this crate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct MissionId(String);
+
+impl TryFrom<String> for MissionId {
+    type Error = IdError;
+
+    fn try_from(raw: String) -> Result<Self, IdError> {
+        Self::parse(raw)
+    }
+}
+
+impl From<MissionId> for String {
+    fn from(id: MissionId) -> String {
+        id.0
+    }
+}
 
 impl MissionId {
     pub fn parse(raw: impl Into<String>) -> Result<Self, IdError> {

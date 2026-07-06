@@ -111,6 +111,72 @@ pub enum InflightEffect {
     },
 }
 
+impl InflightEffect {
+    /// Build the inflight entry for a `…Requested` event. Single source of
+    /// truth shared by the fold and the effect-ledger enqueue.
+    pub fn from_request(
+        event: &super::event::MissionEvent,
+        requested_seq: u64,
+    ) -> Option<(String, Self)> {
+        use super::event::MissionEvent;
+        match event {
+            MissionEvent::RoleRunRequested {
+                task_id,
+                attempt_no,
+                idempotency_key,
+                role,
+                prompt,
+                base_sha,
+            } => Some((
+                idempotency_key.clone(),
+                Self::RoleRun {
+                    task_id: task_id.clone(),
+                    attempt_no: *attempt_no,
+                    role: role.clone(),
+                    prompt: prompt.clone(),
+                    base_sha: base_sha.clone(),
+                    requested_seq,
+                },
+            )),
+            MissionEvent::OracleRunRequested {
+                assertion_ids,
+                oracle,
+                judged_sha,
+                attempt_no,
+                idempotency_key,
+            } => Some((
+                idempotency_key.clone(),
+                Self::OracleRun {
+                    assertion_ids: assertion_ids.clone(),
+                    oracle: oracle.clone(),
+                    judged_sha: judged_sha.clone(),
+                    attempt_no: *attempt_no,
+                    requested_seq,
+                },
+            )),
+            MissionEvent::TerminalReviewRequested {
+                attempt_no,
+                idempotency_key,
+            } => Some((
+                idempotency_key.clone(),
+                Self::TerminalReview {
+                    attempt_no: *attempt_no,
+                    requested_seq,
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::RoleRun { .. } => "role_run",
+            Self::OracleRun { .. } => "oracle_run",
+            Self::TerminalReview { .. } => "terminal_review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissionState {
     pub mission_id: MissionId,

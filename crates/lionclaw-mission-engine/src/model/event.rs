@@ -220,6 +220,64 @@ pub enum MissionEvent {
     },
 }
 
+/// Idempotency role of an event within a two-event (request/outcome) pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdemClass {
+    Request,
+    Outcome,
+}
+
+impl MissionEvent {
+    /// Stable type tag (matches the serde tag; persisted for queries).
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::MissionCreated { .. } => "mission_created",
+            Self::PlanSubmitted { .. } => "plan_submitted",
+            Self::RoleRunRequested { .. } => "role_run_requested",
+            Self::RoleRunCompleted { .. } => "role_run_completed",
+            Self::RoleRunFailed { .. } => "role_run_failed",
+            Self::OracleRunRequested { .. } => "oracle_run_requested",
+            Self::OracleRunCompleted { .. } => "oracle_run_completed",
+            Self::OracleRunFailed { .. } => "oracle_run_failed",
+            Self::TerminalReviewRequested { .. } => "terminal_review_requested",
+            Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
+            Self::MissionAborted { .. } => "mission_aborted",
+        }
+    }
+
+    /// The idempotency key and its class, for events participating in a
+    /// request/outcome pair.
+    pub fn idempotency(&self) -> Option<(IdemClass, &str)> {
+        match self {
+            Self::RoleRunRequested { idempotency_key, .. }
+            | Self::OracleRunRequested { idempotency_key, .. }
+            | Self::TerminalReviewRequested { idempotency_key, .. } => {
+                Some((IdemClass::Request, idempotency_key))
+            }
+            Self::RoleRunCompleted { idempotency_key, .. }
+            | Self::RoleRunFailed { idempotency_key, .. }
+            | Self::OracleRunCompleted { idempotency_key, .. }
+            | Self::OracleRunFailed { idempotency_key, .. }
+            | Self::TerminalReviewCompleted { idempotency_key, .. } => {
+                Some((IdemClass::Outcome, idempotency_key))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether an outcome event records a success (`done`) or failure
+    /// (`failed`) for its effect ledger row.
+    pub fn outcome_succeeded(&self) -> Option<bool> {
+        match self {
+            Self::RoleRunCompleted { .. }
+            | Self::OracleRunCompleted { .. }
+            | Self::TerminalReviewCompleted { .. } => Some(true),
+            Self::RoleRunFailed { .. } | Self::OracleRunFailed { .. } => Some(false),
+            _ => None,
+        }
+    }
+}
+
 /// A persisted event with its log position and provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
