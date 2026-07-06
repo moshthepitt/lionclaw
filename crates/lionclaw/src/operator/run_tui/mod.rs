@@ -53,9 +53,11 @@ use crate::{
     runtime_timeouts::RuntimeTurnTimeouts,
 };
 
+#[cfg(test)]
+use crate::kernel::runtime::ExecutionPreset;
 use crate::kernel::runtime::{
     append_streamed_text_boundary, append_streamed_text_delta,
-    execution::planner::resolve_execution_preset, ExecutionPlanPurpose,
+    execution::planner::resolve_execution_preset, ExecutionPlanPurpose, InstallPolicy,
 };
 
 mod backend;
@@ -72,6 +74,8 @@ use render::{render_app, vertical_scroll_limit};
 
 #[cfg(test)]
 use backend::append_transcript_delta;
+#[cfg(test)]
+use backend::resolve_boundary_summary;
 #[cfg(test)]
 use input::{global_command_for, handle_key};
 #[cfg(test)]
@@ -275,6 +279,8 @@ struct BoundarySummary {
     workspace: String,
     network: String,
     secrets: String,
+    install_policy: String,
+    root_posture: String,
     turn_timeout: String,
     preset: String,
 }
@@ -1546,6 +1552,8 @@ impl ConsoleApp {
                 workspace: "blocked".to_string(),
                 network: "blocked".to_string(),
                 secrets: "blocked".to_string(),
+                install_policy: "blocked".to_string(),
+                root_posture: "blocked".to_string(),
                 turn_timeout: "-".to_string(),
                 preset: "-".to_string(),
             },
