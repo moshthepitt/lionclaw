@@ -31,10 +31,6 @@ use super::{
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
 pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
-const RUNTIME_IMAGE_BASE_PATH: &str = concat!(
-    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    ":/usr/local/games:/usr/games"
-);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -817,15 +813,10 @@ fn prepend_environment_path(
         .find(|(existing_key, _)| existing_key == "PATH")
     {
         if existing_value.is_empty() {
-            *existing_value = format!("{prefix}:{RUNTIME_IMAGE_BASE_PATH}");
+            *existing_value = prefix;
         } else {
             *existing_value = format!("{prefix}:{existing_value}");
         }
-    } else {
-        environment.push((
-            "PATH".to_string(),
-            format!("{prefix}:{RUNTIME_IMAGE_BASE_PATH}"),
-        ));
     }
 }
 
@@ -861,7 +852,7 @@ mod tests {
     use super::{
         EffectiveExecutionPlan, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
         ExecutionPlannerConfig, RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY,
-        BUILTIN_PRESET_HIDDEN_COMPACTION, RUNTIME_IMAGE_BASE_PATH, RUNTIME_INSTALL_ENV_PATH,
+        BUILTIN_PRESET_HIDDEN_COMPACTION, RUNTIME_INSTALL_ENV_PATH,
     };
     use crate::home::{
         runtime_project_partition_key, RUNTIME_NATIVE_HOMES_DIR, RUNTIME_NATIVE_HOME_DIR,
@@ -1057,16 +1048,7 @@ mod tests {
                 ),
                 ("CARGO_HOME".to_string(), "/runtime/home/.cargo".to_string()),
                 ("GOBIN".to_string(), "/runtime/home/go/bin".to_string()),
-                (
-                    "BASH_ENV".to_string(),
-                    RUNTIME_INSTALL_ENV_PATH.to_string()
-                ),
-                (
-                    "PATH".to_string(),
-                    format!(
-                        "/runtime/home/.local/bin:/runtime/home/.npm-global/bin:/runtime/home/.cargo/bin:/runtime/home/go/bin:{RUNTIME_IMAGE_BASE_PATH}"
-                    )
-                ),
+                ("BASH_ENV".to_string(), RUNTIME_INSTALL_ENV_PATH.to_string()),
                 ("LIONCLAW_RUNTIME_DIR".to_string(), "/runtime".to_string()),
                 ("LIONCLAW_DRAFTS_DIR".to_string(), "/drafts".to_string()),
                 ("TMPDIR".to_string(), "/tmp".to_string()),
@@ -1239,7 +1221,12 @@ mod tests {
             InstallPolicy::User,
         );
 
-        assert_user_install_environment(&environment, Some("/usr/local/bin:/usr/bin"));
+        assert_user_install_environment(
+            &environment,
+            Some(
+                "/runtime/home/.local/bin:/runtime/home/.npm-global/bin:/runtime/home/.cargo/bin:/runtime/home/go/bin:/usr/local/bin:/usr/bin",
+            ),
+        );
     }
 
     #[test]
@@ -1306,37 +1293,18 @@ mod tests {
     }
 
     #[test]
-    fn install_policy_fallback_path_includes_debian_games_dirs() {
-        let sandbox = tempdir().expect("temp dir");
-        let presets = [(
-            "system".to_string(),
-            preset_with_install_policy(InstallPolicy::System),
-        )]
-        .into_iter()
-        .collect();
-        let planner =
-            planner_for_install_policy_tests(sandbox.path(), presets, BTreeMap::new(), true);
+    fn install_policy_user_does_not_synthesize_path_without_passthrough() {
+        let environment = super::build_runtime_environment(
+            Vec::new(),
+            true,
+            true,
+            true,
+            false,
+            false,
+            InstallPolicy::User,
+        );
 
-        for (preset_name, expected_policy) in [
-            (None, InstallPolicy::User),
-            (Some("system"), InstallPolicy::System),
-        ] {
-            let plan = planner
-                .plan(install_policy_plan_request(preset_name))
-                .expect("install policy plan");
-
-            assert_eq!(plan.install_policy, expected_policy);
-            let path = single_environment_value(&plan.environment, "PATH");
-            let entries = path.split(':').collect::<Vec<_>>();
-            assert!(
-                entries.contains(&"/usr/local/games"),
-                "{expected_policy:?} fallback PATH missing /usr/local/games: {path}"
-            );
-            assert!(
-                entries.contains(&"/usr/games"),
-                "{expected_policy:?} fallback PATH missing /usr/games: {path}"
-            );
-        }
+        assert_user_install_environment(&environment, None);
     }
 
     #[test]
@@ -2357,7 +2325,7 @@ mod tests {
 
     fn assert_user_install_environment(
         environment: &[(String, String)],
-        existing_path_suffix: Option<&str>,
+        expected_path: Option<&str>,
     ) {
         assert_eq!(
             single_environment_value(environment, "PYTHONUSERBASE"),
@@ -2383,12 +2351,13 @@ mod tests {
             single_environment_value(environment, "BASH_ENV"),
             RUNTIME_INSTALL_ENV_PATH
         );
-        let expected_prefix = "/runtime/home/.local/bin:/runtime/home/.npm-global/bin:/runtime/home/.cargo/bin:/runtime/home/go/bin";
-        let expected_path = existing_path_suffix.map_or_else(
-            || format!("{expected_prefix}:{RUNTIME_IMAGE_BASE_PATH}"),
-            |existing| format!("{expected_prefix}:{existing}"),
-        );
-        assert_eq!(single_environment_value(environment, "PATH"), expected_path);
+        match expected_path {
+            Some(expected) => assert_eq!(single_environment_value(environment, "PATH"), expected),
+            None => assert!(
+                !environment.iter().any(|(key, _)| key == "PATH"),
+                "PATH should not be synthesized when it was not passed through"
+            ),
+        }
     }
 
     fn assert_no_install_helper_environment(environment: &[(String, String)]) {
