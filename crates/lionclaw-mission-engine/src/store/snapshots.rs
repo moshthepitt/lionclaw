@@ -17,15 +17,20 @@ impl MissionStore {
     pub async fn save_snapshot(&self, state: &MissionState, now_ms: i64) -> Result<()> {
         let state_json = serde_json::to_string(state)?;
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let current: Option<i64> = sqlx::query_scalar(
-            "SELECT upto_sequence_no FROM mission_snapshots WHERE mission_id = ?1",
+        let current: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT upto_sequence_no, reducer_version FROM mission_snapshots WHERE mission_id = ?1",
         )
         .bind(state.mission_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        if current.is_some_and(|c| c as u64 >= state.head) {
-            tx.rollback().await?;
-            return Ok(());
+        // Monotonic in head, but always replace a stale-reducer snapshot even
+        // at equal head — otherwise a terminal/parked mission keeps refolding
+        // from zero forever after a REDUCER_VERSION bump.
+        if let Some((upto, reducer)) = current {
+            if upto as u64 >= state.head && reducer as u32 == REDUCER_VERSION {
+                tx.rollback().await?;
+                return Ok(());
+            }
         }
         sqlx::query(
             "INSERT INTO mission_snapshots

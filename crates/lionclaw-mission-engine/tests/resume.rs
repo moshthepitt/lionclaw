@@ -120,6 +120,109 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
 }
 
 #[tokio::test]
+async fn a_live_lease_is_not_reconciled_to_failure() {
+    // Regression (review): a second driver must not synthesize failure over a
+    // role run whose lease is still live (the LLM may be running elsewhere).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .await
+        .expect("create");
+    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+
+    // Record a role-run request and lease it with a long, still-live lease.
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let event = NewEvent::new(MissionEvent::RoleRunRequested {
+        task_id: lionclaw_mission_engine::model::TaskId::new("fix").unwrap(),
+        attempt_no: 1,
+        idempotency_key: "live-key".to_string(),
+        role: lionclaw_mission_engine::model::RoleName::new("implementer").unwrap(),
+        prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
+        base_sha: BASE_SHA.to_string(),
+    });
+    h.engine.store().append(&mission_id, state.head, &[event], 1_000).await.expect("append");
+    // Another worker holds a 1-hour lease as of t=1000.
+    let leases = h
+        .engine
+        .store()
+        .pull_due(&mission_id, "other-worker", 1, 3_600_000, 1_000)
+        .await
+        .expect("lease");
+    assert_eq!(leases.len(), 1);
+
+    // This driver advances: the live lease must be left alone — no synthesized
+    // failure, and the role runner is never invoked for the live key.
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert!(matches!(outcome, AdvanceOutcome::Busy), "got {outcome:?}");
+    let events = h.engine.store().load(&mission_id).await.expect("load");
+    assert!(
+        !events.iter().any(|e| matches!(&e.event,
+            MissionEvent::RoleRunFailed { idempotency_key, .. } if idempotency_key == "live-key")),
+        "a live lease must not be reconciled to failure"
+    );
+    assert_eq!(
+        h.role_runner.invocations_by_key.lock().unwrap().get("live-key"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
+    // Regression (review): rebuild_cursors must not launder a crashed (leased)
+    // role run back to 'queued', which would re-invoke the LLM. It reseeds as
+    // an expired lease so the next advance synthesizes failure instead.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .await
+        .expect("create");
+    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+
+    // Record + lease a role run, then "crash" (no outcome recorded).
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let event = NewEvent::new(MissionEvent::RoleRunRequested {
+        task_id: lionclaw_mission_engine::model::TaskId::new("fix").unwrap(),
+        attempt_no: 1,
+        idempotency_key: "crash-key".to_string(),
+        role: lionclaw_mission_engine::model::RoleName::new("implementer").unwrap(),
+        prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
+        base_sha: BASE_SHA.to_string(),
+    });
+    h.engine.store().append(&mission_id, state.head, &[event], 1_000).await.expect("append");
+    h.engine.store().pull_due(&mission_id, "dead", 1, 60_000, 1_000).await.expect("lease");
+
+    // Rebuild every derived cursor from the log.
+    h.engine.store().rebuild_cursors(&mission_id, 5_000).await.expect("rebuild");
+
+    // The next advance must synthesize failure, NOT re-run the LLM.
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert!(matches!(outcome, AdvanceOutcome::Parked { .. }), "got {outcome:?}");
+    assert_eq!(
+        h.role_runner.invocations_by_key.lock().unwrap().get("crash-key"),
+        None,
+        "the crashed role run must never be re-invoked after a rebuild"
+    );
+    let events = h.engine.store().load(&mission_id).await.expect("load");
+    assert!(events.iter().any(|e| matches!(&e.event,
+        MissionEvent::RoleRunFailed { idempotency_key, synthesized: true, .. }
+            if idempotency_key == "crash-key")));
+}
+
+#[tokio::test]
 async fn one_outcome_per_idempotency_key_is_a_store_invariant() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(

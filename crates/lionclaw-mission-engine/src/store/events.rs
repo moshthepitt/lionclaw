@@ -207,10 +207,15 @@ impl MissionStore {
             .collect()
     }
 
-    /// Rebuild the queued effect ledger from a folded state's inflight set
-    /// (cursor rebuild). Inflight effects whose outcome is already recorded
-    /// are, by definition, absent from `inflight`, so this reseeds exactly
-    /// the still-owed effects as `queued`.
+    /// Rebuild the effect ledger from a folded state's inflight set (cursor
+    /// rebuild). Inflight effects whose outcome is already recorded are, by
+    /// definition, absent from `inflight`.
+    ///
+    /// Reproducible effects (oracles, terminal review) reseed as `queued` —
+    /// a re-run is safe. A role run reseeds as an **expired lease**: the
+    /// "an attempt was started" fact is otherwise ledger-only, and losing it
+    /// would let a rebuild re-invoke the LLM. An expired lease makes reconcile
+    /// synthesize failure instead (never re-run a possibly-already-run LLM).
     pub async fn reseed_effects(
         &self,
         state: &crate::model::MissionState,
@@ -220,21 +225,42 @@ impl MissionStore {
         for (key, effect) in &state.inflight {
             let request_json = serde_json::to_string(effect)?;
             let source_seq = inflight_source_seq(effect);
-            sqlx::query(
-                "INSERT INTO mission_effects
-                     (effect_id, mission_id, source_seq, kind, request_json, status,
-                      created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)
-                 ON CONFLICT(effect_id) DO NOTHING",
-            )
-            .bind(key)
-            .bind(state.mission_id.as_str())
-            .bind(source_seq as i64)
-            .bind(effect.kind_str())
-            .bind(&request_json)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
+            let is_role_run = matches!(effect, InflightEffect::RoleRun { .. });
+            if is_role_run {
+                sqlx::query(
+                    "INSERT INTO mission_effects
+                         (effect_id, mission_id, source_seq, kind, request_json, status,
+                          attempt_count, lease_owner, lease_expires_at_ms, current_attempt_id,
+                          created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'leased', 1, 'rebuild-orphan', 0,
+                             ?1 || '-orphan', ?6, ?6)
+                     ON CONFLICT(effect_id) DO NOTHING",
+                )
+                .bind(key)
+                .bind(state.mission_id.as_str())
+                .bind(source_seq as i64)
+                .bind(effect.kind_str())
+                .bind(&request_json)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO mission_effects
+                         (effect_id, mission_id, source_seq, kind, request_json, status,
+                          created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)
+                     ON CONFLICT(effect_id) DO NOTHING",
+                )
+                .bind(key)
+                .bind(state.mission_id.as_str())
+                .bind(source_seq as i64)
+                .bind(effect.kind_str())
+                .bind(&request_json)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -332,30 +358,55 @@ impl MissionStore {
     }
 
     /// Current ledger status of an effect (`queued`/`leased`/`done`/`failed`),
-    /// or `None` if the row is missing.
-    pub async fn effect_status(&self, effect_id: &str) -> anyhow::Result<Option<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT status FROM mission_effects WHERE effect_id = ?1",
+    /// plus its lease expiry (if leased). `None` if the row is missing.
+    pub async fn effect_status(
+        &self,
+        effect_id: &str,
+    ) -> anyhow::Result<Option<EffectStatus>> {
+        let row: Option<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT status, lease_expires_at_ms FROM mission_effects WHERE effect_id = ?1",
         )
         .bind(effect_id)
         .fetch_optional(self.pool())
-        .await?)
+        .await?;
+        Ok(row.map(|(status, lease_expires_at_ms)| EffectStatus {
+            status,
+            lease_expires_at_ms,
+        }))
     }
 
     /// Reset an effect to `queued` (reconcile path for safely re-runnable
-    /// effects — engine-run oracles, never LLM role runs).
+    /// effects — engine-run oracles, never LLM role runs). Refuses to steal a
+    /// live (unexpired) lease held by a concurrent driver.
     pub async fn requeue_effect(&self, effect_id: &str, now_ms: i64) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE mission_effects
              SET status = 'queued', lease_owner = NULL, lease_expires_at_ms = NULL,
                  current_attempt_id = NULL, updated_at_ms = ?2
-             WHERE effect_id = ?1 AND status IN ('queued', 'leased')",
+             WHERE effect_id = ?1
+               AND (status = 'queued'
+                    OR (status = 'leased' AND lease_expires_at_ms <= ?2))",
         )
         .bind(effect_id)
         .bind(now_ms)
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+}
+
+/// An effect's ledger status and lease expiry.
+#[derive(Debug, Clone)]
+pub struct EffectStatus {
+    pub status: String,
+    pub lease_expires_at_ms: Option<i64>,
+}
+
+impl EffectStatus {
+    /// Whether a concurrent driver still holds a live claim on this effect
+    /// (leased with a lease that has not yet expired).
+    pub fn is_live_lease(&self, now_ms: i64) -> bool {
+        self.status == "leased" && self.lease_expires_at_ms.is_some_and(|exp| exp > now_ms)
     }
 }
 

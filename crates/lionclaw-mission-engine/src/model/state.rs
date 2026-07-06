@@ -227,6 +227,10 @@ pub struct MissionState {
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
     pub oracle_failures: BTreeMap<OracleName, String>,
+    /// Oracles whose obligation a human waived (`continue` on an oracle
+    /// failure): the mission may finish, but never *verified* — there is no
+    /// authoritative verdict.
+    pub waived_oracles: std::collections::BTreeSet<OracleName>,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
 }

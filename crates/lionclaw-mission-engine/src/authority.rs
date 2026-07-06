@@ -206,14 +206,32 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         return Err(MoatViolation::NonEnforcingBackend);
     }
 
-    // (2) Reserved targets may not be shadowed by config-supplied mounts.
-    for mount in &request.confinement.oci().additional_mounts {
+    // (2) Reserved targets may not be shadowed by config-supplied mounts —
+    // OR by a config tmpfs. A tmpfs is a writable in-memory filesystem the
+    // backend applies verbatim, so a tmpfs at (or under) /workspace, /mission,
+    // /scratch, /runtime would layer a writable region over the judged tree
+    // exactly as a rw bind mount would. `/tmp` is not reserved, so the default
+    // scratch tmpfs is unaffected.
+    let oci = request.confinement.oci();
+    for mount in &oci.additional_mounts {
         if RESERVED_TARGETS
             .iter()
             .any(|reserved| target_shadows(&mount.target, reserved))
         {
             return Err(MoatViolation::ReservedTargetShadowed {
                 target: mount.target.clone(),
+            });
+        }
+    }
+    for entry in &oci.tmpfs {
+        // A tmpfs entry is `<target>[:<options>]`.
+        let target = entry.split(':').next().unwrap_or(entry);
+        if RESERVED_TARGETS
+            .iter()
+            .any(|reserved| target_shadows(target, reserved))
+        {
+            return Err(MoatViolation::ReservedTargetShadowed {
+                target: target.to_string(),
             });
         }
     }
@@ -522,6 +540,43 @@ mod tests {
             &judged,
         ))
         .expect("read-only overlap is fine");
+    }
+
+    #[test]
+    fn tmpfs_over_judged_workspace_refuses_to_compile() {
+        // Regression (review): a writable tmpfs layered over the judged tree
+        // bypasses the rw-mount check unless the moat inspects tmpfs too.
+        let ceiling = AuthorityCeiling::default();
+        let judge =
+            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
+        for target in ["/workspace", "/workspace/sub:rw", "/mission/oracle", "/scratch"] {
+            let mut confinement = oci();
+            confinement.oci_mut().tmpfs.push(target.to_string());
+            let err = compile_role_plan(RolePlanRequest {
+                confinement,
+                ..request(&judge, mounts(MountAccess::ReadOnly, Vec::new()), &[])
+            })
+            .expect_err("tmpfs over the judged tree must refuse");
+            assert!(
+                matches!(err, MoatViolation::ReservedTargetShadowed { .. }),
+                "target {target}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_tmp_tmpfs_is_allowed() {
+        // The engine's own scratch tmpfs at /tmp is not a reserved target.
+        let ceiling = AuthorityCeiling::default();
+        let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
+            .expect("worker");
+        let mut confinement = oci();
+        confinement.oci_mut().tmpfs.push("/tmp:rw,size=512m".to_string());
+        compile_role_plan(RolePlanRequest {
+            confinement,
+            ..request(&worker, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+        })
+        .expect("/tmp tmpfs compiles");
     }
 
     #[test]

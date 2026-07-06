@@ -458,6 +458,9 @@ async fn report_state(
                     println!("  [{}] {}", item.id, item.report);
                 }
             }
+            AdvanceOutcome::Busy => {
+                println!("mission {mission_id}: effects in progress under another driver")
+            }
             AdvanceOutcome::Terminal { phase } => {
                 println!("mission {mission_id}: {}", phase_slug(phase));
             }
@@ -480,6 +483,7 @@ fn outcome_slug(outcome: &AdvanceOutcome) -> &'static str {
     match outcome {
         AdvanceOutcome::AwaitingPlan => "awaiting_plan",
         AdvanceOutcome::Parked { .. } => "parked",
+        AdvanceOutcome::Busy => "busy",
         AdvanceOutcome::Terminal { .. } => "terminal",
     }
 }

@@ -66,6 +66,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         acknowledged_gates: Default::default(),
         flagged_nodes: Default::default(),
         oracle_failures: Default::default(),
+        waived_oracles: Default::default(),
         head: envelope.sequence_no,
     })
 }
@@ -269,13 +270,26 @@ fn apply_decision(
         (DecisionAction::Continue, AttentionKind::GateCheckpoint | AttentionKind::GateFailed) => {
             if let Some(task_id) = &item.task_id {
                 state.acknowledged_gates.insert(task_id.clone());
+                // Accepting a gate (cleared checkpoint or blocked gate) lets
+                // the mission proceed past it: mark it cleared so downstream
+                // tasks become runnable instead of wedging forever.
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.status = TaskStatus::Cleared;
+                }
             }
         }
-        (DecisionAction::Retry | DecisionAction::Continue, AttentionKind::OracleFailed) => {
-            // Retry re-opens the obligation (step re-requests); continue
-            // accepts the infra failure. Both clear the failure record.
+        (DecisionAction::Retry, AttentionKind::OracleFailed) => {
+            // Re-open the obligation: step will re-request the oracle.
             if let Some(oracle) = &item.oracle {
                 state.oracle_failures.remove(oracle);
+            }
+        }
+        (DecisionAction::Continue, AttentionKind::OracleFailed) => {
+            // Accept the infra failure: waive the obligation so the mission
+            // can finish (never verified — there is no authoritative verdict).
+            if let Some(oracle) = &item.oracle {
+                state.oracle_failures.remove(oracle);
+                state.waived_oracles.insert(oracle.clone());
             }
         }
         (DecisionAction::Abort, _) => {
@@ -300,7 +314,10 @@ fn derive_attention(state: &mut MissionState) {
                 .map(|id| id.to_string())
                 .or_else(|| oracle.as_ref().map(|o| o.to_string()))
                 .unwrap_or_else(|| "mission".to_string());
-            let id = format!("{kind:?}:{anchor}").to_lowercase();
+            // Lowercase only the kind — the anchor (a case-sensitive task or
+            // oracle id) must stay verbatim so two ids differing only by case
+            // never collide into one attention item.
+            let id = format!("{}:{anchor}", format!("{kind:?}").to_lowercase());
             attention.insert(
                 id.clone(),
                 AttentionItem {
@@ -470,7 +487,11 @@ fn tasks_active(state: &MissionState) -> bool {
 /// is a human decision, not an engine loop).
 pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
     state.contract.values().any(|assertion| {
-        assertion.oracle.is_some()
+        let Some(oracle) = &assertion.oracle else {
+            return false;
+        };
+        // A waived oracle owes nothing (the mission just can't be verified).
+        !state.waived_oracles.contains(oracle)
             && assertion
                 .last_authoritative
                 .as_ref()
@@ -647,6 +668,174 @@ mod tests {
             stderr: PayloadRef::inline("err"),
             duration_ms: 5,
         }
+    }
+
+    fn decision(item: &str, action: super::super::event::DecisionAction) -> MissionEvent {
+        MissionEvent::DecisionRecorded {
+            attention_id: item.into(),
+            action,
+            justification: "j".into(),
+            actor: "test".into(),
+        }
+    }
+
+    fn gate_task(id: &str, targets: &[&str], deps: &[&str]) -> Task {
+        Task {
+            id: tid(id),
+            kind: TaskKind::Gate,
+            body: "".into(),
+            targets: targets.iter().map(|t| aid(t)).collect(),
+            role: None,
+            depends_on: deps.iter().map(|d| tid(d)).collect(),
+        }
+    }
+
+    // Regression (review): a fresh authoritative FAIL must dominate a green
+    // advisory verdict — Unverified, never InternallyConsistent.
+    #[test]
+    fn fresh_oracle_fail_dominates_green_advisory() {
+        use super::super::verdict::FinishClass;
+        let state = fold_log(vec![
+            created(),
+            plan_submitted(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w"), validate_task("v")],
+            ),
+            role_completed("w", "kw", work_handoff(true, false), Some(ArtifactOutcome {
+                base_sha: "base".into(),
+                head_sha: "sha-1".into(),
+            })),
+            // Validator says pass (advisory becomes sticky Passed).
+            role_completed("v", "kv", validate_handoff(&[("A1", true)]), None),
+            // Oracle runs at the current commit and FAILS.
+            oracle_requested("A1", "sha-1", "ko"),
+            oracle_completed("A1", "sha-1", "ko", 1),
+        ])
+        .expect("state");
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done { finish: FinishClass::Unverified },
+            "a real oracle failure is not laundered to internally-consistent"
+        );
+    }
+
+    // Regression (review): Continue on a GateFailed must let downstream
+    // proceed, not wedge the mission in Running forever.
+    #[test]
+    fn continue_on_failed_gate_unblocks_downstream() {
+        let base = vec![
+            created(),
+            plan_submitted(
+                vec![assertion("AA", None)],
+                vec![
+                    work_task("w"),
+                    validate_task("v"),
+                    gate_task("g", &["AA"], &["v"]),
+                    {
+                        let mut w2 = work_task("w2");
+                        w2.depends_on = vec![tid("g")];
+                        w2
+                    },
+                ],
+            ),
+            role_completed("w", "kw", work_handoff(true, false), None),
+            // Validator dissents → gate g latches Failed → GateFailed parks.
+            role_completed("v", "kv", validate_handoff(&[("AA", false)]), None),
+        ];
+        let parked = fold_log(base.clone()).expect("state");
+        assert_eq!(parked.tasks[&tid("g")].status, TaskStatus::Failed);
+        assert!(parked.open_attention.contains_key("gatefailed:g"));
+
+        let mut resolved = base;
+        resolved.push(decision("gatefailed:g", super::super::event::DecisionAction::Continue));
+        let state = fold_log(resolved).expect("state");
+        // Gate accepted → cleared → downstream w2 is runnable, not wedged.
+        assert_eq!(state.tasks[&tid("g")].status, TaskStatus::Cleared);
+        assert_eq!(state.tasks[&tid("w2")].status, TaskStatus::Pending);
+        assert!(state.open_attention.is_empty());
+        assert_eq!(super::super::step::step(&state), super::super::step::StepDecision::DispatchRole(
+            super::super::step::RoleDispatchIntent {
+                task_id: tid("w2"),
+                role: RoleName::new("implementer").unwrap(),
+                attempt_no: 1,
+                body: "do".into(),
+                targets: vec![],
+                base_sha: state.current_sha.clone(),
+            }
+        ));
+    }
+
+    // Regression (review): Continue on an OracleFailed waives the obligation
+    // so the mission can finish (unverified) instead of looping forever.
+    #[test]
+    fn continue_on_oracle_failure_waives_and_finishes() {
+        use super::super::verdict::FinishClass;
+        let base = vec![
+            created(),
+            plan_submitted(vec![assertion("A1", Some("cargo-test"))], vec![work_task("w")]),
+            role_completed("w", "kw", work_handoff(true, false), Some(ArtifactOutcome {
+                base_sha: "base".into(),
+                head_sha: "sha-1".into(),
+            })),
+            oracle_requested("A1", "sha-1", "ko"),
+            MissionEvent::OracleRunFailed {
+                assertion_ids: vec![aid("A1")],
+                oracle: oracle("cargo-test"),
+                judged_sha: "sha-1".into(),
+                attempt_no: 1,
+                idempotency_key: "ko".into(),
+                detail: "binary missing".into(),
+                synthesized: false,
+            },
+        ];
+        let parked = fold_log(base.clone()).expect("state");
+        assert!(parked.open_attention.contains_key("oraclefailed:cargo-test"));
+
+        let mut resolved = base;
+        resolved.push(decision(
+            "oraclefailed:cargo-test",
+            super::super::event::DecisionAction::Continue,
+        ));
+        let state = fold_log(resolved).expect("state");
+        assert!(state.waived_oracles.contains(&oracle("cargo-test")));
+        // No outstanding obligation → mission closes, but never verified.
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done { finish: FinishClass::Unverified }
+        );
+    }
+
+    // Regression (review): attention ids must not collapse task ids that
+    // differ only by case (lowercase only the kind, not the anchor).
+    #[test]
+    fn attention_ids_preserve_anchor_case() {
+        // Two gates differing only by case, both blocked by one dissent.
+        let state = fold_log(vec![
+            created(),
+            plan_submitted(
+                vec![assertion("AA", None)],
+                vec![
+                    work_task("w"),
+                    validate_task("v"),
+                    gate_task("Check", &["AA"], &["v"]),
+                    gate_task("check", &["AA"], &["v"]),
+                ],
+            ),
+            role_completed("w", "kw", work_handoff(true, false), None),
+            role_completed("v", "kv", validate_handoff(&[("AA", false)]), None),
+        ])
+        .expect("state");
+        // Distinct ids — no collision collapsing two gates into one item.
+        assert!(state.open_attention.contains_key("gatefailed:Check"));
+        assert!(state.open_attention.contains_key("gatefailed:check"));
+        assert_eq!(
+            state
+                .open_attention
+                .keys()
+                .filter(|k| k.starts_with("gatefailed:"))
+                .count(),
+            2
+        );
     }
 
     #[test]

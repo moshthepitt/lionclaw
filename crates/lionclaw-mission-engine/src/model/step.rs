@@ -124,7 +124,9 @@ fn step_running(state: &MissionState) -> StepDecision {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
-            if state.oracle_failures.contains_key(oracle) {
+            if state.oracle_failures.contains_key(oracle)
+                || state.waived_oracles.contains(oracle)
+            {
                 continue;
             }
             let fresh = assertion

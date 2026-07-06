@@ -65,7 +65,8 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
                 .effect_status(key)
                 .await
                 .expect("status")
-                .expect("row exists");
+                .expect("row exists")
+                .status;
             assert!(
                 status == "done" || status == "failed",
                 "effect {key} left in state {status}"

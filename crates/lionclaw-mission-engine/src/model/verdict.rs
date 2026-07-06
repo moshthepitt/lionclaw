@@ -83,26 +83,39 @@ pub enum FinishClass {
 
 /// Classify a finished mission. Freshness: an authoritative verdict counts
 /// only if it judged the mission's current artifact commit.
+///
+/// A fresh authoritative **fail** is ground truth and dominates: it forces
+/// Unverified no matter what an advisory verdict claims. "Internally
+/// consistent" means advisory-only green with *no* fresh authoritative
+/// contradiction — never a green advisory papering over a real oracle
+/// failure.
 pub fn classify_finish(state: &MissionState) -> FinishClass {
-    let mut all_authoritative = true;
-    let mut all_green = true;
-    for assertion in state.contract.values() {
-        let fresh_pass = assertion
-            .last_authoritative
-            .as_ref()
-            .is_some_and(|v| v.judged_sha() == state.current_sha && v.passed());
-        if !fresh_pass {
-            all_authoritative = false;
-            let advisory_green = assertion.advisory == AdvisoryStatus::Passed;
-            if !advisory_green {
-                all_green = false;
-            }
-        }
-    }
     if state.contract.is_empty() {
         return FinishClass::Unverified;
     }
-    if all_authoritative {
+    let mut all_authoritative_pass = true;
+    let mut all_green = true;
+    for assertion in state.contract.values() {
+        let fresh = assertion
+            .last_authoritative
+            .as_ref()
+            .filter(|v| v.judged_sha() == state.current_sha);
+        match fresh {
+            Some(v) if v.passed() => {}
+            Some(_) => {
+                // Fresh authoritative fail: ground truth, dominates advisory.
+                all_authoritative_pass = false;
+                all_green = false;
+            }
+            None => {
+                all_authoritative_pass = false;
+                if assertion.advisory != AdvisoryStatus::Passed {
+                    all_green = false;
+                }
+            }
+        }
+    }
+    if all_authoritative_pass {
         FinishClass::Verified
     } else if all_green {
         FinishClass::InternallyConsistent

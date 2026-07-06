@@ -42,6 +42,9 @@ pub enum AdvanceOutcome {
     AwaitingPlan,
     /// Parked on open attention (durable interrupt, zero compute).
     Parked { attention: Vec<AttentionItem> },
+    /// Effects are in flight under live leases held by another driver; this
+    /// invocation has nothing to do. The next advance resumes.
+    Busy,
     /// Done or aborted.
     Terminal { phase: MissionPhase },
 }
@@ -184,11 +187,16 @@ impl Engine {
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             if !state.inflight.is_empty() {
-                let appended = self.reconcile(&state).await?;
-                if !appended {
-                    self.drive_one(&state).await?;
+                if self.reconcile(&state).await? {
+                    continue; // reconcile appended an outcome; refold
                 }
-                continue;
+                if self.drive_one(&state).await? {
+                    continue; // drove an effect; refold
+                }
+                // Inflight effects remain but none were reconcilable or due:
+                // they are held by live leases (another driver is running
+                // them). Return rather than spin; the next advance resumes.
+                return Ok(AdvanceOutcome::Busy);
             }
             match step(&state) {
                 StepDecision::Idle => {
@@ -221,12 +229,22 @@ impl Engine {
     /// `_reconcile_pending_attempts` discipline); an oracle or review run is
     /// reproducible → re-queued. Returns true when an event was appended
     /// (caller must refold before driving).
+    ///
+    /// A **live (unexpired) lease is left alone**: another driver still owns
+    /// the effect, and stealing it would fabricate failure over a running LLM
+    /// or double-run an oracle. Only expired or never-leased effects are
+    /// reconciled — mirroring `pull_due`'s eligibility.
     async fn reconcile(&self, state: &MissionState) -> Result<bool> {
         let now_ms = self.clock.now_ms();
         for (key, effect) in &state.inflight {
-            let status = self.store.effect_status(key).await?;
-            if status.as_deref() == Some("queued") {
+            let Some(status) = self.store.effect_status(key).await? else {
+                continue; // ledger row missing; nothing to reconcile
+            };
+            if status.status == "queued" {
                 continue; // normal path: drive_one will lease it
+            }
+            if status.is_live_lease(now_ms) {
+                continue; // a concurrent driver owns it; do not disturb
             }
             match effect {
                 InflightEffect::RoleRun {
@@ -239,9 +257,8 @@ impl Engine {
                         attempt_no: *attempt_no,
                         idempotency_key: key.clone(),
                         error_kind: RunErrorKind::Infra,
-                        detail: format!(
-                            "resumed with role run in ledger state {status:?}; outcome unknowable"
-                        ),
+                        detail: "resumed with an expired role-run lease; outcome unknowable"
+                            .to_string(),
                         synthesized: true,
                     });
                     match self.store.append(&state.mission_id, state.head, &[event], now_ms).await {
@@ -259,16 +276,17 @@ impl Engine {
         Ok(false)
     }
 
-    /// Lease and execute one due effect, recording its outcome. Serial by
-    /// design in the walking skeleton; validators parallelize later.
-    async fn drive_one(&self, state: &MissionState) -> Result<()> {
+    /// Lease and execute one due effect, recording its outcome. Returns
+    /// whether an effect was driven (false = nothing was due to lease).
+    /// Serial by design in the walking skeleton; validators parallelize later.
+    async fn drive_one(&self, state: &MissionState) -> Result<bool> {
         let now_ms = self.clock.now_ms();
         let leases = self
             .store
             .pull_due(&state.mission_id, &self.worker_id, 1, EFFECT_LEASE_MS, now_ms)
             .await?;
         let Some(lease) = leases.into_iter().next() else {
-            return Ok(());
+            return Ok(false);
         };
         let outcome = match &lease.request {
             InflightEffect::RoleRun { .. } => {
@@ -288,9 +306,9 @@ impl Engine {
             .append(&state.mission_id, state.head, &[outcome], self.clock.now_ms())
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             // Outcome already recorded (concurrent driver) — reconcile wins.
-            Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(()),
+            Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(true),
             Err(err) => Err(err.into()),
         }
     }
