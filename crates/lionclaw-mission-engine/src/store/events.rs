@@ -176,6 +176,70 @@ impl MissionStore {
             .collect()
     }
 
+    /// Load events after a given sequence number (snapshot tail).
+    pub async fn load_after(
+        &self,
+        mission_id: &MissionId,
+        after_seq: u64,
+    ) -> anyhow::Result<Vec<EventEnvelope>> {
+        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+            "SELECT sequence_no, recorded_at_ms, payload_json
+             FROM mission_events WHERE mission_id = ?1 AND sequence_no > ?2
+             ORDER BY sequence_no",
+        )
+        .bind(mission_id.as_str())
+        .bind(after_seq as i64)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|(sequence_no, recorded_at_ms, payload_json)| {
+                let doc: PayloadDoc = serde_json::from_str(&payload_json).map_err(|err| {
+                    anyhow::anyhow!("cannot decode event {sequence_no}: {err}")
+                })?;
+                Ok(EventEnvelope {
+                    mission_id: mission_id.clone(),
+                    sequence_no: sequence_no as u64,
+                    recorded_at_ms,
+                    stamps: doc.stamps,
+                    event: doc.event,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the queued effect ledger from a folded state's inflight set
+    /// (cursor rebuild). Inflight effects whose outcome is already recorded
+    /// are, by definition, absent from `inflight`, so this reseeds exactly
+    /// the still-owed effects as `queued`.
+    pub async fn reseed_effects(
+        &self,
+        state: &crate::model::MissionState,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        for (key, effect) in &state.inflight {
+            let request_json = serde_json::to_string(effect)?;
+            let source_seq = inflight_source_seq(effect);
+            sqlx::query(
+                "INSERT INTO mission_effects
+                     (effect_id, mission_id, source_seq, kind, request_json, status,
+                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)
+                 ON CONFLICT(effect_id) DO NOTHING",
+            )
+            .bind(key)
+            .bind(state.mission_id.as_str())
+            .bind(source_seq as i64)
+            .bind(effect.kind_str())
+            .bind(&request_json)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn list_missions(&self) -> anyhow::Result<Vec<MissionSummary>> {
         let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
             "SELECT mission_id, workspace_dir, objective, created_at_ms
@@ -206,13 +270,19 @@ impl MissionStore {
         now_ms: i64,
     ) -> anyhow::Result<Vec<EffectLease>> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        // Due = queued, or leased with an expired lease (a crashed worker's
+        // claim is reclaimable). The CAS UPDATE below re-checks this so a
+        // concurrent puller can never double-lease.
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT effect_id, request_json, attempt_count FROM mission_effects
-             WHERE mission_id = ?1 AND status = 'queued'
+             WHERE mission_id = ?1
+               AND (status = 'queued'
+                    OR (status = 'leased' AND lease_expires_at_ms <= ?3))
              ORDER BY source_seq LIMIT ?2",
         )
         .bind(mission_id.as_str())
         .bind(limit as i64)
+        .bind(now_ms)
         .fetch_all(&mut *tx)
         .await?;
         let mut leases = Vec::with_capacity(rows.len());
@@ -223,7 +293,9 @@ impl MissionStore {
                  SET status = 'leased', attempt_count = attempt_count + 1,
                      lease_owner = ?2, lease_expires_at_ms = ?3,
                      current_attempt_id = ?4, updated_at_ms = ?5
-                 WHERE effect_id = ?1 AND status = 'queued'",
+                 WHERE effect_id = ?1
+                   AND (status = 'queued'
+                        OR (status = 'leased' AND lease_expires_at_ms <= ?5))",
             )
             .bind(&effect_id)
             .bind(worker_id)
@@ -381,6 +453,14 @@ async fn insert_event(
         .map_err(anyhow::Error::from)?;
     }
     Ok(())
+}
+
+fn inflight_source_seq(effect: &InflightEffect) -> u64 {
+    match effect {
+        InflightEffect::RoleRun { requested_seq, .. }
+        | InflightEffect::OracleRun { requested_seq, .. }
+        | InflightEffect::TerminalReview { requested_seq, .. } => *requested_seq,
+    }
 }
 
 fn is_unique_violation(err: &sqlx::Error) -> bool {

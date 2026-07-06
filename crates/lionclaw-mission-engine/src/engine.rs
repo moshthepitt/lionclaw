@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    fold, step, validate_plan_submission, AttentionItem, Handoff, InflightEffect, MissionEvent,
+    step, validate_plan_submission, AttentionItem, Handoff, InflightEffect, MissionEvent,
     MissionId, MissionPhase, MissionState, OracleDispatchIntent, PayloadRef, PlanSubmission,
     PlanValidationError, RoleDispatchIntent, RunErrorKind, StepDecision,
 };
@@ -142,12 +142,23 @@ impl Engine {
     }
 
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
-        let events = self.store.load(mission_id).await?;
-        fold(events).with_context(|| format!("mission {mission_id} not found"))
+        self.store
+            .load_state_snapshotted(mission_id)
+            .await?
+            .with_context(|| format!("mission {mission_id} not found"))
     }
 
     /// Drive the mission until it parks, terminates, or awaits input.
     pub async fn advance(&self, mission_id: &MissionId) -> Result<AdvanceOutcome> {
+        let outcome = self.drive(mission_id).await?;
+        // Persist a fold snapshot before parking or exiting so the next
+        // invocation resumes without re-folding the whole log.
+        let state = self.load_state(mission_id).await?;
+        self.store.save_snapshot(&state, self.clock.now_ms()).await?;
+        Ok(outcome)
+    }
+
+    async fn drive(&self, mission_id: &MissionId) -> Result<AdvanceOutcome> {
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             if !state.inflight.is_empty() {

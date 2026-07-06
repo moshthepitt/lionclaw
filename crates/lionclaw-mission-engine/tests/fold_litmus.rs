@@ -72,4 +72,45 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
             );
         }
     }
+
+    // The real litmus: delete every derived cursor (snapshot + effect
+    // ledger) and rebuild from the log alone; the rebuilt state must equal
+    // the live one.
+    let rebuilt = h
+        .engine
+        .store()
+        .rebuild_cursors(&mission_id, 9_000_000)
+        .await
+        .expect("rebuild cursors");
+    assert_eq!(rebuilt, once, "state diverged after cursor rebuild");
+}
+
+#[tokio::test]
+async fn snapshot_resume_matches_full_refold() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .await
+        .expect("create");
+    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    h.engine.advance(&mission_id).await.expect("advance");
+
+    // advance() saved a snapshot; loading via the snapshot path must equal a
+    // fresh full fold of the log.
+    let via_snapshot = h
+        .engine
+        .store()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("load")
+        .expect("state");
+    let via_full = fold(h.engine.store().load(&mission_id).await.expect("load")).expect("fold");
+    assert_eq!(via_snapshot, via_full);
 }

@@ -8,6 +8,7 @@
 
 mod blobs;
 mod events;
+mod snapshots;
 
 pub use blobs::{BlobStore, BLOB_INLINE_MAX};
 pub use events::{AppendError, EffectLease, MissionSummary, NewEvent};

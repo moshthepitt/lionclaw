@@ -71,3 +71,13 @@ CREATE TABLE mission_effect_attempts (
 ) STRICT;
 
 CREATE INDEX idx_mission_effect_attempts_effect ON mission_effect_attempts (effect_id);
+
+-- Persisted fold snapshot: a discard-and-rebuildable cursor (exactly one live
+-- row per mission), version-stamped so a reducer change forces a full refold.
+CREATE TABLE mission_snapshots (
+    mission_id       TEXT PRIMARY KEY NOT NULL REFERENCES missions (mission_id),
+    upto_sequence_no INTEGER NOT NULL,
+    reducer_version  INTEGER NOT NULL,
+    state_json       TEXT NOT NULL,
+    created_at_ms    INTEGER NOT NULL
+) STRICT;
