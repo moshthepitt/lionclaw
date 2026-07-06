@@ -43,6 +43,9 @@ pub enum TaskStatus {
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
     pub attempts: u32,
+    /// The latest handoff report, for threading into downstream prompts.
+    #[serde(default)]
+    pub last_report: Option<PayloadRef>,
 }
 
 /// Zenith's sticky per-assertion advisory status: `pending → passed` is

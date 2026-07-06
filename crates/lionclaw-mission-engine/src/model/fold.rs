@@ -93,20 +93,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 state
                     .tasks
                     .entry(task.id.clone())
-                    .or_insert(TaskRuntimeState {
-                        status: TaskStatus::Pending,
-                        attempts: 0,
-                    });
+                    .or_insert(TaskRuntimeState { status: TaskStatus::Pending, attempts: 0, last_report: None });
             }
             state.plan = Some(plan.clone());
         }
         MissionEvent::RoleRunRequested {
             task_id, attempt_no, ..
         } => {
-            let task = state.tasks.entry(task_id.clone()).or_insert(TaskRuntimeState {
-                status: TaskStatus::Pending,
-                attempts: 0,
-            });
+            let task = state.tasks.entry(task_id.clone()).or_insert(TaskRuntimeState { status: TaskStatus::Pending, attempts: 0, last_report: None });
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
             track_inflight(state, &envelope.event, seq);
@@ -390,6 +384,9 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
 }
 
 fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
+    let report = match handoff {
+        Handoff::Work { report, .. } | Handoff::Validate { report, .. } => Some(report.clone()),
+    };
     match handoff {
         Handoff::Work {
             done,
@@ -403,6 +400,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             };
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = status;
+                task.last_report = report;
             }
             // A done task that asks for a look is flagged (derived into a
             // node_attention item); a not-done task is Failed (derived into a
@@ -419,6 +417,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             // Validators always clear — they ran; their verdicts are data.
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Cleared;
+                task.last_report = report;
             }
             for item in items {
                 if let Some(assertion) = state.contract.get_mut(&item.item_id) {

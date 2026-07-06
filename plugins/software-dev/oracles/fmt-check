@@ -1,0 +1,5 @@
+#!/bin/sh
+# Authoritative oracle: the tree must already be rustfmt-clean.
+set -e
+cd /workspace
+exec cargo fmt --all -- --check

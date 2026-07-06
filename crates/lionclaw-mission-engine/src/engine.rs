@@ -434,12 +434,26 @@ impl Engine {
             .roles
             .get(&intent.role)
             .with_context(|| format!("role '{}' missing from plugin", intent.role))?;
+        // Thread the reports of this task's dependencies in (resolved from
+        // blob refs). Prompt assembly excludes them for verdict roles.
+        let task = plan
+            .tasks
+            .iter()
+            .find(|t| t.id == intent.task_id)
+            .context("dispatched task not in plan")?;
+        let mut upstream_reports = Vec::new();
+        for dep in &task.depends_on {
+            if let Some(report) = state.tasks.get(dep).and_then(|t| t.last_report.as_ref()) {
+                upstream_reports.push(self.store.blobs().resolve(report)?);
+            }
+        }
         let prompt_text = assemble_role_prompt(
             role,
             &PromptContext {
                 objective: &state.objective,
                 task_body: &intent.body,
                 targets: &targets,
+                upstream_reports: &upstream_reports,
             },
         );
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));

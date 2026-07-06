@@ -1,0 +1,5 @@
+#!/bin/sh
+# Authoritative oracle: the release build must succeed.
+set -e
+cd /workspace
+exec cargo build --locked --release

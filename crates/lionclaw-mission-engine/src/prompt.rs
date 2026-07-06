@@ -12,6 +12,11 @@ pub struct PromptContext<'a> {
     pub task_body: &'a str,
     /// The contract assertions this dispatch targets (id + prose).
     pub targets: &'a [&'a Assertion],
+    /// Reports from this task's cleared dependencies, threaded in for
+    /// producing roles. **Excluded for verdict roles** — a judge sees the
+    /// artifact and the contract, never the producer's narrative
+    /// (fresh-context).
+    pub upstream_reports: &'a [String],
 }
 
 pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> String {
@@ -29,6 +34,13 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
         prompt.push_str("\n\n## Contract assertions in scope\n\n");
         for assertion in ctx.targets {
             prompt.push_str(&format!("- {}: {}\n", assertion.id, assertion.prose));
+        }
+    }
+    // Fresh-context invariant: verdict roles never receive producer prose.
+    if role.output != OutputSemantics::EmitsVerdict && !ctx.upstream_reports.is_empty() {
+        prompt.push_str("\n\n## Handoffs from upstream tasks\n\n");
+        for report in ctx.upstream_reports {
+            prompt.push_str(&format!("- {report}\n"));
         }
     }
     prompt
@@ -107,3 +119,47 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<the composed content>\"},
     \"request_attention\": false}";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::RoleName;
+
+    fn role(output: OutputSemantics) -> RoleDefinition {
+        RoleDefinition {
+            name: RoleName::new("r").unwrap(),
+            output,
+            runtime: None,
+            network: false,
+            secrets: false,
+            skills: Vec::new(),
+            prompt_body: "role body".to_string(),
+        }
+    }
+
+    fn ctx<'a>(upstream: &'a [String]) -> PromptContext<'a> {
+        PromptContext {
+            objective: "obj",
+            task_body: "do it",
+            targets: &[],
+            upstream_reports: upstream,
+        }
+    }
+
+    #[test]
+    fn worker_prompt_includes_upstream_reports() {
+        let upstream = vec!["the planner said: change add()".to_string()];
+        let prompt = assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
+        assert!(prompt.contains("Handoffs from upstream tasks"));
+        assert!(prompt.contains("the planner said"));
+    }
+
+    #[test]
+    fn judge_prompt_excludes_producer_prose_fresh_context() {
+        let upstream = vec!["the implementer said: I changed add() to add".to_string()];
+        let prompt = assemble_role_prompt(&role(OutputSemantics::EmitsVerdict), &ctx(&upstream));
+        // A judge must never see the producer's narrative.
+        assert!(!prompt.contains("the implementer said"));
+        assert!(!prompt.contains("Handoffs from upstream tasks"));
+    }
+}
