@@ -17,13 +17,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::authority::{
-    compile_role_plan, oracle_authority, AuthorityCeiling, MissionMounts, RolePlanRequest,
+    compile_authority, compile_role_plan, oracle_authority, AuthorityCeiling, CompiledAuthority,
+    MissionMounts, RolePlanRequest,
 };
 use crate::config::MissionRuntimeProfile;
 use crate::engine::Engine;
 use crate::model::{
-    Assertion, AssertionId, FinishClass, Handoff, MissionConfig, MissionEvent, MissionId,
-    OracleName, PayloadRef, PlanSubmission, RoleName, Task, TaskId, TaskKind,
+    ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff, MissionConfig, MissionEvent,
+    MissionId, MissionPhase, OracleName, PayloadRef, PlanSubmission, RoleName, RunErrorKind, Task,
+    TaskId, TaskKind,
 };
 use crate::oracle::OciOracleRunner;
 use crate::plugin::{load_plugin, PluginError};
@@ -36,14 +38,13 @@ use crate::store::MissionStore;
 use crate::workspace;
 
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec, WORKSPACE_MOUNT_TARGET};
-use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeProgramExecutor};
+use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
 
 const RUNTIME_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
 
 /// A no-op producer: clears its work task without changing the tree, so the
-/// real oracle judges the base fixture. This is the only stub in the harness
-/// (the oracle and confinement are real); it exists so the mission does not
-/// need a model to reach a work-task's outcome.
+/// real oracle judges the base fixture as-is. Used by the oracle-honesty
+/// check, where the tree must stay broken for the oracle to decide.
 struct NoopRoleRunner;
 
 #[async_trait]
@@ -115,7 +116,7 @@ type RuntimeCheck = fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = R
 
 fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
     vec![
-        ("happy-path-and-resume-no-dup", || Box::pin(check_happy_and_resume())),
+        ("writable-worker-writes-land-and-resume-no-dup", || Box::pin(check_happy_writer_and_resume())),
         ("oracle-honesty-on-real-broken-code", || Box::pin(check_oracle_honesty())),
         ("confinement-read-only-workspace-erofs", || Box::pin(check_confinement_erofs())),
     ]
@@ -189,8 +190,21 @@ async fn podman_readiness() -> Result<(), String> {
 
 // ---- Embedded fixtures & plugins (self-contained; no repo files needed) ----
 
-const PASSING_CARGO: &str = "[package]\nname = \"selftest-pass\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n";
-const PASSING_LIB: &str = "\
+const ADD_CARGO: &str = "[package]\nname = \"selftest-add\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n";
+/// `add` subtracts — the test fails until a worker fixes it. Used by check (1)
+/// to prove a real writable worker's fix lands and is judged.
+const BROKEN_ADD_LIB: &str = "\
+pub fn add(a: i64, b: i64) -> i64 { a - b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn adds() { assert_eq!(add(2, 3), 5); }
+}
+";
+/// The known-good fix the scripted worker writes.
+const FIXED_ADD_LIB: &str = "\
 pub fn add(a: i64, b: i64) -> i64 { a + b }
 
 #[cfg(test)]
@@ -201,7 +215,8 @@ mod tests {
 }
 ";
 
-// The broken fixture reuses interval-bug (single source of truth).
+// The oracle-honesty fixture reuses interval-bug (a real off-by-one, single
+// source of truth).
 const BROKEN_CARGO: &str = include_str!("../tests/fixtures/eval/interval-bug/Cargo.toml");
 const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/lib.rs");
 
@@ -211,12 +226,16 @@ const PLUGIN_IMPLEMENTER: &str = "\
 output: produces-artifact
 runtime: codex
 ---
-Self-test worker (never actually dispatched to a model).
+Self-test worker.
 ";
 const PLUGIN_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
 
-const WRITABLE_JUDGE_TOML: &str = "[plugin]\nname = \"writable-judge\"\nstop = \"verified\"\n";
-const WRITABLE_JUDGE_REVIEWER: &str = "\
+// A verdict role that illegally requests secrets — the loader must refuse it.
+// (A judge can't be declared *writable* in a plugin — workspace access is
+// derived from output — so an over-privileged judge is a secrets-requesting
+// one.)
+const SECRETS_JUDGE_TOML: &str = "[plugin]\nname = \"secrets-judge\"\nstop = \"verified\"\n";
+const SECRETS_JUDGE_REVIEWER: &str = "\
 ---
 output: emits-verdict
 secrets: true
@@ -236,10 +255,10 @@ fn materialize_sw_plugin(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn materialize_writable_judge_plugin(root: &Path) -> Result<()> {
+fn materialize_secrets_judge_plugin(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
-    std::fs::write(root.join("mission.toml"), WRITABLE_JUDGE_TOML)?;
-    std::fs::write(root.join("roles/reviewer.md"), WRITABLE_JUDGE_REVIEWER)?;
+    std::fs::write(root.join("mission.toml"), SECRETS_JUDGE_TOML)?;
+    std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
     Ok(())
 }
 
@@ -317,10 +336,124 @@ fn oracle_plan() -> PlanSubmission {
     }
 }
 
-/// Build an engine over `repo` with the noop worker + the counting real oracle.
+/// A real writable worker without a model: it clones the repo, writes a
+/// known-good fix and commits it **inside a real read-write container**, and
+/// returns the captured commit — proving the allow-side of confinement (writes
+/// land) and that the engine records the commit. Reuses the same clone/capture
+/// helpers as the production `OciRoleRunner`.
+struct ScriptedRoleRunner {
+    fixed_lib: &'static str,
+}
+
+#[async_trait]
+impl RoleRunner for ScriptedRoleRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+        self.run_inner(request).await.map_err(|e| RoleRunFailure {
+            kind: RunErrorKind::Launch,
+            detail: format!("{e:#}"),
+        })
+    }
+}
+
+impl ScriptedRoleRunner {
+    async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
+        let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
+        let dest = request
+            .state_dir
+            .join("selftest-work")
+            .join(&attempt_tag);
+        let clone = workspace::create_worker_clone(
+            &request.workspace_dir,
+            &dest,
+            request.mission_id.as_str(),
+            &attempt_tag,
+            &request.base_sha,
+        )
+        .await?;
+        // The produces-artifact role compiles to a writable workspace.
+        let authority = compile_authority(&request.role, &AuthorityCeiling::default())
+            .map_err(|e| anyhow::anyhow!("authority refused to compile: {e}"))?;
+        // Write the fix and commit, in a real read-write container. Commit
+        // identity + gpgsign=off come from the clone's git config.
+        let script = format!(
+            "set -e; cd /workspace; cat > src/lib.rs <<'LIONCLAW_SELFTEST_EOF'\n{}LIONCLAW_SELFTEST_EOF\ngit add -A; git commit -q -m 'self-test scripted fix'",
+            self.fixed_lib
+        );
+        let output = run_confined_sh(&authority, &clone.dir, MountAccess::ReadWrite, &[], &script)
+            .await?;
+        if output.exit_code != Some(0) {
+            anyhow::bail!(
+                "scripted writer failed (exit {:?}): {}",
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let head = workspace::capture_worker_result(&request.workspace_dir, &clone)
+            .await?
+            .context("scripted worker produced no commit")?;
+        workspace::remove_dir(&clone.dir).await;
+        Ok(RoleRunOutcome {
+            handoff: Handoff::Work {
+                done: true,
+                report: PayloadRef::inline("self-test scripted fix"),
+                request_attention: false,
+            },
+            artifact: Some(ArtifactOutcome {
+                base_sha: request.base_sha.clone(),
+                head_sha: head,
+            }),
+            model_id: None,
+        })
+    }
+}
+
+/// Run a shell command in a real container under a compiled role plan. Shared
+/// by the writable scripted worker (rw) and the EROFS probe (ro).
+async fn run_confined_sh(
+    authority: &CompiledAuthority,
+    workspace_source: &Path,
+    workspace_access: MountAccess,
+    judged_roots: &[std::path::PathBuf],
+    script: &str,
+) -> Result<ExecutionOutput> {
+    let profile = MissionRuntimeProfile::codex_default();
+    let compiled = compile_role_plan(RolePlanRequest {
+        authority,
+        runtime_id: "codex".to_string(),
+        confinement: profile.confinement.clone(),
+        mounts: MissionMounts {
+            workspace: MountSpec {
+                source: workspace_source.to_path_buf(),
+                target: WORKSPACE_MOUNT_TARGET.to_string(),
+                access: workspace_access,
+            },
+            extras: Vec::new(),
+        },
+        judged_roots,
+        environment: Vec::new(),
+        idle_timeout: Duration::from_secs(120),
+        hard_timeout: Duration::from_secs(120),
+    })
+    .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
+    let mut executor =
+        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+    executor
+        .execute_captured(RuntimeProgramSpec {
+            executable: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            environment: Vec::new(),
+            stdin: String::new(),
+            auth: None,
+        })
+        .await
+        .context("running the confined command")
+}
+
+/// Build an engine over `repo` with the given worker + the counting real oracle.
 async fn build_engine(
     repo: &Path,
     plugin_dir: &Path,
+    role_runner: Arc<dyn RoleRunner>,
     oracle_count: Arc<AtomicUsize>,
 ) -> Result<Engine> {
     let plugin = load_plugin(plugin_dir, &AuthorityCeiling::default())
@@ -331,7 +464,7 @@ async fn build_engine(
     Ok(Engine::new(
         store,
         plugin,
-        Arc::new(NoopRoleRunner),
+        role_runner,
         Arc::new(CountingOracleRunner {
             inner: OciOracleRunner::new(profile),
             count: oracle_count,
@@ -342,21 +475,24 @@ async fn build_engine(
 
 // ---- The four checks ----
 
-/// (1) A passing fixture reaches VERIFIED; a fresh engine on the same DB
-/// resumes and does NOT re-run the oracle (counter stays 1).
-async fn check_happy_and_resume() -> Result<()> {
+/// (1) A real writable worker fixes a broken tree in a container; its commit
+/// lands and the engine records it (`current_sha` advances); the real oracle
+/// then judges the fix and the mission reaches VERIFIED. A fresh engine on the
+/// same DB resumes and does NOT re-run the oracle (counter stays 1).
+async fn check_happy_writer_and_resume() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     let plugin = tempfile::tempdir().context("tempdir")?;
     materialize_sw_plugin(plugin.path())?;
-    let base = materialize_repo(repo.path(), PASSING_CARGO, PASSING_LIB).await?;
+    let base = materialize_repo(repo.path(), ADD_CARGO, BROKEN_ADD_LIB).await?;
     let count = Arc::new(AtomicUsize::new(0));
+    let worker = Arc::new(ScriptedRoleRunner { fixed_lib: FIXED_ADD_LIB });
 
     let mission_id = {
-        let engine = build_engine(repo.path(), plugin.path(), count.clone()).await?;
+        let engine = build_engine(repo.path(), plugin.path(), worker.clone(), count.clone()).await?;
         let id = engine
             .create_mission(
                 &repo.path().to_string_lossy(),
-                "self-test happy path",
+                "self-test writable worker",
                 &base,
                 MissionConfig { ratification_gate: false, ..Default::default() },
             )
@@ -366,18 +502,22 @@ async fn check_happy_and_resume() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
         assert_verified(&engine, &id).await?;
+        // The worker's writes landed and the engine recorded the commit.
+        let state = engine.load_state(&id).await?;
+        if state.current_sha == base {
+            anyhow::bail!("worker ran but no commit was recorded (current_sha unchanged)");
+        }
         id
     };
 
-    // Resume from disk with a fresh engine sharing the same counter.
-    let engine2 = build_engine(repo.path(), plugin.path(), count.clone()).await?;
+    // Resume from disk with a fresh engine sharing the same oracle counter.
+    let engine2 = build_engine(repo.path(), plugin.path(), worker, count.clone()).await?;
     assert_verified(&engine2, &mission_id).await?;
 
     let ran = count.load(Ordering::SeqCst);
     if ran != 1 {
         anyhow::bail!("oracle ran {ran} times across two invocations; expected exactly 1");
     }
-    // The log agrees: exactly one recorded oracle completion.
     let completions = engine2
         .store()
         .load(&mission_id)
@@ -395,19 +535,21 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = engine.advance(id).await?;
     let state = engine.load_state(id).await?;
     match state.phase {
-        crate::model::MissionPhase::Done { finish: FinishClass::Verified } => Ok(()),
+        MissionPhase::Done { finish: FinishClass::Verified } => Ok(()),
         other => anyhow::bail!("expected verified finish, got {other:?} (outcome {outcome:?})"),
     }
 }
 
-/// (2) The real cargo-test oracle on a genuinely-broken tree ⇒ NOT verified.
+/// (2) The real cargo-test oracle on a genuinely-broken tree ⇒ the mission
+/// finishes Unverified (specifically — not merely "not verified"). The noop
+/// worker leaves the tree broken so the oracle is what decides.
 async fn check_oracle_honesty() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     let plugin = tempfile::tempdir().context("tempdir")?;
     materialize_sw_plugin(plugin.path())?;
     let base = materialize_repo(repo.path(), BROKEN_CARGO, BROKEN_LIB).await?;
     let count = Arc::new(AtomicUsize::new(0));
-    let engine = build_engine(repo.path(), plugin.path(), count).await?;
+    let engine = build_engine(repo.path(), plugin.path(), Arc::new(NoopRoleRunner), count).await?;
     let id = engine
         .create_mission(
             &repo.path().to_string_lossy(),
@@ -421,80 +563,44 @@ async fn check_oracle_honesty() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
     engine.advance(&id).await?;
-    let state = engine.load_state(&id).await?;
-    match state.phase {
-        crate::model::MissionPhase::Done { finish: FinishClass::Verified } => {
-            anyhow::bail!("a failing oracle reported VERIFIED — honesty invariant broken")
+    match engine.load_state(&id).await?.phase {
+        MissionPhase::Done { finish: FinishClass::Unverified } => Ok(()),
+        MissionPhase::Done { finish } => {
+            anyhow::bail!("a failing oracle produced finish {finish:?}; expected unverified")
         }
-        _ => Ok(()),
+        other => anyhow::bail!("mission did not finish (phase {other:?}); oracle infra may be broken"),
     }
 }
 
-/// (3) A plugin declaring an over-privileged judge refuses to load, and a
-/// mission started from it writes no event log.
+/// (3) A plugin declaring an over-privileged judge refuses to load with a
+/// typed moat violation — so the mission never starts (no event log).
 async fn check_moat() -> Result<()> {
     let plugin = tempfile::tempdir().context("tempdir")?;
-    materialize_writable_judge_plugin(plugin.path())?;
+    materialize_secrets_judge_plugin(plugin.path())?;
     match load_plugin(plugin.path(), &AuthorityCeiling::default()) {
         Ok(_) => anyhow::bail!("over-privileged judge plugin loaded (moat breached)"),
-        Err(PluginError::Role { detail, .. }) if detail.contains("moat") => {}
+        Err(PluginError::Moat { .. }) => Ok(()),
         Err(other) => anyhow::bail!("plugin refused, but not by the moat: {other}"),
     }
-    // Starting a mission from it must create no mission in the store.
-    let repo = tempfile::tempdir().context("tempdir")?;
-    let store = MissionStore::open(repo.path()).await?;
-    let load = load_plugin(plugin.path(), &AuthorityCeiling::default());
-    assert!(load.is_err());
-    if !store.list_missions().await?.is_empty() {
-        anyhow::bail!("a refused plugin still created a mission (event log written)");
-    }
-    Ok(())
 }
 
 /// (4) A read-only role's write to /workspace is denied by the container.
 async fn check_confinement_erofs() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
-    let _base = materialize_repo(repo.path(), PASSING_CARGO, PASSING_LIB).await?;
+    materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
     let snapshot = tempfile::tempdir().context("tempdir")?;
-    workspace::create_snapshot(repo.path(), &snapshot.path().join("tree"), "HEAD").await?;
     let judged = snapshot.path().join("tree");
+    workspace::create_snapshot(repo.path(), &judged, "HEAD").await?;
 
     let authority = oracle_authority("erofs-probe");
-    let profile = MissionRuntimeProfile::codex_default();
-    let compiled = compile_role_plan(RolePlanRequest {
-        authority: &authority,
-        runtime_id: "codex".to_string(),
-        confinement: profile.confinement.clone(),
-        mounts: MissionMounts {
-            workspace: MountSpec {
-                source: judged.clone(),
-                target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: MountAccess::ReadOnly,
-            },
-            extras: Vec::new(),
-        },
-        judged_roots: std::slice::from_ref(&judged),
-        environment: Vec::new(),
-        idle_timeout: Duration::from_secs(60),
-        hard_timeout: Duration::from_secs(60),
-    })
-    .map_err(|e| anyhow::anyhow!("read-only plan refused to compile: {e}"))?;
-
-    let mut executor =
-        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
-    let output = executor
-        .execute_captured(RuntimeProgramSpec {
-            executable: "/bin/sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "set -C; : > /workspace/PROBE && echo WROTE || echo DENIED".to_string(),
-            ],
-            environment: Vec::new(),
-            stdin: String::new(),
-            auth: None,
-        })
-        .await
-        .context("running the write probe in the container")?;
+    let output = run_confined_sh(
+        &authority,
+        &judged,
+        MountAccess::ReadOnly,
+        std::slice::from_ref(&judged),
+        "set -C; : > /workspace/PROBE && echo WROTE || echo DENIED",
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();

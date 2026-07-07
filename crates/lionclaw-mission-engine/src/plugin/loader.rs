@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::authority::{compile_authority, AuthorityCeiling};
+use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{OracleName, RoleName, StopBar};
 
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
@@ -22,6 +22,12 @@ pub enum PluginError {
     Manifest(String),
     #[error("role '{role}' is invalid: {detail}")]
     Role { role: String, detail: String },
+    #[error("role '{role}' does not satisfy the moat: {violation}")]
+    Moat {
+        role: String,
+        #[source]
+        violation: MoatViolation,
+    },
     #[error("oracle '{oracle}' is invalid: {detail}")]
     Oracle { oracle: String, detail: String },
     #[error("plugin at '{0}' has no roles")]
@@ -126,9 +132,9 @@ fn load_roles(
         };
         // Fail-closed moat check at load time: an authority that cannot
         // compile (e.g. a judge requesting secrets) rejects the plugin.
-        compile_authority(&role, ceiling).map_err(|e| PluginError::Role {
+        compile_authority(&role, ceiling).map_err(|violation| PluginError::Moat {
             role: stem.to_string(),
-            detail: format!("does not satisfy the moat: {e}"),
+            violation,
         })?;
         roles.insert(name, role);
     }

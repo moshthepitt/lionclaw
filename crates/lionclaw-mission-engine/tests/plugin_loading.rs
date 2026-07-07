@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use lionclaw_mission_engine::authority::AuthorityCeiling;
 use lionclaw_mission_engine::model::{OutputSemantics, StopBar};
+use lionclaw_mission_engine::authority::MoatViolation;
 use lionclaw_mission_engine::plugin::{load_plugin, PluginError};
 
 fn repo_root() -> PathBuf {
@@ -42,10 +43,16 @@ fn writable_judge_plugin_refuses_to_load() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/plugins/writable-judge");
     let err = load_plugin(&fixture, &AuthorityCeiling::default()).expect_err("must refuse");
-    // A verdict role asking for secrets cannot satisfy the moat.
+    // A verdict role asking for secrets cannot satisfy the moat — a typed
+    // moat violation, not a generic role error.
     assert!(
-        matches!(err, PluginError::Role { .. }),
-        "expected a role moat violation, got {err:?}"
+        matches!(
+            err,
+            PluginError::Moat {
+                violation: MoatViolation::SecretsForJudge { .. },
+                ..
+            }
+        ),
+        "expected a typed moat violation, got {err:?}"
     );
-    assert!(err.to_string().contains("moat"));
 }

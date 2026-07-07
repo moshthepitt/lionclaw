@@ -27,13 +27,15 @@ fn fixtures() -> PathBuf {
 /// refuses to load, so no mission can ever start from it.
 #[test]
 fn moat_refuses_over_privileged_judge_plugin() {
-    let result = load_plugin(
+    let err = load_plugin(
         &fixtures().join("plugins/writable-judge"),
         &AuthorityCeiling::default(),
+    )
+    .expect_err("an over-privileged judge must refuse to load");
+    assert!(
+        matches!(err, lionclaw_mission_engine::plugin::PluginError::Moat { .. }),
+        "expected a typed moat violation, got {err:?}"
     );
-    assert!(result.is_err(), "an over-privileged judge must refuse to load");
-    let msg = result.err().unwrap().to_string();
-    assert!(msg.contains("moat"), "error should name the moat: {msg}");
 }
 
 /// Scenario 4 — advisory-only "done" is refused: a plugin with a reviewer
