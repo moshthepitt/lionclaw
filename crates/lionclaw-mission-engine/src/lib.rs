@@ -17,6 +17,7 @@ pub mod plugin;
 pub mod ports;
 pub mod prompt;
 pub mod runner;
+pub mod selftest;
 pub mod store;
 pub mod workspace;
 

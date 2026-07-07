@@ -53,6 +53,9 @@ pub enum MissionCommand {
     Decide(DecideArgs),
     /// Validate a plugin directory (loader + moat) without starting anything.
     Plugin(PluginArgs),
+    /// Drive the real stack end-to-end and assert the Slice-1 invariants
+    /// (needs podman; model-auth-free).
+    SelfTest(SelfTestArgs),
 }
 
 #[derive(Args)]
@@ -155,6 +158,12 @@ pub struct PluginArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct SelfTestArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Run a command, returning the process exit code (so callers can gate on
 /// e.g. `plugin check` without the command itself calling `process::exit`).
 pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
@@ -175,6 +184,7 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Plugin(args) => cmd_plugin(args).await,
+        MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
     }
 }
 

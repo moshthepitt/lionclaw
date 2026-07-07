@@ -24,6 +24,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "sync", "time"] }
 toml.workspace = true
@@ -33,4 +34,3 @@ uuid = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 lionclaw-mission-engine = { path = ".", features = ["testing"] }
 lionclaw-runtime-mock.workspace = true
-tempfile.workspace = true
