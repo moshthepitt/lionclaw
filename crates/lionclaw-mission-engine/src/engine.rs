@@ -16,9 +16,10 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    step, validate_plan_submission, AttentionItem, Handoff, InflightEffect, MissionEvent,
-    MissionId, MissionPhase, MissionState, OracleDispatchIntent, PayloadRef, PlanSubmission,
-    PlanValidationError, RoleDispatchIntent, RunErrorKind, StepDecision,
+    step, validate_plan_amendment, validate_plan_submission, AmendmentError, AmendmentOps,
+    AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId, MissionPhase, MissionState,
+    OracleDispatchIntent, PayloadRef, PlanSubmission, PlanValidationError, RoleDispatchIntent,
+    RunErrorKind, StepDecision,
 };
 use crate::plugin::LoadedPlugin;
 use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
@@ -53,6 +54,22 @@ pub enum SubmitError {
     Invalid(Vec<PlanValidationError>),
     #[error("mission is not awaiting a plan (phase: {0})")]
     WrongPhase(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AmendError {
+    #[error("mission is busy (an effect is in flight); retry once it quiesces")]
+    MissionBusy,
+    #[error("mission is not amendable (phase: {0}); amend a running or parked mission")]
+    WrongPhase(String),
+    #[error(
+        "stale amendment: you targeted revision {targeted}, the plan is now revision {current}"
+    )]
+    StaleRevision { targeted: u32, current: u32 },
+    #[error(transparent)]
+    Rejected(#[from] AmendmentError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -139,6 +156,59 @@ impl Engine {
             .append(mission_id, state.head, &[event], self.clock.now_ms())
             .await
             .map_err(|e| SubmitError::Other(e.into()))?;
+        Ok(())
+    }
+
+    /// Amend a running mission's plan (add / supersede / cancel tasks,
+    /// strengthen the contract). Fail-closed and quiescent: reconcile crashed
+    /// leases first, then refuse (`MissionBusy`) if any effect is still in
+    /// flight; refuse a stale amendment (`StaleRevision`); validate the whole
+    /// resulting plan; append one `PlanAmended` fact event under the head
+    /// guard. An invalid amendment records nothing.
+    pub async fn amend_plan(
+        &self,
+        mission_id: &MissionId,
+        ops: AmendmentOps,
+        actor: &str,
+        justification: &str,
+        base_revision: u32,
+    ) -> Result<(), AmendError> {
+        // Quiesce: reconcile crashed leases so only genuinely-live effects
+        // block, then require an empty in-flight set (whole-mission quiesce).
+        let mut state = self.load_state(mission_id).await?;
+        while !state.inflight.is_empty() {
+            if self.reconcile(&state).await? {
+                state = self.load_state(mission_id).await?;
+            } else {
+                break;
+            }
+        }
+        if !state.inflight.is_empty() {
+            return Err(AmendError::MissionBusy);
+        }
+        if !matches!(
+            state.phase,
+            MissionPhase::Running | MissionPhase::AttentionNeeded
+        ) {
+            return Err(AmendError::WrongPhase(format!("{:?}", state.phase)));
+        }
+        if base_revision != state.revision {
+            return Err(AmendError::StaleRevision {
+                targeted: base_revision,
+                current: state.revision,
+            });
+        }
+        validate_plan_amendment(&state, &ops, &self.plugin.inventory())?;
+        let event = NewEvent::new(MissionEvent::PlanAmended {
+            base_revision,
+            ops,
+            actor: actor.to_string(),
+            justification: justification.to_string(),
+        });
+        self.store
+            .append(mission_id, state.head, &[event], self.clock.now_ms())
+            .await
+            .map_err(|e| AmendError::Other(e.into()))?;
         Ok(())
     }
 

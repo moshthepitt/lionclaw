@@ -39,6 +39,9 @@ pub enum MissionCommand {
     Start(StartArgs),
     /// Submit a plan (contract + task DAG) from a JSON file.
     SubmitPlan(SubmitPlanArgs),
+    /// Amend a running mission's plan (add/supersede/cancel tasks, strengthen
+    /// the contract) from an ops JSON file.
+    Amend(AmendArgs),
     /// Drive a mission until it parks, finishes, or awaits input.
     Advance(AdvanceArgs),
     /// Show a mission's state (contract, phase, finish grade).
@@ -123,6 +126,28 @@ pub struct SubmitPlanArgs {
 }
 
 #[derive(Args)]
+pub struct AmendArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub plugin: PathBuf,
+    /// Amendment ops JSON ({ "add": [...], "supersede": [...], "cancel": [...],
+    /// "add_assertion": [...], "bind_oracle": [...] }).
+    #[arg(long)]
+    pub ops: PathBuf,
+    /// The plan revision this amendment was authored against (see `status`).
+    #[arg(long)]
+    pub base_revision: u32,
+    #[arg(long, default_value = "orchestrator")]
+    pub actor: String,
+    #[arg(long, default_value = "")]
+    pub justification: String,
+    #[arg(long, default_value = "codex")]
+    pub runtime: String,
+}
+
+#[derive(Args)]
 pub struct AdvanceArgs {
     pub mission_id: String,
     #[arg(long)]
@@ -177,6 +202,7 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
     match cmd {
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::SubmitPlan(args) => cmd_submit_plan(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Amend(args) => cmd_amend(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Advance(args) => cmd_advance(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
@@ -346,6 +372,27 @@ async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_amend(args: AmendArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let ops_text = std::fs::read_to_string(&args.ops)
+        .with_context(|| format!("failed to read ops '{}'", args.ops.display()))?;
+    let ops = serde_json::from_str(&ops_text).context("amendment ops JSON is invalid")?;
+    engine
+        .amend_plan(
+            &mission_id,
+            ops,
+            &args.actor,
+            &args.justification,
+            args.base_revision,
+        )
+        .await
+        .context("amendment rejected")?;
+    println!("amendment accepted for mission {mission_id}");
+    Ok(())
+}
+
 async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
     let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
@@ -379,6 +426,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 "mission_id": mission_id.as_str(),
                 "phase": phase_slug(&state.phase),
                 "finish": finish,
+                "revision": state.revision,
                 "current_sha": state.current_sha,
                 "objective": state.objective,
                 "contract": state.contract.iter().map(|(id, a)| {
@@ -391,7 +439,11 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             })
         );
     } else {
-        println!("mission {mission_id}: {}", phase_slug(&state.phase));
+        println!(
+            "mission {mission_id}: {} (revision {})",
+            phase_slug(&state.phase),
+            state.revision
+        );
         println!("objective: {}", state.objective);
         for (id, assertion) in &state.contract {
             let auth = assertion

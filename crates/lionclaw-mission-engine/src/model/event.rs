@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::PlanSubmission;
+use super::plan::{Assertion, PlanSubmission, Task};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -228,6 +228,71 @@ pub enum MissionEvent {
         justification: String,
         actor: String,
     },
+    /// A mid-mission amendment: add / supersede / cancel tasks and *strengthen*
+    /// the contract (add assertions, bind oracles), applied atomically as one
+    /// transition between two valid plan revisions (ADRs 0003–0011). A fact
+    /// event like `DecisionRecorded` — no idempotency key, no effect-ledger
+    /// row. `base_revision` is the plan revision the amendment was authored
+    /// against; the fold no-ops the whole event if it no longer matches
+    /// (never trust the writer).
+    PlanAmended {
+        base_revision: u32,
+        ops: AmendmentOps,
+        actor: String,
+        justification: String,
+    },
+}
+
+/// The operation set of one amendment. All fields default-empty, so an
+/// amendment carries only the ops it uses. Task ops are legal on any live
+/// task; contract ops are strengthen-only (never remove/unbind/weaken).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AmendmentOps {
+    /// New tasks, seeded `Pending`.
+    #[serde(default)]
+    pub add: Vec<Task>,
+    /// Replace a live task: `old → Superseded`, downstream `depends_on`
+    /// rewritten `old → new`. `new` must be among `add`.
+    #[serde(default)]
+    pub supersede: Vec<Supersession>,
+    /// Retire a live task without replacement: `old → Superseded`, downstream
+    /// `depends_on` drops `old`.
+    #[serde(default)]
+    pub cancel: Vec<TaskId>,
+    /// New contract assertions (must arrive with a covering work task in the
+    /// same amendment — coverage is re-validated over the whole plan).
+    #[serde(default)]
+    pub add_assertion: Vec<Assertion>,
+    /// Bind an oracle to a currently-unbound assertion (strengthening). Never
+    /// replaces or removes an existing binding.
+    #[serde(default)]
+    pub bind_oracle: Vec<OracleBinding>,
+}
+
+impl AmendmentOps {
+    /// No-op amendment (all op lists empty).
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty()
+            && self.supersede.is_empty()
+            && self.cancel.is_empty()
+            && self.add_assertion.is_empty()
+            && self.bind_oracle.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Supersession {
+    pub old: TaskId,
+    pub new: TaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleBinding {
+    pub assertion: AssertionId,
+    pub oracle: OracleName,
 }
 
 /// The actions a decision can take on an open attention item.
@@ -268,6 +333,7 @@ impl MissionEvent {
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
+            Self::PlanAmended { .. } => "plan_amended",
         }
     }
 

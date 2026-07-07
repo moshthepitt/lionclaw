@@ -10,8 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use super::event::{EventEnvelope, Handoff, MissionEvent};
+use super::event::{AmendmentOps, EventEnvelope, Handoff, MissionEvent};
 use super::ids::TaskId;
+use super::plan::PlanSubmission;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, TaskRuntimeState, TaskStatus,
@@ -20,7 +21,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 1;
+pub const REDUCER_VERSION: u32 = 2;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -63,6 +64,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         inflight: Default::default(),
         open_attention: Default::default(),
         ratified: false,
+        revision: 0,
         acknowledged_gates: Default::default(),
         flagged_nodes: Default::default(),
         oracle_failures: Default::default(),
@@ -101,6 +103,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     });
             }
             state.plan = Some(plan.clone());
+            state.revision = 1;
         }
         MissionEvent::RoleRunRequested {
             task_id,
@@ -209,11 +212,124 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             apply_decision(state, attention_id, action);
         }
+        MissionEvent::PlanAmended {
+            base_revision, ops, ..
+        } => {
+            apply_amendment(state, *base_revision, ops);
+        }
     }
     state.head = seq;
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+/// Apply an amendment (ADR 0011). Defensive: the whole event no-ops unless it
+/// targets the current revision and every `bind_oracle` strengthens (never
+/// unbinds) — the log may be written by an older/other engine, so we never
+/// trust it. Honesty needs no sealing check: an amendment only ever
+/// *strengthens* the contract, and the oracle re-judges the real tree at the
+/// final head, so it cannot launder a verdict.
+fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &AmendmentOps) {
+    if state.plan.is_none() || base_revision != state.revision {
+        return;
+    }
+    for b in &ops.bind_oracle {
+        let strengthens = state
+            .contract
+            .get(&b.assertion)
+            .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(&b.oracle));
+        if !strengthens {
+            return;
+        }
+    }
+
+    // Reconcile the runtime maps: seed added tasks/assertions, tombstone
+    // retired tasks, apply oracle bindings.
+    for task in &ops.add {
+        state
+            .tasks
+            .entry(task.id.clone())
+            .or_insert(TaskRuntimeState {
+                status: TaskStatus::Pending,
+                attempts: 0,
+                last_report: None,
+            });
+    }
+    for old in ops
+        .supersede
+        .iter()
+        .map(|s| &s.old)
+        .chain(ops.cancel.iter())
+    {
+        if let Some(rt) = state.tasks.get_mut(old) {
+            rt.status = TaskStatus::Superseded;
+        }
+    }
+    for assertion in &ops.add_assertion {
+        state
+            .contract
+            .entry(assertion.id.clone())
+            .or_insert_with(|| AssertionState {
+                oracle: assertion.oracle.clone(),
+                advisory: AdvisoryStatus::Pending,
+                last_advisory: Default::default(),
+                last_authoritative: None,
+            });
+    }
+    for b in &ops.bind_oracle {
+        if let Some(a) = state.contract.get_mut(&b.assertion) {
+            if a.oracle.is_none() {
+                a.oracle = Some(b.oracle.clone());
+            }
+        }
+    }
+
+    // Replace the plan with the resulting *live* plan (retired tasks removed,
+    // dependencies reconciled) — the same transform validation ran.
+    let new_plan = resulting_plan(state.plan.as_ref().expect("plan present"), ops);
+    state.plan = Some(new_plan);
+    state.revision += 1;
+    // A material amendment re-opens the ratification gate for the new revision
+    // (ADR 0006); with the gate off this is a no-op.
+    if state.config.ratification_gate {
+        state.ratified = false;
+    }
+}
+
+/// The live plan after applying `ops`: add new tasks, retire superseded/
+/// cancelled tasks (removed from the live plan, downstream `depends_on`
+/// rewritten old→new for supersede / dropped for cancel), add assertions, and
+/// bind oracles (None→Some). Pure and shared by the fold and amendment
+/// validation so the two can never disagree about the resulting plan.
+pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> PlanSubmission {
+    let mut plan = current.clone();
+    plan.tasks.extend(ops.add.iter().cloned());
+    for s in &ops.supersede {
+        plan.tasks.retain(|t| t.id != s.old);
+        for task in &mut plan.tasks {
+            for dep in &mut task.depends_on {
+                if *dep == s.old {
+                    *dep = s.new.clone();
+                }
+            }
+        }
+    }
+    for old in &ops.cancel {
+        plan.tasks.retain(|t| &t.id != old);
+        for task in &mut plan.tasks {
+            task.depends_on.retain(|dep| dep != old);
+        }
+    }
+    plan.assertions.extend(ops.add_assertion.iter().cloned());
+    for b in &ops.bind_oracle {
+        if let Some(a) = plan.assertions.iter_mut().find(|a| a.id == b.assertion) {
+            if a.oracle.is_none() {
+                a.oracle = Some(b.oracle.clone());
+            }
+        }
+    }
+    plan
 }
 
 /// Gate status is derived, never an event: a gate whose dependencies are all

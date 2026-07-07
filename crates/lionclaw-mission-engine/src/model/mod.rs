@@ -18,14 +18,18 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Handoff, IdemClass, MissionConfig,
-    MissionEvent, PayloadRef, RunErrorKind, StopBar, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    AmendmentOps, ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Handoff, IdemClass,
+    MissionConfig, MissionEvent, OracleBinding, PayloadRef, RunErrorKind, StopBar, Supersession,
+    ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
 pub use plan::{derive_kind, Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
-pub use plan_validation::{validate_plan_submission, PlanValidationError, PluginInventory};
+pub use plan_validation::{
+    validate_plan_amendment, validate_plan_submission, AmendmentError, PlanValidationError,
+    PluginInventory,
+};
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, TaskRuntimeState, TaskStatus,

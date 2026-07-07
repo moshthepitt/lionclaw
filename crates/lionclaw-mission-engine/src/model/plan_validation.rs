@@ -14,8 +14,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::event::AmendmentOps;
 use super::ids::{OracleName, RoleName, TaskId};
 use super::plan::{OutputSemantics, PlanSubmission, TaskKind};
+use super::state::MissionState;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]
@@ -80,6 +82,90 @@ pub fn validate_plan_submission(
     // Group 6: every gate target has an upstream validator (else the gate can
     // never clear — reject at author time instead of parking at run time).
     check_gate_coverage(submission)
+}
+
+/// Why an amendment is refused. The structural prechecks below carry the
+/// invariants the whole-plan validator can't see (which task is live, whether
+/// a bind strengthens); everything else (coverage, deps, cycles, shape) rides
+/// on `validate_plan_submission` over the resulting plan, so amend-validation
+/// can never drift from submit-validation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AmendmentError {
+    #[error("task '{task}' is not live (unknown or already retired)")]
+    UnknownTask { task: String },
+    #[error("supersede of '{old}' names replacement '{new}' that is not in `add`")]
+    ReplacementMissing { old: String, new: String },
+    #[error(
+        "bind_oracle on assertion '{assertion}' would replace/unbind an oracle \
+         (the contract is strengthen-only; bind an unbound assertion)"
+    )]
+    OracleUnbound { assertion: String },
+    #[error("the resulting plan is invalid: {0:?}")]
+    Invalid(Vec<PlanValidationError>),
+}
+
+/// Validate an amendment fail-closed: structural op prechecks + the full
+/// submit-time validation over the *whole resulting plan* (atomicity, ADR
+/// 0009). Contract weakening is unrepresentable — no op removes an assertion
+/// or shrinks a binding — so only `bind_oracle`'s strengthen-only rule needs a
+/// check here. No sealing check: honesty is carried by the oracle re-judging
+/// the final head, so re-planning verified work cannot launder a verdict.
+pub fn validate_plan_amendment(
+    state: &MissionState,
+    ops: &AmendmentOps,
+    inventory: &PluginInventory,
+) -> Result<(), AmendmentError> {
+    let Some(plan) = state.plan.as_ref() else {
+        return Err(AmendmentError::Invalid(vec![err(
+            "no_plan",
+            "mission has no plan to amend",
+        )]));
+    };
+    let is_live = |id: &TaskId| plan.tasks.iter().any(|t| &t.id == id);
+    let added: BTreeSet<&TaskId> = ops.add.iter().map(|t| &t.id).collect();
+
+    for s in &ops.supersede {
+        if !is_live(&s.old) {
+            return Err(AmendmentError::UnknownTask {
+                task: s.old.to_string(),
+            });
+        }
+        if !added.contains(&s.new) {
+            return Err(AmendmentError::ReplacementMissing {
+                old: s.old.to_string(),
+                new: s.new.to_string(),
+            });
+        }
+    }
+    for old in &ops.cancel {
+        if !is_live(old) {
+            return Err(AmendmentError::UnknownTask {
+                task: old.to_string(),
+            });
+        }
+    }
+    // Strengthen-only: bind an existing, currently-unbound assertion (or the
+    // identical oracle, idempotent). Anything else — a different oracle, or an
+    // unknown assertion — is refused.
+    for b in &ops.bind_oracle {
+        let strengthens = state
+            .contract
+            .get(&b.assertion)
+            .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(&b.oracle));
+        if !strengthens {
+            return Err(AmendmentError::OracleUnbound {
+                assertion: b.assertion.to_string(),
+            });
+        }
+    }
+
+    let resulting = super::fold::resulting_plan(plan, ops);
+    let errors = validate_plan_submission(&resulting, inventory);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AmendmentError::Invalid(errors))
+    }
 }
 
 fn check_gate_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {

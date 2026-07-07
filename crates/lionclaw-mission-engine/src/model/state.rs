@@ -40,6 +40,10 @@ pub enum TaskStatus {
     Running,
     Cleared,
     Failed,
+    /// Retired by an amendment (superseded or cancelled). A tombstone: the
+    /// task is removed from the live `plan.tasks`, so no derivation dispatches
+    /// or judges it; this row survives in `tasks` (with its `attempts`) for
+    /// audit. Never transitions to any other status.
     Superseded,
 }
 
@@ -220,7 +224,13 @@ pub struct MissionState {
     /// ratification gate, minus anything a decision has resolved.
     pub open_attention: BTreeMap<String, AttentionItem>,
     /// The plan was ratified (the durable ratification gate was answered).
+    /// Cleared on any accepted amendment when the gate is on, so approval of
+    /// one plan revision never authorizes the next (ADR 0006).
     pub ratified: bool,
+    /// Plan revision: the initial submission is 1, each accepted amendment the
+    /// next. Used for the amendment staleness guard (`base_revision`) and
+    /// status display; the initial `MissionCreated` state (no plan) is 0.
+    pub revision: u32,
     /// Gate checkpoints the human confirmed (`continue`) — the mission
     /// proceeds past them without re-raising the checkpoint.
     pub acknowledged_gates: std::collections::BTreeSet<TaskId>,

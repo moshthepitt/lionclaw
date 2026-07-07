@@ -21,11 +21,11 @@ use crate::authority::{
     MissionMounts, RolePlanRequest,
 };
 use crate::config::MissionRuntimeProfile;
-use crate::engine::Engine;
+use crate::engine::{AmendError, Engine};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff, MissionConfig, MissionEvent,
-    MissionId, MissionPhase, OracleName, PayloadRef, PlanSubmission, RoleName, RunErrorKind, Task,
-    TaskId, TaskKind,
+    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff,
+    MissionConfig, MissionEvent, MissionId, MissionPhase, OracleBinding, OracleName, PayloadRef,
+    PlanSubmission, RoleName, RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::plugin::{load_plugin, PluginError};
@@ -93,10 +93,15 @@ pub async fn run(json: bool) -> Result<ExitCode> {
     let podman = podman_readiness().await;
     let mut checks = Vec::new();
 
-    // (3) Moat is pure — always runs, even without podman.
+    // (3) Moat and (5) re-planning are pure — they always run, even without
+    // podman.
     checks.push(Check {
         name: "moat-refuses-over-privileged-judge",
         status: to_status(check_moat().await),
+    });
+    checks.push(Check {
+        name: "replanning-amends-atomically-and-strengthen-only",
+        status: to_status(check_replanning().await),
     });
 
     // (1),(2),(4) need real confinement.
@@ -608,6 +613,95 @@ async fn check_moat() -> Result<()> {
         Ok(_) => anyhow::bail!("over-privileged judge plugin loaded (moat breached)"),
         Err(PluginError::Moat { .. }) => Ok(()),
         Err(other) => anyhow::bail!("plugin refused, but not by the moat: {other}"),
+    }
+}
+
+/// (5) Re-planning through the shipped binary: an amendment supersedes a live
+/// task and strengthens the contract atomically (revision bumps, the old task
+/// becomes a `Superseded` tombstone), while a contract-weakening amendment is
+/// refused. Pure — no agent turn, no oracle run — so it always runs.
+async fn check_replanning() -> Result<()> {
+    let repo = tempfile::tempdir().context("tempdir")?;
+    let plugin = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_plugin(plugin.path())?;
+    let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
+    let engine = build_engine(
+        repo.path(),
+        plugin.path(),
+        Arc::new(NoopRoleRunner),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await?;
+    let mission_id = engine
+        .create_mission(
+            repo.path().to_str().context("utf8 repo path")?,
+            "re-planning self-test",
+            &base,
+            MissionConfig {
+                ratification_gate: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+    engine
+        .submit_plan(&mission_id, oracle_plan())
+        .await
+        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+
+    // Supersede the sole coverer with a replacement (atomic — both in one op).
+    let ops = AmendmentOps {
+        add: vec![Task {
+            id: TaskId::new("build2").expect("task id"),
+            kind: TaskKind::Work,
+            body: "produce the change again".to_string(),
+            targets: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
+            role: Some(RoleName::new("implementer").expect("role name")),
+            depends_on: Vec::new(),
+        }],
+        supersede: vec![Supersession {
+            old: TaskId::new("build").expect("task id"),
+            new: TaskId::new("build2").expect("task id"),
+        }],
+        ..Default::default()
+    };
+    engine
+        .amend_plan(&mission_id, ops, "self-test", "swap the coverer", 1)
+        .await
+        .map_err(|e| anyhow::anyhow!("amendment rejected: {e}"))?;
+
+    let state = engine.load_state(&mission_id).await?;
+    if state.revision != 2 {
+        anyhow::bail!(
+            "expected revision 2 after amendment, got {}",
+            state.revision
+        );
+    }
+    if state.tasks[&TaskId::new("build").unwrap()].status != TaskStatus::Superseded {
+        anyhow::bail!("superseded task is not a tombstone");
+    }
+    if state
+        .plan
+        .as_ref()
+        .is_some_and(|p| p.tasks.iter().any(|t| t.id.as_str() == "build"))
+    {
+        anyhow::bail!("superseded task still in the live plan");
+    }
+
+    // A contract-weakening amendment (rebind the bound oracle) is refused.
+    let weaken = AmendmentOps {
+        bind_oracle: vec![OracleBinding {
+            assertion: AssertionId::new("TESTS-PASS").expect("assertion id"),
+            oracle: OracleName::new("cargo-clippy").expect("oracle name"),
+        }],
+        ..Default::default()
+    };
+    match engine
+        .amend_plan(&mission_id, weaken, "self-test", "weaken", 2)
+        .await
+    {
+        Err(AmendError::Rejected(AmendmentError::OracleUnbound { .. })) => Ok(()),
+        Ok(()) => anyhow::bail!("contract-weakening amendment was accepted"),
+        Err(other) => anyhow::bail!("weakening refused, but not as OracleUnbound: {other}"),
     }
 }
 
