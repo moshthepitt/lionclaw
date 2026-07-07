@@ -31,11 +31,6 @@ impl OciOracleRunner {
             repo_lock: Arc::new(Mutex::new(())),
         }
     }
-
-    /// Share the role runner's per-repo lock so worktree ops never race.
-    pub fn with_repo_lock(profile: MissionRuntimeProfile, repo_lock: Arc<Mutex<()>>) -> Self {
-        Self { profile, repo_lock }
-    }
 }
 
 fn fail(detail: impl Into<String>) -> OracleFailure {
@@ -95,7 +90,7 @@ impl OracleRunner for OciOracleRunner {
                 access: MountAccess::ReadWrite,
             },
         ];
-        let judged_roots = [canonical(&snapshot)];
+        let judged_roots = [crate::authority::canonical_or_lexical(&snapshot)];
         let compiled = compile_role_plan(RolePlanRequest {
             authority: &authority,
             runtime_id: self.profile.name.clone(),
@@ -171,8 +166,4 @@ fn make_executable(path: &std::path::Path) -> std::io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms)
-}
-
-fn canonical(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

@@ -121,6 +121,14 @@ fn load_roles(
             role: stem.to_string(),
             detail: e,
         })?;
+        // Skill projection is not wired yet; fail closed so an author can't
+        // declare a silently-ignored capability.
+        if !skills.is_empty() {
+            return Err(PluginError::Role {
+                role: stem.to_string(),
+                detail: "skills projection is not supported yet".to_string(),
+            });
+        }
         let role = RoleDefinition {
             name: name.clone(),
             output,

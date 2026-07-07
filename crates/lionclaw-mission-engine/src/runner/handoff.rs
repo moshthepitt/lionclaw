@@ -20,13 +20,32 @@ pub fn expected_schema(output: OutputSemantics) -> &'static str {
     }
 }
 
+/// The handoff file is a small control document; cap the read so an agent
+/// can't OOM the host by writing a huge file into the rw handoff mount.
+const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Read and validate the handoff file for a finished role run.
 pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, RoleRunFailure> {
+    use std::io::Read;
     let path = dir.join("handoff.json");
-    let raw = std::fs::read_to_string(&path).map_err(|err| RoleRunFailure {
+    let file = std::fs::File::open(&path).map_err(|err| RoleRunFailure {
         kind: RunErrorKind::HandoffMissing,
         detail: format!("no handoff at '{}': {err}", path.display()),
     })?;
+    // Read one byte past the cap so an over-limit file is detected.
+    let mut raw = String::new();
+    file.take(MAX_HANDOFF_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|err| RoleRunFailure {
+            kind: RunErrorKind::HandoffInvalid,
+            detail: format!("handoff at '{}' is not valid UTF-8: {err}", path.display()),
+        })?;
+    if raw.len() as u64 > MAX_HANDOFF_BYTES {
+        return Err(RoleRunFailure {
+            kind: RunErrorKind::HandoffInvalid,
+            detail: format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
+        });
+    }
     parse_handoff(&raw, output)
 }
 
@@ -71,6 +90,18 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
 mod tests {
     use super::*;
     use crate::model::PayloadRef;
+
+    #[test]
+    fn oversized_handoff_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = format!(
+            "{{\"schema\":\"lionclaw.mission.work-handoff.v1\",\"type\":\"work\",\"done\":true,\"report\":{{\"kind\":\"inline\",\"text\":\"{}\"}},\"request_attention\":false}}",
+            "x".repeat((MAX_HANDOFF_BYTES + 1024) as usize)
+        );
+        std::fs::write(dir.path().join("handoff.json"), big).expect("write");
+        let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
+        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+    }
 
     #[test]
     fn parses_work_handoff() {

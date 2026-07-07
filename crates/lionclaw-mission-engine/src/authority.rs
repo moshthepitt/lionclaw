@@ -121,9 +121,14 @@ pub fn compile_authority(
     }
     let preset = ExecutionPreset {
         workspace_access,
-        // Agent-backed roles need the model API; oracles (no agent) are the
-        // network-off path — see `oracle_authority`.
-        network_mode: NetworkMode::On,
+        // Enforced from the role's `network` flag (default on — agent roles
+        // reach the model API; `network: false` air-gaps the container).
+        // Oracles take the separate network-off path (`oracle_authority`).
+        network_mode: if role.network {
+            NetworkMode::On
+        } else {
+            NetworkMode::None
+        },
         install_policy: match role.output {
             OutputSemantics::ProducesArtifact => InstallPolicy::User,
             _ => InstallPolicy::None,
@@ -317,9 +322,10 @@ fn kind_slug(output: OutputSemantics) -> &'static str {
     }
 }
 
-/// Resolve symlinks where possible; fall back to the lexical path for
-/// not-yet-existing sources (they still get prefix-checked).
-fn canonical_or_lexical(path: &Path) -> PathBuf {
+/// Resolve symlinks where possible; fall back to the lexical path for a
+/// not-yet-existing source (still prefix-checked). Shared by the moat's
+/// overlap check and the runner/oracle judged-root construction.
+pub(crate) fn canonical_or_lexical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -341,7 +347,7 @@ mod tests {
             name: RoleName::new("probe").expect("role name"),
             output,
             runtime: None,
-            network: false,
+            network: true,
             secrets,
             skills: Vec::new(),
             prompt_body: "p".to_string(),
@@ -646,5 +652,19 @@ mod tests {
         ))
         .expect("oracle plan compiles");
         assert_eq!(compiled.plan().network_mode, NetworkMode::None);
+    }
+
+    #[test]
+    fn network_flag_is_enforced() {
+        let ceiling = AuthorityCeiling::default();
+        // Default (true) → network on.
+        let on = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
+            .expect("worker");
+        assert_eq!(on.preset().network_mode, NetworkMode::On);
+        // Opt out → network off, honored (not silently ignored).
+        let mut air_gapped = role(OutputSemantics::ProducesArtifact, false);
+        air_gapped.network = false;
+        let off = compile_authority(&air_gapped, &ceiling).expect("worker");
+        assert_eq!(off.preset().network_mode, NetworkMode::None);
     }
 }

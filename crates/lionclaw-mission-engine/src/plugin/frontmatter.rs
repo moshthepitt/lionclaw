@@ -29,7 +29,9 @@ pub struct RoleFrontmatter {
 pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     let (frontmatter, body) = split_frontmatter(text)?;
     let mut output: Option<OutputSemantics> = None;
-    let mut network = false;
+    // Agent roles reach the model API, so network is on by default; a role
+    // opts out with `network: false` (enforced in `compile_authority`).
+    let mut network = true;
     let mut secrets = false;
     let mut runtime: Option<String> = None;
     let mut skills: Vec<String> = Vec::new();
@@ -174,7 +176,7 @@ mod tests {
         let text = "---\noutput: produces-artifact\n---\nDo it.";
         let fm = parse_role_file(text).expect("parse");
         assert_eq!(fm.output, OutputSemantics::ProducesArtifact);
-        assert!(!fm.network);
+        assert!(fm.network, "agent roles are network-on by default");
         assert!(!fm.secrets);
         assert!(fm.runtime.is_none());
         assert!(fm.skills.is_empty());

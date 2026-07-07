@@ -56,3 +56,26 @@ fn writable_judge_plugin_refuses_to_load() {
         "expected a typed moat violation, got {err:?}"
     );
 }
+
+#[test]
+fn role_declaring_skills_is_rejected_at_load() {
+    // Skill projection isn't wired; a declared skill must fail closed rather
+    // than be a silent no-op.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[plugin]\nname = \"skilled\"\nstop = \"verified\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+    let err = load_plugin(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, PluginError::Role { detail, .. } if detail.contains("skills")),
+        "got {err:?}"
+    );
+}

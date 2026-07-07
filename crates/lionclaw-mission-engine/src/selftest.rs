@@ -625,7 +625,11 @@ async fn check_confinement_erofs() -> Result<()> {
         &judged,
         MountAccess::ReadOnly,
         std::slice::from_ref(&judged),
-        "set -C; : > /workspace/PROBE && echo WROTE || echo DENIED",
+        // Use `echo` (a regular built-in): a redirection failure returns
+        // non-zero WITHOUT exiting the shell, so the `|| echo DENIED` branch
+        // actually runs and proves the script executed inside the container.
+        // (`: > file` would exit the shell — `:` is a special built-in.)
+        "echo probe > /workspace/PROBE && echo WROTE || echo DENIED",
     )
     .await?;
 
@@ -634,11 +638,17 @@ async fn check_confinement_erofs() -> Result<()> {
     if stdout.contains("wrote") || judged.join("PROBE").exists() {
         anyhow::bail!("the read-only workspace was writable");
     }
-    let denied = stderr.contains("read-only file system")
-        || stderr.contains("permission denied")
-        || stdout.contains("denied");
-    if !denied {
-        anyhow::bail!("write neither succeeded nor was clearly denied: {stderr}");
+    // Require the script's own DENIED marker: it proves /bin/sh actually ran
+    // inside the container and hit the `||` branch after the write failed —
+    // not that podman merely failed to launch (which would also lack "wrote").
+    if !stdout.contains("denied") {
+        anyhow::bail!(
+            "probe did not reach the DENIED branch (container may not have run): stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    // And corroborate the reason is the read-only mount.
+    if !(stderr.contains("read-only file system") || stderr.contains("permission denied")) {
+        anyhow::bail!("write was denied but not by the read-only mount: {stderr:?}");
     }
     Ok(())
 }

@@ -4,7 +4,6 @@
 //! resulting commit). Timeouts are enforced here (`process.rs` does not);
 //! `kill_on_drop` reaps the container when a timed-out future is dropped.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -65,6 +64,18 @@ fn launch(detail: String) -> RoleRunFailure {
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+        // A per-role `runtime` override must name the mission's runtime — the
+        // engine wires a single profile, so a mismatch is a fail-closed error
+        // rather than a silently-ignored knob.
+        if let Some(requested) = &request.role.runtime {
+            if requested != &self.profile.name {
+                return Err(launch(format!(
+                    "role requests runtime '{requested}' but this mission runs '{}'",
+                    self.profile.name
+                )));
+            }
+        }
+
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dirs = AttemptDirs::prepare(
             &request.state_dir,
@@ -102,7 +113,7 @@ impl RoleRunner for OciRoleRunner {
         // Compile the plan through the moat. Judged roots = the workspace
         // the verdict is about (only meaningful for verdict roles, but the
         // predicate is applied uniformly).
-        let authority = compile_authority(&role_definition(&request), &self.ceiling)
+        let authority = compile_authority(&request.role, &self.ceiling)
             .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
         let workspace_mount = MountSpec {
             source: workspace_source.clone(),
@@ -111,7 +122,7 @@ impl RoleRunner for OciRoleRunner {
         };
         let extras = dirs.agent_mounts();
         let environment = mission_environment(&dirs);
-        let judged_roots = [canonical(&workspace_source)];
+        let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
         let compiled = compile_role_plan(RolePlanRequest {
             authority: &authority,
             runtime_id: self.profile.name.clone(),
@@ -130,41 +141,38 @@ impl RoleRunner for OciRoleRunner {
         // Run the agent turn under confinement.
         let outcome = self.run_turn(&request, compiled.plan().clone()).await;
 
-        // Capture the artifact (writer only) before tearing the clone down.
-        let result = match outcome {
-            Ok(model_id) => {
-                let handoff = read_handoff(&dirs.handoff, request.role.output)?;
-                let artifact = if let Some(clone) = &worker_clone {
-                    let _guard = self.repo_lock.lock().await;
-                    match workspace::capture_worker_result(&request.workspace_dir, clone).await {
-                        Ok(Some(head_sha)) => Some(ArtifactOutcome {
-                            base_sha: request.base_sha.clone(),
-                            head_sha,
-                        }),
-                        Ok(None) => None,
-                        Err(e) => {
-                            return Err(RoleRunFailure {
-                                kind: RunErrorKind::DirtyWorktree,
-                                detail: e.to_string(),
-                            })
-                        }
-                    }
-                } else {
-                    None
-                };
-                Ok(RoleRunOutcome {
-                    handoff,
-                    artifact,
-                    model_id,
-                })
-            }
-            Err(failure) => Err(failure),
-        };
-
-        // Best-effort teardown; the object survives in the target repo ref.
-        if let Some(clone) = worker_clone {
-            workspace::remove_dir(&clone.dir).await;
+        // Capture the artifact (writer only) before tearing the workspace
+        // down. Held in a Result so cleanup below runs on every path.
+        let result = async {
+            let model_id = outcome?;
+            let handoff = read_handoff(&dirs.handoff, request.role.output)?;
+            let artifact = if let Some(clone) = &worker_clone {
+                let _guard = self.repo_lock.lock().await;
+                workspace::capture_worker_result(&request.workspace_dir, clone)
+                    .await
+                    .map_err(|e| RoleRunFailure {
+                        kind: RunErrorKind::DirtyWorktree,
+                        detail: e.to_string(),
+                    })?
+                    .map(|head_sha| ArtifactOutcome {
+                        base_sha: request.base_sha.clone(),
+                        head_sha,
+                    })
+            } else {
+                None
+            };
+            Ok(RoleRunOutcome {
+                handoff,
+                artifact,
+                model_id,
+            })
         }
+        .await;
+
+        // Unconditional teardown of the isolated workspace (clone or
+        // snapshot) on every exit path; the committed object already survives
+        // in the target repo's mission ref.
+        workspace::remove_dir(&workspace_source).await;
         result
     }
 }
@@ -202,6 +210,11 @@ impl OciRoleRunner {
             RuntimeAuthRegistry::new(driver.auth_provider().into_iter().collect::<Vec<_>>());
         let adapter = driver.create_adapter(config);
 
+        // Compute the fallible execution context *before* opening a session,
+        // so a failure here cannot leak a started session.
+        let context = mission_execution_context(&plan)
+            .map_err(|e| launch(format!("execution context failed: {e}")))?;
+
         let state_root = plan
             .mounts
             .iter()
@@ -219,8 +232,6 @@ impl OciRoleRunner {
             .await
             .map_err(|e| launch(format!("session_start failed: {e}")))?;
 
-        let context = mission_execution_context(&plan)
-            .map_err(|e| launch(format!("execution context failed: {e}")))?;
         let (journal_tx, mut journal_rx) =
             tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
         let drain = tokio::spawn(async move {
@@ -268,10 +279,6 @@ impl OciRoleRunner {
     }
 }
 
-fn role_definition(request: &RoleRunRequest) -> crate::plugin::RoleDefinition {
-    request.role.clone()
-}
-
 /// Env for a mission container: HOME/XDG under the runtime home, TMPDIR, and
 /// (for writers) cargo/npm under scratch so installs stay in the writable
 /// area. Kept minimal and mission-specific rather than importing the kernel
@@ -304,10 +311,6 @@ fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
         dirs.root.to_string_lossy().into_owned(),
     )))
     .collect()
-}
-
-fn canonical(path: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Deterministic session UUID derived from the idempotency key (no RNG).

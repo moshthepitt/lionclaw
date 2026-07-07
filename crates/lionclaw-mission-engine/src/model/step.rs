@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use super::fold::oracle_obligation_outstanding;
 use super::ids::{AssertionId, OracleName, RoleName, TaskId};
 use super::plan::TaskKind;
-use super::state::{InflightEffect, MissionPhase, MissionState, TaskStatus};
+use super::state::{MissionPhase, MissionState, TaskStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepDecision {
@@ -156,13 +156,6 @@ fn step_running(state: &MissionState) -> StepDecision {
     // Phase derivation would have closed the mission if nothing were owed;
     // reaching here means an outcome is still folding in.
     StepDecision::Idle
-}
-
-/// Reconcile targets on resume: inflight `…Requested` entries whose outcome
-/// was never recorded (zenith `_reconcile_pending_attempts`). Pure selector;
-/// the shell probes the world and appends real or synthesized outcomes.
-pub fn unreconciled(state: &MissionState) -> Vec<(&String, &InflightEffect)> {
-    state.inflight.iter().collect()
 }
 
 #[cfg(test)]
@@ -701,25 +694,5 @@ mod tests {
             );
             assert_eq!(step(&state), StepDecision::Terminal, "exit {exit_code}");
         }
-    }
-
-    // --- reconcile selector ---
-
-    #[test]
-    fn unreconciled_lists_requests_without_outcomes() {
-        let requested = vec![
-            created("sha-0"),
-            plan(vec![assertion("A1")], vec![work("w1", &[], &[])]),
-            role_requested("w1", 1, "k-w1-1"),
-        ];
-        let state = fold_log(requested.clone());
-        let pending = unreconciled(&state);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, "k-w1-1");
-        assert!(matches!(pending[0].1, InflightEffect::RoleRun { .. }));
-
-        let mut reconciled = requested;
-        reconciled.push(work_done("w1", "k-w1-1", None));
-        assert!(unreconciled(&fold_log(reconciled)).is_empty());
     }
 }

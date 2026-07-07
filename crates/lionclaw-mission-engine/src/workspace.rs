@@ -111,7 +111,11 @@ pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<O
         );
     }
     let head = head_sha(&clone.dir).await?;
-    let refspec = format!("+refs/heads/{}:refs/{}", clone.branch, clone.branch);
+    // Fetch the clone's *HEAD commit* (not the branch tip) so the object we
+    // record is the object we store — a worker that moves HEAD off its branch
+    // (detached commit, `checkout -b other`, `reset`) cannot make the engine
+    // record a `head_sha` it never transferred.
+    let refspec = format!("+HEAD:refs/{}", clone.branch);
     let clone_str = clone.dir.to_string_lossy();
     run(
         Command::new("git")
@@ -120,6 +124,11 @@ pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<O
         "git fetch from worker clone",
     )
     .await?;
+    // The engine observes the commit from git, never trusts the agent: verify
+    // the recorded head actually landed in the target repo.
+    if !commit_exists(repo, &head).await {
+        bail!("worker HEAD {head} was not transferred into the repo (moved off its branch?)");
+    }
     Ok(Some(head))
 }
 
@@ -187,4 +196,82 @@ async fn run(command: &mut Command, label: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_repo(dir: &Path) -> String {
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git(dir, &["init", "-q"]).await.unwrap();
+        for (k, v) in [
+            ("user.name", "t"),
+            ("user.email", "t@l"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git(dir, &["config", k, v]).await.unwrap();
+        }
+        git(dir, &["add", "-A"]).await.unwrap();
+        git(dir, &["commit", "-q", "-m", "base"]).await.unwrap();
+        head_sha(dir).await.unwrap()
+    }
+
+    // Regression (QA): a worker that moves HEAD off its mission branch must
+    // not make the engine record a commit that was never transferred.
+    #[tokio::test]
+    async fn capture_records_the_actual_head_even_when_moved_off_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let clone = create_worker_clone(
+            repo.path(),
+            &work.path().join("clone"),
+            "mabc123def456",
+            "fix-a1",
+            &base,
+        )
+        .await
+        .unwrap();
+
+        // The worker detaches HEAD and commits there, leaving the mission
+        // branch pointing at base.
+        git(&clone.dir, &["checkout", "--quiet", "--detach"])
+            .await
+            .unwrap();
+        std::fs::write(clone.dir.join("f.txt"), "worker change\n").unwrap();
+        git(&clone.dir, &["add", "-A"]).await.unwrap();
+        git(&clone.dir, &["commit", "-q", "-m", "off-branch"])
+            .await
+            .unwrap();
+        let detached = head_sha(&clone.dir).await.unwrap();
+        assert_ne!(detached, base);
+
+        let recorded = capture_worker_result(repo.path(), &clone)
+            .await
+            .unwrap()
+            .expect("head");
+        // The recorded head is the worker's actual HEAD, and it really landed
+        // in the target repo (so a later `git archive`/snapshot succeeds).
+        assert_eq!(recorded, detached);
+        assert!(commit_exists(repo.path(), &recorded).await);
+    }
+
+    #[tokio::test]
+    async fn capture_rejects_a_dirty_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let clone = create_worker_clone(
+            repo.path(),
+            &work.path().join("clone"),
+            "mabc123def456",
+            "a1",
+            &base,
+        )
+        .await
+        .unwrap();
+        std::fs::write(clone.dir.join("f.txt"), "uncommitted\n").unwrap();
+        assert!(capture_worker_result(repo.path(), &clone).await.is_err());
+    }
 }
