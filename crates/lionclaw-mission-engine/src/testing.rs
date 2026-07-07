@@ -27,7 +27,8 @@ impl Clock for MockClock {
     }
 }
 
-type RoleScript = Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> + Send + Sync>;
+type RoleScript =
+    Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> + Send + Sync>;
 
 pub struct MockRoleRunner {
     script: RoleScript,
@@ -102,7 +103,8 @@ impl RoleRunner for MockRoleRunner {
     }
 }
 
-type OracleScript = Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, OracleFailure> + Send + Sync>;
+type OracleScript =
+    Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, OracleFailure> + Send + Sync>;
 
 pub struct MockOracleRunner {
     script: OracleScript,

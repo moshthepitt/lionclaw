@@ -193,9 +193,8 @@ impl MissionStore {
         .await?;
         rows.into_iter()
             .map(|(sequence_no, recorded_at_ms, payload_json)| {
-                let doc: PayloadDoc = serde_json::from_str(&payload_json).map_err(|err| {
-                    anyhow::anyhow!("cannot decode event {sequence_no}: {err}")
-                })?;
+                let doc: PayloadDoc = serde_json::from_str(&payload_json)
+                    .map_err(|err| anyhow::anyhow!("cannot decode event {sequence_no}: {err}"))?;
                 Ok(EventEnvelope {
                     mission_id: mission_id.clone(),
                     sequence_no: sequence_no as u64,
@@ -359,10 +358,7 @@ impl MissionStore {
 
     /// Current ledger status of an effect (`queued`/`leased`/`done`/`failed`),
     /// plus its lease expiry (if leased). `None` if the row is missing.
-    pub async fn effect_status(
-        &self,
-        effect_id: &str,
-    ) -> anyhow::Result<Option<EffectStatus>> {
+    pub async fn effect_status(&self, effect_id: &str) -> anyhow::Result<Option<EffectStatus>> {
         let row: Option<(String, Option<i64>)> = sqlx::query_as(
             "SELECT status, lease_expires_at_ms FROM mission_effects WHERE effect_id = ?1",
         )

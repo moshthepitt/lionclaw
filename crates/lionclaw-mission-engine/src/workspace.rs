@@ -24,9 +24,17 @@ pub async fn head_sha(repo: &Path) -> Result<String> {
 }
 
 pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
-    git(repo, &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")])
-        .await
-        .is_ok()
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{sha}^{{commit}}"),
+        ],
+    )
+    .await
+    .is_ok()
 }
 
 /// Keep mission state out of the user's `git status` without touching
@@ -73,8 +81,7 @@ pub async fn create_worker_clone(
     let repo_str = repo.to_string_lossy();
     let dest_str = dest.to_string_lossy();
     run(
-        Command::new("git")
-            .args(["clone", "--quiet", "--no-hardlinks", &repo_str, &dest_str]),
+        Command::new("git").args(["clone", "--quiet", "--no-hardlinks", &repo_str, &dest_str]),
         "git clone",
     )
     .await?;
@@ -95,10 +102,7 @@ pub async fn create_worker_clone(
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives clone teardown.
-pub async fn capture_worker_result(
-    repo: &Path,
-    clone: &WorkerClone,
-) -> Result<Option<String>> {
+pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<Option<String>> {
     let status = git(&clone.dir, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         bail!(

@@ -238,7 +238,11 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
         );
     } else {
         println!("started mission {mission_id} at {base_sha}");
-        println!("submit a plan, then: lionclaw mission advance {mission_id} --repo {} --plugin {}", repo.display(), args.plugin.display());
+        println!(
+            "submit a plan, then: lionclaw mission advance {mission_id} --repo {} --plugin {}",
+            repo.display(),
+            args.plugin.display()
+        );
     }
     Ok(())
 }
@@ -320,7 +324,10 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
         "cli",
     )
     .await?;
-    println!("recorded decision on '{}' for mission {mission_id}", args.item);
+    println!(
+        "recorded decision on '{}' for mission {mission_id}",
+        args.item
+    );
     Ok(())
 }
 
@@ -345,7 +352,15 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
     let mission_id = MissionId::parse(&args.mission_id)?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
-    report_state(&args.mission_id, &state.phase, &outcome, args.json, &engine, &mission_id).await
+    report_state(
+        &args.mission_id,
+        &state.phase,
+        &outcome,
+        args.json,
+        &engine,
+        &mission_id,
+    )
+    .await
 }
 
 async fn cmd_status(args: StatusArgs) -> Result<()> {
@@ -425,7 +440,10 @@ async fn cmd_plugin(args: PluginArgs) -> Result<std::process::ExitCode> {
         }
         Err(err) => {
             if args.json {
-                println!("{}", serde_json::json!({ "ok": false, "error": err.to_string() }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "ok": false, "error": err.to_string() })
+                );
             } else {
                 eprintln!("plugin invalid: {err}");
             }
@@ -463,7 +481,10 @@ async fn report_state(
         match outcome {
             AdvanceOutcome::AwaitingPlan => println!("mission {mission_id}: awaiting a plan"),
             AdvanceOutcome::Parked { attention } => {
-                println!("mission {mission_id}: parked ({} attention item(s))", attention.len());
+                println!(
+                    "mission {mission_id}: parked ({} attention item(s))",
+                    attention.len()
+                );
                 for item in attention {
                     println!("  [{}] {}", item.id, item.report);
                 }

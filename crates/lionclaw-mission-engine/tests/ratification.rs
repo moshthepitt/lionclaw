@@ -36,7 +36,10 @@ async fn ratification_gate_parks_then_ratify_proceeds_to_verified() {
         )
         .await
         .expect("create");
-    engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
 
     // Advance parks at the ratification gate — no work has run.
     let parked = engine.advance(&mission_id).await.expect("advance");
@@ -48,18 +51,36 @@ async fn ratification_gate_parks_then_ratify_proceeds_to_verified() {
 
     // An invalid decision (retry on the ratify item) is refused.
     assert!(engine
-        .decide(&mission_id, "ratify:mission", DecisionAction::Retry, "", "test")
+        .decide(
+            &mission_id,
+            "ratify:mission",
+            DecisionAction::Retry,
+            "",
+            "test"
+        )
         .await
         .is_err());
     // A decision on a nonexistent item is refused.
     assert!(engine
-        .decide(&mission_id, "node_failed:ghost", DecisionAction::Continue, "", "test")
+        .decide(
+            &mission_id,
+            "node_failed:ghost",
+            DecisionAction::Continue,
+            "",
+            "test"
+        )
         .await
         .is_err());
 
     // Ratify, then advance runs the mission to a verified finish.
     engine
-        .decide(&mission_id, "ratify:mission", DecisionAction::Ratify, "ok", "test")
+        .decide(
+            &mission_id,
+            "ratify:mission",
+            DecisionAction::Ratify,
+            "ok",
+            "test",
+        )
         .await
         .expect("ratify");
     let done = engine.advance(&mission_id).await.expect("advance 2");
@@ -78,14 +99,28 @@ async fn abort_decision_terminates_the_mission() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
-        .create_mission(dir.path().to_str().unwrap(), "gated", BASE_SHA, MissionConfig::default())
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "gated",
+            BASE_SHA,
+            MissionConfig::default(),
+        )
         .await
         .expect("create");
-    engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
     engine.advance(&mission_id).await.expect("advance");
 
     engine
-        .decide(&mission_id, "ratify:mission", DecisionAction::Abort, "stop", "test")
+        .decide(
+            &mission_id,
+            "ratify:mission",
+            DecisionAction::Abort,
+            "stop",
+            "test",
+        )
         .await
         .expect("abort");
     let state = engine.load_state(&mission_id).await.expect("state");

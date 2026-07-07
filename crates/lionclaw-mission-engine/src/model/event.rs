@@ -275,18 +275,30 @@ impl MissionEvent {
     /// request/outcome pair.
     pub fn idempotency(&self) -> Option<(IdemClass, &str)> {
         match self {
-            Self::RoleRunRequested { idempotency_key, .. }
-            | Self::OracleRunRequested { idempotency_key, .. }
-            | Self::TerminalReviewRequested { idempotency_key, .. } => {
-                Some((IdemClass::Request, idempotency_key))
+            Self::RoleRunRequested {
+                idempotency_key, ..
             }
-            Self::RoleRunCompleted { idempotency_key, .. }
-            | Self::RoleRunFailed { idempotency_key, .. }
-            | Self::OracleRunCompleted { idempotency_key, .. }
-            | Self::OracleRunFailed { idempotency_key, .. }
-            | Self::TerminalReviewCompleted { idempotency_key, .. } => {
-                Some((IdemClass::Outcome, idempotency_key))
+            | Self::OracleRunRequested {
+                idempotency_key, ..
             }
+            | Self::TerminalReviewRequested {
+                idempotency_key, ..
+            } => Some((IdemClass::Request, idempotency_key)),
+            Self::RoleRunCompleted {
+                idempotency_key, ..
+            }
+            | Self::RoleRunFailed {
+                idempotency_key, ..
+            }
+            | Self::OracleRunCompleted {
+                idempotency_key, ..
+            }
+            | Self::OracleRunFailed {
+                idempotency_key, ..
+            }
+            | Self::TerminalReviewCompleted {
+                idempotency_key, ..
+            } => Some((IdemClass::Outcome, idempotency_key)),
             _ => None,
         }
     }

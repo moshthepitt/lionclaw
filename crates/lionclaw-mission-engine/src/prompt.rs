@@ -149,7 +149,8 @@ mod tests {
     #[test]
     fn worker_prompt_includes_upstream_reports() {
         let upstream = vec!["the planner said: change add()".to_string()];
-        let prompt = assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
+        let prompt =
+            assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
         assert!(prompt.contains("Handoffs from upstream tasks"));
         assert!(prompt.contains("the planner said"));
     }

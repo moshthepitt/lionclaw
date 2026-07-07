@@ -75,9 +75,7 @@ fn validate_assertion_id(raw: &str) -> Result<(), IdError> {
 fn validate_task_id(raw: &str) -> Result<(), IdError> {
     let mut chars = raw.chars();
     let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
-    if !first_ok
-        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err(IdError(format!(
             "task id '{raw}' must match ^[A-Za-z][A-Za-z0-9_-]*$"
         )));

@@ -116,9 +116,15 @@ type RuntimeCheck = fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = R
 
 fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
     vec![
-        ("writable-worker-writes-land-and-resume-no-dup", || Box::pin(check_happy_writer_and_resume())),
-        ("oracle-honesty-on-real-broken-code", || Box::pin(check_oracle_honesty())),
-        ("confinement-read-only-workspace-erofs", || Box::pin(check_confinement_erofs())),
+        ("writable-worker-writes-land-and-resume-no-dup", || {
+            Box::pin(check_happy_writer_and_resume())
+        }),
+        ("oracle-honesty-on-real-broken-code", || {
+            Box::pin(check_oracle_honesty())
+        }),
+        ("confinement-read-only-workspace-erofs", || {
+            Box::pin(check_confinement_erofs())
+        }),
     ]
 }
 
@@ -155,9 +161,15 @@ fn report(checks: &[Check], json: bool) {
 }
 
 fn exit_code(checks: &[Check]) -> ExitCode {
-    if checks.iter().any(|c| matches!(c.status, CheckStatus::Fail(_))) {
+    if checks
+        .iter()
+        .any(|c| matches!(c.status, CheckStatus::Fail(_)))
+    {
         ExitCode::from(1)
-    } else if checks.iter().any(|c| matches!(c.status, CheckStatus::Skip(_))) {
+    } else if checks
+        .iter()
+        .any(|c| matches!(c.status, CheckStatus::Skip(_)))
+    {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
@@ -312,7 +324,10 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
         .await
         .with_context(|| format!("git {args:?}"))?;
     if !out.status.success() {
-        anyhow::bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -358,10 +373,7 @@ impl RoleRunner for ScriptedRoleRunner {
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
-        let dest = request
-            .state_dir
-            .join("selftest-work")
-            .join(&attempt_tag);
+        let dest = request.state_dir.join("selftest-work").join(&attempt_tag);
         let clone = workspace::create_worker_clone(
             &request.workspace_dir,
             &dest,
@@ -379,8 +391,8 @@ impl ScriptedRoleRunner {
             "set -e; cd /workspace; cat > src/lib.rs <<'LIONCLAW_SELFTEST_EOF'\n{}LIONCLAW_SELFTEST_EOF\ngit add -A; git commit -q -m 'self-test scripted fix'",
             self.fixed_lib
         );
-        let output = run_confined_sh(&authority, &clone.dir, MountAccess::ReadWrite, &[], &script)
-            .await?;
+        let output =
+            run_confined_sh(&authority, &clone.dir, MountAccess::ReadWrite, &[], &script).await?;
         if output.exit_code != Some(0) {
             anyhow::bail!(
                 "scripted writer failed (exit {:?}): {}",
@@ -485,16 +497,22 @@ async fn check_happy_writer_and_resume() -> Result<()> {
     materialize_sw_plugin(plugin.path())?;
     let base = materialize_repo(repo.path(), ADD_CARGO, BROKEN_ADD_LIB).await?;
     let count = Arc::new(AtomicUsize::new(0));
-    let worker = Arc::new(ScriptedRoleRunner { fixed_lib: FIXED_ADD_LIB });
+    let worker = Arc::new(ScriptedRoleRunner {
+        fixed_lib: FIXED_ADD_LIB,
+    });
 
     let mission_id = {
-        let engine = build_engine(repo.path(), plugin.path(), worker.clone(), count.clone()).await?;
+        let engine =
+            build_engine(repo.path(), plugin.path(), worker.clone(), count.clone()).await?;
         let id = engine
             .create_mission(
                 &repo.path().to_string_lossy(),
                 "self-test writable worker",
                 &base,
-                MissionConfig { ratification_gate: false, ..Default::default() },
+                MissionConfig {
+                    ratification_gate: false,
+                    ..Default::default()
+                },
             )
             .await?;
         engine
@@ -535,7 +553,9 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = engine.advance(id).await?;
     let state = engine.load_state(id).await?;
     match state.phase {
-        MissionPhase::Done { finish: FinishClass::Verified } => Ok(()),
+        MissionPhase::Done {
+            finish: FinishClass::Verified,
+        } => Ok(()),
         other => anyhow::bail!("expected verified finish, got {other:?} (outcome {outcome:?})"),
     }
 }
@@ -555,7 +575,10 @@ async fn check_oracle_honesty() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test oracle honesty",
             &base,
-            MissionConfig { ratification_gate: false, ..Default::default() },
+            MissionConfig {
+                ratification_gate: false,
+                ..Default::default()
+            },
         )
         .await?;
     engine
@@ -564,11 +587,15 @@ async fn check_oracle_honesty() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
     engine.advance(&id).await?;
     match engine.load_state(&id).await?.phase {
-        MissionPhase::Done { finish: FinishClass::Unverified } => Ok(()),
+        MissionPhase::Done {
+            finish: FinishClass::Unverified,
+        } => Ok(()),
         MissionPhase::Done { finish } => {
             anyhow::bail!("a failing oracle produced finish {finish:?}; expected unverified")
         }
-        other => anyhow::bail!("mission did not finish (phase {other:?}); oracle infra may be broken"),
+        other => {
+            anyhow::bail!("mission did not finish (phase {other:?}); oracle infra may be broken")
+        }
     }
 }
 

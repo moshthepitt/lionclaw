@@ -9,10 +9,9 @@ use std::sync::Arc;
 
 use lionclaw_mission_engine::authority::AuthorityCeiling;
 use lionclaw_mission_engine::engine::Engine;
-use lionclaw_mission_engine::model::{TaskId,
-    
+use lionclaw_mission_engine::model::{
     AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
-    PlanSubmission, RoleName, StopBar, Task, TaskKind, ValidationItem,
+    PlanSubmission, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
 use lionclaw_mission_engine::plugin::load_plugin;
 use lionclaw_mission_engine::ports::{RoleRunOutcome, RoleRunRequest};
@@ -33,7 +32,10 @@ fn moat_refuses_over_privileged_judge_plugin() {
     )
     .expect_err("an over-privileged judge must refuse to load");
     assert!(
-        matches!(err, lionclaw_mission_engine::plugin::PluginError::Moat { .. }),
+        matches!(
+            err,
+            lionclaw_mission_engine::plugin::PluginError::Moat { .. }
+        ),
         "expected a typed moat violation, got {err:?}"
     );
 }

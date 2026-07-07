@@ -21,7 +21,12 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
     h.engine
@@ -40,8 +45,14 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
     assert!(matches!(second, AdvanceOutcome::Terminal { .. }));
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert_eq!(state.head, head_before);
-    assert_eq!(h.role_runner.calls.lock().expect("lock").len(), role_calls_before);
-    assert_eq!(h.oracle_runner.calls.lock().expect("lock").len(), oracle_calls_before);
+    assert_eq!(
+        h.role_runner.calls.lock().expect("lock").len(),
+        role_calls_before
+    );
+    assert_eq!(
+        h.oracle_runner.calls.lock().expect("lock").len(),
+        oracle_calls_before
+    );
     // Per-key ceiling held throughout.
     assert!(h.role_runner.max_invocations_per_key() <= 1);
 }
@@ -57,7 +68,12 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
     h.engine
@@ -92,7 +108,10 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
     // Resume: the run's outcome is unknowable → synthesized failure, parked
     // attention, and the role runner is never invoked for the crashed key.
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert!(matches!(outcome, AdvanceOutcome::Parked { .. }), "got {outcome:?}");
+    assert!(
+        matches!(outcome, AdvanceOutcome::Parked { .. }),
+        "got {outcome:?}"
+    );
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
     assert!(state.inflight.is_empty());
@@ -132,10 +151,18 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
-    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
 
     // Record a role-run request and lease it with a long, still-live lease.
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -147,7 +174,11 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
         prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
-    h.engine.store().append(&mission_id, state.head, &[event], 1_000).await.expect("append");
+    h.engine
+        .store()
+        .append(&mission_id, state.head, &[event], 1_000)
+        .await
+        .expect("append");
     // Another worker holds a 1-hour lease as of t=1000.
     let leases = h
         .engine
@@ -168,7 +199,11 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
         "a live lease must not be reconciled to failure"
     );
     assert_eq!(
-        h.role_runner.invocations_by_key.lock().unwrap().get("live-key"),
+        h.role_runner
+            .invocations_by_key
+            .lock()
+            .unwrap()
+            .get("live-key"),
         None
     );
 }
@@ -187,10 +222,18 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
-    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
 
     // Record + lease a role run, then "crash" (no outcome recorded).
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -202,17 +245,36 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
         prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
-    h.engine.store().append(&mission_id, state.head, &[event], 1_000).await.expect("append");
-    h.engine.store().pull_due(&mission_id, "dead", 1, 60_000, 1_000).await.expect("lease");
+    h.engine
+        .store()
+        .append(&mission_id, state.head, &[event], 1_000)
+        .await
+        .expect("append");
+    h.engine
+        .store()
+        .pull_due(&mission_id, "dead", 1, 60_000, 1_000)
+        .await
+        .expect("lease");
 
     // Rebuild every derived cursor from the log.
-    h.engine.store().rebuild_cursors(&mission_id, 5_000).await.expect("rebuild");
+    h.engine
+        .store()
+        .rebuild_cursors(&mission_id, 5_000)
+        .await
+        .expect("rebuild");
 
     // The next advance must synthesize failure, NOT re-run the LLM.
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    assert!(matches!(outcome, AdvanceOutcome::Parked { .. }), "got {outcome:?}");
+    assert!(
+        matches!(outcome, AdvanceOutcome::Parked { .. }),
+        "got {outcome:?}"
+    );
     assert_eq!(
-        h.role_runner.invocations_by_key.lock().unwrap().get("crash-key"),
+        h.role_runner
+            .invocations_by_key
+            .lock()
+            .unwrap()
+            .get("crash-key"),
         None,
         "the crashed role run must never be re-invoked after a rebuild"
     );
@@ -233,7 +295,12 @@ async fn one_outcome_per_idempotency_key_is_a_store_invariant() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
     h.engine
@@ -247,9 +314,9 @@ async fn one_outcome_per_idempotency_key_is_a_store_invariant() {
     let (key, template) = events
         .iter()
         .find_map(|e| match &e.event {
-            MissionEvent::OracleRunCompleted { idempotency_key, .. } => {
-                Some((idempotency_key.clone(), e.event.clone()))
-            }
+            MissionEvent::OracleRunCompleted {
+                idempotency_key, ..
+            } => Some((idempotency_key.clone(), e.event.clone())),
             _ => None,
         })
         .expect("oracle outcome exists");

@@ -13,9 +13,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::ids::TaskId;
 use super::plan::{PlanSubmission, TaskKind};
 use super::state::MissionState;
-use super::ids::TaskId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateResult {
@@ -40,11 +40,7 @@ pub fn evaluate_gate(state: &MissionState, plan: &PlanSubmission, gate_id: &Task
         // this gate target.
         let covering: Vec<&TaskId> = validators
             .iter()
-            .filter(|v| {
-                by_id
-                    .get(*v)
-                    .is_some_and(|t| t.targets.contains(target))
-            })
+            .filter(|v| by_id.get(*v).is_some_and(|t| t.targets.contains(target)))
             .copied()
             .collect();
         if covering.is_empty() {
@@ -104,7 +100,9 @@ fn blocked(reason: String) -> GateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::event::{EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps};
+    use crate::model::event::{
+        EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps,
+    };
     use crate::model::fold::fold;
     use crate::model::ids::{AssertionId, MissionId, RoleName};
     use crate::model::plan::{Assertion, Task};
@@ -160,42 +158,67 @@ mod tests {
     ) -> MissionState {
         let mission_id = MissionId::from_digest_prefix("abcdef0123456789");
         let mut events = vec![
-            env(&mission_id, 1, MissionEvent::MissionCreated {
-                objective: "o".into(),
-                plugin_name: "p".into(),
-                workspace_dir: "/w".into(),
-                base_sha: "s0".into(),
-                config: MissionConfig { ratification_gate: false, ..Default::default() },
-            }),
-            env(&mission_id, 2, MissionEvent::PlanSubmitted {
-                plan: plan.clone(),
-                plan_hash: "h".into(),
-            }),
+            env(
+                &mission_id,
+                1,
+                MissionEvent::MissionCreated {
+                    objective: "o".into(),
+                    plugin_name: "p".into(),
+                    workspace_dir: "/w".into(),
+                    base_sha: "s0".into(),
+                    config: MissionConfig {
+                        ratification_gate: false,
+                        ..Default::default()
+                    },
+                },
+            ),
+            env(
+                &mission_id,
+                2,
+                MissionEvent::PlanSubmitted {
+                    plan: plan.clone(),
+                    plan_hash: "h".into(),
+                },
+            ),
         ];
         let mut seq = 3;
         for (validator, items) in verdicts {
-            events.push(env(&mission_id, seq, MissionEvent::RoleRunRequested {
-                task_id: tid(validator),
-                attempt_no: 1,
-                idempotency_key: format!("k{validator}"),
-                role: RoleName::new("reviewer").unwrap(),
-                prompt: PayloadRef::inline("p"),
-                base_sha: "s0".into(),
-            }));
-            seq += 1;
-            events.push(env(&mission_id, seq, MissionEvent::RoleRunCompleted {
-                task_id: tid(validator),
-                attempt_no: 1,
-                idempotency_key: format!("k{validator}"),
-                handoff: Handoff::Validate {
-                    done: true,
-                    report: PayloadRef::inline("r"),
-                    items: items.iter().map(|(a, p)| ValidationItem { item_id: aid(a), passed: *p }).collect(),
-                    passed: items.iter().all(|(_, p)| *p),
-                    request_attention: false,
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunRequested {
+                    task_id: tid(validator),
+                    attempt_no: 1,
+                    idempotency_key: format!("k{validator}"),
+                    role: RoleName::new("reviewer").unwrap(),
+                    prompt: PayloadRef::inline("p"),
+                    base_sha: "s0".into(),
                 },
-                artifact: None,
-            }));
+            ));
+            seq += 1;
+            events.push(env(
+                &mission_id,
+                seq,
+                MissionEvent::RoleRunCompleted {
+                    task_id: tid(validator),
+                    attempt_no: 1,
+                    idempotency_key: format!("k{validator}"),
+                    handoff: Handoff::Validate {
+                        done: true,
+                        report: PayloadRef::inline("r"),
+                        items: items
+                            .iter()
+                            .map(|(a, p)| ValidationItem {
+                                item_id: aid(a),
+                                passed: *p,
+                            })
+                            .collect(),
+                        passed: items.iter().all(|(_, p)| *p),
+                        request_attention: false,
+                    },
+                    artifact: None,
+                },
+            ));
             seq += 1;
         }
         fold(events).unwrap()
@@ -214,8 +237,16 @@ mod tests {
     #[test]
     fn unanimous_pass_clears() {
         let plan = plan_with(
-            vec![Assertion { id: aid("AA"), prose: "a".into(), oracle: None }],
-            vec![work("w", &["AA"]), validate("v", &["AA"], &["w"]), gate("g", &["AA"], &["v"])],
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: None,
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v"]),
+            ],
         );
         let state = state_with_verdicts(plan.clone(), &[("v", &[("AA", true)])]);
         assert_eq!(evaluate_gate(&state, &plan, &tid("g")), GateResult::Cleared);
@@ -224,11 +255,22 @@ mod tests {
     #[test]
     fn any_dissent_blocks() {
         let plan = plan_with(
-            vec![Assertion { id: aid("AA"), prose: "a".into(), oracle: None }],
-            vec![work("w", &["AA"]), validate("v", &["AA"], &["w"]), gate("g", &["AA"], &["v"])],
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: None,
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v"]),
+            ],
         );
         let state = state_with_verdicts(plan.clone(), &[("v", &[("AA", false)])]);
-        assert!(matches!(evaluate_gate(&state, &plan, &tid("g")), GateResult::Blocked { .. }));
+        assert!(matches!(
+            evaluate_gate(&state, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
     }
 
     #[test]
@@ -236,8 +278,16 @@ mod tests {
         // Gate targets A and B, but only A has a covering validator.
         let plan = plan_with(
             vec![
-                Assertion { id: aid("AA"), prose: "a".into(), oracle: None },
-                Assertion { id: aid("BB"), prose: "b".into(), oracle: None },
+                Assertion {
+                    id: aid("AA"),
+                    prose: "a".into(),
+                    oracle: None,
+                },
+                Assertion {
+                    id: aid("BB"),
+                    prose: "b".into(),
+                    oracle: None,
+                },
             ],
             vec![
                 work("wa", &["AA"]),
@@ -255,18 +305,33 @@ mod tests {
     fn never_reported_target_counts_as_fail() {
         // Validator covers A (declares it a target) but its handoff omitted A.
         let plan = plan_with(
-            vec![Assertion { id: aid("AA"), prose: "a".into(), oracle: None }],
-            vec![work("w", &["AA"]), validate("v", &["AA"], &["w"]), gate("g", &["AA"], &["v"])],
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: None,
+            }],
+            vec![
+                work("w", &["AA"]),
+                validate("v", &["AA"], &["w"]),
+                gate("g", &["AA"], &["v"]),
+            ],
         );
         let state = state_with_verdicts(plan.clone(), &[("v", &[])]);
-        assert!(matches!(evaluate_gate(&state, &plan, &tid("g")), GateResult::Blocked { .. }));
+        assert!(matches!(
+            evaluate_gate(&state, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
     }
 
     #[test]
     fn two_validators_and_semantics() {
         // Both validators cover A; one dissents → blocked.
         let plan = plan_with(
-            vec![Assertion { id: aid("AA"), prose: "a".into(), oracle: None }],
+            vec![Assertion {
+                id: aid("AA"),
+                prose: "a".into(),
+                oracle: None,
+            }],
             vec![
                 work("w", &["AA"]),
                 validate("v1", &["AA"], &["w"]),
@@ -274,9 +339,18 @@ mod tests {
                 gate("g", &["AA"], &["v1", "v2"]),
             ],
         );
-        let pass = state_with_verdicts(plan.clone(), &[("v1", &[("AA", true)]), ("v2", &[("AA", true)])]);
+        let pass = state_with_verdicts(
+            plan.clone(),
+            &[("v1", &[("AA", true)]), ("v2", &[("AA", true)])],
+        );
         assert_eq!(evaluate_gate(&pass, &plan, &tid("g")), GateResult::Cleared);
-        let dissent = state_with_verdicts(plan.clone(), &[("v1", &[("AA", true)]), ("v2", &[("AA", false)])]);
-        assert!(matches!(evaluate_gate(&dissent, &plan, &tid("g")), GateResult::Blocked { .. }));
+        let dissent = state_with_verdicts(
+            plan.clone(),
+            &[("v1", &[("AA", true)]), ("v2", &[("AA", false)])],
+        );
+        assert!(matches!(
+            evaluate_gate(&dissent, &plan, &tid("g")),
+            GateResult::Blocked { .. }
+        ));
     }
 }

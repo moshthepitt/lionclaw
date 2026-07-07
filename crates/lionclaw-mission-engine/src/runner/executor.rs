@@ -7,9 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw_confinement::{
     execute_captured, execute_streaming, map_host_path_into_runtime_mount,
-    runtime_state_mount_source, spawn_interactive,
-    EffectiveExecutionPlan, ExecutionRequest, RuntimeExecutionSession, RUNTIME_HOME_MOUNT_TARGET,
-    RUNTIME_MOUNT_TARGET,
+    runtime_state_mount_source, spawn_interactive, EffectiveExecutionPlan, ExecutionRequest,
+    RuntimeExecutionSession, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
 };
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeAuthContext, RuntimeAuthRegistry, RuntimeExecutionContext,
@@ -70,9 +69,7 @@ impl RuntimeProgramExecutor for MissionProgramExecutor {
 }
 
 /// The runtime-visible execution context for a compiled plan.
-pub fn mission_execution_context(
-    plan: &EffectiveExecutionPlan,
-) -> Result<RuntimeExecutionContext> {
+pub fn mission_execution_context(plan: &EffectiveExecutionPlan) -> Result<RuntimeExecutionContext> {
     let projections = plan
         .mounts
         .iter()
@@ -97,4 +94,3 @@ pub fn mission_execution_context(
         mcp_servers: Vec::new(),
     })
 }
-

@@ -19,10 +19,18 @@ async fn expired_lease_is_reclaimable_exactly_once() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
-    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
     let store = h.engine.store();
 
     // Record a request so there is a queued effect to lease.
@@ -35,22 +43,40 @@ async fn expired_lease_is_reclaimable_exactly_once() {
         prompt: PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
-    store.append(&mission_id, state.head, &[event], 1_000).await.expect("append");
+    store
+        .append(&mission_id, state.head, &[event], 1_000)
+        .await
+        .expect("append");
 
     // Worker A leases at t=1000 with a 5s lease (expires 6000).
-    let a = store.pull_due(&mission_id, "worker-a", 1, 5_000, 1_000).await.expect("lease a");
+    let a = store
+        .pull_due(&mission_id, "worker-a", 1, 5_000, 1_000)
+        .await
+        .expect("lease a");
     assert_eq!(a.len(), 1);
 
     // Before expiry, no one else can lease it.
-    let b_early = store.pull_due(&mission_id, "worker-b", 1, 5_000, 3_000).await.expect("lease b");
+    let b_early = store
+        .pull_due(&mission_id, "worker-b", 1, 5_000, 3_000)
+        .await
+        .expect("lease b");
     assert!(b_early.is_empty(), "a live lease must not be reclaimable");
 
     // After expiry (t=7000), worker B reclaims it — exactly once.
-    let b_late = store.pull_due(&mission_id, "worker-b", 1, 5_000, 7_000).await.expect("lease b late");
+    let b_late = store
+        .pull_due(&mission_id, "worker-b", 1, 5_000, 7_000)
+        .await
+        .expect("lease b late");
     assert_eq!(b_late.len(), 1, "expired lease must be reclaimable");
     assert_eq!(b_late[0].effect_id, a[0].effect_id);
 
     // A second puller at the same instant gets nothing (single reclaim).
-    let c = store.pull_due(&mission_id, "worker-c", 1, 5_000, 7_000).await.expect("lease c");
-    assert!(c.is_empty(), "a freshly reclaimed lease is not double-leased");
+    let c = store
+        .pull_due(&mission_id, "worker-c", 1, 5_000, 7_000)
+        .await
+        .expect("lease c");
+    assert!(
+        c.is_empty(),
+        "a freshly reclaimed lease is not double-leased"
+    );
 }

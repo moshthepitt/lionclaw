@@ -19,8 +19,12 @@ pub enum MissionPhase {
     Running,
     /// Open attention items — parked at zero compute (durable interrupt).
     AttentionNeeded,
-    Done { finish: FinishClass },
-    Aborted { reason: String },
+    Done {
+        finish: FinishClass,
+    },
+    Aborted {
+        reason: String,
+    },
 }
 
 impl MissionPhase {

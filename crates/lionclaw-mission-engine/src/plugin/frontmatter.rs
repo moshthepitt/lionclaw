@@ -87,12 +87,14 @@ fn split_frontmatter(text: &str) -> Result<(&str, &str), String> {
             .ok_or("role file has no closing '---' fence")?;
         let at_line_start = idx == 0 || rest.as_bytes()[idx - 1] == b'\n';
         let after = &rest[idx + 3..];
-        let fence_line_ends = after.is_empty()
-            || after.starts_with('\n')
-            || after.starts_with("\r\n");
+        let fence_line_ends =
+            after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n");
         if at_line_start && fence_line_ends {
             let frontmatter = &rest[..idx];
-            let body = after.strip_prefix('\n').or_else(|| after.strip_prefix("\r\n")).unwrap_or(after);
+            let body = after
+                .strip_prefix('\n')
+                .or_else(|| after.strip_prefix("\r\n"))
+                .unwrap_or(after);
             return Ok((frontmatter, body));
         }
         search_start = idx + 3;

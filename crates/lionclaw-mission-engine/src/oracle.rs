@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use lionclaw_confinement::{
-    MountAccess, MountSpec, RuntimeProgramSpec, WORKSPACE_MOUNT_TARGET,
-};
+use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec, WORKSPACE_MOUNT_TARGET};
 use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeProgramExecutor};
 use tokio::sync::Mutex;
 
@@ -49,9 +47,17 @@ fn fail(detail: impl Into<String>) -> OracleFailure {
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
-        let attempt_tag = format!("oracle-{}-{}", request.oracle, &request.judged_sha[..12.min(request.judged_sha.len())]);
-        let dirs = AttemptDirs::prepare(&request.state_dir, request.mission_id.as_str(), &attempt_tag)
-            .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
+        let attempt_tag = format!(
+            "oracle-{}-{}",
+            request.oracle,
+            &request.judged_sha[..12.min(request.judged_sha.len())]
+        );
+        let dirs = AttemptDirs::prepare(
+            &request.state_dir,
+            request.mission_id.as_str(),
+            &attempt_tag,
+        )
+        .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
         // Read-only snapshot of the judged commit — never the worker's live
         // clone, so a worker cannot influence the verdict it is judged by.

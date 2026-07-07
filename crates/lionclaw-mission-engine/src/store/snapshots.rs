@@ -70,7 +70,9 @@ impl MissionStore {
 
         let base = match row {
             Some((upto, reducer, json)) if reducer as u32 == REDUCER_VERSION => {
-                serde_json::from_str::<MissionState>(&json).ok().map(|s| (upto as u64, s))
+                serde_json::from_str::<MissionState>(&json)
+                    .ok()
+                    .map(|s| (upto as u64, s))
             }
             _ => None,
         };
@@ -89,7 +91,11 @@ impl MissionStore {
     /// Drop all derived cursors for a mission (snapshot + effect ledger) and
     /// rebuild them from the log alone — the litmus that state is a pure fold
     /// (delete cursors, rebuild, assert equality).
-    pub async fn rebuild_cursors(&self, mission_id: &MissionId, now_ms: i64) -> Result<MissionState> {
+    pub async fn rebuild_cursors(
+        &self,
+        mission_id: &MissionId,
+        now_ms: i64,
+    ) -> Result<MissionState> {
         {
             let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
             sqlx::query("DELETE FROM mission_snapshots WHERE mission_id = ?1")

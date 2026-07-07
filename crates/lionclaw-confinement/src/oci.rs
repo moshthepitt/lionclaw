@@ -909,9 +909,7 @@ mod tests {
         prepare_oci_process_launch, private_network_probe_reached_process_exec,
         OciExecutionBackend,
     };
-    use crate::backend::{
-        ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
-    };
+    use crate::backend::{ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest,
         InstallPolicy, NetworkMode, OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount,

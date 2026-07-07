@@ -21,9 +21,7 @@ use crate::model::{
     PlanValidationError, RoleDispatchIntent, RunErrorKind, StepDecision,
 };
 use crate::plugin::LoadedPlugin;
-use crate::ports::{
-    Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner,
-};
+use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
 use crate::prompt::{assemble_role_prompt, PromptContext};
 use crate::store::{AppendError, MissionStore, NewEvent};
 
@@ -179,7 +177,9 @@ impl Engine {
         // Persist a fold snapshot before parking or exiting so the next
         // invocation resumes without re-folding the whole log.
         let state = self.load_state(mission_id).await?;
-        self.store.save_snapshot(&state, self.clock.now_ms()).await?;
+        self.store
+            .save_snapshot(&state, self.clock.now_ms())
+            .await?;
         Ok(outcome)
     }
 
@@ -261,8 +261,14 @@ impl Engine {
                             .to_string(),
                         synthesized: true,
                     });
-                    match self.store.append(&state.mission_id, state.head, &[event], now_ms).await {
-                        Ok(_) | Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => {}
+                    match self
+                        .store
+                        .append(&state.mission_id, state.head, &[event], now_ms)
+                        .await
+                    {
+                        Ok(_)
+                        | Err(AppendError::Duplicate { .. })
+                        | Err(AppendError::Conflict { .. }) => {}
                         Err(err) => return Err(err.into()),
                     }
                     // One reconcile action per pass; refold before the next.
@@ -283,7 +289,13 @@ impl Engine {
         let now_ms = self.clock.now_ms();
         let leases = self
             .store
-            .pull_due(&state.mission_id, &self.worker_id, 1, EFFECT_LEASE_MS, now_ms)
+            .pull_due(
+                &state.mission_id,
+                &self.worker_id,
+                1,
+                EFFECT_LEASE_MS,
+                now_ms,
+            )
             .await?;
         let Some(lease) = leases.into_iter().next() else {
             return Ok(false);
@@ -303,7 +315,12 @@ impl Engine {
         };
         match self
             .store
-            .append(&state.mission_id, state.head, &[outcome], self.clock.now_ms())
+            .append(
+                &state.mission_id,
+                state.head,
+                &[outcome],
+                self.clock.now_ms(),
+            )
             .await
         {
             Ok(_) => Ok(true),
@@ -598,6 +615,8 @@ pub async fn record_decision(
         justification: justification.to_string(),
         actor: actor.to_string(),
     });
-    store.append(mission_id, state.head, &[event], now_ms).await?;
+    store
+        .append(mission_id, state.head, &[event], now_ms)
+        .await?;
     Ok(())
 }

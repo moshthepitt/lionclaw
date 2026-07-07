@@ -149,7 +149,10 @@ fn check_shape(
                 if task.kind == TaskKind::Validate && task.targets.is_empty() {
                     errors.push(err(
                         "empty_targets",
-                        format!("validate task '{}' must target at least one assertion", task.id),
+                        format!(
+                            "validate task '{}' must target at least one assertion",
+                            task.id
+                        ),
                     ));
                 }
                 let Some(role) = &task.role else {
@@ -240,7 +243,9 @@ fn check_acyclic(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     while let Some(id) = queue.pop() {
         visited += 1;
         for succ in successors.get(id).into_iter().flatten() {
-            let deg = indegree.get_mut(succ).expect("successor is a declared task");
+            let deg = indegree
+                .get_mut(succ)
+                .expect("successor is a declared task");
             *deg -= 1;
             if *deg == 0 {
                 queue.push(succ);
@@ -342,11 +347,25 @@ mod tests {
     }
 
     fn work(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(id, TaskKind::Work, Some("implementer"), "produce it", targets, deps)
+        task(
+            id,
+            TaskKind::Work,
+            Some("implementer"),
+            "produce it",
+            targets,
+            deps,
+        )
     }
 
     fn validate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(id, TaskKind::Validate, Some("checker"), "check it", targets, deps)
+        task(
+            id,
+            TaskKind::Validate,
+            Some("checker"),
+            "check it",
+            targets,
+            deps,
+        )
     }
 
     fn gate(id: &str, targets: &[&str], deps: &[&str]) -> Task {
@@ -396,7 +415,14 @@ mod tests {
         let sub = submission(vec![], vec![]);
         assert_eq!(codes(&sub), vec!["empty_contract"]);
         // ...or a task list full of shape errors, only empty_contract returns.
-        let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &["g1"]);
+        let bad_gate = task(
+            "g1",
+            TaskKind::Gate,
+            Some("implementer"),
+            "body",
+            &[],
+            &["g1"],
+        );
         let sub = submission(vec![], vec![bad_gate]);
         assert_eq!(codes(&sub), vec!["empty_contract"]);
     }
@@ -413,7 +439,10 @@ mod tests {
             vec![assertion("A1"), assertion("A1")],
             vec![work("w1", &["A1"], &[]), work("w1", &["A1"], &[])],
         );
-        assert_eq!(codes(&sub), vec!["duplicate_assertion_id", "duplicate_task_id"]);
+        assert_eq!(
+            codes(&sub),
+            vec!["duplicate_assertion_id", "duplicate_task_id"]
+        );
     }
 
     #[test]
@@ -423,7 +452,14 @@ mod tests {
                 "gate_with_role",
                 submission(
                     vec![assertion("A1")],
-                    vec![task("g1", TaskKind::Gate, Some("implementer"), "", &["A1"], &[])],
+                    vec![task(
+                        "g1",
+                        TaskKind::Gate,
+                        Some("implementer"),
+                        "",
+                        &["A1"],
+                        &[],
+                    )],
                 ),
                 vec!["gate_with_role"],
             ),
@@ -449,7 +485,14 @@ mod tests {
                 "missing_body",
                 submission(
                     vec![assertion("A1")],
-                    vec![task("w1", TaskKind::Work, Some("implementer"), "", &["A1"], &[])],
+                    vec![task(
+                        "w1",
+                        TaskKind::Work,
+                        Some("implementer"),
+                        "",
+                        &["A1"],
+                        &[],
+                    )],
                 ),
                 vec!["missing_body"],
             ),
@@ -465,7 +508,14 @@ mod tests {
                 "unknown_role",
                 submission(
                     vec![assertion("A1")],
-                    vec![task("w1", TaskKind::Work, Some("stranger"), "body", &["A1"], &[])],
+                    vec![task(
+                        "w1",
+                        TaskKind::Work,
+                        Some("stranger"),
+                        "body",
+                        &["A1"],
+                        &[],
+                    )],
                 ),
                 vec!["unknown_role"],
             ),
@@ -473,7 +523,14 @@ mod tests {
                 "verdict_role_on_work_task",
                 submission(
                     vec![assertion("A1")],
-                    vec![task("w1", TaskKind::Work, Some("checker"), "body", &["A1"], &[])],
+                    vec![task(
+                        "w1",
+                        TaskKind::Work,
+                        Some("checker"),
+                        "body",
+                        &["A1"],
+                        &[],
+                    )],
                 ),
                 vec!["role_output_mismatch"],
             ),
@@ -481,7 +538,14 @@ mod tests {
                 "artifact_role_on_validate_task",
                 submission(
                     vec![assertion("A1")],
-                    vec![task("v1", TaskKind::Validate, Some("implementer"), "body", &["A1"], &[])],
+                    vec![task(
+                        "v1",
+                        TaskKind::Validate,
+                        Some("implementer"),
+                        "body",
+                        &["A1"],
+                        &[],
+                    )],
                 ),
                 vec!["role_output_mismatch"],
             ),
@@ -575,7 +639,14 @@ mod tests {
         // Shape errors suppress dep errors.
         let sub = submission(
             vec![assertion("A1")],
-            vec![task("w1", TaskKind::Work, None, "body", &["A1"], &["ghost"])],
+            vec![task(
+                "w1",
+                TaskKind::Work,
+                None,
+                "body",
+                &["A1"],
+                &["ghost"],
+            )],
         );
         assert_eq!(codes(&sub), vec!["missing_role"]);
 

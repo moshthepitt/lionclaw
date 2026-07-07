@@ -59,8 +59,8 @@ impl BlobStore {
             .join(&blob.hex[..2])
             .join(&blob.hex[2..4])
             .join(&blob.hex);
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read blob '{}'", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read blob '{}'", path.display()))?;
         let actual = hex::encode(Sha256::digest(&bytes));
         if actual != blob.hex {
             bail!(

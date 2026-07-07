@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn writable_judge_plan_refuses_to_compile() {
         let ceiling = AuthorityCeiling::default();
-        let judge =
-            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
         // A mount builder bug hands the judge a writable workspace: refused.
         let err = compile_role_plan(request(
             &judge,
@@ -478,8 +478,8 @@ mod tests {
     #[test]
     fn rw_mount_overlapping_judged_root_refuses_to_compile() {
         let ceiling = AuthorityCeiling::default();
-        let judge =
-            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
         let judged = vec![PathBuf::from("/repo")];
         let overlapping = MountSpec {
             source: "/repo/.lionclaw/handoff".into(),
@@ -492,7 +492,10 @@ mod tests {
             &judged,
         ))
         .expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::RwMountOverlapsJudgedSet { .. }));
+        assert!(matches!(
+            err,
+            MoatViolation::RwMountOverlapsJudgedSet { .. }
+        ));
     }
 
     #[test]
@@ -504,8 +507,8 @@ mod tests {
         std::os::unix::fs::symlink(&judged_root, &alias).expect("symlink");
 
         let ceiling = AuthorityCeiling::default();
-        let judge =
-            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
         let judged = vec![judged_root];
         // The rw mount source hides behind a symlink outside the judged
         // root lexically — canonicalization must still catch it.
@@ -520,14 +523,17 @@ mod tests {
             &judged,
         ))
         .expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::RwMountOverlapsJudgedSet { .. }));
+        assert!(matches!(
+            err,
+            MoatViolation::RwMountOverlapsJudgedSet { .. }
+        ));
     }
 
     #[test]
     fn read_only_mount_overlap_is_allowed_for_judges() {
         let ceiling = AuthorityCeiling::default();
-        let judge =
-            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
         let judged = vec![PathBuf::from("/repo")];
         let ro_extra = MountSpec {
             source: "/repo/docs".into(),
@@ -547,9 +553,14 @@ mod tests {
         // Regression (review): a writable tmpfs layered over the judged tree
         // bypasses the rw-mount check unless the moat inspects tmpfs too.
         let ceiling = AuthorityCeiling::default();
-        let judge =
-            compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling).expect("judge");
-        for target in ["/workspace", "/workspace/sub:rw", "/mission/oracle", "/scratch"] {
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
+        for target in [
+            "/workspace",
+            "/workspace/sub:rw",
+            "/mission/oracle",
+            "/scratch",
+        ] {
             let mut confinement = oci();
             confinement.oci_mut().tmpfs.push(target.to_string());
             let err = compile_role_plan(RolePlanRequest {
@@ -571,7 +582,10 @@ mod tests {
         let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
             .expect("worker");
         let mut confinement = oci();
-        confinement.oci_mut().tmpfs.push("/tmp:rw,size=512m".to_string());
+        confinement
+            .oci_mut()
+            .tmpfs
+            .push("/tmp:rw,size=512m".to_string());
         compile_role_plan(RolePlanRequest {
             confinement,
             ..request(&worker, mounts(MountAccess::ReadWrite, Vec::new()), &[])
@@ -619,7 +633,10 @@ mod tests {
     fn oracle_authority_is_network_off_read_only() {
         let authority = oracle_authority("cargo-test");
         assert_eq!(authority.output(), OutputSemantics::EmitsVerdict);
-        assert_eq!(authority.preset().workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(
+            authority.preset().workspace_access,
+            WorkspaceAccess::ReadOnly
+        );
         assert_eq!(authority.preset().network_mode, NetworkMode::None);
         assert_eq!(authority.preset().install_policy, InstallPolicy::None);
         let compiled = compile_role_plan(request(

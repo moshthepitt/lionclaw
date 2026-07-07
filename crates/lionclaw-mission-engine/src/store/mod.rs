@@ -33,9 +33,8 @@ impl MissionStore {
     /// Open (creating if needed) the mission store for a target workspace.
     pub async fn open(workspace_root: &Path) -> Result<Self> {
         let lionclaw_dir = workspace_root.join(".lionclaw");
-        fs::create_dir_all(&lionclaw_dir).with_context(|| {
-            format!("failed to create '{}'", lionclaw_dir.display())
-        })?;
+        fs::create_dir_all(&lionclaw_dir)
+            .with_context(|| format!("failed to create '{}'", lionclaw_dir.display()))?;
         let options = SqliteConnectOptions::new()
             .filename(lionclaw_dir.join("mission.db"))
             .create_if_missing(true)

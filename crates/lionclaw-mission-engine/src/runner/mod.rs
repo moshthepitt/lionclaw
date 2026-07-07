@@ -11,7 +11,9 @@ pub use role_runner::OciRoleRunner;
 
 use std::path::{Path, PathBuf};
 
-use lionclaw_confinement::{MountAccess, MountSpec, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET};
+use lionclaw_confinement::{
+    MountAccess, MountSpec, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+};
 
 /// Container mount targets the mission owns.
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";

@@ -159,13 +159,13 @@ fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, PluginError
                 detail: "must be a regular file (no symlinks)".to_string(),
             });
         }
-        let stem = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| PluginError::Oracle {
-                oracle: path.display().to_string(),
-                detail: "non-utf8 filename".to_string(),
-            })?;
+        let stem =
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| PluginError::Oracle {
+                    oracle: path.display().to_string(),
+                    detail: "non-utf8 filename".to_string(),
+                })?;
         let name = OracleName::new(stem).map_err(|e| PluginError::Oracle {
             oracle: stem.to_string(),
             detail: e.to_string(),

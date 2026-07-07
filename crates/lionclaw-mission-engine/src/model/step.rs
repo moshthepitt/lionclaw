@@ -124,9 +124,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
-            if state.oracle_failures.contains_key(oracle)
-                || state.waived_oracles.contains(oracle)
-            {
+            if state.oracle_failures.contains_key(oracle) || state.waived_oracles.contains(oracle) {
                 continue;
             }
             let fresh = assertion
@@ -134,7 +132,10 @@ fn step_running(state: &MissionState) -> StepDecision {
                 .as_ref()
                 .is_some_and(|v| v.judged_sha() == state.current_sha);
             if !fresh {
-                by_oracle.entry(oracle.clone()).or_default().push(id.clone());
+                by_oracle
+                    .entry(oracle.clone())
+                    .or_default()
+                    .push(id.clone());
             }
         }
         let intents = by_oracle
@@ -227,11 +228,25 @@ mod tests {
     }
 
     fn work(id: &str, targets: &[&str], deps: &[&str]) -> Task {
-        task(id, TaskKind::Work, Some("implementer"), "produce it", targets, deps)
+        task(
+            id,
+            TaskKind::Work,
+            Some("implementer"),
+            "produce it",
+            targets,
+            deps,
+        )
     }
 
     fn validate(id: &str, targets: &[&str]) -> Task {
-        task(id, TaskKind::Validate, Some("checker"), "check it", targets, &[])
+        task(
+            id,
+            TaskKind::Validate,
+            Some("checker"),
+            "check it",
+            targets,
+            &[],
+        )
     }
 
     fn gate(id: &str) -> Task {
@@ -246,7 +261,10 @@ mod tests {
             plugin_name: "software-dev".to_string(),
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
-            config: MissionConfig { ratification_gate: false, ..Default::default() },
+            config: MissionConfig {
+                ratification_gate: false,
+                ..Default::default()
+            },
         }
     }
 
@@ -337,13 +355,18 @@ mod tests {
     /// Fold hand-built events with sequence numbers 1..=n so every state a
     /// test steps is one the real fold produced.
     fn fold_log(events: Vec<MissionEvent>) -> MissionState {
-        fold(events.into_iter().enumerate().map(|(i, event)| EventEnvelope {
-            mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
-            sequence_no: i as u64 + 1,
-            recorded_at_ms: 0,
-            stamps: VersionStamps::default(),
-            event,
-        }))
+        fold(
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| EventEnvelope {
+                    mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
+                    sequence_no: i as u64 + 1,
+                    recorded_at_ms: 0,
+                    stamps: VersionStamps::default(),
+                    event,
+                }),
+        )
         .expect("log begins with MissionCreated")
     }
 
@@ -401,7 +424,9 @@ mod tests {
         ]);
         assert_eq!(
             done.phase,
-            MissionPhase::Done { finish: FinishClass::Unverified }
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            }
         );
         assert_eq!(step(&done), StepDecision::Terminal);
     }
@@ -438,7 +463,10 @@ mod tests {
         // No task is Running here, so this isolates the inflight guard: the
         // obligation is still outstanding but must not be re-requested while
         // its oracle run is inflight.
-        assert!(state.tasks.values().all(|t| t.status != TaskStatus::Running));
+        assert!(state
+            .tasks
+            .values()
+            .all(|t| t.status != TaskStatus::Running));
         assert_eq!(step(&state), StepDecision::Idle);
     }
 
@@ -666,7 +694,11 @@ mod tests {
                 oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
                 oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", exit_code),
             ]);
-            assert_eq!(state.phase, MissionPhase::Done { finish }, "exit {exit_code}");
+            assert_eq!(
+                state.phase,
+                MissionPhase::Done { finish },
+                "exit {exit_code}"
+            );
             assert_eq!(step(&state), StepDecision::Terminal, "exit {exit_code}");
         }
     }

@@ -94,14 +94,27 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 state
                     .tasks
                     .entry(task.id.clone())
-                    .or_insert(TaskRuntimeState { status: TaskStatus::Pending, attempts: 0, last_report: None });
+                    .or_insert(TaskRuntimeState {
+                        status: TaskStatus::Pending,
+                        attempts: 0,
+                        last_report: None,
+                    });
             }
             state.plan = Some(plan.clone());
         }
         MissionEvent::RoleRunRequested {
-            task_id, attempt_no, ..
+            task_id,
+            attempt_no,
+            ..
         } => {
-            let task = state.tasks.entry(task_id.clone()).or_insert(TaskRuntimeState { status: TaskStatus::Pending, attempts: 0, last_report: None });
+            let task = state
+                .tasks
+                .entry(task_id.clone())
+                .or_insert(TaskRuntimeState {
+                    status: TaskStatus::Pending,
+                    attempts: 0,
+                    last_report: None,
+                });
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
             track_inflight(state, &envelope.event, seq);
@@ -119,7 +132,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
             apply_handoff(state, task_id, handoff);
         }
-        MissionEvent::RoleRunFailed { task_id, idempotency_key, .. } => {
+        MissionEvent::RoleRunFailed {
+            task_id,
+            idempotency_key,
+            ..
+        } => {
             state.inflight.remove(idempotency_key);
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
@@ -186,7 +203,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             };
         }
         MissionEvent::DecisionRecorded {
-            attention_id, action, ..
+            attention_id,
+            action,
+            ..
         } => {
             apply_decision(state, attention_id, action);
         }
@@ -307,28 +326,30 @@ fn apply_decision(
 /// changed a task's status or set a flag removes its item automatically.
 fn derive_attention(state: &mut MissionState) {
     let mut attention: BTreeMap<String, AttentionItem> = BTreeMap::new();
-    let mut raise =
-        |kind: AttentionKind, task_id: Option<TaskId>, oracle: Option<super::ids::OracleName>, report: String| {
-            let anchor = task_id
-                .as_ref()
-                .map(|id| id.to_string())
-                .or_else(|| oracle.as_ref().map(|o| o.to_string()))
-                .unwrap_or_else(|| "mission".to_string());
-            // Lowercase only the kind — the anchor (a case-sensitive task or
-            // oracle id) must stay verbatim so two ids differing only by case
-            // never collide into one attention item.
-            let id = format!("{}:{anchor}", format!("{kind:?}").to_lowercase());
-            attention.insert(
-                id.clone(),
-                AttentionItem {
-                    id,
-                    kind,
-                    task_id,
-                    oracle,
-                    report,
-                },
-            );
-        };
+    let mut raise = |kind: AttentionKind,
+                     task_id: Option<TaskId>,
+                     oracle: Option<super::ids::OracleName>,
+                     report: String| {
+        let anchor = task_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .or_else(|| oracle.as_ref().map(|o| o.to_string()))
+            .unwrap_or_else(|| "mission".to_string());
+        // Lowercase only the kind — the anchor (a case-sensitive task or
+        // oracle id) must stay verbatim so two ids differing only by case
+        // never collide into one attention item.
+        let id = format!("{}:{anchor}", format!("{kind:?}").to_lowercase());
+        attention.insert(
+            id.clone(),
+            AttentionItem {
+                id,
+                kind,
+                task_id,
+                oracle,
+                report,
+            },
+        );
+    };
 
     // Ratification gate: park before any work until the plan is approved.
     if state.plan.is_some() && state.config.ratification_gate && !state.ratified {
@@ -368,7 +389,10 @@ fn derive_attention(state: &mut MissionState) {
                     AttentionKind::GateFailed,
                     Some(task.id.clone()),
                     None,
-                    format!("gate '{}' is blocked by dissenting or missing verdicts", task.id),
+                    format!(
+                        "gate '{}' is blocked by dissenting or missing verdicts",
+                        task.id
+                    ),
                 ),
                 _ => {}
             },
@@ -549,7 +573,10 @@ mod tests {
             plugin_name: "plugin".into(),
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
-            config: MissionConfig { ratification_gate: false, ..Default::default() },
+            config: MissionConfig {
+                ratification_gate: false,
+                ..Default::default()
+            },
         }
     }
 
@@ -701,10 +728,15 @@ mod tests {
                 vec![assertion("A1", Some("cargo-test"))],
                 vec![work_task("w"), validate_task("v")],
             ),
-            role_completed("w", "kw", work_handoff(true, false), Some(ArtifactOutcome {
-                base_sha: "base".into(),
-                head_sha: "sha-1".into(),
-            })),
+            role_completed(
+                "w",
+                "kw",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "sha-1".into(),
+                }),
+            ),
             // Validator says pass (advisory becomes sticky Passed).
             role_completed("v", "kv", validate_handoff(&[("A1", true)]), None),
             // Oracle runs at the current commit and FAILS.
@@ -714,7 +746,9 @@ mod tests {
         .expect("state");
         assert_eq!(
             state.phase,
-            MissionPhase::Done { finish: FinishClass::Unverified },
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            },
             "a real oracle failure is not laundered to internally-consistent"
         );
     }
@@ -747,22 +781,28 @@ mod tests {
         assert!(parked.open_attention.contains_key("gatefailed:g"));
 
         let mut resolved = base;
-        resolved.push(decision("gatefailed:g", super::super::event::DecisionAction::Continue));
+        resolved.push(decision(
+            "gatefailed:g",
+            super::super::event::DecisionAction::Continue,
+        ));
         let state = fold_log(resolved).expect("state");
         // Gate accepted → cleared → downstream w2 is runnable, not wedged.
         assert_eq!(state.tasks[&tid("g")].status, TaskStatus::Cleared);
         assert_eq!(state.tasks[&tid("w2")].status, TaskStatus::Pending);
         assert!(state.open_attention.is_empty());
-        assert_eq!(super::super::step::step(&state), super::super::step::StepDecision::DispatchRole(
-            super::super::step::RoleDispatchIntent {
-                task_id: tid("w2"),
-                role: RoleName::new("implementer").unwrap(),
-                attempt_no: 1,
-                body: "do".into(),
-                targets: vec![],
-                base_sha: state.current_sha.clone(),
-            }
-        ));
+        assert_eq!(
+            super::super::step::step(&state),
+            super::super::step::StepDecision::DispatchRole(
+                super::super::step::RoleDispatchIntent {
+                    task_id: tid("w2"),
+                    role: RoleName::new("implementer").unwrap(),
+                    attempt_no: 1,
+                    body: "do".into(),
+                    targets: vec![],
+                    base_sha: state.current_sha.clone(),
+                }
+            )
+        );
     }
 
     // Regression (review): Continue on an OracleFailed waives the obligation
@@ -772,11 +812,19 @@ mod tests {
         use super::super::verdict::FinishClass;
         let base = vec![
             created(),
-            plan_submitted(vec![assertion("A1", Some("cargo-test"))], vec![work_task("w")]),
-            role_completed("w", "kw", work_handoff(true, false), Some(ArtifactOutcome {
-                base_sha: "base".into(),
-                head_sha: "sha-1".into(),
-            })),
+            plan_submitted(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w")],
+            ),
+            role_completed(
+                "w",
+                "kw",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "sha-1".into(),
+                }),
+            ),
             oracle_requested("A1", "sha-1", "ko"),
             MissionEvent::OracleRunFailed {
                 assertion_ids: vec![aid("A1")],
@@ -789,7 +837,9 @@ mod tests {
             },
         ];
         let parked = fold_log(base.clone()).expect("state");
-        assert!(parked.open_attention.contains_key("oraclefailed:cargo-test"));
+        assert!(parked
+            .open_attention
+            .contains_key("oraclefailed:cargo-test"));
 
         let mut resolved = base;
         resolved.push(decision(
@@ -801,7 +851,9 @@ mod tests {
         // No outstanding obligation → mission closes, but never verified.
         assert_eq!(
             state.phase,
-            MissionPhase::Done { finish: FinishClass::Unverified }
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            }
         );
     }
 
@@ -944,7 +996,12 @@ mod tests {
                 ),
             ])
             .expect(case.name);
-            assert_eq!(state.tasks[&tid("t1")].status, case.expect_status, "{}", case.name);
+            assert_eq!(
+                state.tasks[&tid("t1")].status,
+                case.expect_status,
+                "{}",
+                case.name
+            );
             match case.expect_kind {
                 None => {
                     assert!(state.open_attention.is_empty(), "{}", case.name);
@@ -1005,7 +1062,10 @@ mod tests {
                 created(),
                 plan_submitted(
                     vec![assertion("A1", None)],
-                    case.verdicts.iter().map(|(v, _)| validate_task(v)).collect(),
+                    case.verdicts
+                        .iter()
+                        .map(|(v, _)| validate_task(v))
+                        .collect(),
                 ),
             ];
             for (i, (validator, passed)) in case.verdicts.iter().enumerate() {
@@ -1089,7 +1149,11 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.attempts, 1);
         assert!(state.inflight.is_empty(), "outcome settles the request");
-        let item = state.open_attention.values().next().expect("attention item");
+        let item = state
+            .open_attention
+            .values()
+            .next()
+            .expect("attention item");
         assert_eq!(item.kind, AttentionKind::NodeFailed);
         assert_eq!(item.task_id, Some(tid("t1")));
         assert!(item.report.contains("t1"), "{}", item.report);
@@ -1157,7 +1221,9 @@ mod tests {
             // A fresh verdict — pass or fail — settles the obligation.
             assert_eq!(
                 state.phase,
-                MissionPhase::Done { finish: expect_finish },
+                MissionPhase::Done {
+                    finish: expect_finish
+                },
                 "exit {exit_code}"
             );
         }
@@ -1181,8 +1247,14 @@ mod tests {
         ])
         .expect("state");
         assert!(state.inflight.is_empty());
-        assert!(state.contract[&aid("TESTS-PASS")].last_authoritative.is_none());
-        let item = state.open_attention.values().next().expect("attention item");
+        assert!(state.contract[&aid("TESTS-PASS")]
+            .last_authoritative
+            .is_none());
+        let item = state
+            .open_attention
+            .values()
+            .next()
+            .expect("attention item");
         assert_eq!(item.kind, AttentionKind::OracleFailed);
         assert_eq!(item.task_id, None);
         assert_eq!(item.oracle, Some(oracle("cargo-test")));
@@ -1227,7 +1299,11 @@ mod tests {
         assert_eq!(keys, vec!["nodefailed:t1"]);
         assert_eq!(
             keys,
-            twice.open_attention.keys().map(String::as_str).collect::<Vec<_>>()
+            twice
+                .open_attention
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
         );
         assert_eq!(once, twice, "the fold is deterministic");
     }
@@ -1240,7 +1316,12 @@ mod tests {
             // Task never declared by any plan.
             role_completed("ghost", "k1", work_handoff(true, false), None),
             // Validator verdict for an assertion the contract never heard of.
-            role_completed("phantom", "k2", validate_handoff(&[("UNKNOWN-1", true)]), None),
+            role_completed(
+                "phantom",
+                "k2",
+                validate_handoff(&[("UNKNOWN-1", true)]),
+                None,
+            ),
             MissionEvent::RoleRunFailed {
                 task_id: tid("specter"),
                 attempt_no: 1,
@@ -1256,7 +1337,10 @@ mod tests {
         // an undeclared task raises nothing (it cannot, and should not).
         assert!(state.tasks.is_empty());
         assert_eq!(state.contract.len(), 1);
-        assert_eq!(state.contract[&aid("KNOWN-1")].advisory, AdvisoryStatus::Pending);
+        assert_eq!(
+            state.contract[&aid("KNOWN-1")].advisory,
+            AdvisoryStatus::Pending
+        );
         assert!(state.open_attention.is_empty());
     }
 }

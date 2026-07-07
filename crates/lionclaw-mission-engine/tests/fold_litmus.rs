@@ -21,7 +21,12 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().expect("utf8"), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
     h.engine
@@ -97,10 +102,18 @@ async fn snapshot_resume_matches_full_refold() {
     .await;
     let mission_id = h
         .engine
-        .create_mission(dir.path().to_str().unwrap(), "obj", BASE_SHA, default_config())
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
         .await
         .expect("create");
-    h.engine.submit_plan(&mission_id, simple_plan()).await.expect("submit");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
     h.engine.advance(&mission_id).await.expect("advance");
 
     // advance() saved a snapshot; loading via the snapshot path must equal a
