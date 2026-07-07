@@ -116,8 +116,22 @@ async fn snapshot_resume_matches_full_refold() {
         .expect("submit");
     h.engine.advance(&mission_id).await.expect("advance");
 
-    // advance() saved a snapshot; loading via the snapshot path must equal a
-    // fresh full fold of the log.
+    // Prove the snapshot branch is actually taken (not silently full-refolding
+    // via the fallback): a live snapshot row must cover the whole log at the
+    // current reducer.
+    let events = h.engine.store().load(&mission_id).await.expect("load");
+    let head = events.last().expect("events exist").sequence_no;
+    let (upto, reducer) = h
+        .engine
+        .store()
+        .snapshot_meta(&mission_id)
+        .await
+        .expect("meta")
+        .expect("advance() must have written a snapshot");
+    assert_eq!(upto, head, "snapshot must cover the whole log");
+    assert_eq!(reducer, lionclaw_mission_engine::model::REDUCER_VERSION);
+
+    // Loading via the snapshot path must equal a fresh full fold of the log.
     let via_snapshot = h
         .engine
         .store()
@@ -125,6 +139,6 @@ async fn snapshot_resume_matches_full_refold() {
         .await
         .expect("load")
         .expect("state");
-    let via_full = fold(h.engine.store().load(&mission_id).await.expect("load")).expect("fold");
+    let via_full = fold(events).expect("fold");
     assert_eq!(via_snapshot, via_full);
 }

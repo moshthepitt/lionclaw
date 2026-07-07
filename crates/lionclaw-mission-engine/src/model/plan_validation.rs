@@ -73,7 +73,37 @@ pub fn validate_plan_submission(
         return errors;
     }
     // Group 5: coverage.
-    check_coverage(submission)
+    let errors = check_coverage(submission);
+    if !errors.is_empty() {
+        return errors;
+    }
+    // Group 6: every gate target has an upstream validator (else the gate can
+    // never clear — reject at author time instead of parking at run time).
+    check_gate_coverage(submission)
+}
+
+fn check_gate_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+    let by_id: BTreeMap<&TaskId, &super::plan::Task> =
+        submission.tasks.iter().map(|t| (&t.id, t)).collect();
+    let mut errors = Vec::new();
+    for gate in submission.tasks.iter().filter(|t| t.kind == TaskKind::Gate) {
+        let validators = super::gate::upstream_validators(&by_id, &gate.id);
+        for target in &gate.targets {
+            let covered = validators
+                .iter()
+                .any(|v| by_id.get(*v).is_some_and(|t| t.targets.contains(target)));
+            if !covered {
+                errors.push(err(
+                    "gate_target_uncovered",
+                    format!(
+                        "gate '{}' target '{target}' has no upstream validator; it can never clear",
+                        gate.id
+                    ),
+                ));
+            }
+        }
+    }
+    errors
 }
 
 fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {

@@ -325,6 +325,13 @@ fn apply_decision(
 /// resolved. Attention is a pure function of state, so a decision that
 /// changed a task's status or set a flag removes its item automatically.
 fn derive_attention(state: &mut MissionState) {
+    // An aborted mission is over — it carries no open attention even if a
+    // node was left failed. (Done is set later, in `derive_phase`, and closes
+    // only when attention is already empty.)
+    if matches!(state.phase, MissionPhase::Aborted { .. }) {
+        state.open_attention.clear();
+        return;
+    }
     let mut attention: BTreeMap<String, AttentionItem> = BTreeMap::new();
     let mut raise = |kind: AttentionKind,
                      task_id: Option<TaskId>,
@@ -1227,6 +1234,46 @@ mod tests {
                 "exit {exit_code}"
             );
         }
+    }
+
+    // Regression (QA): a signal-killed oracle (clean exit_code 0 but a signal)
+    // is NOT a pass — the honesty floor requires no signal. Pins the
+    // `exit_signal.is_none()` clause so it can't silently regress.
+    #[test]
+    fn signal_killed_oracle_is_not_a_pass() {
+        let state = fold_log(vec![
+            created(),
+            plan_submitted(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("t1")],
+            ),
+            role_completed("t1", "kr", work_handoff(true, false), None),
+            oracle_requested("TESTS-PASS", "base", "ko"),
+            MissionEvent::OracleRunCompleted {
+                assertion_ids: vec![aid("TESTS-PASS")],
+                oracle: oracle("cargo-test"),
+                judged_sha: "base".into(),
+                attempt_no: 1,
+                idempotency_key: "ko".into(),
+                exit_code: 0,
+                exit_signal: Some(9), // SIGKILL (timeout/OOM) despite exit 0
+                stdout: PayloadRef::inline("out"),
+                stderr: PayloadRef::inline("err"),
+                duration_ms: 5,
+            },
+        ])
+        .expect("state");
+        let verdict = state.contract[&aid("TESTS-PASS")]
+            .last_authoritative
+            .as_ref()
+            .expect("verdict minted");
+        assert!(!verdict.passed(), "a signal-killed oracle must not pass");
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            }
+        );
     }
 
     #[test]

@@ -53,6 +53,19 @@ impl MissionStore {
         Ok(())
     }
 
+    /// The live snapshot cursor's `(upto_sequence_no, reducer_version)`, or
+    /// `None` if no snapshot has been persisted. Lets callers confirm a
+    /// snapshot was actually written rather than silently full-refolding.
+    pub async fn snapshot_meta(&self, mission_id: &MissionId) -> Result<Option<(u64, u32)>> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT upto_sequence_no, reducer_version FROM mission_snapshots WHERE mission_id = ?1",
+        )
+        .bind(mission_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|(upto, reducer)| (upto as u64, reducer as u32)))
+    }
+
     /// Load a mission's state, using the snapshot as a starting fold when it
     /// matches the current reducer, then applying the tail. Falls back to a
     /// full refold on a reducer-version mismatch or a missing snapshot.

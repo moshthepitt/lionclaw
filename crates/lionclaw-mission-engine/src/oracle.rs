@@ -64,83 +64,90 @@ impl OracleRunner for OciOracleRunner {
                 .map_err(|e| fail(format!("failed to snapshot judged commit: {e}")))?;
         }
 
-        // Copy the oracle executable into the snapshot's mount set (read-only).
-        let oracle_dir = dirs.root.join("oracle");
-        std::fs::create_dir_all(&oracle_dir).map_err(|e| fail(e.to_string()))?;
-        let oracle_dest = oracle_dir.join(request.oracle.as_str());
-        std::fs::copy(&request.oracle_path, &oracle_dest)
-            .map_err(|e| fail(format!("failed to stage oracle executable: {e}")))?;
-        make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
+        // Stage + run inside an inner block so the snapshot (a full checkout)
+        // is reclaimed on every exit path — the moat-compile and staging
+        // steps below can fail before the run.
+        let result = async {
+            // Copy the oracle executable into its own read-only mount.
+            let oracle_dir = dirs.root.join("oracle");
+            std::fs::create_dir_all(&oracle_dir).map_err(|e| fail(e.to_string()))?;
+            let oracle_dest = oracle_dir.join(request.oracle.as_str());
+            std::fs::copy(&request.oracle_path, &oracle_dest)
+                .map_err(|e| fail(format!("failed to stage oracle executable: {e}")))?;
+            make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
 
-        let authority = oracle_authority(request.oracle.as_str());
-        let workspace_mount = MountSpec {
-            source: snapshot.clone(),
-            target: WORKSPACE_MOUNT_TARGET.to_string(),
-            access: MountAccess::ReadOnly,
-        };
-        let extras = vec![
-            MountSpec {
-                source: oracle_dir.clone(),
-                target: ORACLE_MOUNT_TARGET.to_string(),
+            let authority = oracle_authority(request.oracle.as_str());
+            let workspace_mount = MountSpec {
+                source: snapshot.clone(),
+                target: WORKSPACE_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadOnly,
-            },
-            MountSpec {
-                source: dirs.scratch.clone(),
-                target: SCRATCH_MOUNT_TARGET.to_string(),
-                access: MountAccess::ReadWrite,
-            },
-        ];
-        let judged_roots = [crate::authority::canonical_or_lexical(&snapshot)];
-        let compiled = compile_role_plan(RolePlanRequest {
-            authority: &authority,
-            runtime_id: self.profile.name.clone(),
-            confinement: self.profile.confinement.clone(),
-            mounts: MissionMounts {
-                workspace: workspace_mount,
-                extras,
-            },
-            judged_roots: &judged_roots,
-            environment: oracle_environment(),
-            idle_timeout: self.profile.oracle_timeout,
-            hard_timeout: self.profile.oracle_timeout,
-        })
-        .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
+            };
+            let extras = vec![
+                MountSpec {
+                    source: oracle_dir.clone(),
+                    target: ORACLE_MOUNT_TARGET.to_string(),
+                    access: MountAccess::ReadOnly,
+                },
+                MountSpec {
+                    source: dirs.scratch.clone(),
+                    target: SCRATCH_MOUNT_TARGET.to_string(),
+                    access: MountAccess::ReadWrite,
+                },
+            ];
+            let judged_roots = [crate::authority::canonical_or_lexical(&snapshot)];
+            let compiled = compile_role_plan(RolePlanRequest {
+                authority: &authority,
+                runtime_id: self.profile.name.clone(),
+                confinement: self.profile.confinement.clone(),
+                mounts: MissionMounts {
+                    workspace: workspace_mount,
+                    extras,
+                },
+                judged_roots: &judged_roots,
+                environment: oracle_environment(),
+                idle_timeout: self.profile.oracle_timeout,
+                hard_timeout: self.profile.oracle_timeout,
+            })
+            .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 
-        let program = RuntimeProgramSpec {
-            executable: format!("{ORACLE_MOUNT_TARGET}/{}", request.oracle),
-            args: Vec::new(),
-            environment: Vec::new(),
-            stdin: String::new(),
-            auth: None,
-        };
-        let mut executor =
-            MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
-        // Wall-clock duration is recorded evidence, not fold state; measuring
-        // it here is a runner concern that never threatens fold purity.
-        #[expect(clippy::disallowed_methods)]
-        let started = Instant::now();
-        let run = tokio::time::timeout(
-            self.profile.oracle_timeout,
-            executor.execute_captured(program),
-        )
-        .await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let _ = tokio::fs::remove_dir_all(&snapshot).await;
-
-        match run {
-            Err(_) => Err(fail(format!(
-                "oracle exceeded {:?}",
-                self.profile.oracle_timeout
-            ))),
-            Ok(Err(err)) => Err(fail(format!("oracle failed to run: {err}"))),
-            Ok(Ok(output)) => Ok(OracleOutcome {
-                exit_code: output.exit_code.unwrap_or(-1),
-                exit_signal: output.exit_signal,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                duration_ms,
-            }),
+            let program = RuntimeProgramSpec {
+                executable: format!("{ORACLE_MOUNT_TARGET}/{}", request.oracle),
+                args: Vec::new(),
+                environment: Vec::new(),
+                stdin: String::new(),
+                auth: None,
+            };
+            let mut executor =
+                MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+            // Wall-clock duration is recorded evidence, not fold state; measuring
+            // it here is a runner concern that never threatens fold purity.
+            #[expect(clippy::disallowed_methods)]
+            let started = Instant::now();
+            let run = tokio::time::timeout(
+                self.profile.oracle_timeout,
+                executor.execute_captured(program),
+            )
+            .await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            match run {
+                Err(_) => Err(fail(format!(
+                    "oracle exceeded {:?}",
+                    self.profile.oracle_timeout
+                ))),
+                Ok(Err(err)) => Err(fail(format!("oracle failed to run: {err}"))),
+                Ok(Ok(output)) => Ok(OracleOutcome {
+                    exit_code: output.exit_code.unwrap_or(-1),
+                    exit_signal: output.exit_signal,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    duration_ms,
+                }),
+            }
         }
+        .await;
+
+        let _ = tokio::fs::remove_dir_all(&snapshot).await;
+        result
     }
 }
 

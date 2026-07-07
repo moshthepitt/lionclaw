@@ -69,7 +69,9 @@ pub fn evaluate_gate(state: &MissionState, plan: &PlanSubmission, gate_id: &Task
 }
 
 /// Transitive validate-type predecessors of a task (DFS over `depends_on`).
-fn upstream_validators<'a>(
+/// Shared with plan validation so a gate with an uncovered target is rejected
+/// at author time rather than parking the mission at run time.
+pub(crate) fn upstream_validators<'a>(
     by_id: &BTreeMap<&'a TaskId, &'a super::plan::Task>,
     start: &'a TaskId,
 ) -> BTreeSet<&'a TaskId> {

@@ -428,6 +428,18 @@ mod tests {
     }
 
     #[test]
+    fn worker_secrets_are_granted_when_ceiling_allows() {
+        // Pins the AND: ceiling permits + role requests ⇒ actually mounted.
+        let ceiling = AuthorityCeiling {
+            allow_secrets: true,
+            ..Default::default()
+        };
+        let authority = compile_authority(&role(OutputSemantics::ProducesArtifact, true), &ceiling)
+            .expect("worker");
+        assert!(authority.preset().mount_runtime_secrets);
+    }
+
+    #[test]
     fn writable_judge_plan_refuses_to_compile() {
         let ceiling = AuthorityCeiling::default();
         let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
