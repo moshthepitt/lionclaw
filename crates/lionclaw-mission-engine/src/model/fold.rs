@@ -209,10 +209,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_phase(state);
 }
 
-/// Apply an amendment (ADR 0011). Defensive: the whole event no-ops unless it
-/// targets the current revision and every `bind_oracle` strengthens (never
-/// unbinds) — the log may be written by an older/other engine, so we never
-/// trust it. Honesty needs no sealing check: an amendment only ever
+/// Apply an amendment (ADR 0011). The fold guards the *honesty-relevant*
+/// invariants against a bad writer: the whole event no-ops unless it targets
+/// the current revision and every `bind_oracle` strengthens (never unbinds).
+/// It does NOT re-run the engine's structural validation (coverage, acyclicity,
+/// materiality) — those bound liveness, not honesty, and a structurally-broken
+/// amendment can at worst leave the mission unverifiable, never falsely
+/// Verified. Honesty needs no sealing check either: an amendment only ever
 /// *strengthens* the contract, and the oracle re-judges the real tree at the
 /// final head, so it cannot launder a verdict.
 fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &AmendmentOps) {
@@ -290,13 +293,17 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
             // Scrub every latch that pinned the node's stale judgment, so the
             // re-run re-establishes them against the new tree: the gate
             // acknowledgement, the attention flag, and the advisory verdicts it
-            // recorded (else a re-run validator that omits a target would keep
-            // a stale pass and re-clear its gate on discarded work). Gate ids
-            // are absent from the latter two, so this is uniform and harmless.
+            // recorded. Removing a verdict also re-derives the assertion's
+            // sticky advisory from the *surviving* validators — else a re-run
+            // that now fails would leave a stale `Passed` and finish
+            // InternallyConsistent on a tree the validator just rejected. Gate
+            // ids are absent from the flag/verdict maps, so this is uniform.
             state.acknowledged_gates.remove(&id);
             state.flagged_nodes.remove(&id);
             for assertion in state.contract.values_mut() {
-                assertion.last_advisory.remove(&id);
+                if assertion.last_advisory.remove(&id).is_some() {
+                    assertion.advisory = recompute_advisory(&assertion.last_advisory);
+                }
             }
         }
     }
@@ -333,6 +340,12 @@ pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> Pl
             task.depends_on.retain(|dep| dep != old);
         }
     }
+    // A supersede old→new can duplicate a dependency (a task that depended on
+    // both). Dedup, preserving order, so the plan has no redundant edges.
+    for task in &mut plan.tasks {
+        let mut seen = BTreeSet::new();
+        task.depends_on.retain(|dep| seen.insert(dep.clone()));
+    }
     plan.assertions.extend(ops.add_assertion.iter().cloned());
     for b in &ops.bind_oracle {
         if let Some(a) = plan.assertions.iter_mut().find(|a| a.id == b.assertion) {
@@ -342,6 +355,20 @@ pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> Pl
         }
     }
     plan
+}
+
+/// The sticky advisory status implied by a set of per-validator verdicts: a
+/// pass anywhere wins (sticky), else a fail, else pending. Matches the
+/// accumulation in `apply_handoff`, used to re-derive an assertion's advisory
+/// after a re-planned validator's verdict is scrubbed.
+fn recompute_advisory(last_advisory: &BTreeMap<TaskId, bool>) -> AdvisoryStatus {
+    if last_advisory.values().any(|&p| p) {
+        AdvisoryStatus::Passed
+    } else if !last_advisory.is_empty() {
+        AdvisoryStatus::Failed
+    } else {
+        AdvisoryStatus::Pending
+    }
 }
 
 /// Whether `start` transitively depends (over `plan.depends_on`) on any task
@@ -721,7 +748,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::super::event::{
-        ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
+        ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, Supersession, ValidationItem,
     };
     use super::super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
     use super::super::plan::{Assertion, PlanSubmission, Task, TaskKind};
@@ -908,6 +935,178 @@ mod tests {
             role: None,
             depends_on: deps.iter().map(|d| tid(d)).collect(),
         }
+    }
+
+    fn covering_work(id: &str, target: &str, deps: &[&str]) -> Task {
+        Task {
+            id: tid(id),
+            kind: TaskKind::Work,
+            body: "do".into(),
+            targets: vec![aid(target)],
+            role: Some(RoleName::new("implementer").expect("role")),
+            depends_on: deps.iter().map(|d| tid(d)).collect(),
+        }
+    }
+
+    fn reviewer_of(id: &str, target: &str, deps: &[&str]) -> Task {
+        Task {
+            id: tid(id),
+            kind: TaskKind::Validate,
+            body: "check".into(),
+            targets: vec![aid(target)],
+            role: Some(RoleName::new("reviewer").expect("role")),
+            depends_on: deps.iter().map(|d| tid(d)).collect(),
+        }
+    }
+
+    fn commit(head: &str) -> Option<ArtifactOutcome> {
+        Some(ArtifactOutcome {
+            base_sha: "base".into(),
+            head_sha: head.into(),
+        })
+    }
+
+    fn plan_amended(base_revision: u32, ops: AmendmentOps) -> MissionEvent {
+        MissionEvent::PlanAmended {
+            base_revision,
+            ops,
+            actor: "test".into(),
+            justification: "j".into(),
+        }
+    }
+
+    fn supersede(old: &str, new: &str) -> Supersession {
+        Supersession {
+            old: tid(old),
+            new: tid(new),
+        }
+    }
+
+    // Honesty (review G1): re-planning ALREADY-VERIFIED work cannot launder —
+    // the oracle re-runs at the new head and the grade follows the real tree.
+    // The automated stand-in for the removed seal-enforcement test.
+    #[test]
+    fn superseding_verified_work_re_judges_at_the_new_head() {
+        // A is oracle-verified at h1; a pending `keep` holds the mission Running
+        // (so the amendment is reachable, exactly as in a multi-node mission).
+        let verified = vec![
+            created(),
+            plan_submitted(
+                vec![assertion("AA", Some("cargo-test"))],
+                vec![covering_work("wa", "AA", &[]), work_task("keep")],
+            ),
+            role_completed("wa", "kwa", work_handoff(true, false), commit("h1")),
+            oracle_completed("AA", "h1", "koa", 0),
+        ];
+        let mid = fold_log(verified.clone()).expect("state");
+        assert_eq!(mid.phase, MissionPhase::Running, "keep pending → not Done");
+        assert_eq!(
+            mid.contract[&aid("AA")]
+                .last_authoritative
+                .as_ref()
+                .map(|v| v.passed()),
+            Some(true),
+            "A is verified at h1"
+        );
+
+        // Supersede the verified work with a regression; the oracle re-judges h2.
+        let mut events = verified;
+        events.extend([
+            plan_amended(
+                1,
+                AmendmentOps {
+                    add: vec![covering_work("wa2", "AA", &[])],
+                    supersede: vec![supersede("wa", "wa2")],
+                    ..Default::default()
+                },
+            ),
+            role_completed("wa2", "kwa2", work_handoff(true, false), commit("h2")),
+            role_completed("keep", "kk", work_handoff(true, false), None),
+            oracle_completed("AA", "h2", "koa2", 1),
+        ]);
+        let state = fold_log(events).expect("state");
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            },
+            "regressed re-plan of verified work drops to Unverified"
+        );
+    }
+
+    // Honesty (review #1): superseding a validator's upstream work resets the
+    // validator AND re-derives the assertion's sticky advisory — a re-review
+    // that now fails must not finish InternallyConsistent on the discarded tree.
+    #[test]
+    fn re_reviewed_advisory_re_derives_and_cannot_launder() {
+        let base = vec![
+            created(),
+            plan_submitted(
+                vec![assertion("STYLE-OK", None)],
+                vec![
+                    covering_work("w", "STYLE-OK", &[]),
+                    reviewer_of("v", "STYLE-OK", &["w"]),
+                ],
+            ),
+            role_completed("w", "kw", work_handoff(true, false), commit("h1")),
+            role_completed("v", "kv", validate_handoff(&[("STYLE-OK", true)]), None),
+        ];
+        assert_eq!(
+            fold_log(base.clone()).expect("state").phase,
+            MissionPhase::Done {
+                finish: FinishClass::InternallyConsistent
+            },
+            "v passed → advisory-green"
+        );
+
+        // Supersede the reviewed work; v re-reviews the new tree as FAILING.
+        let mut events = base;
+        events.extend([
+            plan_amended(
+                1,
+                AmendmentOps {
+                    add: vec![covering_work("w2", "STYLE-OK", &[])],
+                    supersede: vec![supersede("w", "w2")],
+                    ..Default::default()
+                },
+            ),
+            role_completed("w2", "kw2", work_handoff(true, false), commit("h2")),
+            role_completed("v", "kv2", validate_handoff(&[("STYLE-OK", false)]), None),
+        ]);
+        let state = fold_log(events).expect("state");
+        assert_eq!(
+            state.contract[&aid("STYLE-OK")].advisory,
+            AdvisoryStatus::Failed,
+            "sticky advisory re-derived from the failing re-review"
+        );
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            },
+            "must not finish InternallyConsistent on the rejected tree"
+        );
+    }
+
+    #[test]
+    fn supersede_dedups_downstream_dependencies() {
+        // A downstream task depending on both the superseded task and its
+        // replacement ends with a single, deduped edge.
+        let plan = PlanSubmission {
+            assertions: Vec::new(),
+            tasks: vec![work_task("a"), work_task("b"), {
+                let mut c = work_task("c");
+                c.depends_on = vec![tid("a"), tid("b")];
+                c
+            }],
+        };
+        let ops = AmendmentOps {
+            supersede: vec![supersede("a", "b")],
+            ..Default::default()
+        };
+        let result = resulting_plan(&plan, &ops);
+        let c = result.tasks.iter().find(|t| t.id == tid("c")).expect("c");
+        assert_eq!(c.depends_on, vec![tid("b")]);
     }
 
     // Regression (review): a fresh authoritative FAIL must dominate a green
