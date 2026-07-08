@@ -93,6 +93,8 @@ pub fn validate_plan_submission(
 pub enum AmendmentError {
     #[error("task '{task}' is not live (unknown or already retired)")]
     UnknownTask { task: String },
+    #[error("added task '{task}' reuses an existing task id (retired ids are never revived)")]
+    TaskIdReused { task: String },
     #[error("supersede of '{old}' names replacement '{new}' that is not in `add`")]
     ReplacementMissing { old: String, new: String },
     #[error(
@@ -124,6 +126,17 @@ pub fn validate_plan_amendment(
     let is_live = |id: &TaskId| plan.tasks.iter().any(|t| &t.id == id);
     let added: BTreeSet<&TaskId> = ops.add.iter().map(|t| &t.id).collect();
 
+    // Added ids must be genuinely new: a retired task keeps a `Superseded`
+    // tombstone in `state.tasks` (removed from the live plan), so re-adding its
+    // id would birth the new task tombstoned and never run it. `state.tasks`
+    // covers both live and retired ids.
+    for task in &ops.add {
+        if state.tasks.contains_key(&task.id) {
+            return Err(AmendmentError::TaskIdReused {
+                task: task.id.to_string(),
+            });
+        }
+    }
     for s in &ops.supersede {
         if !is_live(&s.old) {
             return Err(AmendmentError::UnknownTask {
@@ -146,13 +159,9 @@ pub fn validate_plan_amendment(
     }
     // Strengthen-only: bind an existing, currently-unbound assertion (or the
     // identical oracle, idempotent). Anything else — a different oracle, or an
-    // unknown assertion — is refused.
+    // unknown assertion — is refused. Shares `bind_strengthens` with the fold.
     for b in &ops.bind_oracle {
-        let strengthens = state
-            .contract
-            .get(&b.assertion)
-            .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(&b.oracle));
-        if !strengthens {
+        if !super::fold::bind_strengthens(&state.contract, &b.assertion, &b.oracle) {
             return Err(AmendmentError::OracleUnbound {
                 assertion: b.assertion.to_string(),
             });

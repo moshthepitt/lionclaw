@@ -549,6 +549,154 @@ async fn amendment_while_an_effect_is_in_flight_is_busy() {
     assert!(matches!(err, AmendError::MissionBusy), "got {err:?}");
 }
 
+// --- id reuse ---------------------------------------------------------------
+
+#[tokio::test]
+async fn readding_a_retired_task_id_is_refused() {
+    // A retired task keeps a Superseded tombstone in state.tasks; re-adding its
+    // id would birth the new task tombstoned (never runnable), so it is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, simple_plan()).await.unwrap();
+
+    // Retire "fix" (supersede it with "fix2").
+    h.engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("fix2", "TESTS-PASS", &[])],
+                supersede: vec![Supersession {
+                    old: "fix".parse_task(),
+                    new: "fix2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap();
+
+    // Re-adding a task with the retired id "fix" (over a new assertion) is refused.
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("fix", "FEATURE-OK", &[])],
+                add_assertion: vec![oracle_assertion("FEATURE-OK")],
+                ..Default::default()
+            },
+            "o",
+            "",
+            2,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AmendError::Rejected(AmendmentError::TaskIdReused { .. })
+        ),
+        "got {err:?}"
+    );
+    // The refused amendment changed nothing.
+    assert_eq!(h.engine.load_state(&m).await.unwrap().revision, 2);
+}
+
+// --- a rejected amendment has no side effects -------------------------------
+
+#[tokio::test]
+async fn a_rejected_amendment_appends_nothing() {
+    // The phase/revision guards run BEFORE the reconcile/quiesce loop, so a
+    // rejected amendment never appends a synthesized reconcile event — even
+    // when an expired-lease effect is in flight.
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, simple_plan()).await.unwrap();
+
+    // Inject a role-run request with an already-EXPIRED lease (reconcile would
+    // synthesize a failure for it if it ran).
+    let state = h.engine.load_state(&m).await.unwrap();
+    let ev = NewEvent::new(
+        lionclaw_mission_engine::model::MissionEvent::RoleRunRequested {
+            task_id: "fix".parse_task(),
+            attempt_no: 1,
+            idempotency_key: "expired-key".to_string(),
+            role: RoleName::new("implementer").unwrap(),
+            prompt: PayloadRef::inline("p"),
+            base_sha: BASE_SHA.to_string(),
+        },
+    );
+    h.engine
+        .store()
+        .append(&m, state.head, &[ev], 1_000)
+        .await
+        .unwrap();
+    h.engine
+        .store()
+        .pull_due(&m, "dead", 1, 1, 1_000)
+        .await
+        .unwrap(); // 1ms lease → expired
+
+    let log_before = h.engine.store().load(&m).await.unwrap().len();
+    // A stale-revision amendment is rejected up front — no reconcile append.
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("x", "TESTS-PASS", &[])],
+                ..Default::default()
+            },
+            "o",
+            "",
+            99,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AmendError::StaleRevision { .. }),
+        "got {err:?}"
+    );
+    let log_after = h.engine.store().load(&m).await.unwrap().len();
+    assert_eq!(
+        log_before, log_after,
+        "a rejected amendment appends nothing"
+    );
+}
+
 // --- ratification -----------------------------------------------------------
 
 #[tokio::test]

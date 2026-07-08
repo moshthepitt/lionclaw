@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use super::event::{AmendmentOps, EventEnvelope, Handoff, MissionEvent};
-use super::ids::TaskId;
-use super::plan::PlanSubmission;
+use super::ids::{AssertionId, OracleName, TaskId};
+use super::plan::{Assertion, PlanSubmission};
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, TaskRuntimeState, TaskStatus,
@@ -82,25 +82,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::MissionCreated { .. } => {}
         MissionEvent::PlanSubmitted { plan, .. } => {
             for assertion in &plan.assertions {
-                state
-                    .contract
-                    .entry(assertion.id.clone())
-                    .or_insert_with(|| AssertionState {
-                        oracle: assertion.oracle.clone(),
-                        advisory: AdvisoryStatus::Pending,
-                        last_advisory: Default::default(),
-                        last_authoritative: None,
-                    });
+                seed_assertion(&mut state.contract, assertion);
             }
             for task in &plan.tasks {
-                state
-                    .tasks
-                    .entry(task.id.clone())
-                    .or_insert(TaskRuntimeState {
-                        status: TaskStatus::Pending,
-                        attempts: 0,
-                        last_report: None,
-                    });
+                seed_task(&mut state.tasks, &task.id);
             }
             state.plan = Some(plan.clone());
             state.revision = 1;
@@ -235,26 +220,16 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
         return;
     }
     for b in &ops.bind_oracle {
-        let strengthens = state
-            .contract
-            .get(&b.assertion)
-            .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(&b.oracle));
-        if !strengthens {
+        if !bind_strengthens(&state.contract, &b.assertion, &b.oracle) {
             return;
         }
     }
 
     // Reconcile the runtime maps: seed added tasks/assertions, tombstone
-    // retired tasks, apply oracle bindings.
+    // retired tasks, apply oracle bindings. (Re-adding a retired id is rejected
+    // by validation, so `seed_task` never collides with a tombstone here.)
     for task in &ops.add {
-        state
-            .tasks
-            .entry(task.id.clone())
-            .or_insert(TaskRuntimeState {
-                status: TaskStatus::Pending,
-                attempts: 0,
-                last_report: None,
-            });
+        seed_task(&mut state.tasks, &task.id);
     }
     for old in ops
         .supersede
@@ -267,15 +242,7 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
         }
     }
     for assertion in &ops.add_assertion {
-        state
-            .contract
-            .entry(assertion.id.clone())
-            .or_insert_with(|| AssertionState {
-                oracle: assertion.oracle.clone(),
-                advisory: AdvisoryStatus::Pending,
-                last_advisory: Default::default(),
-                last_authoritative: None,
-            });
+        seed_assertion(&mut state.contract, assertion);
     }
     for b in &ops.bind_oracle {
         if let Some(a) = state.contract.get_mut(&b.assertion) {
@@ -330,6 +297,42 @@ pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> Pl
         }
     }
     plan
+}
+
+/// Seed a task's runtime as `Pending` (idempotent — keeps any existing entry).
+/// Shared by the initial submission and amendment folds.
+fn seed_task(tasks: &mut BTreeMap<TaskId, TaskRuntimeState>, id: &TaskId) {
+    tasks.entry(id.clone()).or_insert(TaskRuntimeState {
+        status: TaskStatus::Pending,
+        attempts: 0,
+        last_report: None,
+    });
+}
+
+/// Seed an assertion's runtime (idempotent — keeps any existing verdicts).
+fn seed_assertion(contract: &mut BTreeMap<AssertionId, AssertionState>, assertion: &Assertion) {
+    contract
+        .entry(assertion.id.clone())
+        .or_insert_with(|| AssertionState {
+            oracle: assertion.oracle.clone(),
+            advisory: AdvisoryStatus::Pending,
+            last_advisory: Default::default(),
+            last_authoritative: None,
+        });
+}
+
+/// A `bind_oracle` op strengthens (never weakens) iff the target assertion
+/// exists and is currently unbound, or re-binds the identical oracle
+/// (idempotent). Shared by the fold's defensive re-check and validation so the
+/// two can never disagree.
+pub(crate) fn bind_strengthens(
+    contract: &BTreeMap<AssertionId, AssertionState>,
+    assertion: &AssertionId,
+    oracle: &OracleName,
+) -> bool {
+    contract
+        .get(assertion)
+        .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(oracle))
 }
 
 /// Gate status is derived, never an event: a gate whose dependencies are all

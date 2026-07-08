@@ -173,19 +173,12 @@ impl Engine {
         justification: &str,
         base_revision: u32,
     ) -> Result<(), AmendError> {
-        // Quiesce: reconcile crashed leases so only genuinely-live effects
-        // block, then require an empty in-flight set (whole-mission quiesce).
+        // Check the cheap guards BEFORE reconciling, so a rejected amendment
+        // has no side effects (reconcile appends synthesized-failure events).
+        // Neither guard can be invalidated by reconcile: it never changes the
+        // revision, nor moves a Running/AttentionNeeded mission out of those
+        // phases (it only synthesizes a failure or re-queues an oracle).
         let mut state = self.load_state(mission_id).await?;
-        while !state.inflight.is_empty() {
-            if self.reconcile(&state).await? {
-                state = self.load_state(mission_id).await?;
-            } else {
-                break;
-            }
-        }
-        if !state.inflight.is_empty() {
-            return Err(AmendError::MissionBusy);
-        }
         if !matches!(
             state.phase,
             MissionPhase::Running | MissionPhase::AttentionNeeded
@@ -197,6 +190,18 @@ impl Engine {
                 targeted: base_revision,
                 current: state.revision,
             });
+        }
+        // Quiesce: reconcile crashed leases so only genuinely-live effects
+        // block, then require an empty in-flight set (whole-mission quiesce).
+        while !state.inflight.is_empty() {
+            if self.reconcile(&state).await? {
+                state = self.load_state(mission_id).await?;
+            } else {
+                break;
+            }
+        }
+        if !state.inflight.is_empty() {
+            return Err(AmendError::MissionBusy);
         }
         validate_plan_amendment(&state, &ops, &self.plugin.inventory())?;
         let event = NewEvent::new(MissionEvent::PlanAmended {
