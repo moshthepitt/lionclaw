@@ -104,7 +104,7 @@ pub enum AmendmentError {
          (the contract is strengthen-only; bind an unbound assertion)"
     )]
     OracleUnbound { assertion: String },
-    #[error("the resulting plan is invalid: {0:?}")]
+    #[error("the resulting plan is invalid:\n{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
     Invalid(Vec<PlanValidationError>),
 }
 

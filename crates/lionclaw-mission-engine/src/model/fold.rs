@@ -254,7 +254,32 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
 
     // Replace the plan with the resulting *live* plan (retired tasks removed,
     // dependencies reconciled) — the same transform validation ran.
-    let new_plan = resulting_plan(state.plan.as_ref().expect("plan present"), ops);
+    let old_plan = state.plan.as_ref().expect("plan present");
+    let new_plan = resulting_plan(old_plan, ops);
+    // Re-open any live gate whose dependencies this amendment changed: its
+    // Cleared/Failed status was latched on now-retired upstream validators, so
+    // it must be re-evaluated against the live plan. `derive_gates` re-derives
+    // any Pending gate; un-acknowledge it so the checkpoint is re-raised.
+    let reopened: Vec<TaskId> = new_plan
+        .tasks
+        .iter()
+        .filter(|t| t.kind == super::plan::TaskKind::Gate)
+        .filter(|g| {
+            old_plan
+                .tasks
+                .iter()
+                .find(|t| t.id == g.id)
+                .map(|t| &t.depends_on)
+                != Some(&g.depends_on)
+        })
+        .map(|g| g.id.clone())
+        .collect();
+    for gid in reopened {
+        if let Some(rt) = state.tasks.get_mut(&gid) {
+            rt.status = TaskStatus::Pending;
+        }
+        state.acknowledged_gates.remove(&gid);
+    }
     state.plan = Some(new_plan);
     state.revision += 1;
     // A material amendment re-opens the ratification gate for the new revision

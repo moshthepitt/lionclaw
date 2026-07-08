@@ -1,17 +1,18 @@
 //! Mid-mission re-planning: an amendment adds / supersedes / cancels tasks and
 //! *strengthens* the contract, atomically, without a new path to `Verified`.
-//! The load-bearing test is `replan_cannot_launder_a_regression`: re-planning
-//! verified work is allowed (no sealing), and honesty holds because the oracle
-//! re-judges the real tree at the final head.
+//! The load-bearing honesty tests are `replan_cannot_launder_a_non_fix` and
+//! `replan_with_a_real_fix_verifies`: re-planning a red node is allowed (no
+//! sealing), and the grade follows the oracle re-judging the real final tree.
 
 mod common;
 
 use common::{advisory_plan, default_config, harness, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw_mission_engine::engine::{AdvanceOutcome, AmendError};
 use lionclaw_mission_engine::model::{
-    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff,
-    MissionConfig, MissionPhase, OracleBinding, OracleName, PayloadRef, PlanSubmission, RoleName,
-    RunErrorKind, Supersession, Task, TaskKind, TaskStatus,
+    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, AttentionKind,
+    FinishClass, Handoff, MissionConfig, MissionPhase, OracleBinding, OracleName, PayloadRef,
+    PlanSubmission, RoleName, RunErrorKind, Supersession, Task, TaskKind, TaskStatus,
+    ValidationItem,
 };
 use lionclaw_mission_engine::ports::{RoleRunFailure, RoleRunOutcome};
 use lionclaw_mission_engine::store::NewEvent;
@@ -694,6 +695,246 @@ async fn a_rejected_amendment_appends_nothing() {
     assert_eq!(
         log_before, log_after,
         "a rejected amendment appends nothing"
+    );
+}
+
+// --- refused amendments (guards) --------------------------------------------
+
+#[tokio::test]
+async fn supersede_without_a_replacement_in_add_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, simple_plan()).await.unwrap();
+
+    // supersede names a replacement that is not in `add`.
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                supersede: vec![Supersession {
+                    old: "fix".parse_task(),
+                    new: "fix2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AmendError::Rejected(AmendmentError::ReplacementMissing { .. })
+        ),
+        "got {err:?}"
+    );
+
+    // cancel of a non-live task.
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                cancel: vec!["ghost".parse_task()],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AmendError::Rejected(AmendmentError::UnknownTask { .. })
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn amending_a_finished_mission_is_wrong_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, simple_plan()).await.unwrap();
+    // Drive to a terminal Done{Verified}.
+    let done = h.engine.advance(&m).await.unwrap();
+    assert!(matches!(
+        done,
+        AdvanceOutcome::Terminal {
+            phase: MissionPhase::Done { .. }
+        }
+    ));
+    // A terminal mission is not amendable.
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("x", "TESTS-PASS", &[])],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AmendError::WrongPhase(_)), "got {err:?}");
+}
+
+// --- a re-planned gate is re-evaluated --------------------------------------
+
+#[tokio::test]
+async fn superseding_a_gates_validator_re_evaluates_the_gate() {
+    // A cleared gate latched on a validator's verdict must be re-evaluated when
+    // an amendment replaces that validator — else a post-re-plan dissent is
+    // silently swallowed.
+    let dir = tempfile::tempdir().unwrap();
+    // v passes STYLE-OK; its replacement v2 dissents; work "w" just clears.
+    let runner = MockRoleRunner::new(Box::new(|req| {
+        let verdict = |passed: bool| {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("reviewed"),
+                    items: vec![ValidationItem {
+                        item_id: AssertionId::new("STYLE-OK").unwrap(),
+                        passed,
+                    }],
+                    passed,
+                    request_attention: false,
+                },
+                artifact: None,
+                model_id: None,
+            })
+        };
+        match req.task_id.as_str() {
+            "v" => verdict(true),
+            "v2" => verdict(false),
+            _ => Ok(work_done(HEAD_SHA, false)),
+        }
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    // Plan: work w -> validate v(STYLE-OK) -> gate g(STYLE-OK).
+    let style = || AssertionId::new("STYLE-OK").unwrap();
+    let plan = PlanSubmission {
+        assertions: vec![Assertion {
+            id: style(),
+            prose: "clean".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![
+            work_task("w", "STYLE-OK", &[]),
+            Task {
+                id: "v".parse_task(),
+                kind: TaskKind::Validate,
+                body: "review".to_string(),
+                targets: vec![style()],
+                role: Some(RoleName::new("reviewer").unwrap()),
+                depends_on: vec!["w".parse_task()],
+            },
+            Task {
+                id: "g".parse_task(),
+                kind: TaskKind::Gate,
+                body: String::new(),
+                targets: vec![style()],
+                role: None,
+                depends_on: vec!["v".parse_task()],
+            },
+        ],
+    };
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, plan).await.unwrap();
+
+    // v passes → gate g clears → parked on the gate checkpoint.
+    let parked = h.engine.advance(&m).await.unwrap();
+    let AdvanceOutcome::Parked { attention } = parked else {
+        panic!("got {parked:?}")
+    };
+    assert!(attention
+        .iter()
+        .any(|a| a.kind == AttentionKind::GateCheckpoint));
+
+    // Supersede v with a dissenting v2. The gate's deps change → it re-opens.
+    h.engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![Task {
+                    id: "v2".parse_task(),
+                    kind: TaskKind::Validate,
+                    body: "review again".to_string(),
+                    targets: vec![style()],
+                    role: Some(RoleName::new("reviewer").unwrap()),
+                    depends_on: vec!["w".parse_task()],
+                }],
+                supersede: vec![Supersession {
+                    old: "v".parse_task(),
+                    new: "v2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "re-review",
+            1,
+        )
+        .await
+        .unwrap();
+
+    // v2 dissents → the re-evaluated gate now FAILS (not silently cleared).
+    let parked = h.engine.advance(&m).await.unwrap();
+    let AdvanceOutcome::Parked { attention } = parked else {
+        panic!("got {parked:?}")
+    };
+    assert!(
+        attention
+            .iter()
+            .any(|a| a.kind == AttentionKind::GateFailed),
+        "gate re-evaluated to failed after the validator dissent: {attention:?}"
     );
 }
 
