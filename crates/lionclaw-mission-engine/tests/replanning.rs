@@ -6,6 +6,9 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use common::{advisory_plan, default_config, harness, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw_mission_engine::engine::{AdvanceOutcome, AmendError};
 use lionclaw_mission_engine::model::{
@@ -53,6 +56,62 @@ fn work_done(head: &str, request_attention: bool) -> RoleRunOutcome {
             head_sha: head.to_string(),
         }),
         model_id: None,
+    }
+}
+
+/// A validator outcome: reports STYLE-OK with the given verdict when
+/// `report_style` is true (omits it entirely otherwise), and optionally flags.
+fn review(report_style: bool, passed: bool, request_attention: bool) -> RoleRunOutcome {
+    let items = if report_style {
+        vec![ValidationItem {
+            item_id: AssertionId::new("STYLE-OK").unwrap(),
+            passed,
+        }]
+    } else {
+        Vec::new()
+    };
+    RoleRunOutcome {
+        handoff: Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("reviewed"),
+            items,
+            passed,
+            request_attention,
+        },
+        artifact: None,
+        model_id: None,
+    }
+}
+
+/// work `w` → validate `v` → gate `g`, all over the advisory (oracle-less)
+/// assertion STYLE-OK.
+fn gate_plan() -> PlanSubmission {
+    let style = || AssertionId::new("STYLE-OK").unwrap();
+    PlanSubmission {
+        assertions: vec![Assertion {
+            id: style(),
+            prose: "clean".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![
+            work_task("w", "STYLE-OK", &[]),
+            Task {
+                id: "v".parse_task(),
+                kind: TaskKind::Validate,
+                body: "review".to_string(),
+                targets: vec![style()],
+                role: Some(RoleName::new("reviewer").unwrap()),
+                depends_on: vec!["w".parse_task()],
+            },
+            Task {
+                id: "g".parse_task(),
+                kind: TaskKind::Gate,
+                body: String::new(),
+                targets: vec![style()],
+                role: None,
+                depends_on: vec!["v".parse_task()],
+            },
+        ],
     }
 }
 
@@ -826,58 +885,12 @@ async fn superseding_a_gates_validator_re_evaluates_the_gate() {
     // silently swallowed.
     let dir = tempfile::tempdir().unwrap();
     // v passes STYLE-OK; its replacement v2 dissents; work "w" just clears.
-    let runner = MockRoleRunner::new(Box::new(|req| {
-        let verdict = |passed: bool| {
-            Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
-                    done: true,
-                    report: PayloadRef::inline("reviewed"),
-                    items: vec![ValidationItem {
-                        item_id: AssertionId::new("STYLE-OK").unwrap(),
-                        passed,
-                    }],
-                    passed,
-                    request_attention: false,
-                },
-                artifact: None,
-                model_id: None,
-            })
-        };
-        match req.task_id.as_str() {
-            "v" => verdict(true),
-            "v2" => verdict(false),
-            _ => Ok(work_done(HEAD_SHA, false)),
-        }
+    let runner = MockRoleRunner::new(Box::new(|req| match req.task_id.as_str() {
+        "v" => Ok(review(true, true, false)),
+        "v2" => Ok(review(true, false, false)),
+        _ => Ok(work_done(HEAD_SHA, false)),
     }));
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
-    // Plan: work w -> validate v(STYLE-OK) -> gate g(STYLE-OK).
-    let style = || AssertionId::new("STYLE-OK").unwrap();
-    let plan = PlanSubmission {
-        assertions: vec![Assertion {
-            id: style(),
-            prose: "clean".to_string(),
-            oracle: None,
-        }],
-        tasks: vec![
-            work_task("w", "STYLE-OK", &[]),
-            Task {
-                id: "v".parse_task(),
-                kind: TaskKind::Validate,
-                body: "review".to_string(),
-                targets: vec![style()],
-                role: Some(RoleName::new("reviewer").unwrap()),
-                depends_on: vec!["w".parse_task()],
-            },
-            Task {
-                id: "g".parse_task(),
-                kind: TaskKind::Gate,
-                body: String::new(),
-                targets: vec![style()],
-                role: None,
-                depends_on: vec!["v".parse_task()],
-            },
-        ],
-    };
     let m = h
         .engine
         .create_mission(
@@ -888,7 +901,7 @@ async fn superseding_a_gates_validator_re_evaluates_the_gate() {
         )
         .await
         .unwrap();
-    h.engine.submit_plan(&m, plan).await.unwrap();
+    h.engine.submit_plan(&m, gate_plan()).await.unwrap();
 
     // v passes → gate g clears → parked on the gate checkpoint.
     let parked = h.engine.advance(&m).await.unwrap();
@@ -908,7 +921,7 @@ async fn superseding_a_gates_validator_re_evaluates_the_gate() {
                     id: "v2".parse_task(),
                     kind: TaskKind::Validate,
                     body: "review again".to_string(),
-                    targets: vec![style()],
+                    targets: vec![AssertionId::new("STYLE-OK").unwrap()],
                     role: Some(RoleName::new("reviewer").unwrap()),
                     depends_on: vec!["w".parse_task()],
                 }],
@@ -945,51 +958,11 @@ async fn superseding_work_upstream_of_a_validator_re_reviews_against_the_new_tre
     // against the new tree — not left certifying the discarded work.
     let dir = tempfile::tempdir().unwrap();
     let runner = MockRoleRunner::new(Box::new(|req| match req.task_id.as_str() {
-        "v" => Ok(RoleRunOutcome {
-            handoff: Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("reviewed"),
-                items: vec![ValidationItem {
-                    item_id: AssertionId::new("STYLE-OK").unwrap(),
-                    passed: true,
-                }],
-                passed: true,
-                request_attention: false,
-            },
-            artifact: None,
-            model_id: None,
-        }),
+        "v" => Ok(review(true, true, false)),
         "w2" => Ok(work_done(HEAD2_SHA, false)),
         _ => Ok(work_done(HEAD_SHA, false)),
     }));
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
-    let style = || AssertionId::new("STYLE-OK").unwrap();
-    let plan = PlanSubmission {
-        assertions: vec![Assertion {
-            id: style(),
-            prose: "clean".to_string(),
-            oracle: None,
-        }],
-        tasks: vec![
-            work_task("w", "STYLE-OK", &[]),
-            Task {
-                id: "v".parse_task(),
-                kind: TaskKind::Validate,
-                body: "review".to_string(),
-                targets: vec![style()],
-                role: Some(RoleName::new("reviewer").unwrap()),
-                depends_on: vec!["w".parse_task()],
-            },
-            Task {
-                id: "g".parse_task(),
-                kind: TaskKind::Gate,
-                body: String::new(),
-                targets: vec![style()],
-                role: None,
-                depends_on: vec!["v".parse_task()],
-            },
-        ],
-    };
     let m = h
         .engine
         .create_mission(
@@ -1000,7 +973,7 @@ async fn superseding_work_upstream_of_a_validator_re_reviews_against_the_new_tre
         )
         .await
         .unwrap();
-    h.engine.submit_plan(&m, plan).await.unwrap();
+    h.engine.submit_plan(&m, gate_plan()).await.unwrap();
     h.engine.advance(&m).await.unwrap(); // w, v run; g clears; parked
 
     // Supersede the WORK task the validator/gate transitively depend on.
@@ -1045,6 +1018,153 @@ async fn superseding_work_upstream_of_a_validator_re_reviews_against_the_new_tre
         calls.iter().any(|(t, _, _)| t.as_str() == "w2"),
         "replacement work ran"
     );
+}
+
+#[tokio::test]
+async fn re_reviewing_validator_must_re_establish_its_verdicts() {
+    // The reset scrubs last_advisory, so a re-run validator that no longer
+    // reports a target cannot ride its stale PASS to re-clear the gate.
+    let dir = tempfile::tempdir().unwrap();
+    let v_runs = Arc::new(AtomicUsize::new(0));
+    let vr = v_runs.clone();
+    let runner = MockRoleRunner::new(Box::new(move |req| match req.task_id.as_str() {
+        // First review passes STYLE-OK; on re-review it omits STYLE-OK entirely.
+        "v" => Ok(review(vr.fetch_add(1, Ordering::SeqCst) == 0, true, false)),
+        "w2" => Ok(work_done(HEAD2_SHA, false)),
+        _ => Ok(work_done(HEAD_SHA, false)),
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, gate_plan()).await.unwrap();
+    h.engine.advance(&m).await.unwrap(); // v passes → g clears → parked
+
+    // Supersede the upstream work; the validator + gate reset and re-run.
+    h.engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("w2", "STYLE-OK", &[])],
+                supersede: vec![Supersession {
+                    old: "w".parse_task(),
+                    new: "w2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap();
+
+    // The re-review omits STYLE-OK → with last_advisory scrubbed, the gate is
+    // uncovered (never-reported = fail) and blocks, rather than re-clearing on
+    // the stale first-review pass.
+    let parked = h.engine.advance(&m).await.unwrap();
+    let AdvanceOutcome::Parked { attention } = parked else {
+        panic!("got {parked:?}")
+    };
+    assert!(
+        attention
+            .iter()
+            .any(|a| a.kind == AttentionKind::GateFailed),
+        "gate must not re-clear on a scrubbed verdict: {attention:?}"
+    );
+}
+
+#[tokio::test]
+async fn resetting_a_flagged_validator_scrubs_its_stale_attention() {
+    // A validator flagged for attention, then reset by an amendment, must not
+    // stay parked on the stale flag — the reset scrubs flagged_nodes so the
+    // re-run establishes attention (or not) against the new tree.
+    let dir = tempfile::tempdir().unwrap();
+    let v_runs = Arc::new(AtomicUsize::new(0));
+    let vr = v_runs.clone();
+    let runner = MockRoleRunner::new(Box::new(move |req| match req.task_id.as_str() {
+        // First review flags for attention; the re-review is clean.
+        "v" => Ok(review(true, true, vr.fetch_add(1, Ordering::SeqCst) == 0)),
+        "w2" => Ok(work_done(HEAD2_SHA, false)),
+        _ => Ok(work_done(HEAD_SHA, false)),
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    // work w -> validate v (flags), over advisory STYLE-OK — no gate.
+    let plan = PlanSubmission {
+        assertions: vec![Assertion {
+            id: AssertionId::new("STYLE-OK").unwrap(),
+            prose: "clean".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![
+            work_task("w", "STYLE-OK", &[]),
+            Task {
+                id: "v".parse_task(),
+                kind: TaskKind::Validate,
+                body: "review".to_string(),
+                targets: vec![AssertionId::new("STYLE-OK").unwrap()],
+                role: Some(RoleName::new("reviewer").unwrap()),
+                depends_on: vec!["w".parse_task()],
+            },
+        ],
+    };
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, plan).await.unwrap();
+    let parked = h.engine.advance(&m).await.unwrap();
+    let AdvanceOutcome::Parked { attention } = parked else {
+        panic!("got {parked:?}")
+    };
+    assert!(attention
+        .iter()
+        .any(|a| a.kind == AttentionKind::NodeAttention));
+
+    // Supersede the upstream work; the flagged validator resets. With its flag
+    // scrubbed, the re-run proceeds (clean) instead of wedging on the stale
+    // NodeAttention.
+    h.engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("w2", "STYLE-OK", &[])],
+                supersede: vec![Supersession {
+                    old: "w".parse_task(),
+                    new: "w2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap();
+    let done = h.engine.advance(&m).await.unwrap();
+    assert!(
+        matches!(
+            done,
+            AdvanceOutcome::Terminal {
+                phase: MissionPhase::Done { .. }
+            }
+        ),
+        "the re-run validator is not stuck on a stale flag: got {done:?}"
+    );
+    assert_eq!(v_runs.load(Ordering::SeqCst), 2, "validator re-ran");
 }
 
 // --- immateriality ----------------------------------------------------------

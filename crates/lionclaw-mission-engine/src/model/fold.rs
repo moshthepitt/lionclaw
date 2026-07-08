@@ -8,7 +8,7 @@
 //! task that isn't `done` fails and raises attention; a validate task always
 //! clears and folds its per-assertion verdicts in with sticky passes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::event::{AmendmentOps, EventEnvelope, Handoff, MissionEvent};
 use super::ids::{AssertionId, OracleName, TaskId};
@@ -262,15 +262,14 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
     // Pending gate, and step re-dispatches a Pending validator against the new
     // head. (Work is cumulative — no rewind — so only advisory nodes stale;
     // the oracle re-judges the real tree regardless, so Verified is untouched.)
-    let retired: std::collections::BTreeSet<&TaskId> = ops
+    let retired: BTreeSet<&TaskId> = ops
         .supersede
         .iter()
         .map(|s| &s.old)
         .chain(ops.cancel.iter())
         .collect();
     if !retired.is_empty() {
-        let live: std::collections::BTreeSet<&TaskId> =
-            new_plan.tasks.iter().map(|t| &t.id).collect();
+        let live: BTreeSet<&TaskId> = new_plan.tasks.iter().map(|t| &t.id).collect();
         let to_reset: Vec<TaskId> = old_plan
             .tasks
             .iter()
@@ -288,7 +287,17 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
             if let Some(rt) = state.tasks.get_mut(&id) {
                 rt.status = TaskStatus::Pending;
             }
+            // Scrub every latch that pinned the node's stale judgment, so the
+            // re-run re-establishes them against the new tree: the gate
+            // acknowledgement, the attention flag, and the advisory verdicts it
+            // recorded (else a re-run validator that omits a target would keep
+            // a stale pass and re-clear its gate on discarded work). Gate ids
+            // are absent from the latter two, so this is uniform and harmless.
             state.acknowledged_gates.remove(&id);
+            state.flagged_nodes.remove(&id);
+            for assertion in state.contract.values_mut() {
+                assertion.last_advisory.remove(&id);
+            }
         }
     }
     state.plan = Some(new_plan);
@@ -337,13 +346,9 @@ pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> Pl
 
 /// Whether `start` transitively depends (over `plan.depends_on`) on any task
 /// in `retired` — i.e. a retired task sits in its upstream closure.
-fn depends_on_retired(
-    plan: &PlanSubmission,
-    start: &TaskId,
-    retired: &std::collections::BTreeSet<&TaskId>,
-) -> bool {
+fn depends_on_retired(plan: &PlanSubmission, start: &TaskId, retired: &BTreeSet<&TaskId>) -> bool {
     let mut stack = vec![start];
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
