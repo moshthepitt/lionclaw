@@ -256,29 +256,40 @@ fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &Amendment
     // dependencies reconciled) — the same transform validation ran.
     let old_plan = state.plan.as_ref().expect("plan present");
     let new_plan = resulting_plan(old_plan, ops);
-    // Re-open any live gate whose dependencies this amendment changed: its
-    // Cleared/Failed status was latched on now-retired upstream validators, so
-    // it must be re-evaluated against the live plan. `derive_gates` re-derives
-    // any Pending gate; un-acknowledge it so the checkpoint is re-raised.
-    let reopened: Vec<TaskId> = new_plan
-        .tasks
+    // Re-open the advisory nodes whose basis this amendment invalidated. A
+    // Validate/Gate that is transitively downstream of a retired task judged a
+    // now-discarded tree, so reset it to Pending: derive_gates re-derives a
+    // Pending gate, and step re-dispatches a Pending validator against the new
+    // head. (Work is cumulative — no rewind — so only advisory nodes stale;
+    // the oracle re-judges the real tree regardless, so Verified is untouched.)
+    let retired: std::collections::BTreeSet<&TaskId> = ops
+        .supersede
         .iter()
-        .filter(|t| t.kind == super::plan::TaskKind::Gate)
-        .filter(|g| {
-            old_plan
-                .tasks
-                .iter()
-                .find(|t| t.id == g.id)
-                .map(|t| &t.depends_on)
-                != Some(&g.depends_on)
-        })
-        .map(|g| g.id.clone())
+        .map(|s| &s.old)
+        .chain(ops.cancel.iter())
         .collect();
-    for gid in reopened {
-        if let Some(rt) = state.tasks.get_mut(&gid) {
-            rt.status = TaskStatus::Pending;
+    if !retired.is_empty() {
+        let live: std::collections::BTreeSet<&TaskId> =
+            new_plan.tasks.iter().map(|t| &t.id).collect();
+        let to_reset: Vec<TaskId> = old_plan
+            .tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    super::plan::TaskKind::Validate | super::plan::TaskKind::Gate
+                )
+            })
+            .filter(|t| live.contains(&t.id))
+            .filter(|t| depends_on_retired(old_plan, &t.id, &retired))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in to_reset {
+            if let Some(rt) = state.tasks.get_mut(&id) {
+                rt.status = TaskStatus::Pending;
+            }
+            state.acknowledged_gates.remove(&id);
         }
-        state.acknowledged_gates.remove(&gid);
     }
     state.plan = Some(new_plan);
     state.revision += 1;
@@ -322,6 +333,32 @@ pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> Pl
         }
     }
     plan
+}
+
+/// Whether `start` transitively depends (over `plan.depends_on`) on any task
+/// in `retired` — i.e. a retired task sits in its upstream closure.
+fn depends_on_retired(
+    plan: &PlanSubmission,
+    start: &TaskId,
+    retired: &std::collections::BTreeSet<&TaskId>,
+) -> bool {
+    let mut stack = vec![start];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(task) = plan.tasks.iter().find(|t| &t.id == id) else {
+            continue;
+        };
+        for dep in &task.depends_on {
+            if retired.contains(dep) {
+                return true;
+            }
+            stack.push(dep);
+        }
+    }
+    false
 }
 
 /// Seed a task's runtime as `Pending` (idempotent — keeps any existing entry).

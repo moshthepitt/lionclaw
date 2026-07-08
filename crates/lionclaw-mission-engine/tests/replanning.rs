@@ -938,6 +938,115 @@ async fn superseding_a_gates_validator_re_evaluates_the_gate() {
     );
 }
 
+#[tokio::test]
+async fn superseding_work_upstream_of_a_validator_re_reviews_against_the_new_tree() {
+    // Superseding a WORK task that a validator/gate transitively depends on
+    // resets that validator (and its gate) so the advisory judgment is re-run
+    // against the new tree — not left certifying the discarded work.
+    let dir = tempfile::tempdir().unwrap();
+    let runner = MockRoleRunner::new(Box::new(|req| match req.task_id.as_str() {
+        "v" => Ok(RoleRunOutcome {
+            handoff: Handoff::Validate {
+                done: true,
+                report: PayloadRef::inline("reviewed"),
+                items: vec![ValidationItem {
+                    item_id: AssertionId::new("STYLE-OK").unwrap(),
+                    passed: true,
+                }],
+                passed: true,
+                request_attention: false,
+            },
+            artifact: None,
+            model_id: None,
+        }),
+        "w2" => Ok(work_done(HEAD2_SHA, false)),
+        _ => Ok(work_done(HEAD_SHA, false)),
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let style = || AssertionId::new("STYLE-OK").unwrap();
+    let plan = PlanSubmission {
+        assertions: vec![Assertion {
+            id: style(),
+            prose: "clean".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![
+            work_task("w", "STYLE-OK", &[]),
+            Task {
+                id: "v".parse_task(),
+                kind: TaskKind::Validate,
+                body: "review".to_string(),
+                targets: vec![style()],
+                role: Some(RoleName::new("reviewer").unwrap()),
+                depends_on: vec!["w".parse_task()],
+            },
+            Task {
+                id: "g".parse_task(),
+                kind: TaskKind::Gate,
+                body: String::new(),
+                targets: vec![style()],
+                role: None,
+                depends_on: vec!["v".parse_task()],
+            },
+        ],
+    };
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, plan).await.unwrap();
+    h.engine.advance(&m).await.unwrap(); // w, v run; g clears; parked
+
+    // Supersede the WORK task the validator/gate transitively depend on.
+    h.engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                add: vec![work_task("w2", "STYLE-OK", &[])],
+                supersede: vec![Supersession {
+                    old: "w".parse_task(),
+                    new: "w2".parse_task(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "redo the work",
+            1,
+        )
+        .await
+        .unwrap();
+
+    // The amendment reset the downstream validator and gate to Pending.
+    let state = h.engine.load_state(&m).await.unwrap();
+    assert_eq!(
+        state.tasks[&"v".parse_task()].status,
+        TaskStatus::Pending,
+        "validator reset to re-review"
+    );
+    assert_eq!(
+        state.tasks[&"g".parse_task()].status,
+        TaskStatus::Pending,
+        "gate reset to re-derive"
+    );
+
+    // Advancing re-runs w2 and re-reviews (v runs a second time) before the
+    // gate can clear again.
+    h.engine.advance(&m).await.unwrap();
+    let calls = h.role_runner.calls.lock().unwrap();
+    let v_runs = calls.iter().filter(|(t, _, _)| t.as_str() == "v").count();
+    assert_eq!(v_runs, 2, "validator re-reviewed the new tree");
+    assert!(
+        calls.iter().any(|(t, _, _)| t.as_str() == "w2"),
+        "replacement work ran"
+    );
+}
+
 // --- immateriality ----------------------------------------------------------
 
 #[tokio::test]
