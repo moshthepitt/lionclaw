@@ -270,17 +270,6 @@ pub struct AmendmentOps {
     pub bind_oracle: Vec<OracleBinding>,
 }
 
-impl AmendmentOps {
-    /// No-op amendment (all op lists empty).
-    pub fn is_empty(&self) -> bool {
-        self.add.is_empty()
-            && self.supersede.is_empty()
-            && self.cancel.is_empty()
-            && self.add_assertion.is_empty()
-            && self.bind_oracle.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Supersession {

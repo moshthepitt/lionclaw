@@ -91,6 +91,8 @@ pub fn validate_plan_submission(
 /// can never drift from submit-validation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AmendmentError {
+    #[error("amendment is immaterial (it leaves the plan unchanged)")]
+    Immaterial,
     #[error("task '{task}' is not live (unknown or already retired)")]
     UnknownTask { task: String },
     #[error("added task '{task}' reuses an existing task id (retired ids are never revived)")]
@@ -169,6 +171,12 @@ pub fn validate_plan_amendment(
     }
 
     let resulting = super::fold::resulting_plan(plan, ops);
+    // Materiality: an amendment that leaves the plan unchanged (empty ops, or a
+    // bind_oracle that only re-binds already-bound oracles) must not bump the
+    // revision and re-open ratification for nothing.
+    if resulting == *plan {
+        return Err(AmendmentError::Immaterial);
+    }
     let errors = validate_plan_submission(&resulting, inventory);
     if errors.is_empty() {
         Ok(())

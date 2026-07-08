@@ -697,6 +697,67 @@ async fn a_rejected_amendment_appends_nothing() {
     );
 }
 
+// --- immateriality ----------------------------------------------------------
+
+#[tokio::test]
+async fn an_immaterial_amendment_is_refused() {
+    // An empty amendment — or one that only re-binds an already-bound oracle —
+    // changes nothing, so it must not bump the revision or re-open ratification.
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let m = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.submit_plan(&m, simple_plan()).await.unwrap();
+
+    // Empty ops.
+    let err = h
+        .engine
+        .amend_plan(&m, AmendmentOps::default(), "o", "", 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AmendError::Rejected(AmendmentError::Immaterial)),
+        "empty: got {err:?}"
+    );
+    // A no-op bind (TESTS-PASS is already bound to cargo-test).
+    let err = h
+        .engine
+        .amend_plan(
+            &m,
+            AmendmentOps {
+                bind_oracle: vec![OracleBinding {
+                    assertion: AssertionId::new("TESTS-PASS").unwrap(),
+                    oracle: OracleName::new("cargo-test").unwrap(),
+                }],
+                ..Default::default()
+            },
+            "o",
+            "",
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AmendError::Rejected(AmendmentError::Immaterial)),
+        "idempotent bind: got {err:?}"
+    );
+    // Nothing changed.
+    assert_eq!(h.engine.load_state(&m).await.unwrap().revision, 1);
+}
+
 // --- ratification -----------------------------------------------------------
 
 #[tokio::test]
