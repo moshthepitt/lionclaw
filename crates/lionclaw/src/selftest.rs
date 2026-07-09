@@ -283,7 +283,6 @@ fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     Ok(())
 }
 
-
 /// Materialize a Cargo crate into a fresh git repo (lockfile generated so the
 /// oracle's `cargo test --locked` works offline). Returns the HEAD sha.
 async fn materialize_repo(root: &Path, cargo_toml: &str, lib_rs: &str) -> Result<String> {

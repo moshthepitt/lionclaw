@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::mission_type::RoleDefinition;
-use crate::model::{
-    ArtifactOutcome, Handoff, MissionId, OracleName, RunErrorKind, TaskId,
-};
+use crate::model::{ArtifactOutcome, Handoff, MissionId, OracleName, RunErrorKind, TaskId};
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an idempotency key with a recorded outcome

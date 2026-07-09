@@ -9,8 +9,8 @@
 //! runtime: codex
 //! network: false
 //! secrets: false
-//! skills: [rust, git]
-//! ---
+//! skills: []          # parsed, but the loader rejects a non-empty list
+//! ---                 # (skill projection is not wired yet)
 //! <prompt body>
 //! ```
 

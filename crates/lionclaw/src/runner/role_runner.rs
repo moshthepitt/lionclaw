@@ -293,9 +293,9 @@ impl OciRoleRunner {
 }
 
 /// Env for a mission container: HOME/XDG under the runtime home, TMPDIR, and
-/// (for writers) cargo/npm under scratch so installs stay in the writable
-/// area. Kept minimal and mission-specific rather than importing the kernel
-/// planner's env builder.
+/// cargo (CARGO_HOME/CARGO_TARGET_DIR) under the writable scratch mount so
+/// builds stay out of the read-only rootfs. Kept minimal and mission-specific
+/// rather than importing the kernel planner's env builder.
 fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
     let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
     vec![

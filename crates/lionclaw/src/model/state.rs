@@ -14,7 +14,9 @@ use super::verdict::{AuthoritativeVerdict, FinishClass};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum MissionPhase {
-    /// Created, awaiting a plan submission.
+    /// No execution plan yet: drives the in-engine planning DAG (research →
+    /// red-team → author) toward a proposal, or — with an empty planning DAG —
+    /// idles awaiting a manually submitted plan.
     Planning,
     Running,
     /// Open attention items — parked at zero compute (durable interrupt).

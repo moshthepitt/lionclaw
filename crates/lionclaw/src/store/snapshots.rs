@@ -1,9 +1,8 @@
 //! Persisted fold snapshots: a discard-and-rebuildable cursor, never a
-//! source of truth. Exactly one live snapshot per mission (superseded rows
-//! are pruned in the same transaction — the session-compactions pattern),
-//! guarded by `upto_sequence_no` monotonicity so a stale writer is a no-op.
-//! A snapshot whose `reducer_version` differs from the running engine is
-//! ignored and the state is refolded from sequence zero.
+//! source of truth. Exactly one row per mission (the mission id is the primary
+//! key), upserted in place, guarded by `upto_sequence_no` monotonicity so a
+//! stale writer is a no-op. A snapshot whose `reducer_version` differs from the
+//! running engine is ignored and the state is refolded from sequence zero.
 
 use anyhow::Result;
 

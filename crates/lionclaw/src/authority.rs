@@ -3,10 +3,11 @@
 //! Authority is engine-internal: the author declares only output semantics
 //! (plus the `network`/`secrets` flags); everything enforceable is compiled
 //! here as `effective = role_request ∩ ceiling ∩ semantics_floor`, then
-//! container-enforced. **The moat**: a verdict-emitting node must be
-//! read-only on an enforcing rung, with no read-write mount overlapping the
-//! judged set, no escape class that could feed back, and no secrets. Any
-//! violation refuses to compile — the mission never starts.
+//! container-enforced. **The moat**: every non-artifact role — a verdict judge
+//! and every planning role (report/proposal) — must be read-only on an enforcing
+//! rung, with no read-write mount overlapping the judged set, no escape class
+//! that could feed back, and no secrets. Any violation refuses to compile — the
+//! mission never starts.
 //!
 //! [`CompiledRolePlan`] has one constructor, [`compile_role_plan`], and the
 //! runner accepts nothing else: an un-vetted plan is unrepresentable.
@@ -16,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lionclaw_confinement::{
-    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, InstallPolicy,
-    MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
-    RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
+    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, InstallPolicy, MountAccess,
+    MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
+    WORKSPACE_MOUNT_TARGET,
 };
 
 use crate::mission_type::RoleDefinition;
@@ -418,7 +419,9 @@ mod tests {
     fn judge_requesting_secrets_refuses_to_compile() {
         let err = compile_authority(
             &role(OutputSemantics::EmitsVerdict, true),
-            &AuthorityCeiling { allow_secrets: true },
+            &AuthorityCeiling {
+                allow_secrets: true,
+            },
         )
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
@@ -435,7 +438,9 @@ mod tests {
     #[test]
     fn worker_secrets_are_granted_when_ceiling_allows() {
         // Pins the AND: ceiling permits + role requests ⇒ actually mounted.
-        let ceiling = AuthorityCeiling { allow_secrets: true };
+        let ceiling = AuthorityCeiling {
+            allow_secrets: true,
+        };
         let authority = compile_authority(&role(OutputSemantics::ProducesArtifact, true), &ceiling)
             .expect("worker");
         assert!(authority.preset().mount_runtime_secrets);
@@ -475,6 +480,29 @@ mod tests {
         ))
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::WritableJudge { .. }));
+    }
+
+    #[test]
+    fn forged_secrets_judge_authority_refuses_to_compile() {
+        // The plan-compile secrets backstop (sibling of the writable/escape
+        // backstops): a forged read-only verdict authority carrying
+        // mount_runtime_secrets still hits the moat at compile_role_plan.
+        let forged = CompiledAuthority::for_tests(
+            "forged",
+            OutputSemantics::EmitsVerdict,
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadOnly,
+                mount_runtime_secrets: true,
+                ..Default::default()
+            },
+        );
+        let err = compile_role_plan(request(
+            &forged,
+            mounts(MountAccess::ReadOnly, Vec::new()),
+            &[],
+        ))
+        .expect_err("must refuse");
+        assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
     }
 
     #[test]

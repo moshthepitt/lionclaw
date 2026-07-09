@@ -777,6 +777,14 @@ mod tests {
             planning_codes(vec![ptask("author", "implementer", &[])]),
             vec!["role_output_mismatch"]
         );
+        // A dependency on an unknown planning task → dep_unknown_task.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("research", "reporter", &["ghost"]),
+                ptask("author", "author", &["research"]),
+            ]),
+            vec!["dep_unknown_task"]
+        );
     }
 
     // The check_shape chokepoint: a read-only planning role (produces-report /

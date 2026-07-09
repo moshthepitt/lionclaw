@@ -338,7 +338,12 @@ mod tests {
         .await
         .unwrap();
         std::fs::write(clone.dir.join("f.txt"), "uncommitted\n").unwrap();
-        assert!(capture_worker_result(repo.path(), &clone).await.is_err());
+        // An uncommitted tree is DirtyWorktree specifically — not the Infra
+        // bucket, which would mislabel the persisted failure.
+        assert!(matches!(
+            capture_worker_result(repo.path(), &clone).await,
+            Err(CaptureError::DirtyWorktree(_))
+        ));
     }
 
     async fn commit_change(repo: &Path, contents: &str) -> String {

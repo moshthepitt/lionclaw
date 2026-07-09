@@ -497,9 +497,10 @@ async fn git_worktree_root() -> Result<PathBuf> {
     PathBuf::from(root).canonicalize().context("repo path")
 }
 
-/// Resolve a mission id: an explicit id is parsed; omitted ⇒ the sole
-/// non-terminal mission in this repo. Errors (never guesses) when zero or more
-/// than one mission is live.
+/// Resolve a mission id: an explicit id is parsed; omitted ⇒ the sole live
+/// mission, or — once every mission has finished — the sole mission overall
+/// (so post-completion commands still default). Errors (never guesses) only
+/// when the choice is ambiguous: no mission, or more than one live.
 async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Result<MissionId> {
     if let Some(id) = explicit {
         return MissionId::parse(id).map_err(Into::into);

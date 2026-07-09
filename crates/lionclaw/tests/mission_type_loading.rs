@@ -103,3 +103,103 @@ fn a_planning_dag_naming_an_execution_role_fails_to_load() {
         "got {err:?}"
     );
 }
+
+// ---- Loader fail-closed guards (each with a failing-first fault injection) ----
+
+fn write_oracle(path: &std::path::Path, contents: &str, executable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents).unwrap();
+    // Set the mode explicitly — `fs::write` preserves an existing file's bits.
+    let mode = if executable { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A minimal, loadable mission type: one artifact role + one valid oracle.
+fn write_valid_type(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("roles")).unwrap();
+    std::fs::create_dir_all(root.join("oracles")).unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/implementer.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    write_oracle(
+        &root.join("oracles/cargo-test"),
+        "#!/bin/sh\nexit 0\n",
+        true,
+    );
+}
+
+fn load_err(root: &std::path::Path) -> MissionTypeError {
+    load_mission_type(root, &AuthorityCeiling::default()).expect_err("must refuse")
+}
+
+#[test]
+fn the_minimal_type_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid type loads");
+}
+
+#[test]
+fn a_non_executable_oracle_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    write_oracle(
+        &dir.path().join("oracles/cargo-test"),
+        "#!/bin/sh\nexit 0\n",
+        false,
+    );
+    assert!(
+        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("executable")),
+    );
+}
+
+#[test]
+fn an_oracle_without_a_shebang_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    write_oracle(&dir.path().join("oracles/cargo-test"), "exit 0\n", true);
+    assert!(
+        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("shebang")),
+    );
+}
+
+#[test]
+fn a_symlinked_oracle_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    let oracle = dir.path().join("oracles/cargo-test");
+    std::fs::remove_file(&oracle).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", &oracle).unwrap();
+    assert!(
+        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("regular file")),
+    );
+}
+
+#[test]
+fn a_mission_type_with_no_roles_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::remove_file(dir.path().join("roles/implementer.md")).unwrap();
+    assert!(matches!(load_err(dir.path()), MissionTypeError::NoRoles(_)));
+}
+
+#[test]
+fn a_path_unsafe_mission_type_name_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"../evil\"\nstop = \"verified\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    assert!(
+        matches!(&load_err(dir.path()), MissionTypeError::Manifest(d) if d.contains("path-safe")),
+    );
+}
