@@ -1,61 +1,53 @@
 # AGENTS.md
 
-## Purpose
-This repository builds LionClaw as a secure-first local Claw: a small trusted
-kernel that runs real agent CLIs inside an explicit local boundary.
-Contributors (human or AI) should follow the workflow and quality gates below.
+Contributor guide for any agent (human or AI) working in this repo. This file
+is the **workflow and the guardrails** — not an explanation of how the engine
+works. For that, read the source of truth below.
 
-## Source of Truth
-- Project overview: `README.md`
-- architecture and contracts: `docs/ARCHITECTURE.md`
-- manual acceptance: `docs/MANUAL_QA.md`
-- release process: `docs/RELEASE.md`
-- developer/CI smoke helpers: `scripts/README.md`
+## Source of truth
 
-## Working Rules
-- Prefer TDD when practical: RED -> GREEN -> REFACTOR.
-- Keep the core small, explicit, and auditable.
-- Preserve deterministic behavior in kernel decisions and policy checks.
-- Security boundaries are enforced by kernel code, not prompt instructions.
-- Channels are skills; do not bake external channels into core defaults.
-- Do not change API contracts silently; update docs in the same PR.
-- Keep code clean, simple, modern, idiomatic, and DRY.
-- If verification is blocked by sandbox DNS/connectivity issues, rerun the same command with approved escalation rather than adding non-standard local shims.
+*(These docs are being written; until one lands, the code is authoritative.)*
 
-## Implementation Discipline
-- Prefer durable, domain-oriented naming over temporary phase labels.
-- Encode validation intent in types and request/response contracts.
-- Keep module boundaries explicit (`sessions`, `skills`, `policy`, `runtime`, `channels`, `audit`).
-- Default to deny for capability checks unless explicit grants exist.
-- Treat policy and audit as first-class concerns for LionClaw-owned privileged
-  actions and runtime boundary decisions.
-- Build tests as composable scenarios with reusable setup helpers.
-- When behavior changes, update tests and docs in the same change.
+- Product overview and the everyday command path: `README.md`
+- Architecture, the determinism wall, and the honesty moat: `docs/`
+- Design decisions and their rationale: `docs/adr/`
+- In-code: `crates/lionclaw/src/lib.rs` and `model/mod.rs` module docs.
 
-## Product Lessons
-- LionClaw must have one obvious everyday command path.
-- Prefer one canonical confinement and runtime-auth path over parallel ways to do the same job.
-- `lionclaw run [runtime]` is the canonical interactive path.
-- Raw HTTP is for workers, tests, and debugging only; never document it as normal usage.
-- `systemd --user` is deployment/admin plumbing for background services and many channels, not the default local interactive path.
-- Runtime configuration must live in LionClaw state/config, not rely on accidental shell PATH or session env.
-- LionClaw owns the product entrypoint; runtimes are real agent harnesses behind it.
-- LionClaw owns the boundary, not every private tool step inside a program-backed runtime.
-- Channels remain external skills/workers; do not absorb transport logic into Rust core to paper over UX gaps.
-- Product-facing docs must be command-first and readable without architecture context.
-- Internal implementation names such as `lionclawd`, `kernel`, and raw HTTP APIs should appear in product docs only when operationally necessary.
-- The README first screen must explain LionClaw in user terms and avoid “not X / not Y” framing.
-- Product-facing docs should lead with the problem, the stance, and the command the reader runs.
-- The README should preserve the core thesis: Claws turn agents into assistants; LionClaw runs real agents under a small trusted core and explicit local boundary.
+## Guardrails you must not break
 
-## Required Verification Commands
-Run from repository root before considering work complete:
-- `cargo fmt -- --check`
-- `cargo check`
-- `cargo test`
+Two invariants *are* the product. Changing either needs a fault-injection test
+that fails first, and a note in the PR. See `docs/` for what they mean and why.
 
-## Required for Behavior-Changing PRs
-- Failing test evidence first (or explicit rationale if adding net-new surface).
-- Security impact statement (policy, secrets, egress, sandbox boundary).
-- API/event contract impact statement.
-- Docs updated for any contract or architectural change.
+- **The determinism wall** — `crates/lionclaw/src/model/` stays pure (only
+  `std` / `serde` / `thiserror`; no I/O, clock, RNG, or async).
+- **The honesty moat** — one mint site for an authoritative verdict, one path to
+  a `Verified` finish, and no non-artifact role that can write or hold secrets.
+
+## Working rules
+
+- Clean, simple, DRY, idiomatic Rust. No jank, no half-built scaffolding, no
+  tech debt. Pause on each change to find the true solution.
+- **No backwards compatibility** (pre-launch): break old logs loudly rather than
+  carry shims; bump `SCHEMA_VERSION` / `REDUCER_VERSION` when the log or fold
+  changes, and keep `fold_litmus` / `resume` green at the new version.
+- Every new guard gets a fault-injection test: break it → confirm the test
+  *fails* → restore by editing it back (never `git checkout`).
+- Prefer making illegal states unrepresentable over rejecting them by rule;
+  exhaustive matches over `_ =>` wildcards.
+
+## Verification (run from the repo root)
+
+- `scripts/ci.sh` — fmt, check, clippy `-D warnings`, doc, `cargo test
+  --workspace`, and the mission self-test.
+- `cargo run -p lionclaw -- mission self-test` — drives the real stack
+  (podman + an engine-run oracle), model-auth-free; skips cleanly without podman.
+
+The agentic evals (`scripts/mission-eval.sh`) need a real runtime auth and are
+not part of the gate; run them when changing planning or role prompts.
+
+## For behavior-changing PRs
+
+- A failing test first (or an explicit rationale for net-new surface).
+- A note on determinism-wall / moat impact if either is touched.
+- The `SCHEMA_VERSION` / `REDUCER_VERSION` bump and a passing `fold_litmus` /
+  `resume` if the log or fold changed.
