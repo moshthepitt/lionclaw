@@ -505,8 +505,7 @@ async fn insert_event(
 fn inflight_source_seq(effect: &InflightEffect) -> u64 {
     match effect {
         InflightEffect::RoleRun { requested_seq, .. }
-        | InflightEffect::OracleRun { requested_seq, .. }
-        | InflightEffect::TerminalReview { requested_seq, .. } => *requested_seq,
+        | InflightEffect::OracleRun { requested_seq, .. } => *requested_seq,
     }
 }
 

@@ -36,8 +36,7 @@ pub fn validate_decision(
             | AttentionKind::NodeAttention
             | AttentionKind::OracleFailed
             | AttentionKind::GateCheckpoint
-            | AttentionKind::GateFailed
-            | AttentionKind::TerminalReview,
+            | AttentionKind::GateFailed,
         ) => true,
         // Abort is always available while an item is open.
         (DecisionAction::Abort, _) => true,

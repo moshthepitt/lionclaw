@@ -21,7 +21,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 2;
+pub const REDUCER_VERSION: u32 = 3;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -59,8 +59,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         tasks: Default::default(),
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
-        terminal_review_attempts: 0,
-        terminal_review_done: None,
         inflight: Default::default(),
         open_attention: Default::default(),
         ratified: false,
@@ -172,18 +170,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(idempotency_key);
             state.oracle_failures.insert(oracle.clone(), detail.clone());
-        }
-        MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
-            state.terminal_review_attempts = *attempt_no;
-            track_inflight(state, &envelope.event, seq);
-        }
-        MissionEvent::TerminalReviewCompleted {
-            idempotency_key,
-            done,
-            ..
-        } => {
-            state.inflight.remove(idempotency_key);
-            state.terminal_review_done = Some(*done);
         }
         MissionEvent::MissionAborted { reason, .. } => {
             state.phase = MissionPhase::Aborted {

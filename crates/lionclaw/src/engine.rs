@@ -349,7 +349,7 @@ impl Engine {
                     // One reconcile action per pass; refold before the next.
                     return Ok(true);
                 }
-                InflightEffect::OracleRun { .. } | InflightEffect::TerminalReview { .. } => {
+                InflightEffect::OracleRun { .. } => {
                     self.store.requeue_effect(key, now_ms).await?;
                 }
             }
@@ -383,9 +383,6 @@ impl Engine {
             InflightEffect::OracleRun { .. } => {
                 self.execute_oracle_run(state, &lease.effect_id, &lease.request)
                     .await?
-            }
-            InflightEffect::TerminalReview { .. } => {
-                bail!("terminal review effects are not implemented yet")
             }
         };
         match self

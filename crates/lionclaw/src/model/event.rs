@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Assertion, PlanSubmission, Task};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,6 @@ pub enum StopBar {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
-    pub max_parallel: u32,
     pub ratification_gate: bool,
     pub stop: StopBar,
 }
@@ -61,7 +60,6 @@ pub struct MissionConfig {
 impl Default for MissionConfig {
     fn default() -> Self {
         Self {
-            max_parallel: 4,
             ratification_gate: true,
             stop: StopBar::Verified,
         }
@@ -204,16 +202,6 @@ pub enum MissionEvent {
         detail: String,
         synthesized: bool,
     },
-    TerminalReviewRequested {
-        attempt_no: u32,
-        idempotency_key: String,
-    },
-    TerminalReviewCompleted {
-        attempt_no: u32,
-        idempotency_key: String,
-        done: bool,
-        report: PayloadRef,
-    },
     MissionAborted {
         reason: String,
         actor: String,
@@ -318,8 +306,6 @@ impl MissionEvent {
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
             Self::OracleRunFailed { .. } => "oracle_run_failed",
-            Self::TerminalReviewRequested { .. } => "terminal_review_requested",
-            Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
             Self::PlanAmended { .. } => "plan_amended",
@@ -335,9 +321,6 @@ impl MissionEvent {
             }
             | Self::OracleRunRequested {
                 idempotency_key, ..
-            }
-            | Self::TerminalReviewRequested {
-                idempotency_key, ..
             } => Some((IdemClass::Request, idempotency_key)),
             Self::RoleRunCompleted {
                 idempotency_key, ..
@@ -350,9 +333,6 @@ impl MissionEvent {
             }
             | Self::OracleRunFailed {
                 idempotency_key, ..
-            }
-            | Self::TerminalReviewCompleted {
-                idempotency_key, ..
             } => Some((IdemClass::Outcome, idempotency_key)),
             _ => None,
         }
@@ -362,9 +342,7 @@ impl MissionEvent {
     /// (`failed`) for its effect ledger row.
     pub fn outcome_succeeded(&self) -> Option<bool> {
         match self {
-            Self::RoleRunCompleted { .. }
-            | Self::OracleRunCompleted { .. }
-            | Self::TerminalReviewCompleted { .. } => Some(true),
+            Self::RoleRunCompleted { .. } | Self::OracleRunCompleted { .. } => Some(true),
             Self::RoleRunFailed { .. } | Self::OracleRunFailed { .. } => Some(false),
             _ => None,
         }

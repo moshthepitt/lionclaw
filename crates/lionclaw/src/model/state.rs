@@ -89,7 +89,6 @@ pub enum AttentionKind {
     OracleFailed,
     GateFailed,
     GateCheckpoint,
-    TerminalReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,10 +122,6 @@ pub enum InflightEffect {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
-        attempt_no: u32,
-        requested_seq: u64,
-    },
-    TerminalReview {
         attempt_no: u32,
         requested_seq: u64,
     },
@@ -175,16 +170,6 @@ impl InflightEffect {
                     requested_seq,
                 },
             )),
-            MissionEvent::TerminalReviewRequested {
-                attempt_no,
-                idempotency_key,
-            } => Some((
-                idempotency_key.clone(),
-                Self::TerminalReview {
-                    attempt_no: *attempt_no,
-                    requested_seq,
-                },
-            )),
             _ => None,
         }
     }
@@ -193,7 +178,6 @@ impl InflightEffect {
         match self {
             Self::RoleRun { .. } => "role_run",
             Self::OracleRun { .. } => "oracle_run",
-            Self::TerminalReview { .. } => "terminal_review",
         }
     }
 }
@@ -216,9 +200,6 @@ pub struct MissionState {
     pub current_sha: String,
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
-    pub terminal_review_attempts: u32,
-    /// Outcome of the latest terminal review, if any.
-    pub terminal_review_done: Option<bool>,
     pub inflight: BTreeMap<String, InflightEffect>,
     /// Derived each fold from failed nodes, gate results, and the
     /// ratification gate, minus anything a decision has resolved.

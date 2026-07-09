@@ -39,7 +39,7 @@ CREATE TABLE mission_effects (
     effect_id           TEXT PRIMARY KEY NOT NULL, -- idempotency key of the request
     mission_id          TEXT NOT NULL REFERENCES missions (mission_id),
     source_seq          INTEGER NOT NULL,
-    kind                TEXT NOT NULL CHECK (kind IN ('role_run', 'oracle_run', 'terminal_review')),
+    kind                TEXT NOT NULL CHECK (kind IN ('role_run', 'oracle_run')),
     request_json        TEXT NOT NULL,
     status              TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'done', 'failed')),
     attempt_count       INTEGER NOT NULL DEFAULT 0,
