@@ -10,16 +10,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::{advisory_plan, default_config, harness, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::engine::{AdvanceOutcome, AmendError};
-use lionclaw_mission_engine::model::{
+use lionclaw::engine::{AdvanceOutcome, AmendError};
+use lionclaw::model::{
     AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, AttentionKind,
     FinishClass, Handoff, MissionConfig, MissionPhase, OracleBinding, OracleName, PayloadRef,
     PlanSubmission, RoleName, RunErrorKind, Supersession, Task, TaskKind, TaskStatus,
     ValidationItem,
 };
-use lionclaw_mission_engine::ports::{RoleRunFailure, RoleRunOutcome};
-use lionclaw_mission_engine::store::NewEvent;
-use lionclaw_mission_engine::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::ports::{RoleRunFailure, RoleRunOutcome};
+use lionclaw::store::NewEvent;
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 const HEAD2_SHA: &str = "0000000000000000000000000000000000000003";
 
@@ -286,7 +286,7 @@ async fn replan_red_node(fix_passes_oracle: bool) -> (FinishClass, bool) {
         } else {
             0
         };
-        Ok(lionclaw_mission_engine::ports::OracleOutcome {
+        Ok(lionclaw::ports::OracleOutcome {
             exit_code: exit,
             exit_signal: None,
             stdout: Vec::new(),
@@ -580,16 +580,14 @@ async fn amendment_while_an_effect_is_in_flight_is_busy() {
     // Inject a role-run request with a long, still-live lease (a concurrent
     // driver is running it) so the mission is not quiescent.
     let state = h.engine.load_state(&m).await.unwrap();
-    let ev = NewEvent::new(
-        lionclaw_mission_engine::model::MissionEvent::RoleRunRequested {
-            task_id: "fix".parse_task(),
-            attempt_no: 1,
-            idempotency_key: "live-key".to_string(),
-            role: RoleName::new("implementer").unwrap(),
-            prompt: PayloadRef::inline("p"),
-            base_sha: BASE_SHA.to_string(),
-        },
-    );
+    let ev = NewEvent::new(lionclaw::model::MissionEvent::RoleRunRequested {
+        task_id: "fix".parse_task(),
+        attempt_no: 1,
+        idempotency_key: "live-key".to_string(),
+        role: RoleName::new("implementer").unwrap(),
+        prompt: PayloadRef::inline("p"),
+        base_sha: BASE_SHA.to_string(),
+    });
     h.engine
         .store()
         .append(&m, state.head, &[ev], 1_000)
@@ -709,16 +707,14 @@ async fn a_rejected_amendment_appends_nothing() {
     // Inject a role-run request with an already-EXPIRED lease (reconcile would
     // synthesize a failure for it if it ran).
     let state = h.engine.load_state(&m).await.unwrap();
-    let ev = NewEvent::new(
-        lionclaw_mission_engine::model::MissionEvent::RoleRunRequested {
-            task_id: "fix".parse_task(),
-            attempt_no: 1,
-            idempotency_key: "expired-key".to_string(),
-            role: RoleName::new("implementer").unwrap(),
-            prompt: PayloadRef::inline("p"),
-            base_sha: BASE_SHA.to_string(),
-        },
-    );
+    let ev = NewEvent::new(lionclaw::model::MissionEvent::RoleRunRequested {
+        task_id: "fix".parse_task(),
+        attempt_no: 1,
+        idempotency_key: "expired-key".to_string(),
+        role: RoleName::new("implementer").unwrap(),
+        prompt: PayloadRef::inline("p"),
+        base_sha: BASE_SHA.to_string(),
+    });
     h.engine
         .store()
         .append(&m, state.head, &[ev], 1_000)
@@ -1232,7 +1228,7 @@ async fn an_immaterial_amendment_is_refused() {
 
 #[tokio::test]
 async fn material_amendment_reopens_ratification_when_the_gate_is_on() {
-    use lionclaw_mission_engine::model::DecisionAction;
+    use lionclaw::model::DecisionAction;
     let dir = tempfile::tempdir().unwrap();
     let h = harness(
         dir.path(),
@@ -1321,7 +1317,7 @@ async fn amendment_flows_without_ratification_when_the_gate_is_off() {
 
 #[tokio::test]
 async fn amended_mission_snapshot_fold_equals_full_refold() {
-    use lionclaw_mission_engine::model::{fold, REDUCER_VERSION};
+    use lionclaw::model::{fold, REDUCER_VERSION};
     let dir = tempfile::tempdir().unwrap();
     let h = harness(
         dir.path(),

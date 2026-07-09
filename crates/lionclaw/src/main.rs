@@ -1,5 +1,5 @@
 use clap::Parser;
-use lionclaw_mission_engine::cli::{run, Cli};
+use lionclaw::cli::{run, Cli};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<std::process::ExitCode> {

@@ -5,10 +5,10 @@
 mod common;
 
 use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::engine::AdvanceOutcome;
-use lionclaw_mission_engine::model::{MissionEvent, MissionPhase};
-use lionclaw_mission_engine::store::{AppendError, NewEvent};
-use lionclaw_mission_engine::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::engine::AdvanceOutcome;
+use lionclaw::model::{MissionEvent, MissionPhase};
+use lionclaw::store::{AppendError, NewEvent};
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
 async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
@@ -85,11 +85,11 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
     // outcome lands.
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let event = NewEvent::new(MissionEvent::RoleRunRequested {
-        task_id: lionclaw_mission_engine::model::TaskId::new("fix").expect("task id"),
+        task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
         attempt_no: 1,
         idempotency_key: "crashed-key".to_string(),
-        role: lionclaw_mission_engine::model::RoleName::new("implementer").expect("role"),
-        prompt: lionclaw_mission_engine::model::PayloadRef::inline("prompt"),
+        role: lionclaw::model::RoleName::new("implementer").expect("role"),
+        prompt: lionclaw::model::PayloadRef::inline("prompt"),
         base_sha: BASE_SHA.to_string(),
     });
     h.engine
@@ -167,11 +167,11 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
     // Record a role-run request and lease it with a long, still-live lease.
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let event = NewEvent::new(MissionEvent::RoleRunRequested {
-        task_id: lionclaw_mission_engine::model::TaskId::new("fix").unwrap(),
+        task_id: lionclaw::model::TaskId::new("fix").unwrap(),
         attempt_no: 1,
         idempotency_key: "live-key".to_string(),
-        role: lionclaw_mission_engine::model::RoleName::new("implementer").unwrap(),
-        prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
+        role: lionclaw::model::RoleName::new("implementer").unwrap(),
+        prompt: lionclaw::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
     h.engine
@@ -238,11 +238,11 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
     // Record + lease a role run, then "crash" (no outcome recorded).
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let event = NewEvent::new(MissionEvent::RoleRunRequested {
-        task_id: lionclaw_mission_engine::model::TaskId::new("fix").unwrap(),
+        task_id: lionclaw::model::TaskId::new("fix").unwrap(),
         attempt_no: 1,
         idempotency_key: "crash-key".to_string(),
-        role: lionclaw_mission_engine::model::RoleName::new("implementer").unwrap(),
-        prompt: lionclaw_mission_engine::model::PayloadRef::inline("p"),
+        role: lionclaw::model::RoleName::new("implementer").unwrap(),
+        prompt: lionclaw::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
     h.engine

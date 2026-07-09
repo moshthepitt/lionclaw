@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw-cli") | .version')
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw") | .version')
           if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
             echo "failed to determine LionClaw version from merged commit" >&2
             exit 1

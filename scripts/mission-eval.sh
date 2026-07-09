@@ -9,7 +9,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug/lionclaw"
 PLUGIN="$ROOT/plugins/software-dev"
-FIXTURES="$ROOT/crates/lionclaw-mission-engine/tests/fixtures/eval"
+FIXTURES="$ROOT/crates/lionclaw/tests/fixtures/eval"
 RUNS="${1:-3}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

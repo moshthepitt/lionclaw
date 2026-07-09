@@ -7,8 +7,8 @@
 mod common;
 
 use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::model::{apply, fold};
-use lionclaw_mission_engine::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::model::{apply, fold};
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
 async fn fold_is_deterministic_incremental_and_serde_stable() {
@@ -61,9 +61,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
     // runnable ledger rows.
     assert!(once.inflight.is_empty());
     for envelope in &events {
-        if let Some((lionclaw_mission_engine::model::IdemClass::Request, key)) =
-            envelope.event.idempotency()
-        {
+        if let Some((lionclaw::model::IdemClass::Request, key)) = envelope.event.idempotency() {
             let status = h
                 .engine
                 .store()
@@ -129,7 +127,7 @@ async fn snapshot_resume_matches_full_refold() {
         .expect("meta")
         .expect("advance() must have written a snapshot");
     assert_eq!(upto, head, "snapshot must cover the whole log");
-    assert_eq!(reducer, lionclaw_mission_engine::model::REDUCER_VERSION);
+    assert_eq!(reducer, lionclaw::model::REDUCER_VERSION);
 
     // Loading via the snapshot path must equal a fresh full fold of the log.
     let via_snapshot = h

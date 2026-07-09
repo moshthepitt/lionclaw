@@ -15,7 +15,7 @@ cargo test --workspace
 # podman and the runtime image. Skip cleanly where either is absent.
 if command -v podman >/dev/null 2>&1 \
     && podman image exists localhost/lionclaw-runtime-dev:v1 2>/dev/null; then
-    cargo run -q -p lionclaw-cli -- mission self-test
+    cargo run -q -p lionclaw -- mission self-test
 else
     echo "skipping mission self-test (podman or runtime image unavailable)"
 fi

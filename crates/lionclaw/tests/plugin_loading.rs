@@ -3,10 +3,10 @@
 
 use std::path::PathBuf;
 
-use lionclaw_mission_engine::authority::AuthorityCeiling;
-use lionclaw_mission_engine::authority::MoatViolation;
-use lionclaw_mission_engine::model::{OutputSemantics, StopBar};
-use lionclaw_mission_engine::plugin::{load_plugin, PluginError};
+use lionclaw::authority::AuthorityCeiling;
+use lionclaw::authority::MoatViolation;
+use lionclaw::model::{OutputSemantics, StopBar};
+use lionclaw::plugin::{load_plugin, PluginError};
 
 fn repo_root() -> PathBuf {
     // <crate>/tests/plugin_loading.rs → repo root is three parents up from
@@ -33,9 +33,9 @@ fn software_dev_plugin_loads() {
         .find(|r| r.output == OutputSemantics::ProducesArtifact)
         .expect("has an implementer role");
     assert_eq!(implementer.runtime.as_deref(), Some("codex"));
-    assert!(plugin.oracles.contains_key(
-        &lionclaw_mission_engine::model::OracleName::new("cargo-test").expect("name")
-    ));
+    assert!(plugin
+        .oracles
+        .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
 }
 
 #[test]

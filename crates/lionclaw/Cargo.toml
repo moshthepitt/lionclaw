@@ -1,11 +1,15 @@
 [package]
-name = "lionclaw-mission-engine"
+name = "lionclaw"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "lionclaw"
+path = "src/main.rs"
 
 [features]
 testing = []
@@ -29,8 +33,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-lionclaw-mission-engine = { path = ".", features = ["testing"] }
+lionclaw = { path = ".", features = ["testing"] }
 lionclaw-runtime-mock.workspace = true

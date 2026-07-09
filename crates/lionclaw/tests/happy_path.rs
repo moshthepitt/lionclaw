@@ -4,9 +4,9 @@
 mod common;
 
 use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::engine::AdvanceOutcome;
-use lionclaw_mission_engine::model::{FinishClass, MissionPhase, TaskStatus};
-use lionclaw_mission_engine::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::engine::AdvanceOutcome;
+use lionclaw::model::{FinishClass, MissionPhase, TaskStatus};
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
 async fn passing_oracle_yields_verified_finish() {
@@ -112,10 +112,10 @@ async fn worker_reporting_not_done_parks_with_attention() {
     let h = harness(
         dir.path(),
         MockRoleRunner::new(Box::new(|_| {
-            Ok(lionclaw_mission_engine::ports::RoleRunOutcome {
-                handoff: lionclaw_mission_engine::model::Handoff::Work {
+            Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: lionclaw::model::Handoff::Work {
                     done: false,
-                    report: lionclaw_mission_engine::model::PayloadRef::inline("stuck"),
+                    report: lionclaw::model::PayloadRef::inline("stuck"),
                     request_attention: false,
                 },
                 artifact: None,

@@ -7,16 +7,16 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lionclaw_mission_engine::authority::AuthorityCeiling;
-use lionclaw_mission_engine::engine::Engine;
-use lionclaw_mission_engine::model::{
+use lionclaw::authority::AuthorityCeiling;
+use lionclaw::engine::Engine;
+use lionclaw::model::{
     AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
     PlanSubmission, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
-use lionclaw_mission_engine::plugin::load_plugin;
-use lionclaw_mission_engine::ports::{RoleRunOutcome, RoleRunRequest};
-use lionclaw_mission_engine::store::MissionStore;
-use lionclaw_mission_engine::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::plugin::load_plugin;
+use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::store::MissionStore;
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -32,10 +32,7 @@ fn moat_refuses_over_privileged_judge_plugin() {
     )
     .expect_err("an over-privileged judge must refuse to load");
     assert!(
-        matches!(
-            err,
-            lionclaw_mission_engine::plugin::PluginError::Moat { .. }
-        ),
+        matches!(err, lionclaw::plugin::PluginError::Moat { .. }),
         "expected a typed moat violation, got {err:?}"
     );
 }
@@ -76,7 +73,7 @@ async fn advisory_only_plugin_never_verifies() {
             }
         };
         let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
-            lionclaw_mission_engine::model::ArtifactOutcome {
+            lionclaw::model::ArtifactOutcome {
                 base_sha: req.base_sha.clone(),
                 head_sha: "head-1".to_string(),
             }
@@ -108,7 +105,7 @@ async fn advisory_only_plugin_never_verifies() {
         .expect("create");
     // One oracle-less assertion, covered by a worker and judged by a reviewer.
     let plan = PlanSubmission {
-        assertions: vec![lionclaw_mission_engine::model::Assertion {
+        assertions: vec![lionclaw::model::Assertion {
             id: AssertionId::new("READABLE").unwrap(),
             prose: "the code reads cleanly".to_string(),
             oracle: None,

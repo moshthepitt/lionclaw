@@ -4,9 +4,9 @@
 mod common;
 
 use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::model::{MissionEvent, PayloadRef, RoleName, TaskId};
-use lionclaw_mission_engine::store::NewEvent;
-use lionclaw_mission_engine::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw::model::{MissionEvent, PayloadRef, RoleName, TaskId};
+use lionclaw::store::NewEvent;
+use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
 async fn expired_lease_is_reclaimable_exactly_once() {

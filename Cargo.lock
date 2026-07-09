@@ -1075,15 +1075,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "lionclaw-cli"
+name = "lionclaw"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
- "lionclaw-mission-engine",
+ "hex",
+ "lionclaw",
+ "lionclaw-confinement",
+ "lionclaw-durable-fs",
+ "lionclaw-runtime-acp",
+ "lionclaw-runtime-api",
+ "lionclaw-runtime-codex",
+ "lionclaw-runtime-mock",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "toml",
+ "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1112,33 +1128,6 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "rustix",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "lionclaw-mission-engine"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "hex",
- "lionclaw-confinement",
- "lionclaw-durable-fs",
- "lionclaw-mission-engine",
- "lionclaw-runtime-acp",
- "lionclaw-runtime-api",
- "lionclaw-runtime-codex",
- "lionclaw-runtime-mock",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
  "tracing",
  "uuid",
 ]

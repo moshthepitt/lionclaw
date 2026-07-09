@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use lionclaw_mission_engine::engine::Engine;
-use lionclaw_mission_engine::model::{
+use lionclaw::engine::Engine;
+use lionclaw::model::{
     Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, PlanSubmission, RoleName,
     StopBar, Task, TaskKind,
 };
-use lionclaw_mission_engine::plugin::{LoadedPlugin, RoleDefinition};
-use lionclaw_mission_engine::store::MissionStore;
-use lionclaw_mission_engine::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::plugin::{LoadedPlugin, RoleDefinition};
+use lionclaw::store::MissionStore;
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
 
 pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
 pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
@@ -109,12 +109,12 @@ pub fn simple_plan() -> PlanSubmission {
 }
 
 pub trait ParseTask {
-    fn parse_task(&self) -> lionclaw_mission_engine::model::TaskId;
+    fn parse_task(&self) -> lionclaw::model::TaskId;
 }
 
 impl ParseTask for str {
-    fn parse_task(&self) -> lionclaw_mission_engine::model::TaskId {
-        lionclaw_mission_engine::model::TaskId::new(self).expect("task id")
+    fn parse_task(&self) -> lionclaw::model::TaskId {
+        lionclaw::model::TaskId::new(self).expect("task id")
     }
 }
 

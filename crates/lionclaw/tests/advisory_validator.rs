@@ -7,25 +7,25 @@ mod common;
 use std::sync::Arc;
 
 use common::{advisory_plan, test_plugin, BASE_SHA, HEAD_SHA};
-use lionclaw_mission_engine::engine::Engine;
-use lionclaw_mission_engine::model::{
+use lionclaw::engine::Engine;
+use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
 };
-use lionclaw_mission_engine::ports::{RoleRunOutcome, RoleRunRequest};
-use lionclaw_mission_engine::store::MissionStore;
-use lionclaw_mission_engine::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::store::MissionStore;
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
 
 /// A role-aware mock: verdict roles return a ValidateHandoff, others a work
 /// handoff that "commits" HEAD_SHA.
 fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
-        use lionclaw_mission_engine::model::OutputSemantics;
+        use lionclaw::model::OutputSemantics;
         let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
             Handoff::Validate {
                 done: true,
                 report: PayloadRef::inline("reviewed"),
                 items: vec![ValidationItem {
-                    item_id: lionclaw_mission_engine::model::AssertionId::new("STYLE-OK").unwrap(),
+                    item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
                     passed: reviewer_passes,
                 }],
                 passed: reviewer_passes,
@@ -39,7 +39,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
             }
         };
         let artifact = (req.role.output == OutputSemantics::ProducesArtifact).then(|| {
-            lionclaw_mission_engine::model::ArtifactOutcome {
+            lionclaw::model::ArtifactOutcome {
                 base_sha: req.base_sha.clone(),
                 head_sha: HEAD_SHA.to_string(),
             }
@@ -67,7 +67,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             dir.path().to_str().unwrap(),
             "advisory-only mission",
             BASE_SHA,
-            lionclaw_mission_engine::model::MissionConfig {
+            lionclaw::model::MissionConfig {
                 ratification_gate: false,
                 ..Default::default()
             },
@@ -82,7 +82,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
     let state = engine.load_state(&mission_id).await.expect("state");
     let advisory = state
         .contract
-        .get(&lionclaw_mission_engine::model::AssertionId::new("STYLE-OK").unwrap())
+        .get(&lionclaw::model::AssertionId::new("STYLE-OK").unwrap())
         .expect("assertion")
         .advisory;
     (state.phase, advisory)
