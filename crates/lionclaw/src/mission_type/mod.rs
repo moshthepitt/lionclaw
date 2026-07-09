@@ -11,8 +11,10 @@
 //! ```
 
 mod frontmatter;
+mod home;
 mod loader;
 
+pub use home::{bundled_mission_types_dir, Home};
 pub use loader::{load_mission_type, MissionTypeError};
 
 use std::collections::{BTreeMap, BTreeSet};

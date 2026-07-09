@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::authority::AuthorityCeiling;
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
-use crate::mission_type::load_mission_type;
+use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
 use crate::model::{fold, MissionConfig, MissionId, MissionPhase};
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
@@ -28,9 +28,24 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Install the bundled mission types into `~/.lionclaw` (run once).
+    Install(InstallArgs),
+    /// Check the install: podman, git, and each installed mission type + image.
+    Doctor,
     /// Mission engine commands.
     #[command(subcommand)]
     Mission(MissionCommand),
+}
+
+#[derive(Args)]
+pub struct InstallArgs {
+    /// Source directory of mission types to install (defaults to the ones
+    /// bundled with this binary).
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+    /// Overwrite mission types already installed.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Subcommand)]
@@ -54,11 +69,44 @@ pub enum MissionCommand {
     Ratify(RatifyArgs),
     /// Resolve an open attention item.
     Decide(DecideArgs),
-    /// Validate a mission type directory (loader + moat) without starting anything.
-    Plugin(PluginArgs),
+    /// Inspect installed mission types.
+    #[command(subcommand)]
+    Type(TypeCommand),
     /// Drive the real stack end-to-end and assert the Slice-1 invariants
     /// (needs podman; model-auth-free).
     SelfTest(SelfTestArgs),
+}
+
+#[derive(Subcommand)]
+pub enum TypeCommand {
+    /// List installed mission types.
+    List(TypeListArgs),
+    /// Show one installed mission type (roles, oracles, stop bar, playbook).
+    Show(TypeShowArgs),
+    /// Validate a mission type directory (loader + moat) without installing it.
+    Check(TypeCheckArgs),
+}
+
+#[derive(Args)]
+pub struct TypeListArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TypeShowArgs {
+    /// Installed mission type name.
+    pub name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TypeCheckArgs {
+    /// Mission type directory to validate.
+    pub dir: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -177,22 +225,18 @@ pub struct LogArgs {
 }
 
 #[derive(Args)]
-pub struct PluginArgs {
-    pub dir: PathBuf,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args)]
 pub struct SelfTestArgs {
     #[arg(long)]
     pub json: bool,
 }
 
 /// Run a command, returning the process exit code (so callers can gate on
-/// e.g. `plugin check` without the command itself calling `process::exit`).
+/// e.g. `type check` without the command itself calling `process::exit`).
 pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
+    use std::process::ExitCode;
     match cli.command {
+        Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
+        Command::Doctor => cmd_doctor().await,
         Command::Mission(cmd) => run_mission(cmd).await,
     }
 }
@@ -209,7 +253,7 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Plugin(args) => cmd_plugin(args).await,
+        MissionCommand::Type(cmd) => cmd_type(cmd).await,
         MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
     }
 }
@@ -471,36 +515,210 @@ async fn cmd_log(args: LogArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_plugin(args: PluginArgs) -> Result<std::process::ExitCode> {
-    match load_mission_type(&args.dir, &AuthorityCeiling::default()) {
-        Ok(plugin) => {
+async fn cmd_install(args: InstallArgs) -> Result<()> {
+    let home = Home::from_env()?;
+    let source = match args.from {
+        Some(dir) => dir,
+        None => bundled_mission_types_dir()?,
+    };
+    let dest_dir = home.mission_types_dir();
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("creating '{}'", dest_dir.display()))?;
+
+    let mut installed = Vec::new();
+    for entry in
+        std::fs::read_dir(&source).with_context(|| format!("reading '{}'", source.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let dest = dest_dir.join(&name);
+        if dest.exists() {
+            if !args.force {
+                println!(
+                    "skip {} (already installed; --force to overwrite)",
+                    name.to_string_lossy()
+                );
+                continue;
+            }
+            std::fs::remove_dir_all(&dest)
+                .with_context(|| format!("removing '{}'", dest.display()))?;
+        }
+        // Validate before installing: an invalid mission type never lands.
+        load_mission_type(&entry.path(), &AuthorityCeiling::default())
+            .with_context(|| format!("mission type '{}' is invalid", name.to_string_lossy()))?;
+        copy_tree(&entry.path(), &dest)?;
+        println!("installed {}", name.to_string_lossy());
+        installed.push(name.to_string_lossy().into_owned());
+    }
+    if installed.is_empty() {
+        println!("nothing to install (all mission types already present)");
+    }
+    println!("home: {}", home.root().display());
+    Ok(())
+}
+
+/// Recursively copy a directory tree. `std::fs::copy` preserves Unix mode bits,
+/// so oracle executables stay executable.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("creating '{}'", dst.display()))?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copying '{}'", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_doctor() -> Result<std::process::ExitCode> {
+    use std::process::ExitCode;
+    let mut ok = true;
+    let mut check = |label: &str, pass: bool, detail: &str| {
+        println!(
+            "{} {label}{}",
+            if pass { "PASS" } else { "FAIL" },
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {detail}")
+            }
+        );
+        ok &= pass;
+    };
+
+    check("podman", command_ok("podman", &["--version"]).await, "");
+    check("git", command_ok("git", &["--version"]).await, "");
+
+    let home = Home::from_env()?;
+    let types = home.installed_mission_types()?;
+    if types.is_empty() {
+        check(
+            "mission types installed",
+            false,
+            "none — run `lionclaw install`",
+        );
+    }
+    for name in &types {
+        match load_mission_type(&home.mission_type_dir(name), &AuthorityCeiling::default()) {
+            Ok(mt) => {
+                let img = command_ok("podman", &["image", "exists", &mt.image]).await;
+                check(
+                    &format!("mission type '{name}'"),
+                    img,
+                    &if img {
+                        String::new()
+                    } else {
+                        format!("image '{}' not present", mt.image)
+                    },
+                );
+            }
+            Err(e) => check(&format!("mission type '{name}'"), false, &e.to_string()),
+        }
+    }
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+async fn command_ok(program: &str, args: &[&str]) -> bool {
+    tokio::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
+    use std::process::ExitCode;
+    match cmd {
+        TypeCommand::List(args) => {
+            let home = Home::from_env()?;
+            let types = home.installed_mission_types()?;
             if args.json {
+                println!("{}", serde_json::json!({ "mission_types": types }));
+            } else if types.is_empty() {
+                println!("no mission types installed (run `lionclaw install`)");
+            } else {
+                for name in types {
+                    println!("{name}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        TypeCommand::Show(args) => {
+            let home = Home::from_env()?;
+            let dir = home.mission_type_dir(&args.name);
+            show_mission_type(&dir, args.json)
+        }
+        TypeCommand::Check(args) => show_mission_type(&args.dir, args.json),
+    }
+}
+
+/// Load a mission type from `dir` and print it; nonzero exit if it fails to
+/// load (so a caller can gate on validity).
+fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
+    match load_mission_type(dir, &AuthorityCeiling::default()) {
+        Ok(mt) => {
+            if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "ok": true,
-                        "name": plugin.name,
-                        "roles": plugin.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
-                        "oracles": plugin.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
+                        "name": mt.name,
+                        "stop": format!("{:?}", mt.stop).to_lowercase(),
+                        "image": mt.image,
+                        "roles": mt.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
+                        "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
+                        "playbook": mt.playbook,
                     })
                 );
             } else {
-                println!("plugin '{}' is valid", plugin.name);
-                println!("  roles: {}", plugin.roles.len());
-                println!("  oracles: {}", plugin.oracles.len());
+                println!("mission type '{}' is valid", mt.name);
+                println!("  stop:  {:?}", mt.stop);
+                println!("  image: {}", mt.image);
+                println!(
+                    "  roles: {}",
+                    mt.roles
+                        .keys()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                println!(
+                    "  oracles: {}",
+                    mt.oracles
+                        .keys()
+                        .map(|o| o.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if let Some(playbook) = &mt.playbook {
+                    println!("\n--- playbook ---\n{playbook}");
+                }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
         Err(err) => {
-            if args.json {
+            if json {
                 println!(
                     "{}",
                     serde_json::json!({ "ok": false, "error": err.to_string() })
                 );
             } else {
-                eprintln!("plugin invalid: {err}");
+                eprintln!("mission type invalid: {err}");
             }
-            // Non-zero exit so a caller can gate on it.
             Ok(std::process::ExitCode::FAILURE)
         }
     }

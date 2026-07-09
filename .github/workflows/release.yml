@@ -89,7 +89,7 @@ jobs:
 
           mkdir -p "$RELEASE_DIR"
           cp target/release/lionclaw "$RELEASE_DIR/"
-          cp -R plugins "$RELEASE_DIR/mission-types"
+          cp -R mission-types "$RELEASE_DIR/mission-types"
           cp LICENSE "$RELEASE_DIR/"
 
           test -x "$RELEASE_DIR/lionclaw"
