@@ -38,7 +38,6 @@ fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
         runtime: None,
         network: false,
         secrets: false,
-        skills: Vec::new(),
         prompt_body: "role prose".to_string(),
     }
 }
@@ -62,7 +61,6 @@ fn planning_mission_type() -> MissionType {
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: planning_dag(),
-        root: "/nonexistent".into(),
         playbook: Some("plan carefully".to_string()),
         roles,
         oracles: BTreeMap::from([(

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::model::{ArtifactOutcome, Handoff, PayloadRef, RunErrorKind, TaskId};
+use crate::model::{ArtifactOutcome, Handoff, PayloadRef, TaskId};
 use crate::ports::{
     Clock, OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure,
     RoleRunOutcome, RoleRunRequest, RoleRunner,
@@ -60,16 +60,6 @@ impl MockRoleRunner {
                     head_sha: head_sha.clone(),
                 }),
                 model_id: Some("mock-model".to_string()),
-            })
-        }))
-    }
-
-    pub fn failing(kind: RunErrorKind, detail: &str) -> Self {
-        let detail = detail.to_string();
-        Self::new(Box::new(move |_| {
-            Err(RoleRunFailure {
-                kind,
-                detail: detail.clone(),
             })
         }))
     }

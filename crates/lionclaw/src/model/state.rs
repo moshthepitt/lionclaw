@@ -231,8 +231,7 @@ impl InflightEffect {
             | MissionEvent::OracleRunFailed { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
-            | MissionEvent::PlanAmended { .. }
-            | MissionEvent::PlanProposed { .. } => None,
+            | MissionEvent::PlanAmended { .. } => None,
         }
     }
 

@@ -65,7 +65,7 @@ CREATE TABLE mission_effect_attempts (
     attempt_id     TEXT PRIMARY KEY NOT NULL,
     effect_id      TEXT NOT NULL REFERENCES mission_effects (effect_id) ON DELETE CASCADE,
     worker_id      TEXT NOT NULL,
-    status         TEXT NOT NULL CHECK (status IN ('leased', 'completed', 'failed', 'stale_rejected')),
+    status         TEXT NOT NULL CHECK (status IN ('leased', 'completed', 'failed')),
     started_at_ms  INTEGER NOT NULL,
     finished_at_ms INTEGER
 ) STRICT;

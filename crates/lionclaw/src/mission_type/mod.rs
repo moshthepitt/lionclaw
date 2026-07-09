@@ -24,9 +24,9 @@ use crate::model::{
     MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
 };
 
-/// A role is property-composed data: open fields (name, prompt, skills,
-/// runtime) plus the closed engine-understood axes (`output`, and the plain
-/// `network`/`secrets` flags). There is no role "kind".
+/// A role is property-composed data: open fields (name, prompt, runtime) plus
+/// the closed engine-understood axes (`output`, and the plain `network`/
+/// `secrets` flags). There is no role "kind".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDefinition {
     pub name: RoleName,
@@ -35,7 +35,6 @@ pub struct RoleDefinition {
     pub runtime: Option<String>,
     pub network: bool,
     pub secrets: bool,
-    pub skills: Vec<String>,
     pub prompt_body: String,
 }
 
@@ -51,7 +50,6 @@ pub struct MissionType {
     /// The planning DAG (how an objective becomes a proposed contract). Empty
     /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
     pub planning: PlanningDag,
-    pub root: PathBuf,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,
     pub oracles: BTreeMap<OracleName, PathBuf>,

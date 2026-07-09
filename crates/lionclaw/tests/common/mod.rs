@@ -34,7 +34,6 @@ pub fn test_mission_type() -> MissionType {
         stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
-        root: "/nonexistent-mission-type".into(),
         playbook: None,
         roles: BTreeMap::from([
             (
@@ -45,7 +44,6 @@ pub fn test_mission_type() -> MissionType {
                     runtime: None,
                     network: false,
                     secrets: false,
-                    skills: Vec::new(),
                     prompt_body: "Fix the code.".to_string(),
                 },
             ),
@@ -57,7 +55,6 @@ pub fn test_mission_type() -> MissionType {
                     runtime: None,
                     network: false,
                     secrets: false,
-                    skills: Vec::new(),
                     prompt_body: "Judge the code.".to_string(),
                 },
             ),

@@ -359,7 +359,6 @@ mod tests {
             runtime: None,
             network: true,
             secrets,
-            skills: Vec::new(),
             prompt_body: "p".to_string(),
         }
     }

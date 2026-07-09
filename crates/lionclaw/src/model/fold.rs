@@ -220,15 +220,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             apply_amendment(state, *base_revision, ops);
         }
-        MissionEvent::PlanProposed { plan, .. } => {
-            // Manual escape hatch: a host-authored plan becomes the gradeless
-            // proposal, exactly like the in-engine author's, then rides the same
-            // ratify-then-promote path.
-            if state.plan.is_none() && state.proposal.is_none() {
-                state.proposal = Some(plan.clone());
-                state.proposal_engine_authored = false;
-            }
-        }
     }
     state.head = seq;
     // Promotion runs first: a just-ratified proposal must seed the contract

@@ -101,8 +101,6 @@ pub struct VersionStamps {
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_schema_hash: Option<String>,
 }
 
 /// What a role's agent handed back. Written by the agent as
@@ -272,14 +270,6 @@ pub enum MissionEvent {
         actor: String,
         justification: String,
     },
-    /// A plan proposed *manually* (not by the in-engine author) — the escape
-    /// hatch for a host that hand-authors a `PlanSubmission`. A fact event: the
-    /// fold sets `proposal` (gradeless), and it seeds the contract only after
-    /// ratification, exactly like an engine-authored proposal.
-    PlanProposed {
-        plan: PlanSubmission,
-        actor: String,
-    },
 }
 
 /// The operation set of one amendment. All fields default-empty, so an
@@ -360,7 +350,6 @@ impl MissionEvent {
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
             Self::PlanAmended { .. } => "plan_amended",
-            Self::PlanProposed { .. } => "plan_proposed",
         }
     }
 
@@ -393,8 +382,7 @@ impl MissionEvent {
             | Self::PlanSubmitted { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. }
-            | Self::PlanProposed { .. } => None,
+            | Self::PlanAmended { .. } => None,
         }
     }
 
@@ -411,8 +399,7 @@ impl MissionEvent {
             | Self::OracleRunRequested { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. }
-            | Self::PlanProposed { .. } => None,
+            | Self::PlanAmended { .. } => None,
         }
     }
 }

@@ -92,7 +92,6 @@ pub fn load_mission_type(
         stop,
         image: manifest.mission_type.image,
         planning: manifest.planning,
-        root: root.to_path_buf(),
         playbook,
         roles,
         oracles,
@@ -164,7 +163,6 @@ fn load_roles(
             runtime,
             network,
             secrets,
-            skills,
             prompt_body,
         };
         // Fail-closed moat check at load time: an authority that cannot

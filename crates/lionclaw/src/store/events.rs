@@ -350,7 +350,6 @@ impl MissionStore {
                 .map_err(|err| anyhow::anyhow!("corrupt effect '{effect_id}': {err}"))?;
             leases.push(EffectLease {
                 effect_id,
-                attempt_id,
                 request,
             });
         }
@@ -411,7 +410,6 @@ impl EffectStatus {
 #[derive(Debug, Clone)]
 pub struct EffectLease {
     pub effect_id: String,
-    pub attempt_id: String,
     pub request: InflightEffect,
 }
 
