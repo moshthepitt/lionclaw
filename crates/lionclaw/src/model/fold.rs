@@ -1756,6 +1756,36 @@ mod tests {
         }
     }
 
+    // Regression (QA): the freshness filter in classify_finish. A fresh
+    // authoritative pass verifies; if the artifact head then moves past the
+    // judged commit, the SAME pass is stale and must no longer count toward
+    // Verified. Removing the `is_fresh_at` filter would keep this Verified.
+    #[test]
+    fn classify_finish_ignores_a_stale_authoritative_pass() {
+        let mut state = fold_log(vec![
+            created(),
+            plan_submitted(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("t1")],
+            ),
+            role_completed("t1", "kr", work_handoff(true, false), None),
+            oracle_completed("TESTS-PASS", "base", "ko", 0),
+        ])
+        .expect("state");
+        assert_eq!(
+            classify_finish(&state),
+            FinishClass::Verified,
+            "a fresh pass verifies"
+        );
+        // The head advances past the judged commit: the verdict is now stale.
+        state.current_sha = "moved-on".into();
+        assert_eq!(
+            classify_finish(&state),
+            FinishClass::Unverified,
+            "a stale pass must not verify"
+        );
+    }
+
     // Regression (QA): a signal-killed oracle (clean exit_code 0 but a signal)
     // is NOT a pass — the honesty floor requires no signal. Pins the
     // `exit_signal.is_none()` clause so it can't silently regress.

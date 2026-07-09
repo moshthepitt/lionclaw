@@ -366,3 +366,110 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
     );
     assert!(state.plan.is_none());
 }
+
+/// Drive planning where the author hands back `author_handoff`, returning the
+/// parked state.
+async fn park_after_author(dir: &std::path::Path, author_handoff: Handoff) -> lionclaw::model::MissionState {
+    let store = MissionStore::open(dir).await.expect("store");
+    let runner = MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
+        let handoff = if req.role.output == OutputSemantics::ProposesPlan {
+            author_handoff.clone()
+        } else {
+            Handoff::Work {
+                done: true,
+                report: PayloadRef::inline("report"),
+                request_attention: false,
+            }
+        };
+        Ok(RoleRunOutcome {
+            handoff,
+            artifact: None,
+            model_id: None,
+        })
+    }));
+    let engine = Engine::new(
+        store,
+        planning_mission_type(),
+        "codex".to_string(),
+        "img".to_string(),
+        Arc::new(runner),
+        Arc::new(MockOracleRunner::exiting(0)),
+        Arc::new(MockClock::default()),
+    );
+    let id = engine
+        .create_mission(
+            &dir.to_string_lossy(),
+            "obj",
+            BASE_SHA,
+            MissionConfig {
+                ratification_gate: true,
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+            },
+        )
+        .await
+        .unwrap();
+    engine.advance(&id).await.unwrap();
+    engine.load_state(&id).await.unwrap()
+}
+
+fn assert_author_failed_seeding_nothing(state: &lionclaw::model::MissionState) {
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert!(
+        state.open_attention.values().any(|a| a.kind == AttentionKind::NodeFailed
+            && a.task_id.as_ref() == Some(&tid("author"))),
+        "the author node failed"
+    );
+    assert!(state.proposal.is_none(), "a bad handoff seeds no proposal");
+    assert!(state.contract.is_empty());
+}
+
+/// The engine re-validates the author's Handoff::Plan fail-closed before it can
+/// become a ratifiable proposal — neither a done-with-no-proposal nor a proposal
+/// that fails plan validation slips through.
+#[tokio::test]
+async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
+    // (a) `done` but proposed nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let state = park_after_author(
+        dir.path(),
+        Handoff::Plan {
+            done: true,
+            report: PayloadRef::inline("no plan"),
+            proposal: None,
+            request_attention: false,
+        },
+    )
+    .await;
+    assert_author_failed_seeding_nothing(&state);
+
+    // (b) a proposal that fails validation under the `verified` stop bar (an
+    // oracle-less assertion).
+    let invalid = PlanSubmission {
+        assertions: vec![Assertion {
+            id: aid("UNCHECKABLE"),
+            prose: "no oracle can prove this".to_string(),
+            oracle: None,
+        }],
+        tasks: vec![Task {
+            id: tid("fix"),
+            kind: TaskKind::Work,
+            body: "x".to_string(),
+            targets: vec![aid("UNCHECKABLE")],
+            role: Some(rn("implementer")),
+            depends_on: vec![],
+        }],
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let state = park_after_author(
+        dir.path(),
+        Handoff::Plan {
+            done: true,
+            report: PayloadRef::inline("bad plan"),
+            proposal: Some(invalid),
+            request_attention: false,
+        },
+    )
+    .await;
+    assert_author_failed_seeding_nothing(&state);
+}

@@ -53,6 +53,12 @@ impl BlobStore {
         if blob.algo != "sha256" {
             bail!("unsupported blob algo '{}'", blob.algo);
         }
+        // The ref can come from an agent-authored handoff (PayloadRef::Blob), so
+        // validate the hex before slicing it into a path — a short or non-hex
+        // value must be a clean error, never a panic (byte-index/char-boundary).
+        if blob.hex.len() != 64 || !blob.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("malformed blob hex '{}'", blob.hex);
+        }
         let path = self
             .root
             .join("sha256")
@@ -147,5 +153,21 @@ mod tests {
         std::fs::set_permissions(&path, perms).expect("chmod");
         std::fs::write(&path, b"tampered").expect("tamper");
         assert!(store.get(&blob).is_err());
+    }
+
+    // A BlobRef can come from an agent-authored handoff, so a malformed hex must
+    // return an error, never panic on the `[..2]`/`[2..4]` path slicing.
+    #[test]
+    fn get_rejects_a_malformed_hex_ref_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path().to_path_buf());
+        for hex in ["", "a", "ab", "é", &"z".repeat(64), &"a".repeat(63)] {
+            let bad = BlobRef {
+                algo: "sha256".to_string(),
+                hex: hex.to_string(),
+                len: 0,
+            };
+            assert!(store.get(&bad).is_err(), "hex {hex:?} must be rejected");
+        }
     }
 }
