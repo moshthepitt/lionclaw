@@ -212,8 +212,8 @@ impl MissionStore {
     /// rebuild). Inflight effects whose outcome is already recorded are, by
     /// definition, absent from `inflight`.
     ///
-    /// Reproducible effects (oracles, terminal review) reseed as `queued` —
-    /// a re-run is safe. A role run reseeds as an **expired lease**: the
+    /// Reproducible effects (oracles) reseed as `queued` — a re-run is safe.
+    /// A role run reseeds as an **expired lease**: the
     /// "an attempt was started" fact is otherwise ledger-only, and losing it
     /// would let a rebuild re-invoke the LLM. An expired lease makes reconcile
     /// synthesize failure instead (never re-run a possibly-already-run LLM).

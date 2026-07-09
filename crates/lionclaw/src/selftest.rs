@@ -1,6 +1,7 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants. Hermetic and model-auth-free — the *oracle*
+//! four Slice-1 invariants plus the re-planning/amendment invariant (five
+//! numbered checks). Hermetic and model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
 //!

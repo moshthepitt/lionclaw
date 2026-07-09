@@ -278,10 +278,13 @@ impl Engine {
             .load_state_snapshotted(mission_id)
             .await?
             .with_context(|| format!("mission {mission_id} not found"))?;
-        // The instrument of judgment is pinned: every engine open verifies the
-        // mission type's content digest against the one recorded at start, so a
-        // mutated role or oracle cannot advance this mission (the fake-green
-        // vector). This is the single funnel — every engine method loads here.
+        // The instrument of judgment is pinned: this verifies the mission type's
+        // content digest against the one recorded at start, so a mutated role or
+        // oracle cannot advance this mission (the fake-green vector). Every method
+        // that loads the pinned type — submit_plan, amend_plan, advance/drive —
+        // funnels here. `decide`/`record_decision` are deliberately store-only
+        // (no type loaded): a decision mints no verdict, and the next `advance`
+        // re-verifies the digest before any oracle can run.
         if state.mission_type.digest != self.mission_type.digest {
             let short = |d: &str| d.chars().take(12).collect::<String>();
             bail!(
@@ -350,7 +353,7 @@ impl Engine {
 
     /// Settle inflight effects whose ledger row is no longer runnable: a
     /// role run mid-crash is unknowable → synthesized failure (zenith's
-    /// `_reconcile_pending_attempts` discipline); an oracle or review run is
+    /// `_reconcile_pending_attempts` discipline); an oracle run is
     /// reproducible → re-queued. Returns true when an event was appended
     /// (caller must refold before driving).
     ///

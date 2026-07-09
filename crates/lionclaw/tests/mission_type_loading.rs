@@ -9,8 +9,8 @@ use lionclaw::mission_type::{load_mission_type, MissionTypeError};
 use lionclaw::model::{OutputSemantics, StopBar};
 
 fn repo_root() -> PathBuf {
-    // <crate>/tests/plugin_loading.rs → repo root is three parents up from
-    // the crate dir.
+    // <crate>/tests/mission_type_loading.rs → repo root is two parents up from
+    // the crate manifest dir (crates/lionclaw → crates → repo root).
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
