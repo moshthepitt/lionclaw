@@ -61,61 +61,16 @@ JSON
     [ "$pass" -ge 2 ] && echo "  => SCENARIO 1 PASS" || echo "  => SCENARIO 1 FAIL"
 }
 
-# --- Scenario 2: reviewer catches a planted regression ---------------------
-# The harness commits a patch that keeps `cargo test` GREEN but breaks the
-# documented capacity invariant, then dispatches the reviewer against that
-# commit. The reviewer must return passed:false for the invariant assertion.
-scenario_planted_regression() {
-    local pass=0
-    for i in $(seq 1 "$RUNS"); do
-        local repo="$WORK/cache-$i"
-        materialize "$FIXTURES/cache-invariant" "$repo"
-        # Plant the regression: remove the eviction so capacity can be
-        # exceeded. Existing tests never overflow, so they stay green.
-        python3 - "$repo/src/lib.rs" <<'PY'
-import sys, re
-p = sys.argv[1]
-s = open(p).read()
-s = s.replace(
-    "        if self.values.len() >= self.capacity {\n            let oldest = self.order.remove(0);\n            self.values.retain(|(k, _)| k != &oldest);\n        }\n",
-    "        // regression: eviction removed; capacity can now be exceeded\n")
-open(p, "w").write(s)
-PY
-        git_quiet -C "$repo" commit -aqm "perf: drop eviction on insert"
-        local regressed; regressed="$(git -C "$repo" rev-parse HEAD)"
+# NOTE: the former "reviewer catches a planted regression" scenario was removed.
+# It needs a reviewer-only (oracle-less) assertion, which is only submittable
+# under a `stop = reviewed` mission type — and no product mission type ships with
+# that bar today (software-dev is `verified`, which rejects an oracle-less
+# assertion at submit). The advisory-only-can't-verify behavior it checked stays
+# covered deterministically by `cargo test --test eval_deterministic`. Restore an
+# agentic reviewer scenario once a `reviewed`-stop mission type (e.g. code-review)
+# ships.
 
-        local mid; mid="$(mission_json start --type software-dev --repo "$repo" \
-            --objective "Review the cache for correctness against its documented invariant." --yes \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
-        # A no-op work task keeps the (regressed) commit as the judged state,
-        # then the reviewer judges it.
-        cat > "$repo/plan.json" <<JSON
-{ "assertions": [ { "id": "CAP-INVARIANT", "prose": "BoundedCache.len() never exceeds capacity(); insertion past capacity must evict the oldest entry" } ],
-  "tasks": [ { "id": "keep", "kind": "work", "body": "Do not change any code. Add a one-line comment to src/lib.rs acknowledging the review is pending, then commit.", "targets": ["CAP-INVARIANT"], "role": "implementer", "depends_on": [] },
-             { "id": "review", "kind": "validate", "body": "Judge whether BoundedCache preserves its documented capacity invariant. Read put(); if inserting past capacity no longer evicts, the invariant is VIOLATED and you must report passed:false for CAP-INVARIANT.", "targets": ["CAP-INVARIANT"], "role": "reviewer", "depends_on": ["keep"] } ] }
-JSON
-        "$BIN" mission submit-plan "$mid" --repo "$repo" --plan "$repo/plan.json" >/dev/null 2>&1
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
-        local status; status="$(mission_json status "$mid" --repo "$repo")"
-        # The reviewer must have marked CAP-INVARIANT advisory=failed, AND the
-        # mission must NOT be verified (advisory alone can't verify).
-        local advisory finish; advisory="$(echo "$status" | python3 -c '
-import sys,json
-d=json.load(sys.stdin)
-c=[a for a in d["contract"] if a["id"]=="CAP-INVARIANT"]
-print(c[0]["advisory"] if c else "missing")')"
-        finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
-        if [ "$advisory" = "failed" ] && [ "$finish" != "verified" ]; then
-            echo "  run $i: PASS (reviewer caught it: advisory=failed, finish=$finish)"; pass=$((pass+1))
-        else
-            echo "  run $i: FAIL (advisory=$advisory, finish=$finish, regressed=$regressed)"
-        fi
-    done
-    echo "scenario 2 (planted regression): $pass/$RUNS caught"
-    [ "$pass" -ge 2 ] && echo "  => SCENARIO 2 PASS" || echo "  => SCENARIO 2 FAIL"
-}
-
-# --- Scenario 3: planning-in-phase -> ratify -> verified -------------------
+# --- Scenario 2: planning-in-phase -> ratify -> verified -------------------
 # No hand-written plan: the planning DAG (strategist -> red-team -> author)
 # proposes the contract, a human ratifies it, then execution verifies. The
 # ratification gate is ON (no --yes), so planning must park before any work.
@@ -145,14 +100,12 @@ scenario_planning() {
             echo "  run $i: FAIL (phase-after-plan=$phase, finish=$finish, head=$head, base=$base)"
         fi
     done
-    echo "scenario 3 (planning -> ratify -> verified): $pass/$RUNS verified"
-    [ "$pass" -ge 2 ] && echo "  => SCENARIO 3 PASS" || echo "  => SCENARIO 3 FAIL"
+    echo "scenario 2 (planning -> ratify -> verified): $pass/$RUNS verified"
+    [ "$pass" -ge 2 ] && echo "  => SCENARIO 2 PASS" || echo "  => SCENARIO 2 FAIL"
 }
 
 echo "== Slice 6 agentic eval ($RUNS runs each) =="
 echo "[1] fixes the bug -> verified"
 scenario_fix_bug
-echo "[2] reviewer catches a planted regression"
-scenario_planted_regression
-echo "[3] planning -> ratify -> verified"
+echo "[2] planning -> ratify -> verified"
 scenario_planning
