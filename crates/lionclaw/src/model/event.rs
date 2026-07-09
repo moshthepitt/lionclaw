@@ -319,7 +319,9 @@ pub struct OracleBinding {
 pub enum DecisionAction {
     /// Approve the plan/contract at the ratification gate.
     Ratify,
-    /// Re-dispatch a failed node (valid only for `node_failed`).
+    /// Re-run a failed node, re-run a rejected proposal's planning DAG, or
+    /// re-open a failed oracle (valid for `node_failed`, `ratify_proposal`,
+    /// `oracle_failed`).
     Retry,
     /// Accept the current situation and proceed (accept a node failure, or
     /// confirm a cleared gate checkpoint).

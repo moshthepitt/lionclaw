@@ -91,11 +91,15 @@ jobs:
           cp target/release/lionclaw "$RELEASE_DIR/"
           cp -R mission-types "$RELEASE_DIR/mission-types"
           cp LICENSE "$RELEASE_DIR/"
+          # The binary compiles in Apache-2.0 code ported from Zenith; its
+          # license + attribution must travel with the distributed artifact.
+          cp crates/lionclaw/LICENSE-zenith "$RELEASE_DIR/"
 
           test -x "$RELEASE_DIR/lionclaw"
           test -f "$RELEASE_DIR/mission-types/software-dev/mission.toml"
           test -x "$RELEASE_DIR/mission-types/software-dev/oracles/cargo-test"
           test -f "$RELEASE_DIR/LICENSE"
+          test -f "$RELEASE_DIR/LICENSE-zenith"
 
           tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"
           (

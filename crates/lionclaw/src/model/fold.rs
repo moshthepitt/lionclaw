@@ -221,10 +221,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_phase(state);
 }
 
-/// Seed the execution contract + task DAG from a ratified proposal — the ONE
-/// path by which `state.contract`/`state.tasks` are ever populated, guarded by
+/// Seed the execution contract + task DAG from a ratified *proposal* (the
+/// in-engine author flow) — the sole promotion path, guarded by
 /// `plan.is_none()`. A proposal is gradeless until here; an engine-authored one
-/// (or any, under the ratification gate) needs a human `Ratify` first.
+/// (or any, under the ratification gate) needs a human `Ratify` first. A
+/// manually submitted plan is the other way the contract is seeded — directly,
+/// via the `PlanSubmitted` arm, gated instead by the ratification attention.
 fn derive_promotion(state: &mut MissionState) {
     if state.plan.is_some() || state.proposal.is_none() {
         return;

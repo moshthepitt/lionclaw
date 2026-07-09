@@ -252,8 +252,9 @@ pub enum AmendmentError {
     #[error("supersede of '{old}' names replacement '{new}' that is not in `add`")]
     ReplacementMissing { old: String, new: String },
     #[error(
-        "bind_oracle on assertion '{assertion}' would replace/unbind an oracle \
-         (the contract is strengthen-only; bind an unbound assertion)"
+        "bind_oracle names assertion '{assertion}' that is absent or already bound to a \
+         different oracle (the contract is strengthen-only; only an unbound assertion \
+         can take an oracle)"
     )]
     OracleUnbound { assertion: String },
     #[error("the resulting plan is invalid:\n{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
@@ -809,6 +810,18 @@ mod tests {
             ],
         );
         assert!(codes(&validate_on_author).contains(&"role_output_mismatch"));
+    }
+
+    // A gate whose target has no upstream validator can never clear — reject it
+    // at author time (group 6) rather than parking at run time. The only
+    // fault-injection test for this guard.
+    #[test]
+    fn a_gate_over_an_assertion_with_no_validator_is_rejected() {
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![work("w1", &["A1"], &[]), gate("g1", &["A1"], &["w1"])],
+        );
+        assert_eq!(codes(&sub), vec!["gate_target_uncovered"]);
     }
 
     #[test]
