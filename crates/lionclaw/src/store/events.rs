@@ -348,10 +348,7 @@ impl MissionStore {
             .await?;
             let request: InflightEffect = serde_json::from_str(&request_json)
                 .map_err(|err| anyhow::anyhow!("corrupt effect '{effect_id}': {err}"))?;
-            leases.push(EffectLease {
-                effect_id,
-                request,
-            });
+            leases.push(EffectLease { effect_id, request });
         }
         tx.commit().await?;
         Ok(leases)

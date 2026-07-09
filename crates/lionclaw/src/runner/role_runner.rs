@@ -108,9 +108,13 @@ impl RoleRunner for OciRoleRunner {
                     (clone.dir.clone(), MountAccess::ReadWrite, Some(clone))
                 } else {
                     let snapshot = dirs.root.join("snapshot");
-                    workspace::create_snapshot(&request.workspace_dir, &snapshot, &request.base_sha)
-                        .await
-                        .map_err(|e| launch(format!("failed to snapshot workspace: {e}")))?;
+                    workspace::create_snapshot(
+                        &request.workspace_dir,
+                        &snapshot,
+                        &request.base_sha,
+                    )
+                    .await
+                    .map_err(|e| launch(format!("failed to snapshot workspace: {e}")))?;
                     (snapshot, MountAccess::ReadOnly, None)
                 }
             };
