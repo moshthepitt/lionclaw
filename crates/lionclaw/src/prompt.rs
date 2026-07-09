@@ -53,7 +53,6 @@ fn skeleton(output: OutputSemantics) -> &'static str {
         OutputSemantics::ProducesArtifact => PRODUCES_ARTIFACT_SKELETON,
         OutputSemantics::EmitsVerdict => EMITS_VERDICT_SKELETON,
         OutputSemantics::Plans => PLANS_SKELETON,
-        OutputSemantics::Egresses => EGRESSES_SKELETON,
     }
 }
 
@@ -106,18 +105,6 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
     \"type\": \"work\",
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<your plan>\"},
-    \"request_attention\": false}";
-
-const EGRESSES_SKELETON: &str = "\
-You are a communication role in an engineering mission. Compose the outbound
-content the task asks for in your handoff report; the engine controls actual
-delivery.
-
-When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.work-handoff.v1\",
-    \"type\": \"work\",
-    \"done\": true,
-    \"report\": {\"kind\": \"inline\", \"text\": \"<the composed content>\"},
     \"request_attention\": false}";
 
 #[cfg(test)]

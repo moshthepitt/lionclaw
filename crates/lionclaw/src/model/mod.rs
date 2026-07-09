@@ -25,7 +25,7 @@ pub use event::{
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
-pub use plan::{derive_kind, Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
+pub use plan::{Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
 pub use plan_validation::{
     validate_plan_amendment, validate_plan_submission, AmendmentError, PlanValidationError,
     PluginInventory,

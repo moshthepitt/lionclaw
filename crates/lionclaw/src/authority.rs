@@ -108,9 +108,7 @@ pub fn compile_authority(
 ) -> Result<CompiledAuthority, MoatViolation> {
     let workspace_access = match role.output {
         OutputSemantics::ProducesArtifact => WorkspaceAccess::ReadWrite,
-        OutputSemantics::Plans | OutputSemantics::EmitsVerdict | OutputSemantics::Egresses => {
-            WorkspaceAccess::ReadOnly
-        }
+        OutputSemantics::Plans | OutputSemantics::EmitsVerdict => WorkspaceAccess::ReadOnly,
     };
     if role.secrets && role.output == OutputSemantics::EmitsVerdict {
         // Fail closed rather than silently clamp: a judge asking for secrets
@@ -318,7 +316,6 @@ fn kind_slug(output: OutputSemantics) -> &'static str {
         OutputSemantics::Plans => "plans",
         OutputSemantics::ProducesArtifact => "produces-artifact",
         OutputSemantics::EmitsVerdict => "emits-verdict",
-        OutputSemantics::Egresses => "egresses",
     }
 }
 
@@ -392,11 +389,7 @@ mod tests {
         let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
             .expect("worker");
         assert_eq!(worker.preset().workspace_access, WorkspaceAccess::ReadWrite);
-        for output in [
-            OutputSemantics::Plans,
-            OutputSemantics::EmitsVerdict,
-            OutputSemantics::Egresses,
-        ] {
+        for output in [OutputSemantics::Plans, OutputSemantics::EmitsVerdict] {
             let authority = compile_authority(&role(output, false), &ceiling).expect("read-only");
             assert_eq!(
                 authority.preset().workspace_access,

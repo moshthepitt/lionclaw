@@ -108,9 +108,8 @@ fn parse_output(value: &str) -> Result<OutputSemantics, String> {
         "plans" => Ok(OutputSemantics::Plans),
         "produces-artifact" => Ok(OutputSemantics::ProducesArtifact),
         "emits-verdict" => Ok(OutputSemantics::EmitsVerdict),
-        "egresses" => Ok(OutputSemantics::Egresses),
         other => Err(format!(
-            "output must be one of plans|produces-artifact|emits-verdict|egresses, got '{other}'"
+            "output must be one of plans|produces-artifact|emits-verdict, got '{other}'"
         )),
     }
 }

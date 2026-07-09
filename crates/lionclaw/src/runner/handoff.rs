@@ -14,9 +14,7 @@ pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v1"
 pub fn expected_schema(output: OutputSemantics) -> &'static str {
     match output {
         OutputSemantics::EmitsVerdict => VALIDATE_HANDOFF_SCHEMA,
-        OutputSemantics::Plans | OutputSemantics::ProducesArtifact | OutputSemantics::Egresses => {
-            WORK_HANDOFF_SCHEMA
-        }
+        OutputSemantics::Plans | OutputSemantics::ProducesArtifact => WORK_HANDOFF_SCHEMA,
     }
 }
 

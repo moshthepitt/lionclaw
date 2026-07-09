@@ -308,9 +308,9 @@ fn check_shape(
                 // Routing is bound to output semantics, never to names.
                 let compatible = match output {
                     OutputSemantics::EmitsVerdict => task.kind == TaskKind::Validate,
-                    OutputSemantics::Plans
-                    | OutputSemantics::ProducesArtifact
-                    | OutputSemantics::Egresses => task.kind == TaskKind::Work,
+                    OutputSemantics::Plans | OutputSemantics::ProducesArtifact => {
+                        task.kind == TaskKind::Work
+                    }
                 };
                 if !compatible {
                     errors.push(err(
@@ -518,10 +518,6 @@ mod tests {
         roles.insert(
             RoleName::new("planner").expect("valid role name"),
             OutputSemantics::Plans,
-        );
-        roles.insert(
-            RoleName::new("courier").expect("valid role name"),
-            OutputSemantics::Egresses,
         );
         PluginInventory {
             roles,

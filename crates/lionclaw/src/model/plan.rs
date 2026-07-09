@@ -17,17 +17,6 @@ pub enum OutputSemantics {
     Plans,
     ProducesArtifact,
     EmitsVerdict,
-    Egresses,
-}
-
-/// Derived display label — zero enforcement power.
-pub fn derive_kind(output: OutputSemantics) -> &'static str {
-    match output {
-        OutputSemantics::Plans => "orchestrator",
-        OutputSemantics::ProducesArtifact => "worker",
-        OutputSemantics::EmitsVerdict => "validator",
-        OutputSemantics::Egresses => "communicator",
-    }
 }
 
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
