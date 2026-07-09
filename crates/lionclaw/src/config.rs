@@ -9,12 +9,16 @@ use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementCon
 
 #[derive(Debug, Clone)]
 pub struct MissionRuntimeProfile {
-    /// Runtime id (also the driver selector): "codex" or an ACP profile.
+    /// Runtime id (also the per-role selector): "codex" or "opencode".
     pub name: String,
     /// Driver protocol: "codex" (app-server) or "acp".
     pub driver: String,
     /// Agent executable inside the container.
     pub command: String,
+    /// Fixed arguments the executable is launched with (e.g. the ACP subcommand).
+    pub args: Vec<String>,
+    /// Driver-level environment for the agent process.
+    pub environment: Vec<(String, String)>,
     pub model: Option<String>,
     pub confinement: ConfinementConfig,
     /// Ceiling on one agent turn.
@@ -25,15 +29,18 @@ pub struct MissionRuntimeProfile {
 }
 
 impl MissionRuntimeProfile {
-    pub fn codex_default() -> Self {
+    /// The confinement + timeouts shared by every runtime. The image is filled
+    /// from the mission type's `mission.toml` when the engine is opened.
+    fn base(name: &str, driver: &str, command: &str) -> Self {
         Self {
-            name: "codex".to_string(),
-            driver: "codex".to_string(),
-            command: "codex".to_string(),
+            name: name.to_string(),
+            driver: driver.to_string(),
+            command: command.to_string(),
+            args: Vec::new(),
+            environment: Vec::new(),
             model: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
                 engine: "podman".to_string(),
-                // Filled from the mission type's `mission.toml` at open time.
                 image: None,
                 read_only_rootfs: true,
                 tmpfs: vec!["/tmp:rw,size=512m".to_string()],
@@ -46,6 +53,21 @@ impl MissionRuntimeProfile {
             hard_timeout: Duration::from_secs(30 * 60),
             idle_timeout: Duration::from_secs(10 * 60),
             oracle_timeout: Duration::from_secs(15 * 60),
+        }
+    }
+
+    /// Codex over its app-server driver.
+    pub fn codex_default() -> Self {
+        Self::base("codex", "codex", "codex")
+    }
+
+    /// opencode over the ACP driver: `opencode acp`, with auto-update disabled
+    /// (it would fail in the network-less container anyway).
+    pub fn opencode_default() -> Self {
+        Self {
+            args: vec!["acp".to_string()],
+            environment: vec![("OPENCODE_DISABLE_AUTOUPDATE".to_string(), "1".to_string())],
+            ..Self::base("opencode", "acp", "opencode")
         }
     }
 }

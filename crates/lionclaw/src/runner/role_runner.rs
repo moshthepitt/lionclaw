@@ -196,8 +196,8 @@ impl OciRoleRunner {
         let config = RuntimeDriverConfig {
             runtime_id: self.profile.name.clone(),
             executable: self.profile.command.clone(),
-            args: Vec::new(),
-            environment: Vec::new(),
+            args: self.profile.args.clone(),
+            environment: self.profile.environment.clone(),
             model: self.profile.model.clone(),
             mode: None,
             auth: auth_kind.clone(),

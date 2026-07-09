@@ -249,7 +249,8 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
 fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
     match runtime {
         "codex" => Ok(MissionRuntimeProfile::codex_default()),
-        other => bail!("unknown runtime '{other}' (only 'codex' is wired)"),
+        "opencode" => Ok(MissionRuntimeProfile::opencode_default()),
+        other => bail!("unknown runtime '{other}' (expected 'codex' or 'opencode')"),
     }
 }
 
