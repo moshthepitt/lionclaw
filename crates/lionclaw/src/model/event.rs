@@ -50,6 +50,16 @@ pub enum StopBar {
     Reviewed,
 }
 
+impl StopBar {
+    /// The stable snake_case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Reviewed => "reviewed",
+        }
+    }
+}
+
 /// The mission type a mission was created against, pinned by content digest.
 /// The digest is verified on every engine open, so the instrument of judgment
 /// (roles, oracles) cannot be swapped after the mission starts. Plain data —

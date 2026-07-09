@@ -115,8 +115,44 @@ print(c[0]["advisory"] if c else "missing")')"
     [ "$pass" -ge 2 ] && echo "  => SCENARIO 2 PASS" || echo "  => SCENARIO 2 FAIL"
 }
 
+# --- Scenario 3: planning-in-phase -> ratify -> verified -------------------
+# No hand-written plan: the planning DAG (strategist -> red-team -> author)
+# proposes the contract, a human ratifies it, then execution verifies. The
+# ratification gate is ON (no --yes), so planning must park before any work.
+scenario_planning() {
+    local pass=0
+    for i in $(seq 1 "$RUNS"); do
+        local repo="$WORK/planning-$i"
+        materialize "$FIXTURES/interval-bug" "$repo"
+        local base; base="$(git -C "$repo" rev-parse HEAD)"
+        local mid; mid="$(mission_json start --type software-dev --repo "$repo" \
+            --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
+        # Drive planning; it must park on the engine-authored proposal.
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
+        local phase; phase="$(mission_json status "$mid" --repo "$repo" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("phase"))')"
+        # Ratify the proposal (seeds the contract), then execute to a verdict.
+        "$BIN" mission ratify "$mid" --repo "$repo" >/dev/null 2>&1
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
+        local status; status="$(mission_json status "$mid" --repo "$repo")"
+        local finish head
+        finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
+        head="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("current_sha"))')"
+        if [ "$finish" = "verified" ] && [ "$head" != "$base" ]; then
+            echo "  run $i: PASS (planned, ratified, verified; head $head)"; pass=$((pass+1))
+        else
+            echo "  run $i: FAIL (phase-after-plan=$phase, finish=$finish, head=$head, base=$base)"
+        fi
+    done
+    echo "scenario 3 (planning -> ratify -> verified): $pass/$RUNS verified"
+    [ "$pass" -ge 2 ] && echo "  => SCENARIO 3 PASS" || echo "  => SCENARIO 3 FAIL"
+}
+
 echo "== Slice 6 agentic eval ($RUNS runs each) =="
 echo "[1] fixes the bug -> verified"
 scenario_fix_bug
 echo "[2] reviewer catches a planted regression"
 scenario_planted_regression
+echo "[3] planning -> ratify -> verified"
+scenario_planning

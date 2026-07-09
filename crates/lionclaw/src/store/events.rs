@@ -106,6 +106,7 @@ impl MissionStore {
         .map_err(|err| map_sqlx(err, "mission already exists"))?;
         insert_event(&mut tx, mission_id, 1, &created, now_ms).await?;
         tx.commit().await.map_err(anyhow::Error::from)?;
+        self.publish(mission_id, 1, std::slice::from_ref(&created), now_ms);
         Ok(())
     }
 
@@ -143,6 +144,7 @@ impl MissionStore {
             insert_event(&mut tx, mission_id, seq, event, now_ms).await?;
         }
         tx.commit().await.map_err(anyhow::Error::from)?;
+        self.publish(mission_id, expected_head + 1, events, now_ms);
         Ok(seq)
     }
 
@@ -521,5 +523,88 @@ fn map_sqlx(err: sqlx::Error, unique_detail: &str) -> AppendError {
         }
     } else {
         AppendError::Store(err.into())
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::model::{
+        DecisionAction, EventEnvelope, MissionConfig, MissionEvent, MissionTypeRef, StopBar,
+    };
+    use crate::ports::EventSink;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<u64>>);
+    impl EventSink for Recorder {
+        fn emit(&self, event: &EventEnvelope) {
+            self.0.lock().unwrap().push(event.sequence_no);
+        }
+    }
+
+    fn created() -> NewEvent {
+        NewEvent::new(MissionEvent::MissionCreated {
+            objective: "o".into(),
+            mission_type: MissionTypeRef {
+                name: "t".into(),
+                digest: "d".into(),
+            },
+            runtime: "codex".into(),
+            image_id: "img".into(),
+            workspace_dir: "/w".into(),
+            base_sha: "base".into(),
+            config: MissionConfig {
+                ratification_gate: false,
+                stop: StopBar::Reviewed,
+                planning: Default::default(),
+            },
+        })
+    }
+
+    fn decision() -> NewEvent {
+        NewEvent::new(MissionEvent::DecisionRecorded {
+            attention_id: "x".into(),
+            action: DecisionAction::Continue,
+            justification: String::new(),
+            actor: "t".into(),
+        })
+    }
+
+    // The sink sees exactly the committed sequence numbers, in order — and a
+    // rolled-back append (stale head) publishes nothing, so a consumer never
+    // sees a phantom event.
+    #[tokio::test]
+    async fn sink_fires_after_commit_never_on_a_rolled_back_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Recorder::default());
+        let store = MissionStore::open(dir.path())
+            .await
+            .unwrap()
+            .with_sink(rec.clone());
+        let id = MissionId::parse("mabc123def456").unwrap();
+
+        store
+            .create_mission(&id, "/w", "o", created(), 1)
+            .await
+            .unwrap();
+        assert_eq!(*rec.0.lock().unwrap(), vec![1]);
+
+        let head = store
+            .append(&id, 1, &[decision(), decision()], 2)
+            .await
+            .unwrap();
+        assert_eq!(head, 3);
+        assert_eq!(*rec.0.lock().unwrap(), vec![1, 2, 3]);
+
+        // Stale expected-head ⇒ Conflict ⇒ transaction never commits.
+        assert!(store.append(&id, 1, &[decision()], 3).await.is_err());
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec![1, 2, 3],
+            "a rolled-back append must not publish"
+        );
     }
 }

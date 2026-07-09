@@ -12,12 +12,24 @@ use crate::authority::AuthorityCeiling;
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
-use crate::model::{fold, AttentionKind, FinishClass, MissionConfig, MissionId, MissionPhase};
+use crate::model::{
+    fold, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId, MissionPhase,
+};
 use crate::oracle::OciOracleRunner;
-use crate::ports::{Clock, SystemClock};
+use crate::ports::{Clock, EventSink, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::MissionStore;
 use crate::workspace;
+
+/// Streams committed events to stderr so a long `advance` is not silent. Stderr,
+/// not stdout, so `--json` consumers reading stdout are unaffected.
+struct StderrEventSink;
+
+impl EventSink for StderrEventSink {
+    fn emit(&self, event: &EventEnvelope) {
+        eprintln!("  · {:>4}  {}", event.sequence_no, event.event.event_type());
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "lionclaw", about = "LionClaw mission engine")]
@@ -121,9 +133,9 @@ pub struct StartArgs {
     /// Installed mission type name (see `mission type list`).
     #[arg(long = "type")]
     pub mission_type: String,
-    /// Target repository the mission operates on.
+    /// Target repository (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     /// The mission objective.
     #[arg(long)]
     pub objective: String,
@@ -138,26 +150,31 @@ pub struct StartArgs {
 
 #[derive(Args)]
 pub struct InboxArgs {
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args)]
 pub struct RatifyArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long, default_value = "approved")]
     pub justification: String,
 }
 
 #[derive(Args)]
 pub struct PlanArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -169,29 +186,34 @@ pub struct DecideArgs {
     pub item: String,
     /// One of: ratify | retry | continue | abort.
     pub action: String,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long, default_value = "")]
     pub justification: String,
 }
 
 #[derive(Args)]
 pub struct SubmitPlanArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
-    /// Plan JSON file ({ "assertions": [...], "tasks": [...] }).
+    pub repo: Option<PathBuf>,
+    /// Plan JSON file ({ "assertions": [...], "tasks": [...] }); `-` reads stdin.
     #[arg(long)]
     pub plan: PathBuf,
 }
 
 #[derive(Args)]
 pub struct AmendArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     /// Amendment ops JSON ({ "add": [...], "supersede": [...], "cancel": [...],
-    /// "add_assertion": [...], "bind_oracle": [...] }).
+    /// "add_assertion": [...], "bind_oracle": [...] }); `-` reads stdin.
     #[arg(long)]
     pub ops: PathBuf,
     /// The plan revision this amendment was authored against (see `status`).
@@ -205,27 +227,33 @@ pub struct AmendArgs {
 
 #[derive(Args)]
 pub struct AdvanceArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args)]
 pub struct StatusArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args)]
 pub struct ReportArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     /// Include the base..head diff (text output only).
     #[arg(long)]
     pub patch: bool,
@@ -235,9 +263,11 @@ pub struct ReportArgs {
 
 #[derive(Args)]
 pub struct ApplyArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
     /// Overwrite the branch if it already exists.
     #[arg(long)]
     pub force: bool,
@@ -245,9 +275,11 @@ pub struct ApplyArgs {
 
 #[derive(Args)]
 pub struct LogArgs {
-    pub mission_id: String,
+    /// Mission id (default: the sole live mission in this repo).
+    pub mission_id: Option<String>,
+    /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
-    pub repo: PathBuf,
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -268,6 +300,57 @@ pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
 }
 
 async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
+    // One error policy for every command: a `--json` command reports failure as
+    // a structured `{"ok":false,"error":…}` envelope on stdout and exits 1; a
+    // human command lets the error bubble to stderr. Success output is each
+    // command's own concern.
+    let json = cmd.is_json();
+    match dispatch_mission(cmd).await {
+        Ok(code) => Ok(code),
+        Err(err) if json => {
+            println!(
+                "{}",
+                serde_json::json!({ "ok": false, "error": err.to_string() })
+            );
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+impl MissionCommand {
+    /// Whether this invocation asked for machine output (`--json`).
+    fn is_json(&self) -> bool {
+        match self {
+            Self::Start(a) => a.json,
+            Self::Status(a) => a.json,
+            Self::Report(a) => a.json,
+            Self::Plan(a) => a.json,
+            Self::Inbox(a) => a.json,
+            Self::Advance(a) => a.json,
+            Self::SelfTest(a) => a.json,
+            Self::Type(t) => t.is_json(),
+            Self::SubmitPlan(_)
+            | Self::Amend(_)
+            | Self::Apply(_)
+            | Self::Log(_)
+            | Self::Ratify(_)
+            | Self::Decide(_) => false,
+        }
+    }
+}
+
+impl TypeCommand {
+    fn is_json(&self) -> bool {
+        match self {
+            Self::List(a) => a.json,
+            Self::Show(a) => a.json,
+            Self::Check(a) => a.json,
+        }
+    }
+}
+
+async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
     use std::process::ExitCode;
     match cmd {
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
@@ -321,11 +404,16 @@ fn assemble_engine(
     ))
 }
 
-/// Open an engine to CREATE a mission from an installed mission type (by name).
+/// Build an engine to CREATE a mission from an installed mission type (by name).
 /// The confinement image is resolved to a content id here — once, at start — so
 /// a later rebuild of the tag cannot silently change the instrument. The engine
 /// carries the runtime + image id it records on `MissionCreated`.
-async fn open_engine_for_start(repo: &Path, type_name: &str, runtime: &str) -> Result<Engine> {
+async fn build_engine_for_start(
+    store: MissionStore,
+    repo: &Path,
+    type_name: &str,
+    runtime: &str,
+) -> Result<Engine> {
     let ceiling = AuthorityCeiling::default();
     let type_dir = Home::from_env()?.mission_type_dir(type_name);
     let mission_type = load_mission_type(&type_dir, &ceiling)
@@ -339,24 +427,25 @@ async fn open_engine_for_start(repo: &Path, type_name: &str, runtime: &str) -> R
     .await
     .with_context(|| format!("resolving image '{}'", mission_type.image))?;
     profile.confinement.oci_mut().image = Some(image_id.clone());
-    let store = MissionStore::open(repo).await?;
-    let engine = assemble_engine(
+    assemble_engine(
         store,
         repo,
         mission_type,
         runtime.to_string(),
-        image_id.clone(),
+        image_id,
         profile,
         ceiling,
-    )?;
-    Ok(engine)
+    )
 }
 
-/// Open an engine for an EXISTING mission: resolve its recorded mission type (by
+/// Build an engine for an EXISTING mission: resolve its recorded mission type (by
 /// name, from the home), runtime, and pinned image id — so no `--type`/`--runtime`
 /// is needed. `load_state` then verifies the pinned digest, fail-closed.
-async fn open_engine_for_mission(repo: &Path, mission_id: &MissionId) -> Result<Engine> {
-    let store = MissionStore::open(repo).await?;
+async fn build_engine_for_mission(
+    store: MissionStore,
+    repo: &Path,
+    mission_id: &MissionId,
+) -> Result<Engine> {
     let state = store
         .load_state_snapshotted(mission_id)
         .await?
@@ -381,11 +470,77 @@ async fn open_engine_for_mission(repo: &Path, mission_id: &MissionId) -> Result<
     Ok(engine)
 }
 
+/// Resolve `--repo` (an explicit path is canonicalized; omitted ⇒ the enclosing
+/// git worktree root) and open its store. The root is discovered *before* the
+/// store is opened, so a default never creates a stray `.lionclaw/` in a
+/// subdirectory (`MissionStore::open` creates unconditionally).
+async fn open_store(explicit_repo: Option<PathBuf>) -> Result<(PathBuf, MissionStore)> {
+    let repo = match explicit_repo {
+        Some(path) => path.canonicalize().context("repo path")?,
+        None => git_worktree_root().await?,
+    };
+    let store = MissionStore::open(&repo).await?;
+    Ok((repo, store))
+}
+
+/// The top level of the git worktree containing the current directory.
+async fn git_worktree_root() -> Result<PathBuf> {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .await
+        .context("failed to run git")?;
+    if !out.status.success() {
+        bail!("--repo not given and the current directory is not inside a git repository");
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    PathBuf::from(root).canonicalize().context("repo path")
+}
+
+/// Resolve a mission id: an explicit id is parsed; omitted ⇒ the sole
+/// non-terminal mission in this repo. Errors (never guesses) when zero or more
+/// than one mission is live.
+async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Result<MissionId> {
+    if let Some(id) = explicit {
+        return MissionId::parse(id).map_err(Into::into);
+    }
+    let mut live = Vec::new();
+    for summary in store.list_missions().await? {
+        let Some(state) = fold(store.load(&summary.mission_id).await?) else {
+            continue;
+        };
+        if !state.phase.is_terminal() {
+            live.push(summary.mission_id);
+        }
+    }
+    match live.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => bail!("no live mission in this repo; pass a mission id"),
+        _ => bail!("{} live missions; pass a mission id to choose", live.len()),
+    }
+}
+
+/// Read a JSON argument from a file, or from stdin when the path is `-`.
+fn read_json_arg<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let text = if path == Path::new("-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read JSON from stdin")?;
+        buf
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?
+    };
+    serde_json::from_str(&text).context("invalid JSON")
+}
+
 async fn cmd_start(args: StartArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
+    let (repo, store) = open_store(args.repo).await?;
     // Fail-closed: loading the mission type (and its moat check) happens before
     // any event is written.
-    let engine = open_engine_for_start(&repo, &args.mission_type, &args.runtime).await?;
+    let engine = build_engine_for_start(store, &repo, &args.mission_type, &args.runtime).await?;
     let base_sha = workspace::head_sha(&repo).await?;
     let mission_id = engine
         .create_mission(
@@ -419,7 +574,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
 }
 
 async fn cmd_inbox(args: InboxArgs) -> Result<()> {
-    let store = MissionStore::open(&args.repo.canonicalize().context("repo path")?).await?;
+    let (_repo, store) = open_store(args.repo).await?;
     let mut parked = Vec::new();
     for summary in store.list_missions().await? {
         let events = store.load(&summary.mission_id).await?;
@@ -436,7 +591,7 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
                     "mission_id": id.as_str(),
                     "objective": state.objective,
                     "attention": state.open_attention.values().map(|a| {
-                        serde_json::json!({ "id": a.id, "kind": format!("{:?}", a.kind).to_lowercase(), "report": a.report })
+                        serde_json::json!({ "id": a.id, "kind": a.kind.slug(), "report": a.report })
                     }).collect::<Vec<_>>(),
                 })
             })
@@ -456,9 +611,8 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
 }
 
 async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let store = MissionStore::open(&repo).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     // Resolve whichever ratification item is open — a proposed contract
     // (RatifyProposal) or a post-amendment re-ratification (Ratify) — so the
     // human never has to type the item id.
@@ -491,9 +645,8 @@ async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
 }
 
 async fn cmd_plan(args: PlanArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let store = MissionStore::open(&repo).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store
         .load_state_snapshotted(&mission_id)
         .await?
@@ -555,9 +708,8 @@ async fn cmd_plan(args: PlanArgs) -> Result<()> {
 }
 
 async fn cmd_apply(args: ApplyArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let store = MissionStore::open(&repo).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store
         .load_state_snapshotted(&mission_id)
         .await?
@@ -577,9 +729,8 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
 }
 
 async fn cmd_report(args: ReportArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let store = MissionStore::open(&repo).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store
         .load_state_snapshotted(&mission_id)
         .await?
@@ -628,10 +779,10 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "mission_type": { "name": state.mission_type.name, "digest": state.mission_type.digest },
                 "runtime": state.runtime,
                 "image_id": state.image_id,
-                "stop_bar": format!("{:?}", state.config.stop).to_lowercase(),
+                "stop_bar": state.config.stop.slug(),
                 "base_sha": state.base_sha,
                 "current_sha": state.current_sha,
-                "finish": finish.map(|f| format!("{f:?}").to_lowercase()),
+                "finish": finish.map(|f| f.slug()),
                 "assertions": rows.iter().map(|(id, _, v)| serde_json::json!({ "id": id, "verdict": v })).collect::<Vec<_>>(),
                 "not_covered_by_an_oracle": uncovered,
             })
@@ -713,8 +864,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
 }
 
 async fn cmd_decide(args: DecideArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let store = MissionStore::open(&repo).await?;
+    let (_repo, store) = open_store(args.repo).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let action = match args.action.as_str() {
         "ratify" => crate::model::DecisionAction::Ratify,
@@ -741,12 +891,10 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
 }
 
 async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
-    let engine = open_engine_for_mission(&repo, &mission_id).await?;
-    let plan_text = std::fs::read_to_string(&args.plan)
-        .with_context(|| format!("failed to read plan '{}'", args.plan.display()))?;
-    let submission = serde_json::from_str(&plan_text).context("plan JSON is invalid")?;
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
+    let submission = read_json_arg(&args.plan)?;
     engine
         .submit_plan(&mission_id, submission)
         .await
@@ -756,12 +904,10 @@ async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
 }
 
 async fn cmd_amend(args: AmendArgs) -> Result<()> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
-    let engine = open_engine_for_mission(&repo, &mission_id).await?;
-    let ops_text = std::fs::read_to_string(&args.ops)
-        .with_context(|| format!("failed to read ops '{}'", args.ops.display()))?;
-    let ops = serde_json::from_str(&ops_text).context("amendment ops JSON is invalid")?;
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
+    let ops = read_json_arg(&args.ops)?;
     engine
         .amend_plan(
             &mission_id,
@@ -777,12 +923,15 @@ async fn cmd_amend(args: AmendArgs) -> Result<()> {
 }
 
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
-    let repo = args.repo.canonicalize().context("repo path")?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
-    let engine = open_engine_for_mission(&repo, &mission_id).await?;
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    // Stream committed events to stderr so a run that blocks minutes per agent
+    // turn is not silent (stdout stays clean for `--json`).
+    let store = store.with_sink(Arc::new(StderrEventSink));
+    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
-    print_advance_outcome(&args.mission_id, &state.phase, &outcome, args.json);
+    print_advance_outcome(mission_id.as_str(), &state.phase, &outcome, args.json);
     // The exit code reflects the honesty bar: a mission that finished below the
     // stop bar its mission type declares exits nonzero, so a caller or CI can
     // gate on "actually verified" without parsing output.
@@ -799,13 +948,13 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
 }
 
 async fn cmd_status(args: StatusArgs) -> Result<()> {
-    let store = MissionStore::open(&args.repo.canonicalize().context("repo path")?).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let events = store.load(&mission_id).await?;
     let state = fold(events).with_context(|| format!("mission {mission_id} not found"))?;
     if args.json {
         let finish = match &state.phase {
-            MissionPhase::Done { finish } => Some(format!("{finish:?}").to_lowercase()),
+            MissionPhase::Done { finish } => Some(finish.slug()),
             _ => None,
         };
         println!(
@@ -820,7 +969,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 "contract": state.contract.iter().map(|(id, a)| {
                     serde_json::json!({
                         "id": id.as_str(),
-                        "advisory": format!("{:?}", a.advisory).to_lowercase(),
+                        "advisory": a.advisory.slug(),
                         "authoritative_pass": a.last_authoritative.as_ref().map(|v| v.passed()),
                     })
                 }).collect::<Vec<_>>(),
@@ -846,8 +995,8 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
 }
 
 async fn cmd_log(args: LogArgs) -> Result<()> {
-    let store = MissionStore::open(&args.repo.canonicalize().context("repo path")?).await?;
-    let mission_id = MissionId::parse(&args.mission_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     for envelope in store.load(&mission_id).await? {
         println!(
             "{:>4} {}",
@@ -1020,7 +1169,7 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
                     serde_json::json!({
                         "ok": true,
                         "name": mt.name,
-                        "stop": format!("{:?}", mt.stop).to_lowercase(),
+                        "stop": mt.stop.slug(),
                         "image": mt.image,
                         "roles": mt.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
                         "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
@@ -1053,17 +1202,9 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        Err(err) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "ok": false, "error": err.to_string() })
-                );
-            } else {
-                eprintln!("mission type invalid: {err}");
-            }
-            Ok(std::process::ExitCode::FAILURE)
-        }
+        // Bubble up — `run_mission` renders the `{"ok":false,…}` envelope for
+        // `--json` and lets the human path print to stderr; either way exit 1.
+        Err(err) => Err(anyhow::Error::from(err).context("mission type invalid")),
     }
 }
 
@@ -1074,7 +1215,7 @@ fn print_advance_outcome(
     json: bool,
 ) {
     let finish = match phase {
-        MissionPhase::Done { finish } => Some(format!("{finish:?}").to_lowercase()),
+        MissionPhase::Done { finish } => Some(finish.slug()),
         _ => None,
     };
     if json {
@@ -1084,7 +1225,7 @@ fn print_advance_outcome(
                 "mission_id": mission_id,
                 "phase": phase_slug(phase),
                 "finish": finish,
-                "outcome": outcome_slug(outcome),
+                "outcome": outcome.slug(),
             })
         );
     } else {
@@ -1109,21 +1250,11 @@ fn print_advance_outcome(
     }
 }
 
+/// The mission phase as a slug, carrying the finish grade for `Done`
+/// (`done:verified`). The variant slugs live on the enums (one source).
 fn phase_slug(phase: &MissionPhase) -> String {
     match phase {
-        MissionPhase::Planning => "planning".to_string(),
-        MissionPhase::Running => "running".to_string(),
-        MissionPhase::AttentionNeeded => "attention_needed".to_string(),
-        MissionPhase::Done { finish } => format!("done:{}", format!("{finish:?}").to_lowercase()),
-        MissionPhase::Aborted { .. } => "aborted".to_string(),
-    }
-}
-
-fn outcome_slug(outcome: &AdvanceOutcome) -> &'static str {
-    match outcome {
-        AdvanceOutcome::AwaitingPlan => "awaiting_plan",
-        AdvanceOutcome::Parked { .. } => "parked",
-        AdvanceOutcome::Busy => "busy",
-        AdvanceOutcome::Terminal { .. } => "terminal",
+        MissionPhase::Done { finish } => format!("done:{}", finish.slug()),
+        other => other.slug().to_string(),
     }
 }

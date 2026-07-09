@@ -97,6 +97,19 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
 }
 
+/// A synchronous, non-blocking observer of committed events. The store fires it
+/// *after* `tx.commit()`, so a sink never sees a phantom event from a rolled-back
+/// append (a `Conflict`/`Duplicate`). The contract is "return fast, don't block":
+/// the CLI sink prints one line to stderr; a future daemon sink pushes into an
+/// async channel and returns immediately (so a long-running driver stays live).
+///
+/// Deliberately not a `broadcast::Sender`: `advance` is one sequential loop with
+/// one in-process consumer, so pub/sub fan-out (lag handling, subscribe/select)
+/// would be dead weight.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: &crate::model::EventEnvelope);
+}
+
 /// The crate's single wall-clock call site; everything else takes time
 /// through this port.
 pub struct SystemClock;

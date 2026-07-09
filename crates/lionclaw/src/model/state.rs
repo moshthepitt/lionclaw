@@ -31,6 +31,19 @@ impl MissionPhase {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Aborted { .. })
     }
+
+    /// The stable snake_case variant name (matches the serde `phase` tag). The
+    /// `Done`/`Aborted` payloads are not part of the slug — a caller that wants
+    /// the finish grade composes it from [`FinishClass::slug`].
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Running => "running",
+            Self::AttentionNeeded => "attention_needed",
+            Self::Done { .. } => "done",
+            Self::Aborted { .. } => "aborted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +86,17 @@ pub enum AdvisoryStatus {
     Failed,
 }
 
+impl AdvisoryStatus {
+    /// The stable snake_case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertionState {
     /// The engine-run oracle binding, if any (copied from the plan).
@@ -99,6 +123,23 @@ pub enum AttentionKind {
     /// The in-engine author's proposal awaits a human's ratification before it
     /// seeds the contract.
     RatifyProposal,
+}
+
+impl AttentionKind {
+    /// The stable snake_case name (matches the serde repr). Used both to derive
+    /// the durable attention-item id in the fold and to render it in the CLI, so
+    /// the id a user reads is exactly the id they pass back to `decide`.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Ratify => "ratify",
+            Self::NodeFailed => "node_failed",
+            Self::NodeAttention => "node_attention",
+            Self::OracleFailed => "oracle_failed",
+            Self::GateFailed => "gate_failed",
+            Self::GateCheckpoint => "gate_checkpoint",
+            Self::RatifyProposal => "ratify_proposal",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,4 +306,70 @@ pub struct MissionState {
     pub waived_oracles: std::collections::BTreeSet<OracleName>,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
+}
+
+#[cfg(test)]
+mod slug_tests {
+    use super::*;
+    use crate::model::{FinishClass, StopBar};
+
+    /// Every `slug()` must equal the enum's serde repr — the single source that
+    /// keeps the CLI, the fold's attention ids, and the wire format from
+    /// drifting (`InternallyConsistent` → `internally_consistent`, not
+    /// `internallyconsistent`).
+    fn assert_slug<T: serde::Serialize>(value: &T, slug: &str) {
+        let serde = serde_json::to_value(value).unwrap();
+        // Unit enums serialize to a bare string; the internally-tagged
+        // `MissionPhase` to an object whose tag field is the variant name.
+        let repr = serde
+            .as_str()
+            .or_else(|| serde.get("phase").and_then(|v| v.as_str()))
+            .expect("a string or a tagged object");
+        assert_eq!(repr, slug, "slug drifted from the serde repr");
+    }
+
+    #[test]
+    fn slugs_match_the_serde_repr() {
+        for k in [
+            AttentionKind::Ratify,
+            AttentionKind::NodeFailed,
+            AttentionKind::NodeAttention,
+            AttentionKind::OracleFailed,
+            AttentionKind::GateFailed,
+            AttentionKind::GateCheckpoint,
+            AttentionKind::RatifyProposal,
+        ] {
+            assert_slug(&k, k.slug());
+        }
+        for s in [
+            AdvisoryStatus::Pending,
+            AdvisoryStatus::Passed,
+            AdvisoryStatus::Failed,
+        ] {
+            assert_slug(&s, s.slug());
+        }
+        for f in [
+            FinishClass::Verified,
+            FinishClass::InternallyConsistent,
+            FinishClass::Unverified,
+        ] {
+            assert_slug(&f, f.slug());
+        }
+        for b in [StopBar::Verified, StopBar::Reviewed] {
+            assert_slug(&b, b.slug());
+        }
+        for p in [
+            MissionPhase::Planning,
+            MissionPhase::Running,
+            MissionPhase::AttentionNeeded,
+            MissionPhase::Done {
+                finish: FinishClass::Verified,
+            },
+            MissionPhase::Aborted {
+                reason: String::new(),
+            },
+        ] {
+            assert_slug(&p, p.slug());
+        }
+    }
 }

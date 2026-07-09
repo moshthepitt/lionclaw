@@ -15,6 +15,7 @@ pub use events::{AppendError, EffectLease, EffectStatus, MissionSummary, NewEven
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,11 +23,17 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 
+use crate::model::MissionId;
+use crate::ports::EventSink;
+
 #[derive(Clone)]
 pub struct MissionStore {
     pool: SqlitePool,
     blobs: BlobStore,
     lionclaw_dir: PathBuf,
+    /// Fired after each append commits (see [`EventSink`]). Set once at
+    /// construction, before any clone, so every clone shares it via the `Arc`.
+    sink: Option<Arc<dyn EventSink>>,
 }
 
 impl MissionStore {
@@ -55,7 +62,36 @@ impl MissionStore {
             pool,
             blobs: BlobStore::new(lionclaw_dir.join("blobs")),
             lionclaw_dir,
+            sink: None,
         })
+    }
+
+    /// Attach a live event sink. Call once at construction (before the store is
+    /// cloned into an engine); every clone then shares this sink.
+    pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Fire the sink over a run of just-committed events. Called only after
+    /// `tx.commit()`; a no-op when no sink is attached.
+    pub(crate) fn publish(
+        &self,
+        mission_id: &MissionId,
+        first_seq: u64,
+        events: &[NewEvent],
+        now_ms: i64,
+    ) {
+        let Some(sink) = &self.sink else { return };
+        for (offset, event) in events.iter().enumerate() {
+            sink.emit(&crate::model::EventEnvelope {
+                mission_id: mission_id.clone(),
+                sequence_no: first_seq + offset as u64,
+                recorded_at_ms: now_ms,
+                stamps: event.stamps.clone(),
+                event: event.event.clone(),
+            });
+        }
     }
 
     pub fn blobs(&self) -> &BlobStore {

@@ -81,6 +81,19 @@ pub enum FinishClass {
     Unverified,
 }
 
+impl FinishClass {
+    /// The stable snake_case name (matches the serde repr). One source for
+    /// both the fold and the CLI, so no `format!("{:?}").to_lowercase()` drifts
+    /// into `internallyconsistent`.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::InternallyConsistent => "internally_consistent",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 impl StopBar {
     /// Does a finish class clear this honesty bar? `Verified` demands an
     /// authoritative oracle pass; `Reviewed` also accepts agent-only

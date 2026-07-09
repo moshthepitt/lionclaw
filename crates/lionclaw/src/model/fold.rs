@@ -630,10 +630,10 @@ fn derive_attention(state: &mut MissionState) {
             .map(|id| id.to_string())
             .or_else(|| oracle.as_ref().map(|o| o.to_string()))
             .unwrap_or_else(|| "mission".to_string());
-        // Lowercase only the kind — the anchor (a case-sensitive task or
-        // oracle id) must stay verbatim so two ids differing only by case
-        // never collide into one attention item.
-        let id = format!("{}:{anchor}", format!("{kind:?}").to_lowercase());
+        // The kind's stable slug — the anchor (a case-sensitive task or oracle
+        // id) stays verbatim so two ids differing only by case never collide
+        // into one attention item.
+        let id = format!("{}:{anchor}", kind.slug());
         attention.insert(
             id.clone(),
             AttentionItem {
@@ -1319,11 +1319,11 @@ mod tests {
         ];
         let parked = fold_log(base.clone()).expect("state");
         assert_eq!(parked.tasks[&tid("g")].status, TaskStatus::Failed);
-        assert!(parked.open_attention.contains_key("gatefailed:g"));
+        assert!(parked.open_attention.contains_key("gate_failed:g"));
 
         let mut resolved = base;
         resolved.push(decision(
-            "gatefailed:g",
+            "gate_failed:g",
             super::super::event::DecisionAction::Continue,
         ));
         let state = fold_log(resolved).expect("state");
@@ -1380,11 +1380,11 @@ mod tests {
         let parked = fold_log(base.clone()).expect("state");
         assert!(parked
             .open_attention
-            .contains_key("oraclefailed:cargo-test"));
+            .contains_key("oracle_failed:cargo-test"));
 
         let mut resolved = base;
         resolved.push(decision(
-            "oraclefailed:cargo-test",
+            "oracle_failed:cargo-test",
             super::super::event::DecisionAction::Continue,
         ));
         let state = fold_log(resolved).expect("state");
@@ -1419,13 +1419,13 @@ mod tests {
         ])
         .expect("state");
         // Distinct ids — no collision collapsing two gates into one item.
-        assert!(state.open_attention.contains_key("gatefailed:Check"));
-        assert!(state.open_attention.contains_key("gatefailed:check"));
+        assert!(state.open_attention.contains_key("gate_failed:Check"));
+        assert!(state.open_attention.contains_key("gate_failed:check"));
         assert_eq!(
             state
                 .open_attention
                 .keys()
-                .filter(|k| k.starts_with("gatefailed:"))
+                .filter(|k| k.starts_with("gate_failed:"))
                 .count(),
             2
         );
@@ -1877,7 +1877,7 @@ mod tests {
         let keys: Vec<&str> = once.open_attention.keys().map(String::as_str).collect();
         // Derived ids are stable (kind:anchor), not seq-embedded, so a
         // decision can name them across resumes.
-        assert_eq!(keys, vec!["nodefailed:t1"]);
+        assert_eq!(keys, vec!["node_failed:t1"]);
         assert_eq!(
             keys,
             twice

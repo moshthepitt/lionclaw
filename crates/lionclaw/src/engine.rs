@@ -54,6 +54,18 @@ pub enum AdvanceOutcome {
     Terminal { phase: MissionPhase },
 }
 
+impl AdvanceOutcome {
+    /// The stable snake_case name for `--json` output.
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::AwaitingPlan => "awaiting_plan",
+            Self::Parked { .. } => "parked",
+            Self::Busy => "busy",
+            Self::Terminal { .. } => "terminal",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitError {
     #[error("plan rejected:\n{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
@@ -822,8 +834,10 @@ pub async fn record_decision(
         .load_state_snapshotted(mission_id)
         .await?
         .with_context(|| format!("mission {mission_id} not found"))?;
-    crate::model::validate_decision(&state, attention_id, &action)
-        .map_err(|e| anyhow::anyhow!("decision rejected: {e}"))?;
+    // Preserve the typed `DecisionError` as the error source (its `Display` is
+    // already specific: unknown item vs illegal action for the item's kind), so
+    // a JSON caller sees the real reason, not a flattened string.
+    crate::model::validate_decision(&state, attention_id, &action)?;
     let event = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
         action,
