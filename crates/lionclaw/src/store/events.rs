@@ -229,11 +229,10 @@ impl MissionStore {
 
     /// Mission ids in creation order.
     pub async fn list_missions(&self) -> anyhow::Result<Vec<MissionId>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT mission_id FROM missions ORDER BY created_at_ms, mission_id",
-        )
-        .fetch_all(self.pool())
-        .await?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT mission_id FROM missions ORDER BY created_at_ms, mission_id")
+                .fetch_all(self.pool())
+                .await?;
         rows.into_iter()
             .map(|(id,)| Ok(MissionId::parse(id)?))
             .collect()
