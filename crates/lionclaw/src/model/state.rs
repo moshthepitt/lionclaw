@@ -170,7 +170,17 @@ impl InflightEffect {
                     requested_seq,
                 },
             )),
-            _ => None,
+            // Exhaustive on purpose: a new `…Requested` event must build its
+            // inflight entry here, never silently skip the effect ledger.
+            MissionEvent::MissionCreated { .. }
+            | MissionEvent::PlanSubmitted { .. }
+            | MissionEvent::RoleRunCompleted { .. }
+            | MissionEvent::RoleRunFailed { .. }
+            | MissionEvent::OracleRunCompleted { .. }
+            | MissionEvent::OracleRunFailed { .. }
+            | MissionEvent::MissionAborted { .. }
+            | MissionEvent::DecisionRecorded { .. }
+            | MissionEvent::PlanAmended { .. } => None,
         }
     }
 

@@ -351,17 +351,31 @@ impl MissionEvent {
             | Self::OracleRunFailed {
                 idempotency_key, ..
             } => Some((IdemClass::Outcome, idempotency_key)),
-            _ => None,
+            // Fact events carry no idempotency key. Exhaustive on purpose: a new
+            // effect-style event must decide its class here, never silently skip
+            // the ledger (the bug the deleted terminal-review scaffolding had).
+            Self::MissionCreated { .. }
+            | Self::PlanSubmitted { .. }
+            | Self::MissionAborted { .. }
+            | Self::DecisionRecorded { .. }
+            | Self::PlanAmended { .. } => None,
         }
     }
 
     /// Whether an outcome event records a success (`done`) or failure
-    /// (`failed`) for its effect ledger row.
+    /// (`failed`) for its effect ledger row. Exhaustive on purpose (see
+    /// `idempotency`).
     pub fn outcome_succeeded(&self) -> Option<bool> {
         match self {
             Self::RoleRunCompleted { .. } | Self::OracleRunCompleted { .. } => Some(true),
             Self::RoleRunFailed { .. } | Self::OracleRunFailed { .. } => Some(false),
-            _ => None,
+            Self::MissionCreated { .. }
+            | Self::PlanSubmitted { .. }
+            | Self::RoleRunRequested { .. }
+            | Self::OracleRunRequested { .. }
+            | Self::MissionAborted { .. }
+            | Self::DecisionRecorded { .. }
+            | Self::PlanAmended { .. } => None,
         }
     }
 }
