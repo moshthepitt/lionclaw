@@ -7,8 +7,11 @@
 //!   and no hardlinked object inode is shared with it. The engine fetches
 //!   the resulting commit back into the target repo under `refs/mission/…`
 //!   (content-addressed: `git rev-parse --verify` reconciles on resume).
-//! - **Judges and oracles** get a `git archive` snapshot — no `.git` at all,
-//!   nothing to tamper with, byte-stable for a given commit.
+//! - **Judges and oracles** get a `checkout-index` snapshot of the exact
+//!   committed tree via a throwaway index — no `.git` at all, nothing to
+//!   tamper with. Deliberately NOT `git archive`: archive honors a committed
+//!   `.gitattributes export-ignore`, which would let a worker hide a file
+//!   (e.g. a failing test) from the very oracle judging its commit.
 //!
 //! Worker output is a recorded commit, never auto-applied (roborev's
 //! captured-patch discipline, adapted to content-addressed outcomes).
@@ -132,8 +135,10 @@ pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<O
     Ok(Some(head))
 }
 
-/// Materialize a read-only snapshot of `sha` (no `.git`) for judges and
-/// oracles.
+/// Materialize a read-only snapshot of `sha`'s exact committed tree (no `.git`)
+/// for judges and oracles. Uses a throwaway index + `checkout-index` rather than
+/// `git archive`: archive would honor a committed `.gitattributes export-ignore`,
+/// letting a worker hide files from the oracle judging its own commit.
 pub async fn create_snapshot(repo: &Path, dest: &Path, sha: &str) -> Result<()> {
     if dest.exists() {
         tokio::fs::remove_dir_all(dest)
@@ -141,20 +146,32 @@ pub async fn create_snapshot(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
             .context("failed to clear stale snapshot")?;
     }
     tokio::fs::create_dir_all(dest).await?;
-    let tar_path = dest.with_extension("snapshot.tar");
-    let tar_str = tar_path.to_string_lossy().into_owned();
-    git(repo, &["archive", "--format=tar", "-o", &tar_str, sha]).await?;
-    let unpack = run(
-        Command::new("tar")
-            .arg("-xf")
-            .arg(&tar_path)
-            .arg("-C")
-            .arg(dest),
-        "tar extract snapshot",
-    )
-    .await;
-    let _ = tokio::fs::remove_file(&tar_path).await;
-    unpack
+    let index = dest.with_extension("snapshot.index");
+    let index_str = index.to_string_lossy().into_owned();
+    // `checkout-index --prefix` requires a trailing separator and creates the
+    // leading directories itself.
+    let prefix = format!("{}/", dest.to_string_lossy());
+    let materialize = async {
+        run(
+            Command::new("git")
+                .current_dir(repo)
+                .env("GIT_INDEX_FILE", &index_str)
+                .args(["read-tree", sha]),
+            "git read-tree",
+        )
+        .await?;
+        run(
+            Command::new("git")
+                .current_dir(repo)
+                .env("GIT_INDEX_FILE", &index_str)
+                .args(["checkout-index", "--all", &format!("--prefix={prefix}")]),
+            "git checkout-index",
+        )
+        .await
+    };
+    let result = materialize.await;
+    let _ = tokio::fs::remove_file(&index).await;
+    result
 }
 
 pub async fn remove_dir(dir: &Path) {
@@ -367,5 +384,39 @@ mod tests {
             head,
             "--force moves the branch"
         );
+    }
+
+    // The oracle judges the EXACT committed tree: a worker must not be able to
+    // hide a file (e.g. a failing test) from its judge with a committed
+    // `.gitattributes export-ignore`, which `git archive` honors. Regression for
+    // the false-Verified vector.
+    #[tokio::test]
+    async fn snapshot_materializes_the_full_tree_ignoring_export_ignore() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("hidden.txt"), "the failing test\n").unwrap();
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "hidden.txt export-ignore\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "-A"]).await.unwrap();
+        git(repo.path(), &["commit", "-q", "-m", "hide a file"])
+            .await
+            .unwrap();
+        let head = head_sha(repo.path()).await.unwrap();
+
+        let dest = repo.path().join("snap");
+        create_snapshot(repo.path(), &dest, &head).await.unwrap();
+        assert!(
+            dest.join("hidden.txt").exists(),
+            "an export-ignored file must still appear in the oracle's snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("hidden.txt")).unwrap(),
+            "the failing test\n",
+            "the snapshot is the exact committed bytes"
+        );
+        assert!(!dest.join(".git").exists(), "the snapshot has no .git");
     }
 }

@@ -29,6 +29,21 @@ const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
 pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, RoleRunFailure> {
     use std::io::Read;
     let path = dir.join("handoff.json");
+    // The agent controls this file (the handoff mount is read-write). Reject
+    // anything that is not a regular file BEFORE opening it: a symlink would let
+    // the host read outside the mount, and a FIFO would block this thread
+    // forever on open (never reaping the attempt dir). The agent's turn has
+    // already ended, so there is no live race between this stat and the open.
+    let meta = std::fs::symlink_metadata(&path).map_err(|err| RoleRunFailure {
+        kind: RunErrorKind::HandoffMissing,
+        detail: format!("no handoff at '{}': {err}", path.display()),
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(RoleRunFailure {
+            kind: RunErrorKind::HandoffInvalid,
+            detail: format!("handoff at '{}' is not a regular file", path.display()),
+        });
+    }
     let file = std::fs::File::open(&path).map_err(|err| RoleRunFailure {
         kind: RunErrorKind::HandoffMissing,
         detail: format!("no handoff at '{}': {err}", path.display()),
@@ -105,6 +120,36 @@ mod tests {
         std::fs::write(dir.path().join("handoff.json"), big).expect("write");
         let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
         assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+    }
+
+    // A malicious agent could leave a symlink (traverse to a host file) or a
+    // FIFO (block the host's open forever) at handoff.json. Both are rejected as
+    // non-regular files — the read must never follow or block.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_handoff_is_rejected_not_followed_or_hung() {
+        // Symlink to a host file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "host bytes").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("handoff.json")).unwrap();
+        let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
+        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+
+        // FIFO — a plain open would block here forever; the stat gate must catch
+        // it first and return promptly.
+        let fifo_dir = tempfile::tempdir().expect("tempdir");
+        let fifo = fifo_dir.path().join("handoff.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if made {
+            let err = read_handoff(fifo_dir.path(), OutputSemantics::ProducesArtifact)
+                .expect_err("reject");
+            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        }
     }
 
     #[test]
