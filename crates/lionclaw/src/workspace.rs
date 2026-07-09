@@ -161,6 +161,24 @@ pub async fn remove_dir(dir: &Path) {
     let _ = tokio::fs::remove_dir_all(dir).await;
 }
 
+/// The unified diff between two commits (`from..to`). Empty when the tree did
+/// not change (a writer that committed nothing yields `to == from`).
+pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {
+    git(repo, &["diff", &format!("{from}..{to}")]).await
+}
+
+/// Create a branch `name` at `sha` without touching HEAD or the worktree. With
+/// `force`, move an existing branch; otherwise fail if it already exists.
+pub async fn create_branch(repo: &Path, name: &str, sha: &str, force: bool) -> Result<()> {
+    let mut args = vec!["branch"];
+    if force {
+        args.push("--force");
+    }
+    args.push(name);
+    args.push(sha);
+    git(repo, &args).await.map(|_| ())
+}
+
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = git_bytes(repo, args).await?;
     Ok(String::from_utf8_lossy(&out).into_owned())
@@ -273,5 +291,81 @@ mod tests {
         .unwrap();
         std::fs::write(clone.dir.join("f.txt"), "uncommitted\n").unwrap();
         assert!(capture_worker_result(repo.path(), &clone).await.is_err());
+    }
+
+    async fn commit_change(repo: &Path, contents: &str) -> String {
+        std::fs::write(repo.join("f.txt"), contents).unwrap();
+        git(repo, &["add", "-A"]).await.unwrap();
+        git(repo, &["commit", "-q", "-m", "change"]).await.unwrap();
+        head_sha(repo).await.unwrap()
+    }
+
+    // `report --patch` / `apply` read the diff between the recorded base and
+    // head; an unchanged tree (a writer that committed nothing) must yield an
+    // empty diff, never an error.
+    #[tokio::test]
+    async fn diff_shows_changes_and_is_empty_for_an_unchanged_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let head = commit_change(repo.path(), "changed\n").await;
+
+        let changed = diff(repo.path(), &base, &head).await.unwrap();
+        assert!(
+            changed.contains("+changed"),
+            "diff shows the change: {changed}"
+        );
+        assert!(
+            diff(repo.path(), &base, &base)
+                .await
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "an unchanged tree diffs empty, not errors"
+        );
+    }
+
+    // `apply` creates `lionclaw/<id>` at the produced commit without moving HEAD;
+    // it refuses to clobber an existing branch unless forced.
+    #[tokio::test]
+    async fn create_branch_pins_a_sha_and_guards_against_clobber() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let head = commit_change(repo.path(), "changed\n").await;
+        let head_before = head_sha(repo.path()).await.unwrap();
+
+        create_branch(repo.path(), "lionclaw/m1", &base, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "lionclaw/m1"])
+                .await
+                .unwrap()
+                .trim(),
+            base,
+            "the branch points at the requested sha"
+        );
+        assert_eq!(
+            head_sha(repo.path()).await.unwrap(),
+            head_before,
+            "HEAD is untouched"
+        );
+
+        assert!(
+            create_branch(repo.path(), "lionclaw/m1", &head, false)
+                .await
+                .is_err(),
+            "an existing branch is not clobbered without --force"
+        );
+        create_branch(repo.path(), "lionclaw/m1", &head, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "lionclaw/m1"])
+                .await
+                .unwrap()
+                .trim(),
+            head,
+            "--force moves the branch"
+        );
     }
 }

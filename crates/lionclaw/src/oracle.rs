@@ -146,7 +146,10 @@ impl OracleRunner for OciOracleRunner {
         }
         .await;
 
-        let _ = tokio::fs::remove_dir_all(&snapshot).await;
+        // Reap the whole attempt directory (snapshot checkout, staged oracle,
+        // scratch target dir) on every exit path; the outcome is already in
+        // `result` and the verdict is minted from it in the fold.
+        workspace::remove_dir(&dirs.root).await;
         result
     }
 }

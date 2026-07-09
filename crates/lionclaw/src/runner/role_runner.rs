@@ -169,10 +169,12 @@ impl RoleRunner for OciRoleRunner {
         }
         .await;
 
-        // Unconditional teardown of the isolated workspace (clone or
-        // snapshot) on every exit path; the committed object already survives
-        // in the target repo's mission ref.
-        workspace::remove_dir(&workspace_source).await;
+        // Unconditional teardown of the whole attempt directory (workspace
+        // clone/snapshot, handoff, scratch=CARGO_TARGET_DIR, runtime homes) on
+        // every exit path: the handoff is already read into `result` and the
+        // worker's commit already survives in the target repo's mission ref, so
+        // nothing here is load-bearing once the run has settled.
+        workspace::remove_dir(&dirs.root).await;
         result
     }
 }

@@ -12,7 +12,7 @@ use crate::authority::AuthorityCeiling;
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
-use crate::model::{fold, AttentionKind, MissionConfig, MissionId, MissionPhase};
+use crate::model::{fold, AttentionKind, FinishClass, MissionConfig, MissionId, MissionPhase};
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
@@ -61,6 +61,10 @@ pub enum MissionCommand {
     Advance(AdvanceArgs),
     /// Show a mission's state (contract, phase, finish grade).
     Status(StatusArgs),
+    /// The verifiable receipt: what was proven, by what, and what was NOT.
+    Report(ReportArgs),
+    /// Create a branch (`lionclaw/<id>`) at the mission's produced commit.
+    Apply(ApplyArgs),
     /// Print a mission's event log.
     Log(LogArgs),
     /// List missions parked on open attention (durable interrupts).
@@ -218,6 +222,28 @@ pub struct StatusArgs {
 }
 
 #[derive(Args)]
+pub struct ReportArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    /// Include the base..head diff (text output only).
+    #[arg(long)]
+    pub patch: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ApplyArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    /// Overwrite the branch if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args)]
 pub struct LogArgs {
     pub mission_id: String,
     #[arg(long)]
@@ -249,6 +275,8 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Amend(args) => cmd_amend(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Advance(args) => cmd_advance(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
@@ -526,6 +554,164 @@ async fn cmd_plan(args: PlanArgs) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_apply(args: ApplyArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let store = MissionStore::open(&repo).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let state = store
+        .load_state_snapshotted(&mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+    if state.current_sha == state.base_sha {
+        bail!("mission {mission_id} produced no commit to apply");
+    }
+    let branch = format!("lionclaw/{mission_id}");
+    workspace::create_branch(&repo, &branch, &state.current_sha, args.force)
+        .await
+        .with_context(|| {
+            format!("could not create branch '{branch}' (already exists? use --force)")
+        })?;
+    let short: String = state.current_sha.chars().take(12).collect();
+    println!("applied mission {mission_id} → branch {branch} ({short})");
+    Ok(())
+}
+
+async fn cmd_report(args: ReportArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let store = MissionStore::open(&repo).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let state = store
+        .load_state_snapshotted(&mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+
+    let finish = match &state.phase {
+        MissionPhase::Done { finish } => Some(*finish),
+        _ => None,
+    };
+    // Per-assertion evidence: the oracle that judged it, its exit code, the
+    // commit it judged, whether that verdict is fresh at the final head, and a
+    // short excerpt of its output.
+    let mut rows = Vec::new();
+    for (aid, a) in &state.contract {
+        let verdict = a.last_authoritative.as_ref().map(|v| {
+            let (stdout, _stderr) = v.evidence();
+            let excerpt = store
+                .blobs()
+                .resolve(stdout)
+                .ok()
+                .map(|s| s.chars().take(160).collect::<String>());
+            serde_json::json!({
+                "oracle": v.oracle().as_str(),
+                "passed": v.passed(),
+                "exit_code": v.exit_code(),
+                "judged_sha": v.judged_sha(),
+                "fresh": v.judged_sha() == state.current_sha,
+                "evidence_excerpt": excerpt,
+            })
+        });
+        rows.push((aid.as_str().to_string(), a.oracle.is_some(), verdict));
+    }
+    let uncovered: Vec<&str> = state
+        .contract
+        .iter()
+        .filter(|(_, a)| a.oracle.is_none())
+        .map(|(id, _)| id.as_str())
+        .collect();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "mission_id": mission_id.as_str(),
+                "objective": state.objective,
+                "mission_type": { "name": state.mission_type.name, "digest": state.mission_type.digest },
+                "runtime": state.runtime,
+                "image_id": state.image_id,
+                "stop_bar": format!("{:?}", state.config.stop).to_lowercase(),
+                "base_sha": state.base_sha,
+                "current_sha": state.current_sha,
+                "finish": finish.map(|f| format!("{f:?}").to_lowercase()),
+                "assertions": rows.iter().map(|(id, _, v)| serde_json::json!({ "id": id, "verdict": v })).collect::<Vec<_>>(),
+                "not_covered_by_an_oracle": uncovered,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Mission {mission_id} — {}", state.objective);
+    println!(
+        "  type:    {} @ {}",
+        state.mission_type.name,
+        state
+            .mission_type
+            .digest
+            .chars()
+            .take(12)
+            .collect::<String>()
+    );
+    println!("  runtime: {}   image: {}", state.runtime, state.image_id);
+    println!(
+        "  commit:  {} → {}",
+        state.base_sha.chars().take(12).collect::<String>(),
+        state.current_sha.chars().take(12).collect::<String>()
+    );
+    match finish {
+        Some(FinishClass::Verified) => {
+            println!(
+                "  finish:  VERIFIED — a fresh oracle pass at the final commit for every assertion"
+            )
+        }
+        Some(FinishClass::InternallyConsistent) => {
+            println!("  finish:  INTERNALLY-CONSISTENT — no machine checked this; an agent said so")
+        }
+        Some(FinishClass::Unverified) => {
+            println!("  finish:  UNVERIFIED — not proven at the final commit")
+        }
+        None => println!(
+            "  finish:  (not finished; phase {})",
+            phase_slug(&state.phase)
+        ),
+    }
+    println!("  bar:     {:?}", state.config.stop);
+    println!("\n  assertions:");
+    for (id, has_oracle, verdict) in &rows {
+        match verdict {
+            Some(v) => {
+                let passed = v["passed"].as_bool().unwrap_or(false);
+                let fresh = v["fresh"].as_bool().unwrap_or(false);
+                println!(
+                    "    {id}: {} by {} (exit {}){}",
+                    if passed { "PASS" } else { "FAIL" },
+                    v["oracle"].as_str().unwrap_or("?"),
+                    v["exit_code"],
+                    if fresh {
+                        ""
+                    } else {
+                        " [STALE — not at the final commit]"
+                    },
+                );
+            }
+            None if *has_oracle => println!("    {id}: (oracle owed, not yet run)"),
+            None => println!("    {id}: advisory only — no oracle can prove this"),
+        }
+    }
+    if !uncovered.is_empty() {
+        println!(
+            "\n  NOT covered by an oracle (agent judgement only): {}",
+            uncovered.join(", ")
+        );
+    }
+    if args.patch && state.current_sha != state.base_sha {
+        let diff = workspace::diff(&repo, &state.base_sha, &state.current_sha).await?;
+        println!(
+            "\n--- diff {}..{} ---\n{diff}",
+            state.base_sha, state.current_sha
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_decide(args: DecideArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
     let store = MissionStore::open(&repo).await?;
@@ -596,15 +782,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let engine = open_engine_for_mission(&repo, &mission_id).await?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
-    report_state(
-        &args.mission_id,
-        &state.phase,
-        &outcome,
-        args.json,
-        &engine,
-        &mission_id,
-    )
-    .await?;
+    print_advance_outcome(&args.mission_id, &state.phase, &outcome, args.json);
     // The exit code reflects the honesty bar: a mission that finished below the
     // stop bar its mission type declares exits nonzero, so a caller or CI can
     // gate on "actually verified" without parsing output.
@@ -889,16 +1067,12 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
     }
 }
 
-async fn report_state(
+fn print_advance_outcome(
     mission_id: &str,
     phase: &MissionPhase,
     outcome: &AdvanceOutcome,
     json: bool,
-    engine: &Engine,
-    id: &MissionId,
-) -> Result<()> {
-    let _ = engine;
-    let _ = id;
+) {
     let finish = match phase {
         MissionPhase::Done { finish } => Some(format!("{finish:?}").to_lowercase()),
         _ => None,
@@ -933,7 +1107,6 @@ async fn report_state(
             }
         }
     }
-    Ok(())
 }
 
 fn phase_slug(phase: &MissionPhase) -> String {
