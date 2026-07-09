@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw") | .version')
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw-cli") | .version')
           if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
             echo "failed to determine LionClaw version from merged commit" >&2
             exit 1
@@ -87,43 +87,15 @@ jobs:
           RELEASE_DIR="dist/lionclaw-v$VERSION-linux-x86_64"
           ARCHIVE="dist/${{ steps.version.outputs.archive }}"
 
-          mkdir -p "$RELEASE_DIR/skills"
+          mkdir -p "$RELEASE_DIR"
           cp target/release/lionclaw "$RELEASE_DIR/"
-          cp target/release/lionclawd "$RELEASE_DIR/"
-          cp target/release/lionclaw-channel-email "$RELEASE_DIR/"
-          cp target/release/lionclaw-channel-team-local "$RELEASE_DIR/"
-          cp target/release/lionclaw-private-context "$RELEASE_DIR/"
-          cp -R skills/channel-email "$RELEASE_DIR/skills/"
-          cp -R skills/channel-team-local "$RELEASE_DIR/skills/"
-          cp -R skills/lionclaw-private-context "$RELEASE_DIR/skills/"
+          cp -R plugins "$RELEASE_DIR/mission-types"
           cp LICENSE "$RELEASE_DIR/"
 
           test -x "$RELEASE_DIR/lionclaw"
-          test -x "$RELEASE_DIR/lionclawd"
-          test -x "$RELEASE_DIR/lionclaw-channel-email"
-          test -x "$RELEASE_DIR/lionclaw-channel-team-local"
-          test -x "$RELEASE_DIR/lionclaw-private-context"
-          test -x "$RELEASE_DIR/skills/channel-email/scripts/worker"
-          test -f "$RELEASE_DIR/skills/channel-email/README.md"
-          test -f "$RELEASE_DIR/skills/channel-email/lionclaw.toml"
-          test -f "$RELEASE_DIR/skills/channel-email/runtime/email/SKILL.md"
-          test -f "$RELEASE_DIR/skills/channel-email/runtime/email/EMAIL_WORKFLOW_GUIDE.md"
-          grep -q '^name: email$' "$RELEASE_DIR/skills/channel-email/runtime/email/SKILL.md"
-          test -x "$RELEASE_DIR/skills/channel-team-local/scripts/worker"
-          test -f "$RELEASE_DIR/skills/channel-team-local/README.md"
-          test -f "$RELEASE_DIR/skills/channel-team-local/lionclaw.toml"
-          test -f "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/SKILL.md"
-          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/list"
-          test -x "$RELEASE_DIR/skills/channel-team-local/runtime/team-local/scripts/resolve"
-          test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/context"
-          test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/projector"
-          test -x "$RELEASE_DIR/skills/lionclaw-private-context/scripts/recorder"
-          test -f "$RELEASE_DIR/skills/lionclaw-private-context/README.md"
-          test -f "$RELEASE_DIR/skills/lionclaw-private-context/SKILL.md"
-          test -f "$RELEASE_DIR/skills/lionclaw-private-context/lionclaw.toml"
-          test -f "$RELEASE_DIR/skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md"
-          grep -q '^name: lionclaw-private-context$' "$RELEASE_DIR/skills/lionclaw-private-context/SKILL.md"
-          grep -q '^name: lionclaw-private-context$' "$RELEASE_DIR/skills/lionclaw-private-context/runtime/lionclaw-private-context/SKILL.md"
+          test -f "$RELEASE_DIR/mission-types/software-dev/mission.toml"
+          test -x "$RELEASE_DIR/mission-types/software-dev/oracles/cargo-test"
+          test -f "$RELEASE_DIR/LICENSE"
 
           tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"
           (
