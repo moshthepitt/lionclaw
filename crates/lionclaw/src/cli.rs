@@ -714,6 +714,15 @@ async fn cmd_plan(args: PlanArgs) -> Result<()> {
     Ok(())
 }
 
+/// The branch name and target commit for `apply`, or an error when the mission
+/// produced no commit (`current == base`) — never create an empty branch.
+fn apply_target(mission_id: &MissionId, base_sha: &str, current_sha: &str) -> Result<String> {
+    if current_sha == base_sha {
+        bail!("mission {mission_id} produced no commit to apply");
+    }
+    Ok(format!("lionclaw/{mission_id}"))
+}
+
 async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
@@ -721,10 +730,7 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
         .load_state_snapshotted(&mission_id)
         .await?
         .with_context(|| format!("mission {mission_id} not found"))?;
-    if state.current_sha == state.base_sha {
-        bail!("mission {mission_id} produced no commit to apply");
-    }
-    let branch = format!("lionclaw/{mission_id}");
+    let branch = apply_target(&mission_id, &state.base_sha, &state.current_sha)?;
     workspace::create_branch(&repo, &branch, &state.current_sha, args.force)
         .await
         .with_context(|| {
@@ -1256,5 +1262,25 @@ fn phase_slug(phase: &MissionPhase) -> String {
     match phase {
         MissionPhase::Done { finish } => format!("done:{}", finish.slug()),
         other => other.slug().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mid() -> MissionId {
+        MissionId::parse("mabc123def456").unwrap()
+    }
+
+    #[test]
+    fn apply_refuses_a_mission_that_produced_no_commit() {
+        // current == base ⇒ nothing to apply (never an empty branch).
+        assert!(apply_target(&mid(), "base", "base").is_err());
+        // a produced commit ⇒ the `lionclaw/<id>` branch target.
+        assert_eq!(
+            apply_target(&mid(), "base", "head").unwrap(),
+            "lionclaw/mabc123def456"
+        );
     }
 }

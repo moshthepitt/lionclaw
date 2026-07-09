@@ -590,7 +590,7 @@ fn check_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
 mod tests {
     use super::*;
     use crate::model::ids::AssertionId;
-    use crate::model::plan::{Assertion, Task};
+    use crate::model::plan::{Assertion, PlanningTask, Task};
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
@@ -670,6 +670,16 @@ mod tests {
             RoleName::new("checker").expect("valid role name"),
             OutputSemantics::EmitsVerdict,
         );
+        // Planning-only roles, for the planning-DAG and planning-role-on-an-
+        // execution-task tests.
+        roles.insert(
+            RoleName::new("reporter").expect("valid role name"),
+            OutputSemantics::ProducesReport,
+        );
+        roles.insert(
+            RoleName::new("author").expect("valid role name"),
+            OutputSemantics::ProposesPlan,
+        );
         MissionTypeInventory {
             roles,
             oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
@@ -691,6 +701,115 @@ mod tests {
     }
 
     const CLEAN: Vec<&str> = Vec::new();
+
+    fn ptask(id: &str, role: &str, deps: &[&str]) -> PlanningTask {
+        PlanningTask {
+            id: tid(id),
+            role: RoleName::new(role).expect("valid role name"),
+            body: format!("do {id}"),
+            depends_on: deps.iter().map(|d| tid(d)).collect(),
+        }
+    }
+
+    fn planning_codes(tasks: Vec<PlanningTask>) -> Vec<&'static str> {
+        validate_planning_dag(&PlanningDag { tasks }, &inventory())
+            .into_iter()
+            .map(|e| e.code)
+            .collect()
+    }
+
+    // Fault-injection coverage for the planning-DAG guards unique to the loader:
+    // exactly-one-author, author-is-the-unique-sink, and cycle detection have no
+    // other test, so a fail-open regression would otherwise ship silently.
+    #[test]
+    fn planning_dag_guards() {
+        // Valid: research → author, the author the unique sink.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("research", "reporter", &[]),
+                ptask("author", "author", &["research"]),
+            ]),
+            CLEAN
+        );
+        // Empty is valid (no in-engine planning).
+        assert_eq!(planning_codes(vec![]), CLEAN);
+        // Two proposers → planning_author.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("a1", "author", &[]),
+                ptask("a2", "author", &["a1"]),
+            ]),
+            vec!["planning_author"]
+        );
+        // Zero proposers → planning_author.
+        assert_eq!(
+            planning_codes(vec![ptask("r", "reporter", &[])]),
+            vec!["planning_author"]
+        );
+        // A report node that doesn't drain into the author → planning_sink.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("orphan", "reporter", &[]),
+                ptask("author", "author", &[]),
+            ]),
+            vec!["planning_sink"]
+        );
+        // A dependency cycle → cycle_detected.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("a", "reporter", &["author"]),
+                ptask("author", "author", &["a"]),
+            ]),
+            vec!["cycle_detected"]
+        );
+        // A duplicate id → duplicate_task_id.
+        assert_eq!(
+            planning_codes(vec![
+                ptask("dup", "reporter", &[]),
+                ptask("dup", "author", &["dup"]),
+            ]),
+            vec!["duplicate_task_id"]
+        );
+        // An execution role in the planning DAG → role_output_mismatch.
+        assert_eq!(
+            planning_codes(vec![ptask("author", "implementer", &[])]),
+            vec!["role_output_mismatch"]
+        );
+    }
+
+    // The check_shape chokepoint: a read-only planning role (produces-report /
+    // proposes-plan) must never masquerade as an execution worker in a submitted
+    // plan. Neither arm was exercised before.
+    #[test]
+    fn a_planning_role_on_an_execution_task_is_rejected() {
+        let work_on_reporter = submission(
+            vec![assertion_with_oracle("AA", "cargo-test")],
+            vec![task(
+                "t",
+                TaskKind::Work,
+                Some("reporter"),
+                "do",
+                &["AA"],
+                &[],
+            )],
+        );
+        assert!(codes(&work_on_reporter).contains(&"role_output_mismatch"));
+        let validate_on_author = submission(
+            vec![assertion_with_oracle("AA", "cargo-test")],
+            vec![
+                work("w", &["AA"], &[]),
+                task(
+                    "t",
+                    TaskKind::Validate,
+                    Some("author"),
+                    "check",
+                    &["AA"],
+                    &[],
+                ),
+            ],
+        );
+        assert!(codes(&validate_on_author).contains(&"role_output_mismatch"));
+    }
 
     #[test]
     fn empty_contract_returned_alone() {

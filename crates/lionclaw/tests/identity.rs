@@ -4,12 +4,73 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use common::{default_config, test_mission_type, BASE_SHA, HEAD_SHA};
+use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::Engine;
+use lionclaw::mission_type::load_mission_type;
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+
+fn write_minimal_type(root: &Path) {
+    std::fs::create_dir_all(root.join("roles")).unwrap();
+    std::fs::create_dir_all(root.join("oracles")).unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/implementer.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    let oracle = root.join("oracles/cargo-test");
+    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The pin is only meaningful because the digest is computed over the role and
+/// oracle *content*: prove editing either file changes it (the equality check
+/// in the test above is otherwise vacuous if `compute_digest` ignored content).
+#[test]
+fn the_digest_tracks_role_and_oracle_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("digest-test");
+    write_minimal_type(&root);
+    let digest = || {
+        load_mission_type(&root, &AuthorityCeiling::default())
+            .expect("loads")
+            .digest
+    };
+    let base = digest();
+
+    // Editing a role's prose changes the digest, and restoring it restores the
+    // digest (so the walk is deterministic, not merely order-varying).
+    std::fs::write(
+        root.join("roles/implementer.md"),
+        "---\noutput: produces-artifact\n---\nDo it differently.\n",
+    )
+    .unwrap();
+    assert_ne!(base, digest(), "a mutated role must change the digest");
+    std::fs::write(
+        root.join("roles/implementer.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    assert_eq!(base, digest(), "restoring the role restores the digest");
+
+    // Editing an oracle's bytes changes the digest — the fake-green vector the
+    // pin exists to close.
+    std::fs::write(root.join("oracles/cargo-test"), "#!/bin/sh\nexit 1\n").unwrap();
+    assert_ne!(base, digest(), "a mutated oracle must change the digest");
+}
 
 #[tokio::test]
 async fn opening_a_mission_whose_type_digest_changed_is_refused() {
