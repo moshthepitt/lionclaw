@@ -78,9 +78,10 @@ pub struct PlanSubmission {
 
 impl PlanSubmission {
     /// Whether every assertion binds an oracle — i.e. the plan is
-    /// verified-possible (each claim can be authoritatively judged). The one
-    /// predicate behind the `verified-possible`/`reviewed-only` display and the
-    /// `Verified` stop-bar reachability check.
+    /// verified-possible (each claim can be authoritatively judged). Backs the
+    /// CLI `verified-possible`/`reviewed-only` ceiling display. (The `Verified`
+    /// stop-bar reachability check computes the same condition independently, to
+    /// report the offending assertion ids.)
     pub fn all_assertions_bound(&self) -> bool {
         self.assertions.iter().all(|a| a.oracle.is_some())
     }

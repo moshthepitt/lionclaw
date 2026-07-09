@@ -158,7 +158,9 @@ impl RoleRunner for OciRoleRunner {
                         // Only an uncommitted tree is agent behavior; git infra or
                         // a moved HEAD is infrastructure.
                         kind: match e {
-                            workspace::CaptureError::DirtyWorktree(_) => RunErrorKind::DirtyWorktree,
+                            workspace::CaptureError::DirtyWorktree(_) => {
+                                RunErrorKind::DirtyWorktree
+                            }
                             workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
                         },
                         detail: e.to_string(),

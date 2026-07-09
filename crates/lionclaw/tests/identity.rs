@@ -37,8 +37,9 @@ fn write_minimal_type(root: &Path) {
 }
 
 /// The pin is only meaningful because the digest is computed over the role and
-/// oracle *content*: prove editing either file changes it (the equality check
-/// in the test above is otherwise vacuous if `compute_digest` ignored content).
+/// oracle *content*: prove editing either file changes it (the equality check in
+/// `opening_a_mission_whose_type_digest_changed_is_refused` below is otherwise
+/// vacuous if `compute_digest` ignored content).
 #[test]
 fn the_digest_tracks_role_and_oracle_content() {
     let dir = tempfile::tempdir().unwrap();

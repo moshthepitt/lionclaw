@@ -99,7 +99,6 @@ type OracleScript =
 pub struct MockOracleRunner {
     script: OracleScript,
     pub calls: Mutex<Vec<(String, String)>>,
-    pub invocations_by_key: Mutex<BTreeMap<String, u32>>,
 }
 
 impl MockOracleRunner {
@@ -107,7 +106,6 @@ impl MockOracleRunner {
         Self {
             script,
             calls: Mutex::new(Vec::new()),
-            invocations_by_key: Mutex::new(BTreeMap::new()),
         }
     }
 

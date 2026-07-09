@@ -686,21 +686,13 @@ async fn cmd_plan(args: PlanArgs) -> Result<()> {
             "{}",
             serde_json::json!({
                 "mission_id": mission_id.as_str(),
-                "engine_authored": state.proposal_engine_authored,
                 "ceiling": ceiling,
                 "assertions": bindings,
                 "tasks": proposal.tasks.len(),
             })
         );
     } else {
-        println!(
-            "proposed contract for mission {mission_id} ({ceiling}, {} authored):",
-            if state.proposal_engine_authored {
-                "engine"
-            } else {
-                "human"
-            }
-        );
+        println!("proposed contract for mission {mission_id} ({ceiling}):");
         for a in &proposal.assertions {
             let oracle = a
                 .oracle

@@ -196,7 +196,6 @@ async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
     assert!(state.plan.is_none(), "planning must not seed a plan");
     assert!(state.contract.is_empty(), "no contract before ratification");
     assert!(state.proposal.is_some(), "the author proposed a contract");
-    assert!(state.proposal_engine_authored);
     let ratify = state
         .open_attention
         .values()

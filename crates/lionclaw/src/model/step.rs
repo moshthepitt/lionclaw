@@ -9,7 +9,9 @@
 //! isolation zenith disabled:
 //! - **Writers serialize.** Each artifact-producing run gets its own
 //!   worktree stacked on the previous artifact commit, so at most one work
-//!   task dispatches at a time. Validators and oracles parallelize freely.
+//!   task dispatches at a time. Validators dispatch one at a time too (any
+//!   role run does), but need no stacked worktree; only oracles batch and run
+//!   in parallel.
 //! - **Auto-close.** There is no interactive orchestrator process to call
 //!   `end_mission`; when nothing is runnable, inflight, or owed, the phase
 //!   derivation closes the mission. Attention parks keep the human pauses.
@@ -646,8 +648,9 @@ mod tests {
             role_requested("w1", 1, "k-w1-1"),
         ]);
         assert_eq!(state.tasks[&tid("w1")].attempts, 1);
-        // The failure→retry re-pend transition is Slice-4; simulate its
-        // post-state so the numbering contract is pinned now.
+        // Hand-apply the post-state of the failure→retry re-pend (a
+        // RoleRunFailed + DecisionRecorded(Retry, node_failed:…) sequence,
+        // covered in the fold tests) to pin the attempt-numbering contract here.
         state.inflight.clear();
         state.tasks.get_mut(&tid("w1")).expect("w1 exists").status = TaskStatus::Pending;
         assert_eq!(dispatched(&state).attempt_no, 2);

@@ -121,7 +121,10 @@ pub enum CaptureError {
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives clone teardown.
-pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<String, CaptureError> {
+pub async fn capture_worker_result(
+    repo: &Path,
+    clone: &WorkerClone,
+) -> Result<String, CaptureError> {
     let status = git(&clone.dir, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         return Err(CaptureError::DirtyWorktree(status.lines().count()));

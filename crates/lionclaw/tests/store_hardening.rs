@@ -1,5 +1,6 @@
 //! Slice 3 store hardening: lease expiry lets a crashed worker's claim be
-//! reclaimed exactly once; idempotency keeps duplicate requests out.
+//! reclaimed exactly once. (The idempotency-key store invariant is tested in
+//! `resume.rs::one_outcome_per_idempotency_key_is_a_store_invariant`.)
 
 mod common;
 

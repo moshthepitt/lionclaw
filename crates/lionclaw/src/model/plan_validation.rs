@@ -88,12 +88,12 @@ pub fn validate_plan_submission(
     if !errors.is_empty() {
         return errors;
     }
-    // Group 7: the declared stop bar is reachable. Under `Verified` every
-    // assertion must bind an oracle — an oracle-less assertion can never become
-    // authoritatively verified, and (contract being strengthen-only) can never
-    // be removed, so it would cap the mission below `Verified` forever. Reject
-    // at author time; a domain with genuinely unprovable claims declares
-    // `stop = reviewed`.
+    // Group 7: the declared stop bar is reachable. A `Verified` mission must
+    // launch fully provable — every assertion bound to an oracle as submitted.
+    // An oracle-less assertion is rejected at author time. (A later
+    // strengthen-only `bind_oracle` amendment *could* bind one, so this is a
+    // launch-time policy, not a permanence claim; a domain with genuinely
+    // unprovable claims declares `stop = reviewed`.)
     check_stop_bar_reachable(submission, inventory.stop)
 }
 

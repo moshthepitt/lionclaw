@@ -462,13 +462,20 @@ impl Engine {
     /// concurrent driver moved the head, and the next fold re-derives the same
     /// dispatch. Outcome appends do NOT use this — `drive_one` must re-append its
     /// unique computed outcome rather than discard it.
-    async fn append_idempotent(&self, mission_id: &MissionId, head: u64, events: &[NewEvent]) -> Result<()> {
+    async fn append_idempotent(
+        &self,
+        mission_id: &MissionId,
+        head: u64,
+        events: &[NewEvent],
+    ) -> Result<()> {
         match self
             .store
             .append(mission_id, head, events, self.clock.now_ms())
             .await
         {
-            Ok(_) | Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(()),
+            Ok(_) | Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => {
+                Ok(())
+            }
             Err(err) => Err(err.into()),
         }
     }

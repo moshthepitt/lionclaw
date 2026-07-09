@@ -9,7 +9,7 @@ proves it.
 
 1. **State the contract first.** Each assertion is a falsifiable claim about
    the finished code, with an uppercase id (`^[A-Z][A-Z0-9-]+$`) and prose the
-   reviewer and oracles can judge against. This plugin stops at **verified**, so
+   reviewer and oracles can judge against. This mission type stops at **verified**, so
    **every** contract assertion must bind an **oracle** — the engine rejects an
    oracle-less assertion at submit. A claim no command can check (design,
    readability, intent) does not belong in the contract here; capture it as a
@@ -46,7 +46,7 @@ for the oracle.
 
 ## The honesty bar
 
-This plugin stops at **verified**: the engine declares a verified finish only
+This mission type stops at **verified**: the engine declares a verified finish only
 when every contract assertion has a fresh authoritative (oracle) pass at the
 final commit. Because of that, the `verified` bar rejects an oracle-less
 assertion at submit — a reviewer can never stand in for an oracle here; it only

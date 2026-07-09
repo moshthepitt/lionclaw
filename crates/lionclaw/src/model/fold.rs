@@ -81,7 +81,6 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
             tasks: planning_tasks,
         },
         proposal: None,
-        proposal_engine_authored: false,
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
@@ -231,8 +230,10 @@ fn derive_promotion(state: &mut MissionState) {
     if state.plan.is_some() || state.proposal.is_none() {
         return;
     }
-    let gated = state.proposal_engine_authored || state.config.ratification_gate;
-    if gated && !state.ratified {
+    // Every proposal is engine-authored, so it always needs a human `Ratify`
+    // first (regardless of `--yes`/ratification_gate, which govern only the
+    // manual PlanSubmitted path).
+    if !state.ratified {
         return;
     }
     let proposal = state
@@ -473,7 +474,7 @@ pub(crate) fn bind_strengthens(
 /// cleared evaluates its upstream validators (AND semantics). A cleared gate
 /// still raises a checkpoint (zenith's discipline — a human confirms before
 /// the mission proceeds past it); a failed gate raises `gate_failed`. Both
-/// pause the mission until Slice 4's decision surface resolves them.
+/// pause the mission until a human decision (`decide … continue`) resolves them.
 fn derive_gates(state: &mut MissionState) {
     let Some(plan) = state.plan.clone() else {
         return;
@@ -534,7 +535,6 @@ fn apply_decision(
             // stale node_attention item would re-park the mission and block the
             // re-plan (mirrors the NodeFailed retry scrub below).
             state.proposal = None;
-            state.proposal_engine_authored = false;
             for (id, task) in &mut state.planning.tasks {
                 task.status = TaskStatus::Pending;
                 state.flagged_nodes.remove(id);
@@ -668,8 +668,7 @@ fn derive_attention(state: &mut MissionState) {
                 );
             }
         }
-        let gated = state.proposal_engine_authored || state.config.ratification_gate;
-        if state.proposal.is_some() && gated && !state.ratified {
+        if state.proposal.is_some() && !state.ratified {
             raise(
                 AttentionKind::RatifyProposal,
                 None,
@@ -792,7 +791,6 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 if let Some(plan) = proposal {
                     if state.plan.is_none() && state.proposal.is_none() {
                         state.proposal = Some(plan.clone());
-                        state.proposal_engine_authored = true;
                     }
                 }
                 if *request_attention {

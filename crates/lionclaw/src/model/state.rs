@@ -275,11 +275,10 @@ pub struct MissionState {
     pub planning: PlanningState,
     /// The author's proposed plan, awaiting ratification. Gradeless: it becomes
     /// `contract`/`tasks` only via `derive_promotion` once ratified. `None`
-    /// before a proposal and after promotion.
+    /// before a proposal and after promotion. Every proposal is engine-authored
+    /// and always requires a human `Ratify` (the manual path is `PlanSubmitted`,
+    /// which seeds the contract directly and never populates this field).
     pub proposal: Option<PlanSubmission>,
-    /// Whether `proposal` came from the in-engine author (vs a manually
-    /// submitted plan). Engine-authored proposals always require ratification.
-    pub proposal_engine_authored: bool,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
     /// are fresh only when judged at this commit.
     pub current_sha: String,

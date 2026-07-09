@@ -36,11 +36,6 @@ jobs:
 
       - uses: ./.github/actions/setup-rust
 
-      - uses: astral-sh/setup-uv@v8.2.0
-        with:
-          enable-cache: true
-          python-version: "3.12"
-
       - name: Verify main before bumping
         run: bash ./scripts/ci.sh
 
