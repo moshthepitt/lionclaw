@@ -235,7 +235,7 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::SubmitPlan(args) => cmd_submit_plan(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Amend(args) => cmd_amend(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Advance(args) => cmd_advance(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Advance(args) => cmd_advance(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
@@ -354,7 +354,8 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
             MissionConfig {
                 // Default-on ratification gate; `--yes` auto-approves.
                 ratification_gate: !args.yes,
-                ..Default::default()
+                // The honesty bar is the mission type's, not a hardcoded default.
+                stop: engine.mission_type().stop,
             },
         )
         .await?;
@@ -493,7 +494,7 @@ async fn cmd_amend(args: AmendArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
+async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let repo = args.repo.canonicalize().context("repo path")?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let engine = open_engine_for_mission(&repo, &mission_id).await?;
@@ -507,7 +508,20 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
         &engine,
         &mission_id,
     )
-    .await
+    .await?;
+    // The exit code reflects the honesty bar: a mission that finished below the
+    // stop bar its mission type declares exits nonzero, so a caller or CI can
+    // gate on "actually verified" without parsing output.
+    Ok(match &state.phase {
+        MissionPhase::Done { finish } if !state.config.stop.satisfied_by(*finish) => {
+            eprintln!(
+                "finished {finish:?}, below the mission type's stop bar {:?}",
+                state.config.stop
+            );
+            std::process::ExitCode::FAILURE
+        }
+        _ => std::process::ExitCode::SUCCESS,
+    })
 }
 
 async fn cmd_status(args: StatusArgs) -> Result<()> {

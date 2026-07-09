@@ -37,17 +37,20 @@ fn moat_refuses_over_privileged_judge_mission_type() {
     );
 }
 
-/// Scenario 4 — advisory-only "done" is refused: a plugin with a reviewer
-/// and no oracles, whose bar is "verified", finishes internally-consistent
-/// even when the reviewer passes everything. Never verified.
+/// Scenario 4 — the fold-level honesty cap: a mission type with a reviewer and
+/// no oracles finishes internally-consistent even when the reviewer passes
+/// everything. Never verified — an agent-only verdict can't mint authority.
+/// (Its bar is `reviewed`, so the advisory plan is submittable; a `verified`
+/// type would reject the oracle-less plan at submit — see
+/// `plan_validation::tests::verified_bar_rejects_an_oracle_less_assertion`.)
 #[tokio::test]
 async fn advisory_only_mission_type_never_verifies() {
     let plugin = load_mission_type(
         &fixtures().join("mission-types/advisory-only"),
         &AuthorityCeiling::default(),
     )
-    .expect("advisory-only plugin loads");
-    assert_eq!(plugin.stop, StopBar::Verified);
+    .expect("advisory-only mission type loads");
+    assert_eq!(plugin.stop, StopBar::Reviewed);
     assert!(plugin.oracles.is_empty(), "fixture has no oracles");
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -100,7 +103,7 @@ async fn advisory_only_mission_type_never_verifies() {
             "base-0",
             MissionConfig {
                 ratification_gate: false,
-                ..Default::default()
+                stop: StopBar::Reviewed,
             },
         )
         .await

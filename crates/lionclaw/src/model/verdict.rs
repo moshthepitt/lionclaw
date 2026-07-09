@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::event::PayloadRef;
+use super::event::{PayloadRef, StopBar};
 use super::ids::OracleName;
 use super::state::{AdvisoryStatus, MissionState};
 
@@ -79,6 +79,22 @@ pub enum FinishClass {
     Verified,
     InternallyConsistent,
     Unverified,
+}
+
+impl StopBar {
+    /// Does a finish class clear this honesty bar? `Verified` demands an
+    /// authoritative oracle pass; `Reviewed` also accepts agent-only
+    /// `InternallyConsistent`. `Unverified` clears neither.
+    pub const fn satisfied_by(self, finish: FinishClass) -> bool {
+        matches!(
+            (self, finish),
+            (StopBar::Verified, FinishClass::Verified)
+                | (
+                    StopBar::Reviewed,
+                    FinishClass::Verified | FinishClass::InternallyConsistent
+                )
+        )
+    }
 }
 
 /// Classify a finished mission. Freshness: an authoritative verdict counts

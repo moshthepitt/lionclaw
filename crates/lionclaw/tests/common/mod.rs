@@ -28,7 +28,10 @@ pub fn test_mission_type() -> MissionType {
     MissionType {
         name: "software-dev-test".to_string(),
         digest: "test-digest".to_string(),
-        stop: StopBar::Verified,
+        // `Reviewed` so the shared harness accepts both oracle-bound and
+        // advisory plans; the `Verified` submit-reachability check is exercised
+        // in the plan_validation unit tests.
+        stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         root: "/nonexistent-mission-type".into(),
         playbook: None,

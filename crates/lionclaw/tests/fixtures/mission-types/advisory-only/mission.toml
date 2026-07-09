@@ -1,4 +1,4 @@
 [mission-type]
 name = "advisory-only"
-stop = "verified"
+stop = "reviewed"
 image = "localhost/lionclaw-runtime-dev:v1"

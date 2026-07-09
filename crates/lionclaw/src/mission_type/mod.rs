@@ -62,6 +62,7 @@ impl MissionType {
                 .map(|(name, role)| (name.clone(), role.output))
                 .collect(),
             oracles: self.oracles.keys().cloned().collect::<BTreeSet<_>>(),
+            stop: self.stop,
         }
     }
 }

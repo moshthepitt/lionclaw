@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::event::AmendmentOps;
+use super::event::{AmendmentOps, StopBar};
 use super::ids::{OracleName, RoleName, TaskId};
 use super::plan::{OutputSemantics, PlanSubmission, TaskKind};
 use super::state::MissionState;
@@ -37,6 +37,9 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
 pub struct MissionTypeInventory {
     pub roles: BTreeMap<RoleName, OutputSemantics>,
     pub oracles: BTreeSet<OracleName>,
+    /// The honesty bar the mission type declares — plans under `Verified` must
+    /// be provable (every assertion bound to an oracle).
+    pub stop: StopBar,
 }
 
 pub fn validate_plan_submission(
@@ -81,7 +84,41 @@ pub fn validate_plan_submission(
     }
     // Group 6: every gate target has an upstream validator (else the gate can
     // never clear — reject at author time instead of parking at run time).
-    check_gate_coverage(submission)
+    let errors = check_gate_coverage(submission);
+    if !errors.is_empty() {
+        return errors;
+    }
+    // Group 7: the declared stop bar is reachable. Under `Verified` every
+    // assertion must bind an oracle — an oracle-less assertion can never become
+    // authoritatively verified, and (contract being strengthen-only) can never
+    // be removed, so it would cap the mission below `Verified` forever. Reject
+    // at author time; a domain with genuinely unprovable claims declares
+    // `stop = reviewed`.
+    check_stop_bar_reachable(submission, inventory.stop)
+}
+
+fn check_stop_bar_reachable(
+    submission: &PlanSubmission,
+    stop: StopBar,
+) -> Vec<PlanValidationError> {
+    if stop != StopBar::Verified {
+        return Vec::new();
+    }
+    submission
+        .assertions
+        .iter()
+        .filter(|a| a.oracle.is_none())
+        .map(|a| {
+            err(
+                "assertion_unprovable",
+                format!(
+                    "assertion '{}' binds no oracle, so it can never be authoritatively \
+                     Verified; bind an oracle, or declare `stop = reviewed`",
+                    a.id
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Why an amendment is refused. The structural prechecks below carry the
@@ -522,6 +559,9 @@ mod tests {
         MissionTypeInventory {
             roles,
             oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
+            // `Reviewed` so these structural tests aren't also subject to the
+            // stop-bar-reachability check (exercised separately below).
+            stop: StopBar::Reviewed,
         }
     }
 
@@ -809,6 +849,34 @@ mod tests {
                 gate("g1", &["A1", "A2"], &["v1"]),
             ],
         );
+        assert_eq!(codes(&sub), CLEAN);
+    }
+
+    #[test]
+    fn verified_bar_rejects_an_oracle_less_assertion() {
+        let mut verified = inventory();
+        verified.stop = StopBar::Verified;
+        let against = |sub: &PlanSubmission| -> Vec<&'static str> {
+            validate_plan_submission(sub, &verified)
+                .into_iter()
+                .map(|e| e.code)
+                .collect()
+        };
+
+        // Under `verified`, an assertion with no oracle can never become
+        // authoritatively Verified, so it is rejected at author time.
+        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
+        assert_eq!(against(&sub), vec!["assertion_unprovable"]);
+
+        // Bind an oracle and the same plan is accepted.
+        let sub = submission(
+            vec![assertion_with_oracle("A1", "cargo-test")],
+            vec![work("w1", &["A1"], &[])],
+        );
+        assert_eq!(against(&sub), CLEAN);
+
+        // The default `reviewed` inventory accepts the oracle-less plan.
+        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
         assert_eq!(codes(&sub), CLEAN);
     }
 }
