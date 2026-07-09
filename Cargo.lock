@@ -1947,9 +1947,9 @@ dependencies = [
 
 [[package]]
 name = "mail-send"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d06f18f6ad15354b83645a05466570ced7bf770a17b138742e705d54407d83ba"
+checksum = "dc851b8321041a68cc3b017135b6b8d2789a8b6e455aaebe60594bd6a39b2268"
 dependencies = [
  "base64",
  "gethostname",
@@ -3660,7 +3660,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
