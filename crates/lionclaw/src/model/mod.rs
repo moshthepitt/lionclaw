@@ -25,14 +25,16 @@ pub use event::{
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
-pub use plan::{Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
+pub use plan::{
+    Assertion, OutputSemantics, PlanSubmission, PlanningDag, PlanningTask, Task, TaskKind,
+};
 pub use plan_validation::{
     validate_plan_amendment, validate_plan_submission, AmendmentError, MissionTypeInventory,
     PlanValidationError,
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, TaskRuntimeState, TaskStatus,
+    MissionState, PlanningState, TaskRuntimeState, TaskStatus,
 };
 pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
 pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};

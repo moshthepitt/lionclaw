@@ -56,6 +56,13 @@ pub struct TaskRuntimeState {
     pub last_report: Option<PayloadRef>,
 }
 
+/// Runtime status of the contract-free planning DAG. A separate map from the
+/// execution `tasks` so a planning id can never satisfy execution coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PlanningState {
+    pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
+}
+
 /// Zenith's sticky per-assertion advisory status: `pending → passed` is
 /// sticky; anything else that reports non-pass lands `failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +96,9 @@ pub enum AttentionKind {
     OracleFailed,
     GateFailed,
     GateCheckpoint,
+    /// The in-engine author's proposal awaits a human's ratification before it
+    /// seeds the contract.
+    RatifyProposal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +190,8 @@ impl InflightEffect {
             | MissionEvent::OracleRunFailed { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
-            | MissionEvent::PlanAmended { .. } => None,
+            | MissionEvent::PlanAmended { .. }
+            | MissionEvent::PlanProposed { .. } => None,
         }
     }
 
@@ -210,6 +221,17 @@ pub struct MissionState {
     pub plan: Option<PlanSubmission>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
+    /// The contract-free planning phase: the runtime status of the mission
+    /// type's planning DAG. Disjoint from `tasks` (execution) — planning and
+    /// execution ids never coexist, since `plan` goes monotonically `None → Some`.
+    pub planning: PlanningState,
+    /// The author's proposed plan, awaiting ratification. Gradeless: it becomes
+    /// `contract`/`tasks` only via `derive_promotion` once ratified. `None`
+    /// before a proposal and after promotion.
+    pub proposal: Option<PlanSubmission>,
+    /// Whether `proposal` came from the in-engine author (vs a manually
+    /// submitted plan). Engine-authored proposals always require ratification.
+    pub proposal_engine_authored: bool,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
     /// are fresh only when judged at this commit.
     pub current_sha: String,

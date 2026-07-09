@@ -33,6 +33,7 @@ pub fn test_mission_type() -> MissionType {
         // in the plan_validation unit tests.
         stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
+        planning: Default::default(),
         root: "/nonexistent-mission-type".into(),
         playbook: None,
         roles: BTreeMap::from([

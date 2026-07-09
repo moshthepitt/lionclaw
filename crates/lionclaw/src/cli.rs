@@ -356,6 +356,9 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                 ratification_gate: !args.yes,
                 // The honesty bar is the mission type's, not a hardcoded default.
                 stop: engine.mission_type().stop,
+                // The planning DAG the mission type ships (empty ⇒ awaits a
+                // manually submitted plan).
+                planning: engine.mission_type().planning.clone(),
             },
         )
         .await?;

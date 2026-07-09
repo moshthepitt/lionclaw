@@ -15,7 +15,7 @@ use super::ids::{AssertionId, OracleName, TaskId};
 use super::plan::{Assertion, PlanSubmission};
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, TaskRuntimeState, TaskStatus,
+    MissionState, PlanningState, TaskRuntimeState, TaskStatus,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
@@ -48,6 +48,22 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
     else {
         return None;
     };
+    // Seed the planning DAG's nodes as Pending so they are runnable from event 1.
+    let planning_tasks = config
+        .planning
+        .tasks
+        .iter()
+        .map(|t| {
+            (
+                t.id.clone(),
+                TaskRuntimeState {
+                    status: TaskStatus::Pending,
+                    attempts: 0,
+                    last_report: None,
+                },
+            )
+        })
+        .collect();
     Some(MissionState {
         mission_id: envelope.mission_id.clone(),
         objective: objective.clone(),
@@ -61,6 +77,11 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         plan: None,
         contract: Default::default(),
         tasks: Default::default(),
+        planning: PlanningState {
+            tasks: planning_tasks,
+        },
+        proposal: None,
+        proposal_engine_authored: false,
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
@@ -97,14 +118,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attempt_no,
             ..
         } => {
-            let task = state
-                .tasks
-                .entry(task_id.clone())
-                .or_insert(TaskRuntimeState {
-                    status: TaskStatus::Pending,
-                    attempts: 0,
-                    last_report: None,
-                });
+            let tasks = if state.plan.is_none() {
+                &mut state.planning.tasks
+            } else {
+                &mut state.tasks
+            };
+            let task = tasks.entry(task_id.clone()).or_insert(TaskRuntimeState {
+                status: TaskStatus::Pending,
+                attempts: 0,
+                last_report: None,
+            });
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
             track_inflight(state, &envelope.event, seq);
@@ -128,7 +151,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             state.inflight.remove(idempotency_key);
-            if let Some(task) = state.tasks.get_mut(task_id) {
+            let tasks = if state.plan.is_none() {
+                &mut state.planning.tasks
+            } else {
+                &mut state.tasks
+            };
+            if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Failed;
             }
         }
@@ -192,11 +220,50 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             apply_amendment(state, *base_revision, ops);
         }
+        MissionEvent::PlanProposed { plan, .. } => {
+            // Manual escape hatch: a host-authored plan becomes the gradeless
+            // proposal, exactly like the in-engine author's, then rides the same
+            // ratify-then-promote path.
+            if state.plan.is_none() && state.proposal.is_none() {
+                state.proposal = Some(plan.clone());
+                state.proposal_engine_authored = false;
+            }
+        }
     }
     state.head = seq;
+    // Promotion runs first: a just-ratified proposal must seed the contract
+    // before gates/attention/phase are derived this same fold (a plan whose only
+    // sink is a gate would otherwise hang one event behind).
+    derive_promotion(state);
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+/// Seed the execution contract + task DAG from a ratified proposal — the ONE
+/// path by which `state.contract`/`state.tasks` are ever populated, guarded by
+/// `plan.is_none()`. A proposal is gradeless until here; an engine-authored one
+/// (or any, under the ratification gate) needs a human `Ratify` first.
+fn derive_promotion(state: &mut MissionState) {
+    if state.plan.is_some() || state.proposal.is_none() {
+        return;
+    }
+    let gated = state.proposal_engine_authored || state.config.ratification_gate;
+    if gated && !state.ratified {
+        return;
+    }
+    let proposal = state
+        .proposal
+        .take()
+        .expect("proposal present (checked above)");
+    for assertion in &proposal.assertions {
+        seed_assertion(&mut state.contract, assertion);
+    }
+    for task in &proposal.tasks {
+        seed_task(&mut state.tasks, &task.id);
+    }
+    state.plan = Some(proposal);
+    state.revision = 1;
 }
 
 /// Apply an amendment (ADR 0011). The fold guards the *honesty-relevant*
@@ -467,21 +534,39 @@ fn apply_decision(
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return; // unknown or already-resolved item
     };
+    // Planning nodes live in `planning.tasks`, execution nodes in `tasks`; a
+    // node decision resets whichever era the mission is in.
+    let node_status = |state: &mut MissionState, task_id, status| {
+        let tasks = if state.plan.is_none() {
+            &mut state.planning.tasks
+        } else {
+            &mut state.tasks
+        };
+        if let Some(task) = tasks.get_mut(task_id) {
+            task.status = status;
+        }
+    };
     match (action, item.kind) {
-        (DecisionAction::Ratify, AttentionKind::Ratify) => state.ratified = true,
+        (DecisionAction::Ratify, AttentionKind::Ratify)
+        | (DecisionAction::Ratify, AttentionKind::RatifyProposal) => state.ratified = true,
+        (DecisionAction::Retry, AttentionKind::RatifyProposal) => {
+            // Reject the proposal and re-run the whole planning DAG. Attempts are
+            // preserved, so a re-dispatched node gets a fresh idempotency key.
+            state.proposal = None;
+            state.proposal_engine_authored = false;
+            for task in state.planning.tasks.values_mut() {
+                task.status = TaskStatus::Pending;
+            }
+        }
         (DecisionAction::Retry, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
-                if let Some(task) = state.tasks.get_mut(task_id) {
-                    task.status = TaskStatus::Pending;
-                }
+                node_status(state, task_id, TaskStatus::Pending);
                 state.flagged_nodes.remove(task_id);
             }
         }
         (DecisionAction::Continue, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
-                if let Some(task) = state.tasks.get_mut(task_id) {
-                    task.status = TaskStatus::Cleared; // accept the failure
-                }
+                node_status(state, task_id, TaskStatus::Cleared); // accept the failure
             }
         }
         (DecisionAction::Continue, AttentionKind::NodeAttention) => {
@@ -581,6 +666,37 @@ fn derive_attention(state: &mut MissionState) {
         );
     }
 
+    // Planning phase (no plan yet): surface failed/flagged planning nodes, and
+    // the ratify-proposal gate once the author has proposed.
+    if state.plan.is_none() {
+        for (task_id, rt) in &state.planning.tasks {
+            if rt.status == TaskStatus::Failed {
+                raise(
+                    AttentionKind::NodeFailed,
+                    Some(task_id.clone()),
+                    None,
+                    format!("planning task '{task_id}' failed"),
+                );
+            } else if state.flagged_nodes.contains(task_id) {
+                raise(
+                    AttentionKind::NodeAttention,
+                    Some(task_id.clone()),
+                    None,
+                    format!("planning task '{task_id}' asks for a look"),
+                );
+            }
+        }
+        let gated = state.proposal_engine_authored || state.config.ratification_gate;
+        if state.proposal.is_some() && gated && !state.ratified {
+            raise(
+                AttentionKind::RatifyProposal,
+                None,
+                None,
+                "ratify the proposed contract before execution begins".to_string(),
+            );
+        }
+    }
+
     let Some(plan) = state.plan.clone() else {
         state.open_attention = attention;
         return;
@@ -635,23 +751,29 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
 }
 
 fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
-    let report = match handoff {
-        Handoff::Work { report, .. } | Handoff::Validate { report, .. } => Some(report.clone()),
-    };
+    // Route by era: before a plan exists we are in the contract-free planning
+    // phase, and node status lands in `planning.tasks`; afterwards in `tasks`.
+    // The two id spaces are disjoint (plan goes `None → Some` monotonically).
+    let planning = state.plan.is_none();
     match handoff {
         Handoff::Work {
             done,
+            report,
             request_attention,
-            ..
         } => {
             let status = if *done {
                 TaskStatus::Cleared
             } else {
                 TaskStatus::Failed
             };
-            if let Some(task) = state.tasks.get_mut(task_id) {
+            let tasks = if planning {
+                &mut state.planning.tasks
+            } else {
+                &mut state.tasks
+            };
+            if let Some(task) = tasks.get_mut(task_id) {
                 task.status = status;
-                task.last_report = report;
+                task.last_report = Some(report.clone());
             }
             // A done task that asks for a look is flagged (derived into a
             // node_attention item); a not-done task is Failed (derived into a
@@ -660,15 +782,47 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 state.flagged_nodes.insert(task_id.clone());
             }
         }
+        Handoff::Plan {
+            done,
+            report,
+            proposal,
+            request_attention,
+        } => {
+            // Planning-only: the author's handoff. A `done` proposal (the shell
+            // has already validated it) becomes the gradeless `state.proposal`;
+            // it seeds the contract only after ratification (`derive_promotion`).
+            let status = if *done {
+                TaskStatus::Cleared
+            } else {
+                TaskStatus::Failed
+            };
+            if let Some(task) = state.planning.tasks.get_mut(task_id) {
+                task.status = status;
+                task.last_report = Some(report.clone());
+            }
+            if *done {
+                if let Some(plan) = proposal {
+                    if state.plan.is_none() && state.proposal.is_none() {
+                        state.proposal = Some(plan.clone());
+                        state.proposal_engine_authored = true;
+                    }
+                }
+                if *request_attention {
+                    state.flagged_nodes.insert(task_id.clone());
+                }
+            }
+        }
         Handoff::Validate {
+            report,
             items,
             request_attention,
             ..
         } => {
-            // Validators always clear — they ran; their verdicts are data.
+            // Execution-only: validators always clear — they ran; their verdicts
+            // are data folded into the contract.
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Cleared;
-                task.last_report = report;
+                task.last_report = Some(report.clone());
             }
             for item in items {
                 if let Some(assertion) = state.contract.get_mut(&item.item_id) {

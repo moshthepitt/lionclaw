@@ -10,11 +10,14 @@ use crate::ports::RoleRunFailure;
 
 pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v1";
 pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v1";
+pub const PLAN_HANDOFF_SCHEMA: &str = "lionclaw.mission.plan-handoff.v1";
 
 pub fn expected_schema(output: OutputSemantics) -> &'static str {
     match output {
         OutputSemantics::EmitsVerdict => VALIDATE_HANDOFF_SCHEMA,
-        OutputSemantics::Plans | OutputSemantics::ProducesArtifact => WORK_HANDOFF_SCHEMA,
+        OutputSemantics::ProposesPlan => PLAN_HANDOFF_SCHEMA,
+        // A report role hands back a plain work handoff (prose, no proposal).
+        OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact => WORK_HANDOFF_SCHEMA,
     }
 }
 
@@ -69,13 +72,16 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
     }
     let handoff: Handoff = serde_json::from_value(value)
         .map_err(|err| invalid(format!("handoff does not match '{expected}': {err}")))?;
-    // The schema string and the payload tag must agree.
-    let tag_ok = match (&handoff, output) {
-        (Handoff::Validate { .. }, OutputSemantics::EmitsVerdict) => true,
-        (Handoff::Work { .. }, OutputSemantics::EmitsVerdict) => false,
-        (Handoff::Work { .. }, _) => true,
-        (Handoff::Validate { .. }, _) => false,
-    };
+    // The schema string and the payload tag must agree with the role's output.
+    let tag_ok = matches!(
+        (&handoff, output),
+        (Handoff::Validate { .. }, OutputSemantics::EmitsVerdict)
+            | (Handoff::Plan { .. }, OutputSemantics::ProposesPlan)
+            | (
+                Handoff::Work { .. },
+                OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact
+            )
+    );
     if !tag_ok {
         return Err(invalid(format!(
             "handoff type does not match this role's output semantics ({output:?})"

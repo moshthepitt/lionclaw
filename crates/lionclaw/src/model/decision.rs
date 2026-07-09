@@ -28,8 +28,12 @@ pub fn validate_decision(
         return Err(DecisionError::UnknownItem(attention_id.to_string()));
     };
     let legal = match (action, item.kind) {
-        (DecisionAction::Ratify, AttentionKind::Ratify) => true,
-        (DecisionAction::Retry, AttentionKind::NodeFailed | AttentionKind::OracleFailed) => true,
+        (DecisionAction::Ratify, AttentionKind::Ratify | AttentionKind::RatifyProposal) => true,
+        // Retry a rejected proposal (re-run planning) or a failed node.
+        (
+            DecisionAction::Retry,
+            AttentionKind::RatifyProposal | AttentionKind::NodeFailed | AttentionKind::OracleFailed,
+        ) => true,
         (
             DecisionAction::Continue,
             AttentionKind::NodeFailed

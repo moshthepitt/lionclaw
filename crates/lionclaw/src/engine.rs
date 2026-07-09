@@ -689,6 +689,19 @@ impl Engine {
                 passed,
                 request_attention,
             },
+            Handoff::Plan {
+                done,
+                report,
+                proposal,
+                request_attention,
+            } => Handoff::Plan {
+                done,
+                report: self.store.blobs().externalize(report)?,
+                // The proposal stays inline (KB-scale, typed); only the prose
+                // report is externalized above the blob threshold.
+                proposal,
+                request_attention,
+            },
         })
     }
 }

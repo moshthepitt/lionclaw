@@ -1,5 +1,5 @@
 ---
-output: plans
+output: produces-report
 runtime: codex
 ---
 You are the planning engineer. Read the repository (mounted read-only at

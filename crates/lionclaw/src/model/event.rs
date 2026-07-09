@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{Assertion, PlanSubmission, Task};
+use super::plan::{Assertion, PlanSubmission, PlanningDag, Task};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
@@ -65,6 +65,11 @@ pub struct MissionTypeRef {
 pub struct MissionConfig {
     pub ratification_gate: bool,
     pub stop: StopBar,
+    /// The mission type's planning DAG (how an objective becomes a proposed
+    /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
+    /// submitted plan.
+    #[serde(default)]
+    pub planning: PlanningDag,
 }
 
 impl Default for MissionConfig {
@@ -72,6 +77,7 @@ impl Default for MissionConfig {
         Self {
             ratification_gate: true,
             stop: StopBar::Verified,
+            planning: PlanningDag::default(),
         }
     }
 }
@@ -106,6 +112,16 @@ pub enum Handoff {
         report: PayloadRef,
         items: Vec<ValidationItem>,
         passed: bool,
+        request_attention: bool,
+    },
+    /// The planning author's deliverable: a proposed contract + task DAG. It has
+    /// **no verdict field** — a proposal is gradeless and can never mint
+    /// authority; it becomes `state.contract` only after a human ratifies it.
+    Plan {
+        done: bool,
+        report: PayloadRef,
+        #[serde(default)]
+        proposal: Option<PlanSubmission>,
         request_attention: bool,
     },
 }
@@ -246,6 +262,14 @@ pub enum MissionEvent {
         actor: String,
         justification: String,
     },
+    /// A plan proposed *manually* (not by the in-engine author) — the escape
+    /// hatch for a host that hand-authors a `PlanSubmission`. A fact event: the
+    /// fold sets `proposal` (gradeless), and it seeds the contract only after
+    /// ratification, exactly like an engine-authored proposal.
+    PlanProposed {
+        plan: PlanSubmission,
+        actor: String,
+    },
 }
 
 /// The operation set of one amendment. All fields default-empty, so an
@@ -326,6 +350,7 @@ impl MissionEvent {
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
             Self::PlanAmended { .. } => "plan_amended",
+            Self::PlanProposed { .. } => "plan_proposed",
         }
     }
 
@@ -358,7 +383,8 @@ impl MissionEvent {
             | Self::PlanSubmitted { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. } => None,
+            | Self::PlanAmended { .. }
+            | Self::PlanProposed { .. } => None,
         }
     }
 
@@ -375,7 +401,8 @@ impl MissionEvent {
             | Self::OracleRunRequested { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. } => None,
+            | Self::PlanAmended { .. }
+            | Self::PlanProposed { .. } => None,
         }
     }
 }

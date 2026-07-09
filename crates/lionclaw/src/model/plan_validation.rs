@@ -342,12 +342,15 @@ fn check_shape(
                     ));
                     continue;
                 };
-                // Routing is bound to output semantics, never to names.
+                // Routing is bound to output semantics, never to names. The
+                // planning-only outputs are incompatible with *every* execution
+                // kind — this single chokepoint keeps a report/proposal role out
+                // of an executed plan (closing planning recursion and the
+                // manual-submit hole).
                 let compatible = match output {
+                    OutputSemantics::ProducesArtifact => task.kind == TaskKind::Work,
                     OutputSemantics::EmitsVerdict => task.kind == TaskKind::Validate,
-                    OutputSemantics::Plans | OutputSemantics::ProducesArtifact => {
-                        task.kind == TaskKind::Work
-                    }
+                    OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan => false,
                 };
                 if !compatible {
                     errors.push(err(
@@ -551,10 +554,6 @@ mod tests {
         roles.insert(
             RoleName::new("checker").expect("valid role name"),
             OutputSemantics::EmitsVerdict,
-        );
-        roles.insert(
-            RoleName::new("planner").expect("valid role name"),
-            OutputSemantics::Plans,
         );
         MissionTypeInventory {
             roles,

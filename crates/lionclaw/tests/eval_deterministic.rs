@@ -104,6 +104,7 @@ async fn advisory_only_mission_type_never_verifies() {
             MissionConfig {
                 ratification_gate: false,
                 stop: StopBar::Reviewed,
+                planning: Default::default(),
             },
         )
         .await

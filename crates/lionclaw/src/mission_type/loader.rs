@@ -88,6 +88,9 @@ pub fn load_mission_type(
         digest,
         stop,
         image: manifest.mission_type.image,
+        // Parsing + validating the `[planning]` table is wired in P3b; until
+        // then every mission type has no in-engine planning DAG.
+        planning: crate::model::PlanningDag::default(),
         root: root.to_path_buf(),
         playbook,
         roles,

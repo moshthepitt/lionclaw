@@ -20,7 +20,9 @@ pub use loader::{load_mission_type, MissionTypeError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::model::{MissionTypeInventory, OracleName, OutputSemantics, RoleName, StopBar};
+use crate::model::{
+    MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
+};
 
 /// A role is property-composed data: open fields (name, prompt, skills,
 /// runtime) plus the closed engine-understood axes (`output`, and the plain
@@ -46,6 +48,9 @@ pub struct MissionType {
     pub stop: StopBar,
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
+    /// The planning DAG (how an objective becomes a proposed contract). Empty
+    /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
+    pub planning: PlanningDag,
     pub root: PathBuf,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,

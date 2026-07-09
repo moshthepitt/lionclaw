@@ -105,11 +105,13 @@ fn split_frontmatter(text: &str) -> Result<(&str, &str), String> {
 
 fn parse_output(value: &str) -> Result<OutputSemantics, String> {
     match value {
-        "plans" => Ok(OutputSemantics::Plans),
+        "produces-report" => Ok(OutputSemantics::ProducesReport),
         "produces-artifact" => Ok(OutputSemantics::ProducesArtifact),
         "emits-verdict" => Ok(OutputSemantics::EmitsVerdict),
+        "proposes-plan" => Ok(OutputSemantics::ProposesPlan),
         other => Err(format!(
-            "output must be one of plans|produces-artifact|emits-verdict, got '{other}'"
+            "output must be one of produces-report|produces-artifact|emits-verdict|proposes-plan, \
+             got '{other}'"
         )),
     }
 }
@@ -183,13 +185,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_key() {
-        let text = "---\noutput: plans\nwritable: true\n---\nx";
+        let text = "---\noutput: produces-report\nwritable: true\n---\nx";
         assert!(parse_role_file(text).unwrap_err().contains("unknown key"));
     }
 
     #[test]
     fn rejects_duplicate_key() {
-        let text = "---\noutput: plans\noutput: emits-verdict\n---\nx";
+        let text = "---\noutput: produces-report\noutput: emits-verdict\n---\nx";
         assert!(parse_role_file(text).unwrap_err().contains("duplicate"));
     }
 
@@ -201,19 +203,19 @@ mod tests {
 
     #[test]
     fn rejects_missing_fence() {
-        assert!(parse_role_file("output: plans\n\nbody").is_err());
-        assert!(parse_role_file("---\noutput: plans\nbody").is_err());
+        assert!(parse_role_file("output: produces-report\n\nbody").is_err());
+        assert!(parse_role_file("---\noutput: produces-report\nbody").is_err());
     }
 
     #[test]
     fn rejects_empty_body() {
-        let text = "---\noutput: plans\n---\n   \n";
+        let text = "---\noutput: produces-report\n---\n   \n";
         assert!(parse_role_file(text).unwrap_err().contains("empty"));
     }
 
     #[test]
     fn rejects_bad_bool() {
-        let text = "---\noutput: plans\nnetwork: yes\n---\nx";
+        let text = "---\noutput: produces-report\nnetwork: yes\n---\nx";
         assert!(parse_role_file(text).unwrap_err().contains("true or false"));
     }
 }

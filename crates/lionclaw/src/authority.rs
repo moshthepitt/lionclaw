@@ -107,12 +107,17 @@ pub fn compile_authority(
     ceiling: &AuthorityCeiling,
 ) -> Result<CompiledAuthority, MoatViolation> {
     let workspace_access = match role.output {
+        // Only a writer gets the workspace read-write. Judges and every planning
+        // role (report / proposal) are read-only.
         OutputSemantics::ProducesArtifact => WorkspaceAccess::ReadWrite,
-        OutputSemantics::Plans | OutputSemantics::EmitsVerdict => WorkspaceAccess::ReadOnly,
+        OutputSemantics::ProducesReport
+        | OutputSemantics::EmitsVerdict
+        | OutputSemantics::ProposesPlan => WorkspaceAccess::ReadOnly,
     };
-    if role.secrets && role.output == OutputSemantics::EmitsVerdict {
-        // Fail closed rather than silently clamp: a judge asking for secrets
-        // is a mission-type bug the author must see.
+    if role.secrets && role.output != OutputSemantics::ProducesArtifact {
+        // Fail closed rather than silently clamp: only a writer may hold
+        // secrets; a read-only judge or planner asking for them is a
+        // mission-type bug the author must see.
         return Err(MoatViolation::SecretsForJudge {
             role: role.name.to_string(),
         });
@@ -239,8 +244,13 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         }
     }
 
-    // (3) The verdict floor.
-    if authority.output == OutputSemantics::EmitsVerdict {
+    // (3) The read-only-role floor. Every non-writer role — a verdict judge and
+    // every planning role (report/proposal) — must be read-only, secret-free,
+    // escape-free, and never share a rw mount with the tree it reads. So a
+    // writable or credentialed planner is as unrepresentable as a writable
+    // judge. (The `Judge` violation names are historical; they mean "a role that
+    // must not be able to influence what it reads".)
+    if authority.output != OutputSemantics::ProducesArtifact {
         if authority.preset.workspace_access != WorkspaceAccess::ReadOnly
             || request.mounts.workspace.access != MountAccess::ReadOnly
         {
@@ -313,7 +323,8 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
 
 fn kind_slug(output: OutputSemantics) -> &'static str {
     match output {
-        OutputSemantics::Plans => "plans",
+        OutputSemantics::ProducesReport => "produces-report",
+        OutputSemantics::ProposesPlan => "proposes-plan",
         OutputSemantics::ProducesArtifact => "produces-artifact",
         OutputSemantics::EmitsVerdict => "emits-verdict",
     }
@@ -389,7 +400,11 @@ mod tests {
         let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
             .expect("worker");
         assert_eq!(worker.preset().workspace_access, WorkspaceAccess::ReadWrite);
-        for output in [OutputSemantics::Plans, OutputSemantics::EmitsVerdict] {
+        for output in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::ProposesPlan,
+        ] {
             let authority = compile_authority(&role(output, false), &ceiling).expect("read-only");
             assert_eq!(
                 authority.preset().workspace_access,
