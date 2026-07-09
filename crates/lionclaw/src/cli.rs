@@ -63,7 +63,7 @@ pub struct InstallArgs {
 
 #[derive(Subcommand)]
 pub enum MissionCommand {
-    /// Create a mission over a target repo and submit no plan yet.
+    /// Create a mission over a target repo.
     Start(StartArgs),
     /// Submit a plan (contract + task DAG) from a JSON file.
     SubmitPlan(SubmitPlanArgs),
@@ -143,7 +143,11 @@ pub struct StartArgs {
     pub objective: String,
     #[arg(long, default_value = "codex")]
     pub runtime: String,
-    /// Skip the default-on ratification gate (auto-approve the plan).
+    /// Override the mission type's confinement image for this mission.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Skip the ratification gate for manually submitted plans. Engine-authored
+    /// proposals still require `mission ratify`.
     #[arg(long)]
     pub yes: bool,
     #[arg(long)]
@@ -418,6 +422,7 @@ async fn build_engine_for_start(
     repo: &Path,
     type_name: &str,
     runtime: &str,
+    image_override: Option<&str>,
 ) -> Result<Engine> {
     let ceiling = AuthorityCeiling::default();
     let type_dir = Home::from_env()?.mission_type_dir(type_name);
@@ -425,12 +430,11 @@ async fn build_engine_for_start(
         .with_context(|| format!("mission type '{type_name}' (run `lionclaw install`?)"))?;
     let mut profile = runtime_profile(runtime)?;
     let engine = profile.confinement.oci().engine.clone();
-    let image_id = lionclaw_confinement::resolve_oci_image_compatibility_identity(
-        &engine,
-        &mission_type.image,
-    )
-    .await
-    .with_context(|| format!("resolving image '{}'", mission_type.image))?;
+    let image_ref = start_image_ref(&mission_type.image, image_override);
+    let image_id =
+        lionclaw_confinement::resolve_oci_image_compatibility_identity(&engine, image_ref)
+            .await
+            .with_context(|| format!("resolving image '{image_ref}'"))?;
     profile.confinement.oci_mut().image = Some(image_id.clone());
     assemble_engine(
         store,
@@ -442,6 +446,10 @@ async fn build_engine_for_start(
         ceiling,
     )
     .await
+}
+
+fn start_image_ref<'a>(mission_type_image: &'a str, image_override: Option<&'a str>) -> &'a str {
+    image_override.unwrap_or(mission_type_image)
 }
 
 /// Build an engine for an EXISTING mission: resolve its recorded mission type (by
@@ -552,7 +560,14 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     // Fail-closed: loading the mission type (and its moat check) happens before
     // any event is written.
-    let engine = build_engine_for_start(store, &repo, &args.mission_type, &args.runtime).await?;
+    let engine = build_engine_for_start(
+        store,
+        &repo,
+        &args.mission_type,
+        &args.runtime,
+        args.image.as_deref(),
+    )
+    .await?;
     let base_sha = workspace::head_sha(&repo).await?;
     let mission_id = engine
         .create_mission(
@@ -578,11 +593,27 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
     } else {
         println!("started mission {mission_id} at {base_sha}");
         println!(
-            "submit a plan, then: lionclaw mission advance {mission_id} --repo {}",
-            repo.display(),
+            "{}",
+            start_next_step(
+                engine.mission_type().planning.tasks.len(),
+                &mission_id,
+                &repo
+            )
         );
     }
     Ok(())
+}
+
+fn start_next_step(planning_tasks: usize, mission_id: &MissionId, repo: &Path) -> String {
+    let advance = format!(
+        "lionclaw mission advance {mission_id} --repo {}",
+        repo.display()
+    );
+    if planning_tasks == 0 {
+        format!("next: submit a plan, then run: {advance}")
+    } else {
+        format!("next: {advance}")
+    }
 }
 
 async fn cmd_inbox(args: InboxArgs) -> Result<()> {
@@ -1266,6 +1297,28 @@ mod tests {
         assert_eq!(
             apply_target(&mid(), "base", "head").unwrap(),
             "lionclaw/mabc123def456"
+        );
+    }
+
+    #[test]
+    fn start_image_override_replaces_the_mission_type_default() {
+        assert_eq!(start_image_ref("type-image", None), "type-image");
+        assert_eq!(
+            start_image_ref("type-image", Some("override-image")),
+            "override-image"
+        );
+    }
+
+    #[test]
+    fn start_text_points_to_planning_when_the_type_has_a_planning_dag() {
+        let repo = Path::new("/tmp/repo");
+        assert_eq!(
+            start_next_step(3, &mid(), repo),
+            "next: lionclaw mission advance mabc123def456 --repo /tmp/repo"
+        );
+        assert_eq!(
+            start_next_step(0, &mid(), repo),
+            "next: submit a plan, then run: lionclaw mission advance mabc123def456 --repo /tmp/repo"
         );
     }
 }

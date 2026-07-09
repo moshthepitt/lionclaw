@@ -1,6 +1,6 @@
 //! Slice 6 eval — the deterministic (engine-side, no-agent) completion
 //! gates: the moat refuses a writable/over-privileged judge, and an
-//! advisory-only plugin can never reach a verified finish.
+//! advisory-only mission type can never reach a verified finish.
 
 mod common;
 
@@ -22,7 +22,7 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Scenario 3 — the moat holds: a plugin whose verdict role over-reaches
+/// Scenario 3 — the moat holds: a mission type whose verdict role over-reaches
 /// refuses to load, so no mission can ever start from it.
 #[test]
 fn moat_refuses_over_privileged_judge_mission_type() {
@@ -45,13 +45,13 @@ fn moat_refuses_over_privileged_judge_mission_type() {
 /// `plan_validation::tests::verified_bar_rejects_an_oracle_less_assertion`.)
 #[tokio::test]
 async fn advisory_only_mission_type_never_verifies() {
-    let plugin = load_mission_type(
+    let mission_type = load_mission_type(
         &fixtures().join("mission-types/advisory-only"),
         &AuthorityCeiling::default(),
     )
     .expect("advisory-only mission type loads");
-    assert_eq!(plugin.stop, StopBar::Reviewed);
-    assert!(plugin.oracles.is_empty(), "fixture has no oracles");
+    assert_eq!(mission_type.stop, StopBar::Reviewed);
+    assert!(mission_type.oracles.is_empty(), "fixture has no oracles");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -89,7 +89,7 @@ async fn advisory_only_mission_type_never_verifies() {
     }));
     let engine = Engine::new(
         store,
-        plugin,
+        mission_type,
         "codex".to_string(),
         "test-image".to_string(),
         Arc::new(runner),

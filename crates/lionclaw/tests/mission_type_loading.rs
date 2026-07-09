@@ -1,4 +1,4 @@
-//! The real software-dev plugin loads; the moat rejects a plugin whose
+//! The real software-dev mission type loads; the moat rejects a mission type whose
 //! verdict role would violate the honesty floor.
 
 use std::path::PathBuf;
@@ -19,27 +19,27 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn software_dev_plugin_loads() {
-    let plugin = load_mission_type(
+fn software_dev_mission_type_loads() {
+    let mission_type = load_mission_type(
         &repo_root().join("mission-types/software-dev"),
         &AuthorityCeiling::default(),
     )
-    .expect("software-dev plugin loads");
-    assert_eq!(plugin.name, "software-dev");
-    assert_eq!(plugin.stop, StopBar::Verified);
-    let implementer = plugin
+    .expect("software-dev mission type loads");
+    assert_eq!(mission_type.name, "software-dev");
+    assert_eq!(mission_type.stop, StopBar::Verified);
+    let implementer = mission_type
         .roles
         .values()
         .find(|r| r.output == OutputSemantics::ProducesArtifact)
         .expect("has an implementer role");
     assert_eq!(implementer.runtime.as_deref(), Some("codex"));
-    assert!(plugin
+    assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
 }
 
 #[test]
-fn writable_judge_plugin_refuses_to_load() {
+fn writable_judge_mission_type_refuses_to_load() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/mission-types/writable-judge");
     let err = load_mission_type(&fixture, &AuthorityCeiling::default()).expect_err("must refuse");

@@ -6,17 +6,21 @@ works. For that, read the source of truth below.
 
 ## Source of truth
 
-*(These docs are being written; until one lands, the code is authoritative.)*
+*(The public README and architecture docs were intentionally removed on this
+pre-launch branch. Until the replacement docs land, the code is authoritative.)*
 
-- Product overview and the everyday command path: `README.md`
-- Architecture, the determinism wall, and the honesty moat: `docs/`
-- Design decisions and their rationale: `docs/adr/`
-- In-code: `crates/lionclaw/src/lib.rs` and `model/mod.rs` module docs.
+- Product entrypoint and everyday command path: `crates/lionclaw/src/cli.rs`
+- Architecture, the determinism wall, and the honesty moat:
+  `crates/lionclaw/src/lib.rs`, `crates/lionclaw/src/model/mod.rs`,
+  `crates/lionclaw/src/authority.rs`, and `crates/lionclaw/src/model/verdict.rs`
+- Mission-type contract: `crates/lionclaw/src/mission_type/` and
+  `mission-types/software-dev/`
 
 ## Guardrails you must not break
 
 Two invariants *are* the product. Changing either needs a fault-injection test
-that fails first, and a note in the PR. See `docs/` for what they mean and why.
+that fails first, and a note in the PR. Use the source-of-truth files above for
+what they mean and why.
 
 - **The determinism wall** — `crates/lionclaw/src/model/` stays pure (only
   `std` / `serde` / `thiserror`; no I/O, clock, RNG, or async).

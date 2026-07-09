@@ -1,5 +1,5 @@
 //! Shared harness for engine integration tests: tempdir-backed store, a
-//! hand-built plugin (loading is exercised elsewhere), scripted mock ports.
+//! hand-built mission type (loading is exercised elsewhere), scripted mock ports.
 //!
 //! Each integration test binary compiles this module independently, so any
 //! given test uses only a subset of these helpers — dead-code warnings for
@@ -59,7 +59,10 @@ pub fn test_mission_type() -> MissionType {
                 },
             ),
         ]),
-        oracles: BTreeMap::from([(cargo_test, "/nonexistent-plugin/oracles/cargo-test".into())]),
+        oracles: BTreeMap::from([(
+            cargo_test,
+            "/nonexistent-mission-type/oracles/cargo-test".into(),
+        )]),
     }
 }
 

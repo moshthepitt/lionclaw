@@ -43,7 +43,8 @@ pub struct Engine {
 
 #[derive(Debug)]
 pub enum AdvanceOutcome {
-    /// Mission is in `Planning`; submit a plan to proceed.
+    /// Mission is in `Planning` with no runnable planning DAG; submit a plan to
+    /// proceed.
     AwaitingPlan,
     /// Parked on open attention (durable interrupt, zero compute).
     Parked { attention: Vec<AttentionItem> },

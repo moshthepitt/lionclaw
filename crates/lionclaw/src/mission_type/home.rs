@@ -74,7 +74,7 @@ impl Home {
 /// `install` copies from. Next to the executable in a release
 /// (`<exe_dir>/mission-types`), or the repo's `mission-types/` in a dev build.
 /// Follows the same exe-relative-then-source-tree pattern the kernel used for
-/// bundled channel skills.
+/// bundled assets.
 pub fn bundled_mission_types_dir() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
