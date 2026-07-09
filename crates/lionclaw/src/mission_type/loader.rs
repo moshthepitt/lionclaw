@@ -45,6 +45,9 @@ struct ManifestFile {
 struct ManifestMissionType {
     name: String,
     stop: String,
+    /// The confinement image every role and oracle runs in; carries this
+    /// domain's toolchain. Required — the engine ships no default image.
+    image: String,
 }
 
 pub fn load_mission_type(
@@ -82,6 +85,7 @@ pub fn load_mission_type(
     Ok(MissionType {
         name: manifest.mission_type.name,
         stop,
+        image: manifest.mission_type.image,
         root: root.to_path_buf(),
         playbook,
         roles,

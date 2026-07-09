@@ -227,7 +227,8 @@ async fn open_engine(repo: &Path, type_dir: &Path, runtime: &str) -> Result<Engi
         .with_context(|| format!("failed to load mission type '{}'", type_dir.display()))?;
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo)?;
-    let profile = runtime_profile(runtime)?;
+    let mut profile = runtime_profile(runtime)?;
+    profile.confinement.oci_mut().image = Some(mission_type.image.clone());
     let role_runner = Arc::new(OciRoleRunner::new(profile.clone(), ceiling));
     let oracle_runner = Arc::new(OciOracleRunner::new(profile));
     Ok(Engine::new(

@@ -1,7 +1,7 @@
 //! Mission runtime configuration: which agent runtime backs roles and the
-//! confinement it runs under. The image is the locally-built dev image
-//! (`containers/dev/Containerfile`) — agent CLIs plus the pinned Rust
-//! toolchain, `CARGO_HOME=/runtime/cargo` baked in.
+//! confinement it runs under. The confinement image is **not** set here — it
+//! is declared per mission type in `mission.toml` and injected when the engine
+//! is opened, so each domain (Rust, Python, …) carries its own toolchain.
 
 use std::time::Duration;
 
@@ -33,7 +33,8 @@ impl MissionRuntimeProfile {
             model: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
                 engine: "podman".to_string(),
-                image: Some("localhost/lionclaw-runtime-dev:v1".to_string()),
+                // Filled from the mission type's `mission.toml` at open time.
+                image: None,
                 read_only_rootfs: true,
                 tmpfs: vec!["/tmp:rw,size=512m".to_string()],
                 additional_mounts: Vec::new(),

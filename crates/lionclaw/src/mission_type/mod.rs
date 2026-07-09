@@ -39,6 +39,8 @@ pub struct RoleDefinition {
 pub struct MissionType {
     pub name: String,
     pub stop: StopBar,
+    /// The confinement image every role and oracle runs in (from `mission.toml`).
+    pub image: String,
     pub root: PathBuf,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,

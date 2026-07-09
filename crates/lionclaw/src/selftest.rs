@@ -237,7 +237,11 @@ mod tests {
 const BROKEN_CARGO: &str = include_str!("../tests/fixtures/eval/interval-bug/Cargo.toml");
 const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/lib.rs");
 
-const MISSION_TYPE_TOML: &str = "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\n";
+/// A `mission.toml` for a self-test mission type: `stop = verified`, running
+/// in the runtime image the readiness probe already gated on.
+fn manifest_toml(name: &str) -> String {
+    format!("[mission-type]\nname = \"{name}\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n")
+}
 const IMPLEMENTER_ROLE: &str = "\
 ---
 output: produces-artifact
@@ -251,7 +255,6 @@ const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo te
 // (A judge can't be declared *writable* in a mission type — workspace access is
 // derived from output — so an over-privileged judge is a secrets-requesting
 // one.)
-const SECRETS_JUDGE_TOML: &str = "[mission-type]\nname = \"secrets-judge\"\nstop = \"verified\"\n";
 const SECRETS_JUDGE_REVIEWER: &str = "\
 ---
 output: emits-verdict
@@ -264,7 +267,7 @@ A verdict role illegally requesting secrets — the loader must refuse it.
 fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::create_dir_all(root.join("oracles"))?;
-    std::fs::write(root.join("mission.toml"), MISSION_TYPE_TOML)?;
+    std::fs::write(root.join("mission.toml"), manifest_toml("selftest"))?;
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
@@ -274,7 +277,7 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
 
 fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
-    std::fs::write(root.join("mission.toml"), SECRETS_JUDGE_TOML)?;
+    std::fs::write(root.join("mission.toml"), manifest_toml("secrets-judge"))?;
     std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
     Ok(())
 }
@@ -433,7 +436,9 @@ async fn run_confined_sh(
     judged_roots: &[std::path::PathBuf],
     script: &str,
 ) -> Result<ExecutionOutput> {
-    let profile = MissionRuntimeProfile::codex_default();
+    // No mission type in this probe, so set the image directly.
+    let mut profile = MissionRuntimeProfile::codex_default();
+    profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
     let compiled = compile_role_plan(RolePlanRequest {
         authority,
         runtime_id: "codex".to_string(),
@@ -477,7 +482,8 @@ async fn build_engine(
         .map_err(|e| anyhow::anyhow!("mission type load failed: {e}"))?;
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo)?;
-    let profile = MissionRuntimeProfile::codex_default();
+    let mut profile = MissionRuntimeProfile::codex_default();
+    profile.confinement.oci_mut().image = Some(mission_type.image.clone());
     Ok(Engine::new(
         store,
         mission_type,

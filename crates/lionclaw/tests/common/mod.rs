@@ -28,7 +28,8 @@ pub fn test_mission_type() -> MissionType {
     MissionType {
         name: "software-dev-test".to_string(),
         stop: StopBar::Verified,
-        root: "/nonexistent-plugin".into(),
+        image: "localhost/lionclaw-runtime-dev:v1".to_string(),
+        root: "/nonexistent-mission-type".into(),
         playbook: None,
         roles: BTreeMap::from([
             (

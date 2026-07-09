@@ -64,7 +64,7 @@ fn role_declaring_skills_is_rejected_at_load() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
