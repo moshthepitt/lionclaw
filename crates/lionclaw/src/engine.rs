@@ -273,11 +273,7 @@ impl Engine {
     }
 
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
-        let state = self
-            .store
-            .load_state_snapshotted(mission_id)
-            .await?
-            .with_context(|| format!("mission {mission_id} not found"))?;
+        let state = self.store.require_state(mission_id).await?;
         // The instrument of judgment is pinned: this verifies the mission type's
         // content digest against the one recorded at start, so a mutated role or
         // oracle cannot advance this mission (the fake-green vector). Every method
@@ -286,13 +282,12 @@ impl Engine {
         // (no type loaded): a decision mints no verdict, and the next `advance`
         // re-verifies the digest before any oracle can run.
         if state.mission_type.digest != self.mission_type.digest {
-            let short = |d: &str| d.chars().take(12).collect::<String>();
             bail!(
                 "mission type '{}' changed since this mission started \
                  (recorded {}, on-disk {}); start a fresh mission",
                 state.mission_type.name,
-                short(&state.mission_type.digest),
-                short(&self.mission_type.digest),
+                crate::model::short_hex(&state.mission_type.digest),
+                crate::model::short_hex(&self.mission_type.digest),
             );
         }
         Ok(state)
@@ -607,7 +602,6 @@ impl Engine {
             mission_id: state.mission_id.clone(),
             oracle: oracle.clone(),
             oracle_path: oracle_path.clone(),
-            assertion_ids: assertion_ids.to_vec(),
             judged_sha: judged_sha.to_string(),
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
@@ -847,10 +841,7 @@ pub async fn record_decision(
     justification: &str,
     actor: &str,
 ) -> Result<()> {
-    let state = store
-        .load_state_snapshotted(mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(mission_id).await?;
     // Preserve the typed `DecisionError` as the error source (its `Display` is
     // already specific: unknown item vs illegal action for the item's kind), so
     // a JSON caller sees the real reason, not a flattened string.

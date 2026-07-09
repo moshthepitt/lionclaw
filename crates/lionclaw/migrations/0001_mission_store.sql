@@ -14,7 +14,6 @@ CREATE TABLE mission_events (
     mission_id      TEXT    NOT NULL REFERENCES missions (mission_id),
     sequence_no     INTEGER NOT NULL CHECK (sequence_no > 0),
     recorded_at_ms  INTEGER NOT NULL,
-    event_type      TEXT    NOT NULL,
     schema_version  INTEGER NOT NULL,
     payload_json    TEXT    NOT NULL,
     -- Set for two-event (Requested/outcome) pairs; class distinguishes the
@@ -30,8 +29,6 @@ CREATE TABLE mission_events (
 CREATE UNIQUE INDEX idx_mission_events_idem
     ON mission_events (mission_id, idem_class, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
-
-CREATE INDEX idx_mission_events_type ON mission_events (mission_id, event_type);
 
 -- Derived work queue: rebuildable from the log (fold's inflight set).
 -- Lease fields follow the channel_outbox CAS-lease discipline.

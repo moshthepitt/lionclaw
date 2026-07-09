@@ -101,6 +101,14 @@ impl MissionStore {
         }
     }
 
+    /// Load a mission's state, failing with a uniform "not found" if it does not
+    /// exist. The one place callers map the `None` from `load_state_snapshotted`.
+    pub async fn require_state(&self, mission_id: &MissionId) -> Result<MissionState> {
+        self.load_state_snapshotted(mission_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mission {mission_id} not found"))
+    }
+
     /// Drop all derived cursors for a mission (snapshot + effect ledger) and
     /// rebuild them from the log alone — the litmus that state is a pure fold
     /// (delete cursors, rebuild, assert equality).

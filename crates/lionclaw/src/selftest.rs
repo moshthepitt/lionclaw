@@ -272,7 +272,7 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
-    set_executable(&oracle)?;
+    workspace::make_executable(&oracle)?;
     Ok(())
 }
 
@@ -283,13 +283,6 @@ fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
 
 /// Materialize a Cargo crate into a fresh git repo (lockfile generated so the
 /// oracle's `cargo test --locked` works offline). Returns the HEAD sha.

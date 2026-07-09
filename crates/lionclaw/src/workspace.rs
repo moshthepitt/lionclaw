@@ -203,6 +203,15 @@ pub async fn remove_dir(dir: &Path) {
     let _ = tokio::fs::remove_dir_all(dir).await;
 }
 
+/// `chmod 0o755` — used to keep staged oracle executables executable.
+#[cfg(unix)]
+pub fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+}
+
 /// The unified diff between two commits (`from..to`). Empty when the tree did
 /// not change (a writer that committed nothing yields `to == from`).
 pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {

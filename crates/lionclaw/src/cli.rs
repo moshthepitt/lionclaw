@@ -13,7 +13,8 @@ use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
 use crate::model::{
-    fold, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId, MissionPhase,
+    fold, short_hex, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId,
+    MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EventSink, SystemClock};
@@ -447,10 +448,7 @@ async fn build_engine_for_mission(
     repo: &Path,
     mission_id: &MissionId,
 ) -> Result<Engine> {
-    let state = store
-        .load_state_snapshotted(mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(mission_id).await?;
     let ceiling = AuthorityCeiling::default();
     let type_dir = Home::from_env()?.mission_type_dir(&state.mission_type.name);
     let mission_type = load_mission_type(&type_dir, &ceiling)
@@ -625,10 +623,7 @@ async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
     // Resolve whichever ratification item is open — a proposed contract
     // (RatifyProposal) or a post-amendment re-ratification (Ratify) — so the
     // human never has to type the item id.
-    let state = store
-        .load_state_snapshotted(&mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(&mission_id).await?;
     let item = state
         .open_attention
         .values()
@@ -656,10 +651,7 @@ async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
 async fn cmd_plan(args: PlanArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = store
-        .load_state_snapshotted(&mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(&mission_id).await?;
     let Some(proposal) = &state.proposal else {
         bail!("no proposal is awaiting ratification for mission {mission_id}");
     };
@@ -720,28 +712,24 @@ fn apply_target(mission_id: &MissionId, base_sha: &str, current_sha: &str) -> Re
 async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = store
-        .load_state_snapshotted(&mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(&mission_id).await?;
     let branch = apply_target(&mission_id, &state.base_sha, &state.current_sha)?;
     workspace::create_branch(&repo, &branch, &state.current_sha, args.force)
         .await
         .with_context(|| {
             format!("could not create branch '{branch}' (already exists? use --force)")
         })?;
-    let short: String = state.current_sha.chars().take(12).collect();
-    println!("applied mission {mission_id} → branch {branch} ({short})");
+    println!(
+        "applied mission {mission_id} → branch {branch} ({})",
+        short_hex(&state.current_sha)
+    );
     Ok(())
 }
 
 async fn cmd_report(args: ReportArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = store
-        .load_state_snapshotted(&mission_id)
-        .await?
-        .with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(&mission_id).await?;
 
     let finish = state.phase.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
@@ -800,18 +788,13 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     println!(
         "  type:    {} @ {}",
         state.mission_type.name,
-        state
-            .mission_type
-            .digest
-            .chars()
-            .take(12)
-            .collect::<String>()
+        short_hex(&state.mission_type.digest)
     );
     println!("  runtime: {}   image: {}", state.runtime, state.image_id);
     println!(
         "  commit:  {} → {}",
-        state.base_sha.chars().take(12).collect::<String>(),
-        state.current_sha.chars().take(12).collect::<String>()
+        short_hex(&state.base_sha),
+        short_hex(&state.current_sha)
     );
     match finish {
         Some(FinishClass::Verified) => {

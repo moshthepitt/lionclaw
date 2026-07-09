@@ -371,14 +371,13 @@ async fn insert_event(
     };
     sqlx::query(
         "INSERT INTO mission_events
-             (mission_id, sequence_no, recorded_at_ms, event_type, schema_version,
+             (mission_id, sequence_no, recorded_at_ms, schema_version,
               payload_json, idempotency_key, idem_class)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(mission_id.as_str())
     .bind(sequence_no as i64)
     .bind(now_ms)
-    .bind(event.event.event_type())
     .bind(event.stamps.schema_version)
     .bind(&payload)
     .bind(idem_key)

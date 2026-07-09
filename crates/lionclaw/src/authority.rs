@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lionclaw_confinement::{
-    ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionPreset, InstallPolicy,
+    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, InstallPolicy,
     MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
     RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
@@ -34,11 +34,12 @@ const RESERVED_TARGETS: &[&str] = &[
 ];
 
 /// The operator/mission bound authority can never exceed. Intersected,
-/// never unioned.
+/// never unioned. (`allowed_escapes` returns here alongside a real per-role
+/// escape-request knob; until then roles request no escapes, so the ceiling's
+/// escape set would always be the empty intersection.)
 #[derive(Debug, Clone, Default)]
 pub struct AuthorityCeiling {
     pub allow_secrets: bool,
-    pub allowed_escapes: BTreeSet<EscapeClass>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -349,6 +350,7 @@ fn target_shadows(target: &str, reserved: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::RoleName;
+    use lionclaw_confinement::EscapeClass;
 
     fn role(output: OutputSemantics, secrets: bool) -> RoleDefinition {
         RoleDefinition {
@@ -416,10 +418,7 @@ mod tests {
     fn judge_requesting_secrets_refuses_to_compile() {
         let err = compile_authority(
             &role(OutputSemantics::EmitsVerdict, true),
-            &AuthorityCeiling {
-                allow_secrets: true,
-                ..Default::default()
-            },
+            &AuthorityCeiling { allow_secrets: true },
         )
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
@@ -436,10 +435,7 @@ mod tests {
     #[test]
     fn worker_secrets_are_granted_when_ceiling_allows() {
         // Pins the AND: ceiling permits + role requests ⇒ actually mounted.
-        let ceiling = AuthorityCeiling {
-            allow_secrets: true,
-            ..Default::default()
-        };
+        let ceiling = AuthorityCeiling { allow_secrets: true };
         let authority = compile_authority(&role(OutputSemantics::ProducesArtifact, true), &ceiling)
             .expect("worker");
         assert!(authority.preset().mount_runtime_secrets);

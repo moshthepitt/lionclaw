@@ -153,6 +153,11 @@ impl fmt::Display for MissionId {
     }
 }
 
+/// The first 12 chars of a sha/digest, for compact human display.
+pub fn short_hex(hex: &str) -> String {
+    hex.chars().take(12).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

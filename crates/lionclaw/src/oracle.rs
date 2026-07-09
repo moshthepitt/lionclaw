@@ -75,7 +75,7 @@ impl OracleRunner for OciOracleRunner {
             let oracle_dest = oracle_dir.join(request.oracle.as_str());
             std::fs::copy(&request.oracle_path, &oracle_dest)
                 .map_err(|e| fail(format!("failed to stage oracle executable: {e}")))?;
-            make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
+            workspace::make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
 
             let authority = oracle_authority(request.oracle.as_str());
             let workspace_mount = MountSpec {
@@ -171,9 +171,3 @@ fn oracle_environment() -> Vec<(String, String)> {
     ]
 }
 
-fn make_executable(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)
-}

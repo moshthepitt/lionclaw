@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use crate::mission_type::RoleDefinition;
 use crate::model::{
-    ArtifactOutcome, AssertionId, Handoff, MissionId, OracleName, RunErrorKind, TaskId,
+    ArtifactOutcome, Handoff, MissionId, OracleName, RunErrorKind, TaskId,
 };
 
 /// One full autonomous agent run — the engine never micromanages how a role
@@ -68,9 +68,8 @@ pub struct OracleRunRequest {
     pub mission_id: MissionId,
     pub oracle: OracleName,
     /// Resolved oracle executable (engine resolves from the mission type; the
-    /// runner stays domain-blind).
+    /// runner stays domain-blind — it never sees which assertions it judges).
     pub oracle_path: PathBuf,
-    pub assertion_ids: Vec<AssertionId>,
     pub judged_sha: String,
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
