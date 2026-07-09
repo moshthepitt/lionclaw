@@ -1097,7 +1097,7 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
                     &format!("mission type '{name}'"),
                     img,
                     &if img {
-                        String::new()
+                        short_hex(&mt.digest)
                     } else {
                         format!("image '{}' not present", mt.image)
                     },
@@ -1161,6 +1161,7 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
                     serde_json::json!({
                         "ok": true,
                         "name": mt.name,
+                        "digest": mt.digest,
                         "stop": mt.stop.slug(),
                         "image": mt.image,
                         "roles": mt.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
@@ -1170,6 +1171,7 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
                 );
             } else {
                 println!("mission type '{}' is valid", mt.name);
+                println!("  digest: {}", short_hex(&mt.digest));
                 println!("  stop:  {:?}", mt.stop);
                 println!("  image: {}", mt.image);
                 println!(
