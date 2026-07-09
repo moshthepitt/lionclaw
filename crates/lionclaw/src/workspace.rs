@@ -40,15 +40,20 @@ pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
     .is_ok()
 }
 
-/// Keep mission state out of the user's `git status` without touching
-/// tracked files.
-pub fn ensure_excluded(repo: &Path) -> Result<()> {
-    let exclude = repo.join(".git/info/exclude");
+/// Keep mission state out of the user's `git status` without touching tracked
+/// files. Resolves the exclude file via git rather than assuming
+/// `.git/info/exclude`: in a linked worktree `.git` is a file and the exclude
+/// lives in the common dir, so the hard-coded path would silently miss it.
+pub async fn ensure_excluded(repo: &Path) -> Result<()> {
+    // git prints the path relative to `repo` (normal repo) or absolute (linked
+    // worktree common dir); `join` handles both. A failure means "not a repo we
+    // manage" (bare, or git absent) — skip silently.
+    let Ok(rel) = git(repo, &["rev-parse", "--git-path", "info/exclude"]).await else {
+        return Ok(());
+    };
+    let exclude = repo.join(rel.trim());
     if let Some(parent) = exclude.parent() {
-        if !parent.exists() {
-            // Not a repo layout we manage (e.g. bare); skip silently.
-            return Ok(());
-        }
+        std::fs::create_dir_all(parent).ok();
     }
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     if !current.lines().any(|line| line.trim() == ".lionclaw/") {
@@ -57,7 +62,7 @@ pub fn ensure_excluded(repo: &Path) -> Result<()> {
             updated.push('\n');
         }
         updated.push_str(".lionclaw/\n");
-        std::fs::write(&exclude, updated).context("failed to update .git/info/exclude")?;
+        std::fs::write(&exclude, updated).context("failed to update the git exclude file")?;
     }
     Ok(())
 }
@@ -102,16 +107,24 @@ pub async fn create_worker_clone(
     })
 }
 
+/// Why post-run artifact capture failed. Distinguishes the one agent-behavior
+/// case (an uncommitted tree) from everything else (git infra / a moved HEAD),
+/// so the runner labels the persisted failure correctly.
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("worker left uncommitted changes ({0} paths)")]
+    DirtyWorktree(usize),
+    #[error(transparent)]
+    Infra(#[from] anyhow::Error),
+}
+
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives clone teardown.
-pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<String> {
+pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<String, CaptureError> {
     let status = git(&clone.dir, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
-        bail!(
-            "worker left uncommitted changes ({} paths)",
-            status.lines().count()
-        );
+        return Err(CaptureError::DirtyWorktree(status.lines().count()));
     }
     let head = head_sha(&clone.dir).await?;
     // Fetch the clone's *HEAD commit* (not the branch tip) so the object we
@@ -130,7 +143,9 @@ pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<S
     // The engine observes the commit from git, never trusts the agent: verify
     // the recorded head actually landed in the target repo.
     if !commit_exists(repo, &head).await {
-        bail!("worker HEAD {head} was not transferred into the repo (moved off its branch?)");
+        return Err(CaptureError::Infra(anyhow::anyhow!(
+            "worker HEAD {head} was not transferred into the repo (moved off its branch?)"
+        )));
     }
     Ok(head)
 }

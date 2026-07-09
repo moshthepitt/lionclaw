@@ -388,16 +388,8 @@ impl Engine {
                             .to_string(),
                         synthesized: true,
                     });
-                    match self
-                        .store
-                        .append(&state.mission_id, state.head, &[event], now_ms)
-                        .await
-                    {
-                        Ok(_)
-                        | Err(AppendError::Duplicate { .. })
-                        | Err(AppendError::Conflict { .. }) => {}
-                        Err(err) => return Err(err.into()),
-                    }
+                    self.append_idempotent(&state.mission_id, state.head, &[event])
+                        .await?;
                     // One reconcile action per pass; refold before the next.
                     return Ok(true);
                 }
@@ -437,19 +429,46 @@ impl Engine {
                     .await?
             }
         };
+        // The computed outcome is unique — for a role run, not reproducible — so a
+        // stale head must NOT discard it (unlike the request/reconcile appends). A
+        // concurrent driver settling a DIFFERENT effect moved the head, but our
+        // outcome is still unrecorded, so re-append at the refreshed head. A
+        // Duplicate means it is already in the log (we hold the lease, so only a
+        // zombie re-drive), which is genuinely done.
+        let mut head = state.head;
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            match self
+                .store
+                .append(
+                    &state.mission_id,
+                    head,
+                    std::slice::from_ref(&outcome),
+                    self.clock.now_ms(),
+                )
+                .await
+            {
+                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(true),
+                Err(AppendError::Conflict { .. }) => {
+                    head = self.load_state(&state.mission_id).await?.head;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        bail!("outcome append kept conflicting after {MAX_LOOP_ITERATIONS} retries")
+    }
+
+    /// Append events, treating a `Conflict`/`Duplicate` as an idempotent no-op.
+    /// Safe only for *request* and *reconcile* appends: a Conflict means a
+    /// concurrent driver moved the head, and the next fold re-derives the same
+    /// dispatch. Outcome appends do NOT use this — `drive_one` must re-append its
+    /// unique computed outcome rather than discard it.
+    async fn append_idempotent(&self, mission_id: &MissionId, head: u64, events: &[NewEvent]) -> Result<()> {
         match self
             .store
-            .append(
-                &state.mission_id,
-                state.head,
-                &[outcome],
-                self.clock.now_ms(),
-            )
+            .append(mission_id, head, events, self.clock.now_ms())
             .await
         {
-            Ok(_) => Ok(true),
-            // Outcome already recorded (concurrent driver) — reconcile wins.
-            Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(true),
+            Ok(_) | Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(()),
             Err(err) => Err(err.into()),
         }
     }
@@ -731,15 +750,8 @@ impl Engine {
             base_sha: intent.base_sha,
         })
         .with_prompt_hash(prompt_hash);
-        match self
-            .store
-            .append(&state.mission_id, state.head, &[event], self.clock.now_ms())
+        self.append_idempotent(&state.mission_id, state.head, &[event])
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(()),
-            Err(err) => Err(err.into()),
-        }
     }
 
     async fn materialize_oracle_requests(
@@ -766,15 +778,8 @@ impl Engine {
                 })
             })
             .collect();
-        match self
-            .store
-            .append(&state.mission_id, state.head, &events, self.clock.now_ms())
+        self.append_idempotent(&state.mission_id, state.head, &events)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(AppendError::Duplicate { .. }) | Err(AppendError::Conflict { .. }) => Ok(()),
-            Err(err) => Err(err.into()),
-        }
     }
 
     fn externalize_handoff(&self, handoff: Handoff) -> Result<Handoff> {

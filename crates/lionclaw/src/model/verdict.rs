@@ -155,3 +155,22 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
         FinishClass::Unverified
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // P7's "honest exit code at finish": Verified is cleared only by a Verified
+    // finish; Reviewed also accepts an agent-only InternallyConsistent finish;
+    // Unverified clears neither. `cmd_advance` exits nonzero when this is false.
+    #[test]
+    fn stop_bar_satisfied_by_truth_table() {
+        use FinishClass::{InternallyConsistent, Unverified, Verified};
+        assert!(StopBar::Verified.satisfied_by(Verified));
+        assert!(!StopBar::Verified.satisfied_by(InternallyConsistent));
+        assert!(!StopBar::Verified.satisfied_by(Unverified));
+        assert!(StopBar::Reviewed.satisfied_by(Verified));
+        assert!(StopBar::Reviewed.satisfied_by(InternallyConsistent));
+        assert!(!StopBar::Reviewed.satisfied_by(Unverified));
+    }
+}

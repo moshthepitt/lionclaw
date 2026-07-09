@@ -479,7 +479,7 @@ async fn build_engine(
     let mission_type = load_mission_type(type_dir, &AuthorityCeiling::default())
         .map_err(|e| anyhow::anyhow!("mission type load failed: {e}"))?;
     let store = MissionStore::open(repo).await?;
-    workspace::ensure_excluded(repo)?;
+    workspace::ensure_excluded(repo).await?;
     let mut profile = MissionRuntimeProfile::codex_default();
     let image = mission_type.image.clone();
     profile.confinement.oci_mut().image = Some(image.clone());

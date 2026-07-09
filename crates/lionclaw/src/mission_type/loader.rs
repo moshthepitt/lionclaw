@@ -35,6 +35,7 @@ pub enum MissionTypeError {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestFile {
     #[serde(rename = "mission-type")]
     mission_type: ManifestMissionType,

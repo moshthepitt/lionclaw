@@ -155,7 +155,12 @@ impl RoleRunner for OciRoleRunner {
                 let head_sha = workspace::capture_worker_result(&request.workspace_dir, clone)
                     .await
                     .map_err(|e| RoleRunFailure {
-                        kind: RunErrorKind::DirtyWorktree,
+                        // Only an uncommitted tree is agent behavior; git infra or
+                        // a moved HEAD is infrastructure.
+                        kind: match e {
+                            workspace::CaptureError::DirtyWorktree(_) => RunErrorKind::DirtyWorktree,
+                            workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
+                        },
                         detail: e.to_string(),
                     })?;
                 Some(ArtifactOutcome {

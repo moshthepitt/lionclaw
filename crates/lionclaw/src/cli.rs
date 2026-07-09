@@ -381,7 +381,7 @@ fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
 /// Build an engine over an open store, a loaded mission type, and a runtime
 /// profile (whose image the caller has already pinned).
 #[allow(clippy::too_many_arguments)]
-fn assemble_engine(
+async fn assemble_engine(
     store: MissionStore,
     repo: &Path,
     mission_type: crate::mission_type::MissionType,
@@ -390,7 +390,7 @@ fn assemble_engine(
     profile: MissionRuntimeProfile,
     ceiling: AuthorityCeiling,
 ) -> Result<Engine> {
-    workspace::ensure_excluded(repo)?;
+    workspace::ensure_excluded(repo).await?;
     let role_runner = Arc::new(OciRoleRunner::new(profile.clone(), ceiling));
     let oracle_runner = Arc::new(OciOracleRunner::new(profile));
     Ok(Engine::new(
@@ -436,6 +436,7 @@ async fn build_engine_for_start(
         profile,
         ceiling,
     )
+    .await
 }
 
 /// Build an engine for an EXISTING mission: resolve its recorded mission type (by
@@ -464,7 +465,8 @@ async fn build_engine_for_mission(
         state.image_id.clone(),
         profile,
         ceiling,
-    )?;
+    )
+    .await?;
     // Verify the pinned mission-type digest before anything runs.
     engine.load_state(mission_id).await?;
     Ok(engine)
