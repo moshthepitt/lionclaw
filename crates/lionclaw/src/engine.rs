@@ -399,7 +399,8 @@ impl Engine {
 
     /// Lease and execute one due effect, recording its outcome. Returns
     /// whether an effect was driven (false = nothing was due to lease).
-    /// Serial by design in the walking skeleton; validators parallelize later.
+    /// One driver turn claims one effect; durable leases coordinate concurrent
+    /// drivers without requiring an in-process scheduler.
     async fn drive_one(&self, state: &MissionState) -> Result<bool> {
         let now_ms = self.clock.now_ms();
         let leases = self

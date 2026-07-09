@@ -379,7 +379,7 @@ impl MissionEvent {
             } => Some((IdemClass::Outcome, idempotency_key)),
             // Fact events carry no idempotency key. Exhaustive on purpose: a new
             // effect-style event must decide its class here, never silently skip
-            // the ledger (the bug the deleted terminal-review scaffolding had).
+            // the ledger.
             Self::MissionCreated { .. }
             | Self::PlanSubmitted { .. }
             | Self::MissionAborted { .. }

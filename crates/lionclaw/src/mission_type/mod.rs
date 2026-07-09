@@ -5,7 +5,7 @@
 //! ```text
 //! <domain>/
 //! ├─ mission.toml            # identity + the honesty bar (stop)
-//! ├─ playbook.md             # the method (optional in the walking skeleton)
+//! ├─ playbook.md             # the method (optional)
 //! ├─ roles/<name>.md         # frontmatter (output, network, secrets, runtime) + prompt
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```

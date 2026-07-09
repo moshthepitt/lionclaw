@@ -31,8 +31,8 @@ use crate::workspace;
 pub struct OciRoleRunner {
     profile: MissionRuntimeProfile,
     ceiling: AuthorityCeiling,
-    /// Serializes git worktree/clone operations per process (one target repo
-    /// per mission in the walking skeleton).
+    /// Serializes git worktree/clone operations inside this process; the store
+    /// lease owns cross-process coordination.
     repo_lock: Arc<Mutex<()>>,
 }
 
