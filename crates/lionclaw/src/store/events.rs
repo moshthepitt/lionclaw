@@ -149,25 +149,7 @@ impl MissionStore {
         .bind(mission_id.as_str())
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter()
-            .map(|(sequence_no, recorded_at_ms, payload_json)| {
-                // Unknown event types are a hard error: an engine older than
-                // the log must refuse loudly, never skip silently.
-                let doc: PayloadDoc = serde_json::from_str(&payload_json).map_err(|err| {
-                    anyhow::anyhow!(
-                        "cannot decode event {sequence_no} of mission {mission_id}: {err} \
-                         (engine older than the log?)"
-                    )
-                })?;
-                Ok(EventEnvelope {
-                    mission_id: mission_id.clone(),
-                    sequence_no: sequence_no as u64,
-                    recorded_at_ms,
-                    stamps: doc.stamps,
-                    event: doc.event,
-                })
-            })
-            .collect()
+        decode_rows(mission_id, rows)
     }
 
     /// Load events after a given sequence number (snapshot tail).
@@ -185,19 +167,7 @@ impl MissionStore {
         .bind(after_seq as i64)
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter()
-            .map(|(sequence_no, recorded_at_ms, payload_json)| {
-                let doc: PayloadDoc = serde_json::from_str(&payload_json)
-                    .map_err(|err| anyhow::anyhow!("cannot decode event {sequence_no}: {err}"))?;
-                Ok(EventEnvelope {
-                    mission_id: mission_id.clone(),
-                    sequence_no: sequence_no as u64,
-                    recorded_at_ms,
-                    stamps: doc.stamps,
-                    event: doc.event,
-                })
-            })
-            .collect()
+        decode_rows(mission_id, rows)
     }
 
     /// Rebuild the effect ledger from a folded state's inflight set (cursor
@@ -463,6 +433,34 @@ fn inflight_source_seq(effect: &InflightEffect) -> u64 {
         InflightEffect::RoleRun { requested_seq, .. }
         | InflightEffect::OracleRun { requested_seq, .. } => *requested_seq,
     }
+}
+
+/// Decode `(sequence_no, recorded_at_ms, payload_json)` rows into envelopes.
+/// Shared by `load` and `load_after` so the tail loader gets the same rich
+/// "engine older than the log?" diagnostic on an undecodable event.
+fn decode_rows(
+    mission_id: &MissionId,
+    rows: Vec<(i64, i64, String)>,
+) -> anyhow::Result<Vec<EventEnvelope>> {
+    rows.into_iter()
+        .map(|(sequence_no, recorded_at_ms, payload_json)| {
+            // Unknown event types are a hard error: an engine older than the log
+            // must refuse loudly, never skip silently.
+            let doc: PayloadDoc = serde_json::from_str(&payload_json).map_err(|err| {
+                anyhow::anyhow!(
+                    "cannot decode event {sequence_no} of mission {mission_id}: {err} \
+                     (engine older than the log?)"
+                )
+            })?;
+            Ok(EventEnvelope {
+                mission_id: mission_id.clone(),
+                sequence_no: sequence_no as u64,
+                recorded_at_ms,
+                stamps: doc.stamps,
+                event: doc.event,
+            })
+        })
+        .collect()
 }
 
 fn is_unique_violation(err: &sqlx::Error) -> bool {

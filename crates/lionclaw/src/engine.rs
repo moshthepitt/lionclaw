@@ -603,6 +603,22 @@ impl Engine {
         }
     }
 
+    /// Resolve the `last_report` blobs of a task's dependencies (in either era's
+    /// task map) — the upstream context threaded into a role's prompt.
+    fn resolve_upstream_reports(
+        &self,
+        tasks: &std::collections::BTreeMap<crate::model::TaskId, crate::model::TaskRuntimeState>,
+        depends_on: &[crate::model::TaskId],
+    ) -> Result<Vec<String>> {
+        let mut reports = Vec::new();
+        for dep in depends_on {
+            if let Some(report) = tasks.get(dep).and_then(|t| t.last_report.as_ref()) {
+                reports.push(self.store.blobs().resolve(report)?);
+            }
+        }
+        Ok(reports)
+    }
+
     /// Assemble an execution role's prompt (`("role", …)` idempotency namespace).
     fn assemble_execution_request(
         &self,
@@ -624,12 +640,7 @@ impl Engine {
             .iter()
             .find(|t| t.id == intent.task_id)
             .context("dispatched task not in plan")?;
-        let mut upstream_reports = Vec::new();
-        for dep in &task.depends_on {
-            if let Some(report) = state.tasks.get(dep).and_then(|t| t.last_report.as_ref()) {
-                upstream_reports.push(self.store.blobs().resolve(report)?);
-            }
-        }
+        let upstream_reports = self.resolve_upstream_reports(&state.tasks, &task.depends_on)?;
         let prompt = assemble_role_prompt(
             role,
             &PromptContext {
@@ -658,17 +669,8 @@ impl Engine {
             .iter()
             .find(|t| t.id == intent.task_id)
             .context("dispatched planning task not in the DAG")?;
-        let mut upstream_reports = Vec::new();
-        for dep in &task.depends_on {
-            if let Some(report) = state
-                .planning
-                .tasks
-                .get(dep)
-                .and_then(|t| t.last_report.as_ref())
-            {
-                upstream_reports.push(self.store.blobs().resolve(report)?);
-            }
-        }
+        let upstream_reports =
+            self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
         let oracle_inventory: Vec<String> = self
             .mission_type
             .oracles

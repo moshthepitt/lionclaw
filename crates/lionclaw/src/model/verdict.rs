@@ -57,6 +57,13 @@ impl AuthoritativeVerdict {
         &self.judged_sha
     }
 
+    /// Whether this verdict judged the mission's current artifact commit — the
+    /// freshness the honesty moat turns on. One definition, so the fold, the
+    /// scheduler, and the report can never disagree about what "fresh" means.
+    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
+        self.judged_sha == current_sha
+    }
+
     pub fn exit_code(&self) -> i32 {
         self.exit_code
     }
@@ -124,7 +131,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
         let fresh = assertion
             .last_authoritative
             .as_ref()
-            .filter(|v| v.judged_sha() == state.current_sha);
+            .filter(|v| v.is_fresh_at(&state.current_sha));
         match fresh {
             Some(v) if v.passed() => {}
             Some(_) => {

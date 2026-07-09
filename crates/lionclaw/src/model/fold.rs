@@ -869,7 +869,7 @@ pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
             && assertion
                 .last_authoritative
                 .as_ref()
-                .is_none_or(|v| v.judged_sha() != state.current_sha)
+                .is_none_or(|v| !v.is_fresh_at(&state.current_sha))
     })
 }
 

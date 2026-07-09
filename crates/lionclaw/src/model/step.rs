@@ -177,7 +177,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             let fresh = assertion
                 .last_authoritative
                 .as_ref()
-                .is_some_and(|v| v.judged_sha() == state.current_sha);
+                .is_some_and(|v| v.is_fresh_at(&state.current_sha));
             if !fresh {
                 by_oracle
                     .entry(oracle.clone())

@@ -767,7 +767,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "passed": v.passed(),
                 "exit_code": v.exit_code(),
                 "judged_sha": v.judged_sha(),
-                "fresh": v.judged_sha() == state.current_sha,
+                "fresh": v.is_fresh_at(&state.current_sha),
                 "evidence_excerpt": excerpt,
             })
         });
