@@ -10,10 +10,10 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use crate::mission_type::RoleDefinition;
 use crate::model::{
     ArtifactOutcome, AssertionId, Handoff, MissionId, OracleName, RunErrorKind, TaskId,
 };
-use crate::plugin::RoleDefinition;
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an idempotency key with a recorded outcome
@@ -66,7 +66,7 @@ pub trait OracleRunner: Send + Sync {
 pub struct OracleRunRequest {
     pub mission_id: MissionId,
     pub oracle: OracleName,
-    /// Resolved oracle executable (engine resolves from the plugin; the
+    /// Resolved oracle executable (engine resolves from the mission type; the
     /// runner stays domain-blind).
     pub oracle_path: PathBuf,
     pub assertion_ids: Vec<AssertionId>,

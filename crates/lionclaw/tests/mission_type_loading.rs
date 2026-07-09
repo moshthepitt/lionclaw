@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::authority::MoatViolation;
+use lionclaw::mission_type::{load_mission_type, MissionTypeError};
 use lionclaw::model::{OutputSemantics, StopBar};
-use lionclaw::plugin::{load_plugin, PluginError};
 
 fn repo_root() -> PathBuf {
     // <crate>/tests/plugin_loading.rs → repo root is three parents up from
@@ -20,8 +20,8 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn software_dev_plugin_loads() {
-    let plugin = load_plugin(
-        &repo_root().join("plugins/software-dev"),
+    let plugin = load_mission_type(
+        &repo_root().join("mission-types/software-dev"),
         &AuthorityCeiling::default(),
     )
     .expect("software-dev plugin loads");
@@ -40,15 +40,15 @@ fn software_dev_plugin_loads() {
 
 #[test]
 fn writable_judge_plugin_refuses_to_load() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugins/writable-judge");
-    let err = load_plugin(&fixture, &AuthorityCeiling::default()).expect_err("must refuse");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mission-types/writable-judge");
+    let err = load_mission_type(&fixture, &AuthorityCeiling::default()).expect_err("must refuse");
     // A verdict role asking for secrets cannot satisfy the moat — a typed
     // moat violation, not a generic role error.
     assert!(
         matches!(
             err,
-            PluginError::Moat {
+            MissionTypeError::Moat {
                 violation: MoatViolation::SecretsForJudge { .. },
                 ..
             }
@@ -64,7 +64,7 @@ fn role_declaring_skills_is_rejected_at_load() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[plugin]\nname = \"skilled\"\nstop = \"verified\"\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -73,9 +73,9 @@ fn role_declaring_skills_is_rejected_at_load() {
         "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
-    let err = load_plugin(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
-        matches!(&err, PluginError::Role { detail, .. } if detail.contains("skills")),
+        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("skills")),
         "got {err:?}"
     );
 }

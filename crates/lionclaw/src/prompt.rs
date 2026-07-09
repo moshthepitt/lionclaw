@@ -1,11 +1,11 @@
 //! Engine-owned prompt assembly: the engine writes the skeleton (output-
-//! semantics contract + handoff protocol + guardrails), the plugin fills the
+//! semantics contract + handoff protocol + guardrails), the mission type fills the
 //! content slot, the mission adds live context. Enforced exclusion: a
 //! judge's prompt never includes a producer's narrative prose — verdict
 //! roles see the contract and the artifact, not the worker's story.
 
+use crate::mission_type::RoleDefinition;
 use crate::model::{Assertion, OutputSemantics};
-use crate::plugin::RoleDefinition;
 
 pub struct PromptContext<'a> {
     pub objective: &'a str,

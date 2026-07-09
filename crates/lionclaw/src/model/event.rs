@@ -42,7 +42,7 @@ impl PayloadRef {
     }
 }
 
-/// The honesty bar a plugin declares: what "finished" must mean.
+/// The honesty bar a mission type declares: what "finished" must mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopBar {
@@ -133,7 +133,7 @@ pub enum RunErrorKind {
 pub enum MissionEvent {
     MissionCreated {
         objective: String,
-        plugin_name: String,
+        mission_type_name: String,
         workspace_dir: String,
         /// HEAD of the target repo when the mission was created.
         base_sha: String,

@@ -1,4 +1,4 @@
-//! Plugins are data: a directory of prose the engine loads and validates
+//! Mission types are data: a directory of prose the engine loads and validates
 //! fail-closed. The engine imports no domain — adding one is authoring a
 //! directory, no Rust.
 //!
@@ -13,12 +13,12 @@
 mod frontmatter;
 mod loader;
 
-pub use loader::{load_plugin, PluginError};
+pub use loader::{load_mission_type, MissionTypeError};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::model::{OracleName, OutputSemantics, PluginInventory, RoleName, StopBar};
+use crate::model::{MissionTypeInventory, OracleName, OutputSemantics, RoleName, StopBar};
 
 /// A role is property-composed data: open fields (name, prompt, skills,
 /// runtime) plus the closed engine-understood axes (`output`, and the plain
@@ -36,7 +36,7 @@ pub struct RoleDefinition {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoadedPlugin {
+pub struct MissionType {
     pub name: String,
     pub stop: StopBar,
     pub root: PathBuf,
@@ -45,10 +45,10 @@ pub struct LoadedPlugin {
     pub oracles: BTreeMap<OracleName, PathBuf>,
 }
 
-impl LoadedPlugin {
+impl MissionType {
     /// The pure inventory plan validation runs against.
-    pub fn inventory(&self) -> PluginInventory {
-        PluginInventory {
+    pub fn inventory(&self) -> MissionTypeInventory {
+        MissionTypeInventory {
             roles: self
                 .roles
                 .iter()

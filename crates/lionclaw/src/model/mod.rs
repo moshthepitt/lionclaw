@@ -27,8 +27,8 @@ pub use gate::{evaluate_gate, GateResult};
 pub use ids::{AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
 pub use plan::{Assertion, OutputSemantics, PlanSubmission, Task, TaskKind};
 pub use plan_validation::{
-    validate_plan_amendment, validate_plan_submission, AmendmentError, PlanValidationError,
-    PluginInventory,
+    validate_plan_amendment, validate_plan_submission, AmendmentError, MissionTypeInventory,
+    PlanValidationError,
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,

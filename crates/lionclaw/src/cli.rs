@@ -11,9 +11,9 @@ use clap::{Args, Parser, Subcommand};
 use crate::authority::AuthorityCeiling;
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
+use crate::mission_type::load_mission_type;
 use crate::model::{fold, MissionConfig, MissionId, MissionPhase};
 use crate::oracle::OciOracleRunner;
-use crate::plugin::load_plugin;
 use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::MissionStore;
@@ -54,7 +54,7 @@ pub enum MissionCommand {
     Ratify(RatifyArgs),
     /// Resolve an open attention item.
     Decide(DecideArgs),
-    /// Validate a plugin directory (loader + moat) without starting anything.
+    /// Validate a mission type directory (loader + moat) without starting anything.
     Plugin(PluginArgs),
     /// Drive the real stack end-to-end and assert the Slice-1 invariants
     /// (needs podman; model-auth-free).
@@ -63,9 +63,9 @@ pub enum MissionCommand {
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Plugin directory (a domain of prose).
-    #[arg(long)]
-    pub plugin: PathBuf,
+    /// Mission type directory (a domain of prose).
+    #[arg(long = "type")]
+    pub mission_type: PathBuf,
     /// Target repository the mission operates on.
     #[arg(long)]
     pub repo: PathBuf,
@@ -116,8 +116,8 @@ pub struct SubmitPlanArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long)]
-    pub plugin: PathBuf,
+    #[arg(long = "type")]
+    pub mission_type: PathBuf,
     /// Plan JSON file ({ "assertions": [...], "tasks": [...] }).
     #[arg(long)]
     pub plan: PathBuf,
@@ -130,8 +130,8 @@ pub struct AmendArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long)]
-    pub plugin: PathBuf,
+    #[arg(long = "type")]
+    pub mission_type: PathBuf,
     /// Amendment ops JSON ({ "add": [...], "supersede": [...], "cancel": [...],
     /// "add_assertion": [...], "bind_oracle": [...] }).
     #[arg(long)]
@@ -152,8 +152,8 @@ pub struct AdvanceArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long)]
-    pub plugin: PathBuf,
+    #[arg(long = "type")]
+    pub mission_type: PathBuf,
     #[arg(long, default_value = "codex")]
     pub runtime: String,
     #[arg(long)]
@@ -221,10 +221,10 @@ fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
     }
 }
 
-async fn open_engine(repo: &Path, plugin_dir: &Path, runtime: &str) -> Result<Engine> {
+async fn open_engine(repo: &Path, type_dir: &Path, runtime: &str) -> Result<Engine> {
     let ceiling = AuthorityCeiling::default();
-    let plugin = load_plugin(plugin_dir, &ceiling)
-        .with_context(|| format!("failed to load plugin '{}'", plugin_dir.display()))?;
+    let mission_type = load_mission_type(type_dir, &ceiling)
+        .with_context(|| format!("failed to load mission type '{}'", type_dir.display()))?;
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo)?;
     let profile = runtime_profile(runtime)?;
@@ -232,7 +232,7 @@ async fn open_engine(repo: &Path, plugin_dir: &Path, runtime: &str) -> Result<En
     let oracle_runner = Arc::new(OciOracleRunner::new(profile));
     Ok(Engine::new(
         store,
-        plugin,
+        mission_type,
         role_runner,
         oracle_runner,
         Arc::new(SystemClock),
@@ -241,9 +241,9 @@ async fn open_engine(repo: &Path, plugin_dir: &Path, runtime: &str) -> Result<En
 
 async fn cmd_start(args: StartArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    // Fail-closed: loading the plugin (and its moat check) happens before any
-    // event is written.
-    let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
+    // Fail-closed: loading the mission type (and its moat check) happens before
+    // any event is written.
+    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let base_sha = workspace::head_sha(&repo).await?;
     let mission_id = engine
         .create_mission(
@@ -265,9 +265,9 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
     } else {
         println!("started mission {mission_id} at {base_sha}");
         println!(
-            "submit a plan, then: lionclaw mission advance {mission_id} --repo {} --plugin {}",
+            "submit a plan, then: lionclaw mission advance {mission_id} --repo {} --type {}",
             repo.display(),
-            args.plugin.display()
+            args.mission_type.display()
         );
     }
     Ok(())
@@ -359,7 +359,7 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
 
 async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
+    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let plan_text = std::fs::read_to_string(&args.plan)
         .with_context(|| format!("failed to read plan '{}'", args.plan.display()))?;
@@ -374,7 +374,7 @@ async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
 
 async fn cmd_amend(args: AmendArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
+    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let ops_text = std::fs::read_to_string(&args.ops)
         .with_context(|| format!("failed to read ops '{}'", args.ops.display()))?;
@@ -395,7 +395,7 @@ async fn cmd_amend(args: AmendArgs) -> Result<()> {
 
 async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.plugin, &args.runtime).await?;
+    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
@@ -471,7 +471,7 @@ async fn cmd_log(args: LogArgs) -> Result<()> {
 }
 
 async fn cmd_plugin(args: PluginArgs) -> Result<std::process::ExitCode> {
-    match load_plugin(&args.dir, &AuthorityCeiling::default()) {
+    match load_mission_type(&args.dir, &AuthorityCeiling::default()) {
         Ok(plugin) => {
             if args.json {
                 println!(

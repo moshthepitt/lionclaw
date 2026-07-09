@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, test_plugin, BASE_SHA, HEAD_SHA};
+use common::{advisory_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::Engine;
 use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
@@ -57,7 +57,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
     let store = MissionStore::open(dir.path()).await.expect("store");
     let engine = Engine::new(
         store,
-        test_plugin(),
+        test_mission_type(),
         Arc::new(role_aware_runner(reviewer_passes)),
         Arc::new(MockOracleRunner::exiting(0)),
         Arc::new(MockClock::default()),

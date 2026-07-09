@@ -99,8 +99,12 @@ fn validate_component_name(raw: &str) -> Result<(), IdError> {
 
 id_type!(AssertionId, validate_assertion_id, "Contract assertion id.");
 id_type!(TaskId, validate_task_id, "Plan task id.");
-id_type!(RoleName, validate_component_name, "Plugin role name.");
-id_type!(OracleName, validate_component_name, "Plugin oracle name.");
+id_type!(RoleName, validate_component_name, "Mission-type role name.");
+id_type!(
+    OracleName,
+    validate_component_name,
+    "Mission-type oracle name."
+);
 
 /// Mission id: `m` + 12 hex chars, derived by the shell from
 /// (workspace, objective, creation time) — no RNG in this crate.

@@ -3,7 +3,7 @@
 //! a verified finish.
 //!
 //! Thin deterministic spine (event-sourced store, pure fold, moat predicate)
-//! plus fat dynamic body (plugins = directories of prose the engine loads as
+//! plus fat dynamic body (mission types = directories of prose the engine loads as
 //! data). The loop decision logic is ported from Zenith (Apache-2.0,
 //! Intelligent Internet) — see LICENSE-zenith.
 
@@ -11,9 +11,9 @@ pub mod authority;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod mission_type;
 pub mod model;
 pub mod oracle;
-pub mod plugin;
 pub mod ports;
 pub mod prompt;
 pub mod runner;

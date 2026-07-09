@@ -8,7 +8,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/debug/lionclaw"
-PLUGIN="$ROOT/plugins/software-dev"
+MISSION_TYPE="$ROOT/mission-types/software-dev"
 FIXTURES="$ROOT/crates/lionclaw/tests/fixtures/eval"
 RUNS="${1:-3}"
 WORK="$(mktemp -d)"
@@ -35,15 +35,15 @@ scenario_fix_bug() {
         local repo="$WORK/interval-$i"
         materialize "$FIXTURES/interval-bug" "$repo"
         local base; base="$(git -C "$repo" rev-parse HEAD)"
-        local mid; mid="$(mission_json start --plugin "$PLUGIN" --repo "$repo" \
+        local mid; mid="$(mission_json start --type "$MISSION_TYPE" --repo "$repo" \
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
             --yes | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
         cat > "$repo/plan.json" <<JSON
 { "assertions": [ { "id": "TESTS-PASS", "prose": "cargo test passes at the final commit", "oracle": "cargo-test" } ],
   "tasks": [ { "id": "fix", "kind": "work", "body": "Fix overlaps() for closed intervals so tests::touching_intervals_overlap and merge_coalesces_touching_intervals pass. Do not modify the tests.", "targets": ["TESTS-PASS"], "role": "implementer", "depends_on": [] } ] }
 JSON
-        "$BIN" mission submit-plan "$mid" --repo "$repo" --plugin "$PLUGIN" --plan "$repo/plan.json" >/dev/null 2>&1
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --plugin "$PLUGIN" >/dev/null 2>&1
+        "$BIN" mission submit-plan "$mid" --repo "$repo" --type "$MISSION_TYPE" --plan "$repo/plan.json" >/dev/null 2>&1
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --type "$MISSION_TYPE" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head; finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
         head="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("current_sha"))')"
@@ -80,7 +80,7 @@ PY
         git_quiet -C "$repo" commit -aqm "perf: drop eviction on insert"
         local regressed; regressed="$(git -C "$repo" rev-parse HEAD)"
 
-        local mid; mid="$(mission_json start --plugin "$PLUGIN" --repo "$repo" \
+        local mid; mid="$(mission_json start --type "$MISSION_TYPE" --repo "$repo" \
             --objective "Review the cache for correctness against its documented invariant." --yes \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
         # A no-op work task keeps the (regressed) commit as the judged state,
@@ -90,8 +90,8 @@ PY
   "tasks": [ { "id": "keep", "kind": "work", "body": "Do not change any code. Add a one-line comment to src/lib.rs acknowledging the review is pending, then commit.", "targets": ["CAP-INVARIANT"], "role": "implementer", "depends_on": [] },
              { "id": "review", "kind": "validate", "body": "Judge whether BoundedCache preserves its documented capacity invariant. Read put(); if inserting past capacity no longer evicts, the invariant is VIOLATED and you must report passed:false for CAP-INVARIANT.", "targets": ["CAP-INVARIANT"], "role": "reviewer", "depends_on": ["keep"] } ] }
 JSON
-        "$BIN" mission submit-plan "$mid" --repo "$repo" --plugin "$PLUGIN" --plan "$repo/plan.json" >/dev/null 2>&1
-        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --plugin "$PLUGIN" >/dev/null 2>&1
+        "$BIN" mission submit-plan "$mid" --repo "$repo" --type "$MISSION_TYPE" --plan "$repo/plan.json" >/dev/null 2>&1
+        timeout 900 "$BIN" mission advance "$mid" --repo "$repo" --type "$MISSION_TYPE" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         # The reviewer must have marked CAP-INVARIANT advisory=failed, AND the
         # mission must NOT be verified (advisory alone can't verify).

@@ -1,6 +1,6 @@
-//! Fail-closed plugin loading. A plugin is a directory of prose; every role
+//! Fail-closed mission-type loading. A mission type is a directory of prose; every role
 //! compiles through the moat at load time, every oracle is a real executable,
-//! or the plugin does not load and the mission never starts.
+//! or the mission type does not load and the mission never starts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -9,11 +9,11 @@ use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{OracleName, RoleName, StopBar};
 
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
-use super::{LoadedPlugin, RoleDefinition};
+use super::{MissionType, RoleDefinition};
 
 #[derive(Debug, thiserror::Error)]
-pub enum PluginError {
-    #[error("plugin io error at '{path}': {source}")]
+pub enum MissionTypeError {
+    #[error("io error at '{path}': {source}")]
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -30,38 +30,42 @@ pub enum PluginError {
     },
     #[error("oracle '{oracle}' is invalid: {detail}")]
     Oracle { oracle: String, detail: String },
-    #[error("plugin at '{0}' has no roles")]
+    #[error("mission type at '{0}' has no roles")]
     NoRoles(PathBuf),
 }
 
 #[derive(serde::Deserialize)]
 struct ManifestFile {
-    plugin: ManifestPlugin,
+    #[serde(rename = "mission-type")]
+    mission_type: ManifestMissionType,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestPlugin {
+struct ManifestMissionType {
     name: String,
     stop: String,
 }
 
-pub fn load_plugin(root: &Path, ceiling: &AuthorityCeiling) -> Result<LoadedPlugin, PluginError> {
+pub fn load_mission_type(
+    root: &Path,
+    ceiling: &AuthorityCeiling,
+) -> Result<MissionType, MissionTypeError> {
     let manifest_path = root.join("mission.toml");
     let manifest_text = read(&manifest_path)?;
     let manifest: ManifestFile = toml::from_str(&manifest_text)
-        .map_err(|e| PluginError::Manifest(format!("{manifest_path:?}: {e}")))?;
-    if !is_path_safe(&manifest.plugin.name) {
-        return Err(PluginError::Manifest(format!(
-            "plugin name '{}' is not path-safe",
-            manifest.plugin.name
+        .map_err(|e| MissionTypeError::Manifest(format!("{manifest_path:?}: {e}")))?;
+    if !is_path_safe(&manifest.mission_type.name) {
+        return Err(MissionTypeError::Manifest(format!(
+            "mission type name '{}' is not path-safe",
+            manifest.mission_type.name
         )));
     }
-    let stop = match manifest.plugin.stop.as_str() {
+    let stop = match manifest.mission_type.stop.as_str() {
         "verified" => StopBar::Verified,
         "reviewed" => StopBar::Reviewed,
         other => {
-            return Err(PluginError::Manifest(format!(
+            return Err(MissionTypeError::Manifest(format!(
                 "stop must be 'verified' or 'reviewed', got '{other}'"
             )))
         }
@@ -70,13 +74,13 @@ pub fn load_plugin(root: &Path, ceiling: &AuthorityCeiling) -> Result<LoadedPlug
     let oracles = load_oracles(&root.join("oracles"))?;
     let roles = load_roles(&root.join("roles"), ceiling)?;
     if roles.is_empty() {
-        return Err(PluginError::NoRoles(root.to_path_buf()));
+        return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
 
     let playbook = read(&root.join("playbook.md")).ok();
 
-    Ok(LoadedPlugin {
-        name: manifest.plugin.name,
+    Ok(MissionType {
+        name: manifest.mission_type.name,
         stop,
         root: root.to_path_buf(),
         playbook,
@@ -88,7 +92,7 @@ pub fn load_plugin(root: &Path, ceiling: &AuthorityCeiling) -> Result<LoadedPlug
 fn load_roles(
     dir: &Path,
     ceiling: &AuthorityCeiling,
-) -> Result<BTreeMap<RoleName, RoleDefinition>, PluginError> {
+) -> Result<BTreeMap<RoleName, RoleDefinition>, MissionTypeError> {
     let mut roles = BTreeMap::new();
     if !dir.exists() {
         return Ok(roles);
@@ -98,14 +102,14 @@ fn load_roles(
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| PluginError::Role {
-                role: path.display().to_string(),
-                detail: "non-utf8 filename".to_string(),
-            })?;
-        let name = RoleName::new(stem).map_err(|e| PluginError::Role {
+        let stem =
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| MissionTypeError::Role {
+                    role: path.display().to_string(),
+                    detail: "non-utf8 filename".to_string(),
+                })?;
+        let name = RoleName::new(stem).map_err(|e| MissionTypeError::Role {
             role: stem.to_string(),
             detail: e.to_string(),
         })?;
@@ -117,14 +121,14 @@ fn load_roles(
             runtime,
             skills,
             prompt_body,
-        } = parse_role_file(&text).map_err(|e| PluginError::Role {
+        } = parse_role_file(&text).map_err(|e| MissionTypeError::Role {
             role: stem.to_string(),
             detail: e,
         })?;
         // Skill projection is not wired yet; fail closed so an author can't
         // declare a silently-ignored capability.
         if !skills.is_empty() {
-            return Err(PluginError::Role {
+            return Err(MissionTypeError::Role {
                 role: stem.to_string(),
                 detail: "skills projection is not supported yet".to_string(),
             });
@@ -139,8 +143,8 @@ fn load_roles(
             prompt_body,
         };
         // Fail-closed moat check at load time: an authority that cannot
-        // compile (e.g. a judge requesting secrets) rejects the plugin.
-        compile_authority(&role, ceiling).map_err(|violation| PluginError::Moat {
+        // compile (e.g. a judge requesting secrets) rejects the mission type.
+        compile_authority(&role, ceiling).map_err(|violation| MissionTypeError::Moat {
             role: stem.to_string(),
             violation,
         })?;
@@ -149,20 +153,20 @@ fn load_roles(
     Ok(roles)
 }
 
-fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, PluginError> {
+fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, MissionTypeError> {
     let mut oracles = BTreeMap::new();
     if !dir.exists() {
         return Ok(oracles);
     }
     for entry in read_dir(dir)? {
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| PluginError::Io {
+        let file_type = entry.file_type().map_err(|e| MissionTypeError::Io {
             path: path.clone(),
             source: e,
         })?;
-        // No symlinks out of the plugin: an oracle must be a regular file.
+        // No symlinks out of the mission type: an oracle must be a regular file.
         if !file_type.is_file() {
-            return Err(PluginError::Oracle {
+            return Err(MissionTypeError::Oracle {
                 oracle: path.display().to_string(),
                 detail: "must be a regular file (no symlinks)".to_string(),
             });
@@ -170,22 +174,22 @@ fn load_oracles(dir: &Path) -> Result<BTreeMap<OracleName, PathBuf>, PluginError
         let stem =
             path.file_name()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| PluginError::Oracle {
+                .ok_or_else(|| MissionTypeError::Oracle {
                     oracle: path.display().to_string(),
                     detail: "non-utf8 filename".to_string(),
                 })?;
-        let name = OracleName::new(stem).map_err(|e| PluginError::Oracle {
+        let name = OracleName::new(stem).map_err(|e| MissionTypeError::Oracle {
             oracle: stem.to_string(),
             detail: e.to_string(),
         })?;
         if !is_executable(&path) {
-            return Err(PluginError::Oracle {
+            return Err(MissionTypeError::Oracle {
                 oracle: stem.to_string(),
                 detail: "must be executable".to_string(),
             });
         }
         if !has_shebang(&path) {
-            return Err(PluginError::Oracle {
+            return Err(MissionTypeError::Oracle {
                 oracle: stem.to_string(),
                 detail: "must start with a #! shebang".to_string(),
             });
@@ -221,21 +225,21 @@ fn is_path_safe(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-fn read(path: &Path) -> Result<String, PluginError> {
-    std::fs::read_to_string(path).map_err(|source| PluginError::Io {
+fn read(path: &Path) -> Result<String, MissionTypeError> {
+    std::fs::read_to_string(path).map_err(|source| MissionTypeError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>, PluginError> {
+fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>, MissionTypeError> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|source| PluginError::Io {
+        .map_err(|source| MissionTypeError::Io {
             path: dir.to_path_buf(),
             source,
         })?
         .collect::<Result<_, _>>()
-        .map_err(|source| PluginError::Io {
+        .map_err(|source| MissionTypeError::Io {
             path: dir.to_path_buf(),
             source,
         })?;

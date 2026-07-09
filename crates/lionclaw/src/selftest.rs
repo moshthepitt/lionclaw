@@ -22,13 +22,13 @@ use crate::authority::{
 };
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AmendError, Engine};
+use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
     AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff,
     MissionConfig, MissionEvent, MissionId, MissionPhase, OracleBinding, OracleName, PayloadRef,
     PlanSubmission, RoleName, RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
-use crate::plugin::{load_plugin, PluginError};
 use crate::ports::{
     OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome,
     RoleRunRequest, RoleRunner, SystemClock,
@@ -205,7 +205,7 @@ async fn podman_readiness() -> Result<(), String> {
     Ok(())
 }
 
-// ---- Embedded fixtures & plugins (self-contained; no repo files needed) ----
+// ---- Embedded fixtures & mission types (self-contained; no repo files needed) ----
 
 const ADD_CARGO: &str = "[package]\nname = \"selftest-add\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n";
 /// `add` subtracts — the test fails until a worker fixes it. Used by check (1)
@@ -237,21 +237,21 @@ mod tests {
 const BROKEN_CARGO: &str = include_str!("../tests/fixtures/eval/interval-bug/Cargo.toml");
 const BROKEN_LIB: &str = include_str!("../tests/fixtures/eval/interval-bug/src/lib.rs");
 
-const PLUGIN_MISSION_TOML: &str = "[plugin]\nname = \"selftest\"\nstop = \"verified\"\n";
-const PLUGIN_IMPLEMENTER: &str = "\
+const MISSION_TYPE_TOML: &str = "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\n";
+const IMPLEMENTER_ROLE: &str = "\
 ---
 output: produces-artifact
 runtime: codex
 ---
 Self-test worker.
 ";
-const PLUGIN_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
+const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
 
 // A verdict role that illegally requests secrets — the loader must refuse it.
-// (A judge can't be declared *writable* in a plugin — workspace access is
+// (A judge can't be declared *writable* in a mission type — workspace access is
 // derived from output — so an over-privileged judge is a secrets-requesting
 // one.)
-const SECRETS_JUDGE_TOML: &str = "[plugin]\nname = \"secrets-judge\"\nstop = \"verified\"\n";
+const SECRETS_JUDGE_TOML: &str = "[mission-type]\nname = \"secrets-judge\"\nstop = \"verified\"\n";
 const SECRETS_JUDGE_REVIEWER: &str = "\
 ---
 output: emits-verdict
@@ -260,19 +260,19 @@ secrets: true
 A verdict role illegally requesting secrets — the loader must refuse it.
 ";
 
-/// Write a plugin dir: mission.toml + roles/implementer.md + oracles/cargo-test.
-fn materialize_sw_plugin(root: &Path) -> Result<()> {
+/// Write a mission-type dir: mission.toml + roles/implementer.md + oracles/cargo-test.
+fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::create_dir_all(root.join("oracles"))?;
-    std::fs::write(root.join("mission.toml"), PLUGIN_MISSION_TOML)?;
-    std::fs::write(root.join("roles/implementer.md"), PLUGIN_IMPLEMENTER)?;
+    std::fs::write(root.join("mission.toml"), MISSION_TYPE_TOML)?;
+    std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
-    std::fs::write(&oracle, PLUGIN_ORACLE)?;
+    std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
     set_executable(&oracle)?;
     Ok(())
 }
 
-fn materialize_secrets_judge_plugin(root: &Path) -> Result<()> {
+fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::write(root.join("mission.toml"), SECRETS_JUDGE_TOML)?;
     std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
@@ -469,18 +469,18 @@ async fn run_confined_sh(
 /// Build an engine over `repo` with the given worker + the counting real oracle.
 async fn build_engine(
     repo: &Path,
-    plugin_dir: &Path,
+    type_dir: &Path,
     role_runner: Arc<dyn RoleRunner>,
     oracle_count: Arc<AtomicUsize>,
 ) -> Result<Engine> {
-    let plugin = load_plugin(plugin_dir, &AuthorityCeiling::default())
-        .map_err(|e| anyhow::anyhow!("plugin load failed: {e}"))?;
+    let mission_type = load_mission_type(type_dir, &AuthorityCeiling::default())
+        .map_err(|e| anyhow::anyhow!("mission type load failed: {e}"))?;
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo)?;
     let profile = MissionRuntimeProfile::codex_default();
     Ok(Engine::new(
         store,
-        plugin,
+        mission_type,
         role_runner,
         Arc::new(CountingOracleRunner {
             inner: OciOracleRunner::new(profile),
@@ -498,8 +498,8 @@ async fn build_engine(
 /// same DB resumes and does NOT re-run the oracle (counter stays 1).
 async fn check_happy_writer_and_resume() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
-    let plugin = tempfile::tempdir().context("tempdir")?;
-    materialize_sw_plugin(plugin.path())?;
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_mission_type(type_dir.path())?;
     let base = materialize_repo(repo.path(), ADD_CARGO, BROKEN_ADD_LIB).await?;
     let count = Arc::new(AtomicUsize::new(0));
     let worker = Arc::new(ScriptedRoleRunner {
@@ -508,7 +508,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
 
     let mission_id = {
         let engine =
-            build_engine(repo.path(), plugin.path(), worker.clone(), count.clone()).await?;
+            build_engine(repo.path(), type_dir.path(), worker.clone(), count.clone()).await?;
         let id = engine
             .create_mission(
                 &repo.path().to_string_lossy(),
@@ -534,7 +534,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
     };
 
     // Resume from disk with a fresh engine sharing the same oracle counter.
-    let engine2 = build_engine(repo.path(), plugin.path(), worker, count.clone()).await?;
+    let engine2 = build_engine(repo.path(), type_dir.path(), worker, count.clone()).await?;
     assert_verified(&engine2, &mission_id).await?;
 
     let ran = count.load(Ordering::SeqCst);
@@ -570,11 +570,17 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
 /// worker leaves the tree broken so the oracle is what decides.
 async fn check_oracle_honesty() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
-    let plugin = tempfile::tempdir().context("tempdir")?;
-    materialize_sw_plugin(plugin.path())?;
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_mission_type(type_dir.path())?;
     let base = materialize_repo(repo.path(), BROKEN_CARGO, BROKEN_LIB).await?;
     let count = Arc::new(AtomicUsize::new(0));
-    let engine = build_engine(repo.path(), plugin.path(), Arc::new(NoopRoleRunner), count).await?;
+    let engine = build_engine(
+        repo.path(),
+        type_dir.path(),
+        Arc::new(NoopRoleRunner),
+        count,
+    )
+    .await?;
     let id = engine
         .create_mission(
             &repo.path().to_string_lossy(),
@@ -604,15 +610,15 @@ async fn check_oracle_honesty() -> Result<()> {
     }
 }
 
-/// (3) A plugin declaring an over-privileged judge refuses to load with a
+/// (3) A mission type declaring an over-privileged judge refuses to load with a
 /// typed moat violation — so the mission never starts (no event log).
 async fn check_moat() -> Result<()> {
-    let plugin = tempfile::tempdir().context("tempdir")?;
-    materialize_secrets_judge_plugin(plugin.path())?;
-    match load_plugin(plugin.path(), &AuthorityCeiling::default()) {
-        Ok(_) => anyhow::bail!("over-privileged judge plugin loaded (moat breached)"),
-        Err(PluginError::Moat { .. }) => Ok(()),
-        Err(other) => anyhow::bail!("plugin refused, but not by the moat: {other}"),
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_secrets_judge_mission_type(type_dir.path())?;
+    match load_mission_type(type_dir.path(), &AuthorityCeiling::default()) {
+        Ok(_) => anyhow::bail!("over-privileged judge mission type loaded (moat breached)"),
+        Err(MissionTypeError::Moat { .. }) => Ok(()),
+        Err(other) => anyhow::bail!("mission type refused, but not by the moat: {other}"),
     }
 }
 
@@ -622,12 +628,12 @@ async fn check_moat() -> Result<()> {
 /// refused. Pure — no agent turn, no oracle run — so it always runs.
 async fn check_replanning() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
-    let plugin = tempfile::tempdir().context("tempdir")?;
-    materialize_sw_plugin(plugin.path())?;
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_mission_type(type_dir.path())?;
     let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
     let engine = build_engine(
         repo.path(),
-        plugin.path(),
+        type_dir.path(),
         Arc::new(NoopRoleRunner),
         Arc::new(AtomicUsize::new(0)),
     )

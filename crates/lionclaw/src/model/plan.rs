@@ -2,7 +2,7 @@
 //!
 //! Shapes ported from Zenith (Apache-2.0, Intelligent Internet) `models.py`
 //! (`Task`, `TaskType`, `TaskList`), adapted: contract + task list are
-//! submitted together as one [`PlanSubmission`], and tasks reference plugin
+//! submitted together as one [`PlanSubmission`], and tasks reference mission-type
 //! *roles* rather than skills.
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ pub struct Task {
     /// Contract assertion ids this task addresses.
     #[serde(default)]
     pub targets: Vec<AssertionId>,
-    /// Plugin role dispatched for this task (required for work/validate,
+    /// Mission-type role dispatched for this task (required for work/validate,
     /// forbidden for gates).
     #[serde(default)]
     pub role: Option<RoleName>,

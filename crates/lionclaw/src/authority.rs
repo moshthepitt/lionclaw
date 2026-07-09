@@ -21,8 +21,8 @@ use lionclaw_confinement::{
     RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
+use crate::mission_type::RoleDefinition;
 use crate::model::OutputSemantics;
-use crate::plugin::RoleDefinition;
 
 /// Mission targets no mount may shadow.
 const RESERVED_TARGETS: &[&str] = &[
@@ -112,7 +112,7 @@ pub fn compile_authority(
     };
     if role.secrets && role.output == OutputSemantics::EmitsVerdict {
         // Fail closed rather than silently clamp: a judge asking for secrets
-        // is a plugin bug the author must see.
+        // is a mission-type bug the author must see.
         return Err(MoatViolation::SecretsForJudge {
             role: role.name.to_string(),
         });

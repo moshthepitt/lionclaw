@@ -165,7 +165,7 @@ mod tests {
                 1,
                 MissionEvent::MissionCreated {
                     objective: "o".into(),
-                    plugin_name: "p".into(),
+                    mission_type_name: "p".into(),
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {

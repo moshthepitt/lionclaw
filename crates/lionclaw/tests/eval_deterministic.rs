@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::Engine;
+use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
     AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
     PlanSubmission, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
-use lionclaw::plugin::load_plugin;
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
@@ -25,14 +25,14 @@ fn fixtures() -> PathBuf {
 /// Scenario 3 — the moat holds: a plugin whose verdict role over-reaches
 /// refuses to load, so no mission can ever start from it.
 #[test]
-fn moat_refuses_over_privileged_judge_plugin() {
-    let err = load_plugin(
-        &fixtures().join("plugins/writable-judge"),
+fn moat_refuses_over_privileged_judge_mission_type() {
+    let err = load_mission_type(
+        &fixtures().join("mission-types/writable-judge"),
         &AuthorityCeiling::default(),
     )
     .expect_err("an over-privileged judge must refuse to load");
     assert!(
-        matches!(err, lionclaw::plugin::PluginError::Moat { .. }),
+        matches!(err, lionclaw::mission_type::MissionTypeError::Moat { .. }),
         "expected a typed moat violation, got {err:?}"
     );
 }
@@ -41,9 +41,9 @@ fn moat_refuses_over_privileged_judge_plugin() {
 /// and no oracles, whose bar is "verified", finishes internally-consistent
 /// even when the reviewer passes everything. Never verified.
 #[tokio::test]
-async fn advisory_only_plugin_never_verifies() {
-    let plugin = load_plugin(
-        &fixtures().join("plugins/advisory-only"),
+async fn advisory_only_mission_type_never_verifies() {
+    let plugin = load_mission_type(
+        &fixtures().join("mission-types/advisory-only"),
         &AuthorityCeiling::default(),
     )
     .expect("advisory-only plugin loads");

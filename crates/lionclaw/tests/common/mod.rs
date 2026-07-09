@@ -11,21 +11,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lionclaw::engine::Engine;
+use lionclaw::mission_type::{MissionType, RoleDefinition};
 use lionclaw::model::{
     Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, PlanSubmission, RoleName,
     StopBar, Task, TaskKind,
 };
-use lionclaw::plugin::{LoadedPlugin, RoleDefinition};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
 
 pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
 pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
 
-pub fn test_plugin() -> LoadedPlugin {
+pub fn test_mission_type() -> MissionType {
     let implementer = RoleName::new("implementer").expect("role name");
     let cargo_test = OracleName::new("cargo-test").expect("oracle name");
-    LoadedPlugin {
+    MissionType {
         name: "software-dev-test".to_string(),
         stop: StopBar::Verified,
         root: "/nonexistent-plugin".into(),
@@ -137,7 +137,7 @@ pub async fn harness(
     let oracle_runner = Arc::new(oracle_runner);
     let engine = Engine::new(
         store,
-        test_plugin(),
+        test_mission_type(),
         role_runner.clone(),
         oracle_runner.clone(),
         Arc::new(MockClock::default()),

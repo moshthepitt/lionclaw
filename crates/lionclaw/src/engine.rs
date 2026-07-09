@@ -15,20 +15,20 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::mission_type::MissionType;
 use crate::model::{
     step, validate_plan_amendment, validate_plan_submission, AmendmentError, AmendmentOps,
     AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId, MissionPhase, MissionState,
     OracleDispatchIntent, PayloadRef, PlanSubmission, PlanValidationError, RoleDispatchIntent,
     RunErrorKind, StepDecision,
 };
-use crate::plugin::LoadedPlugin;
 use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
 use crate::prompt::{assemble_role_prompt, PromptContext};
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
     store: MissionStore,
-    plugin: LoadedPlugin,
+    mission_type: MissionType,
     role_runner: Arc<dyn RoleRunner>,
     oracle_runner: Arc<dyn OracleRunner>,
     clock: Arc<dyn Clock>,
@@ -80,7 +80,7 @@ const MAX_LOOP_ITERATIONS: usize = 10_000;
 impl Engine {
     pub fn new(
         store: MissionStore,
-        plugin: LoadedPlugin,
+        mission_type: MissionType,
         role_runner: Arc<dyn RoleRunner>,
         oracle_runner: Arc<dyn OracleRunner>,
         clock: Arc<dyn Clock>,
@@ -88,7 +88,7 @@ impl Engine {
         let worker_id = format!("mission-engine-{}", std::process::id());
         Self {
             store,
-            plugin,
+            mission_type,
             role_runner,
             oracle_runner,
             clock,
@@ -100,8 +100,8 @@ impl Engine {
         &self.store
     }
 
-    pub fn plugin(&self) -> &LoadedPlugin {
-        &self.plugin
+    pub fn mission_type(&self) -> &MissionType {
+        &self.mission_type
     }
 
     /// Create a mission. `base_sha` is the target repo's HEAD, observed by
@@ -119,7 +119,7 @@ impl Engine {
         )));
         let created = NewEvent::new(MissionEvent::MissionCreated {
             objective: objective.to_string(),
-            plugin_name: self.plugin.name.clone(),
+            mission_type_name: self.mission_type.name.clone(),
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
@@ -142,7 +142,7 @@ impl Engine {
         if !matches!(state.phase, MissionPhase::Planning) {
             return Err(SubmitError::WrongPhase(format!("{:?}", state.phase)));
         }
-        let errors = validate_plan_submission(&submission, &self.plugin.inventory());
+        let errors = validate_plan_submission(&submission, &self.mission_type.inventory());
         if !errors.is_empty() {
             return Err(SubmitError::Invalid(errors));
         }
@@ -203,7 +203,7 @@ impl Engine {
         if !state.inflight.is_empty() {
             return Err(AmendError::MissionBusy);
         }
-        validate_plan_amendment(&state, &ops, &self.plugin.inventory())?;
+        validate_plan_amendment(&state, &ops, &self.mission_type.inventory())?;
         let event = NewEvent::new(MissionEvent::PlanAmended {
             base_revision,
             ops,
@@ -430,10 +430,10 @@ impl Engine {
                 synthesized: false,
             })
         };
-        let Some(role) = self.plugin.roles.get(role_name) else {
+        let Some(role) = self.mission_type.roles.get(role_name) else {
             return Ok(failed(
                 RunErrorKind::Launch,
-                format!("role '{role_name}' is no longer provided by the plugin"),
+                format!("role '{role_name}' is no longer provided by the mission type"),
             ));
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
@@ -492,9 +492,9 @@ impl Engine {
                 synthesized: false,
             })
         };
-        let Some(oracle_path) = self.plugin.oracles.get(oracle) else {
+        let Some(oracle_path) = self.mission_type.oracles.get(oracle) else {
             return Ok(failed(format!(
-                "oracle '{oracle}' is no longer provided by the plugin"
+                "oracle '{oracle}' is no longer provided by the mission type"
             )));
         };
         let request = OracleRunRequest {
@@ -537,10 +537,10 @@ impl Engine {
             .filter(|a| intent.targets.contains(&a.id))
             .collect();
         let role = self
-            .plugin
+            .mission_type
             .roles
             .get(&intent.role)
-            .with_context(|| format!("role '{}' missing from plugin", intent.role))?;
+            .with_context(|| format!("role '{}' missing from the mission type", intent.role))?;
         // Thread the reports of this task's dependencies in (resolved from
         // blob refs). Prompt assembly excludes them for verdict roles.
         let task = plan

@@ -186,7 +186,7 @@ impl InflightEffect {
 pub struct MissionState {
     pub mission_id: MissionId,
     pub objective: String,
-    pub plugin_name: String,
+    pub mission_type_name: String,
     pub workspace_dir: String,
     /// Target repo HEAD at mission creation.
     pub base_sha: String,

@@ -8,7 +8,7 @@
 //! Divergences: contract + task list validate together (one submission);
 //! roles replace skills, and a task's role must carry compatible output
 //! semantics (verdict roles validate, non-verdict roles work); assertion
-//! oracle bindings must exist in the plugin inventory. Id charset rules are
+//! oracle bindings must exist in the mission-type inventory. Id charset rules are
 //! enforced by the id newtypes at every deserialization boundary, so only
 //! duplicates are checked here.
 
@@ -33,15 +33,15 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
     }
 }
 
-/// The plugin-supplied inventory the plan is validated against.
-pub struct PluginInventory {
+/// The mission-type-supplied inventory the plan is validated against.
+pub struct MissionTypeInventory {
     pub roles: BTreeMap<RoleName, OutputSemantics>,
     pub oracles: BTreeSet<OracleName>,
 }
 
 pub fn validate_plan_submission(
     submission: &PlanSubmission,
-    inventory: &PluginInventory,
+    inventory: &MissionTypeInventory,
 ) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
     if submission.assertions.is_empty() {
@@ -117,7 +117,7 @@ pub enum AmendmentError {
 pub fn validate_plan_amendment(
     state: &MissionState,
     ops: &AmendmentOps,
-    inventory: &PluginInventory,
+    inventory: &MissionTypeInventory,
 ) -> Result<(), AmendmentError> {
     let Some(plan) = state.plan.as_ref() else {
         return Err(AmendmentError::Invalid(vec![err(
@@ -234,7 +234,7 @@ fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
 
 fn check_shape(
     submission: &PlanSubmission,
-    inventory: &PluginInventory,
+    inventory: &MissionTypeInventory,
 ) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     for assertion in &submission.assertions {
@@ -243,7 +243,7 @@ fn check_shape(
                 errors.push(err(
                     "unknown_oracle",
                     format!(
-                        "assertion '{}' binds oracle '{oracle}' which the plugin does not provide",
+                        "assertion '{}' binds oracle '{oracle}' which the mission type does not provide",
                         assertion.id
                     ),
                 ));
@@ -299,7 +299,7 @@ fn check_shape(
                     errors.push(err(
                         "unknown_role",
                         format!(
-                            "task '{}' names role '{role}' which the plugin does not provide",
+                            "task '{}' names role '{role}' which the mission type does not provide",
                             task.id
                         ),
                     ));
@@ -505,7 +505,7 @@ mod tests {
         task(id, TaskKind::Gate, None, "", targets, deps)
     }
 
-    fn inventory() -> PluginInventory {
+    fn inventory() -> MissionTypeInventory {
         let mut roles = BTreeMap::new();
         roles.insert(
             RoleName::new("implementer").expect("valid role name"),
@@ -519,7 +519,7 @@ mod tests {
             RoleName::new("planner").expect("valid role name"),
             OutputSemantics::Plans,
         );
-        PluginInventory {
+        MissionTypeInventory {
             roles,
             oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
         }
