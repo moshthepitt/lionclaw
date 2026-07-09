@@ -142,7 +142,6 @@ impl RoleRunner for OciRoleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
-                idle_timeout: self.profile.idle_timeout,
                 hard_timeout: self.profile.hard_timeout,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
@@ -153,16 +152,16 @@ impl RoleRunner for OciRoleRunner {
             let handoff = read_handoff(&dirs.handoff, request.role.output)?;
             let artifact = if let Some(clone) = &worker_clone {
                 let _guard = self.repo_lock.lock().await;
-                workspace::capture_worker_result(&request.workspace_dir, clone)
+                let head_sha = workspace::capture_worker_result(&request.workspace_dir, clone)
                     .await
                     .map_err(|e| RoleRunFailure {
                         kind: RunErrorKind::DirtyWorktree,
                         detail: e.to_string(),
-                    })?
-                    .map(|head_sha| ArtifactOutcome {
-                        base_sha: request.base_sha.clone(),
-                        head_sha,
-                    })
+                    })?;
+                Some(ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha,
+                })
             } else {
                 None
             };

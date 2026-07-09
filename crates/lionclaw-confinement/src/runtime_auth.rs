@@ -100,7 +100,6 @@ mod tests {
                 working_dir: None,
                 environment: Vec::new(),
                 mcp_servers: Vec::new(),
-                idle_timeout: std::time::Duration::from_secs(30),
                 hard_timeout: std::time::Duration::from_secs(90),
                 mounts: vec![
                     MountSpec {

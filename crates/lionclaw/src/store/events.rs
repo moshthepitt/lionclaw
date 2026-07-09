@@ -63,14 +63,6 @@ pub enum AppendError {
     Store(#[from] anyhow::Error),
 }
 
-#[derive(Debug, Clone)]
-pub struct MissionSummary {
-    pub mission_id: MissionId,
-    pub workspace_dir: String,
-    pub objective: String,
-    pub created_at_ms: i64,
-}
-
 /// Persisted payload document: stamps + event, in one JSON column.
 #[derive(Serialize, Deserialize)]
 struct PayloadDoc {
@@ -231,10 +223,8 @@ impl MissionStore {
                 sqlx::query(
                     "INSERT INTO mission_effects
                          (effect_id, mission_id, source_seq, kind, request_json, status,
-                          attempt_count, lease_owner, lease_expires_at_ms, current_attempt_id,
-                          created_at_ms, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'leased', 1, 'rebuild-orphan', 0,
-                             ?1 || '-orphan', ?6, ?6)
+                          lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'leased', 'rebuild-orphan', 0, ?6, ?6)
                      ON CONFLICT(effect_id) DO NOTHING",
                 )
                 .bind(key)
@@ -267,22 +257,15 @@ impl MissionStore {
         Ok(())
     }
 
-    pub async fn list_missions(&self) -> anyhow::Result<Vec<MissionSummary>> {
-        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
-            "SELECT mission_id, workspace_dir, objective, created_at_ms
-             FROM missions ORDER BY created_at_ms, mission_id",
+    /// Mission ids in creation order.
+    pub async fn list_missions(&self) -> anyhow::Result<Vec<MissionId>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT mission_id FROM missions ORDER BY created_at_ms, mission_id",
         )
         .fetch_all(self.pool())
         .await?;
         rows.into_iter()
-            .map(|(id, workspace_dir, objective, created_at_ms)| {
-                Ok(MissionSummary {
-                    mission_id: MissionId::parse(id)?,
-                    workspace_dir,
-                    objective,
-                    created_at_ms,
-                })
-            })
+            .map(|(id,)| Ok(MissionId::parse(id)?))
             .collect()
     }
 
@@ -300,8 +283,8 @@ impl MissionStore {
         // Due = queued, or leased with an expired lease (a crashed worker's
         // claim is reclaimable). The CAS UPDATE below re-checks this so a
         // concurrent puller can never double-lease.
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT effect_id, request_json, attempt_count FROM mission_effects
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT effect_id, request_json FROM mission_effects
              WHERE mission_id = ?1
                AND (status = 'queued'
                     OR (status = 'leased' AND lease_expires_at_ms <= ?3))
@@ -313,21 +296,19 @@ impl MissionStore {
         .fetch_all(&mut *tx)
         .await?;
         let mut leases = Vec::with_capacity(rows.len());
-        for (effect_id, request_json, attempt_count) in rows {
-            let attempt_id = format!("{effect_id}-a{}", attempt_count + 1);
+        for (effect_id, request_json) in rows {
             let claimed = sqlx::query(
                 "UPDATE mission_effects
-                 SET status = 'leased', attempt_count = attempt_count + 1,
+                 SET status = 'leased',
                      lease_owner = ?2, lease_expires_at_ms = ?3,
-                     current_attempt_id = ?4, updated_at_ms = ?5
+                     updated_at_ms = ?4
                  WHERE effect_id = ?1
                    AND (status = 'queued'
-                        OR (status = 'leased' AND lease_expires_at_ms <= ?5))",
+                        OR (status = 'leased' AND lease_expires_at_ms <= ?4))",
             )
             .bind(&effect_id)
             .bind(worker_id)
             .bind(now_ms + lease_ms)
-            .bind(&attempt_id)
             .bind(now_ms)
             .execute(&mut *tx)
             .await?
@@ -335,17 +316,6 @@ impl MissionStore {
             if claimed == 0 {
                 continue;
             }
-            sqlx::query(
-                "INSERT INTO mission_effect_attempts
-                     (attempt_id, effect_id, worker_id, status, started_at_ms)
-                 VALUES (?1, ?2, ?3, 'leased', ?4)",
-            )
-            .bind(&attempt_id)
-            .bind(&effect_id)
-            .bind(worker_id)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
             let request: InflightEffect = serde_json::from_str(&request_json)
                 .map_err(|err| anyhow::anyhow!("corrupt effect '{effect_id}': {err}"))?;
             leases.push(EffectLease { effect_id, request });
@@ -376,7 +346,7 @@ impl MissionStore {
         sqlx::query(
             "UPDATE mission_effects
              SET status = 'queued', lease_owner = NULL, lease_expires_at_ms = NULL,
-                 current_attempt_id = NULL, updated_at_ms = ?2
+                 updated_at_ms = ?2
              WHERE effect_id = ?1
                AND (status = 'queued'
                     OR (status = 'leased' AND lease_expires_at_ms <= ?2))",
@@ -472,17 +442,6 @@ async fn insert_event(
     } else if let Some(succeeded) = event.event.outcome_succeeded() {
         let (_, key) = idem.expect("outcome events carry an idempotency key");
         let status = if succeeded { "done" } else { "failed" };
-        sqlx::query(
-            "UPDATE mission_effect_attempts
-             SET status = ?2, finished_at_ms = ?3
-             WHERE attempt_id = (SELECT current_attempt_id FROM mission_effects WHERE effect_id = ?1)",
-        )
-        .bind(key)
-        .bind(if succeeded { "completed" } else { "failed" })
-        .bind(now_ms)
-        .execute(&mut **tx)
-        .await
-        .map_err(anyhow::Error::from)?;
         sqlx::query(
             "UPDATE mission_effects
              SET status = ?2, lease_owner = NULL, lease_expires_at_ms = NULL,

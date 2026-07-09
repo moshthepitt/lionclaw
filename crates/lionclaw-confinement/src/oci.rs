@@ -1722,7 +1722,6 @@ esac
             working_dir: Some("/host/workspace/src".to_string()),
             environment: vec![("FOO".to_string(), "from-plan".to_string())],
             mcp_servers: Vec::new(),
-            idle_timeout: Duration::from_secs(30),
             hard_timeout: Duration::from_secs(90),
             mounts: vec![
                 MountSpec {

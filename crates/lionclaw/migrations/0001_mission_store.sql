@@ -42,35 +42,18 @@ CREATE TABLE mission_effects (
     kind                TEXT NOT NULL CHECK (kind IN ('role_run', 'oracle_run')),
     request_json        TEXT NOT NULL,
     status              TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'done', 'failed')),
-    attempt_count       INTEGER NOT NULL DEFAULT 0,
     lease_owner         TEXT,
     lease_expires_at_ms INTEGER,
-    current_attempt_id  TEXT,
     created_at_ms       INTEGER NOT NULL,
     updated_at_ms       INTEGER NOT NULL,
     CHECK (
         status != 'leased'
-        OR (
-            lease_owner IS NOT NULL
-            AND lease_expires_at_ms IS NOT NULL
-            AND current_attempt_id IS NOT NULL
-        )
+        OR (lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL)
     )
 ) STRICT;
 
 CREATE UNIQUE INDEX idx_mission_effects_source ON mission_effects (mission_id, source_seq);
 CREATE INDEX idx_mission_effects_due ON mission_effects (mission_id, status);
-
-CREATE TABLE mission_effect_attempts (
-    attempt_id     TEXT PRIMARY KEY NOT NULL,
-    effect_id      TEXT NOT NULL REFERENCES mission_effects (effect_id) ON DELETE CASCADE,
-    worker_id      TEXT NOT NULL,
-    status         TEXT NOT NULL CHECK (status IN ('leased', 'completed', 'failed')),
-    started_at_ms  INTEGER NOT NULL,
-    finished_at_ms INTEGER
-) STRICT;
-
-CREATE INDEX idx_mission_effect_attempts_effect ON mission_effect_attempts (effect_id);
 
 -- Persisted fold snapshot: a discard-and-rebuildable cursor (exactly one live
 -- row per mission), version-stamped so a reducer change forces a full refold.

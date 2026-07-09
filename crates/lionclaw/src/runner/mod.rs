@@ -6,7 +6,6 @@ mod handoff;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
-pub use handoff::{expected_schema, VALIDATE_HANDOFF_SCHEMA, WORK_HANDOFF_SCHEMA};
 pub use role_runner::OciRoleRunner;
 
 use std::path::{Path, PathBuf};

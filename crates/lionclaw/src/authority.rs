@@ -184,7 +184,6 @@ pub struct RolePlanRequest<'a> {
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
     pub environment: Vec<(String, String)>,
-    pub idle_timeout: Duration,
     pub hard_timeout: Duration,
 }
 
@@ -314,7 +313,6 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         working_dir: Some(working_dir),
         environment: request.environment,
         mcp_servers: Vec::new(),
-        idle_timeout: request.idle_timeout,
         hard_timeout: request.hard_timeout,
         mounts,
         mount_runtime_secrets: authority.preset.mount_runtime_secrets,
@@ -390,7 +388,6 @@ mod tests {
             mounts: m,
             judged_roots: judged,
             environment: Vec::new(),
-            idle_timeout: Duration::from_secs(60),
             hard_timeout: Duration::from_secs(120),
         }
     }

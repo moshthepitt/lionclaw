@@ -23,7 +23,6 @@ pub struct MissionRuntimeProfile {
     pub confinement: ConfinementConfig,
     /// Ceiling on one agent turn.
     pub hard_timeout: Duration,
-    pub idle_timeout: Duration,
     /// Ceiling on one oracle run.
     pub oracle_timeout: Duration,
 }
@@ -51,7 +50,6 @@ impl MissionRuntimeProfile {
                 limits: ExecutionLimits::default(),
             }),
             hard_timeout: Duration::from_secs(30 * 60),
-            idle_timeout: Duration::from_secs(10 * 60),
             oracle_timeout: Duration::from_secs(15 * 60),
         }
     }

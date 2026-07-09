@@ -380,7 +380,6 @@ pub struct EffectiveExecutionPlan {
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub mcp_servers: Vec<lionclaw_runtime_api::RuntimeMcpServerSpec>,
-    pub idle_timeout: Duration,
     pub hard_timeout: Duration,
     pub mounts: Vec<MountSpec>,
     pub mount_runtime_secrets: bool,
@@ -402,7 +401,6 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("working_dir", &self.working_dir)
             .field("environment_count", &self.environment.len())
             .field("mcp_servers", &self.mcp_servers)
-            .field("idle_timeout", &self.idle_timeout)
             .field("hard_timeout", &self.hard_timeout)
             .field("mounts", &self.mounts)
             .field("mount_runtime_secrets", &self.mount_runtime_secrets)
@@ -598,7 +596,6 @@ mod tests {
                 working_dir: None,
                 environment: vec![("SECRET_ENV".to_string(), "sensitive-value".to_string())],
                 mcp_servers: Vec::new(),
-                idle_timeout: std::time::Duration::from_secs(1),
                 hard_timeout: std::time::Duration::from_secs(1),
                 mounts: Vec::new(),
                 mount_runtime_secrets: false,

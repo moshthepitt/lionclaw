@@ -409,9 +409,7 @@ impl ScriptedRoleRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let head = workspace::capture_worker_result(&request.workspace_dir, &clone)
-            .await?
-            .context("scripted worker produced no commit")?;
+        let head = workspace::capture_worker_result(&request.workspace_dir, &clone).await?;
         workspace::remove_dir(&clone.dir).await;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
@@ -454,7 +452,6 @@ async fn run_confined_sh(
         },
         judged_roots,
         environment: Vec::new(),
-        idle_timeout: Duration::from_secs(120),
         hard_timeout: Duration::from_secs(120),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;

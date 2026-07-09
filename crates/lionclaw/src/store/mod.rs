@@ -11,7 +11,7 @@ mod events;
 mod snapshots;
 
 pub use blobs::{BlobStore, BLOB_INLINE_MAX};
-pub use events::{AppendError, EffectLease, EffectStatus, MissionSummary, NewEvent};
+pub use events::{AppendError, EffectLease, EffectStatus, NewEvent};
 
 use std::fs;
 use std::path::{Path, PathBuf};

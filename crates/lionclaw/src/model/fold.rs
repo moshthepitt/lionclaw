@@ -177,7 +177,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 *exit_signal,
                 stdout.clone(),
                 stderr.clone(),
-                seq,
             );
             for assertion_id in assertion_ids {
                 if let Some(assertion) = state.contract.get_mut(assertion_id) {

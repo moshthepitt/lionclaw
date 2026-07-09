@@ -105,7 +105,7 @@ pub async fn create_worker_clone(
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
 /// survives clone teardown.
-pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<Option<String>> {
+pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<String> {
     let status = git(&clone.dir, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         bail!(
@@ -132,7 +132,7 @@ pub async fn capture_worker_result(repo: &Path, clone: &WorkerClone) -> Result<O
     if !commit_exists(repo, &head).await {
         bail!("worker HEAD {head} was not transferred into the repo (moved off its branch?)");
     }
-    Ok(Some(head))
+    Ok(head)
 }
 
 /// Materialize a read-only snapshot of `sha`'s exact committed tree (no `.git`)
@@ -282,12 +282,9 @@ mod tests {
         let detached = head_sha(&clone.dir).await.unwrap();
         assert_ne!(detached, base);
 
-        let recorded = capture_worker_result(repo.path(), &clone)
-            .await
-            .unwrap()
-            .expect("head");
+        let recorded = capture_worker_result(repo.path(), &clone).await.unwrap();
         // The recorded head is the worker's actual HEAD, and it really landed
-        // in the target repo (so a later `git archive`/snapshot succeeds).
+        // in the target repo (so a later snapshot succeeds).
         assert_eq!(recorded, detached);
         assert!(commit_exists(repo.path(), &recorded).await);
     }

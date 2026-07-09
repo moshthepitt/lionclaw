@@ -106,7 +106,6 @@ impl OracleRunner for OciOracleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment: oracle_environment(),
-                idle_timeout: self.profile.oracle_timeout,
                 hard_timeout: self.profile.oracle_timeout,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;

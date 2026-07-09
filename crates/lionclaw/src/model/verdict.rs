@@ -23,11 +23,9 @@ pub struct AuthoritativeVerdict {
     exit_signal: Option<i32>,
     stdout: PayloadRef,
     stderr: PayloadRef,
-    at_seq: u64,
 }
 
 impl AuthoritativeVerdict {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_oracle_outcome(
         oracle: OracleName,
         judged_sha: String,
@@ -35,7 +33,6 @@ impl AuthoritativeVerdict {
         exit_signal: Option<i32>,
         stdout: PayloadRef,
         stderr: PayloadRef,
-        at_seq: u64,
     ) -> Self {
         Self {
             passed: exit_code == 0 && exit_signal.is_none(),
@@ -45,7 +42,6 @@ impl AuthoritativeVerdict {
             exit_signal,
             stdout,
             stderr,
-            at_seq,
         }
     }
 

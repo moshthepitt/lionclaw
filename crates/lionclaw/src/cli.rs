@@ -506,14 +506,14 @@ async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Res
     }
     let mut all = Vec::new();
     let mut live = Vec::new();
-    for summary in store.list_missions().await? {
-        let Some(state) = fold(store.load(&summary.mission_id).await?) else {
+    for mission_id in store.list_missions().await? {
+        let Some(state) = fold(store.load(&mission_id).await?) else {
             continue;
         };
         if !state.phase.is_terminal() {
-            live.push(summary.mission_id.clone());
+            live.push(mission_id.clone());
         }
-        all.push(summary.mission_id);
+        all.push(mission_id);
     }
     // Prefer the sole live mission; once every mission has finished, still default
     // to the sole mission — report/apply are post-completion commands. Refuse to
@@ -583,11 +583,11 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
 async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mut parked = Vec::new();
-    for summary in store.list_missions().await? {
-        let events = store.load(&summary.mission_id).await?;
+    for mission_id in store.list_missions().await? {
+        let events = store.load(&mission_id).await?;
         let Some(state) = fold(events) else { continue };
         if !state.open_attention.is_empty() {
-            parked.push((summary.mission_id, state));
+            parked.push((mission_id, state));
         }
     }
     if args.json {
