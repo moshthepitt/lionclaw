@@ -32,6 +32,14 @@ impl MissionPhase {
         matches!(self, Self::Done { .. } | Self::Aborted { .. })
     }
 
+    /// The finish grade, if this is a `Done` phase.
+    pub const fn finish(&self) -> Option<FinishClass> {
+        match self {
+            Self::Done { finish } => Some(*finish),
+            _ => None,
+        }
+    }
+
     /// The stable snake_case variant name (matches the serde `phase` tag). The
     /// `Done`/`Aborted` payloads are not part of the slug — a caller that wants
     /// the finish grade composes it from [`FinishClass::slug`].

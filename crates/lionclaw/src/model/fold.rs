@@ -118,11 +118,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attempt_no,
             ..
         } => {
-            let tasks = if state.plan.is_none() {
-                &mut state.planning.tasks
-            } else {
-                &mut state.tasks
-            };
+            let tasks = era_tasks_mut(state);
             let task = tasks.entry(task_id.clone()).or_insert(TaskRuntimeState {
                 status: TaskStatus::Pending,
                 attempts: 0,
@@ -151,12 +147,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             state.inflight.remove(idempotency_key);
-            let tasks = if state.plan.is_none() {
-                &mut state.planning.tasks
-            } else {
-                &mut state.tasks
-            };
-            if let Some(task) = tasks.get_mut(task_id) {
+            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
                 task.status = TaskStatus::Failed;
             }
         }
@@ -528,12 +519,7 @@ fn apply_decision(
     // Planning nodes live in `planning.tasks`, execution nodes in `tasks`; a
     // node decision resets whichever era the mission is in.
     let node_status = |state: &mut MissionState, task_id, status| {
-        let tasks = if state.plan.is_none() {
-            &mut state.planning.tasks
-        } else {
-            &mut state.tasks
-        };
-        if let Some(task) = tasks.get_mut(task_id) {
+        if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
             task.status = status;
         }
     };
@@ -745,11 +731,19 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
     }
 }
 
+/// The task map for the mission's current era: planning nodes live in
+/// `planning.tasks` until a plan exists, execution nodes in `tasks` after. The
+/// two id spaces are disjoint because `plan` goes `None → Some` monotonically —
+/// so this one routing decision has a single name, not a copy at every site.
+fn era_tasks_mut(state: &mut MissionState) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
+    if state.plan.is_none() {
+        &mut state.planning.tasks
+    } else {
+        &mut state.tasks
+    }
+}
+
 fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
-    // Route by era: before a plan exists we are in the contract-free planning
-    // phase, and node status lands in `planning.tasks`; afterwards in `tasks`.
-    // The two id spaces are disjoint (plan goes `None → Some` monotonically).
-    let planning = state.plan.is_none();
     match handoff {
         Handoff::Work {
             done,
@@ -761,12 +755,10 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             } else {
                 TaskStatus::Failed
             };
-            let tasks = if planning {
-                &mut state.planning.tasks
-            } else {
-                &mut state.tasks
-            };
-            if let Some(task) = tasks.get_mut(task_id) {
+            // Work runs in either era (a planning report role or an execution
+            // artifact role), so route by era; Plan is planning-only and Validate
+            // execution-only, and address their maps directly below.
+            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
             }

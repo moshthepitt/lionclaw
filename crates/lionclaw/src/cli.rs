@@ -743,10 +743,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         .await?
         .with_context(|| format!("mission {mission_id} not found"))?;
 
-    let finish = match &state.phase {
-        MissionPhase::Done { finish } => Some(*finish),
-        _ => None,
-    };
+    let finish = state.phase.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
     // commit it judged, whether that verdict is fresh at the final head, and a
     // short excerpt of its output.
@@ -960,10 +957,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let events = store.load(&mission_id).await?;
     let state = fold(events).with_context(|| format!("mission {mission_id} not found"))?;
     if args.json {
-        let finish = match &state.phase {
-            MissionPhase::Done { finish } => Some(finish.slug()),
-            _ => None,
-        };
+        let finish = state.phase.finish().map(|f| f.slug());
         println!(
             "{}",
             serde_json::json!({
@@ -1223,10 +1217,7 @@ fn print_advance_outcome(
     outcome: &AdvanceOutcome,
     json: bool,
 ) {
-    let finish = match phase {
-        MissionPhase::Done { finish } => Some(finish.slug()),
-        _ => None,
-    };
+    let finish = phase.finish().map(|f| f.slug());
     if json {
         println!(
             "{}",

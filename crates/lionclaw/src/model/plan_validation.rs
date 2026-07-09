@@ -402,6 +402,7 @@ fn check_shape(
             }
         }
     }
+    let known: BTreeSet<_> = submission.assertions.iter().map(|a| &a.id).collect();
     for task in &submission.tasks {
         match task.kind {
             TaskKind::Gate => {
@@ -478,7 +479,6 @@ fn check_shape(
                 }
             }
         }
-        let known: BTreeSet<_> = submission.assertions.iter().map(|a| &a.id).collect();
         for target in &task.targets {
             if !known.contains(target) {
                 errors.push(err(
