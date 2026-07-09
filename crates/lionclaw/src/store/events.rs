@@ -59,6 +59,8 @@ pub enum AppendError {
     Conflict { expected: u64, actual: u64 },
     #[error("duplicate idempotency key '{key}'")]
     Duplicate { key: String },
+    #[error("{0}")]
+    AlreadyExists(String),
     #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
@@ -467,11 +469,11 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
         .is_some_and(|db| db.is_unique_violation())
 }
 
-fn map_sqlx(err: sqlx::Error, unique_detail: &str) -> AppendError {
+/// Map a `missions`-table insert error: a PK collision (not an idempotency key)
+/// becomes `AlreadyExists` with `detail` as its message.
+fn map_sqlx(err: sqlx::Error, detail: &str) -> AppendError {
     if is_unique_violation(&err) {
-        AppendError::Duplicate {
-            key: unique_detail.to_string(),
-        }
+        AppendError::AlreadyExists(detail.to_string())
     } else {
         AppendError::Store(err.into())
     }

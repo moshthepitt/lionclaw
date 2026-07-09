@@ -55,7 +55,14 @@ pub async fn ensure_excluded(repo: &Path) -> Result<()> {
     if let Some(parent) = exclude.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let current = match std::fs::read_to_string(&exclude) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Can't read it safely (permissions, or non-UTF-8 patterns): leave it
+        // untouched rather than clobber the user's excludes — the worst case is
+        // `.lionclaw/` showing in `git status`.
+        Err(_) => return Ok(()),
+    };
     if !current.lines().any(|line| line.trim() == ".lionclaw/") {
         let mut updated = current;
         if !updated.is_empty() && !updated.ends_with('\n') {

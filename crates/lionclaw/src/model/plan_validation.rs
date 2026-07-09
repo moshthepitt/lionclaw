@@ -558,28 +558,29 @@ fn check_acyclic(submission: &PlanSubmission) -> Vec<PlanValidationError> {
 /// Zenith invariant: each assertion has exactly one active work coverer.
 fn check_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
-    let mut coverers: BTreeMap<_, Vec<&TaskId>> = BTreeMap::new();
+    // Distinct coverer task ids per assertion: a single work task that lists the
+    // same assertion twice in `targets` covers it once, not twice.
+    let mut coverers: BTreeMap<_, BTreeSet<&TaskId>> = BTreeMap::new();
     for task in &submission.tasks {
         if task.kind != TaskKind::Work {
             continue;
         }
         for target in &task.targets {
-            coverers.entry(target).or_default().push(&task.id);
+            coverers.entry(target).or_default().insert(&task.id);
         }
     }
     for assertion in &submission.assertions {
-        match coverers.get(&assertion.id).map(Vec::as_slice) {
-            None | Some([]) => errors.push(err(
+        match coverers.get(&assertion.id).map(BTreeSet::len) {
+            None | Some(0) => errors.push(err(
                 "uncovered_assertion",
                 format!("assertion '{}' has no work task covering it", assertion.id),
             )),
-            Some([_]) => {}
-            Some(many) => errors.push(err(
+            Some(1) => {}
+            Some(n) => errors.push(err(
                 "over_covered_assertion",
                 format!(
-                    "assertion '{}' is covered by {} work tasks; exactly one is required",
+                    "assertion '{}' is covered by {n} work tasks; exactly one is required",
                     assertion.id,
-                    many.len()
                 ),
             )),
         }

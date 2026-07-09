@@ -751,10 +751,12 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     for (aid, a) in &state.contract {
         let verdict = a.last_authoritative.as_ref().map(|v| {
             let (stdout, _stderr) = v.evidence();
-            let excerpt = store
-                .blobs()
-                .resolve(stdout)
-                .ok()
+            // The excerpt is only rendered in --json; don't resolve the blob for
+            // the text receipt, which never prints it.
+            let excerpt = args
+                .json
+                .then(|| store.blobs().resolve(stdout).ok())
+                .flatten()
                 .map(|s| s.chars().take(160).collect::<String>());
             serde_json::json!({
                 "oracle": v.oracle().as_str(),
