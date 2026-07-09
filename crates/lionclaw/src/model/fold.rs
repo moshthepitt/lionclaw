@@ -53,16 +53,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         .planning
         .tasks
         .iter()
-        .map(|t| {
-            (
-                t.id.clone(),
-                TaskRuntimeState {
-                    status: TaskStatus::Pending,
-                    attempts: 0,
-                    last_report: None,
-                },
-            )
-        })
+        .map(|t| (t.id.clone(), pending_task()))
         .collect();
     Some(MissionState {
         mission_id: envelope.mission_id.clone(),
@@ -118,11 +109,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             let tasks = era_tasks_mut(state);
-            let task = tasks.entry(task_id.clone()).or_insert(TaskRuntimeState {
-                status: TaskStatus::Pending,
-                attempts: 0,
-                last_report: None,
-            });
+            let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
             track_inflight(state, &envelope.event, seq);
@@ -436,12 +423,17 @@ fn depends_on_retired(plan: &PlanSubmission, start: &TaskId, retired: &BTreeSet<
 
 /// Seed a task's runtime as `Pending` (idempotent — keeps any existing entry).
 /// Shared by the initial submission and amendment folds.
-fn seed_task(tasks: &mut BTreeMap<TaskId, TaskRuntimeState>, id: &TaskId) {
-    tasks.entry(id.clone()).or_insert(TaskRuntimeState {
+/// A freshly-seeded task: pending, no attempts, no report.
+fn pending_task() -> TaskRuntimeState {
+    TaskRuntimeState {
         status: TaskStatus::Pending,
         attempts: 0,
         last_report: None,
-    });
+    }
+}
+
+fn seed_task(tasks: &mut BTreeMap<TaskId, TaskRuntimeState>, id: &TaskId) {
+    tasks.entry(id.clone()).or_insert_with(pending_task);
 }
 
 /// Seed an assertion's runtime (idempotent — keeps any existing verdicts).
@@ -1242,6 +1234,63 @@ mod tests {
         let result = resulting_plan(&plan, &ops);
         let c = result.tasks.iter().find(|t| t.id == tid("c")).expect("c");
         assert_eq!(c.depends_on, vec![tid("b")]);
+    }
+
+    // Regression (QA): the fold's own "never trust the writer" amendment guards.
+    // Even if a malformed PlanAmended reaches the fold (bypassing the engine's
+    // pre-append validation), a stale base_revision and a non-strengthening
+    // bind_oracle each no-op the whole amendment.
+    #[test]
+    fn the_fold_no_ops_a_stale_or_weakening_amendment() {
+        use crate::model::OracleBinding;
+        let base = vec![
+            created(),
+            plan_submitted(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("w")],
+            ),
+        ];
+        let bound = fold_log(base.clone()).expect("seeded").contract[&aid("A1")]
+            .oracle
+            .clone();
+
+        // (a) A stale base_revision (targets 0; the plan is at 1) seeds nothing.
+        let mut stale = base.clone();
+        stale.push(plan_amended(
+            0,
+            AmendmentOps {
+                add_assertion: vec![assertion("GHOST", None)],
+                ..Default::default()
+            },
+        ));
+        let after = fold_log(stale).expect("state");
+        assert_eq!(after.revision, 1, "stale amendment does not bump revision");
+        assert!(!after.contract.contains_key(&aid("GHOST")));
+
+        // (b) Rebinding an already-bound assertion to a different oracle is not
+        // strengthening — the whole amendment no-ops.
+        let mut weaken = base;
+        weaken.push(plan_amended(
+            1,
+            AmendmentOps {
+                bind_oracle: vec![OracleBinding {
+                    assertion: aid("A1"),
+                    oracle: oracle("cargo-clippy"),
+                }],
+                add_assertion: vec![assertion("ALSO", None)],
+                ..Default::default()
+            },
+        ));
+        let after = fold_log(weaken).expect("state");
+        assert_eq!(
+            after.contract[&aid("A1")].oracle,
+            bound,
+            "A1 oracle unchanged"
+        );
+        assert!(
+            !after.contract.contains_key(&aid("ALSO")),
+            "weakening no-ops"
+        );
     }
 
     // Regression (review): a fresh authoritative FAIL must dominate a green

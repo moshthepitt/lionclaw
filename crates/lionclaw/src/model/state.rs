@@ -319,7 +319,7 @@ pub struct MissionState {
 #[cfg(test)]
 mod slug_tests {
     use super::*;
-    use crate::model::{FinishClass, StopBar};
+    use crate::model::{FinishClass, OutputSemantics, StopBar};
 
     /// Every `slug()` must equal the enum's serde repr — the single source that
     /// keeps the CLI, the fold's attention ids, and the wire format from
@@ -365,6 +365,14 @@ mod slug_tests {
         }
         for b in [StopBar::Verified, StopBar::Reviewed] {
             assert_slug(&b, b.slug());
+        }
+        for o in [
+            OutputSemantics::ProducesReport,
+            OutputSemantics::ProducesArtifact,
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::ProposesPlan,
+        ] {
+            assert_slug(&o, o.slug());
         }
         for p in [
             MissionPhase::Planning,

@@ -6,7 +6,7 @@ images.
 ## Runtime Image
 
 `containers/runtime/Containerfile` is the product runtime image. It contains the
-agent CLIs and common assistant tools used by `lionclaw run`.
+agent CLIs and common assistant tools a mission's roles and oracles run under.
 
 The image pins the tested `@openai/codex` and `opencode-ai` package versions in
 the Containerfile and fails the build if the installed global packages do not
@@ -20,11 +20,9 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 `containers/dev/Containerfile` layers LionClaw development tooling on top of
 the runtime image. It includes the pinned Rust toolchain from
-`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, `uv`,
-Python 3.12 for the Python skill checks, native build dependencies, SQLite
-development headers, and basic debugging tools.
-The managed Python install is kept in the image outside `/runtime`, while cargo
-and uv caches remain under `/runtime` for writable runtime state.
+`rust-toolchain.toml`, `rustfmt`, `clippy`, `rust-analyzer`, `rust-src`, native build dependencies,
+SQLite development headers, and basic debugging tools. Cargo caches live under
+`/runtime` for writable runtime state.
 
 ```bash
 podman build \
@@ -48,9 +46,7 @@ The `keep-id` mapping targets the image's `lionclaw` user so rootless Podman
 can write build outputs into the host-owned checkout while keeping the
 container-owned cargo and uv caches under `/runtime` writable.
 
-Use the dev image for this checkout with:
-
-```bash
-lionclaw runtime add codex --driver codex --bin codex --image lionclaw-runtime-dev:v1
-lionclaw runtime set-default codex
-```
+A mission type declares the image it runs under in its `mission.toml`
+(`image = "localhost/lionclaw-runtime-dev:v1"`); build the image under that tag,
+or override per mission with `lionclaw mission start --image <ref>`. The tag is
+resolved to a content id once at `start` and pinned for the mission's life.

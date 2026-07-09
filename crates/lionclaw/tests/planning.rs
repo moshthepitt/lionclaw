@@ -369,7 +369,10 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
 
 /// Drive planning where the author hands back `author_handoff`, returning the
 /// parked state.
-async fn park_after_author(dir: &std::path::Path, author_handoff: Handoff) -> lionclaw::model::MissionState {
+async fn park_after_author(
+    dir: &std::path::Path,
+    author_handoff: Handoff,
+) -> lionclaw::model::MissionState {
     let store = MissionStore::open(dir).await.expect("store");
     let runner = MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
         let handoff = if req.role.output == OutputSemantics::ProposesPlan {
@@ -416,8 +419,11 @@ async fn park_after_author(dir: &std::path::Path, author_handoff: Handoff) -> li
 fn assert_author_failed_seeding_nothing(state: &lionclaw::model::MissionState) {
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert!(
-        state.open_attention.values().any(|a| a.kind == AttentionKind::NodeFailed
-            && a.task_id.as_ref() == Some(&tid("author"))),
+        state
+            .open_attention
+            .values()
+            .any(|a| a.kind == AttentionKind::NodeFailed
+                && a.task_id.as_ref() == Some(&tid("author"))),
         "the author node failed"
     );
     assert!(state.proposal.is_none(), "a bad handoff seeds no proposal");

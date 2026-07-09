@@ -26,6 +26,18 @@ pub enum OutputSemantics {
     ProposesPlan,
 }
 
+impl OutputSemantics {
+    /// The stable kebab-case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::ProducesReport => "produces-report",
+            Self::ProducesArtifact => "produces-artifact",
+            Self::EmitsVerdict => "emits-verdict",
+            Self::ProposesPlan => "proposes-plan",
+        }
+    }
+}
+
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
 /// worker-independent engine-run check; without one it can only ever be
 /// covered by advisory verdicts.

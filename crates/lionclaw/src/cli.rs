@@ -92,8 +92,9 @@ pub enum MissionCommand {
     /// Inspect installed mission types.
     #[command(subcommand)]
     Type(TypeCommand),
-    /// Drive the real stack end-to-end and assert the Slice-1 invariants
-    /// (needs podman; model-auth-free).
+    /// Drive the real stack end-to-end and assert the core invariants — moat,
+    /// oracle honesty, writable-worker resume, confinement, re-planning (needs
+    /// podman; model-auth-free).
     SelfTest(SelfTestArgs),
 }
 
@@ -309,9 +310,12 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
     match dispatch_mission(cmd).await {
         Ok(code) => Ok(code),
         Err(err) if json => {
+            // `{err:#}` renders the full anyhow context chain (outer: cause: …),
+            // not just the outermost message, so a JSON caller gets the real
+            // reason.
             println!(
                 "{}",
-                serde_json::json!({ "ok": false, "error": err.to_string() })
+                serde_json::json!({ "ok": false, "error": format!("{err:#}") })
             );
             Ok(std::process::ExitCode::FAILURE)
         }
@@ -940,8 +944,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
 async fn cmd_status(args: StatusArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let events = store.load(&mission_id).await?;
-    let state = fold(events).with_context(|| format!("mission {mission_id} not found"))?;
+    let state = store.require_state(&mission_id).await?;
     if args.json {
         let finish = state.phase.finish().map(|f| f.slug());
         println!(

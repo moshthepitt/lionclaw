@@ -1,23 +1,24 @@
 # Scripts
 
-These scripts are developer and CI smoke helpers. They are not the normal
-LionClaw setup path.
-
-Use the product CLI for everyday work:
+Developer and CI helpers — not the everyday path. For real use, install the
+mission types once and drive a mission:
 
 ```bash
-lionclaw project init
-lionclaw configure --runtime codex
-lionclaw run
+lionclaw install && lionclaw doctor
+lionclaw mission start --type software-dev --objective "…"
+lionclaw mission advance   # drives until it parks, finishes, or awaits input
 ```
 
-## Available Scripts
+## Available scripts
 
-- `ci.sh`: local CI gate that mirrors the GitHub Actions `ci` workflow.
+- `ci.sh` — the local CI gate mirroring the GitHub Actions `ci` workflow
+  (fmt, clippy, doc, test, and the podman-gated mission self-test).
+- `mission-eval.sh` — the agentic multi-run eval (needs podman + a codex auth).
+- `mission-fixture.sh` — fixture helpers for the eval.
 
 ## Usage
 
-Run the same checks as GitHub CI:
+Run the same checks as CI:
 
 ```bash
 ./scripts/ci.sh

@@ -7,10 +7,11 @@
 //!
 //! Divergences: contract + task list validate together (one submission);
 //! roles replace skills, and a task's role must carry compatible output
-//! semantics (verdict roles validate, non-verdict roles work); assertion
-//! oracle bindings must exist in the mission-type inventory. Id charset rules are
-//! enforced by the id newtypes at every deserialization boundary, so only
-//! duplicates are checked here.
+//! semantics (an artifact role works, a verdict role validates; the read-only
+//! planning roles — report/proposal — are rejected on every execution task);
+//! assertion oracle bindings must exist in the mission-type inventory. Id charset
+//! rules are enforced by the id newtypes at every deserialization boundary, so
+//! only duplicates are checked here.
 
 use std::collections::{BTreeMap, BTreeSet};
 

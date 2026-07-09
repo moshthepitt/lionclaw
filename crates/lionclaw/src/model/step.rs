@@ -32,7 +32,9 @@ pub enum StepDecision {
     Park,
     /// Terminal phase; nothing will ever run again.
     Terminal,
-    /// Dispatch one artifact-producing role run (writers serialize).
+    /// Dispatch one role run — a planning role, a writer, or a validator. All
+    /// role runs serialize (at most one inflight); only writers also carry the
+    /// stacked-worktree ordering constraint.
     DispatchRole(RoleDispatchIntent),
     /// Run engine oracles (parallelizable).
     RunOracles(Vec<OracleDispatchIntent>),

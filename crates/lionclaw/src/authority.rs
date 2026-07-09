@@ -84,10 +84,6 @@ impl CompiledAuthority {
         &self.preset
     }
 
-    pub fn role_name(&self) -> &str {
-        &self.role_name
-    }
-
     #[cfg(test)]
     pub(crate) fn for_tests(
         role_name: &str,
@@ -305,7 +301,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
 
     Ok(CompiledRolePlan(EffectiveExecutionPlan {
         runtime_id: request.runtime_id,
-        preset_name: format!("mission-{}", kind_slug(authority.output)),
+        preset_name: format!("mission-{}", authority.output.slug()),
         confinement: request.confinement,
         skill_projection: None,
         workspace_access: authority.preset.workspace_access,
@@ -321,15 +317,6 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         escape_classes: authority.preset.escape_classes.clone(),
         limits,
     }))
-}
-
-fn kind_slug(output: OutputSemantics) -> &'static str {
-    match output {
-        OutputSemantics::ProducesReport => "produces-report",
-        OutputSemantics::ProposesPlan => "proposes-plan",
-        OutputSemantics::ProducesArtifact => "produces-artifact",
-        OutputSemantics::EmitsVerdict => "emits-verdict",
-    }
 }
 
 /// Resolve symlinks where possible; fall back to the lexical path for a

@@ -489,7 +489,7 @@ async fn build_engine(
     ))
 }
 
-// ---- The four checks ----
+// ---- The five checks ----
 
 /// (1) A real writable worker fixes a broken tree in a container; its commit
 /// lands and the engine records it (`current_sha` advances); the real oracle
