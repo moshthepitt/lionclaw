@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{MissionConfig, PayloadRef};
+use super::event::{MissionConfig, MissionTypeRef, PayloadRef};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::PlanSubmission;
 use super::verdict::{AuthoritativeVerdict, FinishClass};
@@ -186,7 +186,12 @@ impl InflightEffect {
 pub struct MissionState {
     pub mission_id: MissionId,
     pub objective: String,
-    pub mission_type_name: String,
+    /// The mission type, pinned by content digest (verified on every open).
+    pub mission_type: MissionTypeRef,
+    /// The runtime profile id roles run under.
+    pub runtime: String,
+    /// The confinement image, resolved to a content id at start.
+    pub image_id: String,
     pub workspace_dir: String,
     /// Target repo HEAD at mission creation.
     pub base_sha: String,

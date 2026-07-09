@@ -111,9 +111,9 @@ pub struct TypeCheckArgs {
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Mission type directory (a domain of prose).
+    /// Installed mission type name (see `mission type list`).
     #[arg(long = "type")]
-    pub mission_type: PathBuf,
+    pub mission_type: String,
     /// Target repository the mission operates on.
     #[arg(long)]
     pub repo: PathBuf,
@@ -164,13 +164,9 @@ pub struct SubmitPlanArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long = "type")]
-    pub mission_type: PathBuf,
     /// Plan JSON file ({ "assertions": [...], "tasks": [...] }).
     #[arg(long)]
     pub plan: PathBuf,
-    #[arg(long, default_value = "codex")]
-    pub runtime: String,
 }
 
 #[derive(Args)]
@@ -178,8 +174,6 @@ pub struct AmendArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long = "type")]
-    pub mission_type: PathBuf,
     /// Amendment ops JSON ({ "add": [...], "supersede": [...], "cancel": [...],
     /// "add_assertion": [...], "bind_oracle": [...] }).
     #[arg(long)]
@@ -191,8 +185,6 @@ pub struct AmendArgs {
     pub actor: String,
     #[arg(long, default_value = "")]
     pub justification: String,
-    #[arg(long, default_value = "codex")]
-    pub runtime: String,
 }
 
 #[derive(Args)]
@@ -200,10 +192,6 @@ pub struct AdvanceArgs {
     pub mission_id: String,
     #[arg(long)]
     pub repo: PathBuf,
-    #[arg(long = "type")]
-    pub mission_type: PathBuf,
-    #[arg(long, default_value = "codex")]
-    pub runtime: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -265,30 +253,97 @@ fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
     }
 }
 
-async fn open_engine(repo: &Path, type_dir: &Path, runtime: &str) -> Result<Engine> {
-    let ceiling = AuthorityCeiling::default();
-    let mission_type = load_mission_type(type_dir, &ceiling)
-        .with_context(|| format!("failed to load mission type '{}'", type_dir.display()))?;
-    let store = MissionStore::open(repo).await?;
+/// Build an engine over an open store, a loaded mission type, and a runtime
+/// profile (whose image the caller has already pinned).
+#[allow(clippy::too_many_arguments)]
+fn assemble_engine(
+    store: MissionStore,
+    repo: &Path,
+    mission_type: crate::mission_type::MissionType,
+    runtime: String,
+    image_id: String,
+    profile: MissionRuntimeProfile,
+    ceiling: AuthorityCeiling,
+) -> Result<Engine> {
     workspace::ensure_excluded(repo)?;
-    let mut profile = runtime_profile(runtime)?;
-    profile.confinement.oci_mut().image = Some(mission_type.image.clone());
     let role_runner = Arc::new(OciRoleRunner::new(profile.clone(), ceiling));
     let oracle_runner = Arc::new(OciOracleRunner::new(profile));
     Ok(Engine::new(
         store,
         mission_type,
+        runtime,
+        image_id,
         role_runner,
         oracle_runner,
         Arc::new(SystemClock),
     ))
 }
 
+/// Open an engine to CREATE a mission from an installed mission type (by name).
+/// The confinement image is resolved to a content id here — once, at start — so
+/// a later rebuild of the tag cannot silently change the instrument. The engine
+/// carries the runtime + image id it records on `MissionCreated`.
+async fn open_engine_for_start(repo: &Path, type_name: &str, runtime: &str) -> Result<Engine> {
+    let ceiling = AuthorityCeiling::default();
+    let type_dir = Home::from_env()?.mission_type_dir(type_name);
+    let mission_type = load_mission_type(&type_dir, &ceiling)
+        .with_context(|| format!("mission type '{type_name}' (run `lionclaw install`?)"))?;
+    let mut profile = runtime_profile(runtime)?;
+    let engine = profile.confinement.oci().engine.clone();
+    let image_id = lionclaw_confinement::resolve_oci_image_compatibility_identity(
+        &engine,
+        &mission_type.image,
+    )
+    .await
+    .with_context(|| format!("resolving image '{}'", mission_type.image))?;
+    profile.confinement.oci_mut().image = Some(image_id.clone());
+    let store = MissionStore::open(repo).await?;
+    let engine = assemble_engine(
+        store,
+        repo,
+        mission_type,
+        runtime.to_string(),
+        image_id.clone(),
+        profile,
+        ceiling,
+    )?;
+    Ok(engine)
+}
+
+/// Open an engine for an EXISTING mission: resolve its recorded mission type (by
+/// name, from the home), runtime, and pinned image id — so no `--type`/`--runtime`
+/// is needed. `load_state` then verifies the pinned digest, fail-closed.
+async fn open_engine_for_mission(repo: &Path, mission_id: &MissionId) -> Result<Engine> {
+    let store = MissionStore::open(repo).await?;
+    let state = store
+        .load_state_snapshotted(mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+    let ceiling = AuthorityCeiling::default();
+    let type_dir = Home::from_env()?.mission_type_dir(&state.mission_type.name);
+    let mission_type = load_mission_type(&type_dir, &ceiling)
+        .with_context(|| format!("mission type '{}'", state.mission_type.name))?;
+    let mut profile = runtime_profile(&state.runtime)?;
+    profile.confinement.oci_mut().image = Some(state.image_id.clone());
+    let engine = assemble_engine(
+        store,
+        repo,
+        mission_type,
+        state.runtime.clone(),
+        state.image_id.clone(),
+        profile,
+        ceiling,
+    )?;
+    // Verify the pinned mission-type digest before anything runs.
+    engine.load_state(mission_id).await?;
+    Ok(engine)
+}
+
 async fn cmd_start(args: StartArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
     // Fail-closed: loading the mission type (and its moat check) happens before
     // any event is written.
-    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
+    let engine = open_engine_for_start(&repo, &args.mission_type, &args.runtime).await?;
     let base_sha = workspace::head_sha(&repo).await?;
     let mission_id = engine
         .create_mission(
@@ -310,9 +365,8 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
     } else {
         println!("started mission {mission_id} at {base_sha}");
         println!(
-            "submit a plan, then: lionclaw mission advance {mission_id} --repo {} --type {}",
+            "submit a plan, then: lionclaw mission advance {mission_id} --repo {}",
             repo.display(),
-            args.mission_type.display()
         );
     }
     Ok(())
@@ -404,8 +458,8 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
 
 async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
+    let engine = open_engine_for_mission(&repo, &mission_id).await?;
     let plan_text = std::fs::read_to_string(&args.plan)
         .with_context(|| format!("failed to read plan '{}'", args.plan.display()))?;
     let submission = serde_json::from_str(&plan_text).context("plan JSON is invalid")?;
@@ -419,8 +473,8 @@ async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
 
 async fn cmd_amend(args: AmendArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
+    let engine = open_engine_for_mission(&repo, &mission_id).await?;
     let ops_text = std::fs::read_to_string(&args.ops)
         .with_context(|| format!("failed to read ops '{}'", args.ops.display()))?;
     let ops = serde_json::from_str(&ops_text).context("amendment ops JSON is invalid")?;
@@ -440,8 +494,8 @@ async fn cmd_amend(args: AmendArgs) -> Result<()> {
 
 async fn cmd_advance(args: AdvanceArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
-    let engine = open_engine(&repo, &args.mission_type, &args.runtime).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
+    let engine = open_engine_for_mission(&repo, &mission_id).await?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
     report_state(

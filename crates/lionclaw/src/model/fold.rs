@@ -38,7 +38,9 @@ pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionSt
 fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
     let MissionEvent::MissionCreated {
         objective,
-        mission_type_name,
+        mission_type,
+        runtime,
+        image_id,
         workspace_dir,
         base_sha,
         config,
@@ -49,7 +51,9 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
     Some(MissionState {
         mission_id: envelope.mission_id.clone(),
         objective: objective.clone(),
-        mission_type_name: mission_type_name.clone(),
+        mission_type: mission_type.clone(),
+        runtime: runtime.clone(),
+        image_id: image_id.clone(),
         workspace_dir: workspace_dir.clone(),
         base_sha: base_sha.clone(),
         config: config.clone(),
@@ -776,7 +780,12 @@ mod tests {
     fn created() -> MissionEvent {
         MissionEvent::MissionCreated {
             objective: "objective".into(),
-            mission_type_name: "mt".into(),
+            mission_type: crate::model::MissionTypeRef {
+                name: "mt".into(),
+                digest: "d".into(),
+            },
+            runtime: "codex".into(),
+            image_id: "img".into(),
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {

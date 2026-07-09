@@ -29,6 +29,10 @@ use crate::store::{AppendError, MissionStore, NewEvent};
 pub struct Engine {
     store: MissionStore,
     mission_type: MissionType,
+    /// The runtime profile id and pinned confinement image this engine runs
+    /// under; recorded on `MissionCreated`.
+    runtime: String,
+    image_id: String,
     role_runner: Arc<dyn RoleRunner>,
     oracle_runner: Arc<dyn OracleRunner>,
     clock: Arc<dyn Clock>,
@@ -81,6 +85,8 @@ impl Engine {
     pub fn new(
         store: MissionStore,
         mission_type: MissionType,
+        runtime: String,
+        image_id: String,
         role_runner: Arc<dyn RoleRunner>,
         oracle_runner: Arc<dyn OracleRunner>,
         clock: Arc<dyn Clock>,
@@ -89,6 +95,8 @@ impl Engine {
         Self {
             store,
             mission_type,
+            runtime,
+            image_id,
             role_runner,
             oracle_runner,
             clock,
@@ -104,8 +112,17 @@ impl Engine {
         &self.mission_type
     }
 
+    /// The mission type this engine runs, pinned by name + content digest.
+    fn mission_type_ref(&self) -> crate::model::MissionTypeRef {
+        crate::model::MissionTypeRef {
+            name: self.mission_type.name.clone(),
+            digest: self.mission_type.digest.clone(),
+        }
+    }
+
     /// Create a mission. `base_sha` is the target repo's HEAD, observed by
-    /// the caller (git stays out of the engine core).
+    /// the caller (git stays out of the engine core). The mission type digest,
+    /// runtime, and pinned image id are recorded from the engine's own config.
     pub async fn create_mission(
         &self,
         workspace_dir: &str,
@@ -119,7 +136,9 @@ impl Engine {
         )));
         let created = NewEvent::new(MissionEvent::MissionCreated {
             objective: objective.to_string(),
-            mission_type_name: self.mission_type.name.clone(),
+            mission_type: self.mission_type_ref(),
+            runtime: self.runtime.clone(),
+            image_id: self.image_id.clone(),
             workspace_dir: workspace_dir.to_string(),
             base_sha: base_sha.to_string(),
             config,
@@ -240,10 +259,26 @@ impl Engine {
     }
 
     pub async fn load_state(&self, mission_id: &MissionId) -> Result<MissionState> {
-        self.store
+        let state = self
+            .store
             .load_state_snapshotted(mission_id)
             .await?
-            .with_context(|| format!("mission {mission_id} not found"))
+            .with_context(|| format!("mission {mission_id} not found"))?;
+        // The instrument of judgment is pinned: every engine open verifies the
+        // mission type's content digest against the one recorded at start, so a
+        // mutated role or oracle cannot advance this mission (the fake-green
+        // vector). This is the single funnel — every engine method loads here.
+        if state.mission_type.digest != self.mission_type.digest {
+            let short = |d: &str| d.chars().take(12).collect::<String>();
+            bail!(
+                "mission type '{}' changed since this mission started \
+                 (recorded {}, on-disk {}); start a fresh mission",
+                state.mission_type.name,
+                short(&state.mission_type.digest),
+                short(&self.mission_type.digest),
+            );
+        }
+        Ok(state)
     }
 
     /// Drive the mission until it parks, terminates, or awaits input.

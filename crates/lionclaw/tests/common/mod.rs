@@ -27,6 +27,7 @@ pub fn test_mission_type() -> MissionType {
     let cargo_test = OracleName::new("cargo-test").expect("oracle name");
     MissionType {
         name: "software-dev-test".to_string(),
+        digest: "test-digest".to_string(),
         stop: StopBar::Verified,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         root: "/nonexistent-mission-type".into(),
@@ -139,6 +140,8 @@ pub async fn harness(
     let engine = Engine::new(
         store,
         test_mission_type(),
+        "codex".to_string(),
+        "localhost/lionclaw-runtime-dev:v1".to_string(),
         role_runner.clone(),
         oracle_runner.clone(),
         Arc::new(MockClock::default()),

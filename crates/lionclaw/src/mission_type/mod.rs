@@ -40,6 +40,9 @@ pub struct RoleDefinition {
 #[derive(Debug, Clone)]
 pub struct MissionType {
     pub name: String,
+    /// Content digest over the loaded files (`loader::compute_digest`),
+    /// recorded at start and verified on every engine open.
+    pub digest: String,
     pub stop: StopBar,
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,

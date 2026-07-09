@@ -81,9 +81,11 @@ pub fn load_mission_type(
     }
 
     let playbook = read(&root.join("playbook.md")).ok();
+    let digest = compute_digest(root)?;
 
     Ok(MissionType {
         name: manifest.mission_type.name,
+        digest,
         stop,
         image: manifest.mission_type.image,
         root: root.to_path_buf(),
@@ -234,6 +236,51 @@ fn read(path: &Path) -> Result<String, MissionTypeError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>, MissionTypeError> {
+    std::fs::read(path).map_err(|source| MissionTypeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// A content digest over everything the loader consumes: `mission.toml`,
+/// `playbook.md` (if present), and every `roles/*` and `oracles/*` file, in a
+/// deterministic order, each contributing its relative path, bytes, and — for
+/// oracles — its executable bit. Verified on every engine open, so a mutated
+/// role or oracle (the fake-green vector) is caught. Umask-insensitive: only an
+/// oracle's exec bit is hashed, not raw file modes.
+fn compute_digest(root: &Path) -> Result<String, MissionTypeError> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut feed = |rel: &str, bytes: &[u8], exec: bool| {
+        hasher.update((rel.len() as u64).to_le_bytes());
+        hasher.update(rel.as_bytes());
+        hasher.update([exec as u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    feed(
+        "mission.toml",
+        &read_bytes(&root.join("mission.toml"))?,
+        false,
+    );
+    if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
+        feed("playbook.md", &playbook, false);
+    }
+    for (subdir, hash_exec) in [("roles", false), ("oracles", true)] {
+        let dir = root.join(subdir);
+        if !dir.exists() {
+            continue;
+        }
+        for entry in read_dir(&dir)? {
+            let path = entry.path();
+            let rel = format!("{subdir}/{}", entry.file_name().to_string_lossy());
+            feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
+        }
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>, MissionTypeError> {

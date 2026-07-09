@@ -251,7 +251,12 @@ mod tests {
     fn created(base_sha: &str) -> MissionEvent {
         MissionEvent::MissionCreated {
             objective: "ship it".to_string(),
-            mission_type_name: "software-dev".to_string(),
+            mission_type: crate::model::MissionTypeRef {
+                name: "software-dev".into(),
+                digest: "d".into(),
+            },
+            runtime: "codex".into(),
+            image_id: "img".into(),
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {

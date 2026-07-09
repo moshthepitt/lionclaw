@@ -19,8 +19,8 @@ pub mod verdict;
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     AmendmentOps, ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Handoff, IdemClass,
-    MissionConfig, MissionEvent, OracleBinding, PayloadRef, RunErrorKind, StopBar, Supersession,
-    ValidationItem, VersionStamps, SCHEMA_VERSION,
+    MissionConfig, MissionEvent, MissionTypeRef, OracleBinding, PayloadRef, RunErrorKind, StopBar,
+    Supersession, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};

@@ -165,7 +165,12 @@ mod tests {
                 1,
                 MissionEvent::MissionCreated {
                     objective: "o".into(),
-                    mission_type_name: "p".into(),
+                    mission_type: crate::model::MissionTypeRef {
+                        name: "p".into(),
+                        digest: "d".into(),
+                    },
+                    runtime: "codex".into(),
+                    image_id: "img".into(),
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {

@@ -87,6 +87,8 @@ async fn advisory_only_mission_type_never_verifies() {
     let engine = Engine::new(
         store,
         plugin,
+        "codex".to_string(),
+        "test-image".to_string(),
         Arc::new(runner),
         Arc::new(MockOracleRunner::exiting(0)),
         Arc::new(MockClock::default()),

@@ -483,10 +483,13 @@ async fn build_engine(
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo)?;
     let mut profile = MissionRuntimeProfile::codex_default();
-    profile.confinement.oci_mut().image = Some(mission_type.image.clone());
+    let image = mission_type.image.clone();
+    profile.confinement.oci_mut().image = Some(image.clone());
     Ok(Engine::new(
         store,
         mission_type,
+        "codex".to_string(),
+        image,
         role_runner,
         Arc::new(CountingOracleRunner {
             inner: OciOracleRunner::new(profile),

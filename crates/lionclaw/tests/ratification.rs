@@ -17,6 +17,8 @@ async fn gated_engine(dir: &std::path::Path) -> Engine {
     Engine::new(
         store,
         test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
         Arc::new(MockRoleRunner::happy(HEAD_SHA)),
         Arc::new(MockOracleRunner::exiting(0)),
         Arc::new(MockClock::default()),

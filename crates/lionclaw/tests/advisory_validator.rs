@@ -58,6 +58,8 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
     let engine = Engine::new(
         store,
         test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
         Arc::new(role_aware_runner(reviewer_passes)),
         Arc::new(MockOracleRunner::exiting(0)),
         Arc::new(MockClock::default()),

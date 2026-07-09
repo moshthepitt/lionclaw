@@ -50,6 +50,16 @@ pub enum StopBar {
     Reviewed,
 }
 
+/// The mission type a mission was created against, pinned by content digest.
+/// The digest is verified on every engine open, so the instrument of judgment
+/// (roles, oracles) cannot be swapped after the mission starts. Plain data —
+/// the shell computes the digest (`mission_type::load_mission_type`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionTypeRef {
+    pub name: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
@@ -133,7 +143,14 @@ pub enum RunErrorKind {
 pub enum MissionEvent {
     MissionCreated {
         objective: String,
-        mission_type_name: String,
+        /// The mission type, pinned by content digest (verified on every open).
+        mission_type: MissionTypeRef,
+        /// The runtime profile id roles run under (recorded so later commands
+        /// need no `--runtime`).
+        runtime: String,
+        /// The confinement image resolved to a content id at start, so a
+        /// rebuilt tag can't silently change the instrument mid-mission.
+        image_id: String,
         workspace_dir: String,
         /// HEAD of the target repo when the mission was created.
         base_sha: String,
