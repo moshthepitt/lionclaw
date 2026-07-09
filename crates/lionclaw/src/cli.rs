@@ -12,7 +12,7 @@ use crate::authority::AuthorityCeiling;
 use crate::config::MissionRuntimeProfile;
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
-use crate::model::{fold, MissionConfig, MissionId, MissionPhase};
+use crate::model::{fold, AttentionKind, MissionConfig, MissionId, MissionPhase};
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
@@ -67,6 +67,9 @@ pub enum MissionCommand {
     Inbox(InboxArgs),
     /// Approve the plan at the ratification gate.
     Ratify(RatifyArgs),
+    /// Show the proposed contract awaiting ratification (assertion→oracle
+    /// bindings and the verified/reviewed ceiling).
+    Plan(PlanArgs),
     /// Resolve an open attention item.
     Decide(DecideArgs),
     /// Inspect installed mission types.
@@ -144,6 +147,15 @@ pub struct RatifyArgs {
     pub repo: PathBuf,
     #[arg(long, default_value = "approved")]
     pub justification: String,
+}
+
+#[derive(Args)]
+pub struct PlanArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -240,6 +252,7 @@ async fn run_mission(cmd: MissionCommand) -> Result<std::process::ExitCode> {
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Plan(args) => cmd_plan(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Type(cmd) => cmd_type(cmd).await,
         MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
@@ -418,18 +431,98 @@ async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
     let repo = args.repo.canonicalize().context("repo path")?;
     let store = MissionStore::open(&repo).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
-    // The ratification item id is stable ("ratify:mission").
+    // Resolve whichever ratification item is open — a proposed contract
+    // (RatifyProposal) or a post-amendment re-ratification (Ratify) — so the
+    // human never has to type the item id.
+    let state = store
+        .load_state_snapshotted(&mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+    let item = state
+        .open_attention
+        .values()
+        .find(|a| {
+            matches!(
+                a.kind,
+                AttentionKind::Ratify | AttentionKind::RatifyProposal
+            )
+        })
+        .context("nothing is awaiting ratification for this mission")?;
     crate::engine::record_decision(
         &store,
         SystemClock.now_ms(),
         &mission_id,
-        "ratify:mission",
+        &item.id,
         crate::model::DecisionAction::Ratify,
         &args.justification,
         "cli",
     )
     .await?;
     println!("ratified mission {mission_id}");
+    Ok(())
+}
+
+async fn cmd_plan(args: PlanArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("repo path")?;
+    let store = MissionStore::open(&repo).await?;
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let state = store
+        .load_state_snapshotted(&mission_id)
+        .await?
+        .with_context(|| format!("mission {mission_id} not found"))?;
+    let Some(proposal) = &state.proposal else {
+        bail!("no proposal is awaiting ratification for mission {mission_id}");
+    };
+    // The verified/reviewed ceiling: a plan is verified-possible iff every
+    // assertion binds an oracle.
+    let ceiling = if proposal.all_assertions_bound() {
+        "verified-possible"
+    } else {
+        "reviewed-only"
+    };
+    if args.json {
+        let bindings: Vec<_> = proposal
+            .assertions
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id.as_str(),
+                    "prose": a.prose,
+                    "oracle": a.oracle.as_ref().map(|o| o.as_str()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "mission_id": mission_id.as_str(),
+                "engine_authored": state.proposal_engine_authored,
+                "ceiling": ceiling,
+                "assertions": bindings,
+                "tasks": proposal.tasks.len(),
+            })
+        );
+    } else {
+        println!(
+            "proposed contract for mission {mission_id} ({ceiling}, {} authored):",
+            if state.proposal_engine_authored {
+                "engine"
+            } else {
+                "human"
+            }
+        );
+        for a in &proposal.assertions {
+            let oracle = a
+                .oracle
+                .as_ref()
+                .map_or("— no oracle (advisory)", |o| o.as_str());
+            println!("  {} → {}\n    {}", a.id, oracle, a.prose);
+        }
+        println!(
+            "  ({} tasks) — ratify to seed the contract and begin work",
+            proposal.tasks.len()
+        );
+    }
     Ok(())
 }
 

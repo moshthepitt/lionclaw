@@ -46,6 +46,53 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
     prompt
 }
 
+/// Context for a planning role (research / draft / red-team / author). A
+/// **separate** assembler from `assemble_role_prompt` so a producer's prose can
+/// never structurally reach an execution judge: planning has no verdict roles,
+/// and execution judges are only ever built by `assemble_role_prompt`.
+pub struct PlanningPromptContext<'a> {
+    pub objective: &'a str,
+    /// The mission type's playbook (its method), if any.
+    pub playbook: Option<&'a str>,
+    /// The oracles the author may bind assertions to.
+    pub oracle_inventory: &'a [String],
+    pub task_body: &'a str,
+    /// Reports from this planning node's cleared dependencies.
+    pub upstream_reports: &'a [String],
+}
+
+pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(skeleton(role.output));
+    prompt.push_str("\n\n## Role\n\n");
+    prompt.push_str(&role.prompt_body);
+    prompt.push_str("\n\n## Mission objective\n\n");
+    prompt.push_str(ctx.objective);
+    if let Some(playbook) = ctx.playbook {
+        prompt.push_str("\n\n## Playbook\n\n");
+        prompt.push_str(playbook);
+    }
+    if !ctx.oracle_inventory.is_empty() {
+        prompt.push_str("\n\n## Available oracles\n\n");
+        prompt
+            .push_str("Bind an assertion to one of these to make it authoritatively checkable:\n");
+        for oracle in ctx.oracle_inventory {
+            prompt.push_str(&format!("- {oracle}\n"));
+        }
+    }
+    if !ctx.task_body.is_empty() {
+        prompt.push_str("\n\n## Task\n\n");
+        prompt.push_str(ctx.task_body);
+    }
+    if !ctx.upstream_reports.is_empty() {
+        prompt.push_str("\n\n## Upstream planning reports\n\n");
+        for report in ctx.upstream_reports {
+            prompt.push_str(&format!("- {report}\n"));
+        }
+    }
+    prompt
+}
+
 /// The engine skeleton per output semantics — a total match; adding a
 /// variant without a contract is a compile error.
 fn skeleton(output: OutputSemantics) -> &'static str {

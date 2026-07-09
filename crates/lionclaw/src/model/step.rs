@@ -57,11 +57,63 @@ pub struct OracleDispatchIntent {
 
 pub fn step(state: &MissionState) -> StepDecision {
     match &state.phase {
-        MissionPhase::Planning => StepDecision::Idle,
+        MissionPhase::Planning => step_planning(state),
         MissionPhase::AttentionNeeded => StepDecision::Park,
         MissionPhase::Done { .. } | MissionPhase::Aborted { .. } => StepDecision::Terminal,
         MissionPhase::Running => step_running(state),
     }
+}
+
+/// A node is runnable when it is Pending and every dependency has Cleared. The
+/// pending/deps predicate shared by planning and execution scheduling.
+fn is_runnable(
+    id: &TaskId,
+    deps: &[TaskId],
+    status_of: &impl Fn(&TaskId) -> Option<TaskStatus>,
+) -> bool {
+    status_of(id) == Some(TaskStatus::Pending)
+        && deps
+            .iter()
+            .all(|dep| status_of(dep) == Some(TaskStatus::Cleared))
+}
+
+/// The contract-free planning phase: dispatch the next runnable planning role.
+/// Planning roles are read-only, so the workspace never moves — every node is
+/// judged at `base_sha`. When nothing is runnable the mission idles (an empty
+/// planning DAG ⇒ `AwaitingPlan`; a finished author ⇒ parked on `RatifyProposal`).
+fn step_planning(state: &MissionState) -> StepDecision {
+    if !state.inflight.is_empty() {
+        return StepDecision::Idle;
+    }
+    // A Running planning node means an outcome is folding in; never double-dispatch.
+    if state
+        .planning
+        .tasks
+        .values()
+        .any(|t| t.status == TaskStatus::Running)
+    {
+        return StepDecision::Idle;
+    }
+    let status_of = |id: &TaskId| state.planning.tasks.get(id).map(|t| t.status);
+    let Some(task) = state
+        .config
+        .planning
+        .tasks
+        .iter()
+        .find(|t| is_runnable(&t.id, &t.depends_on, &status_of))
+    else {
+        return StepDecision::Idle;
+    };
+    let attempt_no = state.planning.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
+    StepDecision::DispatchRole(RoleDispatchIntent {
+        task_id: task.id.clone(),
+        role: task.role.clone(),
+        attempt_no,
+        body: task.body.clone(),
+        // Planning has no contract; its roles are read-only at the base commit.
+        targets: Vec::new(),
+        base_sha: state.current_sha.clone(),
+    })
 }
 
 fn step_running(state: &MissionState) -> StepDecision {
@@ -91,12 +143,7 @@ fn step_running(state: &MissionState) -> StepDecision {
     let status_of = |id: &TaskId| state.tasks.get(id).map(|t| t.status);
     let runnable = |kind: TaskKind| {
         plan.tasks.iter().find(move |task| {
-            task.kind == kind
-                && status_of(&task.id) == Some(TaskStatus::Pending)
-                && task
-                    .depends_on
-                    .iter()
-                    .all(|dep| status_of(dep) == Some(TaskStatus::Cleared))
+            task.kind == kind && is_runnable(&task.id, &task.depends_on, &status_of)
         })
     };
     if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {

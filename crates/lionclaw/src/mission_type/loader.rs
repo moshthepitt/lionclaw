@@ -38,6 +38,9 @@ pub enum MissionTypeError {
 struct ManifestFile {
     #[serde(rename = "mission-type")]
     mission_type: ManifestMissionType,
+    /// The optional planning DAG (`[planning]`). Absent ⇒ no in-engine planning.
+    #[serde(default)]
+    planning: crate::model::PlanningDag,
 }
 
 #[derive(serde::Deserialize)]
@@ -83,19 +86,32 @@ pub fn load_mission_type(
     let playbook = read(&root.join("playbook.md")).ok();
     let digest = compute_digest(root)?;
 
-    Ok(MissionType {
+    let mission_type = MissionType {
         name: manifest.mission_type.name,
         digest,
         stop,
         image: manifest.mission_type.image,
-        // Parsing + validating the `[planning]` table is wired in P3b; until
-        // then every mission type has no in-engine planning DAG.
-        planning: crate::model::PlanningDag::default(),
+        planning: manifest.planning,
         root: root.to_path_buf(),
         playbook,
         roles,
         oracles,
-    })
+    };
+    // Validate the planning DAG fail-closed at load against this type's own
+    // inventory (roles must be planning roles; the author is the unique sink).
+    let errors =
+        crate::model::validate_planning_dag(&mission_type.planning, &mission_type.inventory());
+    if !errors.is_empty() {
+        return Err(MissionTypeError::Manifest(format!(
+            "[planning] is invalid:\n{}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+    Ok(mission_type)
 }
 
 fn load_roles(

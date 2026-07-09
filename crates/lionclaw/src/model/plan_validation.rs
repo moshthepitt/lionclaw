@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::event::{AmendmentOps, StopBar};
 use super::ids::{OracleName, RoleName, TaskId};
-use super::plan::{OutputSemantics, PlanSubmission, TaskKind};
+use super::plan::{OutputSemantics, PlanSubmission, PlanningDag, TaskKind};
 use super::state::MissionState;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -95,6 +95,121 @@ pub fn validate_plan_submission(
     // at author time; a domain with genuinely unprovable claims declares
     // `stop = reviewed`.
     check_stop_bar_reachable(submission, inventory.stop)
+}
+
+/// Validate a mission type's planning DAG (at load, fail-closed): unique ids,
+/// resolvable acyclic deps, every role a planning role (`ProducesReport` or the
+/// single `ProposesPlan` author), and the author is the unique sink — so the
+/// DAG fully drains into the proposer with no orphan island.
+pub fn validate_planning_dag(
+    dag: &PlanningDag,
+    inventory: &MissionTypeInventory,
+) -> Vec<PlanValidationError> {
+    // An empty DAG is valid: it means "no in-engine planning" (the mission
+    // awaits a manually submitted plan).
+    if dag.tasks.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = BTreeSet::new();
+    for t in &dag.tasks {
+        if !ids.insert(&t.id) {
+            return vec![err(
+                "duplicate_task_id",
+                format!("planning task '{}' is declared twice", t.id),
+            )];
+        }
+    }
+
+    let mut errors = Vec::new();
+    let mut proposers = 0;
+    for t in &dag.tasks {
+        for dep in &t.depends_on {
+            if dep == &t.id {
+                errors.push(err(
+                    "self_loop",
+                    format!("planning task '{}' depends on itself", t.id),
+                ));
+            } else if !ids.contains(dep) {
+                errors.push(err(
+                    "dep_unknown_task",
+                    format!("planning task '{}' depends on unknown '{dep}'", t.id),
+                ));
+            }
+        }
+        match inventory.roles.get(&t.role) {
+            None => errors.push(err(
+                "unknown_role",
+                format!(
+                    "planning task '{}' names role '{}' which the mission type does not provide",
+                    t.id, t.role
+                ),
+            )),
+            Some(OutputSemantics::ProposesPlan) => proposers += 1,
+            Some(OutputSemantics::ProducesReport) => {}
+            Some(other) => errors.push(err(
+                "role_output_mismatch",
+                format!(
+                    "planning role '{}' must be produces-report or proposes-plan, not {other:?}",
+                    t.role
+                ),
+            )),
+        }
+    }
+    if !errors.is_empty() {
+        return errors;
+    }
+
+    if proposers != 1 {
+        return vec![err(
+            "planning_author",
+            format!("a planning DAG must have exactly one proposes-plan author, found {proposers}"),
+        )];
+    }
+    if planning_has_cycle(dag) {
+        return vec![err(
+            "cycle_detected",
+            "the planning DAG has a dependency cycle",
+        )];
+    }
+    // The author must be the unique sink: no node depends on it, and it is the
+    // only node nothing depends on — every path drains into the proposer.
+    let has_successor: BTreeSet<&TaskId> = dag.tasks.iter().flat_map(|t| &t.depends_on).collect();
+    let sinks: Vec<_> = dag
+        .tasks
+        .iter()
+        .filter(|t| !has_successor.contains(&t.id))
+        .collect();
+    let author_is_unique_sink = sinks.len() == 1
+        && inventory.roles.get(&sinks[0].role) == Some(&OutputSemantics::ProposesPlan);
+    if !author_is_unique_sink {
+        return vec![err(
+            "planning_sink",
+            "the proposes-plan author must be the unique sink of the planning DAG \
+             (every node drains into it)",
+        )];
+    }
+    Vec::new()
+}
+
+fn planning_has_cycle(dag: &PlanningDag) -> bool {
+    // Kahn: repeatedly remove nodes whose deps are all removed; a remainder is a
+    // cycle.
+    let mut remaining: BTreeSet<&TaskId> = dag.tasks.iter().map(|t| &t.id).collect();
+    loop {
+        let ready: Vec<&TaskId> = dag
+            .tasks
+            .iter()
+            .filter(|t| remaining.contains(&t.id))
+            .filter(|t| t.depends_on.iter().all(|d| !remaining.contains(d)))
+            .map(|t| &t.id)
+            .collect();
+        if ready.is_empty() {
+            return !remaining.is_empty();
+        }
+        for id in ready {
+            remaining.remove(id);
+        }
+    }
 }
 
 fn check_stop_bar_reachable(

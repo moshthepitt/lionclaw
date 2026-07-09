@@ -79,3 +79,27 @@ fn role_declaring_skills_is_rejected_at_load() {
         "got {err:?}"
     );
 }
+
+#[test]
+fn a_planning_dag_naming_an_execution_role_fails_to_load() {
+    // The planning DAG must reference only planning roles. An execution role
+    // (produces-artifact) named as a planning node is rejected fail-closed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"bad-planning\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+         \n[[planning.tasks]]\nid = \"author\"\nrole = \"worker\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Manifest(detail) if detail.contains("planning")),
+        "got {err:?}"
+    );
+}

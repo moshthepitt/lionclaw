@@ -29,8 +29,8 @@ pub use plan::{
     Assertion, OutputSemantics, PlanSubmission, PlanningDag, PlanningTask, Task, TaskKind,
 };
 pub use plan_validation::{
-    validate_plan_amendment, validate_plan_submission, AmendmentError, MissionTypeInventory,
-    PlanValidationError,
+    validate_plan_amendment, validate_plan_submission, validate_planning_dag, AmendmentError,
+    MissionTypeInventory, PlanValidationError,
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,

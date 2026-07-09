@@ -23,7 +23,9 @@ use crate::model::{
     RunErrorKind, StepDecision,
 };
 use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
-use crate::prompt::{assemble_role_prompt, PromptContext};
+use crate::prompt::{
+    assemble_planning_prompt, assemble_role_prompt, PlanningPromptContext, PromptContext,
+};
 use crate::store::{AppendError, MissionStore, NewEvent};
 
 pub struct Engine {
@@ -485,6 +487,34 @@ impl Engine {
         };
         match self.role_runner.run(request).await {
             Ok(outcome) => {
+                // A planning author's proposal is validated fail-closed before
+                // it is recorded, exactly like a manually submitted plan — an
+                // invalid proposal is a failed attempt, never a bad contract.
+                if let Handoff::Plan {
+                    done: true,
+                    proposal,
+                    ..
+                } = &outcome.handoff
+                {
+                    let Some(plan) = proposal else {
+                        return Ok(failed(
+                            RunErrorKind::HandoffInvalid,
+                            "planning author reported done but proposed no plan".to_string(),
+                        ));
+                    };
+                    let errors = validate_plan_submission(plan, &self.mission_type.inventory());
+                    if !errors.is_empty() {
+                        let detail = errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Ok(failed(
+                            RunErrorKind::HandoffInvalid,
+                            format!("proposed plan is invalid: {detail}"),
+                        ));
+                    }
+                }
                 let handoff = self.externalize_handoff(outcome.handoff)?;
                 Ok(NewEvent::new(MissionEvent::RoleRunCompleted {
                     task_id: task_id.clone(),
@@ -558,26 +588,22 @@ impl Engine {
         }
     }
 
-    /// Turn a role-dispatch intent into a recorded request: assemble the
-    /// prompt (engine-owned), persist it, derive the idempotency key.
-    async fn materialize_role_request(
+    /// Assemble an execution role's prompt (`("role", …)` idempotency namespace).
+    fn assemble_execution_request(
         &self,
         state: &MissionState,
-        intent: RoleDispatchIntent,
-    ) -> Result<()> {
-        let plan = state.plan.as_ref().context("dispatch without a plan")?;
+        role: &crate::mission_type::RoleDefinition,
+        intent: &RoleDispatchIntent,
+    ) -> Result<(String, &'static str)> {
+        let plan = state
+            .plan
+            .as_ref()
+            .context("execution dispatch without a plan")?;
         let targets: Vec<_> = plan
             .assertions
             .iter()
             .filter(|a| intent.targets.contains(&a.id))
             .collect();
-        let role = self
-            .mission_type
-            .roles
-            .get(&intent.role)
-            .with_context(|| format!("role '{}' missing from the mission type", intent.role))?;
-        // Thread the reports of this task's dependencies in (resolved from
-        // blob refs). Prompt assembly excludes them for verdict roles.
         let task = plan
             .tasks
             .iter()
@@ -589,7 +615,7 @@ impl Engine {
                 upstream_reports.push(self.store.blobs().resolve(report)?);
             }
         }
-        let prompt_text = assemble_role_prompt(
+        let prompt = assemble_role_prompt(
             role,
             &PromptContext {
                 objective: &state.objective,
@@ -598,13 +624,82 @@ impl Engine {
                 upstream_reports: &upstream_reports,
             },
         );
+        Ok((prompt, "role"))
+    }
+
+    /// Assemble a planning role's prompt (`("plan-role", …)` namespace). Threads
+    /// the mission type's playbook + oracle inventory + upstream planning reports
+    /// through a separate assembler.
+    fn assemble_planning_request(
+        &self,
+        state: &MissionState,
+        role: &crate::mission_type::RoleDefinition,
+        intent: &RoleDispatchIntent,
+    ) -> Result<(String, &'static str)> {
+        let task = state
+            .config
+            .planning
+            .tasks
+            .iter()
+            .find(|t| t.id == intent.task_id)
+            .context("dispatched planning task not in the DAG")?;
+        let mut upstream_reports = Vec::new();
+        for dep in &task.depends_on {
+            if let Some(report) = state
+                .planning
+                .tasks
+                .get(dep)
+                .and_then(|t| t.last_report.as_ref())
+            {
+                upstream_reports.push(self.store.blobs().resolve(report)?);
+            }
+        }
+        let oracle_inventory: Vec<String> = self
+            .mission_type
+            .oracles
+            .keys()
+            .map(|o| o.as_str().to_string())
+            .collect();
+        let prompt = assemble_planning_prompt(
+            role,
+            &PlanningPromptContext {
+                objective: &state.objective,
+                playbook: self.mission_type.playbook.as_deref(),
+                oracle_inventory: &oracle_inventory,
+                task_body: &intent.body,
+                upstream_reports: &upstream_reports,
+            },
+        );
+        Ok((prompt, "plan-role"))
+    }
+
+    /// Turn a role-dispatch intent into a recorded request: assemble the
+    /// prompt (engine-owned), persist it, derive the idempotency key.
+    async fn materialize_role_request(
+        &self,
+        state: &MissionState,
+        intent: RoleDispatchIntent,
+    ) -> Result<()> {
+        let role = self
+            .mission_type
+            .roles
+            .get(&intent.role)
+            .with_context(|| format!("role '{}' missing from the mission type", intent.role))?;
+        // Planning and execution assemble prompts and namespace idempotency keys
+        // separately, so a planning report can never reach an execution judge and
+        // a planning id can never collide with an execution one.
+        let (prompt_text, idem_namespace) = if state.plan.is_none() {
+            self.assemble_planning_request(state, role, &intent)?
+        } else {
+            self.assemble_execution_request(state, role, &intent)?
+        };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let prompt = self
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
         let idempotency_key = idem_key(&[
-            "role",
+            idem_namespace,
             state.mission_id.as_str(),
             intent.task_id.as_str(),
             &intent.attempt_no.to_string(),
