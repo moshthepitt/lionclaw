@@ -86,65 +86,66 @@ impl RoleRunner for OciRoleRunner {
 
         let is_writer = request.role.output == OutputSemantics::ProducesArtifact;
 
-        // Isolate the workspace. Writers get a clone (committable), everyone
-        // else a read-only snapshot of the base commit.
-        let (workspace_source, workspace_access, worker_clone) = {
-            let _guard = self.repo_lock.lock().await;
-            if is_writer {
-                let clone = workspace::create_worker_clone(
-                    &request.workspace_dir,
-                    &dirs.root.join("work"),
-                    request.mission_id.as_str(),
-                    &attempt_tag,
-                    &request.base_sha,
-                )
-                .await
-                .map_err(|e| launch(format!("failed to create worker clone: {e}")))?;
-                (clone.dir.clone(), MountAccess::ReadWrite, Some(clone))
-            } else {
-                let snapshot = dirs.root.join("snapshot");
-                workspace::create_snapshot(&request.workspace_dir, &snapshot, &request.base_sha)
+        // Everything after the attempt dirs exist runs inside one block whose
+        // Result is captured, so the teardown below reaps the whole attempt
+        // directory on EVERY exit path — a failure in workspace isolation or
+        // moat compilation, not only after the turn has run.
+        let result: Result<RoleRunOutcome, RoleRunFailure> = async {
+            // Isolate the workspace. Writers get a clone (committable), everyone
+            // else a read-only snapshot of the base commit.
+            let (workspace_source, workspace_access, worker_clone) = {
+                let _guard = self.repo_lock.lock().await;
+                if is_writer {
+                    let clone = workspace::create_worker_clone(
+                        &request.workspace_dir,
+                        &dirs.root.join("work"),
+                        request.mission_id.as_str(),
+                        &attempt_tag,
+                        &request.base_sha,
+                    )
                     .await
-                    .map_err(|e| launch(format!("failed to snapshot workspace: {e}")))?;
-                (snapshot, MountAccess::ReadOnly, None)
-            }
-        };
+                    .map_err(|e| launch(format!("failed to create worker clone: {e}")))?;
+                    (clone.dir.clone(), MountAccess::ReadWrite, Some(clone))
+                } else {
+                    let snapshot = dirs.root.join("snapshot");
+                    workspace::create_snapshot(&request.workspace_dir, &snapshot, &request.base_sha)
+                        .await
+                        .map_err(|e| launch(format!("failed to snapshot workspace: {e}")))?;
+                    (snapshot, MountAccess::ReadOnly, None)
+                }
+            };
 
-        // Compile the plan through the moat. Judged roots = the workspace
-        // the verdict is about (only meaningful for verdict roles, but the
-        // predicate is applied uniformly).
-        let authority = compile_authority(&request.role, &self.ceiling)
-            .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
-        let workspace_mount = MountSpec {
-            source: workspace_source.clone(),
-            target: WORKSPACE_MOUNT_TARGET.to_string(),
-            access: workspace_access,
-        };
-        let extras = dirs.agent_mounts();
-        let environment = mission_environment(&dirs);
-        let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
-        let compiled = compile_role_plan(RolePlanRequest {
-            authority: &authority,
-            runtime_id: self.profile.name.clone(),
-            confinement: self.profile.confinement.clone(),
-            mounts: MissionMounts {
-                workspace: workspace_mount,
-                extras,
-            },
-            judged_roots: &judged_roots,
-            environment,
-            idle_timeout: self.profile.idle_timeout,
-            hard_timeout: self.profile.hard_timeout,
-        })
-        .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
+            // Compile the plan through the moat. Judged roots = the workspace
+            // the verdict is about (only meaningful for verdict roles, but the
+            // predicate is applied uniformly).
+            let authority = compile_authority(&request.role, &self.ceiling)
+                .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
+            let workspace_mount = MountSpec {
+                source: workspace_source.clone(),
+                target: WORKSPACE_MOUNT_TARGET.to_string(),
+                access: workspace_access,
+            };
+            let extras = dirs.agent_mounts();
+            let environment = mission_environment(&dirs);
+            let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
+            let compiled = compile_role_plan(RolePlanRequest {
+                authority: &authority,
+                runtime_id: self.profile.name.clone(),
+                confinement: self.profile.confinement.clone(),
+                mounts: MissionMounts {
+                    workspace: workspace_mount,
+                    extras,
+                },
+                judged_roots: &judged_roots,
+                environment,
+                idle_timeout: self.profile.idle_timeout,
+                hard_timeout: self.profile.hard_timeout,
+            })
+            .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
 
-        // Run the agent turn under confinement.
-        let outcome = self.run_turn(&request, compiled.plan().clone()).await;
-
-        // Capture the artifact (writer only) before tearing the workspace
-        // down. Held in a Result so cleanup below runs on every path.
-        let result = async {
-            let model_id = outcome?;
+            // Run the agent turn under confinement, then capture the artifact
+            // (writer only) before the workspace is torn down.
+            let model_id = self.run_turn(&request, compiled.plan().clone()).await?;
             let handoff = read_handoff(&dirs.handoff, request.role.output)?;
             let artifact = if let Some(clone) = &worker_clone {
                 let _guard = self.repo_lock.lock().await;

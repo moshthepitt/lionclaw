@@ -54,20 +54,21 @@ impl OracleRunner for OciOracleRunner {
         )
         .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
-        // Read-only snapshot of the judged commit — never the worker's live
-        // clone, so a worker cannot influence the verdict it is judged by.
+        // Everything after the attempt dirs exist runs inside one block so the
+        // whole attempt directory is reclaimed on every exit path — the snapshot
+        // (a full checkout), the moat-compile, and the staging steps can all fail
+        // before the run.
         let snapshot = dirs.root.join("snapshot");
-        {
-            let _guard = self.repo_lock.lock().await;
-            workspace::create_snapshot(&request.workspace_dir, &snapshot, &request.judged_sha)
-                .await
-                .map_err(|e| fail(format!("failed to snapshot judged commit: {e}")))?;
-        }
-
-        // Stage + run inside an inner block so the snapshot (a full checkout)
-        // is reclaimed on every exit path — the moat-compile and staging
-        // steps below can fail before the run.
         let result = async {
+            // Read-only snapshot of the judged commit — never the worker's live
+            // clone, so a worker cannot influence the verdict it is judged by.
+            {
+                let _guard = self.repo_lock.lock().await;
+                workspace::create_snapshot(&request.workspace_dir, &snapshot, &request.judged_sha)
+                    .await
+                    .map_err(|e| fail(format!("failed to snapshot judged commit: {e}")))?;
+            }
+
             // Copy the oracle executable into its own read-only mount.
             let oracle_dir = dirs.root.join("oracle");
             std::fs::create_dir_all(&oracle_dir).map_err(|e| fail(e.to_string()))?;

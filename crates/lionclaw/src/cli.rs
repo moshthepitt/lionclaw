@@ -504,18 +504,25 @@ async fn resolve_mission_id(store: &MissionStore, explicit: Option<&str>) -> Res
     if let Some(id) = explicit {
         return MissionId::parse(id).map_err(Into::into);
     }
+    let mut all = Vec::new();
     let mut live = Vec::new();
     for summary in store.list_missions().await? {
         let Some(state) = fold(store.load(&summary.mission_id).await?) else {
             continue;
         };
         if !state.phase.is_terminal() {
-            live.push(summary.mission_id);
+            live.push(summary.mission_id.clone());
         }
+        all.push(summary.mission_id);
     }
-    match live.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => bail!("no live mission in this repo; pass a mission id"),
+    // Prefer the sole live mission; once every mission has finished, still default
+    // to the sole mission — report/apply are post-completion commands. Refuse to
+    // guess only when the choice is genuinely ambiguous.
+    match (live.as_slice(), all.as_slice()) {
+        ([only], _) => Ok(only.clone()),
+        ([], [only]) => Ok(only.clone()),
+        ([], []) => bail!("no mission in this repo; pass a mission id"),
+        ([], _) => bail!("{} missions, none live; pass a mission id", all.len()),
         _ => bail!("{} live missions; pass a mission id to choose", live.len()),
     }
 }
@@ -1025,25 +1032,27 @@ async fn cmd_install(args: InstallArgs) -> Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let name = entry.file_name();
+        let src_dir = entry.path();
+        // Validate before installing (an invalid mission type never lands), and
+        // key the destination by the manifest NAME — the identity a started
+        // mission re-opens by — not the source directory basename, so a type
+        // whose directory differs from its name still installs and starts
+        // coherently.
+        let name = load_mission_type(&src_dir, &AuthorityCeiling::default())
+            .with_context(|| format!("mission type at '{}' is invalid", src_dir.display()))?
+            .name;
         let dest = dest_dir.join(&name);
         if dest.exists() {
             if !args.force {
-                println!(
-                    "skip {} (already installed; --force to overwrite)",
-                    name.to_string_lossy()
-                );
+                println!("skip {name} (already installed; --force to overwrite)");
                 continue;
             }
             std::fs::remove_dir_all(&dest)
                 .with_context(|| format!("removing '{}'", dest.display()))?;
         }
-        // Validate before installing: an invalid mission type never lands.
-        load_mission_type(&entry.path(), &AuthorityCeiling::default())
-            .with_context(|| format!("mission type '{}' is invalid", name.to_string_lossy()))?;
-        copy_tree(&entry.path(), &dest)?;
-        println!("installed {}", name.to_string_lossy());
-        installed.push(name.to_string_lossy().into_owned());
+        copy_tree(&src_dir, &dest)?;
+        println!("installed {name}");
+        installed.push(name);
     }
     if installed.is_empty() {
         println!("nothing to install (all mission types already present)");

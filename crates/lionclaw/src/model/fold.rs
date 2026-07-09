@@ -552,10 +552,14 @@ fn apply_decision(
         (DecisionAction::Retry, AttentionKind::RatifyProposal) => {
             // Reject the proposal and re-run the whole planning DAG. Attempts are
             // preserved, so a re-dispatched node gets a fresh idempotency key.
+            // Scrub any `request_attention` flags the discarded run left, or a
+            // stale node_attention item would re-park the mission and block the
+            // re-plan (mirrors the NodeFailed retry scrub below).
             state.proposal = None;
             state.proposal_engine_authored = false;
-            for task in state.planning.tasks.values_mut() {
+            for (id, task) in &mut state.planning.tasks {
                 task.status = TaskStatus::Pending;
+                state.flagged_nodes.remove(id);
             }
         }
         (DecisionAction::Retry, AttentionKind::NodeFailed) => {

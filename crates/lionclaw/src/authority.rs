@@ -259,13 +259,15 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         if authority.preset.mount_runtime_secrets {
             return Err(MoatViolation::SecretsForJudge { role });
         }
-        for escape in [EscapeClass::ChannelSend, EscapeClass::ArtifactPublish] {
-            if authority.preset.escape_classes.contains(&escape) {
-                return Err(MoatViolation::JudgeEscape {
-                    role,
-                    escape: escape.as_str().to_string(),
-                });
-            }
+        // Escape-free means *no* escape class, not just the two we thought of:
+        // any non-empty set (NetEgress, SecretRequest, SchedulerRun, …) is a
+        // channel a judge/planner could use to influence what it reads. Refuse
+        // the whole set so a newly-added variant can never silently slip through.
+        if let Some(escape) = authority.preset.escape_classes.iter().next() {
+            return Err(MoatViolation::JudgeEscape {
+                role,
+                escape: escape.as_str().to_string(),
+            });
         }
         let rw_mounts = request
             .mounts

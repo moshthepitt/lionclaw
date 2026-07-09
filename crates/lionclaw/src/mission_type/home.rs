@@ -17,9 +17,18 @@ pub struct Home {
 
 impl Home {
     pub fn from_env() -> Result<Self> {
+        // An exported-but-empty value (`LIONCLAW_HOME=`, or an empty `HOME` in a
+        // minimal container/CI) must not become a relative root — that would put
+        // a stray `.lionclaw` in the cwd. Treat empty as unset and fall through.
+        let non_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(v);
         let root = std::env::var_os("LIONCLAW_HOME")
+            .and_then(non_empty)
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".lionclaw")))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .and_then(non_empty)
+                    .map(|h| PathBuf::from(h).join(".lionclaw"))
+            })
             .ok_or_else(|| anyhow!("neither LIONCLAW_HOME nor HOME is set"))?;
         Ok(Self { root })
     }
