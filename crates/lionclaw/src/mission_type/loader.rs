@@ -116,9 +116,9 @@ pub fn load_mission_type(
                     declared.role
                 )));
             };
-            if role.output != OutputSemantics::EmitsVerdict {
+            if role.output != OutputSemantics::EmitsGapVerdict {
                 return Err(MissionTypeError::Manifest(format!(
-                    "[terminal-review] role '{}' must be emits-verdict, got {}",
+                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
                     declared.role,
                     role.output.slug()
                 )));

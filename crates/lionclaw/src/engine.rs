@@ -163,9 +163,9 @@ impl Engine {
         // or the closing dispatch could never resolve it.
         if let Some(review) = &config.terminal_review {
             match self.mission_type.roles.get(&review.role) {
-                Some(role) if role.output == crate::model::OutputSemantics::EmitsVerdict => {}
+                Some(role) if role.output == crate::model::OutputSemantics::EmitsGapVerdict => {}
                 Some(role) => bail!(
-                    "terminal-review role '{}' must be emits-verdict, got {}",
+                    "terminal-review role '{}' must be emits-gap-verdict, got {}",
                     review.role,
                     role.output.slug()
                 ),
@@ -684,7 +684,7 @@ impl Engine {
         }
     }
 
-    /// Execute the closing review: one confined `emits-verdict` role run
+    /// Execute the closing review: one confined `emits-gap-verdict` role run
     /// against a read-only snapshot of the judged commit. The handoff is
     /// translated here — never trusted raw: the echoed nonce must match (a
     /// worker-planted script executed by the reviewer can write the handoff
@@ -743,23 +743,21 @@ impl Engine {
             Ok(outcome) => outcome,
             Err(failure) => return Ok(failed(failure.kind, failure.detail)),
         };
-        let Handoff::Validate {
+        let Handoff::Review {
             done,
             report,
-            items,
             passed,
             gaps,
             nonce: echoed,
-            request_attention,
         } = outcome.handoff
         else {
             // Unreachable via the runner's schema check; fail closed anyway.
             return Ok(failed(
                 RunErrorKind::HandoffInvalid,
-                "terminal reviewer handed back a non-validate handoff".to_string(),
+                "terminal reviewer handed back a non-review handoff".to_string(),
             ));
         };
-        if echoed.as_deref() != Some(nonce.as_str()) {
+        if echoed != *nonce {
             return Ok(failed(
                 RunErrorKind::HandoffInvalid,
                 "handoff nonce mismatch: the handoff was not written by the reviewer".to_string(),
@@ -769,22 +767,6 @@ impl Engine {
             return Ok(failed(
                 RunErrorKind::TurnFailed,
                 "reviewer handed off done=false: the review itself did not complete".to_string(),
-            ));
-        }
-        // Fail closed on fields the terminal review has no channel for —
-        // findings misfiled into `items` (the reviewer is contract-blind)
-        // or an escalation via `request_attention` (the escalation channel
-        // is a blocking gap) must park for a re-roll, never silently vanish.
-        if !items.is_empty() {
-            return Ok(failed(
-                RunErrorKind::HandoffInvalid,
-                "terminal review has no per-assertion contract: report gaps, not items".to_string(),
-            ));
-        }
-        if request_attention {
-            return Ok(failed(
-                RunErrorKind::HandoffInvalid,
-                "terminal review escalates via a blocking gap, not request_attention".to_string(),
             ));
         }
         Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {
@@ -1048,14 +1030,23 @@ impl Engine {
                 items,
                 passed,
                 request_attention,
-                gaps,
-                nonce,
             } => Handoff::Validate {
                 done,
                 report: self.store.blobs().externalize(report)?,
                 items,
                 passed,
                 request_attention,
+            },
+            Handoff::Review {
+                done,
+                report,
+                passed,
+                gaps,
+                nonce,
+            } => Handoff::Review {
+                done,
+                report: self.store.blobs().externalize(report)?,
+                passed,
                 // Typed and KB-scale, like `proposal` below — stays inline.
                 gaps,
                 nonce,

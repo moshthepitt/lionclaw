@@ -961,6 +961,15 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 state.flagged_nodes.insert(task_id.clone());
             }
         }
+        // Terminal reviews are recorded as dedicated terminal-review events;
+        // a plan task can never consume this handoff contract. A hostile log
+        // that claims otherwise fails the task instead of leaving it running
+        // forever with no inflight effect.
+        Handoff::Review { .. } => {
+            if let Some(task) = state.tasks.get_mut(task_id) {
+                task.status = TaskStatus::Failed;
+            }
+        }
     }
 }
 
@@ -1160,8 +1169,6 @@ mod tests {
                 .collect(),
             passed: items.iter().all(|(_, passed)| *passed),
             request_attention: false,
-            gaps: vec![],
-            nonce: None,
         }
     }
 
@@ -1776,6 +1783,33 @@ mod tests {
     }
 
     #[test]
+    fn a_review_handoff_on_a_plan_task_fails_instead_of_wedging() {
+        let state = fold_log(vec![
+            created(),
+            plan_submitted(vec![], vec![work_task("t1")]),
+            role_completed(
+                "t1",
+                "k1",
+                Handoff::Review {
+                    done: true,
+                    report: PayloadRef::inline("wrong channel"),
+                    passed: true,
+                    gaps: vec![],
+                    nonce: "n".into(),
+                },
+                None,
+            ),
+        ])
+        .expect("state");
+        assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Failed);
+        assert_eq!(state.open_attention.len(), 1);
+        assert_eq!(
+            state.open_attention.values().next().unwrap().kind,
+            AttentionKind::NodeFailed
+        );
+    }
+
+    #[test]
     fn validate_handoff_always_clears_and_folds_sticky_advisory() {
         struct Case {
             name: &'static str,
@@ -1871,8 +1905,6 @@ mod tests {
                     }],
                     passed: false,
                     request_attention: false,
-                    gaps: vec![],
-                    nonce: None,
                 },
                 None,
             ),

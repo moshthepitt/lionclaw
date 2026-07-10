@@ -222,8 +222,6 @@ mod tests {
                             .collect(),
                         passed: items.iter().all(|(_, p)| *p),
                         request_attention: false,
-                        gaps: vec![],
-                        nonce: None,
                     },
                     artifact: None,
                 },

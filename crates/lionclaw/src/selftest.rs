@@ -75,12 +75,10 @@ impl RoleRunner for ReviewParkRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
         if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Handoff::Review {
                     done: true,
                     report: PayloadRef::inline("self-test scripted review"),
-                    items: vec![],
                     passed: false,
-                    request_attention: false,
                     gaps: vec![Gap {
                         id: Some("GAP-1".to_string()),
                         severity: GapSeverity::Blocking,
@@ -89,7 +87,9 @@ impl RoleRunner for ReviewParkRoleRunner {
                         observed: "it does not".to_string(),
                         evidence: "self-test scripted verdict".to_string(),
                     }],
-                    nonce: crate::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+                    nonce: crate::prompt::handoff_nonce(&request.prompt)
+                        .expect("terminal-review prompt has a nonce")
+                        .to_string(),
                 },
                 artifact: None,
                 model_id: None,
@@ -813,7 +813,7 @@ async fn check_terminal_review() -> Result<()> {
     )?;
     std::fs::write(
         type_dir.path().join("roles/gap-reviewer.md"),
-        "---\noutput: emits-verdict\nruntime: codex\n---\nSelf-test gap reviewer.\n",
+        "---\noutput: emits-gap-verdict\nruntime: codex\n---\nSelf-test gap reviewer.\n",
     )?;
     let mission_type = load_mission_type(type_dir.path(), &AuthorityCeiling::default())
         .map_err(|e| anyhow::anyhow!("review mission type load failed: {e}"))?;

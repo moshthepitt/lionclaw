@@ -99,7 +99,7 @@ impl Default for MissionConfig {
     }
 }
 
-/// The closing review a mission type declares: an `emits-verdict` role the
+/// The closing review a mission type declares: an `emits-gap-verdict` role the
 /// engine dispatches contract-blind once work and oracle obligations settle.
 /// Engine-owned structure (declared in `mission.toml`), never plan-authored,
 /// so a planner cannot omit or weaken it.
@@ -125,7 +125,7 @@ pub struct VersionStamps {
 /// Mirrors Zenith's `WorkHandoff`/`ValidateHandoff` (Apache-2.0,
 /// Intelligent Internet, `models.py`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Handoff {
     Work {
         done: bool,
@@ -138,16 +138,17 @@ pub enum Handoff {
         items: Vec<ValidationItem>,
         passed: bool,
         request_attention: bool,
-        /// Typed product gaps (terminal review). Default-empty and skipped
-        /// when empty, so ordinary validator handoffs — past and future —
-        /// keep their exact shape.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    },
+    /// The engine-owned terminal review's contract-blind product verdict.
+    /// Separate from `Validate` so per-assertion items and objective-level
+    /// gaps cannot be accepted on the wrong path and silently discarded.
+    Review {
+        done: bool,
+        report: PayloadRef,
+        passed: bool,
         gaps: Vec<Gap>,
-        /// Echo of the per-attempt nonce the engine put in the prompt; the
-        /// runner rejects a terminal-review handoff without the right one
-        /// (worker-planted code can write this file but cannot read the prompt).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        nonce: Option<String>,
+        /// Echo of the per-attempt nonce the engine put in the prompt.
+        nonce: String,
     },
     /// The planning author's deliverable: a proposed contract + task DAG. It has
     /// **no verdict field** — a proposal is gradeless and can never mint
@@ -318,7 +319,7 @@ pub enum MissionEvent {
         detail: String,
         synthesized: bool,
     },
-    /// The closing review was dispatched: a fresh-context `emits-verdict`
+    /// The closing review was dispatched: a fresh-context `emits-gap-verdict`
     /// role judging the tree at `judged_sha` against the objective,
     /// contract-blind. Config-declared (`MissionConfig::terminal_review`),
     /// never a plan task — hence no `task_id`.
@@ -569,17 +570,16 @@ mod compat_tests {
         let json = serde_json::to_string(&config).expect("serialize");
         assert!(!json.contains("terminal_review"));
 
-        // A Validate handoff written before `gaps`/`nonce` existed.
+        // A pre-feature Validate handoff keeps its exact shape; terminal
+        // review uses a separate handoff variant rather than widening it.
         let old_validate = r#"{"type":"validate","done":true,
                                "report":{"kind":"inline","text":"r"},
                                "items":[],"passed":true,"request_attention":false}"#;
         let handoff: Handoff = serde_json::from_str(old_validate).expect("old handoff parses");
-        let Handoff::Validate { gaps, nonce, .. } = &handoff else {
+        let Handoff::Validate { .. } = &handoff else {
             panic!("expected validate");
         };
-        assert!(gaps.is_empty());
-        assert!(nonce.is_none());
-        // And a gap-less validate serializes without the new keys.
+        // A validate serializes without terminal-review keys.
         let json = serde_json::to_string(&handoff).expect("serialize");
         assert!(!json.contains("gaps") && !json.contains("nonce"));
     }

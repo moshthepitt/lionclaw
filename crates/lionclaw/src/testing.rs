@@ -19,14 +19,14 @@ use crate::ports::{
 /// (judges have no clone, so `artifact` is always `None`).
 pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) -> RoleRunOutcome {
     RoleRunOutcome {
-        handoff: Handoff::Validate {
+        handoff: Handoff::Review {
             done: true,
             report: PayloadRef::inline("requirement map + observations"),
-            items: vec![],
             passed,
-            request_attention: false,
             gaps,
-            nonce: crate::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+            nonce: crate::prompt::handoff_nonce(&request.prompt)
+                .expect("terminal-review prompt has a nonce")
+                .to_string(),
         },
         artifact: None,
         model_id: Some("mock-model".to_string()),

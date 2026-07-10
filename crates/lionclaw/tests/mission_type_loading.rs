@@ -206,11 +206,11 @@ fn a_path_unsafe_mission_type_name_is_rejected() {
 
 // ---- Terminal review declaration (fail-closed like the planning DAG) ----
 
-/// `write_valid_type` plus an emits-verdict reviewer role.
+/// `write_valid_type` plus a typed terminal-review role.
 fn write_reviewer_role(root: &std::path::Path) {
     std::fs::write(
         root.join("roles/gap-reviewer.md"),
-        "---\noutput: emits-verdict\n---\nHunt gaps.\n",
+        "---\noutput: emits-gap-verdict\n---\nHunt gaps.\n",
     )
     .unwrap();
 }
@@ -276,7 +276,7 @@ fn a_terminal_review_naming_a_non_verdict_role_refuses_to_load() {
     .unwrap();
     assert!(matches!(
         &load_err(dir.path()),
-        MissionTypeError::Manifest(d) if d.contains("must be emits-verdict")
+        MissionTypeError::Manifest(d) if d.contains("must be emits-gap-verdict")
     ));
 }
 

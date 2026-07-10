@@ -12,8 +12,9 @@ use super::ids::{AssertionId, OracleName, RoleName, TaskId};
 /// How the drive loop consumes a role's handoff. The single closed axis the
 /// engine routes on — names never enter enforcement or routing.
 ///
-/// The execution kinds are `ProducesArtifact` (a writer) and `EmitsVerdict` (a
-/// read-only judge). The planning kinds are `ProducesReport` (research/draft/
+/// The execution kinds are `ProducesArtifact` (a writer), `EmitsVerdict` (a
+/// per-assertion judge), and `EmitsGapVerdict` (the engine-owned objective
+/// reviewer). The planning kinds are `ProducesReport` (research/draft/
 /// adversary — read-only prose) and `ProposesPlan` (the author, whose handoff
 /// carries a `PlanSubmission`); both are read-only and only ever run in the
 /// contract-free planning phase.
@@ -23,6 +24,7 @@ pub enum OutputSemantics {
     ProducesReport,
     ProducesArtifact,
     EmitsVerdict,
+    EmitsGapVerdict,
     ProposesPlan,
 }
 
@@ -33,6 +35,7 @@ impl OutputSemantics {
             Self::ProducesReport => "produces-report",
             Self::ProducesArtifact => "produces-artifact",
             Self::EmitsVerdict => "emits-verdict",
+            Self::EmitsGapVerdict => "emits-gap-verdict",
             Self::ProposesPlan => "proposes-plan",
         }
     }

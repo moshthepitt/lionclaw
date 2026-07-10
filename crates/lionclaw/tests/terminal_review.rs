@@ -291,14 +291,12 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Handoff::Review {
                     done: true,
                     report: PayloadRef::inline("all requirements verified"),
-                    items: vec![],
                     passed: true,
-                    request_attention: false,
                     gaps: vec![],
-                    nonce: Some("forged".to_string()),
+                    nonce: "forged".to_string(),
                 },
                 artifact: None,
                 model_id: None,
@@ -584,7 +582,7 @@ async fn a_config_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creati
     .await;
     for (role, expected) in [
         ("ghost", "is not provided"),
-        ("implementer", "must be emits-verdict"),
+        ("implementer", "must be emits-gap-verdict"),
     ] {
         let err = h
             .engine
@@ -714,14 +712,14 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == REVIEW_TAG {
             Ok(RoleRunOutcome {
-                handoff: Handoff::Validate {
+                handoff: Handoff::Review {
                     done: false,
                     report: PayloadRef::inline("ran out of context"),
-                    items: vec![],
                     passed: false,
-                    request_attention: false,
                     gaps: vec![],
-                    nonce: lionclaw::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+                    nonce: lionclaw::prompt::handoff_nonce(&request.prompt)
+                        .expect("terminal-review prompt has a nonce")
+                        .to_string(),
                 },
                 artifact: None,
                 model_id: None,
@@ -740,54 +738,32 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
 }
 
 #[tokio::test]
-async fn misfiled_items_or_request_attention_park_instead_of_vanishing() {
-    // Regression (QA round 3): findings misfiled into `items` (the reviewer
-    // is contract-blind) or an escalation via request_attention must fail
-    // the attempt loudly — the engine previously discarded both silently,
-    // sealing a "clean" verdict over vanished findings.
-    for (items, request_attention, expected) in [
-        (
-            vec![lionclaw::model::ValidationItem {
-                item_id: lionclaw::model::AssertionId::new("TESTS-PASS").expect("id"),
-                passed: false,
-            }],
-            false,
-            "report gaps, not items",
-        ),
-        (vec![], true, "not request_attention"),
-    ] {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let expected_owned = expected.to_string();
-        let items_owned = items.clone();
-        let runner = MockRoleRunner::new(Box::new(move |request| {
-            if request.task_id.as_str() == REVIEW_TAG {
-                Ok(RoleRunOutcome {
-                    handoff: Handoff::Validate {
-                        done: true,
-                        report: PayloadRef::inline("looks clean"),
-                        items: items_owned.clone(),
-                        passed: true,
-                        request_attention,
-                        gaps: vec![],
-                        nonce: lionclaw::prompt::handoff_nonce(&request.prompt).map(str::to_string),
-                    },
-                    artifact: None,
-                    model_id: None,
-                })
-            } else {
-                Ok(work_outcome(request, HEAD_SHA))
-            }
-        }));
-        let (h, mission_id) = started(&dir, runner).await;
-        let outcome = h.engine.advance(&mission_id).await.expect("advance");
-        let AdvanceOutcome::Parked { attention } = outcome else {
-            panic!("expected a park, got {outcome:?}");
-        };
-        assert_eq!(attention[0].id, "terminal_review_failed:mission");
-        assert!(
-            attention[0].report.contains(&expected_owned),
-            "got: {}",
-            attention[0].report
-        );
-    }
+async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
+    // The production parser binds this role to the dedicated review schema.
+    // Keep the engine fail-closed even when a mock bypasses that parser.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("looks clean"),
+                    items: vec![],
+                    passed: true,
+                    request_attention: false,
+                },
+                artifact: None,
+                model_id: None,
+            })
+        } else {
+            Ok(work_outcome(request, HEAD_SHA))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let AdvanceOutcome::Parked { attention } = outcome else {
+        panic!("expected a park, got {outcome:?}");
+    };
+    assert_eq!(attention[0].id, "terminal_review_failed:mission");
+    assert!(attention[0].report.contains("non-review handoff"));
 }

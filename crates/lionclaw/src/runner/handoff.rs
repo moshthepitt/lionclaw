@@ -10,11 +10,13 @@ use crate::ports::RoleRunFailure;
 
 pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v1";
 pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v1";
+pub const REVIEW_HANDOFF_SCHEMA: &str = "lionclaw.mission.review-handoff.v1";
 pub const PLAN_HANDOFF_SCHEMA: &str = "lionclaw.mission.plan-handoff.v1";
 
 pub fn expected_schema(output: OutputSemantics) -> &'static str {
     match output {
         OutputSemantics::EmitsVerdict => VALIDATE_HANDOFF_SCHEMA,
+        OutputSemantics::EmitsGapVerdict => REVIEW_HANDOFF_SCHEMA,
         OutputSemantics::ProposesPlan => PLAN_HANDOFF_SCHEMA,
         // A report role hands back a plain work handoff (prose, no proposal).
         OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact => WORK_HANDOFF_SCHEMA,
@@ -26,9 +28,7 @@ pub fn expected_schema(output: OutputSemantics) -> &'static str {
 const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Typed gaps land inline in the event log (only `PayloadRef`s externalize
-/// to blobs), so cap them well under the file cap — for EVERY validate
-/// handoff, not just the terminal review's (this parse is the one choke
-/// point they all cross).
+/// to blobs), so cap them well under the file cap.
 const MAX_GAPS_BYTES: usize = 256 * 1024;
 
 /// Read and validate the handoff file for a finished role run.
@@ -93,7 +93,7 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
     }
     let handoff: Handoff = serde_json::from_value(value)
         .map_err(|err| invalid(format!("handoff does not match '{expected}': {err}")))?;
-    if let Handoff::Validate { gaps, .. } = &handoff {
+    if let Handoff::Review { gaps, .. } = &handoff {
         let gaps_bytes = serde_json::to_vec(gaps)
             .map_err(|err| invalid(format!("gaps are not serializable: {err}")))?
             .len();
@@ -126,6 +126,7 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
     let tag_ok = matches!(
         (&handoff, output),
         (Handoff::Validate { .. }, OutputSemantics::EmitsVerdict)
+            | (Handoff::Review { .. }, OutputSemantics::EmitsGapVerdict)
             | (Handoff::Plan { .. }, OutputSemantics::ProposesPlan)
             | (
                 Handoff::Work { .. },
@@ -219,41 +220,69 @@ mod tests {
     }
 
     #[test]
-    fn parses_validate_handoff_with_gaps_and_nonce() {
-        use crate::model::GapSeverity;
+    fn ordinary_validate_handoff_rejects_terminal_review_fields() {
         let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
+                      "done":true,"report":{"kind":"inline","text":"checked"},
+                      "items":[],"passed":true,"request_attention":false,
+                      "nonce":"terminal-only","gaps":[]}"#;
+        let err = parse_handoff(raw, OutputSemantics::EmitsVerdict)
+            .expect_err("terminal-review fields must not enter a validator handoff");
+        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+    }
+
+    #[test]
+    fn parses_review_handoff_with_gaps_and_nonce() {
+        use crate::model::GapSeverity;
+        let raw = r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
                       "done":true,"report":{"kind":"inline","text":"map"},
-                      "items":[],"passed":false,"nonce":"n-1",
+                      "passed":false,"nonce":"n-1",
                       "gaps":[{"severity":"blocking",
                                "requirement":"starts up",
                                "expected":"prints usage",
                                "observed":"panics",
-                               "evidence":"cargo run -> panic"}],
-                      "request_attention":false}"#;
-        let handoff = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect("parse");
-        let Handoff::Validate { gaps, nonce, .. } = handoff else {
-            panic!("expected validate handoff");
+                               "evidence":"cargo run -> panic"}]}"#;
+        let handoff = parse_handoff(raw, OutputSemantics::EmitsGapVerdict).expect("parse");
+        let Handoff::Review { gaps, nonce, .. } = handoff else {
+            panic!("expected review handoff");
         };
-        assert_eq!(nonce.as_deref(), Some("n-1"));
+        assert_eq!(nonce, "n-1");
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].severity, GapSeverity::Blocking);
     }
 
     #[test]
-    fn oversized_gaps_are_rejected_for_every_validate_handoff() {
-        // Regression (QA round 1): typed gaps land inline in the event log,
-        // so the cap must hold at this parse — the one choke point every
-        // validate handoff crosses — not just on the terminal-review path.
+    fn review_handoff_rejects_validator_fields_and_requires_a_nonce() {
+        for raw in [
+            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
+                "done":true,"report":{"kind":"inline","text":"map"},
+                "items":[],"passed":true,"nonce":"n-1","gaps":[]}"#,
+            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
+                "done":true,"report":{"kind":"inline","text":"map"},
+                "passed":true,"request_attention":false,"nonce":"n-1","gaps":[]}"#,
+            r#"{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
+                "done":true,"report":{"kind":"inline","text":"map"},
+                "passed":true,"gaps":[]}"#,
+        ] {
+            let err = parse_handoff(raw, OutputSemantics::EmitsGapVerdict)
+                .expect_err("review and validator contracts must stay disjoint");
+            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        }
+    }
+
+    #[test]
+    fn oversized_review_gaps_are_rejected() {
+        // Typed gaps land inline in the event log, so the terminal-review
+        // parser caps them before they can reach an event.
         let evidence = "x".repeat(300 * 1024);
         let raw = format!(
-            r#"{{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
+            r#"{{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
                 "done":true,"report":{{"kind":"inline","text":""}},
-                "items":[],"passed":false,
+                "passed":false,"nonce":"n-1",
                 "gaps":[{{"severity":"blocking","requirement":"r",
-                         "expected":"e","observed":"o","evidence":"{evidence}"}}],
-                "request_attention":false}}"#
+                         "expected":"e","observed":"o","evidence":"{evidence}"}}]
+                }}"#
         );
-        let err = parse_handoff(&raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
+        let err = parse_handoff(&raw, OutputSemantics::EmitsGapVerdict).expect_err("must refuse");
         assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
         assert!(err.detail.contains("cite short excerpts"));
     }
@@ -273,12 +302,12 @@ mod tests {
             r#"{"severity":"blocking","requirement":"","expected":"e","observed":"o","evidence":"v"}"#,
         ] {
             let raw = format!(
-                r#"{{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
+                r#"{{"schema":"lionclaw.mission.review-handoff.v1","type":"review",
                     "done":true,"report":{{"kind":"inline","text":""}},
-                    "items":[],"passed":false,"gaps":[{gap_json}],
-                    "request_attention":false}}"#
+                    "passed":false,"nonce":"n-1","gaps":[{gap_json}]}}"#
             );
-            let err = parse_handoff(&raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
+            let err =
+                parse_handoff(&raw, OutputSemantics::EmitsGapVerdict).expect_err("must refuse");
             assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
         }
     }

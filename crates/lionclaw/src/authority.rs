@@ -110,6 +110,7 @@ pub fn compile_authority(
         OutputSemantics::ProducesArtifact => WorkspaceAccess::ReadWrite,
         OutputSemantics::ProducesReport
         | OutputSemantics::EmitsVerdict
+        | OutputSemantics::EmitsGapVerdict
         | OutputSemantics::ProposesPlan => WorkspaceAccess::ReadOnly,
     };
     if role.secrets && role.output != OutputSemantics::ProducesArtifact {
@@ -391,6 +392,7 @@ mod tests {
         for output in [
             OutputSemantics::ProducesReport,
             OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
             OutputSemantics::ProposesPlan,
         ] {
             let authority = compile_authority(&role(output, false), &ceiling).expect("read-only");
@@ -404,14 +406,19 @@ mod tests {
 
     #[test]
     fn judge_requesting_secrets_refuses_to_compile() {
-        let err = compile_authority(
-            &role(OutputSemantics::EmitsVerdict, true),
-            &AuthorityCeiling {
-                allow_secrets: true,
-            },
-        )
-        .expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
+        for output in [
+            OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
+        ] {
+            let err = compile_authority(
+                &role(output, true),
+                &AuthorityCeiling {
+                    allow_secrets: true,
+                },
+            )
+            .expect_err("must refuse");
+            assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
+        }
     }
 
     #[test]

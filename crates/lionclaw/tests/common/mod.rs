@@ -81,7 +81,7 @@ pub fn review_mission_type() -> MissionType {
         gap_reviewer.clone(),
         RoleDefinition {
             name: gap_reviewer.clone(),
-            output: OutputSemantics::EmitsVerdict,
+            output: OutputSemantics::EmitsGapVerdict,
             runtime: None,
             network: false,
             secrets: false,

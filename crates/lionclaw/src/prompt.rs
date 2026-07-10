@@ -138,6 +138,7 @@ fn skeleton(output: OutputSemantics) -> &'static str {
     match output {
         OutputSemantics::ProducesArtifact => PRODUCES_ARTIFACT_SKELETON,
         OutputSemantics::EmitsVerdict => EMITS_VERDICT_SKELETON,
+        OutputSemantics::EmitsGapVerdict => TERMINAL_REVIEW_SKELETON,
         OutputSemantics::ProducesReport => PRODUCES_REPORT_SKELETON,
         OutputSemantics::ProposesPlan => PROPOSES_PLAN_SKELETON,
     }
@@ -204,25 +205,23 @@ Before finalizing, self-check both ways:
   preference or speculation.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
-   {\"schema\": \"lionclaw.mission.validate-handoff.v1\",
-    \"type\": \"validate\",
+   {\"schema\": \"lionclaw.mission.review-handoff.v1\",
+    \"type\": \"review\",
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<your requirement map, what you ran, what you observed>\"},
-    \"items\": [],
     \"passed\": false,
     \"nonce\": \"<the nonce given below>\",
     \"gaps\": [{\"severity\": \"blocking\",
               \"requirement\": \"<requirement from your map>\",
               \"expected\": \"<what the objective requires>\",
               \"observed\": \"<what you observed instead>\",
-              \"evidence\": \"<commands run and output seen, or file paths>\"}],
-    \"request_attention\": false}
+              \"evidence\": \"<commands run and output seen, or file paths>\"}]}
 Set passed=true ONLY if there is no blocking gap; list every gap you found
 at every severity (\"gaps\": [] with passed=true is a clean review). Leave
-\"items\" empty — you have no per-assertion contract. Copy the handoff nonce
-from the end of this prompt into the \"nonce\" field exactly. Set done=false
-only if you could not complete the review itself. Exiting without writing
-this file fails the attempt.
+the per-assertion validator fields out — you have no assertion contract.
+Copy the handoff nonce from the end of this prompt into the \"nonce\" field
+exactly. Set done=false only if you could not complete the review itself.
+Exiting without writing this file fails the attempt.
 Your verdict is advisory: it gates closure and routes the mission to a
 human; it can never mark the mission verified.";
 
@@ -343,7 +342,7 @@ mod tests {
         // Regression (QA round 1): the assembler appends its nonce section
         // LAST; an objective that happens to contain the heading text must
         // not shadow the real nonce.
-        let role = role(OutputSemantics::EmitsVerdict);
+        let role = role(OutputSemantics::EmitsGapVerdict);
         let prompt = assemble_terminal_review_prompt(
             &role,
             &TerminalReviewPromptContext {

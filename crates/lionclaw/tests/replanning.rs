@@ -77,8 +77,6 @@ fn review(report_style: bool, passed: bool, request_attention: bool) -> RoleRunO
             items,
             passed,
             request_attention,
-            gaps: vec![],
-            nonce: None,
         },
         artifact: None,
         model_id: None,

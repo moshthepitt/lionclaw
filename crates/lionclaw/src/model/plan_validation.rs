@@ -489,7 +489,9 @@ fn check_shape(
                 let compatible = match output {
                     OutputSemantics::ProducesArtifact => task.kind == TaskKind::Work,
                     OutputSemantics::EmitsVerdict => task.kind == TaskKind::Validate,
-                    OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan => false,
+                    OutputSemantics::ProducesReport
+                    | OutputSemantics::EmitsGapVerdict
+                    | OutputSemantics::ProposesPlan => false,
                 };
                 if !compatible {
                     errors.push(err(

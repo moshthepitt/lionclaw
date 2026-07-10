@@ -564,6 +564,7 @@ mod slug_tests {
             OutputSemantics::ProducesReport,
             OutputSemantics::ProducesArtifact,
             OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
             OutputSemantics::ProposesPlan,
         ] {
             assert_slug(&o, o.slug());

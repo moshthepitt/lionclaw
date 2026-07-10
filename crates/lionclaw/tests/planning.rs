@@ -143,9 +143,10 @@ fn planning_runner() -> MockRoleRunner {
                 items: vec![],
                 passed: true,
                 request_attention: false,
-                gaps: vec![],
-                nonce: None,
             },
+            OutputSemantics::EmitsGapVerdict => {
+                panic!("terminal-review roles are never plan tasks")
+            }
         };
         let artifact =
             (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {

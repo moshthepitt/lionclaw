@@ -71,8 +71,6 @@ async fn advisory_only_mission_type_never_verifies() {
                 }],
                 passed: true,
                 request_attention: false,
-                gaps: vec![],
-                nonce: None,
             }
         } else {
             Handoff::Work {

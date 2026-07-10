@@ -39,7 +39,7 @@ pub enum StepDecision {
     /// Run engine oracles (parallelizable).
     RunOracles(Vec<OracleDispatchIntent>),
     /// Dispatch the closing terminal review: the config-declared
-    /// `emits-verdict` role, fresh-context and contract-blind (the intent
+    /// `emits-gap-verdict` role, fresh-context and contract-blind (the intent
     /// carries no targets and no task body by construction).
     ReviewTerminal(TerminalReviewDispatchIntent),
 }
