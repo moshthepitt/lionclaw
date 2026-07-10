@@ -17,7 +17,7 @@ use super::{
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{
         map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkMode,
-        RuntimeAuthKind,
+        RuntimeAuthKind, INHERITED_SKILLS_MOUNT_TARGET_ROOT,
     },
     process::{
         run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
@@ -26,7 +26,7 @@ use super::{
     runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
-use crate::RuntimeSecretsMount;
+use crate::{project_runtime_skills, RuntimeSecretsMount};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
@@ -124,6 +124,7 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
+        project_runtime_skills(&request.plan).await?;
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let runtime_auth_environment = prepare_runtime_auth(&request).await?;
         let prepared = prepare_oci_process_launch(
@@ -141,6 +142,7 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 
     async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        project_runtime_skills(&request.plan).await?;
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let runtime_auth_environment = prepare_runtime_auth(&request).await?;
         let prepared = prepare_oci_process_launch(
@@ -178,6 +180,7 @@ async fn execute_oci_process<F>(
 where
     F: FnMut(&str) -> Result<()> + Send,
 {
+    project_runtime_skills(&request.plan).await?;
     let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
     let runtime_auth_environment = prepare_runtime_auth(&request).await?;
     let prepared = prepare_oci_process_launch(
@@ -829,6 +832,7 @@ fn bind_mount_relabel(mount: &MountSpec) -> BindMountRelabel {
         || mount_target_is_or_under(&mount.target, RUNTIME_HOME_MOUNT_TARGET)
         || mount.target == DRAFTS_MOUNT_TARGET
         || mount_target_is_or_under(&mount.target, SKILLS_MOUNT_TARGET_ROOT)
+        || mount_target_is_or_under(&mount.target, INHERITED_SKILLS_MOUNT_TARGET_ROOT)
     {
         return BindMountRelabel::Shared;
     }
@@ -1209,6 +1213,7 @@ mod tests {
             "/workspace",
             "/drafts",
             "/lionclaw/skills/loopback",
+            "/lionclaw/inherited-skills/0/human-skill",
         ] {
             let mount = MountSpec {
                 source: "/host/shared".into(),

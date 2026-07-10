@@ -1,7 +1,7 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants plus the re-planning/amendment invariant (five
-//! numbered checks). Hermetic and model-auth-free — the *oracle*
+//! four Slice-1 invariants, the re-planning/amendment invariant, and native
+//! skill projection (six numbered checks). Hermetic and model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
 //!
@@ -21,7 +21,7 @@ use crate::authority::{
     compile_authority, compile_role_plan, oracle_authority, AuthorityCeiling, CompiledAuthority,
     MissionMounts, RolePlanRequest,
 };
-use crate::config::MissionRuntimeProfile;
+use crate::config::RuntimeProfiles;
 use crate::engine::{AmendError, Engine};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
@@ -105,7 +105,7 @@ pub async fn run(json: bool) -> Result<ExitCode> {
         status: to_status(check_replanning().await),
     });
 
-    // (1),(2),(4) need real confinement.
+    // (1),(2),(4),(6) need real confinement.
     for (name, runtime_check) in runtime_checks() {
         let status = match &podman {
             Ok(()) => to_status(runtime_check().await),
@@ -130,6 +130,9 @@ fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
         }),
         ("confinement-read-only-workspace-erofs", || {
             Box::pin(check_confinement_erofs())
+        }),
+        ("runtime-native-skill-projection", || {
+            Box::pin(check_runtime_skill_projection())
         }),
     ]
 }
@@ -428,12 +431,13 @@ async fn run_confined_sh(
     script: &str,
 ) -> Result<ExecutionOutput> {
     // No mission type in this probe, so set the image directly.
-    let mut profile = MissionRuntimeProfile::codex_default();
+    let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
     let compiled = compile_role_plan(RolePlanRequest {
         authority,
         runtime_id: "codex".to_string(),
         confinement: profile.confinement.clone(),
+        skill_projection: None,
         mounts: MissionMounts {
             workspace: MountSpec {
                 source: workspace_source.to_path_buf(),
@@ -472,7 +476,7 @@ async fn build_engine(
         .map_err(|e| anyhow::anyhow!("mission type load failed: {e}"))?;
     let store = MissionStore::open(repo).await?;
     workspace::ensure_excluded(repo).await?;
-    let mut profile = MissionRuntimeProfile::codex_default();
+    let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     let image = mission_type.image.clone();
     profile.confinement.oci_mut().image = Some(image.clone());
     Ok(Engine::new(
@@ -489,7 +493,7 @@ async fn build_engine(
     ))
 }
 
-// ---- The five checks ----
+// ---- The six checks ----
 
 /// (1) A real writable worker fixes a broken tree in a container; its commit
 /// lands and the engine records it (`current_sha` advances); the real oracle
@@ -748,6 +752,96 @@ async fn check_confinement_erofs() -> Result<()> {
     // And corroborate the reason is the read-only mount.
     if !(stderr.contains("read-only file system") || stderr.contains("permission denied")) {
         anyhow::bail!("write was denied but not by the read-only mount: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// (6) Mission and human-installed skills are mounted read-only and projected
+/// into their configured harness-native directories before the real container
+/// process starts.
+async fn check_runtime_skill_projection() -> Result<()> {
+    let workspace = tempfile::tempdir().context("tempdir")?;
+    let runtime_home = tempfile::tempdir().context("tempdir")?;
+    let skill = tempfile::tempdir().context("tempdir")?;
+    let inherited_root = tempfile::tempdir().context("tempdir")?;
+    let inherited_skill = inherited_root.path().join("human-probe");
+    std::fs::create_dir(&inherited_skill).context("creating inherited skill probe")?;
+    std::fs::write(skill.path().join("SKILL.md"), "mission-skill-probe\n")
+        .context("writing skill probe")?;
+    std::fs::write(inherited_skill.join("SKILL.md"), "human-skill-probe\n")
+        .context("writing inherited skill probe")?;
+
+    let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
+    profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
+    let mut projection =
+        lionclaw_confinement::RuntimeSkillProjectionConfig::native_dir(".agents/skills");
+    projection
+        .inherited_roots_mut()
+        .push(lionclaw_confinement::InheritedSkillRoot {
+            source: inherited_root.path().to_path_buf(),
+            target: ".codex/skills".to_string(),
+            optional: false,
+        });
+    let mut extras = vec![
+        MountSpec {
+            source: runtime_home.path().to_path_buf(),
+            target: lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
+            access: MountAccess::ReadWrite,
+        },
+        MountSpec {
+            source: skill.path().to_path_buf(),
+            target: lionclaw_confinement::skill_mount_target("mission-probe"),
+            access: MountAccess::ReadOnly,
+        },
+    ];
+    extras.extend(lionclaw_confinement::inherited_skill_mounts(Some(
+        &projection,
+    ))?);
+    let authority = oracle_authority("skill-projection-probe");
+    let judged_roots = [workspace.path().to_path_buf()];
+    let compiled = compile_role_plan(RolePlanRequest {
+        authority: &authority,
+        runtime_id: "skill-projection-probe".to_string(),
+        confinement: profile.confinement,
+        skill_projection: Some(projection),
+        mounts: MissionMounts {
+            workspace: MountSpec {
+                source: workspace.path().to_path_buf(),
+                target: WORKSPACE_MOUNT_TARGET.to_string(),
+                access: MountAccess::ReadOnly,
+            },
+            extras,
+        },
+        judged_roots: &judged_roots,
+        environment: vec![(
+            "HOME".to_string(),
+            lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
+        )],
+        hard_timeout: Duration::from_secs(120),
+    })
+    .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
+    let mut executor =
+        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+    let output = executor
+        .execute_captured(RuntimeProgramSpec {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "test -L \"$HOME/.agents/skills/mission-probe\" && test \"$(cat \"$HOME/.agents/skills/mission-probe/SKILL.md\")\" = mission-skill-probe && test -L \"$HOME/.codex/skills/human-probe\" && test \"$(cat \"$HOME/.codex/skills/human-probe/SKILL.md\")\" = human-skill-probe"
+                    .to_string(),
+            ],
+            environment: Vec::new(),
+            stdin: String::new(),
+            auth: None,
+        })
+        .await
+        .context("running skill projection probe")?;
+    if output.exit_code != Some(0) {
+        anyhow::bail!(
+            "skill projection probe failed (exit {:?}): {}",
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }

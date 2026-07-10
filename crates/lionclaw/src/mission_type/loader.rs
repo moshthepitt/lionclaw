@@ -9,7 +9,9 @@ use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{OracleName, RoleName, StopBar};
 
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
-use super::{MissionType, RoleDefinition};
+use super::manifest::{is_path_safe_name, ManifestFile, MISSION_LOCK_FILE};
+use super::skills::{load_skills, package_files};
+use super::{MissionType, RoleDefinition, SkillPackage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionTypeError {
@@ -30,28 +32,10 @@ pub enum MissionTypeError {
     },
     #[error("oracle '{oracle}' is invalid: {detail}")]
     Oracle { oracle: String, detail: String },
+    #[error("skill '{skill}' is invalid: {detail}")]
+    Skill { skill: String, detail: String },
     #[error("mission type at '{0}' has no roles")]
     NoRoles(PathBuf),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestFile {
-    #[serde(rename = "mission-type")]
-    mission_type: ManifestMissionType,
-    /// The optional planning DAG (`[planning]`). Absent ⇒ no in-engine planning.
-    #[serde(default)]
-    planning: crate::model::PlanningDag,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestMissionType {
-    name: String,
-    stop: String,
-    /// The confinement image every role and oracle runs in; carries this
-    /// domain's toolchain. Required — the engine ships no default image.
-    image: String,
 }
 
 pub fn load_mission_type(
@@ -62,7 +46,7 @@ pub fn load_mission_type(
     let manifest_text = read(&manifest_path)?;
     let manifest: ManifestFile = toml::from_str(&manifest_text)
         .map_err(|e| MissionTypeError::Manifest(format!("{manifest_path:?}: {e}")))?;
-    if !is_path_safe(&manifest.mission_type.name) {
+    if !is_path_safe_name(&manifest.mission_type.name) {
         return Err(MissionTypeError::Manifest(format!(
             "mission type name '{}' is not path-safe",
             manifest.mission_type.name
@@ -78,14 +62,15 @@ pub fn load_mission_type(
         }
     };
 
+    let skills = load_skills(root, &manifest.skills)?;
     let oracles = load_oracles(&root.join("oracles"))?;
-    let roles = load_roles(&root.join("roles"), ceiling)?;
+    let roles = load_roles(&root.join("roles"), ceiling, &skills)?;
     if roles.is_empty() {
         return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
 
     let playbook = read(&root.join("playbook.md")).ok();
-    let digest = compute_digest(root)?;
+    let digest = compute_digest(root, &skills)?;
 
     let mission_type = MissionType {
         name: manifest.mission_type.name,
@@ -95,6 +80,7 @@ pub fn load_mission_type(
         planning: manifest.planning,
         playbook,
         roles,
+        skills,
         oracles,
     };
     // Validate the planning DAG fail-closed at load against this type's own
@@ -117,6 +103,7 @@ pub fn load_mission_type(
 fn load_roles(
     dir: &Path,
     ceiling: &AuthorityCeiling,
+    packages: &BTreeMap<String, SkillPackage>,
 ) -> Result<BTreeMap<RoleName, RoleDefinition>, MissionTypeError> {
     let mut roles = BTreeMap::new();
     if !dir.exists() {
@@ -150,13 +137,26 @@ fn load_roles(
             role: stem.to_string(),
             detail: e,
         })?;
-        // Skill projection is not wired yet; fail closed so an author can't
-        // declare a silently-ignored capability.
-        if !skills.is_empty() {
-            return Err(MissionTypeError::Role {
-                role: stem.to_string(),
-                detail: "skills projection is not supported yet".to_string(),
-            });
+        let mut seen_skills = std::collections::BTreeSet::new();
+        for skill in &skills {
+            lionclaw_confinement::validate_skill_alias(skill).map_err(|err| {
+                MissionTypeError::Role {
+                    role: stem.to_string(),
+                    detail: err.to_string(),
+                }
+            })?;
+            if !seen_skills.insert(skill) {
+                return Err(MissionTypeError::Role {
+                    role: stem.to_string(),
+                    detail: format!("declares skill '{skill}' more than once"),
+                });
+            }
+            if !packages.contains_key(skill) {
+                return Err(MissionTypeError::Role {
+                    role: stem.to_string(),
+                    detail: format!("references undeclared skill '{skill}'"),
+                });
+            }
         }
         let role = RoleDefinition {
             name: name.clone(),
@@ -164,6 +164,7 @@ fn load_roles(
             runtime,
             network,
             secrets,
+            skills,
             prompt_body,
         };
         // Fail-closed moat check at load time: an authority that cannot
@@ -239,16 +240,6 @@ fn has_shebang(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_path_safe(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 fn read(path: &Path) -> Result<String, MissionTypeError> {
     std::fs::read_to_string(path).map_err(|source| MissionTypeError::Io {
         path: path.to_path_buf(),
@@ -263,13 +254,14 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, MissionTypeError> {
     })
 }
 
-/// A content digest over everything the loader consumes: `mission.toml`,
-/// `playbook.md` (if present), and every `roles/*` and `oracles/*` file, in a
-/// deterministic order, each contributing its relative path, bytes, and — for
-/// oracles — its executable bit. Verified on every engine open, so a mutated
-/// role or oracle (the fake-green vector) is caught. Umask-insensitive: only an
-/// oracle's exec bit is hashed, not raw file modes.
-fn compute_digest(root: &Path) -> Result<String, MissionTypeError> {
+/// A content digest over everything the loader consumes: manifest, optional
+/// lock/playbook, roles, oracles, and each resolved skill package recursively.
+/// Entries contribute logical path, bytes, and executable bit. Verified on
+/// every engine open, so mutated mission behavior is caught.
+fn compute_digest(
+    root: &Path,
+    skills: &BTreeMap<String, SkillPackage>,
+) -> Result<String, MissionTypeError> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut feed = |rel: &str, bytes: &[u8], exec: bool| {
@@ -284,6 +276,9 @@ fn compute_digest(root: &Path) -> Result<String, MissionTypeError> {
         &read_bytes(&root.join("mission.toml"))?,
         false,
     );
+    if let Ok(lock) = std::fs::read(root.join(MISSION_LOCK_FILE)) {
+        feed(MISSION_LOCK_FILE, &lock, false);
+    }
     if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
         feed("playbook.md", &playbook, false);
     }
@@ -296,6 +291,18 @@ fn compute_digest(root: &Path) -> Result<String, MissionTypeError> {
             let path = entry.path();
             let rel = format!("{subdir}/{}", entry.file_name().to_string_lossy());
             feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
+        }
+    }
+    for (name, package) in skills {
+        for path in package_files(name, &package.root)? {
+            let relative =
+                path.strip_prefix(&package.root)
+                    .map_err(|_| MissionTypeError::Skill {
+                        skill: name.clone(),
+                        detail: format!("package entry '{}' escaped its root", path.display()),
+                    })?;
+            let logical = format!("skills/{name}/{}", relative.to_string_lossy());
+            feed(&logical, &read_bytes(&path)?, is_executable(&path));
         }
     }
     Ok(hex::encode(hasher.finalize()))

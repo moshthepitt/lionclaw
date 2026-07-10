@@ -7,14 +7,19 @@
 //! ├─ mission.toml            # identity + the honesty bar (stop)
 //! ├─ playbook.md             # the method (optional)
 //! ├─ roles/<name>.md         # frontmatter (output, network, secrets, runtime) + prompt
+//! ├─ skills/<name>/SKILL.md   # optional role skills and their resources
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
 mod frontmatter;
 mod home;
+mod install;
 mod loader;
+mod manifest;
+mod skills;
 
 pub use home::{bundled_mission_types_dir, Home};
+pub use install::{install_mission_type, materialize_mission_type, InstallOutcome};
 pub use loader::{load_mission_type, MissionTypeError};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,7 +40,16 @@ pub struct RoleDefinition {
     pub runtime: Option<String>,
     pub network: bool,
     pub secrets: bool,
+    /// Mission-owned skills projected for this role. Empty is valid.
+    pub skills: Vec<String>,
     pub prompt_body: String,
+}
+
+/// One resolved Agent Skills package in the loaded mission-type closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackage {
+    pub name: String,
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +66,7 @@ pub struct MissionType {
     pub planning: PlanningDag,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,
+    pub skills: BTreeMap<String, SkillPackage>,
     pub oracles: BTreeMap<OracleName, PathBuf>,
 }
 

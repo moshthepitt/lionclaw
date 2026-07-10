@@ -17,6 +17,7 @@ pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 pub const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
 pub const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
+pub const INHERITED_SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/inherited-skills";
 pub const RUNTIME_INSTALL_ENV_DIR: &str = ".lionclaw";
 pub const RUNTIME_INSTALL_ENV_FILE: &str = "install-env.sh";
 pub const RUNTIME_INSTALL_ENV_PATH: &str = "/runtime/home/.lionclaw/install-env.sh";
@@ -39,7 +40,19 @@ pub enum RuntimeSkillProjectionConfig {
         root: String,
         #[serde(default)]
         format: RuntimeSkillProjectionFormat,
+        /// Existing human-managed skill roots exposed alongside mission skills.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inherit: Vec<InheritedSkillRoot>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct InheritedSkillRoot {
+    pub source: PathBuf,
+    pub target: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl RuntimeSkillProjectionConfig {
@@ -47,6 +60,7 @@ impl RuntimeSkillProjectionConfig {
         let mut projection = Self::NativeDir {
             root: root.into(),
             format: RuntimeSkillProjectionFormat::SkillMd,
+            inherit: Vec::new(),
         };
         projection.normalize();
         projection
@@ -58,17 +72,44 @@ impl RuntimeSkillProjectionConfig {
         }
     }
 
+    pub fn inherited_roots(&self) -> &[InheritedSkillRoot] {
+        match self {
+            Self::NativeDir { inherit, .. } => inherit,
+        }
+    }
+
+    pub fn inherited_roots_mut(&mut self) -> &mut Vec<InheritedSkillRoot> {
+        match self {
+            Self::NativeDir { inherit, .. } => inherit,
+        }
+    }
+
     pub fn normalize(&mut self) {
         match self {
-            Self::NativeDir { root, .. } => {
+            Self::NativeDir { root, inherit, .. } => {
                 *root = normalize_runtime_skill_projection_root(root);
+                for inherited in inherit {
+                    inherited.target = normalize_runtime_skill_projection_root(&inherited.target);
+                }
             }
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::NativeDir { root, .. } => validate_runtime_skill_projection_root(root),
+            Self::NativeDir { root, inherit, .. } => {
+                validate_runtime_skill_projection_root(root)?;
+                for inherited in inherit {
+                    if !inherited.source.is_absolute() {
+                        anyhow::bail!(
+                            "inherited skill source '{}' must be absolute",
+                            inherited.source.display()
+                        );
+                    }
+                    validate_runtime_skill_projection_root(&inherited.target)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -416,8 +457,8 @@ mod tests {
 
     use super::{
         runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
-        ExecutionLimits, ExecutionPreset, InstallPolicy, NetworkMode, OciConfinementConfig,
-        WorkspaceAccess,
+        ExecutionLimits, ExecutionPreset, InheritedSkillRoot, InstallPolicy, NetworkMode,
+        OciConfinementConfig, RuntimeSkillProjectionConfig, WorkspaceAccess,
     };
 
     #[test]
@@ -624,5 +665,24 @@ mod tests {
                 "{root:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn inherited_skill_roots_require_absolute_sources_and_safe_targets() {
+        let mut relative = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
+        relative.inherited_roots_mut().push(InheritedSkillRoot {
+            source: "relative/skills".into(),
+            target: ".native/skills".to_string(),
+            optional: true,
+        });
+        assert!(relative.validate().is_err());
+
+        let mut traversal = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
+        traversal.inherited_roots_mut().push(InheritedSkillRoot {
+            source: "/home/user/skills".into(),
+            target: "../skills".to_string(),
+            optional: true,
+        });
+        assert!(traversal.validate().is_err());
     }
 }

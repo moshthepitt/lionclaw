@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lionclaw_confinement::{MountAccess, MountSpec, WORKSPACE_MOUNT_TARGET};
+use lionclaw_confinement::{
+    inherited_skill_mounts, skill_mount_target, MountAccess, MountSpec, WORKSPACE_MOUNT_TARGET,
+};
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeProgramTurnExecution,
@@ -20,6 +22,7 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::MissionRuntimeProfile;
+use crate::mission_type::SkillPackage;
 use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
 use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
@@ -59,6 +62,22 @@ fn launch(detail: String) -> RoleRunFailure {
         kind: RunErrorKind::Launch,
         detail,
     }
+}
+
+fn role_skill_mounts(
+    skills: &[SkillPackage],
+    projection: Option<&lionclaw_confinement::RuntimeSkillProjectionConfig>,
+) -> anyhow::Result<Vec<MountSpec>> {
+    let mut mounts = skills
+        .iter()
+        .map(|skill| MountSpec {
+            source: skill.root.clone(),
+            target: skill_mount_target(&skill.name),
+            access: MountAccess::ReadOnly,
+        })
+        .collect::<Vec<_>>();
+    mounts.extend(inherited_skill_mounts(projection)?);
+    Ok(mounts)
 }
 
 #[async_trait]
@@ -129,13 +148,18 @@ impl RoleRunner for OciRoleRunner {
                 target: WORKSPACE_MOUNT_TARGET.to_string(),
                 access: workspace_access,
             };
-            let extras = dirs.agent_mounts();
+            let mut extras = dirs.agent_mounts();
+            extras.extend(
+                role_skill_mounts(&request.skills, self.profile.skill_projection.as_ref())
+                    .map_err(|e| launch(format!("failed to resolve inherited skills: {e:#}")))?,
+            );
             let environment = mission_environment(&dirs);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
                 runtime_id: self.profile.name.clone(),
                 confinement: self.profile.confinement.clone(),
+                skill_projection: self.profile.skill_projection.clone(),
                 mounts: MissionMounts {
                     workspace: workspace_mount,
                     extras,
@@ -197,13 +221,27 @@ impl OciRoleRunner {
         plan: lionclaw_confinement::EffectiveExecutionPlan,
     ) -> Result<Option<String>, RoleRunFailure> {
         let driver = self.driver()?;
-        // The auth kind a driver requires is fixed per driver; codex is the
-        // only one that needs host auth synced in.
-        let auth_kind = match driver.auth_provider() {
-            Some(provider) => Some(
-                lionclaw_runtime_api::RuntimeAuthKind::new(provider.kind())
-                    .map_err(|e| launch(format!("invalid auth kind: {e}")))?,
-            ),
+        let auth_kind = match self.profile.auth.as_deref() {
+            Some(configured) => {
+                let provider = driver.auth_provider().ok_or_else(|| {
+                    launch(format!(
+                        "runtime '{}' configures auth '{configured}' but driver '{}' provides no auth broker",
+                        self.profile.name, self.profile.driver
+                    ))
+                })?;
+                if provider.kind() != configured {
+                    return Err(launch(format!(
+                        "runtime '{}' configures auth '{configured}' but driver '{}' provides '{}'",
+                        self.profile.name,
+                        self.profile.driver,
+                        provider.kind()
+                    )));
+                }
+                Some(
+                    lionclaw_runtime_api::RuntimeAuthKind::new(configured)
+                        .map_err(|e| launch(format!("invalid auth kind: {e}")))?,
+                )
+            }
             None => None,
         };
         let config = RuntimeDriverConfig {
@@ -332,4 +370,45 @@ fn uuid_from_key(key: &str) -> uuid::Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lionclaw_confinement::{InheritedSkillRoot, RuntimeSkillProjectionConfig};
+
+    #[test]
+    fn role_skill_mounts_combine_mission_and_inherited_packages_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let inherited_root = temp.path().join("inherited");
+        let inherited_skill = inherited_root.join("human-skill");
+        std::fs::create_dir_all(&inherited_skill).unwrap();
+        std::fs::write(inherited_skill.join("SKILL.md"), "fixture").unwrap();
+        let mut projection = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
+        projection.inherited_roots_mut().push(InheritedSkillRoot {
+            source: inherited_root,
+            target: ".native/skills".to_string(),
+            optional: false,
+        });
+
+        let mounts = role_skill_mounts(
+            &[SkillPackage {
+                name: "mission-skill".to_string(),
+                root: temp.path().join("mission-skill"),
+            }],
+            Some(&projection),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts
+            .iter()
+            .all(|mount| mount.access == MountAccess::ReadOnly));
+        assert!(mounts
+            .iter()
+            .any(|mount| mount.target == "/lionclaw/skills/mission-skill"));
+        assert!(mounts
+            .iter()
+            .any(|mount| { mount.target == "/lionclaw/inherited-skills/0/human-skill" }));
+    }
 }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::mission_type::RoleDefinition;
+use crate::mission_type::{RoleDefinition, SkillPackage};
 use crate::model::{ArtifactOutcome, Handoff, MissionId, OracleName, RunErrorKind, TaskId};
 
 /// One full autonomous agent run — the engine never micromanages how a role
@@ -28,6 +28,8 @@ pub struct RoleRunRequest {
     pub attempt_no: u32,
     pub idempotency_key: String,
     pub role: RoleDefinition,
+    /// Mission-owned skill packages resolved from the pinned mission type.
+    pub skills: Vec<SkillPackage>,
     /// Fully assembled prompt (already persisted in the request event).
     pub prompt: String,
     /// Commit the role's workspace is created at.

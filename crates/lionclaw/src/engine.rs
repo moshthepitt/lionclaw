@@ -512,12 +512,23 @@ impl Engine {
             ));
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
+        let mut skills = Vec::with_capacity(role.skills.len());
+        for name in &role.skills {
+            let Some(package) = self.mission_type.skills.get(name) else {
+                return Ok(failed(
+                    RunErrorKind::Launch,
+                    format!("role '{role_name}' references missing skill '{name}'"),
+                ));
+            };
+            skills.push(package.clone());
+        }
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
             attempt_no,
             idempotency_key: idempotency_key.to_string(),
             role: role.clone(),
+            skills,
             prompt: prompt_text,
             base_sha: base_sha.to_string(),
             workspace_dir: state.workspace_dir.clone().into(),

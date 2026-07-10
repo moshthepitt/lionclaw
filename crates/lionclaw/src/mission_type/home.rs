@@ -47,6 +47,11 @@ impl Home {
         self.mission_types_dir().join(name)
     }
 
+    /// User-configured runtime profiles. Missing means built-in defaults.
+    pub fn runtimes_file(&self) -> PathBuf {
+        self.root.join("runtimes.toml")
+    }
+
     /// Installed mission-type names, sorted. Empty (not an error) before the
     /// first `install`.
     pub fn installed_mission_types(&self) -> Result<Vec<String>> {

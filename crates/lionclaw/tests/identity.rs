@@ -73,6 +73,44 @@ fn the_digest_tracks_role_and_oracle_content() {
     assert_ne!(base, digest(), "a mutated oracle must change the digest");
 }
 
+#[test]
+fn the_digest_tracks_recursive_skill_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("digest-test");
+    write_minimal_type(&root);
+    std::fs::create_dir_all(root.join("skills/rust/references")).unwrap();
+    std::fs::write(
+        root.join("skills/rust/SKILL.md"),
+        "---\nname: rust\ndescription: Rust.\n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("skills/rust/references/guide.md"), "first\n").unwrap();
+    std::fs::write(
+        root.join("mission.toml"),
+        "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roles/implementer.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let digest = || {
+        load_mission_type(&root, &AuthorityCeiling::default())
+            .expect("loads")
+            .digest
+    };
+    let base = digest();
+    std::fs::write(root.join("skills/rust/references/guide.md"), "second\n").unwrap();
+    assert_ne!(
+        base,
+        digest(),
+        "nested skill resources must change the digest"
+    );
+}
+
 #[tokio::test]
 async fn opening_a_mission_whose_type_digest_changed_is_refused() {
     let dir = tempfile::tempdir().unwrap();

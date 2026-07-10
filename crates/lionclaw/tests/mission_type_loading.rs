@@ -58,9 +58,38 @@ fn writable_judge_mission_type_refuses_to_load() {
 }
 
 #[test]
-fn role_declaring_skills_is_rejected_at_load() {
-    // Skill projection isn't wired; a declared skill must fail closed rather
-    // than be a silent no-op.
+fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();
+    std::fs::write(
+        dir.path().join("skills/rust/SKILL.md"),
+        "---\nname: rust\ndescription: Work effectively in Rust.\n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+    let mission_type =
+        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
+    let role = mission_type.roles.values().next().expect("worker role");
+    assert_eq!(role.skills, ["rust"]);
+    assert_eq!(
+        mission_type.skills.get("rust").expect("rust package").root,
+        dir.path().join("skills/rust")
+    );
+}
+
+#[test]
+fn role_referencing_an_undeclared_skill_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
@@ -70,12 +99,102 @@ fn role_declaring_skills_is_rejected_at_load() {
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
     std::fs::write(
         dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [missing]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("undeclared skill 'missing'")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_symlinked_skill_package_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let external = tempfile::tempdir().expect("external skill");
+    std::fs::write(
+        external.path().join("SKILL.md"),
+        "---\nname: rust\ndescription: Rust.\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join("skills/rust")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
         "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
+
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
-        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("skills")),
+        matches!(&err, MissionTypeError::Skill { detail, .. } if detail.contains("symlink")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn skill_frontmatter_name_must_match_the_declared_package() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+         \n[skills.expected]\nsource = { path = \"skills/expected\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::create_dir_all(dir.path().join("skills/expected")).unwrap();
+    std::fs::write(
+        dir.path().join("skills/expected/SKILL.md"),
+        "---\nname: different\ndescription: Wrong name.\n---\n\n# Instructions\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [expected]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Skill { detail, .. } if detail.contains("must match")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn duplicate_role_skill_references_are_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();
+    std::fs::write(
+        dir.path().join("skills/rust/SKILL.md"),
+        "---\nname: rust\ndescription: Rust.\n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust, rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("more than once")),
         "got {err:?}"
     );
 }
