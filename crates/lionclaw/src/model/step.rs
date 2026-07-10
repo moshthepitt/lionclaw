@@ -791,30 +791,14 @@ mod tests {
     // --- terminal review: the closing dispatch ---
 
     fn created_with_review(base_sha: &str) -> MissionEvent {
-        let MissionEvent::MissionCreated {
-            objective,
-            mission_type,
-            runtime,
-            image_id,
-            workspace_dir,
-            base_sha,
-            mut config,
-        } = created(base_sha)
-        else {
+        let mut event = created(base_sha);
+        let MissionEvent::MissionCreated { config, .. } = &mut event else {
             unreachable!("created() builds MissionCreated");
         };
         config.terminal_review = Some(crate::model::event::TerminalReviewConfig {
             role: rname("gap-reviewer"),
         });
-        MissionEvent::MissionCreated {
-            objective,
-            mission_type,
-            runtime,
-            image_id,
-            workspace_dir,
-            base_sha,
-            config,
-        }
+        event
     }
 
     fn review_requested(attempt_no: u32, key: &str, judged_sha: &str) -> MissionEvent {

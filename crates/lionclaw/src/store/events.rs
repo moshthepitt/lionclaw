@@ -177,10 +177,11 @@ impl MissionStore {
     /// definition, absent from `inflight`.
     ///
     /// Reproducible effects (oracles) reseed as `queued` — a re-run is safe.
-    /// A role run reseeds as an **expired lease**: the
-    /// "an attempt was started" fact is otherwise ledger-only, and losing it
-    /// would let a rebuild re-invoke the LLM. An expired lease makes reconcile
-    /// synthesize failure instead (never re-run a possibly-already-run LLM).
+    /// An LLM turn (a role run or the terminal review) reseeds as an
+    /// **expired lease**: the "an attempt was started" fact is otherwise
+    /// ledger-only, and losing it would let a rebuild re-invoke the LLM. An
+    /// expired lease makes reconcile synthesize failure instead (never re-run
+    /// a possibly-already-run LLM).
     pub async fn reseed_effects(
         &self,
         state: &crate::model::MissionState,
@@ -190,8 +191,11 @@ impl MissionStore {
         for (key, effect) in &state.inflight {
             let request_json = serde_json::to_string(effect)?;
             let source_seq = inflight_source_seq(effect);
-            let is_role_run = matches!(effect, InflightEffect::RoleRun { .. });
-            if is_role_run {
+            let is_llm_turn = matches!(
+                effect,
+                InflightEffect::RoleRun { .. } | InflightEffect::TerminalReview { .. }
+            );
+            if is_llm_turn {
                 sqlx::query(
                     "INSERT INTO mission_effects
                          (effect_id, mission_id, source_seq, kind, request_json, status,

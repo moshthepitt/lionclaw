@@ -226,7 +226,7 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
     use lionclaw::ports::RoleRunOutcome;
     let reviews = std::sync::Mutex::new(0usize);
     MockRoleRunner::new(Box::new(move |request| {
-        if request.task_id.as_str() == "terminal-review" {
+        if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
             let mut seen = reviews.lock().expect("lock");
             let (passed, gaps) = verdicts[(*seen).min(verdicts.len() - 1)].clone();
             *seen += 1;

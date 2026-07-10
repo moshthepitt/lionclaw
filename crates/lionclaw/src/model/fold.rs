@@ -15,8 +15,8 @@ use super::ids::{AssertionId, OracleName, TaskId};
 use super::plan::{Assertion, PlanSubmission};
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, ReviewAcceptance, ReviewOutcome, TaskRuntimeState, TaskStatus,
-    TerminalReviewVerdict,
+    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
@@ -219,9 +219,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::DecisionRecorded {
             attention_id,
             action,
-            ..
+            justification,
+            actor,
         } => {
-            apply_decision(state, attention_id, action);
+            apply_decision(state, attention_id, action, actor, justification);
         }
         MissionEvent::PlanAmended {
             base_revision, ops, ..
@@ -537,6 +538,8 @@ fn apply_decision(
     state: &mut MissionState,
     attention_id: &str,
     action: &super::event::DecisionAction,
+    actor: &str,
+    justification: &str,
 ) {
     use super::event::DecisionAction;
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
@@ -606,12 +609,16 @@ fn apply_decision(
             }
         }
         (DecisionAction::Continue, AttentionKind::TerminalReviewGaps) => {
-            // Acknowledge the blocking verdict AT ITS SHA: the mission may
-            // close with these gaps on record; a later head move re-opens the
-            // review (the acknowledgment is keyed, never inherited).
+            // Acknowledge the blocking verdict AT ITS SHA (the gap item only
+            // raises fresh, so the verdict's sha is the current head): the
+            // mission may close with these gaps on record; a later head move
+            // re-opens the review — the acknowledgment is never inherited.
             if let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
-                state.terminal_review.accepted = Some(ReviewAcceptance::AcknowledgedGaps {
+                state.terminal_review.accepted = Some(ReviewAcceptance {
+                    kind: ReviewAcceptanceKind::AcknowledgedGaps,
                     judged_sha: v.judged_sha.clone(),
+                    actor: actor.to_string(),
+                    justification: justification.to_string(),
                 });
             }
         }
@@ -621,22 +628,24 @@ fn apply_decision(
         ) => {
             // Discard the outcome and re-roll a fresh-context reviewer.
             // Attempts are preserved, so the re-dispatch gets a fresh
-            // idempotency key. A stale acknowledgment goes with the verdict;
-            // a waiver (impossible while an item is raised) is left alone.
+            // idempotency key. Any prior acceptance goes with the discarded
+            // outcome — the receipt must never cite a decision this retry
+            // just walked away from.
             state.terminal_review.outcome = None;
-            if matches!(
-                state.terminal_review.accepted,
-                Some(ReviewAcceptance::AcknowledgedGaps { .. })
-            ) {
-                state.terminal_review.accepted = None;
-            }
+            state.terminal_review.accepted = None;
         }
         (DecisionAction::Continue, AttentionKind::TerminalReviewFailed) => {
-            // Accept the infra failure: waive the review so the mission can
-            // close. Recorded distinctly from acknowledged gaps — there is no
-            // verdict.
+            // Accept the infra failure: waive the review AT THIS HEAD so the
+            // mission can close without a verdict. Later work stales the
+            // waiver and re-opens the review — the instrument may have
+            // recovered, and the human never saw the new tree.
             state.terminal_review.outcome = None;
-            state.terminal_review.accepted = Some(ReviewAcceptance::Waived);
+            state.terminal_review.accepted = Some(ReviewAcceptance {
+                kind: ReviewAcceptanceKind::Waived,
+                judged_sha: state.current_sha.clone(),
+                actor: actor.to_string(),
+                justification: justification.to_string(),
+            });
         }
         (DecisionAction::Abort, _) => {
             state.phase = MissionPhase::Aborted {
@@ -802,8 +811,8 @@ fn derive_attention(state: &mut MissionState) {
             Some(ReviewOutcome::Verdict(v)) => {
                 let acknowledged = matches!(
                     &state.terminal_review.accepted,
-                    Some(ReviewAcceptance::AcknowledgedGaps { judged_sha })
-                        if *judged_sha == v.judged_sha
+                    Some(a) if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
+                        && a.judged_sha == v.judged_sha
                 );
                 if v.is_fresh_at(&state.current_sha)
                     && v.blocking()
@@ -1000,16 +1009,19 @@ pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
 /// commit still owes the engine a run. A fresh verdict — clean or blocking —
 /// settles the obligation (the park on gaps is attention's job, exactly as a
 /// fresh oracle *fail* settles the oracle obligation: retry is a human
-/// decision, not an engine loop). A waived review owes nothing, and a finish
-/// already below the stop bar closes without burning a review — the review is
-/// the last gate on an otherwise-passing mission.
+/// decision, not an engine loop). A waiver granted at this head owes nothing —
+/// but later work stales it, exactly like an acknowledgment: acceptance is
+/// never inherited by a tree the human never saw. A finish already below the
+/// stop bar closes without burning a review — the review is the last gate on
+/// an otherwise-passing mission.
 pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
     if state.config.terminal_review.is_none() {
         return false; // config-gated: pre-feature logs derive identically
     }
     if matches!(
-        state.terminal_review.accepted,
-        Some(ReviewAcceptance::Waived)
+        &state.terminal_review.accepted,
+        Some(a) if a.kind == ReviewAcceptanceKind::Waived
+            && a.is_fresh_at(&state.current_sha)
     ) {
         return false;
     }
@@ -2154,33 +2166,28 @@ mod tests {
     // ---- Terminal review: the closing obligation, its parks, and staleness ----
 
     use super::super::event::{Gap, GapSeverity, TerminalReviewConfig};
-    use super::super::state::{ReviewAcceptance, ReviewOutcome};
+    use super::super::state::{ReviewAcceptanceKind, ReviewOutcome};
+
+    /// The acceptance a `decision(...)` builder produces (actor "test",
+    /// justification "j"), for exact-equality assertions.
+    fn accepted(kind: ReviewAcceptanceKind, judged_sha: &str) -> ReviewAcceptance {
+        ReviewAcceptance {
+            kind,
+            judged_sha: judged_sha.into(),
+            actor: "test".into(),
+            justification: "j".into(),
+        }
+    }
 
     fn created_with_review() -> MissionEvent {
-        let MissionEvent::MissionCreated {
-            objective,
-            mission_type,
-            runtime,
-            image_id,
-            workspace_dir,
-            base_sha,
-            mut config,
-        } = created()
-        else {
+        let mut event = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut event else {
             unreachable!("created() builds MissionCreated");
         };
         config.terminal_review = Some(TerminalReviewConfig {
             role: RoleName::new("gap-reviewer").expect("role name"),
         });
-        MissionEvent::MissionCreated {
-            objective,
-            mission_type,
-            runtime,
-            image_id,
-            workspace_dir,
-            base_sha,
-            config,
-        }
+        event
     }
 
     fn gap(severity: GapSeverity) -> Gap {
@@ -2352,9 +2359,7 @@ mod tests {
         let state = fold_log(events).expect("state");
         assert_eq!(
             state.terminal_review.accepted,
-            Some(ReviewAcceptance::AcknowledgedGaps {
-                judged_sha: "h1".into()
-            })
+            Some(accepted(ReviewAcceptanceKind::AcknowledgedGaps, "h1"))
         );
         assert!(state.open_attention.is_empty());
         assert!(matches!(state.phase, MissionPhase::Done { .. }));
@@ -2455,9 +2460,7 @@ mod tests {
         let state = fold_log(events).expect("state");
         assert_eq!(
             state.terminal_review.accepted,
-            Some(ReviewAcceptance::AcknowledgedGaps {
-                judged_sha: "h1".into()
-            })
+            Some(accepted(ReviewAcceptanceKind::AcknowledgedGaps, "h1"))
         );
         assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     }
@@ -2521,10 +2524,11 @@ mod tests {
             super::super::event::DecisionAction::Continue,
         ));
         let state = fold_log(events).expect("state");
-        // The waiver variant keeps the receipt honest: no verdict exists.
+        // The waiver kind keeps the receipt honest: no verdict exists, and
+        // the provenance (who, why) is folded into state.
         assert_eq!(
             state.terminal_review.accepted,
-            Some(ReviewAcceptance::Waived)
+            Some(accepted(ReviewAcceptanceKind::Waived, "h1"))
         );
         assert_eq!(state.terminal_review.outcome, None);
         assert!(!terminal_review_outstanding(&state));
@@ -2535,6 +2539,37 @@ mod tests {
                 finish: FinishClass::Verified
             }
         );
+    }
+
+    #[test]
+    fn a_head_move_stales_a_waiver_and_reopens_the_review() {
+        // A waiver is granted at a head, never inherited: new work after a
+        // waived close re-opens the review obligation (the instrument may
+        // have recovered, and the human never saw the new tree).
+        let mut events = events_to_the_brink();
+        events.push(review_failed("kr", "h1", "agent timed out"));
+        events.push(decision(
+            "terminal_review_failed:mission",
+            super::super::event::DecisionAction::Continue,
+        ));
+        assert!(matches!(
+            fold_log(events.clone()).expect("state").phase,
+            MissionPhase::Done { .. }
+        ));
+
+        events.push(role_completed(
+            "fix",
+            "k2",
+            work_handoff(true, false),
+            Some(ArtifactOutcome {
+                base_sha: "h1".into(),
+                head_sha: "h2".into(),
+            }),
+        ));
+        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
+        let state = fold_log(events).expect("state");
+        assert!(terminal_review_outstanding(&state));
+        assert_eq!(state.phase, MissionPhase::Running);
     }
 
     #[test]

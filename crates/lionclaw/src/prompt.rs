@@ -123,11 +123,12 @@ pub fn assemble_terminal_review_prompt(
 /// The nonce a terminal-review prompt carries — the parsing dual of the
 /// assembler above (one place defines the `## Handoff nonce` framing).
 /// Scripted reviewers (tests, self-test) echo it exactly as a real agent must.
+/// The LAST occurrence is the assembler's: an objective or role body that
+/// happens to contain the heading text must not shadow the real nonce.
 pub fn handoff_nonce(prompt: &str) -> Option<&str> {
     prompt
-        .split("## Handoff nonce")
-        .nth(1)
-        .map(str::trim)
+        .rsplit_once("## Handoff nonce")
+        .map(|(_, tail)| tail.trim())
         .filter(|nonce| !nonce.is_empty())
 }
 
@@ -334,6 +335,23 @@ mod tests {
             assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
         assert!(prompt.contains("Handoffs from upstream tasks"));
         assert!(prompt.contains("the planner said"));
+    }
+
+    #[test]
+    fn handoff_nonce_reads_the_assemblers_section_not_an_objectives() {
+        // Regression (QA round 1): the assembler appends its nonce section
+        // LAST; an objective that happens to contain the heading text must
+        // not shadow the real nonce.
+        let role = role(OutputSemantics::EmitsVerdict);
+        let prompt = assemble_terminal_review_prompt(
+            &role,
+            &TerminalReviewPromptContext {
+                objective: "document our ## Handoff nonce protocol",
+                nonce: "the-real-nonce",
+            },
+        );
+        assert_eq!(handoff_nonce(&prompt), Some("the-real-nonce"));
+        assert_eq!(handoff_nonce("no nonce section here"), None);
     }
 
     #[test]

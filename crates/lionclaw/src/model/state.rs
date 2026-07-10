@@ -149,19 +149,51 @@ pub enum ReviewOutcome {
     },
 }
 
-/// How a human accepted closure despite the review. `continue` on a gap park
-/// acknowledges the verdict at its sha; `continue` on a failure park waives
-/// the review outright. One enum, so waived-and-acknowledged is
-/// unrepresentable and the receipt distinguishes the two by variant.
+/// How a human accepted closure despite the review: `continue` on a gap park
+/// acknowledges the blocking verdict, `continue` on a failure park waives the
+/// review outright. One value, so waived-and-acknowledged is unrepresentable;
+/// the receipt distinguishes the kinds and cites who accepted and why.
+///
+/// Both kinds are keyed to the head they were granted at: a later artifact
+/// commit stales the acceptance and re-opens the review, so neither an
+/// acknowledgment nor a waiver is ever inherited by work the human never saw.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "acceptance", rename_all = "snake_case")]
-pub enum ReviewAcceptance {
-    /// Keyed to the verdict's sha: a later head move re-opens the review;
-    /// the acknowledgment is never inherited.
-    AcknowledgedGaps { judged_sha: String },
-    /// Sticky (the failure is about the instrument, not the tree): the
-    /// mission may close, but no verdict was ever recorded.
+pub struct ReviewAcceptance {
+    pub kind: ReviewAcceptanceKind,
+    /// `current_sha` at the moment of acceptance (for an acknowledgment this
+    /// is also the verdict's `judged_sha` — the gap item only raises fresh).
+    pub judged_sha: String,
+    /// Provenance from the `DecisionRecorded` event, folded into state so
+    /// the receipt can never cite a decision a later retry discarded.
+    pub actor: String,
+    pub justification: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAcceptanceKind {
+    /// A blocking verdict the human closed over; its gaps stay on record.
+    AcknowledgedGaps,
+    /// The review failed to run and the human closed without a verdict.
     Waived,
+}
+
+impl ReviewAcceptance {
+    /// Same freshness law as verdicts: an acceptance holds only at the head
+    /// it was granted at.
+    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
+        self.judged_sha == current_sha
+    }
+}
+
+impl ReviewAcceptanceKind {
+    /// The stable snake_case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::AcknowledgedGaps => "acknowledged_gaps",
+            Self::Waived => "waived",
+        }
+    }
 }
 
 /// A terminal reviewer's verdict. Plain public data — deliberately NOT an
@@ -478,6 +510,12 @@ mod slug_tests {
             GapSeverity::Minor,
         ] {
             assert_slug(&g, g.slug());
+        }
+        for k in [
+            ReviewAcceptanceKind::AcknowledgedGaps,
+            ReviewAcceptanceKind::Waived,
+        ] {
+            assert_slug(&k, k.slug());
         }
         for s in [
             AdvisoryStatus::Pending,

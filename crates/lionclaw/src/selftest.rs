@@ -28,7 +28,7 @@ use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
     AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, DecisionAction,
     FinishClass, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase,
-    OracleBinding, OracleName, PayloadRef, PlanSubmission, ReviewAcceptance, RoleName,
+    OracleBinding, OracleName, PayloadRef, PlanSubmission, ReviewAcceptanceKind, RoleName,
     RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
@@ -73,7 +73,7 @@ struct ReviewParkRoleRunner;
 #[async_trait]
 impl RoleRunner for ReviewParkRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
-        if request.task_id.as_str() == "terminal-review" {
+        if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
             Ok(RoleRunOutcome {
                 handoff: Handoff::Validate {
                     done: true,
@@ -884,8 +884,9 @@ async fn check_terminal_review() -> Result<()> {
         );
     }
     match &done.terminal_review.accepted {
-        Some(ReviewAcceptance::AcknowledgedGaps { judged_sha })
-            if judged_sha == "selftest-head" =>
+        Some(a)
+            if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
+                && a.judged_sha == "selftest-head" =>
         {
             Ok(())
         }

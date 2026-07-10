@@ -96,9 +96,11 @@ pub enum AmendError {
 
 const EFFECT_LEASE_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_LOOP_ITERATIONS: usize = 10_000;
-/// Typed review gaps land inline in the event log (only `PayloadRef`s
-/// externalize to blobs), so cap them well under the 4 MiB handoff cap.
-const MAX_INLINE_GAPS_BYTES: usize = 256 * 1024;
+
+/// The terminal reviewer's runner tag: its attempt-dir name and the task id
+/// scripted reviewers (tests, self-test) route on. Never a ledger id —
+/// review events carry no `task_id`.
+pub const TERMINAL_REVIEW_TASK_TAG: &str = "terminal-review";
 
 impl Engine {
     pub fn new(
@@ -149,6 +151,16 @@ impl Engine {
         base_sha: &str,
         config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
+        // The reviewed bar is *defined* by an independent terminal review.
+        // The loader enforces this for mission types; enforce it here too so
+        // no direct caller can mint a reviewed-bar mission whose closing gate
+        // never runs (the fold is total and cannot refuse the config).
+        if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
+            bail!(
+                "a reviewed-bar mission requires a terminal review: \
+                 the reviewed bar is defined by an independent closing review"
+            );
+        }
         let now_ms = self.clock.now_ms();
         let mission_id = MissionId::from_digest_prefix(&hex::encode(Sha256::digest(
             format!("{workspace_dir}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
@@ -703,9 +715,7 @@ impl Engine {
         let prompt_text = self.store.blobs().resolve(prompt)?;
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
-            // A runner dir tag only, never a ledger id — review events carry
-            // no task_id, and the reviewer never runs concurrently with tasks.
-            task_id: TaskId::new("terminal-review").expect("valid literal task id"),
+            task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
             attempt_no,
             idempotency_key: idempotency_key.to_string(),
             role: role.clone(),
@@ -743,16 +753,6 @@ impl Engine {
             return Ok(failed(
                 RunErrorKind::TurnFailed,
                 "reviewer handed off done=false: the review itself did not complete".to_string(),
-            ));
-        }
-        let gaps_bytes = serde_json::to_vec(&gaps)?.len();
-        if gaps_bytes > MAX_INLINE_GAPS_BYTES {
-            return Ok(failed(
-                RunErrorKind::HandoffInvalid,
-                format!(
-                    "typed gaps are {gaps_bytes} bytes (cap {MAX_INLINE_GAPS_BYTES}): \
-                     cite short excerpts as evidence, not full logs"
-                ),
             ));
         }
         Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {

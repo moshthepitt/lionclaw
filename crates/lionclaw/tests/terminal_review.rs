@@ -11,15 +11,13 @@ use common::{
     blocking_gap, default_config, harness_with_type, review_config, review_mission_type,
     review_runner, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
 };
-use lionclaw::engine::AdvanceOutcome;
+use lionclaw::engine::{AdvanceOutcome, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
 use lionclaw::model::{
     ArtifactOutcome, DecisionAction, FinishClass, Handoff, MissionEvent, MissionPhase, PayloadRef,
-    ReviewAcceptance, ReviewOutcome, Task, TaskKind,
+    ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
-
-const REVIEW_TAG: &str = "terminal-review";
 
 fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
     RoleRunOutcome {
@@ -160,12 +158,12 @@ async fn blocking_gaps_park_then_continue_closes_with_acknowledged_gaps() {
     let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
     assert!(matches!(outcome, AdvanceOutcome::Terminal { .. }));
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    assert_eq!(
-        state.terminal_review.accepted,
-        Some(ReviewAcceptance::AcknowledgedGaps {
-            judged_sha: HEAD_SHA.to_string()
-        })
-    );
+    let accepted = state.terminal_review.accepted.expect("acceptance recorded");
+    assert_eq!(accepted.kind, ReviewAcceptanceKind::AcknowledgedGaps);
+    assert_eq!(accepted.judged_sha, HEAD_SHA);
+    // Provenance is folded into state — the receipt cites who and why.
+    assert_eq!(accepted.actor, "test");
+    assert_eq!(accepted.justification, "gap is acceptable for this release");
 }
 
 #[tokio::test]
@@ -399,4 +397,173 @@ async fn a_mission_without_the_config_never_dispatches_a_review() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(outcome, AdvanceOutcome::Terminal { .. }));
     assert!(review_calls(&h).is_empty(), "no config, no reviewer");
+}
+
+#[tokio::test]
+async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
+    // Regression (QA round 1): rebuild_cursors must not launder a crashed
+    // (leased) terminal review back to 'queued' — it is an LLM turn exactly
+    // like a role run, so it reseeds as an expired lease and the next
+    // advance synthesizes failure instead of re-invoking the reviewer.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (h, mission_id) = started(&dir, review_runner(vec![(true, vec![])])).await;
+
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let event = lionclaw::store::NewEvent::new(MissionEvent::TerminalReviewRequested {
+        attempt_no: 1,
+        idempotency_key: "crash-review".to_string(),
+        role: lionclaw::model::RoleName::new("gap-reviewer").expect("role"),
+        prompt: PayloadRef::inline("p"),
+        judged_sha: BASE_SHA.to_string(),
+        nonce: "n0".to_string(),
+    });
+    h.engine
+        .store()
+        .append(&mission_id, state.head, &[event], 1_000)
+        .await
+        .expect("append");
+    h.engine
+        .store()
+        .pull_due(&mission_id, "dead", 1, 60_000, 1_000)
+        .await
+        .expect("lease");
+
+    h.engine
+        .store()
+        .rebuild_cursors(&mission_id, 5_000)
+        .await
+        .expect("rebuild");
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert!(
+        matches!(outcome, AdvanceOutcome::Parked { .. }),
+        "got {outcome:?}"
+    );
+    assert_eq!(
+        h.role_runner
+            .invocations_by_key
+            .lock()
+            .unwrap()
+            .get("crash-review"),
+        None,
+        "the crashed review must never be re-invoked after a rebuild"
+    );
+    let events = h.engine.store().load(&mission_id).await.expect("load");
+    assert!(events.iter().any(|e| matches!(&e.event,
+        MissionEvent::TerminalReviewFailed { idempotency_key, synthesized: true, .. }
+            if idempotency_key == "crash-review")));
+}
+
+#[tokio::test]
+async fn a_reviewed_bar_mission_without_the_config_is_refused_at_creation() {
+    // Regression (QA round 1): the loader's reviewed-bar rule must also hold
+    // at the config choke point — no direct caller can mint a reviewed-bar
+    // mission whose closing gate never runs.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with_type(
+        dir.path(),
+        review_mission_type(),
+        review_runner(vec![(true, vec![])]),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let err = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            lionclaw::model::MissionConfig {
+                ratification_gate: false,
+                stop: lionclaw::model::StopBar::Reviewed,
+                terminal_review: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a reviewed-bar mission without a review must be refused");
+    assert!(err.to_string().contains("terminal review"), "got {err}");
+}
+
+#[tokio::test]
+async fn a_stale_waiver_reopens_the_review_after_new_work() {
+    // Regression (QA round 1): a waiver is granted at a head, never
+    // inherited. The live sequence: park on a review failure, amend
+    // remediation in WHILE parked, waive the failure — the amended work then
+    // moves the head, the waiver goes stale, and the review re-dispatches at
+    // the new head instead of the mission closing reviewless.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work_heads = Mutex::new(vec![HEAD_SHA.to_string(), format!("{:040}", 3)]);
+    let reviews = Mutex::new(0usize);
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            let mut seen = reviews.lock().expect("lock");
+            *seen += 1;
+            if *seen == 1 {
+                Err(RoleRunFailure {
+                    kind: lionclaw::model::RunErrorKind::Timeout,
+                    detail: "agent timed out".to_string(),
+                })
+            } else {
+                Ok(review_verdict(request, true, vec![]))
+            }
+        } else {
+            let mut heads = work_heads.lock().expect("lock");
+            let head = if heads.len() > 1 {
+                heads.remove(0)
+            } else {
+                heads[0].clone()
+            };
+            Ok(work_outcome(request, &head))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+
+    // Park on the review failure; amend follow-up work in while parked.
+    h.engine.advance(&mission_id).await.expect("advance");
+    h.engine
+        .amend_plan(
+            &mission_id,
+            lionclaw::model::AmendmentOps {
+                add: vec![Task {
+                    id: "more".parse_task(),
+                    kind: TaskKind::Work,
+                    body: "Follow-up work amended in while parked.".to_string(),
+                    targets: vec![],
+                    role: Some(lionclaw::model::RoleName::new("implementer").expect("role")),
+                    depends_on: vec![],
+                }],
+                ..Default::default()
+            },
+            "test",
+            "follow-up work",
+            1,
+        )
+        .await
+        .expect("amend");
+    // Waive the failure at the CURRENT head; the pending work resumes.
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_failed:mission",
+            DecisionAction::Continue,
+            "reviewer infra is down today",
+            "test",
+        )
+        .await
+        .expect("waive");
+
+    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    assert!(
+        matches!(outcome, AdvanceOutcome::Terminal { .. }),
+        "got {outcome:?}"
+    );
+    // The amended work moved the head, staling the waiver: a second review
+    // ran at the new head and its verdict is on record.
+    assert_eq!(review_calls(&h).len(), 2, "the stale waiver must re-review");
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
+        panic!("verdict recorded after the waiver staled");
+    };
+    assert_eq!(v.judged_sha, format!("{:040}", 3));
 }

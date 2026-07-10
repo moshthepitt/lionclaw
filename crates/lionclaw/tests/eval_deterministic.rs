@@ -55,8 +55,12 @@ async fn advisory_only_mission_type_never_verifies() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store = MissionStore::open(dir.path()).await.expect("store");
-    // A reviewer that passes everything; a worker that commits.
+    // A reviewer that passes everything (the plan validator per assertion,
+    // the terminal reviewer with a clean verdict); a worker that commits.
     let runner = MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
+        if req.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
+            return Ok(lionclaw::testing::review_verdict(req, true, vec![]));
+        }
         let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
             Handoff::Validate {
                 done: true,
@@ -89,6 +93,9 @@ async fn advisory_only_mission_type_never_verifies() {
             model_id: None,
         })
     }));
+    // The reviewed bar requires the closing review (create_mission refuses
+    // it otherwise), so thread the fixture's declaration like cmd_start does.
+    let terminal_review = mission_type.terminal_review.clone();
     let engine = Engine::new(
         store,
         mission_type,
@@ -107,7 +114,7 @@ async fn advisory_only_mission_type_never_verifies() {
                 ratification_gate: false,
                 stop: StopBar::Reviewed,
                 planning: Default::default(),
-                terminal_review: None,
+                terminal_review,
             },
         )
         .await
