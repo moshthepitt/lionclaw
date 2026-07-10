@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::loader::MissionTypeError;
-use super::manifest::{ManifestSkill, ManifestSkillSource, MissionLockFile, MISSION_LOCK_FILE};
+use super::manifest::{
+    LockedSkillSource, ManifestSkill, ManifestSkillSource, MissionLockFile, MISSION_LOCK_FILE,
+};
 use super::SkillPackage;
 
 pub(crate) fn load_skills(
@@ -113,6 +115,30 @@ fn validate_lock(
         return Err(MissionTypeError::Manifest(format!(
             "{MISSION_LOCK_FILE} skills do not match mission.toml"
         )));
+    }
+    for (name, declaration) in declarations {
+        let locked = &lock.skills[name];
+        let expected_path = PathBuf::from("skills").join(name);
+        if locked.path != expected_path {
+            return Err(MissionTypeError::Manifest(format!(
+                "{MISSION_LOCK_FILE} path for skill '{name}' must be '{}'",
+                expected_path.display()
+            )));
+        }
+        let source_matches = match (&declaration.source, &locked.source) {
+            (ManifestSkillSource::Path(declared), LockedSkillSource::Path { path }) => {
+                declared.path == *path
+            }
+            (ManifestSkillSource::Git(declared), LockedSkillSource::Git { git, rev, subdir }) => {
+                declared.git == *git && declared.rev == *rev && declared.subdir == *subdir
+            }
+            _ => false,
+        };
+        if !source_matches {
+            return Err(MissionTypeError::Manifest(format!(
+                "{MISSION_LOCK_FILE} source for skill '{name}' does not match mission.toml"
+            )));
+        }
     }
     Ok(())
 }

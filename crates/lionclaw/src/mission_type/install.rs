@@ -508,4 +508,47 @@ mod tests {
         )
         .expect("previous bundle remains loadable");
     }
+
+    #[tokio::test]
+    async fn installed_lock_requires_canonical_package_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_type(&source, "{ path = \"bundled/test-skill\" }");
+        write_skill(&source.join("bundled/test-skill"));
+        let destination = temp.path().join("installed");
+        materialize_mission_type(&source, &destination, &AuthorityCeiling::default())
+            .await
+            .unwrap();
+        let lock_path = destination.join(MISSION_LOCK_FILE);
+        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+            "path = \"skills/test-skill\"",
+            "path = \"bundled/test-skill\"",
+        );
+        std::fs::write(lock_path, lock).unwrap();
+
+        let err = load_mission_type(&destination, &AuthorityCeiling::default())
+            .expect_err("noncanonical locked path");
+        assert!(err.to_string().contains("must be 'skills/test-skill'"));
+    }
+
+    #[tokio::test]
+    async fn installed_lock_source_must_match_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_type(&source, "{ path = \"bundled/test-skill\" }");
+        write_skill(&source.join("bundled/test-skill"));
+        let destination = temp.path().join("installed");
+        materialize_mission_type(&source, &destination, &AuthorityCeiling::default())
+            .await
+            .unwrap();
+        let manifest_path = destination.join("mission.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("bundled/test-skill", "other/test-skill");
+        std::fs::write(manifest_path, manifest).unwrap();
+
+        let err = load_mission_type(&destination, &AuthorityCeiling::default())
+            .expect_err("stale lock source");
+        assert!(err.to_string().contains("does not match mission.toml"));
+    }
 }

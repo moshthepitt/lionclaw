@@ -157,6 +157,11 @@ impl RuntimeProfileFile {
             projection.normalize();
             projection.validate()?;
         }
+        lionclaw_confinement::mount_validation::validate_configured_mounts(
+            &self.confinement.oci().additional_mounts,
+            &[],
+        )
+        .map_err(anyhow::Error::msg)?;
         Ok(MissionRuntimeProfile {
             name,
             driver: self.driver,
@@ -326,5 +331,52 @@ mod tests {
         )
         .expect_err("tilde roots require HOME");
         assert!(err.to_string().contains("HOME is required"), "got {err:#}");
+    }
+
+    #[test]
+    fn configured_additional_mounts_are_validated_and_retained() {
+        let source = tempfile::tempdir().unwrap();
+        let profiles = RuntimeProfiles::from_toml(
+            &format!(
+                r#"
+                [runtimes.custom]
+                driver = "acp"
+                command = "custom"
+                confinement = {{ backend = "podman", additional-mounts = [
+                  {{ source = {:?}, target = "/opt/custom", access = "read-only" }}
+                ] }}
+                "#,
+                source.path()
+            ),
+            Path::new("/home/alice"),
+        )
+        .expect("valid additional mount");
+        assert_eq!(
+            profiles
+                .get("custom")
+                .unwrap()
+                .confinement
+                .oci()
+                .additional_mounts[0]
+                .target,
+            "/opt/custom"
+        );
+
+        let err = RuntimeProfiles::from_toml(
+            &format!(
+                r#"
+                [runtimes.custom]
+                driver = "acp"
+                command = "custom"
+                confinement = {{ backend = "podman", additional-mounts = [
+                  {{ source = {:?}, target = "/lionclaw/skills/shadow", access = "read-only" }}
+                ] }}
+                "#,
+                source.path()
+            ),
+            Path::new("/home/alice"),
+        )
+        .expect_err("reserved additional mount");
+        assert!(err.to_string().contains("reserved runtime path"));
     }
 }

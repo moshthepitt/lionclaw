@@ -32,6 +32,7 @@ const RESERVED_TARGETS: &[&str] = &[
     RUNTIME_HOME_MOUNT_TARGET,
     "/mission",
     "/scratch",
+    "/lionclaw",
 ];
 
 /// The operator/mission bound authority can never exceed. Intersected,
@@ -298,6 +299,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     let working_dir = workspace.source.to_string_lossy().into_owned();
     let mut mounts = vec![workspace];
     mounts.extend(request.mounts.extras);
+    mounts.extend(request.confinement.oci().additional_mounts.clone());
     let limits = request.confinement.oci().limits.clone();
 
     Ok(CompiledRolePlan(EffectiveExecutionPlan {
@@ -648,6 +650,30 @@ mod tests {
         })
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::ReservedTargetShadowed { .. }));
+    }
+
+    #[test]
+    fn configured_additional_mounts_are_carried_into_the_effective_plan() {
+        let worker = role(OutputSemantics::ProducesArtifact, false);
+        let authority = compile_authority(&worker, &AuthorityCeiling::default()).unwrap();
+        let mut confinement = oci();
+        confinement.oci_mut().additional_mounts.push(MountSpec {
+            source: "/host/custom".into(),
+            target: "/opt/custom".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+
+        let compiled = compile_role_plan(RolePlanRequest {
+            confinement,
+            ..request(&authority, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+        })
+        .expect("additional mount compiles");
+
+        assert!(compiled
+            .plan()
+            .mounts
+            .iter()
+            .any(|mount| mount.target == "/opt/custom"));
     }
 
     #[test]

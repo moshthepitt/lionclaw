@@ -68,6 +68,9 @@ fn role_skill_mounts(
     skills: &[SkillPackage],
     projection: Option<&lionclaw_confinement::RuntimeSkillProjectionConfig>,
 ) -> anyhow::Result<Vec<MountSpec>> {
+    if !skills.is_empty() && projection.is_none() {
+        anyhow::bail!("runtime profile has no skill projection for mission-assigned skills");
+    }
     let mut mounts = skills
         .iter()
         .map(|skill| MountSpec {
@@ -94,6 +97,9 @@ impl RoleRunner for OciRoleRunner {
                 )));
             }
         }
+        let skill_mounts =
+            role_skill_mounts(&request.skills, self.profile.skill_projection.as_ref())
+                .map_err(|err| launch(format!("failed to resolve role skills: {err:#}")))?;
 
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dirs = AttemptDirs::prepare(
@@ -149,10 +155,7 @@ impl RoleRunner for OciRoleRunner {
                 access: workspace_access,
             };
             let mut extras = dirs.agent_mounts();
-            extras.extend(
-                role_skill_mounts(&request.skills, self.profile.skill_projection.as_ref())
-                    .map_err(|e| launch(format!("failed to resolve inherited skills: {e:#}")))?,
-            );
+            extras.extend(skill_mounts);
             let environment = mission_environment(&dirs);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
@@ -410,5 +413,20 @@ mod tests {
         assert!(mounts
             .iter()
             .any(|mount| { mount.target == "/lionclaw/inherited-skills/0/human-skill" }));
+    }
+
+    #[test]
+    fn mission_skills_require_a_runtime_projection() {
+        let err = role_skill_mounts(
+            &[SkillPackage {
+                name: "mission-skill".to_string(),
+                root: "/mission-type/skills/mission-skill".into(),
+            }],
+            None,
+        )
+        .expect_err("missing projection");
+
+        assert!(err.to_string().contains("no skill projection"));
+        assert!(role_skill_mounts(&[], None).unwrap().is_empty());
     }
 }
