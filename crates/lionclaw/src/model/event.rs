@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Assertion, PlanSubmission, PlanningDag, Task};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +80,12 @@ pub struct MissionConfig {
     /// submitted plan.
     #[serde(default)]
     pub planning: PlanningDag,
+    /// The mission type's closing review (a fresh-context judge of the final
+    /// tree against the objective). `None` ⇒ feature off: every derivation
+    /// short-circuits, so pre-feature event logs re-derive identically.
+    /// Skipped when absent so non-review missions stay byte-identical on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_review: Option<TerminalReviewConfig>,
 }
 
 impl Default for MissionConfig {
@@ -88,8 +94,19 @@ impl Default for MissionConfig {
             ratification_gate: true,
             stop: StopBar::Verified,
             planning: PlanningDag::default(),
+            terminal_review: None,
         }
     }
+}
+
+/// The closing review a mission type declares: an `emits-verdict` role the
+/// engine dispatches contract-blind once work and oracle obligations settle.
+/// Engine-owned structure (declared in `mission.toml`), never plan-authored,
+/// so a planner cannot omit or weaken it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalReviewConfig {
+    pub role: RoleName,
 }
 
 /// Provenance stamps carried by every envelope.
@@ -121,6 +138,16 @@ pub enum Handoff {
         items: Vec<ValidationItem>,
         passed: bool,
         request_attention: bool,
+        /// Typed product gaps (terminal review). Default-empty and skipped
+        /// when empty, so ordinary validator handoffs — past and future —
+        /// keep their exact shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gaps: Vec<Gap>,
+        /// Echo of the per-attempt nonce the engine put in the prompt; the
+        /// runner rejects a terminal-review handoff without the right one
+        /// (worker-planted code can write this file but cannot read the prompt).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
     },
     /// The planning author's deliverable: a proposed contract + task DAG. It has
     /// **no verdict field** — a proposal is gradeless and can never mint
@@ -138,6 +165,52 @@ pub enum Handoff {
 pub struct ValidationItem {
     pub item_id: AssertionId,
     pub passed: bool,
+}
+
+/// One typed product gap from a terminal review. `severity` is the only
+/// field the engine branches on; the rest is structured evidence for the
+/// human and for remediation amendments. Strict fields (`deny_unknown_fields`,
+/// required prose) force the reviewer to decompose instead of hand-waving.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gap {
+    /// Reviewer-chosen stable label within one verdict (e.g. "GAP-1").
+    /// Display/reference only — never an engine key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub severity: GapSeverity,
+    /// The objective requirement this gap is against (reviewer prose — the
+    /// reviewer is contract-blind, so this is never an assertion id).
+    pub requirement: String,
+    pub expected: String,
+    pub observed: String,
+    /// Observed-behavior evidence (commands run, output seen, file paths).
+    #[serde(default)]
+    pub evidence: String,
+}
+
+/// How bad a gap is, grounded in the objective. Only `Blocking` gates
+/// closure; the rest is triage information for the receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapSeverity {
+    /// The objective is not met without this; parks closure.
+    Blocking,
+    /// A real product defect, but the core objective still holds.
+    Major,
+    /// Polish or hardening beyond what the objective asks.
+    Minor,
+}
+
+impl GapSeverity {
+    /// The stable snake_case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::Major => "major",
+            Self::Minor => "minor",
+        }
+    }
 }
 
 /// Runner-computed artifact fact: the commits that now exist in the target
@@ -241,6 +314,50 @@ pub enum MissionEvent {
         attempt_no: u32,
         idempotency_key: String,
         detail: String,
+        synthesized: bool,
+    },
+    /// The closing review was dispatched: a fresh-context `emits-verdict`
+    /// role judging the tree at `judged_sha` against the objective,
+    /// contract-blind. Config-declared (`MissionConfig::terminal_review`),
+    /// never a plan task — hence no `task_id`.
+    TerminalReviewRequested {
+        attempt_no: u32,
+        idempotency_key: String,
+        role: RoleName,
+        /// Assembled prompt, persisted before the request is recorded so a
+        /// resume re-dispatches byte-identical input.
+        prompt: PayloadRef,
+        /// The commit under review; the verdict is stamped at this sha.
+        judged_sha: String,
+        /// Per-attempt random token the prompt tells the reviewer to echo in
+        /// its handoff. Rides the event so the runner's forgery check
+        /// survives crash/resume (the inflight effect rebuilds from here).
+        nonce: String,
+    },
+    /// The reviewer's verdict — advisory by construction: the fold stores it
+    /// in `terminal_review`, never in any assertion's `last_authoritative`,
+    /// and `classify_finish` never reads it. It gates closure only.
+    TerminalReviewCompleted {
+        attempt_no: u32,
+        idempotency_key: String,
+        judged_sha: String,
+        /// The reviewer's own summary bit. A blocking gap dominates it
+        /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
+        passed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gaps: Vec<Gap>,
+        report: PayloadRef,
+    },
+    /// The reviewer failed to *run or hand off a verdict* (infrastructure or
+    /// an unfinished review), distinct from a verdict with gaps.
+    TerminalReviewFailed {
+        attempt_no: u32,
+        idempotency_key: String,
+        judged_sha: String,
+        error_kind: RunErrorKind,
+        detail: String,
+        /// True when synthesized on resume for a run whose outcome is
+        /// unknowable.
         synthesized: bool,
     },
     MissionAborted {
@@ -349,6 +466,9 @@ impl MissionEvent {
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
             Self::OracleRunFailed { .. } => "oracle_run_failed",
+            Self::TerminalReviewRequested { .. } => "terminal_review_requested",
+            Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
+            Self::TerminalReviewFailed { .. } => "terminal_review_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
             Self::PlanAmended { .. } => "plan_amended",
@@ -364,6 +484,9 @@ impl MissionEvent {
             }
             | Self::OracleRunRequested {
                 idempotency_key, ..
+            }
+            | Self::TerminalReviewRequested {
+                idempotency_key, ..
             } => Some((IdemClass::Request, idempotency_key)),
             Self::RoleRunCompleted {
                 idempotency_key, ..
@@ -375,6 +498,12 @@ impl MissionEvent {
                 idempotency_key, ..
             }
             | Self::OracleRunFailed {
+                idempotency_key, ..
+            }
+            | Self::TerminalReviewCompleted {
+                idempotency_key, ..
+            }
+            | Self::TerminalReviewFailed {
                 idempotency_key, ..
             } => Some((IdemClass::Outcome, idempotency_key)),
             // Fact events carry no idempotency key. Exhaustive on purpose: a new
@@ -393,12 +522,17 @@ impl MissionEvent {
     /// `idempotency`).
     pub fn outcome_succeeded(&self) -> Option<bool> {
         match self {
-            Self::RoleRunCompleted { .. } | Self::OracleRunCompleted { .. } => Some(true),
-            Self::RoleRunFailed { .. } | Self::OracleRunFailed { .. } => Some(false),
+            Self::RoleRunCompleted { .. }
+            | Self::OracleRunCompleted { .. }
+            | Self::TerminalReviewCompleted { .. } => Some(true),
+            Self::RoleRunFailed { .. }
+            | Self::OracleRunFailed { .. }
+            | Self::TerminalReviewFailed { .. } => Some(false),
             Self::MissionCreated { .. }
             | Self::PlanSubmitted { .. }
             | Self::RoleRunRequested { .. }
             | Self::OracleRunRequested { .. }
+            | Self::TerminalReviewRequested { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
             | Self::PlanAmended { .. } => None,
@@ -415,4 +549,36 @@ pub struct EventEnvelope {
     pub recorded_at_ms: i64,
     pub stamps: VersionStamps,
     pub event: MissionEvent,
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    /// Pre-feature wire shapes must keep deserializing, and non-review
+    /// missions must keep serializing byte-identically (no new keys).
+    #[test]
+    fn pre_terminal_review_shapes_round_trip_unchanged() {
+        // A MissionConfig written before the feature existed.
+        let old_config = r#"{"ratification_gate":true,"stop":"verified"}"#;
+        let config: MissionConfig = serde_json::from_str(old_config).expect("old config parses");
+        assert_eq!(config.terminal_review, None);
+        // A config not using the feature serializes without the key.
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(!json.contains("terminal_review"));
+
+        // A Validate handoff written before `gaps`/`nonce` existed.
+        let old_validate = r#"{"type":"validate","done":true,
+                               "report":{"kind":"inline","text":"r"},
+                               "items":[],"passed":true,"request_attention":false}"#;
+        let handoff: Handoff = serde_json::from_str(old_validate).expect("old handoff parses");
+        let Handoff::Validate { gaps, nonce, .. } = &handoff else {
+            panic!("expected validate");
+        };
+        assert!(gaps.is_empty());
+        assert!(nonce.is_none());
+        // And a gap-less validate serializes without the new keys.
+        let json = serde_json::to_string(&handoff).expect("serialize");
+        assert!(!json.contains("gaps") && !json.contains("nonce"));
+    }
 }

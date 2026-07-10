@@ -184,6 +184,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_validate_handoff_with_gaps_and_nonce() {
+        use crate::model::GapSeverity;
+        let raw = r#"{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
+                      "done":true,"report":{"kind":"inline","text":"map"},
+                      "items":[],"passed":false,"nonce":"n-1",
+                      "gaps":[{"severity":"blocking",
+                               "requirement":"starts up",
+                               "expected":"prints usage",
+                               "observed":"panics",
+                               "evidence":"cargo run -> panic"}],
+                      "request_attention":false}"#;
+        let handoff = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect("parse");
+        let Handoff::Validate { gaps, nonce, .. } = handoff else {
+            panic!("expected validate handoff");
+        };
+        assert_eq!(nonce.as_deref(), Some("n-1"));
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].severity, GapSeverity::Blocking);
+    }
+
+    #[test]
+    fn rejects_unknown_gap_severity_and_unknown_gap_fields() {
+        // The severity axis and the Gap shape are closed: a typo'd severity or
+        // a stray field fails the attempt rather than passing as prose.
+        for gap_json in [
+            r#"{"severity":"severe","requirement":"r","expected":"e","observed":"o"}"#,
+            r#"{"severity":"blocking","requirement":"r","expected":"e","observed":"o","note":"x"}"#,
+            r#"{"severity":"blocking","requirement":"r"}"#,
+        ] {
+            let raw = format!(
+                r#"{{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
+                    "done":true,"report":{{"kind":"inline","text":""}},
+                    "items":[],"passed":false,"gaps":[{gap_json}],
+                    "request_attention":false}}"#
+            );
+            let err = parse_handoff(&raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
+            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        }
+    }
+
+    #[test]
     fn rejects_wrong_schema_for_role() {
         // A judge trying to hand back a work handoff is refused.
         let raw = r#"{"schema":"lionclaw.mission.work-handoff.v1","type":"work",

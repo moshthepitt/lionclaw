@@ -34,6 +34,7 @@ pub fn test_mission_type() -> MissionType {
         stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
+        terminal_review: None,
         playbook: None,
         roles: BTreeMap::from([
             (
@@ -64,6 +65,27 @@ pub fn test_mission_type() -> MissionType {
             "/nonexistent-mission-type/oracles/cargo-test".into(),
         )]),
     }
+}
+
+/// `test_mission_type` plus a declared closing review: a fresh-context
+/// `gap-reviewer` judge the engine dispatches once work and oracles settle.
+pub fn review_mission_type() -> MissionType {
+    let gap_reviewer = RoleName::new("gap-reviewer").expect("role name");
+    let mut mission_type = test_mission_type();
+    mission_type.roles.insert(
+        gap_reviewer.clone(),
+        RoleDefinition {
+            name: gap_reviewer.clone(),
+            output: OutputSemantics::EmitsVerdict,
+            runtime: None,
+            network: false,
+            secrets: false,
+            prompt_body: "Hunt product gaps against the objective.".to_string(),
+        },
+    );
+    mission_type.terminal_review =
+        Some(lionclaw::model::TerminalReviewConfig { role: gap_reviewer });
+    mission_type
 }
 
 /// A plan with a work task and a read-only reviewer over one oracle-less
@@ -138,12 +160,21 @@ pub async fn harness(
     role_runner: MockRoleRunner,
     oracle_runner: MockOracleRunner,
 ) -> TestHarness {
+    harness_with_type(workspace, test_mission_type(), role_runner, oracle_runner).await
+}
+
+pub async fn harness_with_type(
+    workspace: &Path,
+    mission_type: MissionType,
+    role_runner: MockRoleRunner,
+    oracle_runner: MockOracleRunner,
+) -> TestHarness {
     let store = MissionStore::open(workspace).await.expect("open store");
     let role_runner = Arc::new(role_runner);
     let oracle_runner = Arc::new(oracle_runner);
     let engine = Engine::new(
         store,
-        test_mission_type(),
+        mission_type,
         "codex".to_string(),
         "localhost/lionclaw-runtime-dev:v1".to_string(),
         role_runner.clone(),
@@ -162,4 +193,57 @@ pub fn default_config() -> MissionConfig {
         ratification_gate: false,
         ..Default::default()
     }
+}
+
+/// `default_config` plus the closing review (matches `review_mission_type`).
+pub fn review_config() -> MissionConfig {
+    MissionConfig {
+        ratification_gate: false,
+        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
+            role: RoleName::new("gap-reviewer").expect("role name"),
+        }),
+        ..Default::default()
+    }
+}
+
+/// One blocking gap, fully evidenced.
+pub fn blocking_gap() -> lionclaw::model::Gap {
+    lionclaw::model::Gap {
+        id: Some("GAP-1".to_string()),
+        severity: lionclaw::model::GapSeverity::Blocking,
+        requirement: "the objective's behavior".to_string(),
+        expected: "it works".to_string(),
+        observed: "it does not".to_string(),
+        evidence: "ran it; saw it fail".to_string(),
+    }
+}
+
+/// A worker that commits `HEAD_SHA` plus a terminal reviewer whose verdicts
+/// are scripted per invocation (the last one repeats). The reviewer echoes
+/// the prompt's nonce, exactly as a real agent must.
+pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRoleRunner {
+    use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef};
+    use lionclaw::ports::RoleRunOutcome;
+    let reviews = std::sync::Mutex::new(0usize);
+    MockRoleRunner::new(Box::new(move |request| {
+        if request.task_id.as_str() == "terminal-review" {
+            let mut seen = reviews.lock().expect("lock");
+            let (passed, gaps) = verdicts[(*seen).min(verdicts.len() - 1)].clone();
+            *seen += 1;
+            Ok(lionclaw::testing::review_verdict(request, passed, gaps))
+        } else {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("committed the change"),
+                    request_attention: false,
+                },
+                artifact: Some(ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: HEAD_SHA.to_string(),
+                }),
+                model_id: None,
+            })
+        }
+    }))
 }

@@ -10,18 +10,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::event::{AmendmentOps, EventEnvelope, Handoff, MissionEvent};
+use super::event::{AmendmentOps, EventEnvelope, GapSeverity, Handoff, MissionEvent};
 use super::ids::{AssertionId, OracleName, TaskId};
 use super::plan::{Assertion, PlanSubmission};
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, TaskRuntimeState, TaskStatus,
+    MissionState, PlanningState, ReviewAcceptance, ReviewOutcome, TaskRuntimeState, TaskStatus,
+    TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 3;
+pub const REDUCER_VERSION: u32 = 4;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -82,6 +83,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         flagged_nodes: Default::default(),
         oracle_failures: Default::default(),
         waived_oracles: Default::default(),
+        terminal_review: Default::default(),
         head: envelope.sequence_no,
     })
 }
@@ -178,6 +180,36 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(idempotency_key);
             state.oracle_failures.insert(oracle.clone(), detail.clone());
+        }
+        MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
+            state.terminal_review.attempts = *attempt_no;
+            track_inflight(state, &envelope.event, seq);
+        }
+        MissionEvent::TerminalReviewCompleted {
+            idempotency_key,
+            judged_sha,
+            passed,
+            gaps,
+            report,
+            ..
+        } => {
+            state.inflight.remove(idempotency_key);
+            state.terminal_review.outcome = Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
+                judged_sha: judged_sha.clone(),
+                passed: *passed,
+                gaps: gaps.clone(),
+                report: report.clone(),
+            }));
+        }
+        MissionEvent::TerminalReviewFailed {
+            idempotency_key,
+            detail,
+            ..
+        } => {
+            state.inflight.remove(idempotency_key);
+            state.terminal_review.outcome = Some(ReviewOutcome::Failed {
+                detail: detail.clone(),
+            });
         }
         MissionEvent::MissionAborted { reason, .. } => {
             state.phase = MissionPhase::Aborted {
@@ -573,6 +605,39 @@ fn apply_decision(
                 state.waived_oracles.insert(oracle.clone());
             }
         }
+        (DecisionAction::Continue, AttentionKind::TerminalReviewGaps) => {
+            // Acknowledge the blocking verdict AT ITS SHA: the mission may
+            // close with these gaps on record; a later head move re-opens the
+            // review (the acknowledgment is keyed, never inherited).
+            if let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
+                state.terminal_review.accepted = Some(ReviewAcceptance::AcknowledgedGaps {
+                    judged_sha: v.judged_sha.clone(),
+                });
+            }
+        }
+        (
+            DecisionAction::Retry,
+            AttentionKind::TerminalReviewGaps | AttentionKind::TerminalReviewFailed,
+        ) => {
+            // Discard the outcome and re-roll a fresh-context reviewer.
+            // Attempts are preserved, so the re-dispatch gets a fresh
+            // idempotency key. A stale acknowledgment goes with the verdict;
+            // a waiver (impossible while an item is raised) is left alone.
+            state.terminal_review.outcome = None;
+            if matches!(
+                state.terminal_review.accepted,
+                Some(ReviewAcceptance::AcknowledgedGaps { .. })
+            ) {
+                state.terminal_review.accepted = None;
+            }
+        }
+        (DecisionAction::Continue, AttentionKind::TerminalReviewFailed) => {
+            // Accept the infra failure: waive the review so the mission can
+            // close. Recorded distinctly from acknowledged gaps — there is no
+            // verdict.
+            state.terminal_review.outcome = None;
+            state.terminal_review.accepted = Some(ReviewAcceptance::Waived);
+        }
         (DecisionAction::Abort, _) => {
             state.phase = MissionPhase::Aborted {
                 reason: "aborted by decision".to_string(),
@@ -714,6 +779,67 @@ fn derive_attention(state: &mut MissionState) {
             }
         }
     }
+
+    // Terminal review (config-gated so pre-feature logs never raise these).
+    if state.config.terminal_review.is_some() {
+        match &state.terminal_review.outcome {
+            // Infra failure: park rather than re-request forever (the
+            // OracleFailed mirror; raised until a decision retries or waives).
+            Some(ReviewOutcome::Failed { detail }) => raise(
+                AttentionKind::TerminalReviewFailed,
+                None,
+                None,
+                format!(
+                    "terminal review failed to run: {detail}; retry to re-run \
+                     the review, continue to waive it, or abort"
+                ),
+            ),
+            // A fresh blocking verdict parks — but only when the mission
+            // would otherwise close. While remediation tasks / inflight
+            // effects / owed oracles are live the park auto-clears: an
+            // amendment resumes the mission without a second decision, and
+            // the head move re-opens the review for free.
+            Some(ReviewOutcome::Verdict(v)) => {
+                let acknowledged = matches!(
+                    &state.terminal_review.accepted,
+                    Some(ReviewAcceptance::AcknowledgedGaps { judged_sha })
+                        if *judged_sha == v.judged_sha
+                );
+                if v.is_fresh_at(&state.current_sha)
+                    && v.blocking()
+                    && !acknowledged
+                    && !work_outstanding(state)
+                {
+                    let blocking_count = v
+                        .gaps
+                        .iter()
+                        .filter(|g| g.severity == GapSeverity::Blocking)
+                        .count();
+                    let finding = if v.gaps.is_empty() {
+                        "terminal review failed the product; see its report".to_string()
+                    } else {
+                        format!(
+                            "terminal review found {blocking_count} blocking gap(s) of {} total",
+                            v.gaps.len()
+                        )
+                    };
+                    raise(
+                        AttentionKind::TerminalReviewGaps,
+                        None,
+                        None,
+                        format!(
+                            "{finding} at {} (attempt {}); amend the plan to \
+                             remediate, retry to re-roll the review, continue to \
+                             acknowledge and close, or abort",
+                            super::ids::short_hex(&v.judged_sha),
+                            state.terminal_review.attempts,
+                        ),
+                    );
+                }
+            }
+            None => {}
+        }
+    }
     state.open_attention = attention;
 }
 
@@ -829,10 +955,7 @@ fn derive_phase(state: &mut MissionState) {
         MissionPhase::AttentionNeeded
     } else if state.plan.is_none() {
         MissionPhase::Planning
-    } else if tasks_active(state)
-        || !state.inflight.is_empty()
-        || oracle_obligation_outstanding(state)
-    {
+    } else if work_outstanding(state) || terminal_review_outstanding(state) {
         MissionPhase::Running
     } else {
         MissionPhase::Done {
@@ -846,6 +969,14 @@ fn tasks_active(state: &MissionState) -> bool {
         .tasks
         .values()
         .any(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Running))
+}
+
+/// Work the mission still owes before it could close: active tasks, inflight
+/// effects, or unfresh oracle obligations. One definition shared by the phase
+/// derivation and the terminal-review park ("would the mission otherwise
+/// close"), so the two can never drift.
+fn work_outstanding(state: &MissionState) -> bool {
+    tasks_active(state) || !state.inflight.is_empty() || oracle_obligation_outstanding(state)
 }
 
 /// An oracle-bound assertion without a verdict at the current artifact commit
@@ -863,6 +994,32 @@ pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
                 .as_ref()
                 .is_none_or(|v| !v.is_fresh_at(&state.current_sha))
     })
+}
+
+/// A configured terminal review with no verdict at the current artifact
+/// commit still owes the engine a run. A fresh verdict — clean or blocking —
+/// settles the obligation (the park on gaps is attention's job, exactly as a
+/// fresh oracle *fail* settles the oracle obligation: retry is a human
+/// decision, not an engine loop). A waived review owes nothing, and a finish
+/// already below the stop bar closes without burning a review — the review is
+/// the last gate on an otherwise-passing mission.
+pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
+    if state.config.terminal_review.is_none() {
+        return false; // config-gated: pre-feature logs derive identically
+    }
+    if matches!(
+        state.terminal_review.accepted,
+        Some(ReviewAcceptance::Waived)
+    ) {
+        return false;
+    }
+    if !state.config.stop.satisfied_by(classify_finish(state)) {
+        return false;
+    }
+    !matches!(
+        &state.terminal_review.outcome,
+        Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(&state.current_sha)
+    )
 }
 
 #[cfg(test)]
@@ -985,6 +1142,8 @@ mod tests {
                 .collect(),
             passed: items.iter().all(|(_, passed)| *passed),
             request_attention: false,
+            gaps: vec![],
+            nonce: None,
         }
     }
 
@@ -1694,6 +1853,8 @@ mod tests {
                     }],
                     passed: false,
                     request_attention: false,
+                    gaps: vec![],
+                    nonce: None,
                 },
                 None,
             ),
@@ -1988,5 +2149,471 @@ mod tests {
             AdvisoryStatus::Pending
         );
         assert!(state.open_attention.is_empty());
+    }
+
+    // ---- Terminal review: the closing obligation, its parks, and staleness ----
+
+    use super::super::event::{Gap, GapSeverity, TerminalReviewConfig};
+    use super::super::state::{ReviewAcceptance, ReviewOutcome};
+
+    fn created_with_review() -> MissionEvent {
+        let MissionEvent::MissionCreated {
+            objective,
+            mission_type,
+            runtime,
+            image_id,
+            workspace_dir,
+            base_sha,
+            mut config,
+        } = created()
+        else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.terminal_review = Some(TerminalReviewConfig {
+            role: RoleName::new("gap-reviewer").expect("role name"),
+        });
+        MissionEvent::MissionCreated {
+            objective,
+            mission_type,
+            runtime,
+            image_id,
+            workspace_dir,
+            base_sha,
+            config,
+        }
+    }
+
+    fn gap(severity: GapSeverity) -> Gap {
+        Gap {
+            id: None,
+            severity,
+            requirement: "the objective's behavior".into(),
+            expected: "it works".into(),
+            observed: "it does not".into(),
+            evidence: "ran it; saw it".into(),
+        }
+    }
+
+    fn review_requested(attempt_no: u32, key: &str, judged: &str) -> MissionEvent {
+        MissionEvent::TerminalReviewRequested {
+            attempt_no,
+            idempotency_key: key.into(),
+            role: RoleName::new("gap-reviewer").expect("role name"),
+            prompt: PayloadRef::inline("review prompt"),
+            judged_sha: judged.into(),
+            nonce: "n0".into(),
+        }
+    }
+
+    fn review_completed(key: &str, judged: &str, passed: bool, gaps: Vec<Gap>) -> MissionEvent {
+        MissionEvent::TerminalReviewCompleted {
+            attempt_no: 1,
+            idempotency_key: key.into(),
+            judged_sha: judged.into(),
+            passed,
+            gaps,
+            report: PayloadRef::inline("requirement map + observations"),
+        }
+    }
+
+    fn review_failed(key: &str, judged: &str, detail: &str) -> MissionEvent {
+        MissionEvent::TerminalReviewFailed {
+            attempt_no: 1,
+            idempotency_key: key.into(),
+            judged_sha: judged.into(),
+            error_kind: RunErrorKind::Timeout,
+            detail: detail.into(),
+            synthesized: false,
+        }
+    }
+
+    /// A review-configured mission driven to the brink of closure: work
+    /// committed (head → "h1"), the oracle fresh-passing there. Only the
+    /// review obligation remains.
+    fn events_to_the_brink() -> Vec<MissionEvent> {
+        vec![
+            created_with_review(),
+            plan_submitted(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("fix")],
+            ),
+            role_completed(
+                "fix",
+                "k1",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            ),
+            oracle_completed("TESTS-PASS", "h1", "ko", 0),
+        ]
+    }
+
+    #[test]
+    fn terminal_review_holds_running_until_a_fresh_verdict_then_closes_clean() {
+        // Work settled + oracle fresh-passing: the review obligation is the
+        // sole reason the mission has not closed.
+        let mut events = events_to_the_brink();
+        let owed = fold_log(events.clone()).expect("owed state");
+        assert!(owed.inflight.is_empty());
+        assert!(owed.open_attention.is_empty());
+        assert!(terminal_review_outstanding(&owed));
+        assert_eq!(owed.phase, MissionPhase::Running);
+
+        // A clean fresh verdict closes with no park — zero mental tax — and
+        // never touches the oracle-minted finish grade.
+        events.push(review_requested(1, "kr", "h1"));
+        events.push(review_completed("kr", "h1", true, vec![]));
+        let state = fold_log(events).expect("state");
+        assert!(state.open_attention.is_empty());
+        assert_eq!(state.terminal_review.attempts, 1);
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
+        );
+    }
+
+    #[test]
+    fn a_log_without_terminal_review_config_derives_exactly_as_before() {
+        // The same brink under a config-less mission closes immediately …
+        let mut events = events_to_the_brink();
+        events[0] = created();
+        let state = fold_log(events.clone()).expect("state");
+        assert!(!terminal_review_outstanding(&state));
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
+        );
+
+        // … and even hostile injected review events gate nothing: the fold
+        // records them (never trust the writer, but never drop facts), while
+        // every derivation stays config-gated.
+        events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        let state = fold_log(events).expect("state");
+        assert!(state.terminal_review.outcome.is_some());
+        assert!(state.open_attention.is_empty());
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
+        );
+    }
+
+    #[test]
+    fn minor_gaps_do_not_park_a_passed_review() {
+        let mut events = events_to_the_brink();
+        events.push(review_completed(
+            "kr",
+            "h1",
+            true,
+            vec![gap(GapSeverity::Major), gap(GapSeverity::Minor)],
+        ));
+        let state = fold_log(events).expect("state");
+        assert!(state.open_attention.is_empty());
+        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+        // The gaps stay on record for the receipt.
+        let Some(ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome else {
+            panic!("verdict recorded");
+        };
+        assert_eq!(v.gaps.len(), 2);
+        assert!(!v.blocking());
+    }
+
+    #[test]
+    fn blocking_gaps_park_and_continue_acknowledges_at_the_judged_sha() {
+        let mut events = events_to_the_brink();
+        events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking), gap(GapSeverity::Minor)],
+        ));
+        let parked = fold_log(events.clone()).expect("parked state");
+        assert_eq!(parked.phase, MissionPhase::AttentionNeeded);
+        let item = &parked.open_attention["terminal_review_gaps:mission"];
+        assert_eq!(item.kind, AttentionKind::TerminalReviewGaps);
+        assert!(item.report.contains("1 blocking gap(s) of 2 total"));
+
+        events.push(decision(
+            "terminal_review_gaps:mission",
+            super::super::event::DecisionAction::Continue,
+        ));
+        let state = fold_log(events).expect("state");
+        assert_eq!(
+            state.terminal_review.accepted,
+            Some(ReviewAcceptance::AcknowledgedGaps {
+                judged_sha: "h1".into()
+            })
+        );
+        assert!(state.open_attention.is_empty());
+        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+    }
+
+    #[test]
+    fn a_passed_verdict_with_a_blocking_gap_still_parks() {
+        // Fail-closed dominance: the reviewer's own summary bit cannot wave a
+        // blocking gap through.
+        let mut events = events_to_the_brink();
+        events.push(review_completed(
+            "kr",
+            "h1",
+            true,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    }
+
+    #[test]
+    fn an_unstructured_fail_still_parks() {
+        // passed=false with zero typed gaps is an honest fail; the report is
+        // the evidence.
+        let mut events = events_to_the_brink();
+        events.push(review_completed("kr", "h1", false, vec![]));
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+        let item = &state.open_attention["terminal_review_gaps:mission"];
+        assert!(item.report.contains("see its report"));
+    }
+
+    #[test]
+    fn retry_discards_the_verdict_and_reopens_the_obligation() {
+        let mut events = events_to_the_brink();
+        events.push(review_requested(1, "kr", "h1"));
+        events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        events.push(decision(
+            "terminal_review_gaps:mission",
+            super::super::event::DecisionAction::Retry,
+        ));
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.terminal_review.outcome, None);
+        assert_eq!(state.terminal_review.accepted, None);
+        // Attempts are preserved (the next dispatch is attempt 2 under a
+        // fresh idempotency key) and the obligation holds the phase.
+        assert_eq!(state.terminal_review.attempts, 1);
+        assert!(terminal_review_outstanding(&state));
+        assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
+    fn a_head_move_stales_both_verdict_and_acknowledgment() {
+        let mut events = events_to_the_brink();
+        events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        events.push(decision(
+            "terminal_review_gaps:mission",
+            super::super::event::DecisionAction::Continue,
+        ));
+        assert!(matches!(
+            fold_log(events.clone()).expect("state").phase,
+            MissionPhase::Done { .. }
+        ));
+
+        // New work moves the head: the h1 verdict and its acknowledgment are
+        // both stale — the mission re-opens and a blocking verdict at h2
+        // parks again (the acknowledgment is keyed, never inherited).
+        events.push(role_completed(
+            "fix",
+            "k2",
+            work_handoff(true, false),
+            Some(ArtifactOutcome {
+                base_sha: "h1".into(),
+                head_sha: "h2".into(),
+            }),
+        ));
+        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
+        let reopened = fold_log(events.clone()).expect("reopened state");
+        assert!(terminal_review_outstanding(&reopened));
+        assert_eq!(reopened.phase, MissionPhase::Running);
+
+        events.push(review_completed(
+            "kr2",
+            "h2",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        let state = fold_log(events).expect("state");
+        assert_eq!(
+            state.terminal_review.accepted,
+            Some(ReviewAcceptance::AcknowledgedGaps {
+                judged_sha: "h1".into()
+            })
+        );
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    }
+
+    #[test]
+    fn an_amendment_auto_clears_the_gap_park_and_resumes_remediation() {
+        let mut events = events_to_the_brink();
+        events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        assert_eq!(
+            fold_log(events.clone()).expect("parked").phase,
+            MissionPhase::AttentionNeeded
+        );
+
+        // Remediation lands as an amendment: pending work makes the mission
+        // no longer otherwise-closing, so the park clears in the same fold —
+        // no second human decision to resume.
+        events.push(plan_amended(
+            1,
+            AmendmentOps {
+                add: vec![work_task("fix-gap")],
+                ..Default::default()
+            },
+        ));
+        let state = fold_log(events).expect("state");
+        assert!(state.open_attention.is_empty());
+        assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
+    fn terminal_review_failure_parks_then_retry_reopens() {
+        let mut events = events_to_the_brink();
+        events.push(review_requested(1, "kr", "h1"));
+        events.push(review_failed("kr", "h1", "agent timed out"));
+        let parked = fold_log(events.clone()).expect("parked state");
+        assert_eq!(parked.phase, MissionPhase::AttentionNeeded);
+        let item = &parked.open_attention["terminal_review_failed:mission"];
+        assert_eq!(item.kind, AttentionKind::TerminalReviewFailed);
+        assert!(item.report.contains("agent timed out"));
+
+        events.push(decision(
+            "terminal_review_failed:mission",
+            super::super::event::DecisionAction::Retry,
+        ));
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.terminal_review.outcome, None);
+        assert!(terminal_review_outstanding(&state));
+        assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
+    fn waiving_a_failed_review_closes_and_is_distinct_from_acknowledgment() {
+        let mut events = events_to_the_brink();
+        events.push(review_failed("kr", "h1", "agent timed out"));
+        events.push(decision(
+            "terminal_review_failed:mission",
+            super::super::event::DecisionAction::Continue,
+        ));
+        let state = fold_log(events).expect("state");
+        // The waiver variant keeps the receipt honest: no verdict exists.
+        assert_eq!(
+            state.terminal_review.accepted,
+            Some(ReviewAcceptance::Waived)
+        );
+        assert_eq!(state.terminal_review.outcome, None);
+        assert!(!terminal_review_outstanding(&state));
+        // The finish grade comes from the oracle facts alone.
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
+        );
+    }
+
+    #[test]
+    fn retry_after_failure_then_completion_records_the_verdict() {
+        let mut events = events_to_the_brink();
+        events.push(review_requested(1, "kr", "h1"));
+        events.push(review_failed("kr", "h1", "agent timed out"));
+        events.push(decision(
+            "terminal_review_failed:mission",
+            super::super::event::DecisionAction::Retry,
+        ));
+        events.push(review_requested(2, "kr2", "h1"));
+        events.push(review_completed("kr2", "h1", true, vec![]));
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.terminal_review.attempts, 2);
+        assert!(matches!(
+            state.terminal_review.outcome,
+            Some(ReviewOutcome::Verdict(_))
+        ));
+        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+    }
+
+    #[test]
+    fn terminal_review_decision_legality() {
+        use super::super::decision::{validate_decision, DecisionError};
+        use super::super::event::DecisionAction;
+        // A gaps park and a failure park, each straight from the fold.
+        let mut gaps_events = events_to_the_brink();
+        gaps_events.push(review_completed(
+            "kr",
+            "h1",
+            false,
+            vec![gap(GapSeverity::Blocking)],
+        ));
+        let gaps_state = fold_log(gaps_events).expect("state");
+        let mut failed_events = events_to_the_brink();
+        failed_events.push(review_failed("kr", "h1", "boom"));
+        let failed_state = fold_log(failed_events).expect("state");
+
+        for (state, item) in [
+            (&gaps_state, "terminal_review_gaps:mission"),
+            (&failed_state, "terminal_review_failed:mission"),
+        ] {
+            for action in [
+                DecisionAction::Retry,
+                DecisionAction::Continue,
+                DecisionAction::Abort,
+            ] {
+                assert!(
+                    validate_decision(state, item, &action).is_ok(),
+                    "{item} must accept {action:?}"
+                );
+            }
+            assert!(
+                matches!(
+                    validate_decision(state, item, &DecisionAction::Ratify),
+                    Err(DecisionError::InvalidAction { .. })
+                ),
+                "{item} must refuse Ratify"
+            );
+        }
+    }
+
+    #[test]
+    fn below_bar_finish_closes_without_review() {
+        // A fresh authoritative FAIL settles the oracle obligation and the
+        // finish is below the verified bar — the mission closes (nonzero exit
+        // at the CLI) without burning a reviewer turn; the review is the last
+        // gate on an otherwise-passing mission only.
+        let mut events = events_to_the_brink();
+        events.pop(); // replace the passing oracle run …
+        events.push(oracle_completed("TESTS-PASS", "h1", "ko", 1)); // … with a fail
+        let state = fold_log(events).expect("state");
+        assert!(!terminal_review_outstanding(&state));
+        assert_eq!(
+            state.phase,
+            MissionPhase::Done {
+                finish: FinishClass::Unverified
+            }
+        );
     }
 }

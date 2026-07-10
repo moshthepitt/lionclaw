@@ -29,18 +29,27 @@ pub fn validate_decision(
     };
     let legal = match (action, item.kind) {
         (DecisionAction::Ratify, AttentionKind::Ratify | AttentionKind::RatifyProposal) => true,
-        // Retry a rejected proposal (re-run planning) or a failed node.
+        // Retry a rejected proposal (re-run planning), a failed node, a failed
+        // oracle, or the terminal review (re-roll the reviewer).
         (
             DecisionAction::Retry,
-            AttentionKind::RatifyProposal | AttentionKind::NodeFailed | AttentionKind::OracleFailed,
+            AttentionKind::RatifyProposal
+            | AttentionKind::NodeFailed
+            | AttentionKind::OracleFailed
+            | AttentionKind::TerminalReviewGaps
+            | AttentionKind::TerminalReviewFailed,
         ) => true,
+        // Continue = accept the situation and proceed: acknowledge review gaps
+        // at their sha, or waive a review that failed to run.
         (
             DecisionAction::Continue,
             AttentionKind::NodeFailed
             | AttentionKind::NodeAttention
             | AttentionKind::OracleFailed
             | AttentionKind::GateCheckpoint
-            | AttentionKind::GateFailed,
+            | AttentionKind::GateFailed
+            | AttentionKind::TerminalReviewGaps
+            | AttentionKind::TerminalReviewFailed,
         ) => true,
         // Abort is always available while an item is open.
         (DecisionAction::Abort, _) => true,

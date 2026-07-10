@@ -582,6 +582,8 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                 // The planning DAG the mission type ships (empty ⇒ awaits a
                 // manually submitted plan).
                 planning: engine.mission_type().planning.clone(),
+                // The closing review the mission type ships (None ⇒ off).
+                terminal_review: engine.mission_type().terminal_review.clone(),
             },
         )
         .await?;
@@ -800,7 +802,16 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         .map(|(id, _)| id.as_str())
         .collect();
 
+    // Who accepted the review outcome (acknowledged gaps or waived after a
+    // failure), from the decision that did it — receipts cite provenance.
+    let review_accepted_by = review_acceptance_provenance(&store, &mission_id).await?;
+
     if args.json {
+        use crate::model::ReviewOutcome;
+        let review_gaps = match &state.terminal_review.outcome {
+            Some(ReviewOutcome::Verdict(v)) => serde_json::to_value(&v.gaps)?,
+            _ => serde_json::Value::Null,
+        };
         println!(
             "{}",
             serde_json::json!({
@@ -815,6 +826,13 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "finish": finish.map(|f| f.slug()),
                 "assertions": rows.iter().map(|(id, _, v)| serde_json::json!({ "id": id, "verdict": v })).collect::<Vec<_>>(),
                 "not_covered_by_an_oracle": uncovered,
+                "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
+                "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "terminal_review": review_summary(&state),
+                "terminal_review_gaps": review_gaps,
+                "terminal_review_accepted_by": review_accepted_by.map(|(actor, justification)| {
+                    serde_json::json!({ "actor": actor, "justification": justification })
+                }),
             })
         );
         return Ok(());
@@ -850,8 +868,38 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         ),
     }
     println!("  bar:     {:?}", state.config.stop);
+    if let Some(line) = review_line(&state) {
+        println!("  {line}");
+        if let Some((actor, justification)) = &review_accepted_by {
+            println!("           accepted by {actor}: \"{justification}\"");
+        }
+        if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
+            for gap in &v.gaps {
+                println!(
+                    "    [{}] {}{}",
+                    gap.severity.slug(),
+                    gap.id
+                        .as_deref()
+                        .map(|id| format!("{id}: "))
+                        .unwrap_or_default(),
+                    gap.requirement,
+                );
+                println!("        expected: {}", gap.expected);
+                println!("        observed: {}", gap.observed);
+                if !gap.evidence.is_empty() {
+                    println!("        evidence: {}", gap.evidence);
+                }
+            }
+        }
+    }
     println!("\n  assertions:");
     for (id, has_oracle, verdict) in &rows {
+        // A waived oracle never ran and never will: say so, never "owed".
+        let waived = state
+            .contract
+            .get(&crate::model::AssertionId::new(id).expect("row ids come from the contract"))
+            .and_then(|a| a.oracle.as_ref())
+            .is_some_and(|o| state.waived_oracles.contains(o));
         match verdict {
             Some(v) => {
                 let passed = v["passed"].as_bool().unwrap_or(false);
@@ -868,6 +916,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     },
                 );
             }
+            None if waived => println!(
+                "    {id}: WAIVED — its oracle failed to run and a human accepted closing without it"
+            ),
             None if *has_oracle => println!("    {id}: (oracle owed, not yet run)"),
             None => println!("    {id}: advisory only — no oracle can prove this"),
         }
@@ -876,6 +927,17 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         println!(
             "\n  NOT covered by an oracle (agent judgement only): {}",
             uncovered.join(", ")
+        );
+    }
+    if !state.acknowledged_gates.is_empty() {
+        println!(
+            "\n  gates a human confirmed or accepted: {}",
+            state
+                .acknowledged_gates
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if args.patch && state.current_sha != state.base_sha {
@@ -956,7 +1018,19 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
-    print_advance_outcome(mission_id.as_str(), &state.phase, &outcome, args.json);
+    print_advance_outcome(mission_id.as_str(), &state, &outcome, args.json);
+    // Closing over acknowledged review gaps was an explicit, justified human
+    // decision — exit SUCCESS, but say so (the receipt has the details).
+    if matches!(state.phase, MissionPhase::Done { .. }) {
+        if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
+            if v.blocking() {
+                eprintln!(
+                    "note: closed with {} acknowledged gap(s); see 'mission report'",
+                    v.gaps.len()
+                );
+            }
+        }
+    }
     // The exit code reflects the honesty bar: a mission that finished below the
     // stop bar its mission type declares exits nonzero, so a caller or CI can
     // gate on "actually verified" without parsing output.
@@ -994,6 +1068,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                         "authoritative_pass": a.last_authoritative.as_ref().map(|v| v.passed()),
                     })
                 }).collect::<Vec<_>>(),
+                "review": review_summary(&state),
             })
         );
     } else {
@@ -1003,6 +1078,9 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             state.revision
         );
         println!("objective: {}", state.objective);
+        if let Some(line) = review_line(&state) {
+            println!("{line}");
+        }
         for (id, assertion) in &state.contract {
             let auth = assertion
                 .last_authoritative
@@ -1197,6 +1275,9 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
                         "image": mt.image,
                         "roles": mt.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
                         "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
+                        "terminal_review": mt.terminal_review.as_ref().map(|tr| {
+                            serde_json::json!({ "role": tr.role.as_str() })
+                        }),
                         "playbook": mt.playbook,
                     })
                 );
@@ -1205,6 +1286,9 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
                 println!("  digest: {}", short_hex(&mt.digest));
                 println!("  stop:  {:?}", mt.stop);
                 println!("  image: {}", mt.image);
+                if let Some(tr) = &mt.terminal_review {
+                    println!("  terminal review: {}", tr.role);
+                }
                 println!(
                     "  roles: {}",
                     mt.roles
@@ -1235,10 +1319,11 @@ fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
 
 fn print_advance_outcome(
     mission_id: &str,
-    phase: &MissionPhase,
+    state: &crate::model::MissionState,
     outcome: &AdvanceOutcome,
     json: bool,
 ) {
+    let phase = &state.phase;
     let finish = phase.finish().map(|f| f.slug());
     if json {
         println!(
@@ -1248,6 +1333,7 @@ fn print_advance_outcome(
                 "phase": phase_slug(phase),
                 "finish": finish,
                 "outcome": outcome.slug(),
+                "review": review_summary(state),
             })
         );
     } else {
@@ -1267,6 +1353,9 @@ fn print_advance_outcome(
             }
             AdvanceOutcome::Terminal { phase } => {
                 println!("mission {mission_id}: {}", phase_slug(phase));
+                if let Some(line) = review_line(state) {
+                    println!("  {line}");
+                }
             }
         }
     }
@@ -1279,6 +1368,112 @@ fn phase_slug(phase: &MissionPhase) -> String {
         MissionPhase::Done { finish } => format!("done:{}", finish.slug()),
         other => other.slug().to_string(),
     }
+}
+
+/// Who accepted the review outcome, from the log: the last `continue`
+/// decision on either terminal-review item (acknowledged gaps or waiver).
+async fn review_acceptance_provenance(
+    store: &MissionStore,
+    mission_id: &MissionId,
+) -> Result<Option<(String, String)>> {
+    use crate::model::{DecisionAction, MissionEvent};
+    let mut accepted = None;
+    for envelope in store.load(mission_id).await? {
+        if let MissionEvent::DecisionRecorded {
+            attention_id,
+            action: DecisionAction::Continue,
+            justification,
+            actor,
+        } = &envelope.event
+        {
+            if attention_id == "terminal_review_gaps:mission"
+                || attention_id == "terminal_review_failed:mission"
+            {
+                accepted = Some((actor.clone(), justification.clone()));
+            }
+        }
+    }
+    Ok(accepted)
+}
+
+/// The terminal-review summary — ONE source of truth behind the advance
+/// banner, `status`, `report`, and every `--json` output. `Null` when the
+/// mission declares no review.
+fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
+    use crate::model::{GapSeverity, ReviewAcceptance, ReviewOutcome};
+    let Some(config) = &state.config.terminal_review else {
+        return serde_json::Value::Null;
+    };
+    let tr = &state.terminal_review;
+    let waived = matches!(tr.accepted, Some(ReviewAcceptance::Waived));
+    let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
+        Some(ReviewOutcome::Verdict(v)) => {
+            let count = |s: GapSeverity| v.gaps.iter().filter(|g| g.severity == s).count();
+            let acknowledged = matches!(
+                &tr.accepted,
+                Some(ReviewAcceptance::AcknowledgedGaps { judged_sha }) if *judged_sha == v.judged_sha
+            );
+            (
+                if v.blocking() { "gaps" } else { "clean" },
+                Some(v.judged_sha.clone()),
+                Some(v.is_fresh_at(&state.current_sha)),
+                Some(serde_json::json!({
+                    "blocking": count(GapSeverity::Blocking),
+                    "major": count(GapSeverity::Major),
+                    "minor": count(GapSeverity::Minor),
+                })),
+                acknowledged,
+            )
+        }
+        Some(ReviewOutcome::Failed { .. }) => ("failed", None, None, None, false),
+        None if waived => ("waived", None, None, None, false),
+        None => ("owed", None, None, None, false),
+    };
+    serde_json::json!({
+        "role": config.role.as_str(),
+        "verdict": verdict,
+        "judged_sha": judged_sha,
+        "fresh": fresh,
+        "gaps": counts,
+        "acknowledged": acknowledged,
+        "waived": waived,
+        "attempts": tr.attempts,
+    })
+}
+
+/// The one-line human rendering of `review_summary`; `None` when the mission
+/// declares no review.
+fn review_line(state: &crate::model::MissionState) -> Option<String> {
+    let summary = review_summary(state);
+    if summary.is_null() {
+        return None;
+    }
+    let sha = summary["judged_sha"]
+        .as_str()
+        .map(short_hex)
+        .unwrap_or_default();
+    let stale = if summary["fresh"] == serde_json::json!(false) {
+        " [STALE — not at the final commit]"
+    } else {
+        ""
+    };
+    Some(match summary["verdict"].as_str().unwrap_or("owed") {
+        "clean" => format!("review: clean (judged {sha}){stale}"),
+        "gaps" => format!(
+            "review: {} blocking, {} major, {} minor gap(s) (judged {sha}){stale}{}",
+            summary["gaps"]["blocking"],
+            summary["gaps"]["major"],
+            summary["gaps"]["minor"],
+            if summary["acknowledged"].as_bool().unwrap_or(false) {
+                " — acknowledged by a human"
+            } else {
+                ""
+            },
+        ),
+        "failed" => "review: FAILED to run — retry, waive (continue), or abort".to_string(),
+        "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
+        _ => "review: owed — not yet judged at the final commit".to_string(),
+    })
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants plus the re-planning/amendment invariant (five
-//! numbered checks). Hermetic and model-auth-free — the *oracle*
+//! four Slice-1 invariants plus the re-planning/amendment invariant and the
+//! terminal-review closure gate (six numbered checks). Hermetic and
+//! model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
 //!
@@ -25,9 +26,10 @@ use crate::config::MissionRuntimeProfile;
 use crate::engine::{AmendError, Engine};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, FinishClass, Handoff,
-    MissionConfig, MissionEvent, MissionId, MissionPhase, OracleBinding, OracleName, PayloadRef,
-    PlanSubmission, RoleName, RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
+    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, DecisionAction,
+    FinishClass, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase,
+    OracleBinding, OracleName, PayloadRef, PlanSubmission, ReviewAcceptance, RoleName,
+    RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -63,6 +65,69 @@ impl RoleRunner for NoopRoleRunner {
     }
 }
 
+/// A worker that "commits" a fixed head, plus a terminal reviewer that
+/// returns one blocking gap (echoing the prompt's nonce, as a real agent
+/// must). Drives check (6) without a model or a container.
+struct ReviewParkRoleRunner;
+
+#[async_trait]
+impl RoleRunner for ReviewParkRoleRunner {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+        if request.task_id.as_str() == "terminal-review" {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("self-test scripted review"),
+                    items: vec![],
+                    passed: false,
+                    request_attention: false,
+                    gaps: vec![Gap {
+                        id: Some("GAP-1".to_string()),
+                        severity: GapSeverity::Blocking,
+                        requirement: "the objective's behavior".to_string(),
+                        expected: "it works".to_string(),
+                        observed: "it does not".to_string(),
+                        evidence: "self-test scripted verdict".to_string(),
+                    }],
+                    nonce: crate::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+                },
+                artifact: None,
+                model_id: None,
+            })
+        } else {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("self-test worker"),
+                    request_attention: false,
+                },
+                artifact: Some(ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: "selftest-head".to_string(),
+                }),
+                model_id: None,
+            })
+        }
+    }
+}
+
+/// An engine-side oracle with a fixed exit code — check (6) is about the
+/// closure gate, not the oracle, so no container is needed.
+struct FixedOracleRunner(i32);
+
+#[async_trait]
+impl OracleRunner for FixedOracleRunner {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+        Ok(OracleOutcome {
+            exit_code: self.0,
+            exit_signal: None,
+            stdout: format!("self-test oracle exit {}", self.0).into_bytes(),
+            stderr: Vec::new(),
+            duration_ms: 1,
+        })
+    }
+}
+
 /// Wraps the real confined oracle and counts how many times it actually ran,
 /// so check (1) can assert resume does NOT re-execute the oracle.
 struct CountingOracleRunner {
@@ -94,8 +159,8 @@ pub async fn run(json: bool) -> Result<ExitCode> {
     let podman = podman_readiness().await;
     let mut checks = Vec::new();
 
-    // (3) Moat and (5) re-planning are pure — they always run, even without
-    // podman.
+    // (3) Moat, (5) re-planning, and (6) terminal review are pure — they
+    // always run, even without podman.
     checks.push(Check {
         name: "moat-refuses-over-privileged-judge",
         status: to_status(check_moat().await),
@@ -103,6 +168,10 @@ pub async fn run(json: bool) -> Result<ExitCode> {
     checks.push(Check {
         name: "replanning-amends-atomically-and-strengthen-only",
         status: to_status(check_replanning().await),
+    });
+    checks.push(Check {
+        name: "terminal-review-gates-closure",
+        status: to_status(check_terminal_review().await),
     });
 
     // (1),(2),(4) need real confinement.
@@ -707,6 +776,120 @@ async fn check_replanning() -> Result<()> {
         Err(AmendError::Rejected(AmendmentError::OracleUnbound { .. })) => Ok(()),
         Ok(()) => anyhow::bail!("contract-weakening amendment was accepted"),
         Err(other) => anyhow::bail!("weakening refused, but not as OracleUnbound: {other}"),
+    }
+}
+
+/// (6) Terminal review gates closure: a mission type declaring a closing
+/// review does not close on a blocking verdict — it parks for a human, and
+/// only an explicit `continue` (acknowledge) lets it finish, with the
+/// acknowledgment on record. Also: the loader refuses `stop = "reviewed"`
+/// without the declaration (that bar is *defined* by the review). Pure — no
+/// agent turn, no oracle run — so it always runs.
+async fn check_terminal_review() -> Result<()> {
+    // Loader gate: an agent-graded bar without an independent closing review
+    // must refuse to load.
+    let bar_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_mission_type(bar_dir.path())?;
+    std::fs::write(
+        bar_dir.path().join("mission.toml"),
+        format!("[mission-type]\nname = \"reviewed-bare\"\nstop = \"reviewed\"\nimage = \"{RUNTIME_IMAGE}\"\n"),
+    )?;
+    match load_mission_type(bar_dir.path(), &AuthorityCeiling::default()) {
+        Ok(_) => anyhow::bail!("stop=reviewed loaded without [terminal-review]"),
+        Err(MissionTypeError::Manifest(detail))
+            if detail.contains("requires [terminal-review]") => {}
+        Err(other) => anyhow::bail!("refused, but not for the missing review: {other}"),
+    }
+
+    // Closure gate: blocking verdict → park → acknowledge → done.
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_sw_mission_type(type_dir.path())?;
+    std::fs::write(
+        type_dir.path().join("mission.toml"),
+        format!(
+            "[mission-type]\nname = \"selftest\"\nstop = \"verified\"\nimage = \"{RUNTIME_IMAGE}\"\n\
+             \n[terminal-review]\nrole = \"gap-reviewer\"\n"
+        ),
+    )?;
+    std::fs::write(
+        type_dir.path().join("roles/gap-reviewer.md"),
+        "---\noutput: emits-verdict\nruntime: codex\n---\nSelf-test gap reviewer.\n",
+    )?;
+    let mission_type = load_mission_type(type_dir.path(), &AuthorityCeiling::default())
+        .map_err(|e| anyhow::anyhow!("review mission type load failed: {e}"))?;
+
+    let repo = tempfile::tempdir().context("tempdir")?;
+    let config = MissionConfig {
+        ratification_gate: false,
+        terminal_review: mission_type.terminal_review.clone(),
+        ..Default::default()
+    };
+    let engine = Engine::new(
+        MissionStore::open(repo.path()).await?,
+        mission_type,
+        "codex".to_string(),
+        RUNTIME_IMAGE.to_string(),
+        Arc::new(ReviewParkRoleRunner),
+        Arc::new(FixedOracleRunner(0)),
+        Arc::new(SystemClock),
+    );
+    let mission_id = engine
+        .create_mission(
+            repo.path().to_str().context("utf8 repo path")?,
+            "terminal-review self-test",
+            "selftest-base",
+            config,
+        )
+        .await?;
+    engine
+        .submit_plan(&mission_id, oracle_plan())
+        .await
+        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+
+    engine.advance(&mission_id).await?;
+    let parked = engine.load_state(&mission_id).await?;
+    if !matches!(parked.phase, MissionPhase::AttentionNeeded) {
+        anyhow::bail!(
+            "a blocking review verdict did not park the mission (phase {:?})",
+            parked.phase
+        );
+    }
+    if !parked
+        .open_attention
+        .contains_key("terminal_review_gaps:mission")
+    {
+        anyhow::bail!("park is not the terminal-review gaps item");
+    }
+
+    engine
+        .decide(
+            &mission_id,
+            "terminal_review_gaps:mission",
+            DecisionAction::Continue,
+            "self-test acknowledges the gap",
+            "self-test",
+        )
+        .await?;
+    engine.advance(&mission_id).await?;
+    let done = engine.load_state(&mission_id).await?;
+    if !matches!(
+        done.phase,
+        MissionPhase::Done {
+            finish: FinishClass::Verified
+        }
+    ) {
+        anyhow::bail!(
+            "acknowledged mission did not close verified: {:?}",
+            done.phase
+        );
+    }
+    match &done.terminal_review.accepted {
+        Some(ReviewAcceptance::AcknowledgedGaps { judged_sha })
+            if judged_sha == "selftest-head" =>
+        {
+            Ok(())
+        }
+        other => anyhow::bail!("acknowledgment not on record at the judged sha: {other:?}"),
     }
 }
 

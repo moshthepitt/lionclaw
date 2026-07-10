@@ -61,6 +61,7 @@ fn planning_mission_type() -> MissionType {
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: planning_dag(),
+        terminal_review: None,
         playbook: Some("plan carefully".to_string()),
         roles,
         oracles: BTreeMap::from([(
@@ -142,6 +143,8 @@ fn planning_runner() -> MockRoleRunner {
                 items: vec![],
                 passed: true,
                 request_attention: false,
+                gaps: vec![],
+                nonce: None,
             },
         };
         let artifact =
@@ -183,6 +186,7 @@ async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
                 ratification_gate: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                terminal_review: None,
             },
         )
         .await
@@ -251,6 +255,7 @@ async fn retrying_a_proposal_rejects_it_and_re_runs_planning() {
                 ratification_gate: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                terminal_review: None,
             },
         )
         .await
@@ -332,6 +337,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
                 ratification_gate: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                terminal_review: None,
             },
         )
         .await
@@ -408,6 +414,7 @@ async fn park_after_author(
                 ratification_gate: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                terminal_review: None,
             },
         )
         .await

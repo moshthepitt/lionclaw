@@ -67,6 +67,8 @@ async fn advisory_only_mission_type_never_verifies() {
                 }],
                 passed: true,
                 request_attention: false,
+                gaps: vec![],
+                nonce: None,
             }
         } else {
             Handoff::Work {
@@ -105,6 +107,7 @@ async fn advisory_only_mission_type_never_verifies() {
                 ratification_gate: false,
                 stop: StopBar::Reviewed,
                 planning: Default::default(),
+                terminal_review: None,
             },
         )
         .await

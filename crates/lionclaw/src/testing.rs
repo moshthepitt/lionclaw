@@ -9,11 +9,29 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::model::{ArtifactOutcome, Handoff, PayloadRef, TaskId};
+use crate::model::{ArtifactOutcome, Gap, Handoff, PayloadRef, TaskId};
 use crate::ports::{
     Clock, OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure,
     RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
+
+/// A terminal-review verdict outcome that echoes the request prompt's nonce
+/// (judges have no clone, so `artifact` is always `None`).
+pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) -> RoleRunOutcome {
+    RoleRunOutcome {
+        handoff: Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("requirement map + observations"),
+            items: vec![],
+            passed,
+            request_attention: false,
+            gaps,
+            nonce: crate::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+        },
+        artifact: None,
+        model_id: Some("mock-model".to_string()),
+    }
+}
 
 /// Deterministic monotonic clock — proves nothing depends on real time.
 #[derive(Default)]

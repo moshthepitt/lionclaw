@@ -30,6 +30,8 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
                 }],
                 passed: reviewer_passes,
                 request_attention: false,
+                gaps: vec![],
+                nonce: None,
             }
         } else {
             Handoff::Work {

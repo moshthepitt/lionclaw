@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use crate::model::{
     MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
+    TerminalReviewConfig,
 };
 
 /// A role is property-composed data: open fields (name, prompt, runtime) plus
@@ -50,6 +51,9 @@ pub struct MissionType {
     /// The planning DAG (how an objective becomes a proposed contract). Empty
     /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
     pub planning: PlanningDag,
+    /// The closing review (the pure-core config type, threaded verbatim into
+    /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
+    pub terminal_review: Option<TerminalReviewConfig>,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,
     pub oracles: BTreeMap<OracleName, PathBuf>,
