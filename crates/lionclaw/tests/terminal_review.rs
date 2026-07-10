@@ -567,3 +567,41 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
     };
     assert_eq!(v.judged_sha, format!("{:040}", 3));
 }
+
+#[tokio::test]
+async fn a_config_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creation() {
+    // Regression (QA round 2): a config whose reviewer the pinned type cannot
+    // resolve would wedge at the closing gate (every advance erroring before
+    // any event lands, so no attention item and no abort path). Refuse it at
+    // the config choke point instead.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with_type(
+        dir.path(),
+        review_mission_type(),
+        review_runner(vec![(true, vec![])]),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    for (role, expected) in [
+        ("ghost", "is not provided"),
+        ("implementer", "must be emits-verdict"),
+    ] {
+        let err = h
+            .engine
+            .create_mission(
+                dir.path().to_str().expect("utf8"),
+                "obj",
+                BASE_SHA,
+                lionclaw::model::MissionConfig {
+                    ratification_gate: false,
+                    terminal_review: Some(lionclaw::model::TerminalReviewConfig {
+                        role: lionclaw::model::RoleName::new(role).expect("role name"),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an unresolvable reviewer must be refused");
+        assert!(err.to_string().contains(expected), "{role}: got {err}");
+    }
+}

@@ -515,7 +515,9 @@ mod sink_tests {
             base_sha: "base".into(),
             config: MissionConfig {
                 ratification_gate: false,
-                stop: StopBar::Reviewed,
+                // Verified: a reviewed-bar config without a terminal review
+                // is a shape production refuses (create_mission + loader).
+                stop: StopBar::Verified,
                 planning: Default::default(),
                 terminal_review: None,
             },

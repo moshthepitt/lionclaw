@@ -137,6 +137,32 @@ pub struct TerminalReviewState {
     pub accepted: Option<ReviewAcceptance>,
 }
 
+impl TerminalReviewState {
+    /// The acceptance, if it still holds at the current head — the ONE
+    /// freshness-law site the fold's derivations and the CLI's summaries all
+    /// share, so they can never disagree about whether the mission may close.
+    pub fn fresh_acceptance(&self, current_sha: &str) -> Option<&ReviewAcceptance> {
+        self.accepted
+            .as_ref()
+            .filter(|a| a.is_fresh_at(current_sha))
+    }
+
+    /// Whether a fresh waiver stands at the current head (closure permitted
+    /// without a verdict).
+    pub fn waived_at(&self, current_sha: &str) -> bool {
+        self.fresh_acceptance(current_sha)
+            .is_some_and(|a| a.kind == ReviewAcceptanceKind::Waived)
+    }
+
+    /// Whether this verdict's blocking gaps were acknowledged (the
+    /// acknowledgment is keyed to the verdict's own sha).
+    pub fn acknowledges(&self, verdict: &TerminalReviewVerdict) -> bool {
+        self.accepted.as_ref().is_some_and(|a| {
+            a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == verdict.judged_sha
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ReviewOutcome {

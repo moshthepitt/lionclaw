@@ -158,6 +158,13 @@ pub fn short_hex(hex: &str) -> String {
     hex.chars().take(12).collect()
 }
 
+/// The terminal reviewer's runner tag: its attempt-dir name and the task id
+/// scripted reviewers (tests, self-test) route on. Never a ledger id — review
+/// events carry no `task_id` — but it shares the attempt-dir namespace with
+/// plan tasks, so plan validation reserves it (a crashed worker attempt named
+/// like this could otherwise leave dirs the reviewer would silently reuse).
+pub const TERMINAL_REVIEW_TASK_TAG: &str = "terminal-review";
+
 #[cfg(test)]
 mod tests {
     use super::*;

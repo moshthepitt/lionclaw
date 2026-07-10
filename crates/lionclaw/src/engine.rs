@@ -97,10 +97,7 @@ pub enum AmendError {
 const EFFECT_LEASE_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_LOOP_ITERATIONS: usize = 10_000;
 
-/// The terminal reviewer's runner tag: its attempt-dir name and the task id
-/// scripted reviewers (tests, self-test) route on. Never a ledger id —
-/// review events carry no `task_id`.
-pub const TERMINAL_REVIEW_TASK_TAG: &str = "terminal-review";
+pub use crate::model::TERMINAL_REVIEW_TASK_TAG;
 
 impl Engine {
     pub fn new(
@@ -151,15 +148,33 @@ impl Engine {
         base_sha: &str,
         config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
-        // The reviewed bar is *defined* by an independent terminal review.
-        // The loader enforces this for mission types; enforce it here too so
-        // no direct caller can mint a reviewed-bar mission whose closing gate
-        // never runs (the fold is total and cannot refuse the config).
+        // The loader enforces both rules for mission types; enforce them here
+        // too so no direct caller can mint a config the closing gate cannot
+        // honor (the fold is total and cannot refuse the config).
+        //
+        // The reviewed bar is *defined* by an independent terminal review …
         if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
             bail!(
                 "a reviewed-bar mission requires a terminal review: \
                  the reviewed bar is defined by an independent closing review"
             );
+        }
+        // … and a declared reviewer must exist as a judge in the pinned type,
+        // or the closing dispatch could never resolve it.
+        if let Some(review) = &config.terminal_review {
+            match self.mission_type.roles.get(&review.role) {
+                Some(role) if role.output == crate::model::OutputSemantics::EmitsVerdict => {}
+                Some(role) => bail!(
+                    "terminal-review role '{}' must be emits-verdict, got {}",
+                    review.role,
+                    role.output.slug()
+                ),
+                None => bail!(
+                    "terminal-review role '{}' is not provided by mission type '{}'",
+                    review.role,
+                    self.mission_type.name
+                ),
+            }
         }
         let now_ms = self.clock.now_ms();
         let mission_id = MissionId::from_digest_prefix(&hex::encode(Sha256::digest(
@@ -912,12 +927,33 @@ impl Engine {
         state: &MissionState,
         intent: TerminalReviewDispatchIntent,
     ) -> Result<()> {
-        let role = self.mission_type.roles.get(&intent.role).with_context(|| {
-            format!(
-                "terminal-review role '{}' missing from the mission type",
-                intent.role
-            )
-        })?;
+        let idempotency_key = idem_key(&[
+            "terminal-review",
+            state.mission_id.as_str(),
+            &intent.judged_sha,
+            &intent.attempt_no.to_string(),
+        ]);
+        // create_mission refuses a config whose reviewer the pinned type
+        // cannot resolve, so this is unreachable through the public API —
+        // but a hostile log must degrade to a durable park a human can
+        // retry/waive/abort, never a permanently wedged mission whose every
+        // advance errors before any event lands.
+        let Some(role) = self.mission_type.roles.get(&intent.role) else {
+            let event = NewEvent::new(MissionEvent::TerminalReviewFailed {
+                attempt_no: intent.attempt_no,
+                idempotency_key,
+                judged_sha: intent.judged_sha,
+                error_kind: RunErrorKind::Launch,
+                detail: format!(
+                    "terminal-review role '{}' is not provided by the mission type",
+                    intent.role
+                ),
+                synthesized: false,
+            });
+            return self
+                .append_idempotent(&state.mission_id, state.head, &[event])
+                .await;
+        };
         // The nonce is recorded on the event and only ever *copied* by the
         // fold, so randomness here never threatens fold purity — same
         // discipline as the oracle's wall-clock duration. It must be random
@@ -937,12 +973,6 @@ impl Engine {
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
-        let idempotency_key = idem_key(&[
-            "terminal-review",
-            state.mission_id.as_str(),
-            &intent.judged_sha,
-            &intent.attempt_no.to_string(),
-        ]);
         let event = NewEvent::new(MissionEvent::TerminalReviewRequested {
             attempt_no: intent.attempt_no,
             idempotency_key,

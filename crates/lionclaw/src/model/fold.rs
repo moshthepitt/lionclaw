@@ -809,11 +809,7 @@ fn derive_attention(state: &mut MissionState) {
             // amendment resumes the mission without a second decision, and
             // the head move re-opens the review for free.
             Some(ReviewOutcome::Verdict(v)) => {
-                let acknowledged = matches!(
-                    &state.terminal_review.accepted,
-                    Some(a) if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                        && a.judged_sha == v.judged_sha
-                );
+                let acknowledged = state.terminal_review.acknowledges(v);
                 if v.is_fresh_at(&state.current_sha)
                     && v.blocking()
                     && !acknowledged
@@ -1018,11 +1014,7 @@ pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
     if state.config.terminal_review.is_none() {
         return false; // config-gated: pre-feature logs derive identically
     }
-    if matches!(
-        &state.terminal_review.accepted,
-        Some(a) if a.kind == ReviewAcceptanceKind::Waived
-            && a.is_fresh_at(&state.current_sha)
-    ) {
+    if state.terminal_review.waived_at(&state.current_sha) {
         return false;
     }
     if !state.config.stop.satisfied_by(classify_finish(state)) {

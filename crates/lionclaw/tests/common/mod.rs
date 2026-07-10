@@ -30,11 +30,16 @@ pub fn test_mission_type() -> MissionType {
         digest: "test-digest".to_string(),
         // `Reviewed` so the shared harness accepts both oracle-bound and
         // advisory plans; the `Verified` submit-reachability check is exercised
-        // in the plan_validation unit tests.
+        // in the plan_validation unit tests. A reviewed-bar type must declare
+        // a terminal review (the loader/engine invariant) — the shipped
+        // `reviewer` judge serves; missions only run it when their CONFIG
+        // carries it (`review_config`), so `default_config` tests are untouched.
         stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
-        terminal_review: None,
+        terminal_review: Some(lionclaw::model::TerminalReviewConfig {
+            role: RoleName::new("reviewer").expect("role name"),
+        }),
         playbook: None,
         roles: BTreeMap::from([
             (

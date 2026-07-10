@@ -25,7 +25,10 @@ pub use event::{
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
-pub use ids::{short_hex, AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
+pub use ids::{
+    short_hex, AssertionId, IdError, MissionId, OracleName, RoleName, TaskId,
+    TERMINAL_REVIEW_TASK_TAG,
+};
 pub use plan::{
     Assertion, OutputSemantics, PlanSubmission, PlanningDag, PlanningTask, Task, TaskKind,
 };

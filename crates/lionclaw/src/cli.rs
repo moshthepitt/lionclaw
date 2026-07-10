@@ -773,6 +773,14 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     // Per-assertion evidence: the oracle that judged it, its exit code, the
     // commit it judged, whether that verdict is fresh at the final head, and a
     // short excerpt of its output.
+    struct ReportRow {
+        id: String,
+        oracle: Option<String>,
+        /// The oracle never ran and never will (a human waived it) — the row
+        /// says so in both formats, never "owed".
+        waived: bool,
+        verdict: Option<serde_json::Value>,
+    }
     let mut rows = Vec::new();
     for (aid, a) in &state.contract {
         let verdict = a.last_authoritative.as_ref().map(|v| {
@@ -793,17 +801,15 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "evidence_excerpt": excerpt,
             })
         });
-        // A waived oracle never ran and never will: the row says so, never "owed".
-        let waived = a
-            .oracle
-            .as_ref()
-            .is_some_and(|o| state.waived_oracles.contains(o));
-        rows.push((
-            aid.as_str().to_string(),
-            a.oracle.is_some(),
-            waived,
+        rows.push(ReportRow {
+            id: aid.as_str().to_string(),
+            oracle: a.oracle.as_ref().map(|o| o.as_str().to_string()),
+            waived: a
+                .oracle
+                .as_ref()
+                .is_some_and(|o| state.waived_oracles.contains(o)),
             verdict,
-        ));
+        });
     }
     let uncovered: Vec<&str> = state
         .contract
@@ -814,9 +820,32 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
 
     if args.json {
         use crate::model::ReviewOutcome;
-        let review_gaps = match &state.terminal_review.outcome {
-            Some(ReviewOutcome::Verdict(v)) => serde_json::to_value(&v.gaps)?,
-            _ => serde_json::Value::Null,
+        // Gated together with the summary: a config-less mission has no
+        // review, whatever a hostile log writer recorded — the three review
+        // fields must never contradict each other.
+        let review = review_summary(&state);
+        let (review_gaps, review_accepted_by) = if review.is_null() {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        } else {
+            let gaps = match &state.terminal_review.outcome {
+                Some(ReviewOutcome::Verdict(v)) => serde_json::to_value(&v.gaps)?,
+                _ => serde_json::Value::Null,
+            };
+            let accepted = state
+                .terminal_review
+                .accepted
+                .as_ref()
+                .map(|a| {
+                    serde_json::json!({
+                        "kind": a.kind.slug(),
+                        "judged_sha": a.judged_sha,
+                        "fresh": a.is_fresh_at(&state.current_sha),
+                        "actor": a.actor,
+                        "justification": a.justification,
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null);
+            (gaps, accepted)
         };
         println!(
             "{}",
@@ -830,21 +859,18 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "base_sha": state.base_sha,
                 "current_sha": state.current_sha,
                 "finish": finish.map(|f| f.slug()),
-                "assertions": rows.iter().map(|(id, _, _, v)| serde_json::json!({ "id": id, "verdict": v })).collect::<Vec<_>>(),
+                "assertions": rows.iter().map(|row| serde_json::json!({
+                    "id": row.id,
+                    "oracle": row.oracle,
+                    "waived": row.waived,
+                    "verdict": row.verdict,
+                })).collect::<Vec<_>>(),
                 "not_covered_by_an_oracle": uncovered,
                 "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
-                "terminal_review": review_summary(&state),
+                "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
-                "terminal_review_accepted_by": state.terminal_review.accepted.as_ref().map(|a| {
-                    serde_json::json!({
-                        "kind": a.kind.slug(),
-                        "judged_sha": a.judged_sha,
-                        "fresh": a.is_fresh_at(&state.current_sha),
-                        "actor": a.actor,
-                        "justification": a.justification,
-                    })
-                }),
+                "terminal_review_accepted_by": review_accepted_by,
             })
         );
         return Ok(());
@@ -884,11 +910,16 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         println!("  {line}");
         if let Some(a) = &state.terminal_review.accepted {
             println!(
-                "           {} at {} by {}: \"{}\"",
+                "           {} at {} by {}: \"{}\"{}",
                 a.kind.slug(),
                 short_hex(&a.judged_sha),
                 a.actor,
-                a.justification
+                a.justification,
+                if a.is_fresh_at(&state.current_sha) {
+                    ""
+                } else {
+                    " [STALE — superseded by later work]"
+                },
             );
         }
         if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
@@ -911,8 +942,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         }
     }
     println!("\n  assertions:");
-    for (id, has_oracle, waived, verdict) in &rows {
-        match verdict {
+    for row in &rows {
+        let id = &row.id;
+        match &row.verdict {
             Some(v) => {
                 let passed = v["passed"].as_bool().unwrap_or(false);
                 let fresh = v["fresh"].as_bool().unwrap_or(false);
@@ -928,10 +960,10 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     },
                 );
             }
-            None if *waived => println!(
+            None if row.waived => println!(
                 "    {id}: WAIVED — its oracle failed to run and a human accepted closing without it"
             ),
-            None if *has_oracle => println!("    {id}: (oracle owed, not yet run)"),
+            None if row.oracle.is_some() => println!("    {id}: (oracle owed, not yet run)"),
             None => println!("    {id}: advisory only — no oracle can prove this"),
         }
     }
@@ -1037,7 +1069,9 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     // superseded head never triggers a false note here.
     if matches!(state.phase, MissionPhase::Done { .. }) {
         let summary = review_summary(&state);
-        if summary["acknowledged"].as_bool() == Some(true) {
+        if summary["verdict"] == serde_json::json!("gaps")
+            && summary["acknowledged"].as_bool() == Some(true)
+        {
             eprintln!(
                 "note: closed with {} blocking gap(s) acknowledged by a human \
                  ({} recorded in total); see 'mission report'",
@@ -1087,7 +1121,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                         "authoritative_pass": a.last_authoritative.as_ref().map(|v| v.passed()),
                     })
                 }).collect::<Vec<_>>(),
-                "review": review_summary(&state),
+                "terminal_review": review_summary(&state),
             })
         );
     } else {
@@ -1352,7 +1386,7 @@ fn print_advance_outcome(
                 "phase": phase_slug(phase),
                 "finish": finish,
                 "outcome": outcome.slug(),
-                "review": review_summary(state),
+                "terminal_review": review_summary(state),
             })
         );
     } else {
@@ -1393,38 +1427,42 @@ fn phase_slug(phase: &MissionPhase) -> String {
 /// banner, `status`, `report`, and every `--json` output. `Null` when the
 /// mission declares no review.
 fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
-    use crate::model::{GapSeverity, ReviewAcceptanceKind, ReviewOutcome};
+    use crate::model::{GapSeverity, ReviewOutcome};
     let Some(config) = &state.config.terminal_review else {
         return serde_json::Value::Null;
     };
     let tr = &state.terminal_review;
-    // Only a FRESH acceptance counts: a stale one belongs to a tree the
-    // human never saw and must never dress up the current outcome.
-    let fresh_acceptance = tr
-        .accepted
-        .as_ref()
-        .filter(|a| a.is_fresh_at(&state.current_sha));
-    let waived = fresh_acceptance.is_some_and(|a| a.kind == ReviewAcceptanceKind::Waived);
+    // A finished mission owes nothing: whatever is not settled by a fresh
+    // verdict or a fresh waiver was deliberately skipped (a below-bar finish
+    // never burns a review) — never report it as still "owed".
+    let done = matches!(state.phase, MissionPhase::Done { .. });
+    let waived = tr.waived_at(&state.current_sha);
     let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
         Some(ReviewOutcome::Verdict(v)) => {
             let count = |s: GapSeverity| v.gaps.iter().filter(|g| g.severity == s).count();
-            let acknowledged = fresh_acceptance.is_some_and(|a| {
-                a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == v.judged_sha
-            });
+            let is_fresh = v.is_fresh_at(&state.current_sha);
+            let kind = if !is_fresh && done {
+                "skipped"
+            } else if v.blocking() {
+                "gaps"
+            } else {
+                "clean"
+            };
             (
-                if v.blocking() { "gaps" } else { "clean" },
+                kind,
                 Some(v.judged_sha.clone()),
-                Some(v.is_fresh_at(&state.current_sha)),
+                Some(is_fresh),
                 Some(serde_json::json!({
                     "blocking": count(GapSeverity::Blocking),
                     "major": count(GapSeverity::Major),
                     "minor": count(GapSeverity::Minor),
                 })),
-                acknowledged,
+                tr.acknowledges(v),
             )
         }
         Some(ReviewOutcome::Failed { .. }) => ("failed", None, None, None, false),
         None if waived => ("waived", None, None, None, false),
+        None if done => ("skipped", None, None, None, false),
         None => ("owed", None, None, None, false),
     };
     serde_json::json!({
@@ -1455,13 +1493,18 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
     } else {
         ""
     };
+    let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
+    let major = summary["gaps"]["major"].as_u64().unwrap_or(0);
+    let minor = summary["gaps"]["minor"].as_u64().unwrap_or(0);
     Some(match summary["verdict"].as_str().unwrap_or("owed") {
         "clean" => format!("review: clean (judged {sha}){stale}"),
+        // A fail with zero typed gaps is an honest unstructured fail — say
+        // that, never "0 gaps" on a parked mission.
+        "gaps" if blocking + major + minor == 0 => {
+            format!("review: FAILED the product — see its report (judged {sha}){stale}")
+        }
         "gaps" => format!(
-            "review: {} blocking, {} major, {} minor gap(s) (judged {sha}){stale}{}",
-            summary["gaps"]["blocking"],
-            summary["gaps"]["major"],
-            summary["gaps"]["minor"],
+            "review: {blocking} blocking, {major} major, {minor} minor gap(s) (judged {sha}){stale}{}",
             if summary["acknowledged"].as_bool().unwrap_or(false) {
                 " — acknowledged by a human"
             } else {
@@ -1470,6 +1513,9 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
         ),
         "failed" => "review: FAILED to run — retry, waive (continue), or abort".to_string(),
         "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
+        "skipped" => {
+            "review: skipped — the finish is below the stop bar; no review is owed".to_string()
+        }
         _ => "review: owed — not yet judged at the final commit".to_string(),
     })
 }
@@ -1500,6 +1546,132 @@ mod tests {
             start_image_ref("type-image", Some("override-image")),
             "override-image"
         );
+    }
+
+    /// Fold a hand-built review mission to a state, for summary rendering
+    /// tests (sequence numbers assigned by position).
+    fn review_state(tail: Vec<crate::model::MissionEvent>) -> crate::model::MissionState {
+        use crate::model::*;
+        let mut events = vec![
+            MissionEvent::MissionCreated {
+                objective: "obj".into(),
+                mission_type: MissionTypeRef {
+                    name: "t".into(),
+                    digest: "d".into(),
+                },
+                runtime: "codex".into(),
+                image_id: "img".into(),
+                workspace_dir: "/w".into(),
+                base_sha: "base".into(),
+                config: MissionConfig {
+                    ratification_gate: false,
+                    terminal_review: Some(TerminalReviewConfig {
+                        role: RoleName::new("gap-reviewer").unwrap(),
+                    }),
+                    ..Default::default()
+                },
+            },
+            MissionEvent::PlanSubmitted {
+                plan: PlanSubmission {
+                    assertions: vec![Assertion {
+                        id: AssertionId::new("TESTS-PASS").unwrap(),
+                        prose: "tests pass".into(),
+                        oracle: Some(OracleName::new("cargo-test").unwrap()),
+                    }],
+                    tasks: vec![Task {
+                        id: TaskId::new("fix").unwrap(),
+                        kind: TaskKind::Work,
+                        body: "fix".into(),
+                        targets: vec![AssertionId::new("TESTS-PASS").unwrap()],
+                        role: Some(RoleName::new("implementer").unwrap()),
+                        depends_on: vec![],
+                    }],
+                },
+                plan_hash: "h".into(),
+            },
+            MissionEvent::RoleRunCompleted {
+                task_id: TaskId::new("fix").unwrap(),
+                attempt_no: 1,
+                idempotency_key: "k1".into(),
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("done"),
+                    request_attention: false,
+                },
+                artifact: Some(ArtifactOutcome {
+                    base_sha: "base".into(),
+                    head_sha: "h1".into(),
+                }),
+            },
+        ];
+        events.extend(tail);
+        fold(
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| EventEnvelope {
+                    mission_id: MissionId::parse("mabc123def456").unwrap(),
+                    sequence_no: i as u64 + 1,
+                    recorded_at_ms: 0,
+                    stamps: Default::default(),
+                    event,
+                }),
+        )
+        .expect("state")
+    }
+
+    fn oracle_completed(exit_code: i32) -> crate::model::MissionEvent {
+        use crate::model::*;
+        MissionEvent::OracleRunCompleted {
+            assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
+            oracle: OracleName::new("cargo-test").unwrap(),
+            judged_sha: "h1".into(),
+            attempt_no: 1,
+            idempotency_key: "ko".into(),
+            exit_code,
+            exit_signal: None,
+            stdout: PayloadRef::inline(""),
+            stderr: PayloadRef::inline(""),
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_below_bar_close_reports_the_review_as_skipped_not_owed() {
+        // Regression (QA round 2): a fresh oracle FAIL closes below the bar
+        // and the engine deliberately never dispatches the reviewer — the
+        // receipt must never say a review is still "owed" on a finished
+        // mission.
+        let state = review_state(vec![oracle_completed(1)]);
+        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+        let summary = review_summary(&state);
+        assert_eq!(summary["verdict"], serde_json::json!("skipped"));
+        let line = review_line(&state).expect("line");
+        assert!(line.contains("skipped"), "got: {line}");
+        assert!(!line.contains("not yet judged"), "got: {line}");
+    }
+
+    #[test]
+    fn an_unstructured_fail_renders_as_failed_not_zero_gaps() {
+        // Regression (QA round 2): passed=false with zero typed gaps parks
+        // the mission; the line must say so, never "0 blocking, 0 major,
+        // 0 minor gap(s)".
+        use crate::model::MissionEvent;
+        let state = review_state(vec![
+            oracle_completed(0),
+            MissionEvent::TerminalReviewCompleted {
+                attempt_no: 1,
+                idempotency_key: "kr".into(),
+                judged_sha: "h1".into(),
+                passed: false,
+                gaps: vec![],
+                report: crate::model::PayloadRef::inline("it does not work"),
+            },
+        ]);
+        assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
+        let line = review_line(&state).expect("line");
+        assert!(line.contains("FAILED the product"), "got: {line}");
+        assert!(!line.contains("0 blocking"), "got: {line}");
     }
 
     #[test]
