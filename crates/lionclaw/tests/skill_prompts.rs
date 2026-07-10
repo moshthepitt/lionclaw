@@ -10,6 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use common::{default_config, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::Engine;
@@ -30,6 +31,38 @@ fn tid(n: &str) -> lionclaw::model::TaskId {
 }
 fn aid(n: &str) -> AssertionId {
     AssertionId::new(n).unwrap()
+}
+
+#[derive(Clone, Default)]
+struct PromptCapture(Arc<Mutex<Option<String>>>);
+
+impl PromptCapture {
+    fn record(&self, request: &RoleRunRequest) {
+        *self.0.lock().unwrap() = Some(request.prompt.clone());
+    }
+
+    fn take(&self, label: &str) -> String {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| panic!("{label} prompt"))
+    }
+}
+
+fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
+    RoleRunOutcome {
+        handoff: Handoff::Work {
+            done: true,
+            report: lionclaw::model::PayloadRef::inline("done"),
+            request_attention: false,
+        },
+        artifact: Some(ArtifactOutcome {
+            base_sha: request.base_sha.clone(),
+            head_sha: HEAD_SHA.to_string(),
+        }),
+        model_id: Some("mock".to_string()),
+    }
 }
 
 /// Extract the `## Assigned skills` section from a prompt (up to the next
@@ -150,24 +183,13 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
     let dir = tempfile::tempdir().unwrap();
     let (mission_type, _skills) = execution_mission_type(dir.path());
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let captured = PromptCapture::default();
     let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.role.name.as_str() == "implementer" {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
+            seen.record(request);
         }
-        Ok(RoleRunOutcome {
-            handoff: Handoff::Work {
-                done: true,
-                report: lionclaw::model::PayloadRef::inline("done"),
-                request_attention: false,
-            },
-            artifact: Some(ArtifactOutcome {
-                base_sha: request.base_sha.clone(),
-                head_sha: HEAD_SHA.to_string(),
-            }),
-            model_id: Some("mock".to_string()),
-        })
+        Ok(work_outcome(request))
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
     let engine = Engine::new(
@@ -194,11 +216,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("implementer prompt");
+    let prompt = captured.take("implementer");
 
     // The assigned-skills section is present.
     assert!(prompt.contains("## Assigned skills"));

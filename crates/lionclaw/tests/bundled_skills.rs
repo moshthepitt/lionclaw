@@ -2,6 +2,7 @@
 //! instruction contains the required handoff-file directive and no stale
 //! `end_node` / unavailable-tool calls or embedded handoff schema literals.
 
+use std::io;
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
@@ -12,31 +13,30 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn walk_skill_md(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn walk_skill_md(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_skill_md(&path, out);
+            walk_skill_md(&path, out)?;
         } else if path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 /// Every `mission-types/**/skills/*/SKILL.md` in the repo.
-fn bundled_skill_files() -> Vec<PathBuf> {
+fn bundled_skill_files() -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    walk_skill_md(&repo_root().join("mission-types"), &mut files);
+    walk_skill_md(&repo_root().join("mission-types"), &mut files)?;
     files.sort();
-    files
+    Ok(files)
 }
 
 #[test]
 fn bundled_skill_set_is_non_empty_and_matches_software_dev() {
-    let files = bundled_skill_files();
+    let files = bundled_skill_files().expect("discover bundled skills");
     assert!(!files.is_empty(), "must find at least one bundled SKILL.md");
 
     let names: Vec<String> = files
@@ -58,11 +58,11 @@ fn bundled_skill_set_is_non_empty_and_matches_software_dev() {
 
 #[test]
 fn every_bundled_skill_has_no_end_node_and_carries_the_handoff_directive() {
-    let files = bundled_skill_files();
+    let files = bundled_skill_files().expect("discover bundled skills");
     assert!(!files.is_empty());
 
     for path in &files {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = std::fs::read_to_string(path).expect("read bundled skill");
 
         // Stale terms absent.
         assert!(
