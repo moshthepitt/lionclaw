@@ -20,6 +20,7 @@ pub use backend::{
     ExecutionOutput, ExecutionRequest, ExecutionSession, RuntimeExecutionSession,
     RuntimeSecretsMount,
 };
+pub use mount_validation::{parse_runtime_tmpfs_entry, RuntimeTmpfsEntry};
 pub use oci::{
     resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
     OciExecutionBackend,

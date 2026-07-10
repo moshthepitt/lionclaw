@@ -24,7 +24,7 @@ use super::{
         ProcessSession,
     },
     runtime_auth::prepare_runtime_auth,
-    OciConfinementConfig,
+    OciConfinementConfig, RuntimeTmpfsEntry,
 };
 use crate::{project_runtime_skills, RuntimeSecretsMount};
 
@@ -353,21 +353,28 @@ fn prepare_oci_process_launch(
         args.push(spec);
     }
 
-    if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &config.tmpfs) {
+    let tmpfs = config
+        .tmpfs
+        .iter()
+        .map(|entry| {
+            crate::parse_runtime_tmpfs_entry(entry).map_err(|detail| {
+                anyhow!(
+                    "runtime '{}' declares invalid tmpfs entry '{}': {detail}",
+                    request.plan.runtime_id,
+                    entry
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &tmpfs) {
         args.push("--tmpfs".to_string());
         args.push(WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string());
     }
 
-    for tmpfs in &config.tmpfs {
-        let value = tmpfs.trim();
-        if value.is_empty() {
-            bail!(
-                "runtime '{}' declares an empty tmpfs entry",
-                request.plan.runtime_id
-            );
-        }
+    for tmpfs in &tmpfs {
         args.push("--tmpfs".to_string());
-        args.push(value.to_string());
+        args.push(tmpfs.argument().to_string());
     }
 
     let environment = merged_environment(&request.plan.environment, &request.program.environment);
@@ -862,24 +869,17 @@ fn plan_mounts_unix_socket(_mounts: &[MountSpec]) -> bool {
 
 fn workspace_lionclaw_metadata_mask_needed(
     mounts: &[MountSpec],
-    configured_tmpfs: &[String],
+    configured_tmpfs: &[RuntimeTmpfsEntry],
 ) -> bool {
     mounts.iter().any(|mount| {
         mount.target == WORKSPACE_MOUNT_TARGET
             && fs::symlink_metadata(mount.source.join(LIONCLAW_METADATA_DIR)).is_ok()
     }) && !configured_tmpfs
         .iter()
-        .any(|entry| tmpfs_target(entry) == WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET)
+        .any(|entry| entry.target() == WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET)
 }
 
 const WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET: &str = "/workspace/.lionclaw";
-
-fn tmpfs_target(entry: &str) -> &str {
-    entry
-        .trim()
-        .split_once(':')
-        .map_or(entry.trim(), |(target, _)| target.trim())
-}
 
 fn merged_environment(
     plan_environment: &[(String, String)],

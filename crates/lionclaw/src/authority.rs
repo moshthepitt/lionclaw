@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lionclaw_confinement::{
-    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, InstallPolicy, MountAccess,
-    MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
-    WORKSPACE_MOUNT_TARGET,
+    parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
+    InstallPolicy, MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
+    RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
 use crate::mission_type::RoleDefinition;
@@ -64,6 +64,8 @@ pub enum MoatViolation {
     SecretsForJudge { role: String },
     #[error("mount target '{target}' shadows a reserved mission target")]
     ReservedTargetShadowed { target: String },
+    #[error("invalid tmpfs entry '{entry}': {detail}")]
+    InvalidTmpfs { entry: String, detail: String },
 }
 
 /// The engine-compiled authority of one role: preset + the output axis it
@@ -231,8 +233,12 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         }
     }
     for entry in &oci.tmpfs {
-        // A tmpfs entry is `<target>[:<options>]`.
-        let target = entry.split(':').next().unwrap_or(entry);
+        let parsed =
+            parse_runtime_tmpfs_entry(entry).map_err(|detail| MoatViolation::InvalidTmpfs {
+                entry: entry.clone(),
+                detail,
+            })?;
+        let target = parsed.target();
         if RESERVED_TARGETS
             .iter()
             .any(|reserved| target_shadows(target, reserved))
@@ -613,6 +619,26 @@ mod tests {
                 "target {target}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn tmpfs_targets_cannot_reach_reserved_paths_through_traversal() {
+        let ceiling = AuthorityCeiling::default();
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
+        let mut confinement = oci();
+        confinement
+            .oci_mut()
+            .tmpfs
+            .push("/opt/../workspace:rw".to_string());
+
+        let err = compile_role_plan(RolePlanRequest {
+            confinement,
+            ..request(&judge, mounts(MountAccess::ReadOnly, Vec::new()), &[])
+        })
+        .expect_err("tmpfs traversal must not bypass reserved targets");
+
+        assert!(err.to_string().contains("invalid tmpfs"), "got {err}");
     }
 
     #[test]

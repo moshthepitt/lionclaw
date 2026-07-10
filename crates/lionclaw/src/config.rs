@@ -157,6 +157,17 @@ impl RuntimeProfileFile {
             projection.normalize();
             projection.validate()?;
         }
+        self.confinement.oci_mut().tmpfs = self
+            .confinement
+            .oci()
+            .tmpfs
+            .iter()
+            .map(|entry| {
+                lionclaw_confinement::parse_runtime_tmpfs_entry(entry)
+                    .map(lionclaw_confinement::RuntimeTmpfsEntry::into_argument)
+                    .map_err(anyhow::Error::msg)
+            })
+            .collect::<Result<Vec<_>>>()?;
         lionclaw_confinement::mount_validation::validate_configured_mounts(
             &self.confinement.oci().additional_mounts,
             &[],
@@ -378,5 +389,27 @@ mod tests {
         )
         .expect_err("reserved additional mount");
         assert!(err.to_string().contains("reserved runtime path"));
+    }
+
+    #[test]
+    fn nested_runtime_configuration_rejects_unknown_fields() {
+        for invalid in [
+            r#"
+            [runtimes.custom]
+            driver = "acp"
+            command = "custom"
+            confinement = { backend = "podman", read-only-rootf = true }
+            "#,
+            r#"
+            [runtimes.custom]
+            driver = "acp"
+            command = "custom"
+            skill-projection = { kind = "native-dir", root = ".agents/skills", inheritt = [] }
+            "#,
+        ] {
+            let err = RuntimeProfiles::from_toml(invalid, Path::new("/home/alice"))
+                .expect_err("unknown nested field");
+            assert!(format!("{err:#}").contains("unknown field"), "got {err:#}");
+        }
     }
 }

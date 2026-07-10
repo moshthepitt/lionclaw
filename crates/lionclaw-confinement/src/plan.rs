@@ -34,7 +34,7 @@ pub fn runtime_skill_mount_target_alias(target: &str) -> Option<&str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RuntimeSkillProjectionConfig {
     NativeDir {
         root: String,
@@ -366,7 +366,7 @@ impl ConfinementBackend {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct OciConfinementConfig {
     #[serde(default = "default_podman_engine")]
     pub engine: String,
@@ -400,7 +400,7 @@ fn default_podman_engine() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ExecutionLimits {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
