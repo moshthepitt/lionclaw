@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::authority::MoatViolation;
 use lionclaw::mission_type::{load_mission_type, MissionTypeError};
-use lionclaw::model::{OutputSemantics, StopBar};
+use lionclaw::model::StopBar;
 
 fn repo_root() -> PathBuf {
     // <crate>/tests/mission_type_loading.rs → repo root is two parents up from
@@ -27,12 +27,13 @@ fn software_dev_mission_type_loads() {
     .expect("software-dev mission type loads");
     assert_eq!(mission_type.name, "software-dev");
     assert_eq!(mission_type.stop, StopBar::Verified);
-    let implementer = mission_type
-        .roles
-        .values()
-        .find(|r| r.output == OutputSemantics::ProducesArtifact)
-        .expect("has an implementer role");
-    assert_eq!(implementer.runtime.as_deref(), Some("codex"));
+    assert!(
+        mission_type
+            .roles
+            .values()
+            .all(|role| role.runtime.is_none()),
+        "bundled roles must inherit the mission's selected runtime"
+    );
     assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));

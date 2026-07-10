@@ -1,6 +1,5 @@
 ---
 output: emits-verdict
-runtime: codex
 skills: [scrutiny-validator, user-testing-validator]
 ---
 You are an independent reviewer. You did not do the work and have not been

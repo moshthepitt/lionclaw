@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
+use super::install::INSTALL_WORK_DIR_PREFIX;
+
 /// The global LionClaw home. `$LIONCLAW_HOME`, else `$HOME/.lionclaw`. There is
 /// no relative fallback: a home we can't locate is a hard error, never a stray
 /// `.lionclaw` in the cwd.
@@ -66,6 +68,9 @@ impl Home {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(INSTALL_WORK_DIR_PREFIX) {
+                        continue;
+                    }
                     names.push(name.to_string());
                 }
             }
@@ -97,4 +102,25 @@ pub fn bundled_mission_types_dir() -> Result<PathBuf> {
         "no bundled mission types found (looked next to the binary and in the source tree); \
          pass `--from <dir>`"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_type_discovery_ignores_internal_install_work_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home {
+            root: temp.path().to_path_buf(),
+        };
+        let types = home.mission_types_dir();
+        std::fs::create_dir_all(types.join("software-dev")).unwrap();
+        std::fs::create_dir_all(types.join(format!("{INSTALL_WORK_DIR_PREFIX}staging-orphan")))
+            .unwrap();
+        std::fs::create_dir_all(types.join(format!("{INSTALL_WORK_DIR_PREFIX}backup-orphan")))
+            .unwrap();
+
+        assert_eq!(home.installed_mission_types().unwrap(), ["software-dev"]);
+    }
 }

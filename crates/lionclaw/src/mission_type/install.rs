@@ -12,6 +12,8 @@ use super::manifest::{
 use super::skills::resolve_package_path;
 use super::{load_mission_type, MissionType};
 
+pub(crate) const INSTALL_WORK_DIR_PREFIX: &str = ".lionclaw-install@";
+
 enum ResolvedSkillSource {
     Path(PathBuf),
     Git(GitCheckout),
@@ -75,7 +77,7 @@ pub async fn install_mission_type(
         });
     }
     let staging_parent = tempfile::Builder::new()
-        .prefix(".mission-type.tmp-")
+        .prefix(&format!("{INSTALL_WORK_DIR_PREFIX}staging-"))
         .tempdir_in(destination_dir)
         .context("creating mission-type staging directory")?;
     let staging = staging_parent.path().join("bundle");
@@ -87,7 +89,7 @@ pub async fn install_mission_type(
     let mut backup_parent = had_destination
         .then(|| {
             tempfile::Builder::new()
-                .prefix(&format!(".{name}.backup-"))
+                .prefix(&format!("{INSTALL_WORK_DIR_PREFIX}backup-"))
                 .tempdir_in(destination_dir)
         })
         .transpose()
