@@ -1178,6 +1178,7 @@ mod tests {
             attempt_no: 1,
             idempotency_key: key.into(),
             role: RoleName::new("implementer").expect("role name"),
+            runtime: "codex".into(),
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
         }
@@ -2244,6 +2245,7 @@ mod tests {
             attempt_no,
             idempotency_key: key.into(),
             role: RoleName::new("gap-reviewer").expect("role name"),
+            runtime: "codex".into(),
             prompt: PayloadRef::inline("review prompt"),
             judged_sha: judged.into(),
             nonce: "n0".into(),

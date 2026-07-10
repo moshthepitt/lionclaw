@@ -56,17 +56,11 @@ impl OciExecutionSession {
             None => Ok(()),
         };
 
-        match (result, runtime_secrets_cleanup_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(output), Err(err)) => {
-                warn!(
-                    error = %err,
-                    "runtime secret cleanup failed after successful interactive OCI runtime turn"
-                );
-                Ok(output)
-            }
-            (Err(err), _) => Err(err),
-        }
+        finish_oci_execution(
+            result,
+            runtime_secrets_cleanup_result,
+            "interactive OCI runtime turn",
+        )
     }
 }
 
@@ -158,17 +152,11 @@ impl ExecutionBackend for OciExecutionBackend {
             None => Ok(()),
         };
 
-        match (result, runtime_secrets_cleanup_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Ok(output), Err(err)) => {
-                warn!(
-                    error = %err,
-                    "runtime secret cleanup failed after attached OCI runtime"
-                );
-                Ok(output)
-            }
-            (Err(err), _) => Err(err),
-        }
+        finish_oci_execution(
+            result,
+            runtime_secrets_cleanup_result,
+            "attached OCI runtime",
+        )
     }
 }
 
@@ -196,18 +184,22 @@ where
         None => Ok(()),
     };
 
-    match (result, runtime_secrets_cleanup_result) {
-        (Ok(output), Ok(())) => Ok(output),
-        (Ok(output), Err(err)) => {
-            warn!(
-                error = %err,
-                context = cleanup_context,
-                "runtime secret cleanup failed after successful OCI runtime"
-            );
-            Ok(output)
-        }
-        (Err(err), _) => Err(err),
+    finish_oci_execution(result, runtime_secrets_cleanup_result, cleanup_context)
+}
+
+fn finish_oci_execution(
+    result: Result<ExecutionOutput>,
+    runtime_secrets_cleanup_result: Result<()>,
+    context: &'static str,
+) -> Result<ExecutionOutput> {
+    if let Err(err) = runtime_secrets_cleanup_result {
+        warn!(
+            error = %err,
+            context,
+            "runtime secret cleanup failed after OCI runtime"
+        );
     }
+    result
 }
 
 pub async fn validate_oci_launch_prerequisites(
@@ -579,11 +571,20 @@ fn build_oci_process_invocation_with_terminal(
         }
     }
 
-    let mut environment = prepared.environment;
-    environment = merged_environment(&environment, runtime_auth_environment);
+    let runtime_auth_environment = merged_environment(&[], runtime_auth_environment);
+    let environment = merged_environment(&prepared.environment, &runtime_auth_environment);
     for (key, value) in environment {
         args.push("--env".to_string());
-        args.push(format!("{key}={value}"));
+        if runtime_auth_environment
+            .iter()
+            .any(|(auth_key, _)| auth_key == &key)
+        {
+            // Podman copies a value-free --env KEY from its own environment.
+            // Keep auth values out of argv and process listings.
+            args.push(key);
+        } else {
+            args.push(format!("{key}={value}"));
+        }
     }
 
     args.push(prepared.image);
@@ -594,7 +595,7 @@ fn build_oci_process_invocation_with_terminal(
         executable: prepared.engine,
         args,
         working_dir: None,
-        environment: Vec::new(),
+        environment: runtime_auth_environment,
         input: prepared.stdin,
     }
 }
@@ -671,6 +672,21 @@ impl Drop for OciRuntimeSecretsSession {
 
 impl OciRuntimeSecretsCleanup {
     async fn shutdown(self) -> Result<()> {
+        let Err(first_err) = self.remove().await else {
+            return Ok(());
+        };
+        warn!(
+            error = %first_err,
+            secret_name = %self.secret_name,
+            "runtime secret cleanup failed; retrying once"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.remove().await.with_context(|| {
+            format!("runtime secret cleanup retry failed after initial error: {first_err}")
+        })
+    }
+
+    async fn remove(&self) -> Result<()> {
         let output = run_oci_preflight_command(
             &build_runtime_secret_remove_invocation(&self.engine, &self.secret_name),
             &format!("remove OCI runtime secret '{}'", self.secret_name),
@@ -1424,13 +1440,16 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_merges_runtime_auth_environment() {
+    fn oci_backend_keeps_runtime_auth_values_out_of_process_arguments() {
         let request = ExecutionRequest {
             plan: sample_plan(),
             program: RuntimeProgramSpec {
                 executable: "/usr/local/bin/codex".to_string(),
                 args: vec!["exec".to_string(), "--json".to_string()],
-                environment: Vec::new(),
+                environment: vec![(
+                    "RUNTIME_AUTH_TOKEN".to_string(),
+                    "stale-program-value".to_string(),
+                )],
                 stdin: String::new(),
                 auth: None,
             },
@@ -1442,8 +1461,8 @@ mod tests {
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request, None).expect("prepare"),
             &[(
-                "RUNTIME_AUTH_HOME".to_string(),
-                "/runtime/home/auth".to_string(),
+                "RUNTIME_AUTH_TOKEN".to_string(),
+                "provider-secret".to_string(),
             )],
         );
 
@@ -1454,12 +1473,25 @@ mod tests {
                 format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
             ]
         }));
-        assert!(invocation.args.windows(2).any(|pair| {
-            pair == [
-                "--env".to_string(),
-                "RUNTIME_AUTH_HOME=/runtime/home/auth".to_string(),
-            ]
-        }));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--env".to_string(), "RUNTIME_AUTH_TOKEN".to_string()] }));
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("provider-secret") || arg.contains("stale-program-value")));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--env".to_string(), "FOO=from-plan".to_string()] }));
+        assert_eq!(
+            invocation.environment,
+            [(
+                "RUNTIME_AUTH_TOKEN".to_string(),
+                "provider-secret".to_string()
+            )]
+        );
         assert!(
             invocation
                 .args
@@ -1626,7 +1658,7 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn oci_backend_does_not_fail_successful_turn_when_runtime_secret_cleanup_races() {
+    async fn oci_backend_retries_runtime_secret_cleanup_without_failing_successful_turn() {
         let temp_dir = tempdir().expect("tempdir");
         let log_path = temp_dir.path().join("podman.log");
         let engine_path = temp_dir.path().join("podman-stub.sh");
@@ -1687,20 +1719,16 @@ esac
 
         let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
         OciExecutionBackend
-            .execute_streaming(request.clone(), stdout_tx)
+            .execute_streaming(request, stdout_tx)
             .await
             .expect("successful turn should not fail on cleanup race");
 
         let log = fs::read_to_string(&log_path).expect("read log");
-        let secret_name = request
-            .runtime_secrets_mount
-            .as_ref()
-            .expect("mount")
-            .mounted_name();
-        assert!(
-            log.contains(&format!("secret rm {secret_name}")),
-            "secret remove should still be attempted: {log}"
-        );
+        let remove_attempts = log
+            .lines()
+            .filter(|line| line.starts_with("secret rm "))
+            .count();
+        assert_eq!(remove_attempts, 2, "secret removal should be retried once");
     }
 
     fn sample_plan() -> EffectiveExecutionPlan {

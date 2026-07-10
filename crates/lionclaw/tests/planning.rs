@@ -56,7 +56,9 @@ fn planning_mission_type() -> MissionType {
     ] {
         roles.insert(rn(name), role(name, output));
     }
-    roles.get_mut(&rn("strategist")).unwrap().skills = vec!["planning-method".to_string()];
+    let strategist = roles.get_mut(&rn("strategist")).unwrap();
+    strategist.skills = vec!["planning-method".to_string()];
+    strategist.runtime = Some("opencode".to_string());
     MissionType {
         name: "planning-test".to_string(),
         digest: "test-digest".to_string(),
@@ -130,9 +132,11 @@ fn proposed_plan() -> PlanSubmission {
 fn planning_runner() -> MockRoleRunner {
     MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
         if req.role.name.as_str() == "strategist" {
+            assert_eq!(req.runtime, "opencode");
             assert_eq!(req.skills.len(), 1);
             assert_eq!(req.skills[0].name, "planning-method");
         } else {
+            assert_eq!(req.runtime, "codex");
             assert!(req.skills.is_empty());
         }
         let handoff = match req.role.output {

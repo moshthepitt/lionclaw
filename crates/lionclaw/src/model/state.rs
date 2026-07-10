@@ -319,6 +319,7 @@ pub enum InflightEffect {
         task_id: TaskId,
         attempt_no: u32,
         role: RoleName,
+        runtime: String,
         prompt: PayloadRef,
         base_sha: String,
         requested_seq: u64,
@@ -333,6 +334,7 @@ pub enum InflightEffect {
     TerminalReview {
         attempt_no: u32,
         role: RoleName,
+        runtime: String,
         prompt: PayloadRef,
         judged_sha: String,
         /// Carried from the event so the runner's handoff-forgery check
@@ -356,6 +358,7 @@ impl InflightEffect {
                 attempt_no,
                 idempotency_key,
                 role,
+                runtime,
                 prompt,
                 base_sha,
             } => Some((
@@ -364,6 +367,7 @@ impl InflightEffect {
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
                     role: role.clone(),
+                    runtime: runtime.clone(),
                     prompt: prompt.clone(),
                     base_sha: base_sha.clone(),
                     requested_seq,
@@ -389,6 +393,7 @@ impl InflightEffect {
                 attempt_no,
                 idempotency_key,
                 role,
+                runtime,
                 prompt,
                 judged_sha,
                 nonce,
@@ -397,6 +402,7 @@ impl InflightEffect {
                 Self::TerminalReview {
                     attempt_no: *attempt_no,
                     role: role.clone(),
+                    runtime: runtime.clone(),
                     prompt: prompt.clone(),
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),

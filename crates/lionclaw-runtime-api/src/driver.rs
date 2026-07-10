@@ -3,10 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    adapter::RuntimeAdapter,
-    auth::{RuntimeAuthKind, RuntimeAuthProvider},
-};
+use crate::{adapter::RuntimeAdapter, auth::RuntimeAuthKind};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -41,8 +38,4 @@ pub trait RuntimeDriverProvider: Send + Sync {
     }
 
     fn create_adapter(&self, config: RuntimeDriverConfig) -> Arc<dyn RuntimeAdapter>;
-
-    fn auth_provider(&self) -> Option<Arc<dyn RuntimeAuthProvider>> {
-        None
-    }
 }

@@ -198,6 +198,7 @@ mod tests {
                     attempt_no: 1,
                     idempotency_key: format!("k{validator}"),
                     role: RoleName::new("reviewer").unwrap(),
+                    runtime: "codex".into(),
                     prompt: PayloadRef::inline("p"),
                     base_sha: "s0".into(),
                 },

@@ -38,6 +38,18 @@ skill-projection = { kind = "native-dir", root = ".agents/skills", format = "ski
   { source = "~/.config/opencode/skills", target = ".config/opencode/skills", optional = true },
 ] }
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
+
+[runtimes.hermes]
+driver = "acp"
+command = "hermes"
+args = ["acp"]
+environment = { HERMES_HOME = "/runtime/home/.hermes" }
+mode = "dont_ask"
+auth = { kind = "native-home", source = "~/.hermes", target = ".hermes", required-files = ["config.yaml"], optional-files = [".env", "auth.json", ".anthropic_oauth.json"] }
+skill-projection = { kind = "native-dir", root = ".hermes/skills", format = "skill-md", inherit = [
+  { source = "~/.hermes/skills", target = ".hermes/skills", optional = true },
+] }
+confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 "#;
 
 #[derive(Debug, Clone)]
@@ -48,11 +60,35 @@ pub struct MissionRuntimeProfile {
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub model: Option<String>,
-    pub auth: Option<String>,
+    pub mode: Option<String>,
+    pub auth: Option<RuntimeAuthConfig>,
     pub skill_projection: Option<RuntimeSkillProjectionConfig>,
     pub confinement: ConfinementConfig,
     pub hard_timeout: Duration,
     pub oracle_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAuthConfig {
+    Provider(String),
+    NativeHome(NativeHomeAuthConfig),
+}
+
+impl RuntimeAuthConfig {
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Provider(kind) => kind,
+            Self::NativeHome(_) => "native-home",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeHomeAuthConfig {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub required_files: Vec<PathBuf>,
+    pub optional_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +164,9 @@ struct RuntimeProfileFile {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    auth: Option<String>,
+    mode: Option<String>,
+    #[serde(default)]
+    auth: Option<RuntimeAuthConfigFile>,
     #[serde(default)]
     skill_projection: Option<RuntimeSkillProjectionConfig>,
     #[serde(default = "default_confinement")]
@@ -139,20 +177,45 @@ struct RuntimeProfileFile {
     oracle_timeout_secs: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RuntimeAuthConfigFile {
+    Provider(String),
+    Structured(StructuredRuntimeAuthConfigFile),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum StructuredRuntimeAuthConfigFile {
+    NativeHome {
+        source: PathBuf,
+        target: PathBuf,
+        #[serde(default, rename = "required-files")]
+        required_files: Vec<PathBuf>,
+        #[serde(default, rename = "optional-files")]
+        optional_files: Vec<PathBuf>,
+    },
+}
+
 impl RuntimeProfileFile {
     fn apply(mut self, name: String, user_home: Option<&Path>) -> Result<MissionRuntimeProfile> {
         self.driver = required_trimmed("driver", self.driver)?;
         self.command = required_trimmed("command", self.command)?;
-        self.auth = self
+        self.mode = self
+            .mode
+            .map(|value| required_trimmed("mode", value))
+            .transpose()?;
+        let auth = self
             .auth
-            .map(|value| required_trimmed("auth", value))
+            .map(|config| config.apply(user_home))
             .transpose()?;
         if self.hard_timeout_secs == 0 || self.oracle_timeout_secs == 0 {
             return Err(anyhow!("runtime timeouts must be greater than zero"));
         }
         if let Some(projection) = &mut self.skill_projection {
             for inherited in projection.inherited_roots_mut() {
-                inherited.source = expand_home(&inherited.source, user_home)?;
+                inherited.source =
+                    expand_home(&inherited.source, user_home, "inherited skill source")?;
             }
             projection.normalize();
             projection.validate()?;
@@ -180,12 +243,53 @@ impl RuntimeProfileFile {
             args: self.args,
             environment: self.environment.into_iter().collect(),
             model: self.model,
-            auth: self.auth,
+            mode: self.mode,
+            auth,
             skill_projection: self.skill_projection,
             confinement: self.confinement,
             hard_timeout: Duration::from_secs(self.hard_timeout_secs),
             oracle_timeout: Duration::from_secs(self.oracle_timeout_secs),
         })
+    }
+}
+
+impl RuntimeAuthConfigFile {
+    fn apply(self, user_home: Option<&Path>) -> Result<RuntimeAuthConfig> {
+        match self {
+            Self::Provider(kind) => {
+                Ok(RuntimeAuthConfig::Provider(required_trimmed("auth", kind)?))
+            }
+            Self::Structured(StructuredRuntimeAuthConfigFile::NativeHome {
+                source,
+                target,
+                required_files,
+                optional_files,
+            }) => {
+                let source = expand_home(&source, user_home, "native-home auth source")?;
+                validate_relative_path(&target, "native-home auth target")?;
+                if required_files.is_empty() && optional_files.is_empty() {
+                    return Err(anyhow!(
+                        "native-home auth must declare at least one required or optional file"
+                    ));
+                }
+                let mut paths = std::collections::BTreeSet::new();
+                for path in required_files.iter().chain(&optional_files) {
+                    validate_relative_path(path, "native-home auth file")?;
+                    if !paths.insert(path.clone()) {
+                        return Err(anyhow!(
+                            "native-home auth file '{}' is declared more than once",
+                            path.display()
+                        ));
+                    }
+                }
+                Ok(RuntimeAuthConfig::NativeHome(NativeHomeAuthConfig {
+                    source,
+                    target,
+                    required_files,
+                    optional_files,
+                }))
+            }
+        }
     }
 }
 
@@ -210,7 +314,7 @@ fn validate_runtime_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn expand_home(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+fn expand_home(path: &Path, home: Option<&Path>, label: &str) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
@@ -218,20 +322,34 @@ fn expand_home(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if text == "~" {
         return home
             .map(Path::to_path_buf)
-            .ok_or_else(|| anyhow!("HOME is required to resolve inherited skill source '~'"));
+            .ok_or_else(|| anyhow!("HOME is required to resolve {label} '~'"));
     }
     if let Some(relative) = text.strip_prefix("~/") {
-        return home.map(|home| home.join(relative)).ok_or_else(|| {
-            anyhow!(
-                "HOME is required to resolve inherited skill source '{}'",
-                path.display()
-            )
-        });
+        return home
+            .map(|home| home.join(relative))
+            .ok_or_else(|| anyhow!("HOME is required to resolve {label} '{}'", path.display()));
     }
     Err(anyhow!(
-        "inherited skill source '{}' must be absolute or start with '~/'",
+        "{label} '{}' must be absolute or start with '~/'",
         path.display()
     ))
+}
+
+fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(anyhow!("{label} must be a non-empty relative path"));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(anyhow!("{label} '{}' contains traversal", path.display()));
+    }
+    Ok(())
 }
 
 fn user_home_from_env() -> Option<PathBuf> {
@@ -290,11 +408,83 @@ mod tests {
     }
 
     #[test]
+    fn acp_session_mode_is_runtime_profile_data() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.example]
+            driver = "acp"
+            command = "example"
+            mode = "autonomous"
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profile");
+
+        assert_eq!(
+            profiles.get("example").unwrap().mode.as_deref(),
+            Some("autonomous")
+        );
+    }
+
+    #[test]
+    fn native_home_auth_is_runtime_profile_data() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.example]
+            driver = "acp"
+            command = "example-agent"
+            auth = { kind = "native-home", source = "~/.example-agent", target = ".example-agent", required-files = ["config.toml"], optional-files = ["auth.json", ".env"] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("valid native-home auth");
+
+        let profile = profiles.get("example").expect("example profile");
+        let RuntimeAuthConfig::NativeHome(config) = profile.auth.expect("auth config") else {
+            panic!("expected native-home auth");
+        };
+        assert_eq!(config.source, PathBuf::from("/home/alice/.example-agent"));
+        assert_eq!(config.target, PathBuf::from(".example-agent"));
+        assert_eq!(config.required_files, [PathBuf::from("config.toml")]);
+        assert_eq!(
+            config.optional_files,
+            [PathBuf::from("auth.json"), PathBuf::from(".env")]
+        );
+    }
+
+    #[test]
+    fn native_home_auth_rejects_paths_outside_its_roots() {
+        for auth in [
+            r#"{ kind = "native-home", source = "~/.example", target = "../escape", required-files = ["config.toml"] }"#,
+            r#"{ kind = "native-home", source = "~/.example", target = ".example", required-files = ["../secret"] }"#,
+            r#"{ kind = "native-home", source = "relative", target = ".example", required-files = ["config.toml"] }"#,
+        ] {
+            let err = RuntimeProfiles::from_toml(
+                &format!(
+                    "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nauth = {auth}\n"
+                ),
+                Path::new("/home/alice"),
+            )
+            .expect_err("unsafe native-home path");
+            assert!(
+                err.to_string().contains("native-home"),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
     fn built_in_profiles_use_the_same_toml_loader() {
         let profiles = RuntimeProfiles::from_toml(DEFAULT_RUNTIMES_TOML, Path::new("/home/alice"))
             .expect("built-in profiles");
-        assert_eq!(profiles.names().collect::<Vec<_>>(), ["codex", "opencode"]);
+        assert_eq!(
+            profiles.names().collect::<Vec<_>>(),
+            ["codex", "hermes", "opencode"]
+        );
         assert_eq!(profiles.get("codex").unwrap().driver, "codex");
+        let hermes = profiles.get("hermes").unwrap();
+        assert_eq!(hermes.driver, "acp");
+        assert_eq!(hermes.mode.as_deref(), Some("dont_ask"));
         assert_eq!(profiles.get("opencode").unwrap().driver, "acp");
     }
 

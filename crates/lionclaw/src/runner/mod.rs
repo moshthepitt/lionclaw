@@ -3,6 +3,7 @@
 
 mod executor;
 mod handoff;
+mod native_home_auth;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;

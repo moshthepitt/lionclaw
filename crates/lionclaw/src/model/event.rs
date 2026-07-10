@@ -266,6 +266,8 @@ pub enum MissionEvent {
         attempt_no: u32,
         idempotency_key: String,
         role: RoleName,
+        /// Effective runtime profile, resolved before the request is recorded.
+        runtime: String,
         /// Assembled prompt, persisted before the request is recorded so a
         /// resume re-dispatches byte-identical input.
         prompt: PayloadRef,
@@ -327,6 +329,8 @@ pub enum MissionEvent {
         attempt_no: u32,
         idempotency_key: String,
         role: RoleName,
+        /// Effective runtime profile, resolved before the request is recorded.
+        runtime: String,
         /// Assembled prompt, persisted before the request is recorded so a
         /// resume re-dispatches byte-identical input.
         prompt: PayloadRef,

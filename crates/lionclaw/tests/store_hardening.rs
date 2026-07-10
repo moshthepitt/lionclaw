@@ -41,6 +41,7 @@ async fn expired_lease_is_reclaimable_exactly_once() {
         attempt_no: 1,
         idempotency_key: "lease-key".to_string(),
         role: RoleName::new("implementer").unwrap(),
+        runtime: "codex".to_string(),
         prompt: PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });

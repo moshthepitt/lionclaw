@@ -5,7 +5,7 @@ use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAuthKind, RuntimeDriverConfig, RuntimeDriverProvider,
 };
 
-use crate::{adapter::CodexRuntimeAdapter, host_auth::CodexRuntimeAuthProvider};
+use crate::adapter::CodexRuntimeAdapter;
 
 pub const CODEX_RUNTIME_DRIVER: &str = "codex";
 pub const CODEX_RUNTIME_AUTH_KIND: &str = CODEX_RUNTIME_DRIVER;
@@ -68,10 +68,6 @@ impl RuntimeDriverProvider for CodexRuntimeDriver {
             executable: config.executable,
             model: config.model,
         }))
-    }
-
-    fn auth_provider(&self) -> Option<Arc<dyn lionclaw_runtime_api::RuntimeAuthProvider>> {
-        Some(Arc::new(CodexRuntimeAuthProvider))
     }
 }
 

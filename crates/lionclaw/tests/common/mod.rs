@@ -85,7 +85,7 @@ pub fn review_mission_type() -> MissionType {
         RoleDefinition {
             name: gap_reviewer.clone(),
             output: OutputSemantics::EmitsGapVerdict,
-            runtime: None,
+            runtime: Some("opencode".to_string()),
             network: false,
             secrets: false,
             skills: Vec::new(),
@@ -236,6 +236,7 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
     let reviews = std::sync::Mutex::new(0usize);
     MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
+            assert_eq!(request.runtime, "opencode");
             let mut seen = reviews.lock().expect("lock");
             let (passed, gaps) = verdicts[(*seen).min(verdicts.len() - 1)].clone();
             *seen += 1;

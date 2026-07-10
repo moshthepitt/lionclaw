@@ -585,6 +585,7 @@ async fn amendment_while_an_effect_is_in_flight_is_busy() {
         attempt_no: 1,
         idempotency_key: "live-key".to_string(),
         role: RoleName::new("implementer").unwrap(),
+        runtime: "codex".to_string(),
         prompt: PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
@@ -712,6 +713,7 @@ async fn a_rejected_amendment_appends_nothing() {
         attempt_no: 1,
         idempotency_key: "expired-key".to_string(),
         role: RoleName::new("implementer").unwrap(),
+        runtime: "codex".to_string(),
         prompt: PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });

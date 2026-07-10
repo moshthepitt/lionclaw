@@ -28,6 +28,8 @@ pub struct RoleRunRequest {
     pub attempt_no: u32,
     pub idempotency_key: String,
     pub role: RoleDefinition,
+    /// Runtime profile resolved when the request event was recorded.
+    pub runtime: String,
     /// Mission-owned skill packages resolved from the pinned mission type.
     pub skills: Vec<SkillPackage>,
     /// Fully assembled prompt (already persisted in the request event).

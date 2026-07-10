@@ -365,6 +365,7 @@ mod tests {
             attempt_no,
             idempotency_key: key.to_string(),
             role: rname("implementer"),
+            runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
             base_sha: "sha-0".to_string(),
         }
@@ -806,6 +807,7 @@ mod tests {
             attempt_no,
             idempotency_key: key.to_string(),
             role: rname("gap-reviewer"),
+            runtime: "codex".to_string(),
             prompt: PayloadRef::inline("review prompt"),
             judged_sha: judged_sha.to_string(),
             nonce: "n0".to_string(),

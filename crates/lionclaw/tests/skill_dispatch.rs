@@ -23,14 +23,16 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
             root: package_root.clone(),
         },
     );
-    mission_type
+    let implementer = mission_type
         .roles
         .get_mut(&RoleName::new("implementer").unwrap())
-        .unwrap()
-        .skills = vec!["engineering".to_string()];
+        .unwrap();
+    implementer.runtime = Some("opencode".to_string());
+    implementer.skills = vec!["engineering".to_string()];
 
     let expected_root = package_root.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
+        assert_eq!(request.runtime, "opencode");
         assert_eq!(request.skills.len(), 1);
         assert_eq!(request.skills[0].name, "engineering");
         assert_eq!(request.skills[0].root, expected_root);
@@ -87,6 +89,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
 async fn role_without_skills_dispatches_an_empty_package_set() {
     let dir = tempfile::tempdir().expect("tempdir");
     let runner = MockRoleRunner::new(Box::new(|request| {
+        assert_eq!(request.runtime, "codex");
         assert!(request.skills.is_empty());
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {

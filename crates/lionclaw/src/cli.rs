@@ -382,8 +382,66 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
     }
 }
 
-fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
-    RuntimeProfiles::load(&Home::from_env()?)?.get(runtime)
+fn runtime_profiles() -> Result<RuntimeProfiles> {
+    RuntimeProfiles::load(&Home::from_env()?)
+}
+
+fn validated_role_profile(
+    role: &crate::mission_type::RoleDefinition,
+    runtime: &str,
+    profiles: &RuntimeProfiles,
+) -> Result<MissionRuntimeProfile> {
+    let profile = profiles.get(runtime).with_context(|| {
+        format!(
+            "role '{}' resolves to unavailable runtime '{runtime}'",
+            role.name
+        )
+    })?;
+    OciRoleRunner::validate_profile(&profile).with_context(|| {
+        format!(
+            "role '{}' resolves to invalid runtime '{runtime}'",
+            role.name
+        )
+    })?;
+    Ok(profile)
+}
+
+fn validate_explicit_role_runtimes(
+    mission_type: &MissionType,
+    profiles: &RuntimeProfiles,
+) -> Result<()> {
+    for role in mission_type.roles.values() {
+        if let Some(runtime) = &role.runtime {
+            validated_role_profile(role, runtime, profiles)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mission_runtimes(
+    mission_type: &MissionType,
+    default_runtime: &str,
+    profiles: &RuntimeProfiles,
+) -> Result<MissionRuntimeProfile> {
+    let default_profile = profiles.get(default_runtime)?;
+    OciRoleRunner::validate_profile(&default_profile)
+        .with_context(|| format!("default runtime '{default_runtime}' is invalid"))?;
+    let default_engine = &default_profile.confinement.oci().engine;
+    for role in mission_type.roles.values() {
+        let runtime = role.runtime.as_deref().unwrap_or(default_runtime);
+        let profile = validated_role_profile(role, runtime, profiles)?;
+        if profile.confinement.oci().engine != *default_engine {
+            bail!(
+                "role '{}' resolves to runtime '{}' using OCI engine '{}', but mission default runtime '{}' uses '{}'; one mission requires one OCI engine",
+                role.name,
+                runtime,
+                profile.confinement.oci().engine,
+                default_runtime,
+                default_engine
+            );
+        }
+    }
+    Ok(default_profile)
 }
 
 /// Build an engine over an open store, a loaded mission type, and a runtime
@@ -395,12 +453,14 @@ async fn assemble_engine(
     mission_type: crate::mission_type::MissionType,
     runtime: String,
     image_id: String,
-    profile: MissionRuntimeProfile,
+    profiles: RuntimeProfiles,
+    mut default_profile: MissionRuntimeProfile,
     ceiling: AuthorityCeiling,
 ) -> Result<Engine> {
     workspace::ensure_excluded(repo).await?;
-    let role_runner = Arc::new(OciRoleRunner::new(profile.clone(), ceiling));
-    let oracle_runner = Arc::new(OciOracleRunner::new(profile));
+    default_profile.confinement.oci_mut().image = Some(image_id.clone());
+    let role_runner = Arc::new(OciRoleRunner::new(profiles, image_id.clone(), ceiling));
+    let oracle_runner = Arc::new(OciOracleRunner::new(default_profile));
     Ok(Engine::new(
         store,
         mission_type,
@@ -427,21 +487,22 @@ async fn build_engine_for_start(
     let type_dir = Home::from_env()?.mission_type_dir(type_name);
     let mission_type = load_mission_type(&type_dir, &ceiling)
         .with_context(|| format!("mission type '{type_name}' (run `lionclaw install`?)"))?;
-    let mut profile = runtime_profile(runtime)?;
-    let engine = profile.confinement.oci().engine.clone();
+    let profiles = runtime_profiles()?;
+    let default_profile = validate_mission_runtimes(&mission_type, runtime, &profiles)?;
+    let engine = default_profile.confinement.oci().engine.clone();
     let image_ref = start_image_ref(&mission_type.image, image_override);
     let image_id =
         lionclaw_confinement::resolve_oci_image_compatibility_identity(&engine, image_ref)
             .await
             .with_context(|| format!("resolving image '{image_ref}'"))?;
-    profile.confinement.oci_mut().image = Some(image_id.clone());
     assemble_engine(
         store,
         repo,
         mission_type,
         runtime.to_string(),
         image_id,
-        profile,
+        profiles,
+        default_profile,
         ceiling,
     )
     .await
@@ -464,15 +525,16 @@ async fn build_engine_for_mission(
     let type_dir = Home::from_env()?.mission_type_dir(&state.mission_type.name);
     let mission_type = load_mission_type(&type_dir, &ceiling)
         .with_context(|| format!("mission type '{}'", state.mission_type.name))?;
-    let mut profile = runtime_profile(&state.runtime)?;
-    profile.confinement.oci_mut().image = Some(state.image_id.clone());
+    let profiles = runtime_profiles()?;
+    let default_profile = validate_mission_runtimes(&mission_type, &state.runtime, &profiles)?;
     let engine = assemble_engine(
         store,
         repo,
         mission_type,
         state.runtime.clone(),
         state.image_id.clone(),
-        profile,
+        profiles,
+        default_profile,
         ceiling,
     )
     .await?;
@@ -1258,14 +1320,20 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
     check("git", command_ok("git", &["--version"]).await, "");
 
     let home = Home::from_env()?;
-    match RuntimeProfiles::load(&home) {
-        Ok(profiles) => check(
-            "runtime profiles",
-            true,
-            &profiles.names().collect::<Vec<_>>().join(", "),
-        ),
-        Err(err) => check("runtime profiles", false, &format!("{err:#}")),
-    }
+    let profiles = match RuntimeProfiles::load(&home) {
+        Ok(profiles) => {
+            check(
+                "runtime profiles",
+                true,
+                &profiles.names().collect::<Vec<_>>().join(", "),
+            );
+            Some(profiles)
+        }
+        Err(err) => {
+            check("runtime profiles", false, &format!("{err:#}"));
+            None
+        }
+    };
     let types = home.installed_mission_types()?;
     if types.is_empty() {
         check(
@@ -1277,6 +1345,16 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
     for name in &types {
         match load_mission_type(&home.mission_type_dir(name), &AuthorityCeiling::default()) {
             Ok(mt) => {
+                if let Some(profiles) = &profiles {
+                    if let Err(err) = validate_explicit_role_runtimes(&mt, profiles) {
+                        check(
+                            &format!("mission type '{name}'"),
+                            false,
+                            &format!("{err:#}"),
+                        );
+                        continue;
+                    }
+                }
                 let img = command_ok("podman", &["image", "exists", &mt.image]).await;
                 check(
                     &format!("mission type '{name}'"),
@@ -1340,6 +1418,8 @@ async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
             )
             .await
             .context("mission type invalid")?;
+            validate_explicit_role_runtimes(&mission_type, &runtime_profiles()?)
+                .context("mission type runtime unavailable")?;
             show_loaded_mission_type(&mission_type, args.json);
             Ok(ExitCode::SUCCESS)
         }
@@ -1351,6 +1431,8 @@ async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
 fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
     match load_mission_type(dir, &AuthorityCeiling::default()) {
         Ok(mt) => {
+            validate_explicit_role_runtimes(&mt, &runtime_profiles()?)
+                .context("mission type runtime unavailable")?;
             show_loaded_mission_type(&mt, json);
             Ok(std::process::ExitCode::SUCCESS)
         }
@@ -1580,6 +1662,37 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
+        use crate::mission_type::RoleDefinition;
+        use crate::model::{OutputSemantics, RoleName, StopBar};
+
+        let name = RoleName::new("worker").expect("role name");
+        MissionType {
+            name: "runtime-test".to_string(),
+            digest: "digest".to_string(),
+            stop: StopBar::Verified,
+            image: "image".to_string(),
+            planning: Default::default(),
+            terminal_review: None,
+            playbook: None,
+            roles: BTreeMap::from([(
+                name.clone(),
+                RoleDefinition {
+                    name,
+                    output: OutputSemantics::ProducesArtifact,
+                    runtime: runtime.map(str::to_string),
+                    network: true,
+                    secrets: false,
+                    skills: Vec::new(),
+                    prompt_body: "work".to_string(),
+                },
+            )]),
+            skills: BTreeMap::new(),
+            oracles: BTreeMap::new(),
+        }
+    }
 
     fn mid() -> MissionId {
         MissionId::parse("mabc123def456").unwrap()
@@ -1602,6 +1715,73 @@ mod tests {
         assert_eq!(
             start_image_ref("type-image", Some("override-image")),
             "override-image"
+        );
+    }
+
+    #[test]
+    fn mission_runtime_validation_rejects_unknown_role_profiles() {
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.default]\ndriver = \"acp\"\ncommand = \"agent\"\n",
+            Path::new("/home/alice"),
+        )
+        .expect("profiles");
+        let err = validate_mission_runtimes(
+            &mission_type_with_runtime(Some("missing")),
+            "default",
+            &profiles,
+        )
+        .expect_err("unknown role runtime");
+        assert!(
+            err.to_string()
+                .contains("role 'worker' resolves to unavailable runtime 'missing'"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn mission_runtime_validation_requires_one_oci_engine() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.default]
+            driver = "acp"
+            command = "agent"
+
+            [runtimes.other]
+            driver = "acp"
+            command = "other-agent"
+            confinement = { backend = "podman", engine = "other-podman" }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profiles");
+        let err = validate_mission_runtimes(
+            &mission_type_with_runtime(Some("other")),
+            "default",
+            &profiles,
+        )
+        .expect_err("mixed OCI engines");
+        assert!(err
+            .to_string()
+            .contains("one mission requires one OCI engine"));
+    }
+
+    #[test]
+    fn mission_runtime_validation_checks_driver_and_auth_compatibility() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.bad]
+            driver = "codex"
+            command = "codex"
+            auth = { kind = "native-home", source = "~/.agent", target = ".agent", required-files = ["auth.json"] }
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profiles");
+        let err = validate_mission_runtimes(&mission_type_with_runtime(None), "bad", &profiles)
+            .expect_err("incompatible auth");
+        assert!(
+            err.to_string().contains("default runtime 'bad' is invalid"),
+            "got {err:#}"
         );
     }
 

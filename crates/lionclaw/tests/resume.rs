@@ -89,6 +89,7 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
         attempt_no: 1,
         idempotency_key: "crashed-key".to_string(),
         role: lionclaw::model::RoleName::new("implementer").expect("role"),
+        runtime: "codex".to_string(),
         prompt: lionclaw::model::PayloadRef::inline("prompt"),
         base_sha: BASE_SHA.to_string(),
     });
@@ -171,6 +172,7 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
         attempt_no: 1,
         idempotency_key: "live-key".to_string(),
         role: lionclaw::model::RoleName::new("implementer").unwrap(),
+        runtime: "codex".to_string(),
         prompt: lionclaw::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });
@@ -242,6 +244,7 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
         attempt_no: 1,
         idempotency_key: "crash-key".to_string(),
         role: lionclaw::model::RoleName::new("implementer").unwrap(),
+        runtime: "codex".to_string(),
         prompt: lionclaw::model::PayloadRef::inline("p"),
         base_sha: BASE_SHA.to_string(),
     });

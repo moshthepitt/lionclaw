@@ -560,6 +560,7 @@ impl Engine {
             task_id,
             attempt_no,
             role: role_name,
+            runtime,
             prompt,
             base_sha,
             ..
@@ -595,6 +596,7 @@ impl Engine {
             attempt_no,
             idempotency_key: idempotency_key.to_string(),
             role: role.clone(),
+            runtime: runtime.clone(),
             skills,
             prompt: prompt_text,
             base_sha: base_sha.to_string(),
@@ -719,6 +721,7 @@ impl Engine {
         let InflightEffect::TerminalReview {
             attempt_no,
             role: role_name,
+            runtime,
             prompt,
             judged_sha,
             nonce,
@@ -757,6 +760,7 @@ impl Engine {
             attempt_no,
             idempotency_key: idempotency_key.to_string(),
             role: role.clone(),
+            runtime: runtime.clone(),
             skills,
             prompt: prompt_text,
             base_sha: judged_sha.clone(),
@@ -928,6 +932,10 @@ impl Engine {
             attempt_no: intent.attempt_no,
             idempotency_key,
             role: intent.role,
+            runtime: role
+                .runtime
+                .clone()
+                .unwrap_or_else(|| state.runtime.clone()),
             prompt,
             base_sha: intent.base_sha,
         })
@@ -1000,6 +1008,10 @@ impl Engine {
             attempt_no: intent.attempt_no,
             idempotency_key,
             role: intent.role,
+            runtime: role
+                .runtime
+                .clone()
+                .unwrap_or_else(|| state.runtime.clone()),
             prompt,
             judged_sha: intent.judged_sha,
             nonce,

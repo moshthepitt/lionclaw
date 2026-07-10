@@ -90,6 +90,7 @@ RUN uv python install 3.12 \
         | jq -e \
             '.dependencies["@openai/codex"].version and .dependencies["opencode-ai"].version' \
             >/dev/null \
+    && hermes acp --check \
     && uv --version \
     && uv python find 3.12 \
     && cargo --version \

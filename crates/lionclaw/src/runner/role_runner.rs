@@ -12,27 +12,31 @@ use lionclaw_confinement::{
 };
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
-    RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider, RuntimeProgramTurnExecution,
-    RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
+    RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
 };
-use lionclaw_runtime_codex::CodexRuntimeDriver;
+use lionclaw_runtime_codex::{
+    CodexRuntimeAuthProvider, CodexRuntimeDriver, CODEX_RUNTIME_AUTH_KIND,
+};
 use tokio::sync::Mutex;
 
 use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
-use crate::config::MissionRuntimeProfile;
+use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
 use crate::mission_type::SkillPackage;
 use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
 use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
+use super::native_home_auth::NativeHomeAuthProvider;
 use super::{AttemptDirs, SCRATCH_MOUNT_TARGET};
 use crate::workspace;
 
 pub struct OciRoleRunner {
-    profile: MissionRuntimeProfile,
+    profiles: RuntimeProfiles,
+    image_id: String,
     ceiling: AuthorityCeiling,
     /// Serializes git worktree/clone operations inside this process; the store
     /// lease owns cross-process coordination.
@@ -40,20 +44,77 @@ pub struct OciRoleRunner {
 }
 
 impl OciRoleRunner {
-    pub fn new(profile: MissionRuntimeProfile, ceiling: AuthorityCeiling) -> Self {
+    pub fn new(profiles: RuntimeProfiles, image_id: String, ceiling: AuthorityCeiling) -> Self {
         Self {
-            profile,
+            profiles,
+            image_id,
             ceiling,
             repo_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    fn driver(&self) -> Result<Box<dyn RuntimeDriverProvider>, RoleRunFailure> {
-        match self.profile.driver.as_str() {
+    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, RoleRunFailure> {
+        let mut profile = self
+            .profiles
+            .get(runtime)
+            .map_err(|err| launch(err.to_string()))?;
+        profile.confinement.oci_mut().image = Some(self.image_id.clone());
+        Ok(profile)
+    }
+
+    fn driver(profile: &MissionRuntimeProfile) -> anyhow::Result<Box<dyn RuntimeDriverProvider>> {
+        match profile.driver.as_str() {
             "codex" => Ok(Box::new(CodexRuntimeDriver)),
             "acp" => Ok(Box::new(AcpRuntimeDriver)),
-            other => Err(launch(format!("unknown runtime driver '{other}'"))),
+            other => anyhow::bail!("unknown runtime driver '{other}'"),
         }
+    }
+
+    fn auth_registry(profile: &MissionRuntimeProfile) -> anyhow::Result<RuntimeAuthRegistry> {
+        let Some(auth) = &profile.auth else {
+            return Ok(RuntimeAuthRegistry::empty());
+        };
+        let provider: Arc<dyn RuntimeAuthProvider> = match auth {
+            RuntimeAuthConfig::Provider(kind) if kind == CODEX_RUNTIME_AUTH_KIND => {
+                Arc::new(CodexRuntimeAuthProvider)
+            }
+            RuntimeAuthConfig::Provider(kind) => {
+                anyhow::bail!(
+                    "runtime '{}' configures unsupported auth provider '{kind}'",
+                    profile.name
+                )
+            }
+            RuntimeAuthConfig::NativeHome(config) => {
+                Arc::new(NativeHomeAuthProvider::new(config.clone()))
+            }
+        };
+        Ok(RuntimeAuthRegistry::new([provider]))
+    }
+
+    fn driver_config(profile: &MissionRuntimeProfile) -> anyhow::Result<RuntimeDriverConfig> {
+        let auth = profile
+            .auth
+            .as_ref()
+            .map(|auth| lionclaw_runtime_api::RuntimeAuthKind::new(auth.kind()))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        Ok(RuntimeDriverConfig {
+            runtime_id: profile.name.clone(),
+            executable: profile.command.clone(),
+            args: profile.args.clone(),
+            environment: profile.environment.clone(),
+            model: profile.model.clone(),
+            mode: profile.mode.clone(),
+            auth,
+            terminal: Default::default(),
+        })
+    }
+
+    pub(crate) fn validate_profile(profile: &MissionRuntimeProfile) -> anyhow::Result<()> {
+        let driver = Self::driver(profile)?;
+        let config = Self::driver_config(profile)?;
+        Self::auth_registry(profile)?;
+        driver.validate_config(&config)
     }
 }
 
@@ -86,20 +147,17 @@ fn role_skill_mounts(
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
-        // A per-role `runtime` override must name the mission's runtime — the
-        // engine wires a single profile, so a mismatch is a fail-closed error
-        // rather than a silently-ignored knob.
-        if let Some(requested) = &request.role.runtime {
-            if requested != &self.profile.name {
+        if let Some(declared) = &request.role.runtime {
+            if declared != &request.runtime {
                 return Err(launch(format!(
-                    "role requests runtime '{requested}' but this mission runs '{}'",
-                    self.profile.name
+                    "role declares runtime '{declared}' but its request resolved '{}'",
+                    request.runtime
                 )));
             }
         }
-        let skill_mounts =
-            role_skill_mounts(&request.skills, self.profile.skill_projection.as_ref())
-                .map_err(|err| launch(format!("failed to resolve role skills: {err:#}")))?;
+        let profile = self.profile(&request.runtime)?;
+        let skill_mounts = role_skill_mounts(&request.skills, profile.skill_projection.as_ref())
+            .map_err(|err| launch(format!("failed to resolve role skills: {err:#}")))?;
 
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dirs = AttemptDirs::prepare(
@@ -160,22 +218,24 @@ impl RoleRunner for OciRoleRunner {
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
             let compiled = compile_role_plan(RolePlanRequest {
                 authority: &authority,
-                runtime_id: self.profile.name.clone(),
-                confinement: self.profile.confinement.clone(),
-                skill_projection: self.profile.skill_projection.clone(),
+                runtime_id: profile.name.clone(),
+                confinement: profile.confinement.clone(),
+                skill_projection: profile.skill_projection.clone(),
                 mounts: MissionMounts {
                     workspace: workspace_mount,
                     extras,
                 },
                 judged_roots: &judged_roots,
                 environment,
-                hard_timeout: self.profile.hard_timeout,
+                hard_timeout: profile.hard_timeout,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
 
             // Run the agent turn under confinement, then capture the artifact
             // (writer only) before the workspace is torn down.
-            let model_id = self.run_turn(&request, compiled.plan().clone()).await?;
+            let model_id = self
+                .run_turn(&profile, &request, compiled.plan().clone())
+                .await?;
             let handoff = read_handoff(&dirs.handoff, request.role.output)?;
             let artifact = if let Some(clone) = &worker_clone {
                 let _guard = self.repo_lock.lock().await;
@@ -220,48 +280,19 @@ impl RoleRunner for OciRoleRunner {
 impl OciRoleRunner {
     async fn run_turn(
         &self,
+        profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
     ) -> Result<Option<String>, RoleRunFailure> {
-        let driver = self.driver()?;
-        let auth_kind = match self.profile.auth.as_deref() {
-            Some(configured) => {
-                let provider = driver.auth_provider().ok_or_else(|| {
-                    launch(format!(
-                        "runtime '{}' configures auth '{configured}' but driver '{}' provides no auth broker",
-                        self.profile.name, self.profile.driver
-                    ))
-                })?;
-                if provider.kind() != configured {
-                    return Err(launch(format!(
-                        "runtime '{}' configures auth '{configured}' but driver '{}' provides '{}'",
-                        self.profile.name,
-                        self.profile.driver,
-                        provider.kind()
-                    )));
-                }
-                Some(
-                    lionclaw_runtime_api::RuntimeAuthKind::new(configured)
-                        .map_err(|e| launch(format!("invalid auth kind: {e}")))?,
-                )
-            }
-            None => None,
-        };
-        let config = RuntimeDriverConfig {
-            runtime_id: self.profile.name.clone(),
-            executable: self.profile.command.clone(),
-            args: self.profile.args.clone(),
-            environment: self.profile.environment.clone(),
-            model: self.profile.model.clone(),
-            mode: None,
-            auth: auth_kind.clone(),
-            terminal: Default::default(),
-        };
+        let driver = Self::driver(profile)
+            .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
+        let config = Self::driver_config(profile)
+            .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
+        let auth_registry = Self::auth_registry(profile)
+            .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         driver
             .validate_config(&config)
             .map_err(|e| launch(format!("driver config invalid: {e}")))?;
-        let auth_registry =
-            RuntimeAuthRegistry::new(driver.auth_provider().into_iter().collect::<Vec<_>>());
         let adapter = driver.create_adapter(config);
 
         // Compute the fallible execution context *before* opening a session,
@@ -312,14 +343,14 @@ impl OciRoleRunner {
             journal_tx,
         );
 
-        let result = tokio::time::timeout(self.profile.hard_timeout, turn).await;
+        let result = tokio::time::timeout(profile.hard_timeout, turn).await;
         let _ = adapter.close(&handle).await;
         let last_error = drain.await.ok().flatten();
 
         match result {
             Err(_) => Err(RoleRunFailure {
                 kind: RunErrorKind::Timeout,
-                detail: format!("agent turn exceeded {:?}", self.profile.hard_timeout),
+                detail: format!("agent turn exceeded {:?}", profile.hard_timeout),
             }),
             Ok(Err(err)) => Err(RoleRunFailure {
                 kind: RunErrorKind::TurnFailed,
@@ -328,7 +359,7 @@ impl OciRoleRunner {
                     None => err.to_string(),
                 },
             }),
-            Ok(Ok(_)) => Ok(self.profile.model.clone()),
+            Ok(Ok(_)) => Ok(profile.model.clone()),
         }
     }
 }
@@ -379,6 +410,26 @@ fn uuid_from_key(key: &str) -> uuid::Uuid {
 mod tests {
     use super::*;
     use lionclaw_confinement::{InheritedSkillRoot, RuntimeSkillProjectionConfig};
+    use std::path::Path;
+
+    #[test]
+    fn acp_profile_mode_reaches_the_driver_config() {
+        let profiles = RuntimeProfiles::from_toml(
+            r#"
+            [runtimes.example]
+            driver = "acp"
+            command = "example"
+            mode = "autonomous"
+            "#,
+            Path::new("/home/alice"),
+        )
+        .expect("profiles");
+        let profile = profiles.get("example").expect("profile");
+
+        let config = OciRoleRunner::driver_config(&profile).expect("driver config");
+
+        assert_eq!(config.mode.as_deref(), Some("autonomous"));
+    }
 
     #[test]
     fn role_skill_mounts_combine_mission_and_inherited_packages_read_only() {
