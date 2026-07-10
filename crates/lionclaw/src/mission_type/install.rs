@@ -257,6 +257,19 @@ async fn checkout_git_skill(source: &GitSkillSource) -> Result<GitCheckout> {
     } else {
         resolve_package_path(checkout.path(), &source.subdir).map_err(anyhow::Error::msg)?
     };
+    let checkout_root = checkout
+        .path()
+        .canonicalize()
+        .context("resolving git skill checkout root")?;
+    let package = package
+        .canonicalize()
+        .with_context(|| format!("resolving git skill subdir '{}'", source.subdir.display()))?;
+    if !package.starts_with(&checkout_root) {
+        bail!(
+            "git skill subdir '{}' resolves outside its checkout",
+            source.subdir.display()
+        );
+    }
     Ok(GitCheckout {
         _directory: checkout,
         package,
@@ -470,6 +483,64 @@ mod tests {
         std::fs::remove_dir_all(&repository).unwrap();
         load_mission_type(&destination, &AuthorityCeiling::default())
             .expect("installed mission no longer needs source repository");
+    }
+
+    #[tokio::test]
+    async fn pinned_git_skill_subdir_cannot_escape_through_a_parent_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        write_skill(&outside.join("package"));
+        let repository = temp.path().join("skill-repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::os::unix::fs::symlink(&outside, repository.join("escape")).unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&repository)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C", repository.to_str().unwrap(), "add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                repository.to_str().unwrap(),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "escaping skill",
+            ])
+            .status()
+            .unwrap();
+        let revision = git_output(&repository, ["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let source = temp.path().join("source");
+        write_type(
+            &source,
+            &format!(
+                "{{ git = {:?}, rev = {:?}, subdir = \"escape/package\" }}",
+                repository.to_string_lossy(),
+                revision
+            ),
+        );
+
+        let err = materialize_mission_type(
+            &source,
+            &temp.path().join("installed"),
+            &AuthorityCeiling::default(),
+        )
+        .await
+        .expect_err("git subdir must remain inside its checkout");
+
+        assert!(err.to_string().contains("resolves outside"), "got {err:#}");
     }
 
     #[tokio::test]
