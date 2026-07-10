@@ -605,3 +605,189 @@ async fn a_config_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creati
         assert!(err.to_string().contains(expected), "{role}: got {err}");
     }
 }
+
+#[tokio::test]
+async fn a_hostile_log_with_an_unresolvable_reviewer_parks_instead_of_wedging() {
+    // Regression (QA round 3): create_mission refuses this config, but a
+    // hostile log writer can record it directly. The closing dispatch must
+    // degrade to a durable TerminalReviewFailed park — with abort as a live
+    // escape hatch — never a mission whose every advance() errors before any
+    // event lands.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with_type(
+        dir.path(),
+        review_mission_type(),
+        review_runner(vec![(true, vec![])]),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = lionclaw::model::MissionId::from_digest_prefix("beefbeefbeefbeef");
+    let created = lionclaw::store::NewEvent::new(MissionEvent::MissionCreated {
+        objective: "obj".into(),
+        mission_type: lionclaw::model::MissionTypeRef {
+            name: "software-dev-test".into(),
+            digest: "test-digest".into(),
+        },
+        runtime: "codex".into(),
+        image_id: "img".into(),
+        workspace_dir: dir.path().to_string_lossy().into_owned(),
+        base_sha: BASE_SHA.into(),
+        config: lionclaw::model::MissionConfig {
+            ratification_gate: false,
+            terminal_review: Some(lionclaw::model::TerminalReviewConfig {
+                role: lionclaw::model::RoleName::new("ghost").expect("role name"),
+            }),
+            ..Default::default()
+        },
+    });
+    h.engine
+        .store()
+        .create_mission(
+            &mission_id,
+            &dir.path().to_string_lossy(),
+            "obj",
+            created,
+            1_000,
+        )
+        .await
+        .expect("hostile create");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let AdvanceOutcome::Parked { attention } = outcome else {
+        panic!("expected a durable park, got {outcome:?}");
+    };
+    assert_eq!(attention[0].id, "terminal_review_failed:mission");
+    assert!(attention[0].report.contains("not provided"));
+
+    // Retry re-parks under a FRESH attempt (the failure event must advance
+    // the attempt counter even though no Requested ever landed) — it must
+    // never spin the drive loop on a duplicate idempotency key.
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_failed:mission",
+            DecisionAction::Retry,
+            "maybe the type recovered",
+            "test",
+        )
+        .await
+        .expect("retry");
+    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    let AdvanceOutcome::Parked { attention } = outcome else {
+        panic!("retry must re-park durably, got {outcome:?}");
+    };
+    assert_eq!(attention[0].id, "terminal_review_failed:mission");
+
+    // The escape hatch is live: abort works.
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_failed:mission",
+            DecisionAction::Abort,
+            "unresolvable reviewer",
+            "test",
+        )
+        .await
+        .expect("abort");
+    let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
+    assert!(
+        matches!(
+            &outcome,
+            AdvanceOutcome::Terminal {
+                phase: MissionPhase::Aborted { .. }
+            }
+        ),
+        "got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
+    // Regression (QA round 3): done=false means "the review itself did not
+    // complete" — an infra park to retry/waive, never a sealed verdict and
+    // never a gaps park.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            Ok(RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: false,
+                    report: PayloadRef::inline("ran out of context"),
+                    items: vec![],
+                    passed: false,
+                    request_attention: false,
+                    gaps: vec![],
+                    nonce: lionclaw::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+                },
+                artifact: None,
+                model_id: None,
+            })
+        } else {
+            Ok(work_outcome(request, HEAD_SHA))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    let AdvanceOutcome::Parked { attention } = outcome else {
+        panic!("expected an infra park, got {outcome:?}");
+    };
+    assert_eq!(attention[0].id, "terminal_review_failed:mission");
+    assert!(attention[0].report.contains("did not complete"));
+}
+
+#[tokio::test]
+async fn misfiled_items_or_request_attention_park_instead_of_vanishing() {
+    // Regression (QA round 3): findings misfiled into `items` (the reviewer
+    // is contract-blind) or an escalation via request_attention must fail
+    // the attempt loudly — the engine previously discarded both silently,
+    // sealing a "clean" verdict over vanished findings.
+    for (items, request_attention, expected) in [
+        (
+            vec![lionclaw::model::ValidationItem {
+                item_id: lionclaw::model::AssertionId::new("TESTS-PASS").expect("id"),
+                passed: false,
+            }],
+            false,
+            "report gaps, not items",
+        ),
+        (vec![], true, "not request_attention"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected_owned = expected.to_string();
+        let items_owned = items.clone();
+        let runner = MockRoleRunner::new(Box::new(move |request| {
+            if request.task_id.as_str() == REVIEW_TAG {
+                Ok(RoleRunOutcome {
+                    handoff: Handoff::Validate {
+                        done: true,
+                        report: PayloadRef::inline("looks clean"),
+                        items: items_owned.clone(),
+                        passed: true,
+                        request_attention,
+                        gaps: vec![],
+                        nonce: lionclaw::prompt::handoff_nonce(&request.prompt).map(str::to_string),
+                    },
+                    artifact: None,
+                    model_id: None,
+                })
+            } else {
+                Ok(work_outcome(request, HEAD_SHA))
+            }
+        }));
+        let (h, mission_id) = started(&dir, runner).await;
+        let outcome = h.engine.advance(&mission_id).await.expect("advance");
+        let AdvanceOutcome::Parked { attention } = outcome else {
+            panic!("expected a park, got {outcome:?}");
+        };
+        assert_eq!(attention[0].id, "terminal_review_failed:mission");
+        assert!(
+            attention[0].report.contains(&expected_owned),
+            "got: {}",
+            attention[0].report
+        );
+    }
+}

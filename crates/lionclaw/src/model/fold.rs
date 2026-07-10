@@ -181,19 +181,25 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             state.inflight.remove(idempotency_key);
             state.oracle_failures.insert(oracle.clone(), detail.clone());
         }
+        // `attempts` is the highest attempt number the log has seen — from
+        // ANY review event, not just requests: the materialize fallback
+        // records a `Failed` without a `Requested`, and a retry must still
+        // dispatch under a fresh attempt (⇒ a fresh idempotency key), never
+        // spin the drive loop re-appending a duplicate.
         MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
-            state.terminal_review.attempts = *attempt_no;
+            state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::TerminalReviewCompleted {
+            attempt_no,
             idempotency_key,
             judged_sha,
             passed,
             gaps,
             report,
-            ..
         } => {
             state.inflight.remove(idempotency_key);
+            state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             state.terminal_review.outcome = Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
                 judged_sha: judged_sha.clone(),
                 passed: *passed,
@@ -202,11 +208,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }));
         }
         MissionEvent::TerminalReviewFailed {
+            attempt_no,
             idempotency_key,
             detail,
             ..
         } => {
             state.inflight.remove(idempotency_key);
+            state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             state.terminal_review.outcome = Some(ReviewOutcome::Failed {
                 detail: detail.clone(),
             });
@@ -820,8 +828,14 @@ fn derive_attention(state: &mut MissionState) {
                         .iter()
                         .filter(|g| g.severity == GapSeverity::Blocking)
                         .count();
-                    let finding = if v.gaps.is_empty() {
-                        "terminal review failed the product; see its report".to_string()
+                    // No blocking gap ⇒ the park came from the reviewer's
+                    // fail bit (blocking() dominance): say so — never
+                    // "0 blocking gap(s)" on a parked mission.
+                    let finding = if blocking_count == 0 {
+                        format!(
+                            "terminal review failed the product ({} gap(s) recorded; see its report)",
+                            v.gaps.len()
+                        )
                     } else {
                         format!(
                             "terminal review found {blocking_count} blocking gap(s) of {} total",

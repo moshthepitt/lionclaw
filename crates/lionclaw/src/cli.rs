@@ -824,12 +824,22 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         // review, whatever a hostile log writer recorded — the three review
         // fields must never contradict each other.
         let review = review_summary(&state);
-        let (review_gaps, review_accepted_by) = if review.is_null() {
-            (serde_json::Value::Null, serde_json::Value::Null)
+        let (review_gaps, review_report, review_accepted_by) = if review.is_null() {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
         } else {
-            let gaps = match &state.terminal_review.outcome {
-                Some(ReviewOutcome::Verdict(v)) => serde_json::to_value(&v.gaps)?,
-                _ => serde_json::Value::Null,
+            // Gaps and the reviewer's report belong to the verdict; a stale
+            // verdict describes a superseded tree, so only a FRESH one is
+            // serialized (the summary's verdict/fresh fields say why).
+            let (gaps, report) = match &state.terminal_review.outcome {
+                Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(&state.current_sha) => (
+                    serde_json::to_value(&v.gaps)?,
+                    serde_json::Value::String(store.blobs().resolve(&v.report)?),
+                ),
+                _ => (serde_json::Value::Null, serde_json::Value::Null),
             };
             let accepted = state
                 .terminal_review
@@ -845,7 +855,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     })
                 })
                 .unwrap_or(serde_json::Value::Null);
-            (gaps, accepted)
+            (gaps, report, accepted)
         };
         println!(
             "{}",
@@ -870,6 +880,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                 "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
+                "terminal_review_report": review_report,
                 "terminal_review_accepted_by": review_accepted_by,
             })
         );
@@ -923,21 +934,37 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             );
         }
         if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
-            for gap in &v.gaps {
-                println!(
-                    "    [{}] {}{}",
-                    gap.severity.slug(),
-                    gap.id
-                        .as_deref()
-                        .map(|id| format!("{id}: "))
-                        .unwrap_or_default(),
-                    gap.requirement,
-                );
-                println!("        expected: {}", gap.expected);
-                println!("        observed: {}", gap.observed);
-                if !gap.evidence.is_empty() {
-                    println!("        evidence: {}", gap.evidence);
+            if v.is_fresh_at(&state.current_sha) {
+                for gap in &v.gaps {
+                    println!(
+                        "    [{}] {}{}",
+                        gap.severity.slug(),
+                        gap.id
+                            .as_deref()
+                            .map(|id| format!("{id}: "))
+                            .unwrap_or_default(),
+                        gap.requirement,
+                    );
+                    println!("        expected: {}", gap.expected);
+                    println!("        observed: {}", gap.observed);
+                    if !gap.evidence.is_empty() {
+                        println!("        evidence: {}", gap.evidence);
+                    }
                 }
+                // The reviewer's own account — the requirement map and what
+                // it observed — is the receipt's primary review evidence.
+                println!("    reviewer's report:");
+                for line in store.blobs().resolve(&v.report)?.lines() {
+                    println!("      {line}");
+                }
+            } else {
+                // Stale findings describe a superseded tree; never render
+                // them like fresh ones.
+                println!(
+                    "    (a superseded verdict at {} recorded {} gap(s); see 'mission log')",
+                    short_hex(&v.judged_sha),
+                    v.gaps.len()
+                );
             }
         }
     }
@@ -1069,17 +1096,26 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     // superseded head never triggers a false note here.
     if matches!(state.phase, MissionPhase::Done { .. }) {
         let summary = review_summary(&state);
+        let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
+        let total = blocking
+            + summary["gaps"]["major"].as_u64().unwrap_or(0)
+            + summary["gaps"]["minor"].as_u64().unwrap_or(0);
         if summary["verdict"] == serde_json::json!("gaps")
             && summary["acknowledged"].as_bool() == Some(true)
         {
-            eprintln!(
-                "note: closed with {} blocking gap(s) acknowledged by a human \
-                 ({} recorded in total); see 'mission report'",
-                summary["gaps"]["blocking"],
-                summary["gaps"]["blocking"].as_u64().unwrap_or(0)
-                    + summary["gaps"]["major"].as_u64().unwrap_or(0)
-                    + summary["gaps"]["minor"].as_u64().unwrap_or(0),
-            );
+            // Zero blocking gaps under a "gaps" verdict = the reviewer's
+            // fail bit; the note must never read as "0 gaps waved through".
+            if blocking == 0 {
+                eprintln!(
+                    "note: closed over a review that FAILED the product \
+                     ({total} gap(s) recorded), acknowledged by a human; see 'mission report'"
+                );
+            } else {
+                eprintln!(
+                    "note: closed with {blocking} blocking gap(s) acknowledged by a human \
+                     ({total} recorded in total); see 'mission report'"
+                );
+            }
         } else if summary["verdict"] == serde_json::json!("waived") {
             eprintln!("note: closed with the terminal review waived; see 'mission report'");
         }
@@ -1432,10 +1468,11 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
         return serde_json::Value::Null;
     };
     let tr = &state.terminal_review;
-    // A finished mission owes nothing: whatever is not settled by a fresh
+    // A terminal mission owes nothing: whatever is not settled by a fresh
     // verdict or a fresh waiver was deliberately skipped (a below-bar finish
-    // never burns a review) — never report it as still "owed".
-    let done = matches!(state.phase, MissionPhase::Done { .. });
+    // never burns a review; an abort ends everything) — never report it as
+    // still "owed".
+    let done = state.phase.is_terminal();
     let waived = tr.waived_at(&state.current_sha);
     let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
         Some(ReviewOutcome::Verdict(v)) => {
@@ -1496,23 +1533,33 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
     let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
     let major = summary["gaps"]["major"].as_u64().unwrap_or(0);
     let minor = summary["gaps"]["minor"].as_u64().unwrap_or(0);
+    let acknowledged = if summary["acknowledged"].as_bool().unwrap_or(false) {
+        " — acknowledged by a human"
+    } else {
+        ""
+    };
     Some(match summary["verdict"].as_str().unwrap_or("owed") {
         "clean" => format!("review: clean (judged {sha}){stale}"),
-        // A fail with zero typed gaps is an honest unstructured fail — say
-        // that, never "0 gaps" on a parked mission.
-        "gaps" if blocking + major + minor == 0 => {
-            format!("review: FAILED the product — see its report (judged {sha}){stale}")
-        }
-        "gaps" => format!(
-            "review: {blocking} blocking, {major} major, {minor} minor gap(s) (judged {sha}){stale}{}",
-            if summary["acknowledged"].as_bool().unwrap_or(false) {
-                " — acknowledged by a human"
-            } else {
-                ""
-            },
+        // A "gaps" verdict without a single blocking gap means the park came
+        // from the reviewer's fail bit — say so, never "0 blocking gap(s)"
+        // on a parked mission.
+        "gaps" if blocking == 0 => format!(
+            "review: FAILED the product ({} gap(s) recorded) — see its report \
+             (judged {sha}){stale}{acknowledged}",
+            major + minor,
         ),
+        "gaps" => format!(
+            "review: {blocking} blocking, {major} major, {minor} minor gap(s) \
+             (judged {sha}){stale}{acknowledged}",
+        ),
+        "failed" if state.phase.is_terminal() => {
+            "review: FAILED to run before the mission ended".to_string()
+        }
         "failed" => "review: FAILED to run — retry, waive (continue), or abort".to_string(),
         "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
+        "skipped" if matches!(state.phase, MissionPhase::Aborted { .. }) => {
+            "review: none — the mission was aborted before a review settled".to_string()
+        }
         "skipped" => {
             "review: skipped — the finish is below the stop bar; no review is owed".to_string()
         }
@@ -1648,6 +1695,75 @@ mod tests {
         assert_eq!(summary["verdict"], serde_json::json!("skipped"));
         let line = review_line(&state).expect("line");
         assert!(line.contains("skipped"), "got: {line}");
+        assert!(!line.contains("not yet judged"), "got: {line}");
+    }
+
+    #[test]
+    fn a_fail_bit_with_only_minor_gaps_renders_as_failed_not_zero_blocking() {
+        // Regression (QA round 3): passed=false with only minor gaps parks
+        // via blocking() dominance; the line must lead with the fail, never
+        // "0 blocking, 0 major, 2 minor gap(s)" as if nothing blocked.
+        use crate::model::{Gap, GapSeverity, MissionEvent};
+        let minor = |req: &str| Gap {
+            id: None,
+            severity: GapSeverity::Minor,
+            requirement: req.into(),
+            expected: "e".into(),
+            observed: "o".into(),
+            evidence: "v".into(),
+        };
+        let state = review_state(vec![
+            oracle_completed(0),
+            MissionEvent::TerminalReviewCompleted {
+                attempt_no: 1,
+                idempotency_key: "kr".into(),
+                judged_sha: "h1".into(),
+                passed: false,
+                gaps: vec![minor("a"), minor("b")],
+                report: crate::model::PayloadRef::inline("failed overall"),
+            },
+        ]);
+        assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
+        let line = review_line(&state).expect("line");
+        assert!(line.contains("FAILED the product"), "got: {line}");
+        assert!(!line.contains("0 blocking"), "got: {line}");
+    }
+
+    #[test]
+    fn an_aborted_mission_never_advises_impossible_decisions() {
+        // Regression (QA round 3): a dead mission must not print "owed" or a
+        // retry/waive/abort menu no decision can act on.
+        use crate::model::MissionEvent;
+        // Aborted while parked on a review failure.
+        let state = review_state(vec![
+            oracle_completed(0),
+            MissionEvent::TerminalReviewFailed {
+                attempt_no: 1,
+                idempotency_key: "kr".into(),
+                judged_sha: "h1".into(),
+                error_kind: crate::model::RunErrorKind::Timeout,
+                detail: "boom".into(),
+                synthesized: false,
+            },
+            MissionEvent::DecisionRecorded {
+                attention_id: "terminal_review_failed:mission".into(),
+                action: crate::model::DecisionAction::Abort,
+                justification: "give up".into(),
+                actor: "test".into(),
+            },
+        ]);
+        assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
+        let line = review_line(&state).expect("line");
+        assert!(line.contains("before the mission ended"), "got: {line}");
+        assert!(!line.contains("retry"), "got: {line}");
+
+        // Aborted before any review dispatch: "none", not "owed" forever.
+        let state = review_state(vec![MissionEvent::MissionAborted {
+            reason: "operator stop".into(),
+            actor: "test".into(),
+        }]);
+        let line = review_line(&state).expect("line");
+        assert!(line.contains("the mission was aborted"), "got: {line}");
         assert!(!line.contains("not yet judged"), "got: {line}");
     }
 

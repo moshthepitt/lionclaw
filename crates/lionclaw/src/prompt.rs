@@ -172,7 +172,8 @@ Method — in this order:
 3. RECORD EVIDENCE. Every finding must cite what you did and what you saw:
    the command you ran and the output you observed, or the exact file path
    and what is (or is not) there. Keep evidence to short excerpts, not full
-   logs. A claim without evidence will be discarded.
+   logs. A gap with an empty requirement, expected, observed, or evidence
+   field is rejected and fails the attempt.
 
 If the product cannot be built or run and that blocks verifying the
 objective, that is itself a blocking gap — report it as one. Never wave a

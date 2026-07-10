@@ -746,10 +746,11 @@ impl Engine {
         let Handoff::Validate {
             done,
             report,
+            items,
             passed,
             gaps,
             nonce: echoed,
-            ..
+            request_attention,
         } = outcome.handoff
         else {
             // Unreachable via the runner's schema check; fail closed anyway.
@@ -768,6 +769,22 @@ impl Engine {
             return Ok(failed(
                 RunErrorKind::TurnFailed,
                 "reviewer handed off done=false: the review itself did not complete".to_string(),
+            ));
+        }
+        // Fail closed on fields the terminal review has no channel for —
+        // findings misfiled into `items` (the reviewer is contract-blind)
+        // or an escalation via `request_attention` (the escalation channel
+        // is a blocking gap) must park for a re-roll, never silently vanish.
+        if !items.is_empty() {
+            return Ok(failed(
+                RunErrorKind::HandoffInvalid,
+                "terminal review has no per-assertion contract: report gaps, not items".to_string(),
+            ));
+        }
+        if request_attention {
+            return Ok(failed(
+                RunErrorKind::HandoffInvalid,
+                "terminal review escalates via a blocking gap, not request_attention".to_string(),
             ));
         }
         Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {

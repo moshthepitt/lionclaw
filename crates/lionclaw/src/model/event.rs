@@ -185,6 +185,8 @@ pub struct Gap {
     pub expected: String,
     pub observed: String,
     /// Observed-behavior evidence (commands run, output seen, file paths).
+    /// The runner rejects a handoff whose gap leaves this (or any prose
+    /// field) empty — a gap is a falsifiable claim, never a bare assertion.
     #[serde(default)]
     pub evidence: String,
 }

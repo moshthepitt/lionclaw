@@ -103,6 +103,24 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
                  cite short excerpts as evidence, not full logs"
             )));
         }
+        // A gap is a falsifiable claim: every prose field must say something.
+        // (The prompt promises evidence-less claims are rejected; hold it.)
+        for gap in gaps {
+            for (field, text) in [
+                ("requirement", &gap.requirement),
+                ("expected", &gap.expected),
+                ("observed", &gap.observed),
+                ("evidence", &gap.evidence),
+            ] {
+                if text.trim().is_empty() {
+                    return Err(invalid(format!(
+                        "gap '{}' has an empty '{field}': every gap must state \
+                         its requirement, expected and observed behavior, and evidence",
+                        gap.id.as_deref().unwrap_or("<unnamed>")
+                    )));
+                }
+            }
+        }
     }
     // The schema string and the payload tag must agree with the role's output.
     let tag_ok = matches!(
@@ -242,12 +260,17 @@ mod tests {
 
     #[test]
     fn rejects_unknown_gap_severity_and_unknown_gap_fields() {
-        // The severity axis and the Gap shape are closed: a typo'd severity or
-        // a stray field fails the attempt rather than passing as prose.
+        // The severity axis and the Gap shape are closed: a typo'd severity,
+        // a stray field, a missing field, or an empty prose field (a gap is a
+        // falsifiable claim — the prompt promises evidence-less claims are
+        // rejected) fails the attempt rather than passing as prose.
         for gap_json in [
             r#"{"severity":"severe","requirement":"r","expected":"e","observed":"o"}"#,
             r#"{"severity":"blocking","requirement":"r","expected":"e","observed":"o","note":"x"}"#,
             r#"{"severity":"blocking","requirement":"r"}"#,
+            r#"{"severity":"blocking","requirement":"r","expected":"e","observed":"o"}"#,
+            r#"{"severity":"blocking","requirement":"r","expected":"e","observed":"o","evidence":"  "}"#,
+            r#"{"severity":"blocking","requirement":"","expected":"e","observed":"o","evidence":"v"}"#,
         ] {
             let raw = format!(
                 r#"{{"schema":"lionclaw.mission.validate-handoff.v1","type":"validate",
