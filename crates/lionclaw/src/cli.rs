@@ -9,9 +9,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
-use crate::config::MissionRuntimeProfile;
+use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
 use crate::engine::{AdvanceOutcome, Engine};
-use crate::mission_type::{bundled_mission_types_dir, load_mission_type, Home};
+use crate::mission_type::{
+    bundled_mission_types_dir, install_mission_type, load_mission_type, materialize_mission_type,
+    Home, MissionType,
+};
 use crate::model::{
     fold, short_hex, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId,
     MissionPhase,
@@ -380,11 +383,7 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
 }
 
 fn runtime_profile(runtime: &str) -> Result<MissionRuntimeProfile> {
-    match runtime {
-        "codex" => Ok(MissionRuntimeProfile::codex_default()),
-        "opencode" => Ok(MissionRuntimeProfile::opencode_default()),
-        other => bail!("unknown runtime '{other}' (expected 'codex' or 'opencode')"),
-    }
+    RuntimeProfiles::load(&Home::from_env()?)?.get(runtime)
 }
 
 /// Build an engine over an open store, a loaded mission type, and a runtime
@@ -1038,7 +1037,7 @@ async fn cmd_install(args: InstallArgs) -> Result<()> {
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("creating '{}'", dest_dir.display()))?;
 
-    let mut installed = Vec::new();
+    let mut installed_count = 0usize;
     for entry in
         std::fs::read_dir(&source).with_context(|| format!("reading '{}'", source.display()))?
     {
@@ -1047,48 +1046,28 @@ async fn cmd_install(args: InstallArgs) -> Result<()> {
             continue;
         }
         let src_dir = entry.path();
-        // Validate before installing (an invalid mission type never lands), and
-        // key the destination by the manifest NAME — the identity a started
-        // mission re-opens by — not the source directory basename, so a type
-        // whose directory differs from its name still installs and starts
-        // coherently.
-        let name = load_mission_type(&src_dir, &AuthorityCeiling::default())
-            .with_context(|| format!("mission type at '{}' is invalid", src_dir.display()))?
-            .name;
-        let dest = dest_dir.join(&name);
-        if dest.exists() {
-            if !args.force {
-                println!("skip {name} (already installed; --force to overwrite)");
-                continue;
-            }
-            std::fs::remove_dir_all(&dest)
-                .with_context(|| format!("removing '{}'", dest.display()))?;
+        let outcome = install_mission_type(
+            &src_dir,
+            &dest_dir,
+            args.force,
+            &AuthorityCeiling::default(),
+        )
+        .await
+        .with_context(|| format!("mission type at '{}' is invalid", src_dir.display()))?;
+        if outcome.installed {
+            println!("installed {}", outcome.name);
+            installed_count += 1;
+        } else {
+            println!(
+                "skip {} (already installed; --force to overwrite)",
+                outcome.name
+            );
         }
-        copy_tree(&src_dir, &dest)?;
-        println!("installed {name}");
-        installed.push(name);
     }
-    if installed.is_empty() {
+    if installed_count == 0 {
         println!("nothing to install (all mission types already present)");
     }
     println!("home: {}", home.root().display());
-    Ok(())
-}
-
-/// Recursively copy a directory tree. `std::fs::copy` preserves Unix mode bits,
-/// so oracle executables stay executable.
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst).with_context(|| format!("creating '{}'", dst.display()))?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to).with_context(|| format!("copying '{}'", from.display()))?;
-        }
-    }
     Ok(())
 }
 
@@ -1112,6 +1091,14 @@ async fn cmd_doctor() -> Result<std::process::ExitCode> {
     check("git", command_ok("git", &["--version"]).await, "");
 
     let home = Home::from_env()?;
+    match RuntimeProfiles::load(&home) {
+        Ok(profiles) => check(
+            "runtime profiles",
+            true,
+            &profiles.names().collect::<Vec<_>>().join(", "),
+        ),
+        Err(err) => check("runtime profiles", false, &format!("{err:#}")),
+    }
     let types = home.installed_mission_types()?;
     if types.is_empty() {
         check(
@@ -1177,7 +1164,18 @@ async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
             let dir = home.mission_type_dir(&args.name);
             show_mission_type(&dir, args.json)
         }
-        TypeCommand::Check(args) => show_mission_type(&args.dir, args.json),
+        TypeCommand::Check(args) => {
+            let prepared = tempfile::tempdir().context("preparing mission type check")?;
+            let mission_type = materialize_mission_type(
+                &args.dir,
+                &prepared.path().join("mission-type"),
+                &AuthorityCeiling::default(),
+            )
+            .await
+            .context("mission type invalid")?;
+            show_loaded_mission_type(&mission_type, args.json);
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -1186,50 +1184,62 @@ async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
 fn show_mission_type(dir: &Path, json: bool) -> Result<std::process::ExitCode> {
     match load_mission_type(dir, &AuthorityCeiling::default()) {
         Ok(mt) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": true,
-                        "name": mt.name,
-                        "digest": mt.digest,
-                        "stop": mt.stop.slug(),
-                        "image": mt.image,
-                        "roles": mt.roles.keys().map(|r| r.as_str()).collect::<Vec<_>>(),
-                        "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
-                        "playbook": mt.playbook,
-                    })
-                );
-            } else {
-                println!("mission type '{}' is valid", mt.name);
-                println!("  digest: {}", short_hex(&mt.digest));
-                println!("  stop:  {:?}", mt.stop);
-                println!("  image: {}", mt.image);
-                println!(
-                    "  roles: {}",
-                    mt.roles
-                        .keys()
-                        .map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                println!(
-                    "  oracles: {}",
-                    mt.oracles
-                        .keys()
-                        .map(|o| o.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if let Some(playbook) = &mt.playbook {
-                    println!("\n--- playbook ---\n{playbook}");
-                }
-            }
+            show_loaded_mission_type(&mt, json);
             Ok(std::process::ExitCode::SUCCESS)
         }
         // Bubble up — `run_mission` renders the `{"ok":false,…}` envelope for
         // `--json` and lets the human path print to stderr; either way exit 1.
         Err(err) => Err(anyhow::Error::from(err).context("mission type invalid")),
+    }
+}
+
+fn show_loaded_mission_type(mt: &MissionType, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "name": mt.name,
+                "digest": mt.digest,
+                "stop": mt.stop.slug(),
+                "image": mt.image,
+                "roles": mt.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
+                "role_skills": mt.roles.values().map(|role| {
+                    (role.name.as_str(), &role.skills)
+                }).collect::<std::collections::BTreeMap<_, _>>(),
+                "skills": mt.skills.keys().collect::<Vec<_>>(),
+                "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
+                "playbook": mt.playbook,
+            })
+        );
+        return;
+    }
+    println!("mission type '{}' is valid", mt.name);
+    println!("  digest: {}", short_hex(&mt.digest));
+    println!("  stop:  {:?}", mt.stop);
+    println!("  image: {}", mt.image);
+    println!(
+        "  roles: {}",
+        mt.roles
+            .keys()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "  skills: {}",
+        mt.skills.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    println!(
+        "  oracles: {}",
+        mt.oracles
+            .keys()
+            .map(|o| o.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some(playbook) = &mt.playbook {
+        println!("\n--- playbook ---\n{playbook}");
     }
 }
 

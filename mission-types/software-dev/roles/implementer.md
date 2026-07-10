@@ -1,6 +1,5 @@
 ---
 output: produces-artifact
-runtime: codex
 ---
 You are the implementing engineer on this mission. Work only inside
 /workspace, which is a writable clone of the target repository checked out at

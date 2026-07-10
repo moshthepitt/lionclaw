@@ -17,16 +17,16 @@ use super::{
     mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{
         map_host_path_into_runtime_mount, ConfinementBackend, MountAccess, MountSpec, NetworkMode,
-        RuntimeAuthKind,
+        RuntimeAuthKind, INHERITED_SKILLS_MOUNT_TARGET_ROOT,
     },
     process::{
         run_process_attached, run_process_streaming, spawn_process_session, ProcessInvocation,
         ProcessSession,
     },
     runtime_auth::prepare_runtime_auth,
-    OciConfinementConfig,
+    OciConfinementConfig, RuntimeTmpfsEntry,
 };
-use crate::RuntimeSecretsMount;
+use crate::{project_runtime_skills, RuntimeSecretsMount};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
@@ -124,6 +124,7 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 
     async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
+        project_runtime_skills(&request.plan).await?;
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let runtime_auth_environment = prepare_runtime_auth(&request).await?;
         let prepared = prepare_oci_process_launch(
@@ -141,6 +142,7 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 
     async fn execute_attached(&self, request: ExecutionRequest) -> Result<ExecutionOutput> {
+        project_runtime_skills(&request.plan).await?;
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let runtime_auth_environment = prepare_runtime_auth(&request).await?;
         let prepared = prepare_oci_process_launch(
@@ -178,6 +180,7 @@ async fn execute_oci_process<F>(
 where
     F: FnMut(&str) -> Result<()> + Send,
 {
+    project_runtime_skills(&request.plan).await?;
     let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
     let runtime_auth_environment = prepare_runtime_auth(&request).await?;
     let prepared = prepare_oci_process_launch(
@@ -350,21 +353,28 @@ fn prepare_oci_process_launch(
         args.push(spec);
     }
 
-    if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &config.tmpfs) {
+    let tmpfs = config
+        .tmpfs
+        .iter()
+        .map(|entry| {
+            crate::parse_runtime_tmpfs_entry(entry).map_err(|detail| {
+                anyhow!(
+                    "runtime '{}' declares invalid tmpfs entry '{}': {detail}",
+                    request.plan.runtime_id,
+                    entry
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &tmpfs) {
         args.push("--tmpfs".to_string());
         args.push(WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string());
     }
 
-    for tmpfs in &config.tmpfs {
-        let value = tmpfs.trim();
-        if value.is_empty() {
-            bail!(
-                "runtime '{}' declares an empty tmpfs entry",
-                request.plan.runtime_id
-            );
-        }
+    for tmpfs in &tmpfs {
         args.push("--tmpfs".to_string());
-        args.push(value.to_string());
+        args.push(tmpfs.argument().to_string());
     }
 
     let environment = merged_environment(&request.plan.environment, &request.program.environment);
@@ -829,6 +839,7 @@ fn bind_mount_relabel(mount: &MountSpec) -> BindMountRelabel {
         || mount_target_is_or_under(&mount.target, RUNTIME_HOME_MOUNT_TARGET)
         || mount.target == DRAFTS_MOUNT_TARGET
         || mount_target_is_or_under(&mount.target, SKILLS_MOUNT_TARGET_ROOT)
+        || mount_target_is_or_under(&mount.target, INHERITED_SKILLS_MOUNT_TARGET_ROOT)
     {
         return BindMountRelabel::Shared;
     }
@@ -858,24 +869,17 @@ fn plan_mounts_unix_socket(_mounts: &[MountSpec]) -> bool {
 
 fn workspace_lionclaw_metadata_mask_needed(
     mounts: &[MountSpec],
-    configured_tmpfs: &[String],
+    configured_tmpfs: &[RuntimeTmpfsEntry],
 ) -> bool {
     mounts.iter().any(|mount| {
         mount.target == WORKSPACE_MOUNT_TARGET
             && fs::symlink_metadata(mount.source.join(LIONCLAW_METADATA_DIR)).is_ok()
     }) && !configured_tmpfs
         .iter()
-        .any(|entry| tmpfs_target(entry) == WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET)
+        .any(|entry| entry.target() == WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET)
 }
 
 const WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET: &str = "/workspace/.lionclaw";
-
-fn tmpfs_target(entry: &str) -> &str {
-    entry
-        .trim()
-        .split_once(':')
-        .map_or(entry.trim(), |(target, _)| target.trim())
-}
 
 fn merged_environment(
     plan_environment: &[(String, String)],
@@ -1209,6 +1213,7 @@ mod tests {
             "/workspace",
             "/drafts",
             "/lionclaw/skills/loopback",
+            "/lionclaw/inherited-skills/0/human-skill",
         ] {
             let mount = MountSpec {
                 source: "/host/shared".into(),

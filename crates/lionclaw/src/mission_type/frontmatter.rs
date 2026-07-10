@@ -9,8 +9,8 @@
 //! runtime: codex
 //! network: false
 //! secrets: false
-//! skills: []          # parsed, but the loader rejects a non-empty list
-//! ---                 # (skill projection is not wired yet)
+//! skills: []          # optional mission skill aliases
+//! ---
 //! <prompt body>
 //! ```
 

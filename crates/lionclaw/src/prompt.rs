@@ -194,6 +194,7 @@ mod tests {
             runtime: None,
             network: false,
             secrets: false,
+            skills: Vec::new(),
             prompt_body: "role body".to_string(),
         }
     }

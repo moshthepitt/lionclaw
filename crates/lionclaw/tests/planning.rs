@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use common::BASE_SHA;
 use lionclaw::engine::Engine;
-use lionclaw::mission_type::{MissionType, RoleDefinition};
+use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
     MissionPhase, OracleName, OutputSemantics, PayloadRef, PlanSubmission, PlanningDag,
@@ -38,6 +38,7 @@ fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
         runtime: None,
         network: false,
         secrets: false,
+        skills: Vec::new(),
         prompt_body: "role prose".to_string(),
     }
 }
@@ -55,6 +56,7 @@ fn planning_mission_type() -> MissionType {
     ] {
         roles.insert(rn(name), role(name, output));
     }
+    roles.get_mut(&rn("strategist")).unwrap().skills = vec!["planning-method".to_string()];
     MissionType {
         name: "planning-test".to_string(),
         digest: "test-digest".to_string(),
@@ -63,6 +65,13 @@ fn planning_mission_type() -> MissionType {
         planning: planning_dag(),
         playbook: Some("plan carefully".to_string()),
         roles,
+        skills: BTreeMap::from([(
+            "planning-method".to_string(),
+            SkillPackage {
+                name: "planning-method".to_string(),
+                root: PathBuf::from("/mission-type/skills/planning-method"),
+            },
+        )]),
         oracles: BTreeMap::from([(
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
@@ -119,6 +128,12 @@ fn proposed_plan() -> PlanSubmission {
 /// a plan proposal for the author, a committed artifact for the implementer.
 fn planning_runner() -> MockRoleRunner {
     MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
+        if req.role.name.as_str() == "strategist" {
+            assert_eq!(req.skills.len(), 1);
+            assert_eq!(req.skills[0].name, "planning-method");
+        } else {
+            assert!(req.skills.is_empty());
+        }
         let handoff = match req.role.output {
             OutputSemantics::ProposesPlan => Handoff::Plan {
                 done: true,

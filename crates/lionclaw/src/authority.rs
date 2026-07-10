@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lionclaw_confinement::{
-    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, InstallPolicy, MountAccess,
-    MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
-    WORKSPACE_MOUNT_TARGET,
+    parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
+    InstallPolicy, MountAccess, MountSpec, NetworkMode, WorkspaceAccess, RUNTIME_HOME_MOUNT_TARGET,
+    RUNTIME_MOUNT_TARGET, WORKSPACE_MOUNT_TARGET,
 };
 
 use crate::mission_type::RoleDefinition;
@@ -32,6 +32,7 @@ const RESERVED_TARGETS: &[&str] = &[
     RUNTIME_HOME_MOUNT_TARGET,
     "/mission",
     "/scratch",
+    "/lionclaw",
 ];
 
 /// The operator/mission bound authority can never exceed. Intersected,
@@ -63,6 +64,8 @@ pub enum MoatViolation {
     SecretsForJudge { role: String },
     #[error("mount target '{target}' shadows a reserved mission target")]
     ReservedTargetShadowed { target: String },
+    #[error("invalid tmpfs entry '{entry}': {detail}")]
+    InvalidTmpfs { entry: String, detail: String },
 }
 
 /// The engine-compiled authority of one role: preset + the output axis it
@@ -178,6 +181,7 @@ pub struct RolePlanRequest<'a> {
     pub authority: &'a CompiledAuthority,
     pub runtime_id: String,
     pub confinement: ConfinementConfig,
+    pub skill_projection: Option<lionclaw_confinement::RuntimeSkillProjectionConfig>,
     pub mounts: MissionMounts,
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
@@ -229,8 +233,12 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         }
     }
     for entry in &oci.tmpfs {
-        // A tmpfs entry is `<target>[:<options>]`.
-        let target = entry.split(':').next().unwrap_or(entry);
+        let parsed =
+            parse_runtime_tmpfs_entry(entry).map_err(|detail| MoatViolation::InvalidTmpfs {
+                entry: entry.clone(),
+                detail,
+            })?;
+        let target = parsed.target();
         if RESERVED_TARGETS
             .iter()
             .any(|reserved| target_shadows(target, reserved))
@@ -297,13 +305,14 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     let working_dir = workspace.source.to_string_lossy().into_owned();
     let mut mounts = vec![workspace];
     mounts.extend(request.mounts.extras);
+    mounts.extend(request.confinement.oci().additional_mounts.clone());
     let limits = request.confinement.oci().limits.clone();
 
     Ok(CompiledRolePlan(EffectiveExecutionPlan {
         runtime_id: request.runtime_id,
         preset_name: format!("mission-{}", authority.output.slug()),
         confinement: request.confinement,
-        skill_projection: None,
+        skill_projection: request.skill_projection,
         workspace_access: authority.preset.workspace_access,
         network_mode: authority.preset.network_mode,
         install_policy: authority.preset.install_policy,
@@ -347,6 +356,7 @@ mod tests {
             runtime: None,
             network: true,
             secrets,
+            skills: Vec::new(),
             prompt_body: "p".to_string(),
         }
     }
@@ -375,6 +385,7 @@ mod tests {
             authority,
             runtime_id: "codex".to_string(),
             confinement: oci(),
+            skill_projection: None,
             mounts: m,
             judged_roots: judged,
             environment: Vec::new(),
@@ -611,6 +622,26 @@ mod tests {
     }
 
     #[test]
+    fn tmpfs_targets_cannot_reach_reserved_paths_through_traversal() {
+        let ceiling = AuthorityCeiling::default();
+        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
+            .expect("judge");
+        let mut confinement = oci();
+        confinement
+            .oci_mut()
+            .tmpfs
+            .push("/opt/../workspace:rw".to_string());
+
+        let err = compile_role_plan(RolePlanRequest {
+            confinement,
+            ..request(&judge, mounts(MountAccess::ReadOnly, Vec::new()), &[])
+        })
+        .expect_err("tmpfs traversal must not bypass reserved targets");
+
+        assert!(err.to_string().contains("invalid tmpfs"), "got {err}");
+    }
+
+    #[test]
     fn default_tmp_tmpfs_is_allowed() {
         // The engine's own scratch tmpfs at /tmp is not a reserved target.
         let ceiling = AuthorityCeiling::default();
@@ -645,6 +676,30 @@ mod tests {
         })
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::ReservedTargetShadowed { .. }));
+    }
+
+    #[test]
+    fn configured_additional_mounts_are_carried_into_the_effective_plan() {
+        let worker = role(OutputSemantics::ProducesArtifact, false);
+        let authority = compile_authority(&worker, &AuthorityCeiling::default()).unwrap();
+        let mut confinement = oci();
+        confinement.oci_mut().additional_mounts.push(MountSpec {
+            source: "/host/custom".into(),
+            target: "/opt/custom".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+
+        let compiled = compile_role_plan(RolePlanRequest {
+            confinement,
+            ..request(&authority, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+        })
+        .expect("additional mount compiles");
+
+        assert!(compiled
+            .plan()
+            .mounts
+            .iter()
+            .any(|mount| mount.target == "/opt/custom"));
     }
 
     #[test]

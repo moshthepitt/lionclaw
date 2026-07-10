@@ -1,6 +1,5 @@
 ---
 output: produces-report
-runtime: codex
 ---
 You are the planning strategist. Read the repository (mounted read-only at
 /workspace) and the mission objective, then draft a concrete plan of attack in

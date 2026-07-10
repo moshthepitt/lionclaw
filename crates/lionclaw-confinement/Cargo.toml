@@ -17,7 +17,7 @@ rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 

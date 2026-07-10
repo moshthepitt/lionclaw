@@ -13,12 +13,14 @@ pub mod plan;
 pub mod process;
 pub mod runtime_auth;
 pub mod skill_alias;
+pub mod skill_projection;
 
 pub use backend::{
     execute_attached, execute_captured, execute_streaming, spawn_interactive, ExecutionBackend,
     ExecutionOutput, ExecutionRequest, ExecutionSession, RuntimeExecutionSession,
     RuntimeSecretsMount,
 };
+pub use mount_validation::{parse_runtime_tmpfs_entry, RuntimeTmpfsEntry};
 pub use oci::{
     resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
     OciExecutionBackend,
@@ -27,10 +29,12 @@ pub use plan::{
     map_host_path_into_runtime_mount, mount_source_for_target, runtime_native_home_mount_source,
     runtime_skill_mount_target_alias, runtime_state_mount_source, skill_mount_target,
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
-    ExecutionPreset, InstallPolicy, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
-    RuntimeAuthKind, RuntimeProgramSpec, RuntimeSkillProjectionConfig,
-    RuntimeSkillProjectionFormat, WorkspaceAccess, DRAFTS_MOUNT_TARGET, RUNTIME_HOME_MOUNT_TARGET,
-    RUNTIME_INSTALL_ENV_DIR, RUNTIME_INSTALL_ENV_FILE, RUNTIME_INSTALL_ENV_PATH,
-    RUNTIME_MOUNT_TARGET, SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
+    ExecutionPreset, InheritedSkillRoot, InstallPolicy, MountAccess, MountSpec, NetworkMode,
+    OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, RuntimeSkillProjectionConfig,
+    RuntimeSkillProjectionFormat, WorkspaceAccess, DRAFTS_MOUNT_TARGET,
+    INHERITED_SKILLS_MOUNT_TARGET_ROOT, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_INSTALL_ENV_DIR,
+    RUNTIME_INSTALL_ENV_FILE, RUNTIME_INSTALL_ENV_PATH, RUNTIME_MOUNT_TARGET,
+    SKILLS_MOUNT_TARGET_ROOT, WORKSPACE_MOUNT_TARGET,
 };
 pub use skill_alias::{validate_skill_alias, SkillAliasValidationError};
+pub use skill_projection::{inherited_skill_mounts, project_runtime_skills};

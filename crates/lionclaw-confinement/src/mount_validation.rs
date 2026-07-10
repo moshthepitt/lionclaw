@@ -77,6 +77,51 @@ pub fn normalize_runtime_mount_target(raw: &str) -> Result<String, String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTmpfsEntry {
+    target: String,
+    argument: String,
+}
+
+impl RuntimeTmpfsEntry {
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn argument(&self) -> &str {
+        &self.argument
+    }
+
+    pub fn into_argument(self) -> String {
+        self.argument
+    }
+}
+
+/// Parse and normalize one Podman tmpfs entry (`<target>[:<options>]`).
+/// Container targets use the same traversal-free contract as bind mounts so
+/// policy checks and the backend always reason about the path Podman receives.
+pub fn parse_runtime_tmpfs_entry(raw: &str) -> Result<RuntimeTmpfsEntry, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("tmpfs entry is required".to_string());
+    }
+    let (raw_target, options) = trimmed
+        .split_once(':')
+        .map_or((trimmed, None), |(target, options)| (target, Some(options)));
+    let target = normalize_runtime_mount_target(raw_target)?;
+    let argument = match options {
+        Some(options) => {
+            let options = options.trim();
+            if options.is_empty() {
+                return Err(format!("tmpfs entry for '{target}' has empty options"));
+            }
+            format!("{target}:{options}")
+        }
+        None => target.clone(),
+    };
+    Ok(RuntimeTmpfsEntry { target, argument })
+}
+
 pub fn validate_configured_mount_target(raw: &str) -> Result<String, String> {
     let target = normalize_runtime_mount_target(raw)?;
     if RESERVED_EXTRA_MOUNT_TARGETS
@@ -256,6 +301,16 @@ mod tests {
         assert!(normalize_runtime_mount_target("docs").is_err());
         assert!(normalize_runtime_mount_target("/mnt/../workspace").is_err());
         assert!(normalize_runtime_mount_target("/").is_err());
+    }
+
+    #[test]
+    fn tmpfs_entries_share_the_normalized_mount_target_contract() {
+        let entry = parse_runtime_tmpfs_entry(" /tmp/cache/:rw,size=64m ").expect("tmpfs");
+        assert_eq!(entry.target(), "/tmp/cache");
+        assert_eq!(entry.argument(), "/tmp/cache:rw,size=64m");
+        assert!(parse_runtime_tmpfs_entry("/opt/../workspace:rw").is_err());
+        assert!(parse_runtime_tmpfs_entry("relative:rw").is_err());
+        assert!(parse_runtime_tmpfs_entry("/tmp:").is_err());
     }
 
     #[test]

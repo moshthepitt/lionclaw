@@ -44,6 +44,7 @@ pub fn test_mission_type() -> MissionType {
                     runtime: None,
                     network: false,
                     secrets: false,
+                    skills: Vec::new(),
                     prompt_body: "Fix the code.".to_string(),
                 },
             ),
@@ -55,10 +56,12 @@ pub fn test_mission_type() -> MissionType {
                     runtime: None,
                     network: false,
                     secrets: false,
+                    skills: Vec::new(),
                     prompt_body: "Judge the code.".to_string(),
                 },
             ),
         ]),
+        skills: BTreeMap::new(),
         oracles: BTreeMap::from([(
             cargo_test,
             "/nonexistent-mission-type/oracles/cargo-test".into(),
@@ -138,12 +141,21 @@ pub async fn harness(
     role_runner: MockRoleRunner,
     oracle_runner: MockOracleRunner,
 ) -> TestHarness {
+    harness_with_type(workspace, test_mission_type(), role_runner, oracle_runner).await
+}
+
+pub async fn harness_with_type(
+    workspace: &Path,
+    mission_type: MissionType,
+    role_runner: MockRoleRunner,
+    oracle_runner: MockOracleRunner,
+) -> TestHarness {
     let store = MissionStore::open(workspace).await.expect("open store");
     let role_runner = Arc::new(role_runner);
     let oracle_runner = Arc::new(oracle_runner);
     let engine = Engine::new(
         store,
-        test_mission_type(),
+        mission_type,
         "codex".to_string(),
         "localhost/lionclaw-runtime-dev:v1".to_string(),
         role_runner.clone(),
