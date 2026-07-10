@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
-use crate::model::{OracleName, RoleName, StopBar};
+use crate::model::{OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig};
 
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
 use super::manifest::{is_path_safe_name, ManifestFile, MISSION_LOCK_FILE};
@@ -69,6 +69,39 @@ pub fn load_mission_type(
         return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
 
+    // The closing review, fail-closed like the planning DAG: the named role
+    // must exist and be a judge. An agent-graded bar without an independent
+    // closing review would be the workers' own validators agreeing with the
+    // workers — so `reviewed` requires the declaration.
+    let terminal_review = match &manifest.terminal_review {
+        None if stop == StopBar::Reviewed => {
+            return Err(MissionTypeError::Manifest(
+                "stop = \"reviewed\" requires [terminal-review]: the reviewed bar is \
+                 defined by an independent terminal review"
+                    .to_string(),
+            ));
+        }
+        None => None,
+        Some(declared) => {
+            let role_name = RoleName::new(&declared.role)
+                .map_err(|e| MissionTypeError::Manifest(format!("[terminal-review] role: {e}")))?;
+            let Some(role) = roles.get(&role_name) else {
+                return Err(MissionTypeError::Manifest(format!(
+                    "[terminal-review] role '{}' is not provided by this mission type",
+                    declared.role
+                )));
+            };
+            if role.output != OutputSemantics::EmitsGapVerdict {
+                return Err(MissionTypeError::Manifest(format!(
+                    "[terminal-review] role '{}' must be emits-gap-verdict, got {}",
+                    declared.role,
+                    role.output.slug()
+                )));
+            }
+            Some(TerminalReviewConfig { role: role_name })
+        }
+    };
+
     let playbook = read(&root.join("playbook.md")).ok();
     let digest = compute_digest(root, &skills)?;
 
@@ -78,6 +111,7 @@ pub fn load_mission_type(
         stop,
         image: manifest.mission_type.image,
         planning: manifest.planning,
+        terminal_review,
         playbook,
         roles,
         skills,

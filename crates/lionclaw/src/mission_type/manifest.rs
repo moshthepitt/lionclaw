@@ -22,8 +22,18 @@ pub(crate) struct ManifestFile {
     pub mission_type: ManifestMissionType,
     #[serde(default)]
     pub planning: crate::model::PlanningDag,
+    /// The optional engine-owned closing review. Required for the reviewed
+    /// stop bar and resolved against the loaded role inventory.
+    #[serde(default, rename = "terminal-review")]
+    pub terminal_review: Option<ManifestTerminalReview>,
     #[serde(default)]
     pub skills: BTreeMap<String, ManifestSkill>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManifestTerminalReview {
+    pub role: String,
 }
 
 #[derive(Debug, Deserialize)]

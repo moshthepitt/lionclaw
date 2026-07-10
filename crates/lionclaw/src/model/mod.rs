@@ -18,13 +18,17 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    AmendmentOps, ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Handoff, IdemClass,
-    MissionConfig, MissionEvent, MissionTypeRef, OracleBinding, PayloadRef, RunErrorKind, StopBar,
-    Supersession, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    AmendmentOps, ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Gap, GapSeverity,
+    Handoff, IdemClass, MissionConfig, MissionEvent, MissionTypeRef, OracleBinding, PayloadRef,
+    RunErrorKind, StopBar, Supersession, TerminalReviewConfig, ValidationItem, VersionStamps,
+    SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
-pub use ids::{short_hex, AssertionId, IdError, MissionId, OracleName, RoleName, TaskId};
+pub use ids::{
+    short_hex, AssertionId, IdError, MissionId, OracleName, RoleName, TaskId,
+    TERMINAL_REVIEW_TASK_TAG,
+};
 pub use plan::{
     Assertion, OutputSemantics, PlanSubmission, PlanningDag, PlanningTask, Task, TaskKind,
 };
@@ -34,7 +38,10 @@ pub use plan_validation::{
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, TaskRuntimeState, TaskStatus,
+    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
 };
-pub use step::{step, OracleDispatchIntent, RoleDispatchIntent, StepDecision};
+pub use step::{
+    step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,
+};
 pub use verdict::{classify_finish, AuthoritativeVerdict, FinishClass};

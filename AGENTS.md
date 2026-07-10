@@ -26,6 +26,13 @@ what they mean and why.
   `std` / `serde` / `thiserror`; no I/O, clock, RNG, or async).
 - **The honesty moat** — one mint site for an authoritative verdict, one path to
   a `Verified` finish, and no non-artifact role that can write or hold secrets.
+  The terminal review (the engine-owned, contract-blind closing judge a mission
+  type declares under `[terminal-review]`) sits deliberately *outside* the
+  moat's mint: its verdict is advisory, gates closure only, and can never
+  upgrade a finish. Its handoff is bound to a per-attempt random nonce so
+  worker-planted code executed during the review cannot forge it (known
+  residual: scraping the agent's runtime state under `/runtime` is not
+  defended; the verdict stays advisory either way).
 
 ## Working rules
 

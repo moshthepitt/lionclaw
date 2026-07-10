@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{MissionConfig, MissionTypeRef, PayloadRef};
+use super::event::{Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::PlanSubmission;
 use super::verdict::{AuthoritativeVerdict, FinishClass};
@@ -118,6 +118,140 @@ pub struct AssertionState {
     pub last_authoritative: Option<AuthoritativeVerdict>,
 }
 
+/// The terminal-review ledger: fold-owned, advisory-only (never read by
+/// `classify_finish`). All-default == "no review has run".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TerminalReviewState {
+    /// Dispatch counter (mirrors `oracle_attempts`): folded from
+    /// `TerminalReviewRequested.attempt_no`; the next dispatch and its
+    /// idempotency key ride on it, so a retry re-rolls under a fresh key.
+    #[serde(default)]
+    pub attempts: u32,
+    /// The last attempt's result. A fresh verdict and a pending failure
+    /// cannot coexist: a failure only follows a dispatch, and dispatch only
+    /// happens without a fresh verdict (history lives in the event log).
+    #[serde(default)]
+    pub outcome: Option<ReviewOutcome>,
+    /// The one human-acceptance fact ("accept closure despite the review").
+    #[serde(default)]
+    pub accepted: Option<ReviewAcceptance>,
+}
+
+impl TerminalReviewState {
+    /// The acceptance, if it still holds at the current head — the ONE
+    /// freshness-law site the fold's derivations and the CLI's summaries all
+    /// share, so they can never disagree about whether the mission may close.
+    pub fn fresh_acceptance(&self, current_sha: &str) -> Option<&ReviewAcceptance> {
+        self.accepted
+            .as_ref()
+            .filter(|a| a.is_fresh_at(current_sha))
+    }
+
+    /// Whether a fresh waiver stands at the current head (closure permitted
+    /// without a verdict).
+    pub fn waived_at(&self, current_sha: &str) -> bool {
+        self.fresh_acceptance(current_sha)
+            .is_some_and(|a| a.kind == ReviewAcceptanceKind::Waived)
+    }
+
+    /// Whether this verdict's blocking gaps were acknowledged (the
+    /// acknowledgment is keyed to the verdict's own sha).
+    pub fn acknowledges(&self, verdict: &TerminalReviewVerdict) -> bool {
+        self.accepted.as_ref().is_some_and(|a| {
+            a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == verdict.judged_sha
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ReviewOutcome {
+    Verdict(TerminalReviewVerdict),
+    /// The reviewer failed to run or hand off a verdict (infrastructure),
+    /// until a decision clears it. Prevents a broken reviewer from
+    /// re-requesting forever (mirrors `oracle_failures`).
+    Failed {
+        detail: String,
+    },
+}
+
+/// How a human accepted closure despite the review: `continue` on a gap park
+/// acknowledges the blocking verdict, `continue` on a failure park waives the
+/// review outright. One value, so waived-and-acknowledged is unrepresentable;
+/// the receipt distinguishes the kinds and cites who accepted and why.
+///
+/// Both kinds are keyed to the head they were granted at: a later artifact
+/// commit stales the acceptance and re-opens the review, so neither an
+/// acknowledgment nor a waiver is ever inherited by work the human never saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAcceptance {
+    pub kind: ReviewAcceptanceKind,
+    /// `current_sha` at the moment of acceptance (for an acknowledgment this
+    /// is also the verdict's `judged_sha` — the gap item only raises fresh).
+    pub judged_sha: String,
+    /// Provenance from the `DecisionRecorded` event, folded into state so
+    /// the receipt can never cite a decision a later retry discarded.
+    pub actor: String,
+    pub justification: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAcceptanceKind {
+    /// A blocking verdict the human closed over; its gaps stay on record.
+    AcknowledgedGaps,
+    /// The review failed to run and the human closed without a verdict.
+    Waived,
+}
+
+impl ReviewAcceptance {
+    /// Same freshness law as verdicts: an acceptance holds only at the head
+    /// it was granted at.
+    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
+        self.judged_sha == current_sha
+    }
+}
+
+impl ReviewAcceptanceKind {
+    /// The stable snake_case name (matches the serde repr).
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::AcknowledgedGaps => "acknowledged_gaps",
+            Self::Waived => "waived",
+        }
+    }
+}
+
+/// A terminal reviewer's verdict. Plain public data — deliberately NOT an
+/// `AuthoritativeVerdict` (private-field mint, `verdict.rs`): this verdict
+/// is advisory, mints nothing, and gates closure only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalReviewVerdict {
+    pub judged_sha: String,
+    pub passed: bool,
+    #[serde(default)]
+    pub gaps: Vec<Gap>,
+    pub report: PayloadRef,
+}
+
+impl TerminalReviewVerdict {
+    /// Same freshness law as `AuthoritativeVerdict::is_fresh_at`.
+    pub fn is_fresh_at(&self, current_sha: &str) -> bool {
+        self.judged_sha == current_sha
+    }
+
+    /// Fail-closed: a blocking gap dominates the reviewer's own summary bit,
+    /// and a fail with no structured gaps still blocks (the report is the
+    /// evidence). Closure is clean iff passed AND no blocking gap.
+    pub fn blocking(&self) -> bool {
+        !self.passed
+            || self
+                .gaps
+                .iter()
+                .any(|g| g.severity == GapSeverity::Blocking)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
@@ -133,6 +267,14 @@ pub enum AttentionKind {
     /// The in-engine author's proposal awaits a human's ratification before it
     /// seeds the contract.
     RatifyProposal,
+    /// The terminal review's blocking verdict awaits a human (amend to
+    /// remediate / retry to re-roll / continue to acknowledge-and-close /
+    /// abort). Raised only when the mission would otherwise close, so
+    /// remediation work auto-clears it.
+    TerminalReviewGaps,
+    /// The terminal reviewer failed to run or hand off a verdict
+    /// (infrastructure), distinct from a verdict with gaps.
+    TerminalReviewFailed,
 }
 
 impl AttentionKind {
@@ -148,6 +290,8 @@ impl AttentionKind {
             Self::GateFailed => "gate_failed",
             Self::GateCheckpoint => "gate_checkpoint",
             Self::RatifyProposal => "ratify_proposal",
+            Self::TerminalReviewGaps => "terminal_review_gaps",
+            Self::TerminalReviewFailed => "terminal_review_failed",
         }
     }
 }
@@ -184,6 +328,16 @@ pub enum InflightEffect {
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
+        requested_seq: u64,
+    },
+    TerminalReview {
+        attempt_no: u32,
+        role: RoleName,
+        prompt: PayloadRef,
+        judged_sha: String,
+        /// Carried from the event so the runner's handoff-forgery check
+        /// still has its expected token after a crash/resume.
+        nonce: String,
         requested_seq: u64,
     },
 }
@@ -231,6 +385,24 @@ impl InflightEffect {
                     requested_seq,
                 },
             )),
+            MissionEvent::TerminalReviewRequested {
+                attempt_no,
+                idempotency_key,
+                role,
+                prompt,
+                judged_sha,
+                nonce,
+            } => Some((
+                idempotency_key.clone(),
+                Self::TerminalReview {
+                    attempt_no: *attempt_no,
+                    role: role.clone(),
+                    prompt: prompt.clone(),
+                    judged_sha: judged_sha.clone(),
+                    nonce: nonce.clone(),
+                    requested_seq,
+                },
+            )),
             // Exhaustive on purpose: a new `…Requested` event must build its
             // inflight entry here, never silently skip the effect ledger.
             MissionEvent::MissionCreated { .. }
@@ -239,6 +411,8 @@ impl InflightEffect {
             | MissionEvent::RoleRunFailed { .. }
             | MissionEvent::OracleRunCompleted { .. }
             | MissionEvent::OracleRunFailed { .. }
+            | MissionEvent::TerminalReviewCompleted { .. }
+            | MissionEvent::TerminalReviewFailed { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
             | MissionEvent::PlanAmended { .. } => None,
@@ -249,6 +423,7 @@ impl InflightEffect {
         match self {
             Self::RoleRun { .. } => "role_run",
             Self::OracleRun { .. } => "oracle_run",
+            Self::TerminalReview { .. } => "terminal_review",
         }
     }
 }
@@ -312,6 +487,10 @@ pub struct MissionState {
     /// failure): the mission may finish, but never *verified* — there is no
     /// authoritative verdict.
     pub waived_oracles: std::collections::BTreeSet<OracleName>,
+    /// Terminal-review runtime (config-gated; default-empty for every
+    /// pre-feature mission and snapshot).
+    #[serde(default)]
+    pub terminal_review: TerminalReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
 }
@@ -346,6 +525,21 @@ mod slug_tests {
             AttentionKind::GateFailed,
             AttentionKind::GateCheckpoint,
             AttentionKind::RatifyProposal,
+            AttentionKind::TerminalReviewGaps,
+            AttentionKind::TerminalReviewFailed,
+        ] {
+            assert_slug(&k, k.slug());
+        }
+        for g in [
+            GapSeverity::Blocking,
+            GapSeverity::Major,
+            GapSeverity::Minor,
+        ] {
+            assert_slug(&g, g.slug());
+        }
+        for k in [
+            ReviewAcceptanceKind::AcknowledgedGaps,
+            ReviewAcceptanceKind::Waived,
         ] {
             assert_slug(&k, k.slug());
         }
@@ -370,6 +564,7 @@ mod slug_tests {
             OutputSemantics::ProducesReport,
             OutputSemantics::ProducesArtifact,
             OutputSemantics::EmitsVerdict,
+            OutputSemantics::EmitsGapVerdict,
             OutputSemantics::ProposesPlan,
         ] {
             assert_slug(&o, o.slug());

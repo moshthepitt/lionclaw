@@ -385,7 +385,7 @@ mod tests {
         std::fs::write(
             root.join("mission.toml"),
             format!(
-                "[mission-type]\nname = \"install-test\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+                "[mission-type]\nname = \"install-test\"\nstop = \"verified\"\nimage = \"img\"\n\
                  \n[skills.test-skill]\nsource = {skill_source}\n"
             ),
         )

@@ -11,6 +11,13 @@ source = { path = "skills/scrutiny-validator" }
 [skills.user-testing-validator]
 source = { path = "skills/user-testing-validator" }
 
+# The engine-owned closing check: once work and oracles settle, a fresh
+# contract-blind reviewer judges the delivered product against the objective
+# (oracles prove the asserted; this catches what was never asserted).
+# Declared here — not in the plan — so a planner can never omit or weaken it.
+[terminal-review]
+role = "gap-reviewer"
+
 # The planning DAG: an objective becomes a proposed contract via research →
 # adversarial critique → authored proposal. All read-only; the author (the
 # unique sink) emits the proposal, which a human ratifies before execution.

@@ -6,36 +6,17 @@
 
 mod common;
 
-use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw::model::{apply, fold};
+use common::{
+    blocking_gap, default_config, harness, harness_with_type, review_config, review_mission_type,
+    review_runner, simple_plan, TestHarness, BASE_SHA, HEAD_SHA,
+};
+use lionclaw::model::{apply, fold, DecisionAction, MissionId};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
-#[tokio::test]
-async fn fold_is_deterministic_incremental_and_serde_stable() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let h = harness(
-        dir.path(),
-        MockRoleRunner::happy(HEAD_SHA),
-        MockOracleRunner::exiting(0),
-    )
-    .await;
-    let mission_id = h
-        .engine
-        .create_mission(
-            dir.path().to_str().expect("utf8"),
-            "obj",
-            BASE_SHA,
-            default_config(),
-        )
-        .await
-        .expect("create");
-    h.engine
-        .submit_plan(&mission_id, simple_plan())
-        .await
-        .expect("submit");
-    h.engine.advance(&mission_id).await.expect("advance");
-
-    let events = h.engine.store().load(&mission_id).await.expect("load");
+/// The four laws, over whatever log the mission produced: determinism,
+/// incremental consistency, serde roundtrip, and cursor agreement/rebuild.
+async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
+    let events = h.engine.store().load(mission_id).await.expect("load");
     assert!(events.len() >= 4, "expected a full mission log");
 
     // Determinism: same log, same state.
@@ -83,10 +64,87 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
     let rebuilt = h
         .engine
         .store()
-        .rebuild_cursors(&mission_id, 9_000_000)
+        .rebuild_cursors(mission_id, 9_000_000)
         .await
         .expect("rebuild cursors");
     assert_eq!(rebuilt, once, "state diverged after cursor rebuild");
+}
+
+#[tokio::test]
+async fn fold_is_deterministic_incremental_and_serde_stable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
+    h.engine.advance(&mission_id).await.expect("advance");
+
+    assert_fold_litmus(&h, &mission_id).await;
+}
+
+#[tokio::test]
+async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
+    // The richest review log: request → blocking verdict → park →
+    // acknowledge → Done. Catches a missing #[serde(default)] on any new
+    // state field the moment it exists.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with_type(
+        dir.path(),
+        review_mission_type(),
+        review_runner(vec![(false, vec![blocking_gap()])]),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            review_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
+    h.engine
+        .advance(&mission_id)
+        .await
+        .expect("advance to park");
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_gaps:mission",
+            DecisionAction::Continue,
+            "acceptable",
+            "test",
+        )
+        .await
+        .expect("decide");
+    h.engine
+        .advance(&mission_id)
+        .await
+        .expect("advance to done");
+
+    assert_fold_litmus(&h, &mission_id).await;
 }
 
 #[tokio::test]

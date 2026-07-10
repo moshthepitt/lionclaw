@@ -239,7 +239,7 @@ fn a_planning_dag_naming_an_execution_role_fails_to_load() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"bad-planning\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+        "[mission-type]\nname = \"bad-planning\"\nstop = \"verified\"\nimage = \"img\"\n\
          \n[[planning.tasks]]\nid = \"author\"\nrole = \"worker\"\n",
     )
     .unwrap();
@@ -354,4 +354,102 @@ fn a_path_unsafe_mission_type_name_is_rejected() {
     assert!(
         matches!(&load_err(dir.path()), MissionTypeError::Manifest(d) if d.contains("path-safe")),
     );
+}
+
+// ---- Terminal review declaration (fail-closed like the planning DAG) ----
+
+/// `write_valid_type` plus a typed terminal-review role.
+fn write_reviewer_role(root: &std::path::Path) {
+    std::fs::write(
+        root.join("roles/gap-reviewer.md"),
+        "---\noutput: emits-gap-verdict\n---\nHunt gaps.\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_terminal_review_declaration_loads_and_pins_the_role() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    write_reviewer_role(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[terminal-review]\nrole = \"gap-reviewer\"\n",
+    )
+    .unwrap();
+    let mission_type = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("loads");
+    assert_eq!(
+        mission_type.terminal_review.map(|tr| tr.role.to_string()),
+        Some("gap-reviewer".to_string())
+    );
+}
+
+#[test]
+fn a_reviewed_bar_without_terminal_review_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"reviewed\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Manifest(d) if d.contains("requires [terminal-review]")
+    ));
+}
+
+#[test]
+fn a_terminal_review_naming_a_missing_role_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[terminal-review]\nrole = \"ghost\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Manifest(d) if d.contains("not provided")
+    ));
+}
+
+#[test]
+fn a_terminal_review_naming_a_non_verdict_role_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[terminal-review]\nrole = \"implementer\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Manifest(d) if d.contains("must be emits-gap-verdict")
+    ));
+}
+
+#[test]
+fn editing_the_terminal_review_declaration_changes_the_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    write_reviewer_role(dir.path());
+    let before = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect("loads")
+        .digest;
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[terminal-review]\nrole = \"gap-reviewer\"\n",
+    )
+    .unwrap();
+    let after = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect("loads")
+        .digest;
+    // The declaration is part of the pinned instrument: adding it mid-mission
+    // trips the digest check on the next engine open.
+    assert_ne!(before, after);
 }

@@ -119,6 +119,15 @@ pub fn validate_planning_dag(
                 format!("planning task '{}' is declared twice", t.id),
             )];
         }
+        if t.id.as_str() == super::ids::TERMINAL_REVIEW_TASK_TAG {
+            return vec![err(
+                "reserved_task_id",
+                format!(
+                    "planning task id '{}' is reserved for the terminal reviewer",
+                    t.id
+                ),
+            )];
+        }
     }
 
     let mut errors = Vec::new();
@@ -382,6 +391,18 @@ fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
                 format!("task '{}' declared more than once", task.id),
             ));
         }
+        // The terminal reviewer's runner tag shares the attempt-dir namespace
+        // with plan tasks; a task by this name could leave crashed-attempt
+        // dirs the closing reviewer would silently reuse.
+        if task.id.as_str() == super::ids::TERMINAL_REVIEW_TASK_TAG {
+            errors.push(err(
+                "reserved_task_id",
+                format!(
+                    "task id '{}' is reserved for the terminal reviewer",
+                    task.id
+                ),
+            ));
+        }
     }
     errors
 }
@@ -468,7 +489,9 @@ fn check_shape(
                 let compatible = match output {
                     OutputSemantics::ProducesArtifact => task.kind == TaskKind::Work,
                     OutputSemantics::EmitsVerdict => task.kind == TaskKind::Validate,
-                    OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan => false,
+                    OutputSemantics::ProducesReport
+                    | OutputSemantics::EmitsGapVerdict
+                    | OutputSemantics::ProposesPlan => false,
                 };
                 if !compatible {
                     errors.push(err(
@@ -1134,5 +1157,21 @@ mod tests {
         // The default `reviewed` inventory accepts the oracle-less plan.
         let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
         assert_eq!(codes(&sub), CLEAN);
+    }
+
+    #[test]
+    fn the_terminal_review_task_tag_is_reserved() {
+        // Regression (QA round 2): the reviewer's attempt-dir tag shares the
+        // plan-task namespace; a task by that name could leave crashed-attempt
+        // dirs the closing reviewer would silently reuse.
+        let sub = submission(
+            vec![assertion("A1")],
+            vec![work(
+                super::super::ids::TERMINAL_REVIEW_TASK_TAG,
+                &["A1"],
+                &[],
+            )],
+        );
+        assert_eq!(codes(&sub), vec!["reserved_task_id"]);
     }
 }

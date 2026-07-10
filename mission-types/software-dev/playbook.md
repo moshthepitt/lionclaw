@@ -52,3 +52,19 @@ final commit. Because of that, the `verified` bar rejects an oracle-less
 assertion at submit — a reviewer can never stand in for an oracle here; it only
 adds depth on top of one. Do not weaken a test to make an oracle pass; the
 reviewer is instructed to catch exactly that.
+
+## The terminal review (engine-owned; not yours to plan)
+
+After every work task settles and every oracle verdict is fresh at the final
+commit, the engine dispatches one more judge: a contract-blind **gap
+reviewer** that sees only the objective and the final tree, and re-derives
+the requirements from scratch. It exists to catch what the contract never
+asserted — the oracle proves what you asserted; the reviewer hunts what you
+missed.
+
+Do not add a final catch-all review task to the plan to pre-empt it, and do
+not write assertions "for the reviewer" — plan the contract on its own
+merits. If the terminal review reports blocking gaps, the right response is
+an **amendment**: new falsifiable assertions bound to oracles plus the fix
+tasks that cover them. Remediation automatically re-runs the review at the
+new commit.

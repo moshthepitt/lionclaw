@@ -18,10 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use super::fold::oracle_obligation_outstanding;
+use super::fold::{oracle_obligation_outstanding, terminal_review_outstanding};
 use super::ids::{AssertionId, OracleName, RoleName, TaskId};
 use super::plan::TaskKind;
-use super::state::{MissionPhase, MissionState, TaskStatus};
+use super::state::{MissionPhase, MissionState, ReviewOutcome, TaskStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepDecision {
@@ -38,6 +38,10 @@ pub enum StepDecision {
     DispatchRole(RoleDispatchIntent),
     /// Run engine oracles (parallelizable).
     RunOracles(Vec<OracleDispatchIntent>),
+    /// Dispatch the closing terminal review: the config-declared
+    /// `emits-gap-verdict` role, fresh-context and contract-blind (the intent
+    /// carries no targets and no task body by construction).
+    ReviewTerminal(TerminalReviewDispatchIntent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +61,15 @@ pub struct OracleDispatchIntent {
     pub assertion_ids: Vec<AssertionId>,
     pub judged_sha: String,
     pub attempt_no: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalReviewDispatchIntent {
+    pub role: RoleName,
+    pub attempt_no: u32,
+    /// The commit under review (== `current_sha` at dispatch); the role's
+    /// workspace is snapshotted here and the verdict is stamped here.
+    pub judged_sha: String,
 }
 
 pub fn step(state: &MissionState) -> StepDecision {
@@ -202,6 +215,28 @@ fn step_running(state: &MissionState) -> StepDecision {
             })
             .collect();
         return StepDecision::RunOracles(intents);
+    }
+
+    // Work settled and every oracle verdict fresh: a configured terminal
+    // review without a fresh verdict at the current head dispatches the
+    // closing reviewer. A parked failure never re-dispatches (attention parks
+    // first; the guard mirrors the failed-oracle skip above).
+    if terminal_review_outstanding(state)
+        && !matches!(
+            state.terminal_review.outcome,
+            Some(ReviewOutcome::Failed { .. })
+        )
+    {
+        let config = state
+            .config
+            .terminal_review
+            .as_ref()
+            .expect("terminal_review_outstanding implies the config is present");
+        return StepDecision::ReviewTerminal(TerminalReviewDispatchIntent {
+            role: config.role.clone(),
+            attempt_no: state.terminal_review.attempts + 1,
+            judged_sha: state.current_sha.clone(),
+        });
     }
 
     // Phase derivation would have closed the mission if nothing were owed;
@@ -751,5 +786,156 @@ mod tests {
             );
             assert_eq!(step(&state), StepDecision::Terminal, "exit {exit_code}");
         }
+    }
+
+    // --- terminal review: the closing dispatch ---
+
+    fn created_with_review(base_sha: &str) -> MissionEvent {
+        let mut event = created(base_sha);
+        let MissionEvent::MissionCreated { config, .. } = &mut event else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.terminal_review = Some(crate::model::event::TerminalReviewConfig {
+            role: rname("gap-reviewer"),
+        });
+        event
+    }
+
+    fn review_requested(attempt_no: u32, key: &str, judged_sha: &str) -> MissionEvent {
+        MissionEvent::TerminalReviewRequested {
+            attempt_no,
+            idempotency_key: key.to_string(),
+            role: rname("gap-reviewer"),
+            prompt: PayloadRef::inline("review prompt"),
+            judged_sha: judged_sha.to_string(),
+            nonce: "n0".to_string(),
+        }
+    }
+
+    fn review_completed(
+        key: &str,
+        judged_sha: &str,
+        passed: bool,
+        blocking_gaps: usize,
+    ) -> MissionEvent {
+        use crate::model::event::{Gap, GapSeverity};
+        MissionEvent::TerminalReviewCompleted {
+            attempt_no: 1,
+            idempotency_key: key.to_string(),
+            judged_sha: judged_sha.to_string(),
+            passed,
+            gaps: (0..blocking_gaps)
+                .map(|_| Gap {
+                    id: None,
+                    severity: GapSeverity::Blocking,
+                    requirement: "r".into(),
+                    expected: "e".into(),
+                    observed: "o".into(),
+                    evidence: "v".into(),
+                })
+                .collect(),
+            report: PayloadRef::inline("map + observations"),
+        }
+    }
+
+    /// Work committed to sha-1 and the oracle fresh-passing there: only the
+    /// review obligation remains.
+    fn review_brink() -> Vec<MissionEvent> {
+        vec![
+            created_with_review("sha-0"),
+            plan(
+                vec![assertion_with_oracle("A1", "tests")],
+                vec![work("w1", &["A1"], &[])],
+            ),
+            role_requested("w1", 1, "k-w1-1"),
+            work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
+            oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
+            oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", 0),
+        ]
+    }
+
+    fn review_dispatched(state: &MissionState) -> TerminalReviewDispatchIntent {
+        match step(state) {
+            StepDecision::ReviewTerminal(intent) => intent,
+            other => panic!("expected ReviewTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reviewer_dispatches_only_after_oracles_settle_at_the_current_head() {
+        // With the oracle still owed, the oracle batch wins the turn …
+        let mut events = review_brink();
+        events.truncate(4); // drop the oracle request/completion
+        let owed = fold_log(events);
+        assert!(matches!(step(&owed), StepDecision::RunOracles(_)));
+
+        // … and only a settled, fresh-passing contract dispatches the
+        // reviewer — contract-blind at the current head.
+        let state = fold_log(review_brink());
+        let intent = review_dispatched(&state);
+        assert_eq!(intent.role, rname("gap-reviewer"));
+        assert_eq!(intent.attempt_no, 1);
+        assert_eq!(intent.judged_sha, "sha-1");
+    }
+
+    #[test]
+    fn no_reviewer_dispatch_without_config() {
+        let mut events = review_brink();
+        events[0] = created("sha-0");
+        let state = fold_log(events);
+        assert_eq!(step(&state), StepDecision::Terminal);
+    }
+
+    #[test]
+    fn inflight_terminal_review_owns_the_turn() {
+        let mut events = review_brink();
+        events.push(review_requested(1, "k-tr-1", "sha-1"));
+        let state = fold_log(events);
+        assert_eq!(step(&state), StepDecision::Idle);
+    }
+
+    #[test]
+    fn stale_review_verdict_redispatches_after_head_move() {
+        let mut events = review_brink();
+        events.push(review_requested(1, "k-tr-1", "sha-1"));
+        events.push(review_completed("k-tr-1", "sha-1", true, 0));
+        // New work moves the head; the oracle re-judges; the clean sha-1
+        // verdict is stale — a second review dispatches at the new head.
+        events.push(work_done("w1", "k-w1-2", Some(("sha-1", "sha-2"))));
+        events.push(oracle_completed(
+            &["A1"],
+            "tests",
+            "sha-2",
+            2,
+            "k-tests-2",
+            0,
+        ));
+        let state = fold_log(events);
+        let intent = review_dispatched(&state);
+        assert_eq!(intent.attempt_no, 2);
+        assert_eq!(intent.judged_sha, "sha-2");
+    }
+
+    #[test]
+    fn a_gap_park_steps_park_and_retry_redispatches_fresh() {
+        use crate::model::event::DecisionAction;
+        let mut events = review_brink();
+        events.push(review_requested(1, "k-tr-1", "sha-1"));
+        events.push(review_completed("k-tr-1", "sha-1", false, 1));
+        let parked = fold_log(events.clone());
+        assert_eq!(step(&parked), StepDecision::Park);
+
+        events.push(MissionEvent::DecisionRecorded {
+            attention_id: "terminal_review_gaps:mission".to_string(),
+            action: DecisionAction::Retry,
+            justification: "re-roll".to_string(),
+            actor: "test".to_string(),
+        });
+        let state = fold_log(events);
+        // Attempts are preserved: the re-roll runs under attempt 2 (⇒ a
+        // fresh idempotency key) at the unchanged head.
+        let intent = review_dispatched(&state);
+        assert_eq!(intent.attempt_no, 2);
+        assert_eq!(intent.judged_sha, "sha-1");
     }
 }

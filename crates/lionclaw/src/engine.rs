@@ -20,11 +20,12 @@ use crate::model::{
     step, validate_plan_amendment, validate_plan_submission, AmendmentError, AmendmentOps,
     AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId, MissionPhase, MissionState,
     OracleDispatchIntent, PayloadRef, PlanSubmission, PlanValidationError, RoleDispatchIntent,
-    RunErrorKind, StepDecision,
+    RunErrorKind, StepDecision, TaskId, TerminalReviewDispatchIntent,
 };
 use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
 use crate::prompt::{
-    assemble_planning_prompt, assemble_role_prompt, PlanningPromptContext, PromptContext,
+    assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
+    PlanningPromptContext, PromptContext, TerminalReviewPromptContext,
 };
 use crate::store::{AppendError, MissionStore, NewEvent};
 
@@ -96,7 +97,23 @@ pub enum AmendError {
 const EFFECT_LEASE_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_LOOP_ITERATIONS: usize = 10_000;
 
+pub use crate::model::TERMINAL_REVIEW_TASK_TAG;
+
 impl Engine {
+    fn resolve_role_skills(
+        &self,
+        role: &crate::mission_type::RoleDefinition,
+    ) -> std::result::Result<Vec<crate::mission_type::SkillPackage>, String> {
+        role.skills
+            .iter()
+            .map(|name| {
+                self.mission_type.skills.get(name).cloned().ok_or_else(|| {
+                    format!("role '{}' references missing skill '{name}'", role.name)
+                })
+            })
+            .collect()
+    }
+
     pub fn new(
         store: MissionStore,
         mission_type: MissionType,
@@ -145,6 +162,34 @@ impl Engine {
         base_sha: &str,
         config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
+        // The loader enforces both rules for mission types; enforce them here
+        // too so no direct caller can mint a config the closing gate cannot
+        // honor (the fold is total and cannot refuse the config).
+        //
+        // The reviewed bar is *defined* by an independent terminal review …
+        if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
+            bail!(
+                "a reviewed-bar mission requires a terminal review: \
+                 the reviewed bar is defined by an independent closing review"
+            );
+        }
+        // … and a declared reviewer must exist as a judge in the pinned type,
+        // or the closing dispatch could never resolve it.
+        if let Some(review) = &config.terminal_review {
+            match self.mission_type.roles.get(&review.role) {
+                Some(role) if role.output == crate::model::OutputSemantics::EmitsGapVerdict => {}
+                Some(role) => bail!(
+                    "terminal-review role '{}' must be emits-gap-verdict, got {}",
+                    review.role,
+                    role.output.slug()
+                ),
+                None => bail!(
+                    "terminal-review role '{}' is not provided by mission type '{}'",
+                    review.role,
+                    self.mission_type.name
+                ),
+            }
+        }
         let now_ms = self.clock.now_ms();
         let mission_id = MissionId::from_digest_prefix(&hex::encode(Sha256::digest(
             format!("{workspace_dir}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
@@ -342,6 +387,10 @@ impl Engine {
                 StepDecision::RunOracles(intents) => {
                     self.materialize_oracle_requests(&state, intents).await?;
                 }
+                StepDecision::ReviewTerminal(intent) => {
+                    self.materialize_terminal_review_request(&state, intent)
+                        .await?;
+                }
             }
         }
         bail!("advance exceeded {MAX_LOOP_ITERATIONS} iterations; aborting as a safety stop")
@@ -392,6 +441,26 @@ impl Engine {
                 InflightEffect::OracleRun { .. } => {
                     self.store.requeue_effect(key, now_ms).await?;
                 }
+                InflightEffect::TerminalReview {
+                    attempt_no,
+                    judged_sha,
+                    ..
+                } => {
+                    // An LLM turn mid-crash is unknowable, exactly like a role
+                    // run — synthesize failure, never re-queue.
+                    let event = NewEvent::new(MissionEvent::TerminalReviewFailed {
+                        attempt_no: *attempt_no,
+                        idempotency_key: key.clone(),
+                        judged_sha: judged_sha.clone(),
+                        error_kind: RunErrorKind::Infra,
+                        detail: "resumed with an expired terminal-review lease; outcome unknowable"
+                            .to_string(),
+                        synthesized: true,
+                    });
+                    self.append_idempotent(&state.mission_id, state.head, &[event])
+                        .await?;
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -423,6 +492,10 @@ impl Engine {
             }
             InflightEffect::OracleRun { .. } => {
                 self.execute_oracle_run(state, &lease.effect_id, &lease.request)
+                    .await?
+            }
+            InflightEffect::TerminalReview { .. } => {
+                self.execute_terminal_review(state, &lease.effect_id, &lease.request)
                     .await?
             }
         };
@@ -512,16 +585,10 @@ impl Engine {
             ));
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
-        let mut skills = Vec::with_capacity(role.skills.len());
-        for name in &role.skills {
-            let Some(package) = self.mission_type.skills.get(name) else {
-                return Ok(failed(
-                    RunErrorKind::Launch,
-                    format!("role '{role_name}' references missing skill '{name}'"),
-                ));
-            };
-            skills.push(package.clone());
-        }
+        let skills = match self.resolve_role_skills(role) {
+            Ok(skills) => skills,
+            Err(detail) => return Ok(failed(RunErrorKind::Launch, detail)),
+        };
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
@@ -634,6 +701,107 @@ impl Engine {
             })),
             Err(failure) => Ok(failed(failure.detail)),
         }
+    }
+
+    /// Execute the closing review: one confined `emits-gap-verdict` role run
+    /// against a read-only snapshot of the judged commit. The handoff is
+    /// translated here — never trusted raw: the echoed nonce must match (a
+    /// worker-planted script executed by the reviewer can write the handoff
+    /// file but cannot read the prompt), `done=false` is "the review itself
+    /// did not complete" (an unfinished review is not a verdict), and the
+    /// typed gaps are size-capped because they land inline in the event log.
+    async fn execute_terminal_review(
+        &self,
+        state: &MissionState,
+        idempotency_key: &str,
+        effect: &InflightEffect,
+    ) -> Result<NewEvent> {
+        let InflightEffect::TerminalReview {
+            attempt_no,
+            role: role_name,
+            prompt,
+            judged_sha,
+            nonce,
+            ..
+        } = effect
+        else {
+            bail!("execute_terminal_review called with a non-review effect");
+        };
+        let attempt_no = *attempt_no;
+        let failed = |kind: RunErrorKind, detail: String| {
+            NewEvent::new(MissionEvent::TerminalReviewFailed {
+                attempt_no,
+                idempotency_key: idempotency_key.to_string(),
+                judged_sha: judged_sha.clone(),
+                error_kind: kind,
+                detail,
+                synthesized: false,
+            })
+        };
+        let Some(role) = self.mission_type.roles.get(role_name) else {
+            return Ok(failed(
+                RunErrorKind::Launch,
+                format!(
+                    "terminal-review role '{role_name}' is no longer provided by the mission type"
+                ),
+            ));
+        };
+        let skills = match self.resolve_role_skills(role) {
+            Ok(skills) => skills,
+            Err(detail) => return Ok(failed(RunErrorKind::Launch, detail)),
+        };
+        let prompt_text = self.store.blobs().resolve(prompt)?;
+        let request = RoleRunRequest {
+            mission_id: state.mission_id.clone(),
+            task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
+            attempt_no,
+            idempotency_key: idempotency_key.to_string(),
+            role: role.clone(),
+            skills,
+            prompt: prompt_text,
+            base_sha: judged_sha.clone(),
+            workspace_dir: state.workspace_dir.clone().into(),
+            state_dir: self.store.lionclaw_dir().to_path_buf(),
+        };
+        let outcome = match self.role_runner.run(request).await {
+            Ok(outcome) => outcome,
+            Err(failure) => return Ok(failed(failure.kind, failure.detail)),
+        };
+        let Handoff::Review {
+            done,
+            report,
+            passed,
+            gaps,
+            nonce: echoed,
+        } = outcome.handoff
+        else {
+            // Unreachable via the runner's schema check; fail closed anyway.
+            return Ok(failed(
+                RunErrorKind::HandoffInvalid,
+                "terminal reviewer handed back a non-review handoff".to_string(),
+            ));
+        };
+        if echoed != *nonce {
+            return Ok(failed(
+                RunErrorKind::HandoffInvalid,
+                "handoff nonce mismatch: the handoff was not written by the reviewer".to_string(),
+            ));
+        }
+        if !done {
+            return Ok(failed(
+                RunErrorKind::TurnFailed,
+                "reviewer handed off done=false: the review itself did not complete".to_string(),
+            ));
+        }
+        Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {
+            attempt_no,
+            idempotency_key: idempotency_key.to_string(),
+            judged_sha: judged_sha.clone(),
+            passed,
+            gaps,
+            report: self.store.blobs().externalize(report)?,
+        })
+        .with_model_id(outcome.model_id))
     }
 
     /// Resolve the `last_report` blobs of a task's dependencies (in either era's
@@ -768,6 +936,79 @@ impl Engine {
             .await
     }
 
+    /// Turn a terminal-review intent into a recorded request
+    /// (`("terminal-review", …)` idempotency namespace). Fresh-context by
+    /// construction: the assembler takes only the objective. The nonce is
+    /// random per materialization — never derived from a deterministic recipe
+    /// that worker-planted code could precompute — so, unlike role runs, the
+    /// idempotency key deliberately excludes the prompt hash (oracle-key
+    /// shape): two racing drivers mint the SAME key with different nonces,
+    /// the second append is a Duplicate no-op, and execution reads the
+    /// winning event's nonce.
+    async fn materialize_terminal_review_request(
+        &self,
+        state: &MissionState,
+        intent: TerminalReviewDispatchIntent,
+    ) -> Result<()> {
+        let idempotency_key = idem_key(&[
+            "terminal-review",
+            state.mission_id.as_str(),
+            &intent.judged_sha,
+            &intent.attempt_no.to_string(),
+        ]);
+        // create_mission refuses a config whose reviewer the pinned type
+        // cannot resolve, so this is unreachable through the public API —
+        // but a hostile log must degrade to a durable park a human can
+        // retry/waive/abort, never a permanently wedged mission whose every
+        // advance errors before any event lands.
+        let Some(role) = self.mission_type.roles.get(&intent.role) else {
+            let event = NewEvent::new(MissionEvent::TerminalReviewFailed {
+                attempt_no: intent.attempt_no,
+                idempotency_key,
+                judged_sha: intent.judged_sha,
+                error_kind: RunErrorKind::Launch,
+                detail: format!(
+                    "terminal-review role '{}' is not provided by the mission type",
+                    intent.role
+                ),
+                synthesized: false,
+            });
+            return self
+                .append_idempotent(&state.mission_id, state.head, &[event])
+                .await;
+        };
+        // The nonce is recorded on the event and only ever *copied* by the
+        // fold, so randomness here never threatens fold purity — same
+        // discipline as the oracle's wall-clock duration. It must be random
+        // (never derived): a deterministic recipe could be precomputed by
+        // worker-planted code, which is the exact forgery this token defeats.
+        #[expect(clippy::disallowed_methods)]
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let prompt_text = assemble_terminal_review_prompt(
+            role,
+            &TerminalReviewPromptContext {
+                objective: &state.objective,
+                nonce: &nonce,
+            },
+        );
+        let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
+        let prompt = self
+            .store
+            .blobs()
+            .externalize(PayloadRef::inline(prompt_text))?;
+        let event = NewEvent::new(MissionEvent::TerminalReviewRequested {
+            attempt_no: intent.attempt_no,
+            idempotency_key,
+            role: intent.role,
+            prompt,
+            judged_sha: intent.judged_sha,
+            nonce,
+        })
+        .with_prompt_hash(prompt_hash);
+        self.append_idempotent(&state.mission_id, state.head, &[event])
+            .await
+    }
+
     async fn materialize_oracle_requests(
         &self,
         state: &MissionState,
@@ -819,6 +1060,20 @@ impl Engine {
                 items,
                 passed,
                 request_attention,
+            },
+            Handoff::Review {
+                done,
+                report,
+                passed,
+                gaps,
+                nonce,
+            } => Handoff::Review {
+                done,
+                report: self.store.blobs().externalize(report)?,
+                passed,
+                // Typed and KB-scale, like `proposal` below — stays inline.
+                gaps,
+                nonce,
             },
             Handoff::Plan {
                 done,

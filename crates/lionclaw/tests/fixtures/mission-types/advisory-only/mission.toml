@@ -2,3 +2,7 @@
 name = "advisory-only"
 stop = "reviewed"
 image = "localhost/lionclaw-runtime-dev:v1"
+
+# The reviewed bar is defined by an independent closing review.
+[terminal-review]
+role = "gap-reviewer"
