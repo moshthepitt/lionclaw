@@ -20,6 +20,7 @@ pub fn inherited_skill_mounts(
     let Some(projection) = projection else {
         return Ok(Vec::new());
     };
+    projection.validate()?;
     let mut mounts = Vec::new();
     for (root_index, inherited) in projection.inherited_roots().iter().enumerate() {
         let entries = match std::fs::read_dir(&inherited.source) {
@@ -539,5 +540,18 @@ mod tests {
         assert!(inherited_skill_mounts(Some(&projection))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn inherited_mount_resolution_rejects_unvalidated_relative_sources() {
+        let mut projection = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
+        projection.inherited_roots_mut().push(InheritedSkillRoot {
+            source: "relative/skills".into(),
+            target: ".native/skills".to_string(),
+            optional: true,
+        });
+
+        let err = inherited_skill_mounts(Some(&projection)).expect_err("relative source");
+        assert!(err.to_string().contains("must be absolute"));
     }
 }

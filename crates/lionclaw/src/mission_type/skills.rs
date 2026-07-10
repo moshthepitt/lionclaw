@@ -31,7 +31,7 @@ pub(crate) fn load_skills(
         } else {
             source_package_path(mission_root, name, declaration)?
         };
-        validate_skill_tree(name, &root)?;
+        validate_skill_tree(name, mission_root, &root)?;
         packages.insert(
             name.clone(),
             SkillPackage {
@@ -41,6 +41,36 @@ pub(crate) fn load_skills(
         );
     }
     Ok(packages)
+}
+
+fn validate_package_containment(
+    name: &str,
+    mission_root: &Path,
+    package_root: &Path,
+) -> Result<(), MissionTypeError> {
+    let canonical_mission = mission_root
+        .canonicalize()
+        .map_err(|source| MissionTypeError::Io {
+            path: mission_root.to_path_buf(),
+            source,
+        })?;
+    let canonical_package = package_root
+        .canonicalize()
+        .map_err(|source| MissionTypeError::Io {
+            path: package_root.to_path_buf(),
+            source,
+        })?;
+    if !canonical_package.starts_with(&canonical_mission) {
+        return Err(MissionTypeError::Skill {
+            skill: name.to_string(),
+            detail: format!(
+                "package root '{}' resolves outside mission type '{}'",
+                package_root.display(),
+                mission_root.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn package_files(
@@ -135,7 +165,11 @@ pub(crate) fn resolve_package_path(
     Ok(mission_root.join(relative))
 }
 
-fn validate_skill_tree(name: &str, root: &Path) -> Result<(), MissionTypeError> {
+fn validate_skill_tree(
+    name: &str,
+    mission_root: &Path,
+    root: &Path,
+) -> Result<(), MissionTypeError> {
     let metadata = std::fs::symlink_metadata(root).map_err(|source| MissionTypeError::Io {
         path: root.to_path_buf(),
         source,
@@ -152,6 +186,7 @@ fn validate_skill_tree(name: &str, root: &Path) -> Result<(), MissionTypeError> 
             detail: format!("package root '{}' must be a directory", root.display()),
         });
     }
+    validate_package_containment(name, mission_root, root)?;
     let skill_md = root.join("SKILL.md");
     let metadata = std::fs::symlink_metadata(&skill_md).map_err(|source| MissionTypeError::Io {
         path: skill_md.clone(),

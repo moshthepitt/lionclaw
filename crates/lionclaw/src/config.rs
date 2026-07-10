@@ -62,14 +62,16 @@ pub struct RuntimeProfiles {
 
 impl RuntimeProfiles {
     pub fn built_in() -> Result<Self> {
-        Self::from_toml(DEFAULT_RUNTIMES_TOML, &user_home_from_env()?)
+        let user_home = user_home_from_env()
+            .ok_or_else(|| anyhow!("HOME is required to resolve built-in runtime skill roots"))?;
+        Self::from_toml(DEFAULT_RUNTIMES_TOML, &user_home)
             .context("invalid built-in runtime configuration")
     }
 
     pub fn load(home: &Home) -> Result<Self> {
         let path = home.runtimes_file();
         match std::fs::read_to_string(&path) {
-            Ok(text) => Self::from_toml(&text, &user_home_from_env()?)
+            Ok(text) => Self::from_toml_with_home(&text, user_home_from_env().as_deref())
                 .with_context(|| format!("invalid runtime configuration '{}'", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::built_in(),
             Err(err) => Err(err).with_context(|| format!("reading '{}'", path.display())),
@@ -77,6 +79,10 @@ impl RuntimeProfiles {
     }
 
     pub fn from_toml(text: &str, user_home: &Path) -> Result<Self> {
+        Self::from_toml_with_home(text, Some(user_home))
+    }
+
+    fn from_toml_with_home(text: &str, user_home: Option<&Path>) -> Result<Self> {
         let file: RuntimeProfilesFile = toml::from_str(text).context("invalid runtimes TOML")?;
         let mut profiles = BTreeMap::new();
         for (name, config) in file.runtimes {
@@ -134,7 +140,7 @@ struct RuntimeProfileFile {
 }
 
 impl RuntimeProfileFile {
-    fn apply(mut self, name: String, user_home: &Path) -> Result<MissionRuntimeProfile> {
+    fn apply(mut self, name: String, user_home: Option<&Path>) -> Result<MissionRuntimeProfile> {
         self.driver = required_trimmed("driver", self.driver)?;
         self.command = required_trimmed("command", self.command)?;
         self.auth = self
@@ -188,16 +194,23 @@ fn validate_runtime_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn expand_home(path: &Path, home: &Path) -> Result<PathBuf> {
+fn expand_home(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
     let text = path.to_string_lossy();
     if text == "~" {
-        return Ok(home.to_path_buf());
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("HOME is required to resolve inherited skill source '~'"));
     }
     if let Some(relative) = text.strip_prefix("~/") {
-        return Ok(home.join(relative));
+        return home.map(|home| home.join(relative)).ok_or_else(|| {
+            anyhow!(
+                "HOME is required to resolve inherited skill source '{}'",
+                path.display()
+            )
+        });
     }
     Err(anyhow!(
         "inherited skill source '{}' must be absolute or start with '~/'",
@@ -205,11 +218,10 @@ fn expand_home(path: &Path, home: &Path) -> Result<PathBuf> {
     ))
 }
 
-fn user_home_from_env() -> Result<PathBuf> {
+fn user_home_from_env() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is required to resolve runtime skill roots"))
 }
 
 fn default_confinement() -> ConfinementConfig {
@@ -283,5 +295,36 @@ mod tests {
         )
         .expect_err("invalid root");
         assert!(err.to_string().contains("traversal"), "got {err:#}");
+    }
+
+    #[test]
+    fn custom_profiles_need_home_only_when_they_use_tilde_paths() {
+        let absolute = RuntimeProfiles::from_toml_with_home(
+            r#"
+            [runtimes.custom]
+            driver = "acp"
+            command = "custom"
+            skill-projection = { kind = "native-dir", root = ".agents/skills", inherit = [
+              { source = "/opt/custom/skills", target = ".custom/skills", optional = true }
+            ] }
+            "#,
+            None,
+        )
+        .expect("absolute roots do not need HOME");
+        assert_eq!(absolute.get("custom").unwrap().driver, "acp");
+
+        let err = RuntimeProfiles::from_toml_with_home(
+            r#"
+            [runtimes.custom]
+            driver = "acp"
+            command = "custom"
+            skill-projection = { kind = "native-dir", root = ".agents/skills", inherit = [
+              { source = "~/.custom/skills", target = ".custom/skills", optional = true }
+            ] }
+            "#,
+            None,
+        )
+        .expect_err("tilde roots require HOME");
+        assert!(err.to_string().contains("HOME is required"), "got {err:#}");
     }
 }

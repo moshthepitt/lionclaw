@@ -142,6 +142,38 @@ fn a_symlinked_skill_package_is_rejected() {
 }
 
 #[test]
+fn a_skill_package_through_an_escaping_parent_symlink_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let external = tempfile::tempdir().expect("external skills");
+    let external_skill = external.path().join("rust");
+    std::fs::create_dir(&external_skill).unwrap();
+    std::fs::write(
+        external_skill.join("SKILL.md"),
+        "---\nname: rust\ndescription: Rust.\n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("roles")).unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join("skills")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Skill { detail, .. } if detail.contains("outside mission type")),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn skill_frontmatter_name_must_match_the_declared_package() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
