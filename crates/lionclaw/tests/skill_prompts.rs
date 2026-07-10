@@ -271,12 +271,7 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
     let dir = tempfile::tempdir().unwrap();
     let (mission_type, _skills) = execution_mission_type(dir.path());
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
-        if request.role.name.as_str() == "reviewer" {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
-        }
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
@@ -443,12 +438,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
     let dir = tempfile::tempdir().unwrap();
     let mission_type = planning_mission_type(dir.path());
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request: &RoleRunRequest| {
-        if request.role.name.as_str() == "strategist" {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
-        }
         let handoff = match request.role.output {
             OutputSemantics::ProposesPlan => Handoff::Plan {
                 done: true,
@@ -522,12 +512,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
     let dir = tempfile::tempdir().unwrap();
     let mission_type = planning_mission_type(dir.path());
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request: &RoleRunRequest| {
-        if request.role.name.as_str() == "author" {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
-        }
         let handoff = match request.role.output {
             OutputSemantics::ProposesPlan => Handoff::Plan {
                 done: true,
@@ -615,11 +600,8 @@ async fn terminal_review_prompt_lists_assigned_skills() {
         .skills
         .push("gap-check".to_string());
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
             Ok(lionclaw::testing::review_verdict(request, true, vec![]))
         } else {
             Ok(RoleRunOutcome {
@@ -671,11 +653,8 @@ async fn terminal_review_prompt_lists_assigned_skills() {
 async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
     let dir = tempfile::tempdir().unwrap();
 
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-    let seen = captured.clone();
     let runner = MockRoleRunner::new(Box::new(move |request| {
         if request.task_id.as_str() == lionclaw::engine::TERMINAL_REVIEW_TASK_TAG {
-            *seen.lock().unwrap() = Some(request.prompt.clone());
             Ok(lionclaw::testing::review_verdict(request, true, vec![]))
         } else {
             Ok(RoleRunOutcome {
