@@ -1,6 +1,7 @@
 //! BUNDLED-SKILL-HANDOFF-TRUTH regression: every bundled mission skill
 //! instruction contains the required handoff-file directive and no stale
-//! `end_node` / unavailable-tool calls or embedded handoff schema literals.
+//! `end_node` / unavailable completion-tool instructions or embedded handoff
+//! schema literals.
 
 use std::io;
 use std::path::PathBuf;
@@ -70,6 +71,11 @@ fn every_bundled_skill_has_no_end_node_and_carries_the_handoff_directive() {
             "{}: stale `end_node` directive must be absent",
             path.display()
         );
+        assert!(
+            !text.to_ascii_lowercase().contains("completion tool"),
+            "{}: unavailable completion-tool instructions must be absent",
+            path.display()
+        );
 
         // Required handoff path present.
         assert!(
@@ -87,7 +93,7 @@ fn every_bundled_skill_has_no_end_node_and_carries_the_handoff_directive() {
 
         // No embedded lionclaw.mission.*-handoff schema literal.
         assert!(
-            !text.contains("lionclaw.mission.") || !text.contains("-handoff"),
+            !text.contains("lionclaw.mission.") && !text.contains("-handoff.v1"),
             "{}: no handoff schema literal may be embedded in a skill file",
             path.display()
         );

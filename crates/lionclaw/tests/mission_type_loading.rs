@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::authority::MoatViolation;
-use lionclaw::mission_type::{load_mission_type, MissionTypeError};
+use lionclaw::mission_type::{load_mission_type, MissionType, MissionTypeError};
 use lionclaw::model::StopBar;
 
 fn repo_root() -> PathBuf {
@@ -481,4 +481,54 @@ fn skill_description_is_loaded_and_trimmed_into_the_package() {
     let pkg = mission_type.skills.get("rust").expect("rust package");
     // Leading and trailing whitespace trimmed, inner spacing preserved.
     assert_eq!(pkg.description, "Work effectively in Rust.");
+}
+
+fn load_skill_with_description(
+    description_line: Option<&str>,
+) -> Result<MissionType, MissionTypeError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+    let description = description_line
+        .map(|value| format!("description: {value}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        dir.path().join("skills/rust/SKILL.md"),
+        format!("---\nname: rust\n{description}---\n\n# Rust\n"),
+    )
+    .unwrap();
+    load_mission_type(dir.path(), &AuthorityCeiling::default())
+}
+
+#[test]
+fn skill_description_is_required() {
+    assert!(load_skill_with_description(None).is_err());
+}
+
+#[test]
+fn skill_description_rejects_whitespace_only() {
+    assert!(load_skill_with_description(Some("   ")).is_err());
+}
+
+#[test]
+fn skill_description_accepts_exactly_1024_utf8_bytes() {
+    let description = "é".repeat(512);
+    let mission_type = load_skill_with_description(Some(&description)).expect("1024 bytes loads");
+    assert_eq!(mission_type.skills["rust"].description.len(), 1024);
+}
+
+#[test]
+fn skill_description_rejects_more_than_1024_utf8_bytes() {
+    let description = format!("{}a", "é".repeat(512));
+    assert!(load_skill_with_description(Some(&description)).is_err());
 }

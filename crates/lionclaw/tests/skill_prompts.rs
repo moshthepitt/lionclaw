@@ -10,7 +10,6 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use common::{default_config, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::Engine;
@@ -31,23 +30,6 @@ fn tid(n: &str) -> lionclaw::model::TaskId {
 }
 fn aid(n: &str) -> AssertionId {
     AssertionId::new(n).unwrap()
-}
-
-#[derive(Clone, Default)]
-struct PromptCapture(Arc<Mutex<Option<String>>>);
-
-impl PromptCapture {
-    fn record(&self, request: &RoleRunRequest) {
-        *self.0.lock().unwrap() = Some(request.prompt.clone());
-    }
-
-    fn take(&self, label: &str) -> String {
-        self.0
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| panic!("{label} prompt"))
-    }
 }
 
 fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
@@ -83,6 +65,63 @@ fn assigned_skill_section(prompt: &str) -> &str {
         .map(|e| start + e)
         .unwrap_or(prompt.len());
     &prompt[start..end]
+}
+
+async fn persisted_prompt(
+    engine: &Engine,
+    mission_id: &lionclaw::model::MissionId,
+    role: &str,
+) -> String {
+    let events = engine.store().load(mission_id).await.expect("load events");
+    let prompt = events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            lionclaw::model::MissionEvent::RoleRunRequested {
+                role: requested_role,
+                prompt,
+                ..
+            }
+            | lionclaw::model::MissionEvent::TerminalReviewRequested {
+                role: requested_role,
+                prompt,
+                ..
+            } if requested_role.as_str() == role => Some(prompt),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("persisted prompt for role {role}"));
+    engine
+        .store()
+        .blobs()
+        .resolve(prompt)
+        .expect("resolve prompt")
+}
+
+fn assert_no_skill_section(prompt: &str) {
+    assert!(!prompt.contains("## Assigned skills"));
+    assert!(!prompt.contains("native skill projection"));
+}
+
+fn assert_skill_section(prompt: &str, skills: &[(&str, &str)], schema: &str) {
+    assert_eq!(prompt.matches("## Assigned skills").count(), 1);
+    assert_eq!(
+        prompt
+            .matches("the harness discovers them through native skill projection")
+            .count(),
+        1
+    );
+    let section = assigned_skill_section(prompt);
+    for (name, description) in skills {
+        assert_eq!(section.matches(name).count(), 1, "skill name {name}");
+        assert_eq!(
+            section.matches(description).count(),
+            1,
+            "skill description {description}"
+        );
+    }
+    assert!(!section.contains("lionclaw.mission."));
+    assert!(!section.contains("\"schema\""));
+    assert!(!section.contains("handoff.json"));
+    assert_eq!(prompt.matches(schema).count(), 1);
 }
 
 /// Write a real SKILL.md with a description into `dir/skills/<name>/SKILL.md`.
@@ -183,14 +222,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
     let dir = tempfile::tempdir().unwrap();
     let (mission_type, _skills) = execution_mission_type(dir.path());
 
-    let captured = PromptCapture::default();
-    let seen = captured.clone();
-    let runner = MockRoleRunner::new(Box::new(move |request| {
-        if request.role.name.as_str() == "implementer" {
-            seen.record(request);
-        }
-        Ok(work_outcome(request))
-    }));
+    let runner = MockRoleRunner::new(Box::new(move |request| Ok(work_outcome(request))));
     let store = MissionStore::open(dir.path()).await.expect("store");
     let engine = Engine::new(
         store,
@@ -216,27 +248,15 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.take("implementer");
+    let prompt = persisted_prompt(&engine, &mission_id, "implementer").await;
 
-    // The assigned-skills section is present.
-    assert!(prompt.contains("## Assigned skills"));
-    // Native projection sentence appears exactly once.
-    assert_eq!(
-        prompt
-            .matches("the harness discovers them through native skill projection")
-            .count(),
-        1
-    );
-    // Both skill names and descriptions appear exactly once.
-    assert_eq!(prompt.matches("zebra-skill").count(), 1);
-    assert_eq!(
-        prompt.matches("Zebra comes first in declaration").count(),
-        1
-    );
-    assert_eq!(prompt.matches("alpha-skill").count(), 1);
-    assert_eq!(
-        prompt.matches("Alpha comes second in declaration").count(),
-        1
+    assert_skill_section(
+        &prompt,
+        &[
+            ("zebra-skill", "Zebra comes first in declaration"),
+            ("alpha-skill", "Alpha comes second in declaration"),
+        ],
+        "lionclaw.mission.work-handoff.v1",
     );
     // Declaration order: zebra before alpha (NOT BTreeMap order where alpha < zebra).
     let zebra_pos = prompt.find("zebra-skill").unwrap();
@@ -244,15 +264,6 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
     assert!(zebra_pos < alpha_pos, "declaration order must be preserved");
     // The assigned-skill section is bounded — no handoff JSON, schema, or
     // completion-tool prose inside it.
-    let section = assigned_skill_section(&prompt);
-    assert!(!section.contains("lionclaw.mission."));
-    assert!(!section.contains("\"schema\""));
-    assert!(!section.contains("handoff.json"));
-    // Exactly one skeleton-owned handoff contract.
-    assert_eq!(
-        prompt.matches("lionclaw.mission.work-handoff.v1").count(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -333,9 +344,8 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.lock().unwrap().clone().expect("reviewer prompt");
-    assert!(!prompt.contains("## Assigned skills"));
-    assert!(!prompt.contains("native skill projection"));
+    let prompt = persisted_prompt(&engine, &mission_id, "reviewer").await;
+    assert_no_skill_section(&prompt);
 }
 
 // ---- Planning path ----
@@ -499,24 +509,11 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.lock().unwrap().clone().expect("strategist prompt");
-    assert!(prompt.contains("## Assigned skills"));
-    assert_eq!(
-        prompt
-            .matches("the harness discovers them through native skill projection")
-            .count(),
-        1
-    );
-    assert_eq!(prompt.matches("planning-method").count(), 1);
-    assert_eq!(prompt.matches("A methodical planning approach").count(), 1);
-    // Bounded section — no handoff schema prose inside the skill section.
-    let section = assigned_skill_section(&prompt);
-    assert!(!section.contains("lionclaw.mission."));
-    assert!(!section.contains("handoff.json"));
-    // Exactly one skeleton-owned handoff contract.
-    assert_eq!(
-        prompt.matches("lionclaw.mission.work-handoff.v1").count(),
-        1
+    let prompt = persisted_prompt(&engine, &mission_id, "strategist").await;
+    assert_skill_section(
+        &prompt,
+        &[("planning-method", "A methodical planning approach")],
+        "lionclaw.mission.work-handoff.v1",
     );
 }
 
@@ -591,9 +588,8 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.lock().unwrap().clone().expect("author prompt");
-    assert!(!prompt.contains("## Assigned skills"));
-    assert!(!prompt.contains("native skill projection"));
+    let prompt = persisted_prompt(&engine, &mission_id, "author").await;
+    assert_no_skill_section(&prompt);
 }
 
 // ---- Terminal-review path ----
@@ -663,24 +659,11 @@ async fn terminal_review_prompt_lists_assigned_skills() {
         .unwrap();
     h.engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.lock().unwrap().clone().expect("reviewer prompt");
-    assert!(prompt.contains("## Assigned skills"));
-    assert_eq!(
-        prompt
-            .matches("the harness discovers them through native skill projection")
-            .count(),
-        1
-    );
-    assert_eq!(prompt.matches("gap-check").count(), 1);
-    assert_eq!(prompt.matches("Hunt gaps in the product").count(), 1);
-    // Bounded section — no handoff schema prose inside the skill section.
-    let section = assigned_skill_section(&prompt);
-    assert!(!section.contains("lionclaw.mission."));
-    assert!(!section.contains("handoff.json"));
-    // Exactly one skeleton-owned handoff contract.
-    assert_eq!(
-        prompt.matches("lionclaw.mission.review-handoff.v1").count(),
-        1
+    let prompt = persisted_prompt(&h.engine, &mission_id, "gap-reviewer").await;
+    assert_skill_section(
+        &prompt,
+        &[("gap-check", "Hunt gaps in the product")],
+        "lionclaw.mission.review-handoff.v1",
     );
 }
 
@@ -732,9 +715,8 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
         .unwrap();
     h.engine.advance(&mission_id).await.unwrap();
 
-    let prompt = captured.lock().unwrap().clone().expect("reviewer prompt");
-    assert!(!prompt.contains("## Assigned skills"));
-    assert!(!prompt.contains("native skill projection"));
+    let prompt = persisted_prompt(&h.engine, &mission_id, "gap-reviewer").await;
+    assert_no_skill_section(&prompt);
 }
 
 // ---- Missing reference fails closed ----

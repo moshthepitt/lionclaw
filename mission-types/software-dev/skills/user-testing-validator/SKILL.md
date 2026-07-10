@@ -132,4 +132,4 @@ Missing required evidence means `passed=false`.
 - <optional setup/skill/AGENTS.md suggestions for orchestrator>
 ```
 
-Write /mission/handoff/handoff.json exactly as specified by the prompt. Do not call any unavailable completion tool.
+Write /mission/handoff/handoff.json exactly as specified by the prompt.

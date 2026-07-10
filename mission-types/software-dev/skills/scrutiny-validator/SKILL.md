@@ -142,4 +142,4 @@ Prefer `passed=false` with concrete limitations over speculative passes.
 - <optional skill/AGENTS.md/setup guidance for orchestrator>
 ```
 
-Write /mission/handoff/handoff.json exactly as specified by the prompt. Do not call any unavailable completion tool.
+Write /mission/handoff/handoff.json exactly as specified by the prompt.
