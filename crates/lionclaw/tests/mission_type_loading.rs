@@ -453,3 +453,32 @@ fn editing_the_terminal_review_declaration_changes_the_digest() {
     // trips the digest check on the next engine open.
     assert_ne!(before, after);
 }
+
+// ---- SKILL-DESCRIPTIONS-AND-PROMPTS loader assertions ----
+
+#[test]
+fn skill_description_is_loaded_and_trimmed_into_the_package() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();
+    std::fs::write(
+        dir.path().join("skills/rust/SKILL.md"),
+        "---\nname: rust\ndescription:   Work effectively in Rust.  \n---\n\n# Rust\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
+    )
+    .unwrap();
+    let mission_type = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("loads");
+    let pkg = mission_type.skills.get("rust").expect("rust package");
+    // Leading and trailing whitespace trimmed, inner spacing preserved.
+    assert_eq!(pkg.description, "Work effectively in Rust.");
+}

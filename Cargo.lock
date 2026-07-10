@@ -1250,7 +1250,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "lionclaw-runtime-api",
- "serde_json",
+ "tokio",
  "uuid",
 ]
 

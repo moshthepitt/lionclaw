@@ -51,6 +51,9 @@ pub struct RoleDefinition {
 pub struct SkillPackage {
     pub name: String,
     pub root: PathBuf,
+    /// The validated, whitespace-trimmed `description` from `SKILL.md`
+    /// frontmatter — carried into the role prompt's assigned-skill section.
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]

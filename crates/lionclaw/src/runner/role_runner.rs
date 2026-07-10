@@ -310,7 +310,6 @@ impl OciRoleRunner {
                 session_id: uuid_from_key(&request.idempotency_key),
                 working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                 environment: plan.environment.clone(),
-                runtime_skill_ids: Vec::new(),
                 runtime_state_root: state_root,
                 runtime_session_ready: RuntimeSessionReady::not_ready(),
             })
@@ -335,7 +334,6 @@ impl OciRoleRunner {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: request.prompt.clone(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context,
                 executor: Box::new(MissionProgramExecutor::new(plan, auth_registry)),
@@ -449,6 +447,7 @@ mod tests {
             &[SkillPackage {
                 name: "mission-skill".to_string(),
                 root: temp.path().join("mission-skill"),
+                description: "mission skill".to_string(),
             }],
             Some(&projection),
         )
@@ -472,6 +471,7 @@ mod tests {
             &[SkillPackage {
                 name: "mission-skill".to_string(),
                 root: "/mission-type/skills/mission-skill".into(),
+                description: "mission skill".to_string(),
             }],
             None,
         )

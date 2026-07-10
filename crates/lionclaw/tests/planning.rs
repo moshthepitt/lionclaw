@@ -73,6 +73,7 @@ fn planning_mission_type() -> MissionType {
             SkillPackage {
                 name: "planning-method".to_string(),
                 root: PathBuf::from("/mission-type/skills/planning-method"),
+                description: "planning method".to_string(),
             },
         )]),
         oracles: BTreeMap::from([(

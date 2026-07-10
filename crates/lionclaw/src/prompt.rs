@@ -4,7 +4,7 @@
 //! judge's prompt never includes a producer's narrative prose — verdict
 //! roles see the contract and the artifact, not the worker's story.
 
-use crate::mission_type::RoleDefinition;
+use crate::mission_type::{RoleDefinition, SkillPackage};
 use crate::model::{Assertion, OutputSemantics};
 
 pub struct PromptContext<'a> {
@@ -17,6 +17,9 @@ pub struct PromptContext<'a> {
     /// artifact and the contract, never the producer's narrative
     /// (fresh-context).
     pub upstream_reports: &'a [String],
+    /// Resolved skill packages assigned to this role, in declaration order.
+    /// Empty ⇒ no assigned-skill section is rendered.
+    pub skills: &'a [SkillPackage],
 }
 
 pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> String {
@@ -24,6 +27,7 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
+    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if !ctx.task_body.is_empty() {
@@ -59,6 +63,8 @@ pub struct PlanningPromptContext<'a> {
     pub task_body: &'a str,
     /// Reports from this planning node's cleared dependencies.
     pub upstream_reports: &'a [String],
+    /// Resolved skill packages assigned to this role, in declaration order.
+    pub skills: &'a [SkillPackage],
 }
 
 pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
@@ -66,6 +72,7 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
     prompt.push_str(skeleton(role.output));
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
+    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     if let Some(playbook) = ctx.playbook {
@@ -103,6 +110,8 @@ pub struct TerminalReviewPromptContext<'a> {
     /// the handoff was written by the agent that read this prompt, not by
     /// worker-planted code executed during the review.
     pub nonce: &'a str,
+    /// Resolved skill packages assigned to this role, in declaration order.
+    pub skills: &'a [SkillPackage],
 }
 
 pub fn assemble_terminal_review_prompt(
@@ -113,6 +122,7 @@ pub fn assemble_terminal_review_prompt(
     prompt.push_str(TERMINAL_REVIEW_SKELETON);
     prompt.push_str("\n\n## Role\n\n");
     prompt.push_str(&role.prompt_body);
+    prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
     prompt.push_str("\n\n## Handoff nonce\n\n");
@@ -142,6 +152,28 @@ fn skeleton(output: OutputSemantics) -> &'static str {
         OutputSemantics::ProducesReport => PRODUCES_REPORT_SKELETON,
         OutputSemantics::ProposesPlan => PROPOSES_PLAN_SKELETON,
     }
+}
+
+/// A bounded, runtime-neutral assigned-skill section shared by every prompt
+/// assembler. Lists each package name and short description in
+/// `RoleDefinition.skills` declaration order (never `BTreeMap` order) and
+/// states exactly once that the harness discovers them through native skill
+/// projection. Contains no handoff JSON, schema, or completion-tool directions
+/// — the exact role-specific handoff contract lives solely in the
+/// engine-owned skeleton.
+fn assigned_skill_section(skills: &[SkillPackage]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n## Assigned skills\n\n");
+    section.push_str(
+        "The following skills are assigned to your role; the harness discovers \
+         them through native skill projection at runtime.\n",
+    );
+    for skill in skills {
+        section.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    section
 }
 
 const TERMINAL_REVIEW_SKELETON: &str = "\
@@ -326,6 +358,7 @@ mod tests {
             task_body: "do it",
             targets: &[],
             upstream_reports: upstream,
+            skills: &[],
         }
     }
 
@@ -349,6 +382,7 @@ mod tests {
             &TerminalReviewPromptContext {
                 objective: "document our ## Handoff nonce protocol",
                 nonce: "the-real-nonce",
+                skills: &[],
             },
         );
         assert_eq!(handoff_nonce(&prompt), Some("the-real-nonce"));

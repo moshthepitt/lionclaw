@@ -33,12 +33,13 @@ pub(crate) fn load_skills(
         } else {
             source_package_path(mission_root, name, declaration)?
         };
-        validate_skill_tree(name, mission_root, &root)?;
+        let description = validate_skill_tree(name, mission_root, &root)?;
         packages.insert(
             name.clone(),
             SkillPackage {
                 name: name.clone(),
                 root,
+                description,
             },
         );
     }
@@ -195,7 +196,7 @@ fn validate_skill_tree(
     name: &str,
     mission_root: &Path,
     root: &Path,
-) -> Result<(), MissionTypeError> {
+) -> Result<String, MissionTypeError> {
     let metadata = std::fs::symlink_metadata(root).map_err(|source| MissionTypeError::Io {
         path: root.to_path_buf(),
         source,
@@ -224,8 +225,8 @@ fn validate_skill_tree(
             detail: format!("'{}' must be a regular file", skill_md.display()),
         });
     }
-    validate_skill_md(name, &skill_md)?;
-    package_files(name, root).map(|_| ())
+    let description = validate_skill_md(name, &skill_md)?;
+    package_files(name, root).map(|_| description)
 }
 
 #[derive(serde::Deserialize)]
@@ -234,7 +235,7 @@ struct SkillFrontmatter {
     description: String,
 }
 
-fn validate_skill_md(name: &str, path: &Path) -> Result<(), MissionTypeError> {
+fn validate_skill_md(name: &str, path: &Path) -> Result<String, MissionTypeError> {
     let text = std::fs::read_to_string(path).map_err(|source| MissionTypeError::Io {
         path: path.to_path_buf(),
         source,
@@ -275,7 +276,7 @@ fn validate_skill_md(name: &str, path: &Path) -> Result<(), MissionTypeError> {
             detail: "SKILL.md instruction body must not be empty".to_string(),
         });
     }
-    Ok(())
+    Ok(description.to_string())
 }
 
 fn split_skill_frontmatter(text: &str) -> Result<(&str, &str), String> {
