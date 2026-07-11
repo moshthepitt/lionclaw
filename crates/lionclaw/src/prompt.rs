@@ -328,16 +328,16 @@ Rules the engine enforces (an invalid proposal is rejected):
   gate a set of assertions behind their validators
 - the DAG is acyclic and every dependency resolves
 
-Use exact names from the available role and oracle inventories. Angle-bracketed
-values in the shape example below are placeholders.
+When assigning a role or binding an oracle, use its exact name from the
+available inventories. Angle-bracketed values in the shape example below are
+placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.plan-handoff.v1\",
     \"type\": \"plan\",
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<why this contract>\"},
-    \"proposal\": {\"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\",
-                                    \"oracle\": \"<available-oracle>\"}],
+    \"proposal\": {\"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
                    \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
                                \"targets\": [\"OUTCOME-HOLDS\"], \"role\": \"<available-work-role>\",
                                \"depends_on\": []}]},
@@ -440,6 +440,7 @@ mod tests {
         assert!(prompt.contains("Judge voice and continuity independently."));
         assert!(!prompt.contains("cargo-test"));
         assert!(!prompt.contains("implementer"));
+        assert!(!prompt.contains("<available-oracle>"));
         assert!(!prompt.contains("Planning-only private instructions."));
         assert!(!prompt.contains("Terminal-review-only private instructions."));
     }
