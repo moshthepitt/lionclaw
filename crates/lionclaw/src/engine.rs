@@ -706,10 +706,10 @@ impl Engine {
     }
 
     /// Execute the closing review: one confined `emits-gap-verdict` role run
-    /// against a read-only snapshot of the judged commit. The handoff is
-    /// translated here — never trusted raw: the echoed nonce must match (a
-    /// worker-planted script executed by the reviewer can write the handoff
-    /// file but cannot read the prompt), `done=false` is "the review itself
+    /// against a complete checkout of the judged commit mounted read-only. The
+    /// handoff is translated here — never trusted raw: the echoed nonce must
+    /// match (a worker-planted script executed by the reviewer can write the
+    /// handoff file but cannot read the prompt), `done=false` is "the review itself
     /// did not complete" (an unfinished review is not a verdict), and the
     /// typed gaps are size-capped because they land inline in the event log.
     async fn execute_terminal_review(

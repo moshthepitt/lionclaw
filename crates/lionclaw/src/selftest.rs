@@ -40,7 +40,7 @@ use crate::runner::MissionProgramExecutor;
 use crate::store::MissionStore;
 use crate::workspace;
 
-use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec, WORKSPACE_MOUNT_TARGET};
+use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
 
 const RUNTIME_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
@@ -424,10 +424,10 @@ fn oracle_plan() -> PlanSubmission {
     }
 }
 
-/// A real writable worker without a model: it clones the repo, writes a
+/// A real writable worker without a model: it checks out the repo, writes a
 /// known-good fix and commits it **inside a real read-write container**, and
 /// returns the captured commit — proving the allow-side of confinement (writes
-/// land) and that the engine records the commit. Reuses the same clone/capture
+/// land) and that the engine records the commit. Reuses the same checkout/capture
 /// helpers as the production `OciRoleRunner`.
 struct ScriptedRoleRunner {
     fixed_lib: &'static str,
@@ -447,25 +447,17 @@ impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dest = request.state_dir.join("selftest-work").join(&attempt_tag);
-        let clone = workspace::create_worker_clone(
-            &request.workspace_dir,
-            &dest,
-            request.mission_id.as_str(),
-            &attempt_tag,
-            &request.base_sha,
-        )
-        .await?;
+        workspace::create_checkout(&request.workspace_dir, &dest, &request.base_sha).await?;
         // The produces-artifact role compiles to a writable workspace.
         let authority = compile_authority(&request.role, &AuthorityCeiling::default())
             .map_err(|e| anyhow::anyhow!("authority refused to compile: {e}"))?;
         // Write the fix and commit, in a real read-write container. Commit
-        // identity + gpgsign=off come from the clone's git config.
+        // identity + gpgsign=off come from the checkout's git config.
         let script = format!(
             "set -e; cd /workspace; cat > src/lib.rs <<'LIONCLAW_SELFTEST_EOF'\n{}LIONCLAW_SELFTEST_EOF\ngit add -A; git commit -q -m 'self-test scripted fix'",
             self.fixed_lib
         );
-        let output =
-            run_confined_sh(&authority, &clone.dir, MountAccess::ReadWrite, &[], &script).await?;
+        let output = run_confined_sh(&authority, &dest, &[], &script).await?;
         if output.exit_code != Some(0) {
             anyhow::bail!(
                 "scripted writer failed (exit {:?}): {}",
@@ -473,8 +465,14 @@ impl ScriptedRoleRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let head = workspace::capture_worker_result(&request.workspace_dir, &clone).await?;
-        workspace::remove_dir(&clone.dir).await;
+        let head = workspace::capture_worker_result(
+            &request.workspace_dir,
+            &dest,
+            request.mission_id.as_str(),
+            &attempt_tag,
+        )
+        .await?;
+        workspace::remove_dir(&dest).await;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
@@ -491,11 +489,10 @@ impl ScriptedRoleRunner {
 }
 
 /// Run a shell command in a real container under a compiled role plan. Shared
-/// by the writable scripted worker (rw) and the EROFS probe (ro).
+/// by the writable scripted worker and the read-only EROFS probe.
 async fn run_confined_sh(
     authority: &CompiledAuthority,
     workspace_source: &Path,
-    workspace_access: MountAccess,
     judged_roots: &[std::path::PathBuf],
     script: &str,
 ) -> Result<ExecutionOutput> {
@@ -508,15 +505,11 @@ async fn run_confined_sh(
         confinement: profile.confinement.clone(),
         skill_projection: None,
         mounts: MissionMounts {
-            workspace: MountSpec {
-                source: workspace_source.to_path_buf(),
-                target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: workspace_access,
-            },
+            workspace: workspace_source.to_path_buf(),
             extras: Vec::new(),
         },
         judged_roots,
-        environment: Vec::new(),
+        environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
         hard_timeout: Duration::from_secs(120),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
@@ -898,31 +891,40 @@ async fn check_terminal_review() -> Result<()> {
     }
 }
 
-/// (4) A read-only role's write to /workspace is denied by the container.
+/// (4) A read-only role gets complete Git inspection while writes to both the
+/// working tree and repository metadata are denied by the container.
 async fn check_confinement_erofs() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
-    let snapshot = tempfile::tempdir().context("tempdir")?;
-    let judged = snapshot.path().join("tree");
-    workspace::create_snapshot(repo.path(), &judged, "HEAD").await?;
+    let checkout = tempfile::tempdir().context("tempdir")?;
+    let judged = checkout.path().join("tree");
+    workspace::create_checkout(repo.path(), &judged, "HEAD").await?;
 
     let authority = oracle_authority("erofs-probe");
     let output = run_confined_sh(
         &authority,
         &judged,
-        MountAccess::ReadOnly,
         std::slice::from_ref(&judged),
-        // Use `echo` (a regular built-in): a redirection failure returns
-        // non-zero WITHOUT exiting the shell, so the `|| echo DENIED` branch
-        // actually runs and proves the script executed inside the container.
-        // (`: > file` would exit the shell — `:` is a special built-in.)
-        "echo probe > /workspace/PROBE && echo WROTE || echo DENIED",
+        "set -e; \
+         git rev-parse --is-inside-work-tree >/dev/null; \
+         git status --porcelain; \
+         git log -1 --format=%H >/dev/null; \
+         git blame -L 1,1 Cargo.toml >/dev/null; \
+         echo GIT_OK; \
+         if echo poison > /workspace/.git/HEAD; then echo GIT_WROTE; else echo GIT_DENIED; fi; \
+         if echo probe > /workspace/PROBE; then echo WROTE; else echo DENIED; fi",
     )
     .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    if stdout.contains("wrote") || judged.join("PROBE").exists() {
+    if !stdout.contains("git_ok") {
+        anyhow::bail!("Git inspection did not complete in the read-only checkout: {stdout:?}");
+    }
+    if stdout.contains("git_wrote") || !stdout.contains("git_denied") {
+        anyhow::bail!("read-only Git metadata was writable: {stdout:?}");
+    }
+    if stdout.lines().any(|line| line == "wrote") || judged.join("PROBE").exists() {
         anyhow::bail!("the read-only workspace was writable");
     }
     // Require the script's own DENIED marker: it proves /bin/sh actually ran
@@ -989,11 +991,7 @@ async fn check_runtime_skill_projection() -> Result<()> {
         confinement: profile.confinement,
         skill_projection: Some(projection),
         mounts: MissionMounts {
-            workspace: MountSpec {
-                source: workspace.path().to_path_buf(),
-                target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: MountAccess::ReadOnly,
-            },
+            workspace: workspace.path().to_path_buf(),
             extras,
         },
         judged_roots: &judged_roots,

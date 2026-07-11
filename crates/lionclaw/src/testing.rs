@@ -16,7 +16,7 @@ use crate::ports::{
 };
 
 /// A terminal-review verdict outcome that echoes the request prompt's nonce
-/// (judges have no clone, so `artifact` is always `None`).
+/// (judges are never captured, so `artifact` is always `None`).
 pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) -> RoleRunOutcome {
     RoleRunOutcome {
         handoff: Handoff::Review {

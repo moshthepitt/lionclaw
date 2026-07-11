@@ -38,7 +38,7 @@ pub struct OciRoleRunner {
     profiles: RuntimeProfiles,
     image_id: String,
     ceiling: AuthorityCeiling,
-    /// Serializes git worktree/clone operations inside this process; the store
+    /// Serializes Git checkout/capture operations inside this process; the store
     /// lease owns cross-process coordination.
     repo_lock: Arc<Mutex<()>>,
 }
@@ -167,51 +167,30 @@ impl RoleRunner for OciRoleRunner {
         )
         .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
 
-        let is_writer = request.role.output == OutputSemantics::ProducesArtifact;
-
         // Everything after the attempt dirs exist runs inside one block whose
         // Result is captured, so the teardown below reaps the whole attempt
         // directory on EVERY exit path — a failure in workspace isolation or
         // moat compilation, not only after the turn has run.
         let result: Result<RoleRunOutcome, RoleRunFailure> = async {
-            // Isolate the workspace. Writers get a clone (committable), everyone
-            // else a read-only snapshot of the base commit.
-            let (workspace_source, workspace_access, worker_clone) = {
+            let authority = compile_authority(&request.role, &self.ceiling)
+                .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
+            let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
+            // Every role gets the same complete checkout. Compiled authority is
+            // the only source of workspace mutability.
+            let workspace_source = dirs.root.join("work");
+            {
                 let _guard = self.repo_lock.lock().await;
-                if is_writer {
-                    let clone = workspace::create_worker_clone(
-                        &request.workspace_dir,
-                        &dirs.root.join("work"),
-                        request.mission_id.as_str(),
-                        &attempt_tag,
-                        &request.base_sha,
-                    )
-                    .await
-                    .map_err(|e| launch(format!("failed to create worker clone: {e}")))?;
-                    (clone.dir.clone(), MountAccess::ReadWrite, Some(clone))
-                } else {
-                    let snapshot = dirs.root.join("snapshot");
-                    workspace::create_snapshot(
-                        &request.workspace_dir,
-                        &snapshot,
-                        &request.base_sha,
-                    )
-                    .await
-                    .map_err(|e| launch(format!("failed to snapshot workspace: {e}")))?;
-                    (snapshot, MountAccess::ReadOnly, None)
-                }
-            };
-
+                workspace::create_checkout(
+                    &request.workspace_dir,
+                    &workspace_source,
+                    &request.base_sha,
+                )
+                .await
+                .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+            }
             // Compile the plan through the moat. Judged roots = the workspace
             // the verdict is about (only meaningful for verdict roles, but the
             // predicate is applied uniformly).
-            let authority = compile_authority(&request.role, &self.ceiling)
-                .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
-            let workspace_mount = MountSpec {
-                source: workspace_source.clone(),
-                target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: workspace_access,
-            };
             let mut extras = dirs.agent_mounts();
             extras.extend(skill_mounts);
             let environment = mission_environment(&dirs);
@@ -222,7 +201,7 @@ impl RoleRunner for OciRoleRunner {
                 confinement: profile.confinement.clone(),
                 skill_projection: profile.skill_projection.clone(),
                 mounts: MissionMounts {
-                    workspace: workspace_mount,
+                    workspace: workspace_source.clone(),
                     extras,
                 },
                 judged_roots: &judged_roots,
@@ -237,21 +216,24 @@ impl RoleRunner for OciRoleRunner {
                 .run_turn(&profile, &request, compiled.plan().clone())
                 .await?;
             let handoff = read_handoff(&dirs.handoff, request.role.output)?;
-            let artifact = if let Some(clone) = &worker_clone {
+            let artifact = if is_writer {
                 let _guard = self.repo_lock.lock().await;
-                let head_sha = workspace::capture_worker_result(&request.workspace_dir, clone)
-                    .await
-                    .map_err(|e| RoleRunFailure {
-                        // Only an uncommitted tree is agent behavior; git infra or
-                        // a moved HEAD is infrastructure.
-                        kind: match e {
-                            workspace::CaptureError::DirtyWorktree(_) => {
-                                RunErrorKind::DirtyWorktree
-                            }
-                            workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
-                        },
-                        detail: e.to_string(),
-                    })?;
+                let head_sha = workspace::capture_worker_result(
+                    &request.workspace_dir,
+                    &workspace_source,
+                    request.mission_id.as_str(),
+                    &attempt_tag,
+                )
+                .await
+                .map_err(|e| RoleRunFailure {
+                    // Only an uncommitted tree is agent behavior; Git
+                    // infrastructure failures remain infrastructure.
+                    kind: match e {
+                        workspace::CaptureError::DirtyWorktree(_) => RunErrorKind::DirtyWorktree,
+                        workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
+                    },
+                    detail: e.to_string(),
+                })?;
                 Some(ArtifactOutcome {
                     base_sha: request.base_sha.clone(),
                     head_sha,
@@ -268,7 +250,7 @@ impl RoleRunner for OciRoleRunner {
         .await;
 
         // Unconditional teardown of the whole attempt directory (workspace
-        // clone/snapshot, handoff, scratch=CARGO_TARGET_DIR, runtime homes) on
+        // checkout, handoff, scratch=CARGO_TARGET_DIR, runtime homes) on
         // every exit path: the handoff is already read into `result` and the
         // worker's commit already survives in the target repo's mission ref, so
         // nothing here is load-bearing once the run has settled.
@@ -377,6 +359,7 @@ fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
         ("XDG_DATA_HOME".to_string(), format!("{home}/.local/share")),
         ("XDG_STATE_HOME".to_string(), format!("{home}/.local/state")),
         ("TMPDIR".to_string(), "/tmp".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
         (
             "CARGO_HOME".to_string(),
             format!("{SCRATCH_MOUNT_TARGET}/cargo"),

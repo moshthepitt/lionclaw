@@ -47,7 +47,8 @@ pub struct RoleRunOutcome {
     pub handoff: Handoff,
     /// Engine-observed commits (never agent-claimed); `Some` for every
     /// artifact-producing role, even one that committed nothing — then
-    /// `head_sha == base_sha`. Readers/judges/planners have no clone, so `None`.
+    /// `head_sha == base_sha`. Readers/judges/planners are never captured, so
+    /// this is `None` for them.
     pub artifact: Option<ArtifactOutcome>,
     pub model_id: Option<String>,
 }

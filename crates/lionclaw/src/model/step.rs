@@ -68,7 +68,7 @@ pub struct TerminalReviewDispatchIntent {
     pub role: RoleName,
     pub attempt_no: u32,
     /// The commit under review (== `current_sha` at dispatch); the role's
-    /// workspace is snapshotted here and the verdict is stamped here.
+    /// checkout is pinned here and the verdict is stamped here.
     pub judged_sha: String,
 }
 

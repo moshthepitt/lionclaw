@@ -1,22 +1,13 @@
 //! Git workspace isolation for confined runs.
 //!
-//! Linked worktrees cannot cross the container boundary (their `.git` file
-//! points at the host repo by absolute path), so:
-//! - **Writers** get a full `git clone --no-hardlinks` at the base commit —
-//!   a self-contained repo; the user's `.git` never enters the container,
-//!   and no hardlinked object inode is shared with it. The engine fetches
-//!   the resulting commit back into the target repo under `refs/mission/…`
-//!   (content-addressed: `git rev-parse --verify` reconciles on resume).
-//! - **Judges and oracles** get a `checkout-index` snapshot of the exact
-//!   committed tree via a throwaway index — no `.git` at all, nothing to
-//!   tamper with. Deliberately NOT `git archive`: archive honors a committed
-//!   `.gitattributes export-ignore`, which would let a worker hide a file
-//!   (e.g. a failing test) from the very oracle judging its commit.
-//!
-//! Worker output is a recorded commit, never auto-applied (roborev's
-//! captured-patch discipline, adapted to content-addressed outcomes).
+//! Every role and oracle gets the same self-contained checkout at its exact
+//! base commit. The authority compiler decides whether that checkout is mounted
+//! read-write or read-only; workspace materialization has no role policy of its
+//! own. `--no-hardlinks` keeps confined Git objects independent from the user
+//! repository, including under OCI relabeling. Artifact-producing output is a
+//! recorded commit fetched back under `refs/mission/…`, never auto-applied.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
@@ -27,17 +18,7 @@ pub async fn head_sha(repo: &Path) -> Result<String> {
 }
 
 pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
-    git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{sha}^{{commit}}"),
-        ],
-    )
-    .await
-    .is_ok()
+    resolve_commit(repo, sha).await.is_ok()
 }
 
 /// Keep mission state out of the user's `git status` without touching tracked
@@ -74,48 +55,58 @@ pub async fn ensure_excluded(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A writer's isolated clone, checked out on a mission branch at `base_sha`.
-pub struct WorkerClone {
-    pub dir: PathBuf,
-    pub branch: String,
-}
-
-pub async fn create_worker_clone(
-    repo: &Path,
-    dest: &Path,
-    mission_id: &str,
-    attempt_tag: &str,
-    base_sha: &str,
-) -> Result<WorkerClone> {
+/// Create a clean, complete Git checkout at `sha`. Callers decide mount access;
+/// this function deliberately has no writer/judge/oracle mode.
+pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> {
     if dest.exists() {
         tokio::fs::remove_dir_all(dest)
             .await
-            .context("failed to clear stale worker clone")?;
+            .context("failed to clear stale checkout")?;
     }
-    tokio::fs::create_dir_all(dest.parent().context("clone dest has no parent")?).await?;
+    tokio::fs::create_dir_all(dest.parent().context("checkout dest has no parent")?).await?;
+    let expected = resolve_commit(repo, sha)
+        .await
+        .with_context(|| format!("resolving checkout commit '{sha}'"))?;
+    let expected = expected.trim();
     let repo_str = repo.to_string_lossy();
     let dest_str = dest.to_string_lossy();
     run(
-        Command::new("git").args(["clone", "--quiet", "--no-hardlinks", &repo_str, &dest_str]),
+        Command::new("git").args([
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            "--no-checkout",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "user.name=LionClaw Mission",
+            "-c",
+            "user.email=mission@lionclaw.local",
+            "-c",
+            "commit.gpgsign=false",
+            "--",
+            &repo_str,
+            &dest_str,
+        ]),
         "git clone",
     )
     .await?;
-    let branch = format!("mission/{mission_id}/{attempt_tag}");
-    git(dest, &["checkout", "--quiet", "-b", &branch, base_sha]).await?;
-    // Container-visible commit identity lives in the runtime home; the
-    // clone-local config is belt and braces for host-side git operations.
-    git(dest, &["config", "user.name", "LionClaw Mission"]).await?;
-    git(dest, &["config", "user.email", "mission@lionclaw.local"]).await?;
-    // The agent commits inside the container; never require a signing key.
-    git(dest, &["config", "commit.gpgsign", "false"]).await?;
-    Ok(WorkerClone {
-        dir: dest.to_path_buf(),
-        branch,
-    })
+    git(dest, &["checkout", "--quiet", "--detach", expected]).await?;
+    let actual = head_sha(dest).await?;
+    if actual != expected {
+        bail!("checkout HEAD {actual} does not match requested commit {expected}");
+    }
+    let status = git(dest, &["status", "--porcelain"]).await?;
+    if !status.is_empty() {
+        bail!("new checkout is unexpectedly dirty");
+    }
+    Ok(())
 }
 
 /// Why post-run artifact capture failed. Distinguishes the one agent-behavior
-/// case (an uncommitted tree) from everything else (git infra / a moved HEAD),
+/// case (an uncommitted tree) from everything else (Git infrastructure),
 /// so the runner labels the persisted failure correctly.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -127,76 +118,41 @@ pub enum CaptureError {
 
 /// Post-run artifact capture: the tree must be committed clean; the head
 /// commit is fetched back into the target repo under `refs/mission/…` so it
-/// survives clone teardown.
+/// survives checkout teardown.
 pub async fn capture_worker_result(
     repo: &Path,
-    clone: &WorkerClone,
+    checkout: &Path,
+    mission_id: &str,
+    attempt_tag: &str,
 ) -> Result<String, CaptureError> {
-    let status = git(&clone.dir, &["status", "--porcelain"]).await?;
+    let status = git(checkout, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         return Err(CaptureError::DirtyWorktree(status.lines().count()));
     }
-    let head = head_sha(&clone.dir).await?;
-    // Fetch the clone's *HEAD commit* (not the branch tip) so the object we
-    // record is the object we store — a worker that moves HEAD off its branch
-    // (detached commit, `checkout -b other`, `reset`) cannot make the engine
-    // record a `head_sha` it never transferred.
-    let refspec = format!("+HEAD:refs/{}", clone.branch);
-    let clone_str = clone.dir.to_string_lossy();
+    let head = head_sha(checkout).await?;
+    // Fetch the checkout's HEAD commit so the object we report is the object we
+    // store, regardless of which refs the agent created or moved locally.
+    let refspec = format!("+HEAD:refs/mission/{mission_id}/{attempt_tag}");
+    let checkout_str = checkout.to_string_lossy();
     run(
         Command::new("git")
             .current_dir(repo)
-            .args(["fetch", "--quiet", &clone_str, &refspec]),
-        "git fetch from worker clone",
+            .args(["fetch", "--quiet", &checkout_str, &refspec]),
+        "git fetch from worker checkout",
     )
     .await?;
-    // The engine observes the commit from git, never trusts the agent: verify
-    // the recorded head actually landed in the target repo.
-    if !commit_exists(repo, &head).await {
+    // The engine observes the commit from Git, never trusts the agent: verify
+    // that the exact durable ref landed at the reported head.
+    let stored = resolve_commit(repo, &format!("refs/mission/{mission_id}/{attempt_tag}"))
+        .await
+        .map_err(CaptureError::Infra)?;
+    if stored.trim() != head {
         return Err(CaptureError::Infra(anyhow::anyhow!(
-            "worker HEAD {head} was not transferred into the repo (moved off its branch?)"
+            "captured mission ref points at {}, expected worker HEAD {head}",
+            stored.trim()
         )));
     }
     Ok(head)
-}
-
-/// Materialize a read-only snapshot of `sha`'s exact committed tree (no `.git`)
-/// for judges and oracles. Uses a throwaway index + `checkout-index` rather than
-/// `git archive`: archive would honor a committed `.gitattributes export-ignore`,
-/// letting a worker hide files from the oracle judging its own commit.
-pub async fn create_snapshot(repo: &Path, dest: &Path, sha: &str) -> Result<()> {
-    if dest.exists() {
-        tokio::fs::remove_dir_all(dest)
-            .await
-            .context("failed to clear stale snapshot")?;
-    }
-    tokio::fs::create_dir_all(dest).await?;
-    let index = dest.with_extension("snapshot.index");
-    let index_str = index.to_string_lossy().into_owned();
-    // `checkout-index --prefix` requires a trailing separator and creates the
-    // leading directories itself.
-    let prefix = format!("{}/", dest.to_string_lossy());
-    let materialize = async {
-        run(
-            Command::new("git")
-                .current_dir(repo)
-                .env("GIT_INDEX_FILE", &index_str)
-                .args(["read-tree", sha]),
-            "git read-tree",
-        )
-        .await?;
-        run(
-            Command::new("git")
-                .current_dir(repo)
-                .env("GIT_INDEX_FILE", &index_str)
-                .args(["checkout-index", "--all", &format!("--prefix={prefix}")]),
-            "git checkout-index",
-        )
-        .await
-    };
-    let result = materialize.await;
-    let _ = tokio::fs::remove_file(&index).await;
-    result
 }
 
 pub async fn remove_dir(dir: &Path) {
@@ -228,6 +184,21 @@ pub async fn create_branch(repo: &Path, name: &str, sha: &str, force: bool) -> R
     args.push(name);
     args.push(sha);
     git(repo, &args).await.map(|_| ())
+}
+
+async fn resolve_commit(repo: &Path, revision: &str) -> Result<String> {
+    let peeled = format!("{revision}^{{commit}}");
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &peeled,
+        ],
+    )
+    .await
 }
 
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -286,41 +257,38 @@ mod tests {
         head_sha(dir).await.unwrap()
     }
 
-    // Regression (QA): a worker that moves HEAD off its mission branch must
-    // not make the engine record a commit that was never transferred.
     #[tokio::test]
-    async fn capture_records_the_actual_head_even_when_moved_off_branch() {
+    async fn capture_records_the_actual_detached_head() {
         let repo = tempfile::tempdir().unwrap();
         let base = init_repo(repo.path()).await;
+        let source_status = git(repo.path(), &["status", "--porcelain"]).await.unwrap();
         let work = tempfile::tempdir().unwrap();
-        let clone = create_worker_clone(
-            repo.path(),
-            &work.path().join("clone"),
-            "mabc123def456",
-            "fix-a1",
-            &base,
-        )
-        .await
-        .unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
 
-        // The worker detaches HEAD and commits there, leaving the mission
-        // branch pointing at base.
-        git(&clone.dir, &["checkout", "--quiet", "--detach"])
+        std::fs::write(checkout.join("f.txt"), "worker change\n").unwrap();
+        git(&checkout, &["add", "-A"]).await.unwrap();
+        git(&checkout, &["commit", "-q", "-m", "off-branch"])
             .await
             .unwrap();
-        std::fs::write(clone.dir.join("f.txt"), "worker change\n").unwrap();
-        git(&clone.dir, &["add", "-A"]).await.unwrap();
-        git(&clone.dir, &["commit", "-q", "-m", "off-branch"])
-            .await
-            .unwrap();
-        let detached = head_sha(&clone.dir).await.unwrap();
+        let detached = head_sha(&checkout).await.unwrap();
         assert_ne!(detached, base);
 
-        let recorded = capture_worker_result(repo.path(), &clone).await.unwrap();
+        let recorded = capture_worker_result(repo.path(), &checkout, "mabc123def456", "fix-a1")
+            .await
+            .unwrap();
         // The recorded head is the worker's actual HEAD, and it really landed
-        // in the target repo (so a later snapshot succeeds).
+        // in the target repo (so a later checkout succeeds).
         assert_eq!(recorded, detached);
         assert!(commit_exists(repo.path(), &recorded).await);
+        assert_eq!(head_sha(repo.path()).await.unwrap(), base);
+        assert_eq!(
+            git(repo.path(), &["status", "--porcelain"]).await.unwrap(),
+            source_status,
+            "capture must not change the source worktree or index"
+        );
     }
 
     #[tokio::test]
@@ -328,20 +296,15 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let base = init_repo(repo.path()).await;
         let work = tempfile::tempdir().unwrap();
-        let clone = create_worker_clone(
-            repo.path(),
-            &work.path().join("clone"),
-            "mabc123def456",
-            "a1",
-            &base,
-        )
-        .await
-        .unwrap();
-        std::fs::write(clone.dir.join("f.txt"), "uncommitted\n").unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        std::fs::write(checkout.join("f.txt"), "uncommitted\n").unwrap();
         // An uncommitted tree is DirtyWorktree specifically — not the Infra
         // bucket, which would mislabel the persisted failure.
         assert!(matches!(
-            capture_worker_result(repo.path(), &clone).await,
+            capture_worker_result(repo.path(), &checkout, "mabc123def456", "a1").await,
             Err(CaptureError::DirtyWorktree(_))
         ));
     }
@@ -422,14 +385,10 @@ mod tests {
         );
     }
 
-    // The oracle judges the EXACT committed tree: a worker must not be able to
-    // hide a file (e.g. a failing test) from its judge with a committed
-    // `.gitattributes export-ignore`, which `git archive` honors. Regression for
-    // the false-Verified vector.
     #[tokio::test]
-    async fn snapshot_materializes_the_full_tree_ignoring_export_ignore() {
+    async fn checkout_is_a_clean_complete_git_repo_at_the_exact_commit() {
         let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path()).await;
+        let base = init_repo(repo.path()).await;
         std::fs::write(repo.path().join("hidden.txt"), "the failing test\n").unwrap();
         std::fs::write(
             repo.path().join(".gitattributes"),
@@ -440,19 +399,94 @@ mod tests {
         git(repo.path(), &["commit", "-q", "-m", "hide a file"])
             .await
             .unwrap();
-        let head = head_sha(repo.path()).await.unwrap();
+        let judged = head_sha(repo.path()).await.unwrap();
 
-        let dest = repo.path().join("snap");
-        create_snapshot(repo.path(), &dest, &head).await.unwrap();
-        assert!(
-            dest.join("hidden.txt").exists(),
-            "an export-ignored file must still appear in the oracle's snapshot"
-        );
+        let attempt = tempfile::tempdir().unwrap();
+        let checkout = attempt.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &judged)
+            .await
+            .unwrap();
+
+        assert!(checkout.join(".git").is_dir());
+        assert_eq!(head_sha(&checkout).await.unwrap(), judged);
+        assert!(git(&checkout, &["status", "--porcelain"])
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            std::fs::read_to_string(dest.join("hidden.txt")).unwrap(),
-            "the failing test\n",
-            "the snapshot is the exact committed bytes"
+            std::fs::read_to_string(checkout.join("hidden.txt")).unwrap(),
+            "the failing test\n"
         );
-        assert!(!dest.join(".git").exists(), "the snapshot has no .git");
+        assert!(git(&checkout, &["log", "--format=%H", "--all"])
+            .await
+            .unwrap()
+            .lines()
+            .any(|line| line == base));
+        assert_eq!(
+            git(
+                &checkout,
+                &["show", "--format=", "--no-renames", "HEAD:hidden.txt"]
+            )
+            .await
+            .unwrap(),
+            "the failing test\n"
+        );
+        assert!(git(&checkout, &["diff", "--stat", &base, &judged])
+            .await
+            .unwrap()
+            .contains("hidden.txt"));
+        assert!(git(&checkout, &["blame", "-L", "1,1", "f.txt"])
+            .await
+            .is_ok());
+        assert_eq!(
+            git(&checkout, &["merge-base", &base, &judged])
+                .await
+                .unwrap()
+                .trim(),
+            base
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_a_non_commit_revision() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        std::fs::write(repo.path().join("blob.txt"), "not a commit\n").unwrap();
+        let blob = git(repo.path(), &["hash-object", "-w", "blob.txt"])
+            .await
+            .unwrap();
+        let attempt = tempfile::tempdir().unwrap();
+        let checkout = attempt.path().join("checkout");
+
+        let error = create_checkout(repo.path(), &checkout, blob.trim())
+            .await
+            .expect_err("a blob cannot be judged as a commit");
+
+        assert!(error.to_string().contains("resolving checkout commit"));
+        assert!(!checkout.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_does_not_hardlink_git_objects_to_the_source() {
+        use std::os::unix::fs::MetadataExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let head = init_repo(repo.path()).await;
+        let attempt = tempfile::tempdir().unwrap();
+        let checkout = attempt.path().join("checkout");
+
+        create_checkout(repo.path(), &checkout, &head)
+            .await
+            .unwrap();
+
+        let object = Path::new("objects").join(&head[..2]).join(&head[2..]);
+        let source = std::fs::metadata(repo.path().join(".git").join(&object)).unwrap();
+        let isolated = std::fs::metadata(checkout.join(".git").join(&object)).unwrap();
+        assert_ne!(
+            (source.dev(), source.ino()),
+            (isolated.dev(), isolated.ino()),
+            "confined checkout objects must not share source-repository inodes"
+        );
     }
 }

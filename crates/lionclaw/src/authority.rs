@@ -169,9 +169,9 @@ pub fn oracle_authority(oracle_name: &str) -> CompiledAuthority {
 /// The mount set the engine builds for one dispatch.
 #[derive(Debug, Clone)]
 pub struct MissionMounts {
-    /// The judged/edited tree → `/workspace`; access is set here and must
-    /// agree with the compiled authority.
-    pub workspace: MountSpec,
+    /// The judged/edited tree. The compiler creates its `/workspace` mount and
+    /// derives access solely from the compiled authority.
+    pub workspace: PathBuf,
     /// Handoff, scratch, runtime-state mounts — sources must live outside
     /// any judged root.
     pub extras: Vec<MountSpec>,
@@ -257,9 +257,7 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
     // judge. (The `Judge` violation names are historical; they mean "a role that
     // must not be able to influence what it reads".)
     if authority.output != OutputSemantics::ProducesArtifact {
-        if authority.preset.workspace_access != WorkspaceAccess::ReadOnly
-            || request.mounts.workspace.access != MountAccess::ReadOnly
-        {
+        if authority.preset.workspace_access != WorkspaceAccess::ReadOnly {
             return Err(MoatViolation::WritableJudge { role });
         }
         if authority.preset.mount_runtime_secrets {
@@ -296,12 +294,15 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         }
     }
 
-    // Compile. The workspace mount's access is forced from the authority —
-    // the mount builder cannot widen it.
-    let mut workspace = request.mounts.workspace;
-    workspace.access = match authority.preset.workspace_access {
-        WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
-        WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
+    // Compile. Callers provide only a source path; workspace access exists in
+    // one place and cannot be widened by a mount builder.
+    let workspace = MountSpec {
+        source: request.mounts.workspace,
+        target: WORKSPACE_MOUNT_TARGET.to_string(),
+        access: match authority.preset.workspace_access {
+            WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
+            WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
+        },
     };
     let working_dir = workspace.source.to_string_lossy().into_owned();
     let mut mounts = vec![workspace];
@@ -366,13 +367,9 @@ mod tests {
         ConfinementConfig::Oci(Default::default())
     }
 
-    fn mounts(workspace_access: MountAccess, extras: Vec<MountSpec>) -> MissionMounts {
+    fn mounts(extras: Vec<MountSpec>) -> MissionMounts {
         MissionMounts {
-            workspace: MountSpec {
-                source: "/repo".into(),
-                target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: workspace_access,
-            },
+            workspace: "/repo".into(),
             extras,
         }
     }
@@ -452,21 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn writable_judge_plan_refuses_to_compile() {
-        let ceiling = AuthorityCeiling::default();
-        let judge = compile_authority(&role(OutputSemantics::EmitsVerdict, false), &ceiling)
-            .expect("judge");
-        // A mount builder bug hands the judge a writable workspace: refused.
-        let err = compile_role_plan(request(
-            &judge,
-            mounts(MountAccess::ReadWrite, Vec::new()),
-            &[],
-        ))
-        .expect_err("must refuse");
-        assert!(matches!(err, MoatViolation::WritableJudge { .. }));
-    }
-
-    #[test]
     fn forged_writable_judge_authority_refuses_to_compile() {
         // Even an authority forged with a writable preset (test-only
         // constructor; production fields are private) hits the moat.
@@ -478,12 +460,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let err = compile_role_plan(request(
-            &forged,
-            mounts(MountAccess::ReadOnly, Vec::new()),
-            &[],
-        ))
-        .expect_err("must refuse");
+        let err =
+            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
         assert!(matches!(err, MoatViolation::WritableJudge { .. }));
     }
 
@@ -501,12 +479,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let err = compile_role_plan(request(
-            &forged,
-            mounts(MountAccess::ReadOnly, Vec::new()),
-            &[],
-        ))
-        .expect_err("must refuse");
+        let err =
+            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
         assert!(matches!(err, MoatViolation::SecretsForJudge { .. }));
     }
 
@@ -519,12 +493,8 @@ mod tests {
         };
         preset.escape_classes.insert(EscapeClass::ChannelSend);
         let forged = CompiledAuthority::for_tests("forged", OutputSemantics::EmitsVerdict, preset);
-        let err = compile_role_plan(request(
-            &forged,
-            mounts(MountAccess::ReadOnly, Vec::new()),
-            &[],
-        ))
-        .expect_err("must refuse");
+        let err =
+            compile_role_plan(request(&forged, mounts(Vec::new()), &[])).expect_err("must refuse");
         assert!(matches!(err, MoatViolation::JudgeEscape { .. }));
     }
 
@@ -539,12 +509,8 @@ mod tests {
             target: "/mission/handoff".to_string(),
             access: MountAccess::ReadWrite,
         };
-        let err = compile_role_plan(request(
-            &judge,
-            mounts(MountAccess::ReadOnly, vec![overlapping]),
-            &judged,
-        ))
-        .expect_err("must refuse");
+        let err = compile_role_plan(request(&judge, mounts(vec![overlapping]), &judged))
+            .expect_err("must refuse");
         assert!(matches!(
             err,
             MoatViolation::RwMountOverlapsJudgedSet { .. }
@@ -570,12 +536,8 @@ mod tests {
             target: "/mission/handoff".to_string(),
             access: MountAccess::ReadWrite,
         };
-        let err = compile_role_plan(request(
-            &judge,
-            mounts(MountAccess::ReadOnly, vec![sneaky]),
-            &judged,
-        ))
-        .expect_err("must refuse");
+        let err = compile_role_plan(request(&judge, mounts(vec![sneaky]), &judged))
+            .expect_err("must refuse");
         assert!(matches!(
             err,
             MoatViolation::RwMountOverlapsJudgedSet { .. }
@@ -593,12 +555,8 @@ mod tests {
             target: "/mission/context".to_string(),
             access: MountAccess::ReadOnly,
         };
-        compile_role_plan(request(
-            &judge,
-            mounts(MountAccess::ReadOnly, vec![ro_extra]),
-            &judged,
-        ))
-        .expect("read-only overlap is fine");
+        compile_role_plan(request(&judge, mounts(vec![ro_extra]), &judged))
+            .expect("read-only overlap is fine");
     }
 
     #[test]
@@ -618,7 +576,7 @@ mod tests {
             confinement.oci_mut().tmpfs.push(target.to_string());
             let err = compile_role_plan(RolePlanRequest {
                 confinement,
-                ..request(&judge, mounts(MountAccess::ReadOnly, Vec::new()), &[])
+                ..request(&judge, mounts(Vec::new()), &[])
             })
             .expect_err("tmpfs over the judged tree must refuse");
             assert!(
@@ -641,7 +599,7 @@ mod tests {
 
         let err = compile_role_plan(RolePlanRequest {
             confinement,
-            ..request(&judge, mounts(MountAccess::ReadOnly, Vec::new()), &[])
+            ..request(&judge, mounts(Vec::new()), &[])
         })
         .expect_err("tmpfs traversal must not bypass reserved targets");
 
@@ -661,7 +619,7 @@ mod tests {
             .push("/tmp:rw,size=512m".to_string());
         compile_role_plan(RolePlanRequest {
             confinement,
-            ..request(&worker, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+            ..request(&worker, mounts(Vec::new()), &[])
         })
         .expect("/tmp tmpfs compiles");
     }
@@ -679,7 +637,7 @@ mod tests {
         });
         let err = compile_role_plan(RolePlanRequest {
             confinement,
-            ..request(&worker, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+            ..request(&worker, mounts(Vec::new()), &[])
         })
         .expect_err("must refuse");
         assert!(matches!(err, MoatViolation::ReservedTargetShadowed { .. }));
@@ -698,7 +656,7 @@ mod tests {
 
         let compiled = compile_role_plan(RolePlanRequest {
             confinement,
-            ..request(&authority, mounts(MountAccess::ReadWrite, Vec::new()), &[])
+            ..request(&authority, mounts(Vec::new()), &[])
         })
         .expect("additional mount compiles");
 
@@ -710,17 +668,12 @@ mod tests {
     }
 
     #[test]
-    fn worker_plan_compiles_read_write_and_forces_workspace_access() {
+    fn worker_plan_compiles_a_read_write_workspace() {
         let ceiling = AuthorityCeiling::default();
         let worker = compile_authority(&role(OutputSemantics::ProducesArtifact, false), &ceiling)
             .expect("worker");
-        // Mount builder handed a read-only workspace; authority forces rw.
-        let compiled = compile_role_plan(request(
-            &worker,
-            mounts(MountAccess::ReadOnly, Vec::new()),
-            &[],
-        ))
-        .expect("compiles");
+        let compiled =
+            compile_role_plan(request(&worker, mounts(Vec::new()), &[])).expect("compiles");
         assert_eq!(compiled.plan().workspace_access, WorkspaceAccess::ReadWrite);
         assert_eq!(compiled.plan().mounts[0].access, MountAccess::ReadWrite);
         assert_eq!(compiled.plan().network_mode, NetworkMode::On);
@@ -738,7 +691,7 @@ mod tests {
         assert_eq!(authority.preset().install_policy, InstallPolicy::None);
         let compiled = compile_role_plan(request(
             &authority,
-            mounts(MountAccess::ReadOnly, Vec::new()),
+            mounts(Vec::new()),
             &[PathBuf::from("/repo")],
         ))
         .expect("oracle plan compiles");
