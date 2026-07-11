@@ -133,7 +133,6 @@ async fn start_codex_test_session_with_config(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root,
             runtime_session_ready,
         })
@@ -695,7 +694,6 @@ async fn review_control_is_unsupported_without_a_verified_native_mapping() {
                     command_name: "review".to_string(),
                     arguments: "base main".to_string(),
                     origin: RuntimeControlOrigin::SessionTurn,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context: RuntimeExecutionContext {
                     network_mode: NetworkMode::On,
@@ -2034,7 +2032,6 @@ async fn symlinked_thread_file_is_rejected() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root),
             runtime_session_ready,
         })
@@ -2063,7 +2060,6 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_a),
             runtime_session_ready: runtime_a_ready,
         })
@@ -2074,7 +2070,6 @@ async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_b),
             runtime_session_ready: runtime_b_ready,
         })
@@ -2112,7 +2107,6 @@ async fn start_codex_ready_test_session(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root),
             runtime_session_ready,
         })

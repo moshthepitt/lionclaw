@@ -846,6 +846,7 @@ impl Engine {
             .find(|t| t.id == intent.task_id)
             .context("dispatched task not in plan")?;
         let upstream_reports = self.resolve_upstream_reports(&state.tasks, &task.depends_on)?;
+        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
         let prompt = assemble_role_prompt(
             role,
             &PromptContext {
@@ -853,6 +854,7 @@ impl Engine {
                 task_body: &intent.body,
                 targets: &targets,
                 upstream_reports: &upstream_reports,
+                skills: &skills,
             },
         );
         Ok((prompt, "role"))
@@ -882,6 +884,7 @@ impl Engine {
             .keys()
             .map(|o| o.as_str().to_string())
             .collect();
+        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
         let prompt = assemble_planning_prompt(
             role,
             &PlanningPromptContext {
@@ -891,6 +894,7 @@ impl Engine {
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
+                skills: &skills,
             },
         );
         Ok((prompt, "plan-role"))
@@ -993,11 +997,13 @@ impl Engine {
         // worker-planted code, which is the exact forgery this token defeats.
         #[expect(clippy::disallowed_methods)]
         let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
         let prompt_text = assemble_terminal_review_prompt(
             role,
             &TerminalReviewPromptContext {
                 objective: &state.objective,
                 nonce: &nonce,
+                skills: &skills,
             },
         );
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));

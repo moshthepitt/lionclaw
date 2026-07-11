@@ -25,7 +25,6 @@ pub struct RuntimeSessionStartInput {
     pub session_id: Uuid,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
-    pub runtime_skill_ids: Vec<String>,
     pub runtime_state_root: Option<PathBuf>,
     pub runtime_session_ready: RuntimeSessionReady,
 }
@@ -47,7 +46,6 @@ pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
     pub prompt: String,
     pub fresh_prompt: Option<String>,
-    pub runtime_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +70,6 @@ pub struct RuntimeControlInput {
     pub command_name: String,
     pub arguments: String,
     pub origin: RuntimeControlOrigin,
-    pub runtime_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -146,6 +146,7 @@ async fn terminal_review_receives_its_declared_skill_packages() {
         lionclaw::mission_type::SkillPackage {
             name: "gap-check".to_string(),
             root: skill_root.clone(),
+            description: "gap check".to_string(),
         },
     );
     mission_type

@@ -142,4 +142,4 @@ Prefer `passed=false` with concrete limitations over speculative passes.
 - <optional skill/AGENTS.md/setup guidance for orchestrator>
 ```
 
-Call `end_node` with one item per assigned target, then exit immediately.
+Write /mission/handoff/handoff.json exactly as specified by the prompt.

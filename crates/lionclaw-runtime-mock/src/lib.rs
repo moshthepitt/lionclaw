@@ -32,14 +32,13 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{json, Value};
 use uuid::Uuid;
 
 use lionclaw_runtime_api::{
-    Capability, HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
-    RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
-    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
+    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult,
+    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeTurnJournalSender, RuntimeTurnResult, TurnEvent,
 };
 
 pub struct MockRuntimeAdapter;
@@ -78,49 +77,17 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             text: "mock runtime started turn".to_string(),
         })));
 
-        let skill_context = if input.runtime_skill_ids.is_empty() {
-            "no runtime skills available".to_string()
-        } else {
-            format!("runtime skill ids: {}", input.runtime_skill_ids.join(", "))
-        };
-
         drop(
             journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
-                text: format!("[mock] {} | prompt: {}", skill_context, input.prompt),
+                text: format!("[mock] prompt: {}", input.prompt),
             })),
         );
 
-        let mut capability_requests = Vec::new();
-        if let Some(skill_id) = input.runtime_skill_ids.first() {
-            for (index, (capability, payload)) in parse_capability_markers(&input.prompt)
-                .into_iter()
-                .enumerate()
-            {
-                capability_requests.push(RuntimeCapabilityRequest {
-                    request_id: format!("req-{}", index + 1),
-                    skill_id: skill_id.clone(),
-                    capability,
-                    scope: None,
-                    payload,
-                });
-            }
-        }
-
-        if capability_requests.is_empty() {
-            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
-        } else {
-            drop(journal.send(TurnEvent::canonical(RuntimeEvent::Status {
-                code: None,
-                text: format!(
-                    "mock runtime requested {} capability checks",
-                    capability_requests.len()
-                ),
-            })));
-        }
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
 
         Ok(RuntimeTurnResult {
-            capability_requests,
+            capability_requests: Vec::new(),
         })
     }
 
@@ -185,43 +152,48 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     }
 }
 
-fn parse_capability_markers(prompt: &str) -> Vec<(Capability, Value)> {
-    let mut requested = Vec::new();
-    for (marker, capability, payload) in [
-        (
-            "[cap:fs.read]",
-            Capability::FsRead,
-            json!({"path": "README.md"}),
-        ),
-        (
-            "[cap:fs.write]",
-            Capability::FsWrite,
-            json!({"path": "target/lionclaw-mock-write.txt", "content": "mock runtime write"}),
-        ),
-        (
-            "[cap:net.egress]",
-            Capability::NetEgress,
-            json!({"method": "GET", "url": "https://example.invalid"}),
-        ),
-        (
-            "[cap:secret.request]",
-            Capability::SecretRequest,
-            json!({"name": "example-secret"}),
-        ),
-        (
-            "[cap:channel.send]",
-            Capability::ChannelSend,
-            json!({"content": "mock runtime channel send"}),
-        ),
-        (
-            "[cap:scheduler.run]",
-            Capability::SchedulerRun,
-            json!({"job": "mock-job"}),
-        ),
-    ] {
-        if prompt.contains(marker) {
-            requested.push((capability, payload));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lionclaw_runtime_api::RuntimeSessionReady;
+
+    /// The mock never derives capability requests from skill IDs — the dead
+    /// speculative-activation path is gone. A prompt packed with capability
+    /// markers produces zero requests.
+    #[tokio::test]
+    async fn mock_turn_never_activates_capabilities_from_skill_ids() {
+        let adapter = MockRuntimeAdapter;
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: uuid::Uuid::nil(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_state_root: None,
+                runtime_session_ready: RuntimeSessionReady::not_ready(),
+            })
+            .await
+            .expect("session_start");
+
+        let (journal_tx, mut journal_rx) =
+            tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
+        let result = adapter
+            .turn(
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: "[cap:fs.read] [cap:net.egress] [cap:secret.request]".to_string(),
+                    fresh_prompt: None,
+                },
+                journal_tx,
+            )
+            .await
+            .expect("turn");
+
+        assert!(
+            result.capability_requests.is_empty(),
+            "no speculative capability activation from skill IDs"
+        );
+        // Drain events to satisfy the journal sender.
+        while journal_rx.try_recv().is_ok() {}
+        adapter.close(&handle).await.expect("close");
     }
-    requested
 }

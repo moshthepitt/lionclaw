@@ -21,6 +21,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
         SkillPackage {
             name: "engineering".to_string(),
             root: package_root.clone(),
+            description: "engineering skill".to_string(),
         },
     );
     let implementer = mission_type

@@ -513,7 +513,6 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: runtime_not_ready(),
         })
@@ -544,7 +543,6 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context,
                 executor: Box::new(executor),
@@ -609,7 +607,6 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: runtime_not_ready(),
         })
@@ -644,7 +641,6 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context,
                 executor: Box::new(executor),
@@ -708,7 +704,6 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: runtime_not_ready(),
         })
@@ -727,7 +722,6 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
                         runtime_session_id: handle_for_task.runtime_session_id,
                         prompt: "cancel me".to_string(),
                         fresh_prompt: None,
-                        runtime_skill_ids: Vec::new(),
                     },
                     context: acp_driver_context(runtime_state_root),
                     executor: Box::new(CancelableAcpProgramExecutor {
@@ -828,7 +822,6 @@ async fn acp_session_start_resumes_saved_ready_session() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root),
             runtime_session_ready,
         })
@@ -853,7 +846,6 @@ async fn acp_resume_uses_effective_working_directory() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: mark_runtime_ready(&runtime_state_root),
         })
@@ -880,7 +872,6 @@ async fn acp_resume_uses_effective_working_directory() {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context,
                 executor: Box::new(executor),
@@ -928,7 +919,6 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: mark_runtime_ready(&runtime_state_root),
         })
@@ -955,7 +945,6 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "continue".to_string(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context,
                 executor: Box::new(executor),
@@ -1003,7 +992,6 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: runtime_not_ready(),
         })
@@ -1029,7 +1017,6 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "hello".to_string(),
                     fresh_prompt: None,
-                    runtime_skill_ids: Vec::new(),
                 },
                 context: acp_driver_context(runtime_state_root.clone()),
                 executor: Box::new(executor),
@@ -1076,7 +1063,6 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
             session_id: Uuid::new_v4(),
             working_dir: None,
             environment: Vec::new(),
-            runtime_skill_ids: Vec::new(),
             runtime_state_root: Some(runtime_state_root.clone()),
             runtime_session_ready: mark_runtime_ready(&runtime_state_root),
         })
@@ -1103,7 +1089,6 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
                     runtime_session_id: handle.runtime_session_id,
                     prompt: "resume prompt".to_string(),
                     fresh_prompt: Some("fresh prompt".to_string()),
-                    runtime_skill_ids: Vec::new(),
                 },
                 context: acp_driver_context(runtime_state_root.clone()),
                 executor: Box::new(executor),

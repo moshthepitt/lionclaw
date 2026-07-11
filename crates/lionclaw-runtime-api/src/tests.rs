@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -8,12 +8,13 @@ use std::{
 use super::{
     canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
     safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
-    RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeExecutionContext, RuntimeMessageLane, RuntimeNativeHomeArtifactDir,
-    RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec,
-    RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTurnInput, RuntimeTurnJournalSender,
-    RuntimeTurnMode, TurnEvent, RUNTIME_SESSION_READY_MARKER,
+    RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlInput, RuntimeControlOrigin,
+    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
+    RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
+    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
+    RUNTIME_SESSION_READY_MARKER,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -236,7 +237,6 @@ fn turn_input(fresh_prompt: Option<String>) -> RuntimeTurnInput {
         runtime_session_id: "session".to_string(),
         prompt: "hello".to_string(),
         fresh_prompt,
-        runtime_skill_ids: Vec::new(),
     }
 }
 
@@ -668,4 +668,89 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
         event_rx.recv().await,
         Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "slow"
     ));
+}
+
+// ---- RUNTIME-SKILL-IDS-REMOVED regression coverage ----
+
+/// The workspace root, derived from this crate's manifest dir.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+/// Every relevant Rust source under the runtime API, LionClaw engine/runner,
+/// mock, Codex, and ACP/OpenCode crates — including tests and fixtures —
+/// must be free of the dead skill-id-activation identifier.
+#[test]
+fn no_dead_skill_id_field_remains_in_any_relevant_source() {
+    // Build the search token at runtime so the test's own source is not a
+    // false positive.
+    let needle = format!("runtime_{}ids", "skill_");
+    let crate_roots = [
+        "crates/lionclaw-runtime-api",
+        "crates/lionclaw-runtime-mock",
+        "crates/lionclaw-runtime-codex",
+        "crates/lionclaw-runtime-acp",
+        "crates/lionclaw",
+    ];
+    let root = workspace_root();
+    let mut scanned = 0u32;
+    let mut hits = Vec::new();
+    for crate_rel in crate_roots {
+        let crate_dir = root.join(crate_rel);
+        walk_rs_files(&crate_dir, &mut |path| {
+            scanned += 1;
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if text.contains(&needle) {
+                hits.push(path.display().to_string());
+            }
+        });
+    }
+    assert!(
+        scanned > 0,
+        "source scan must enumerate a non-empty file set"
+    );
+    assert!(hits.is_empty(), "{} found in: {hits:?}", needle);
+}
+
+fn walk_rs_files(dir: &Path, f: &mut impl FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rs_files(&path, f);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            f(&path);
+        }
+    }
+}
+
+/// The three public runtime input structs are constructible without any
+/// skill-ID field — the dead concept is gone from the contract.
+#[test]
+fn runtime_inputs_are_field_free_without_skill_ids() {
+    let _ = RuntimeSessionStartInput {
+        session_id: uuid::Uuid::nil(),
+        working_dir: None,
+        environment: Vec::new(),
+        runtime_state_root: None,
+        runtime_session_ready: RuntimeSessionReady::not_ready(),
+    };
+    let _ = RuntimeTurnInput {
+        runtime_session_id: "s".to_string(),
+        prompt: "p".to_string(),
+        fresh_prompt: None,
+    };
+    let _ = RuntimeControlInput {
+        runtime_session_id: "s".to_string(),
+        raw: "r".to_string(),
+        command_name: "c".to_string(),
+        arguments: String::new(),
+        origin: RuntimeControlOrigin::SessionTurn,
+    };
 }
