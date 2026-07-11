@@ -1072,6 +1072,16 @@ mod tests {
     }
 
     #[test]
+    fn one_work_task_may_own_multiple_assertions() {
+        let sub = submission(
+            vec![assertion("A1"), assertion("A2")],
+            vec![work("w1", &["A1", "A2"], &[])],
+        );
+
+        assert_eq!(codes(&sub), CLEAN);
+    }
+
+    #[test]
     fn groups_short_circuit_in_order() {
         // Id duplication suppresses shape errors.
         let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &[]);
