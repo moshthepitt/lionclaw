@@ -3,9 +3,10 @@
 //! Every role and oracle gets the same self-contained checkout at its exact
 //! base commit. The authority compiler decides whether that checkout is mounted
 //! read-write or read-only; workspace materialization has no role policy of its
-//! own. `--no-hardlinks` keeps confined Git objects independent from the user
-//! repository, including under OCI relabeling. Artifact-producing output is a
-//! recorded commit fetched back under `refs/mission/…`, never auto-applied.
+//! own. `--no-hardlinks --dissociate` keeps confined Git objects independent
+//! from the user repository and any object store it borrows from, including
+//! under OCI relabeling. Artifact-producing output is a recorded commit fetched
+//! back under `refs/mission/…`, never auto-applied.
 
 use std::path::Path;
 
@@ -68,31 +69,27 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
         .await
         .with_context(|| format!("resolving checkout commit '{sha}'"))?;
     let expected = expected.trim();
-    let repo_str = repo.to_string_lossy();
-    let dest_str = dest.to_string_lossy();
-    run(
-        Command::new("git").args([
-            "clone",
-            "--quiet",
-            "--no-hardlinks",
-            "--no-checkout",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "user.name=LionClaw Mission",
-            "-c",
-            "user.email=mission@lionclaw.local",
-            "-c",
-            "commit.gpgsign=false",
-            "--",
-            &repo_str,
-            &dest_str,
-        ]),
-        "git clone",
-    )
-    .await?;
+    let mut clone = Command::new("git");
+    clone.args([
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        "--dissociate",
+        "--no-checkout",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "user.name=LionClaw Mission",
+        "-c",
+        "user.email=mission@lionclaw.local",
+        "-c",
+        "commit.gpgsign=false",
+        "--",
+    ]);
+    clone.arg(repo).arg(dest);
+    run(&mut clone, "git clone").await?;
     git(dest, &["checkout", "--quiet", "--detach", expected]).await?;
     let actual = head_sha(dest).await?;
     if actual != expected {
@@ -133,14 +130,13 @@ pub async fn capture_worker_result(
     // Fetch the checkout's HEAD commit so the object we report is the object we
     // store, regardless of which refs the agent created or moved locally.
     let refspec = format!("+HEAD:refs/mission/{mission_id}/{attempt_tag}");
-    let checkout_str = checkout.to_string_lossy();
-    run(
-        Command::new("git")
-            .current_dir(repo)
-            .args(["fetch", "--quiet", &checkout_str, &refspec]),
-        "git fetch from worker checkout",
-    )
-    .await?;
+    let mut fetch = Command::new("git");
+    fetch
+        .current_dir(repo)
+        .args(["fetch", "--quiet"])
+        .arg(checkout)
+        .arg(&refspec);
+    run(&mut fetch, "git fetch from worker checkout").await?;
     // The engine observes the commit from Git, never trusts the agent: verify
     // that the exact durable ref landed at the reported head.
     let stored = resolve_commit(repo, &format!("refs/mission/{mission_id}/{attempt_tag}"))
@@ -488,5 +484,31 @@ mod tests {
             (isolated.dev(), isolated.ino()),
             "confined checkout objects must not share source-repository inodes"
         );
+    }
+
+    #[tokio::test]
+    async fn checkout_dissociates_from_a_source_object_alternate() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        let head = init_repo(&origin).await;
+        let source = temp.path().join("source");
+        let mut shared_clone = Command::new("git");
+        shared_clone
+            .args(["clone", "--quiet", "--shared", "--"])
+            .arg(&origin)
+            .arg(&source);
+        run(&mut shared_clone, "shared test clone").await.unwrap();
+        assert!(source.join(".git/objects/info/alternates").is_file());
+
+        let checkout = temp.path().join("checkout");
+        create_checkout(&source, &checkout, &head).await.unwrap();
+        assert!(!checkout.join(".git/objects/info/alternates").exists());
+
+        std::fs::rename(&origin, temp.path().join("origin-away")).unwrap();
+        assert_eq!(head_sha(&checkout).await.unwrap(), head);
+        assert!(git(&checkout, &["fsck", "--full", "--no-dangling"])
+            .await
+            .is_ok());
     }
 }
