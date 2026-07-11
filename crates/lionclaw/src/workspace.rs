@@ -133,7 +133,12 @@ pub async fn capture_worker_result(
     let mut fetch = Command::new("git");
     fetch
         .current_dir(repo)
-        .args(["fetch", "--quiet"])
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+        ])
         .arg(checkout)
         .arg(&refspec);
     run(&mut fetch, "git fetch from worker checkout").await?;
@@ -257,6 +262,8 @@ mod tests {
     async fn capture_records_the_actual_detached_head() {
         let repo = tempfile::tempdir().unwrap();
         let base = init_repo(repo.path()).await;
+        let fetch_head = repo.path().join(".git/FETCH_HEAD");
+        std::fs::write(&fetch_head, "source sentinel\n").unwrap();
         let source_status = git(repo.path(), &["status", "--porcelain"]).await.unwrap();
         let work = tempfile::tempdir().unwrap();
         let checkout = work.path().join("checkout");
@@ -279,12 +286,23 @@ mod tests {
         // in the target repo (so a later checkout succeeds).
         assert_eq!(recorded, detached);
         assert!(commit_exists(repo.path(), &recorded).await);
+        assert_eq!(
+            std::fs::read_to_string(fetch_head).unwrap(),
+            "source sentinel\n",
+            "capture must not rewrite the user's FETCH_HEAD"
+        );
         assert_eq!(head_sha(repo.path()).await.unwrap(), base);
         assert_eq!(
             git(repo.path(), &["status", "--porcelain"]).await.unwrap(),
             source_status,
             "capture must not change the source worktree or index"
         );
+
+        let replay = work.path().join("replay");
+        create_checkout(repo.path(), &replay, &recorded)
+            .await
+            .unwrap();
+        assert_eq!(head_sha(&replay).await.unwrap(), recorded);
     }
 
     #[tokio::test]
