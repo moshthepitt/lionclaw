@@ -88,6 +88,13 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
         };
         found_execution_role = true;
         prompt.push_str(&format!("### {} (`{}`)\n\n", role.name, kind.slug()));
+        if !role.skills.is_empty() {
+            prompt.push_str("Skills:");
+            for skill in &role.skills {
+                prompt.push_str(&format!(" `{skill}`"));
+            }
+            prompt.push_str("\n\n");
+        }
         prompt.push_str(&role.prompt_body);
         prompt.push('\n');
     }
@@ -321,18 +328,18 @@ Rules the engine enforces (an invalid proposal is rejected):
   gate a set of assertions behind their validators
 - the DAG is acyclic and every dependency resolves
 
-Use exact role names from `Available execution roles`; the angle-bracketed role
-in the shape example below is a placeholder.
+Use exact names from the available role and oracle inventories. Angle-bracketed
+values in the shape example below are placeholders.
 
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.plan-handoff.v1\",
     \"type\": \"plan\",
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<why this contract>\"},
-    \"proposal\": {\"assertions\": [{\"id\": \"TESTS-PASS\", \"prose\": \"...\",
-                                    \"oracle\": \"cargo-test\"}],
+    \"proposal\": {\"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\",
+                                    \"oracle\": \"<available-oracle>\"}],
                    \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
-                               \"targets\": [\"TESTS-PASS\"], \"role\": \"<available-work-role>\",
+                               \"targets\": [\"OUTCOME-HOLDS\"], \"role\": \"<available-work-role>\",
                                \"depends_on\": []}]},
     \"request_attention\": false}";
 
@@ -385,12 +392,14 @@ mod tests {
 
     #[test]
     fn planning_prompt_describes_coherent_ownership_and_configured_execution_roles() {
+        let mut novelist = named_role(
+            "novelist",
+            OutputSemantics::ProducesArtifact,
+            "Own coherent prose revisions.",
+        );
+        novelist.skills.push("prose-craft".to_string());
         let roles = [
-            named_role(
-                "novelist",
-                OutputSemantics::ProducesArtifact,
-                "Own coherent prose revisions.",
-            ),
+            novelist,
             named_role(
                 "reader-panel",
                 OutputSemantics::EmitsVerdict,
@@ -425,9 +434,12 @@ mod tests {
         assert!(prompt.contains("one work task may own multiple assertions"));
         assert!(prompt.contains("not instructions for you to follow"));
         assert!(prompt.contains("novelist (`work`)"));
+        assert!(prompt.contains("Skills: `prose-craft`"));
         assert!(prompt.contains("Own coherent prose revisions."));
         assert!(prompt.contains("reader-panel (`validate`)"));
         assert!(prompt.contains("Judge voice and continuity independently."));
+        assert!(!prompt.contains("cargo-test"));
+        assert!(!prompt.contains("implementer"));
         assert!(!prompt.contains("Planning-only private instructions."));
         assert!(!prompt.contains("Terminal-review-only private instructions."));
     }
