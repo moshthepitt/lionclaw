@@ -486,13 +486,7 @@ fn check_shape(
                 // kind — this single chokepoint keeps a report/proposal role out
                 // of an executed plan (closing planning recursion and the
                 // manual-submit hole).
-                let compatible = match output {
-                    OutputSemantics::ProducesArtifact => task.kind == TaskKind::Work,
-                    OutputSemantics::EmitsVerdict => task.kind == TaskKind::Validate,
-                    OutputSemantics::ProducesReport
-                    | OutputSemantics::EmitsGapVerdict
-                    | OutputSemantics::ProposesPlan => false,
-                };
+                let compatible = output.execution_task_kind() == Some(task.kind);
                 if !compatible {
                     errors.push(err(
                         "role_output_mismatch",

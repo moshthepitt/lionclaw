@@ -39,6 +39,16 @@ impl OutputSemantics {
             Self::ProposesPlan => "proposes-plan",
         }
     }
+
+    /// The execution task kind this output may serve. Planning and terminal
+    /// review outputs never appear in a submitted execution plan.
+    pub const fn execution_task_kind(self) -> Option<TaskKind> {
+        match self {
+            Self::ProducesArtifact => Some(TaskKind::Work),
+            Self::EmitsVerdict => Some(TaskKind::Validate),
+            Self::ProducesReport | Self::EmitsGapVerdict | Self::ProposesPlan => None,
+        }
+    }
 }
 
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
@@ -59,6 +69,16 @@ pub enum TaskKind {
     Work,
     Validate,
     Gate,
+}
+
+impl TaskKind {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Validate => "validate",
+            Self::Gate => "gate",
+        }
+    }
 }
 
 /// A DAG node. Dependencies are inline adjacency (`depends_on`); list order

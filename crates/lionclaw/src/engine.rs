@@ -859,8 +859,8 @@ impl Engine {
     }
 
     /// Assemble a planning role's prompt (`("plan-role", …)` namespace). Threads
-    /// the mission type's playbook + oracle inventory + upstream planning reports
-    /// through a separate assembler.
+    /// the mission type's playbook + execution-role/oracle inventories +
+    /// upstream planning reports through a separate assembler.
     fn assemble_planning_request(
         &self,
         state: &MissionState,
@@ -887,6 +887,7 @@ impl Engine {
             &PlanningPromptContext {
                 objective: &state.objective,
                 playbook: self.mission_type.playbook.as_deref(),
+                roles: &self.mission_type.roles,
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,

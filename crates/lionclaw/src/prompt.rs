@@ -4,8 +4,10 @@
 //! judge's prompt never includes a producer's narrative prose — verdict
 //! roles see the contract and the artifact, not the worker's story.
 
+use std::collections::BTreeMap;
+
 use crate::mission_type::RoleDefinition;
-use crate::model::{Assertion, OutputSemantics};
+use crate::model::{Assertion, OutputSemantics, RoleName};
 
 pub struct PromptContext<'a> {
     pub objective: &'a str,
@@ -54,6 +56,9 @@ pub struct PlanningPromptContext<'a> {
     pub objective: &'a str,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
+    /// The mission type's canonical role definitions. The assembler exposes
+    /// only roles eligible for submitted execution tasks.
+    pub roles: &'a BTreeMap<RoleName, RoleDefinition>,
     /// The oracles the author may bind assertions to.
     pub oracle_inventory: &'a [String],
     pub task_body: &'a str,
@@ -71,6 +76,23 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
     if let Some(playbook) = ctx.playbook {
         prompt.push_str("\n\n## Playbook\n\n");
         prompt.push_str(playbook);
+    }
+    prompt.push_str("\n\n## Available execution roles\n\n");
+    prompt.push_str(
+        "These are roles you may assign in the proposal, not instructions for you to follow.\n\n",
+    );
+    let mut found_execution_role = false;
+    for role in ctx.roles.values() {
+        let Some(kind) = role.output.execution_task_kind() else {
+            continue;
+        };
+        found_execution_role = true;
+        prompt.push_str(&format!("### {} (`{}`)\n\n", role.name, kind.slug()));
+        prompt.push_str(&role.prompt_body);
+        prompt.push('\n');
+    }
+    if !found_execution_role {
+        prompt.push_str("This mission type provides no execution roles.\n");
     }
     if !ctx.oracle_inventory.is_empty() {
         prompt.push_str("\n\n## Available oracles\n\n");
@@ -226,14 +248,16 @@ Your verdict is advisory: it gates closure and routes the mission to a
 human; it can never mark the mission verified.";
 
 const PRODUCES_ARTIFACT_SKELETON: &str = "\
-You are one role in an engineering mission run by an engine that independently
+You are an artifact-producing role in a mission whose engine independently
 verifies results; your report is never taken on faith.
 
 Your workspace is mounted read-write at /workspace. Work only there.
 
 When you are finished you MUST:
-1. Commit ALL changes in /workspace with a clear message (the engine records
-   the commit, not your description of it; uncommitted work is discarded).
+1. Leave /workspace clean. If you changed files, commit all changes with a
+   clear message; uncommitted work is discarded. If the assigned outcome was
+   already satisfied, verify it, do not create an empty commit, and leave the
+   unchanged HEAD in place. The engine accepts either outcome.
 2. Write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.work-handoff.v1\",
     \"type\": \"work\",
@@ -245,7 +269,7 @@ When you are finished you MUST:
    continues.";
 
 const EMITS_VERDICT_SKELETON: &str = "\
-You are an independent validator in an engineering mission. Judge only the
+You are an independent validator in a mission. Judge only the
 artifact in front of you against the contract assertions listed below; you
 have deliberately not been shown the author's own account of the work.
 
@@ -265,7 +289,7 @@ Your verdicts are advisory: they route work, they can never mark the mission
 verified.";
 
 const PRODUCES_REPORT_SKELETON: &str = "\
-You are a planning role in an engineering mission. Read the workspace (mounted
+You are a planning role in a mission. Read the workspace (mounted
 read-only at /workspace) and produce the report the task asks for — research,
 a draft plan, or an adversarial critique. You do not modify anything.
 
@@ -281,8 +305,14 @@ You are the planning author. Read the workspace (mounted read-only at
 /workspace) and the upstream reports, then propose the mission's contract and
 task DAG. You do not modify anything; your deliverable is the proposal itself.
 
-A proposal is a contract of falsifiable assertions plus a task DAG that covers
-them. Rules the engine enforces (an invalid proposal is rejected):
+A proposal separates outcomes from proof:
+- a `work` task owns one coherent outcome; one work task may own multiple assertions
+- assertions are independently provable properties of the resulting mission state
+- each assertion has exactly one active `work` owner; dependencies express
+  contribution and real ordering between tasks
+- `validate` tasks independently judge outcomes; they do not produce them
+
+Rules the engine enforces (an invalid proposal is rejected):
 - assertion ids match ^[A-Z][A-Z0-9-]+$ ; task ids match ^[A-Za-z][A-Za-z0-9_-]*$
 - each assertion is covered by exactly one `work` task (via its `targets`)
 - an assertion an oracle can check should bind that oracle by name; under a
@@ -291,6 +321,9 @@ them. Rules the engine enforces (an invalid proposal is rejected):
   gate a set of assertions behind their validators
 - the DAG is acyclic and every dependency resolves
 
+Use exact role names from `Available execution roles`; the angle-bracketed role
+in the shape example below is a placeholder.
+
 When you are finished you MUST write /mission/handoff/handoff.json exactly like:
    {\"schema\": \"lionclaw.mission.plan-handoff.v1\",
     \"type\": \"plan\",
@@ -298,8 +331,8 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
     \"report\": {\"kind\": \"inline\", \"text\": \"<why this contract>\"},
     \"proposal\": {\"assertions\": [{\"id\": \"TESTS-PASS\", \"prose\": \"...\",
                                     \"oracle\": \"cargo-test\"}],
-                   \"tasks\": [{\"id\": \"fix\", \"kind\": \"work\", \"body\": \"...\",
-                               \"targets\": [\"TESTS-PASS\"], \"role\": \"implementer\",
+                   \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
+                               \"targets\": [\"TESTS-PASS\"], \"role\": \"<available-work-role>\",
                                \"depends_on\": []}]},
     \"request_attention\": false}";
 
@@ -309,14 +342,18 @@ mod tests {
     use crate::model::RoleName;
 
     fn role(output: OutputSemantics) -> RoleDefinition {
+        named_role("r", output, "role body")
+    }
+
+    fn named_role(name: &str, output: OutputSemantics, prompt_body: &str) -> RoleDefinition {
         RoleDefinition {
-            name: RoleName::new("r").unwrap(),
+            name: RoleName::new(name).unwrap(),
             output,
             runtime: None,
             network: false,
             secrets: false,
             skills: Vec::new(),
-            prompt_body: "role body".to_string(),
+            prompt_body: prompt_body.to_string(),
         }
     }
 
@@ -336,6 +373,63 @@ mod tests {
             assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&upstream));
         assert!(prompt.contains("Handoffs from upstream tasks"));
         assert!(prompt.contains("the planner said"));
+    }
+
+    #[test]
+    fn worker_prompt_accepts_an_already_satisfied_outcome_without_an_empty_commit() {
+        let prompt = assemble_role_prompt(&role(OutputSemantics::ProducesArtifact), &ctx(&[]));
+
+        assert!(prompt.contains("do not create an empty commit"));
+        assert!(prompt.contains("unchanged HEAD"));
+    }
+
+    #[test]
+    fn planning_prompt_describes_coherent_ownership_and_configured_execution_roles() {
+        let roles = [
+            named_role(
+                "novelist",
+                OutputSemantics::ProducesArtifact,
+                "Own coherent prose revisions.",
+            ),
+            named_role(
+                "reader-panel",
+                OutputSemantics::EmitsVerdict,
+                "Judge voice and continuity independently.",
+            ),
+            named_role(
+                "strategist",
+                OutputSemantics::ProducesReport,
+                "Planning-only private instructions.",
+            ),
+            named_role(
+                "gap-reviewer",
+                OutputSemantics::EmitsGapVerdict,
+                "Terminal-review-only private instructions.",
+            ),
+        ]
+        .into_iter()
+        .map(|role| (role.name.clone(), role))
+        .collect();
+        let prompt = assemble_planning_prompt(
+            &role(OutputSemantics::ProposesPlan),
+            &PlanningPromptContext {
+                objective: "revise the novel",
+                playbook: None,
+                roles: &roles,
+                oracle_inventory: &[],
+                task_body: "author the plan",
+                upstream_reports: &[],
+            },
+        );
+
+        assert!(prompt.contains("one work task may own multiple assertions"));
+        assert!(prompt.contains("not instructions for you to follow"));
+        assert!(prompt.contains("novelist (`work`)"));
+        assert!(prompt.contains("Own coherent prose revisions."));
+        assert!(prompt.contains("reader-panel (`validate`)"));
+        assert!(prompt.contains("Judge voice and continuity independently."));
+        assert!(!prompt.contains("Planning-only private instructions."));
+        assert!(!prompt.contains("Terminal-review-only private instructions."));
     }
 
     #[test]

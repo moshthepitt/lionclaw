@@ -16,9 +16,13 @@ proves it.
    reviewer's remit on an oracle-bound assertion (point 3), never as an
    assertion of its own.
 
-2. **One work task per assertion.** Exactly one active `work` task must cover
-   each assertion (the engine enforces this). A work task is dispatched to
-   the `implementer`, runs in a writable clone, and commits its result.
+2. **Choose work boundaries by coherent change ownership.** Assertions are
+   units of proof; work tasks are units of change. Exactly one active `work`
+   task owns each assertion (the engine enforces this), while one task may own
+   several related assertions. Group behavior, tests, formatting, lint, and
+   build assertions with the implementation outcome they constrain instead of
+   creating work whose only purpose is to run a check. Available work roles
+   receive a writable Git checkout and commit any changes they make.
 
 3. **Add validators for depth on top of the oracle.** An oracle proves a claim
    is *green*; a `validate` task dispatched to the `reviewer` adds the judgement

@@ -61,6 +61,47 @@ async fn passing_oracle_yields_verified_finish() {
 }
 
 #[tokio::test]
+async fn already_satisfied_work_verifies_without_advancing_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(BASE_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "confirm the existing implementation",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .submit_plan(&mission_id, simple_plan())
+        .await
+        .expect("submit");
+
+    let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert!(matches!(
+        outcome,
+        AdvanceOutcome::Terminal {
+            phase: MissionPhase::Done {
+                finish: FinishClass::Verified
+            }
+        }
+    ));
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    assert_eq!(state.current_sha, BASE_SHA);
+    assert_eq!(
+        h.oracle_runner.calls.lock().expect("lock").as_slice(),
+        &[("cargo-test".to_string(), BASE_SHA.to_string())]
+    );
+}
+
+#[tokio::test]
 async fn failing_oracle_never_reports_verified() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
