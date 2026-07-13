@@ -29,11 +29,11 @@ pub use ids::{
     TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
-    Assertion, OutputSemantics, PlanProposal, PlanSubmission, PlanningDag, PlanningTask,
-    Requirement, RequirementDisposition, RequirementKind, Task, TaskKind,
+    Assertion, OutputSemantics, Plan, PlanProposal, PlanningDag, PlanningTask, Requirement,
+    RequirementDisposition, RequirementKind, Task, TaskKind,
 };
 pub use plan_validation::{
-    validate_plan_proposal, validate_plan_submission, validate_planning_dag, MissionTypeInventory,
+    validate_plan, validate_plan_proposal, validate_planning_dag, MissionTypeInventory,
     PlanValidationError, ProposalError,
 };
 pub use state::{

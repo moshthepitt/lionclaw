@@ -35,7 +35,7 @@ async fn passing_oracle_yields_verified_finish() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Terminal { phase } = outcome else {
         panic!("expected terminal, got {outcome:?}");
@@ -92,7 +92,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(
@@ -138,7 +138,7 @@ async fn failing_oracle_never_reports_verified() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {
         panic!("expected repair park, got {outcome:?}");
@@ -197,7 +197,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {
         panic!("expected parked, got {outcome:?}");

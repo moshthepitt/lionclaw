@@ -46,7 +46,7 @@ async fn approval_required_parks_then_approve_proceeds_to_verified() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     // Advance parks at the approval gate — no work has run.
     let parked = engine.advance(&mission_id).await.expect("advance");
@@ -122,7 +122,7 @@ async fn abort_decision_terminates_the_mission() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     engine.advance(&mission_id).await.expect("advance");
 
     engine

@@ -71,7 +71,7 @@ async fn started_with_config(
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     (h, mission_id)
 }
 
@@ -204,7 +204,7 @@ async fn terminal_review_receives_its_declared_skill_packages() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(review_calls(&h).len(), 1);
 }
@@ -502,7 +502,7 @@ async fn a_mission_without_the_config_never_dispatches_a_review() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(outcome, AdvanceOutcome::Terminal { .. }));
     assert!(review_calls(&h).is_empty(), "no config, no reviewer");
@@ -764,7 +764,7 @@ async fn a_hostile_log_with_an_unresolvable_reviewer_parks_instead_of_wedging() 
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {

@@ -36,7 +36,7 @@ async fn expired_lease_is_reclaimable_exactly_once() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let store = h.engine.store();
 
     // Record a request so there is a queued effect to lease.

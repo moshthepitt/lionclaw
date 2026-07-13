@@ -11,7 +11,7 @@ proves it.
    the finished code, with an uppercase id (`^[A-Z][A-Z0-9-]+$`) and prose the
    reviewer and oracles can judge against. This mission type stops at **verified**, so
    **every** contract assertion must bind an **oracle** — the engine rejects an
-   oracle-less assertion at submit. A claim no command can check (design,
+   oracle-less assertion when the plan is proposed. A claim no command can check (design,
    readability, intent) does not belong in the contract here; capture it as a
    reviewer's remit on an oracle-bound assertion (point 3), never as an
    assertion of its own.
@@ -53,7 +53,7 @@ for the oracle.
 This mission type stops at **verified**: the engine declares a verified finish only
 when every contract assertion has a fresh authoritative (oracle) pass at the
 final commit. Because of that, the `verified` bar rejects an oracle-less
-assertion at submit — a reviewer can never stand in for an oracle here; it only
+assertion when proposed — a reviewer can never stand in for an oracle here; it only
 adds depth on top of one. Do not weaken a test to make an oracle pass; the
 reviewer is instructed to catch exactly that.
 

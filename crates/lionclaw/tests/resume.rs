@@ -37,7 +37,7 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     let first = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(first, AdvanceOutcome::Terminal { .. }));
 
@@ -89,7 +89,7 @@ async fn crashed_role_run_synthesizes_failure_without_rerunning_the_llm() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     // Simulate a crash: record the request, lease it, then "die" before any
     // outcome lands.
@@ -178,7 +178,7 @@ async fn a_live_lease_is_not_reconciled_to_failure() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     // Record a role-run request and lease it with a long, still-live lease.
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -255,7 +255,7 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_role_run() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
 
     // Record + lease a role run, then "crash" (no outcome recorded).
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -334,7 +334,7 @@ async fn one_outcome_per_idempotency_key_is_a_store_invariant() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
 
     // Try to record a second outcome for the oracle's key: rejected.

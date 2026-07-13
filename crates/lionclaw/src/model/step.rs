@@ -26,7 +26,7 @@ use super::state::{MissionPhase, MissionState, ReviewOutcome, TaskStatus};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepDecision {
     /// Nothing for the loop to start (waiting on inflight effects, or on a
-    /// plan submission).
+    /// plan proposal).
     Idle,
     /// Open attention — park at zero compute (durable interrupt).
     Park,
@@ -272,7 +272,7 @@ mod tests {
     };
     use crate::model::fold::fold;
     use crate::model::ids::MissionId;
-    use crate::model::plan::{Assertion, PlanSubmission, Task};
+    use crate::model::plan::{Assertion, Plan, Task};
     use crate::model::verdict::FinishClass;
 
     fn aid(raw: &str) -> AssertionId {
@@ -376,7 +376,7 @@ mod tests {
         MissionEvent::PlanProposed {
             proposal: crate::model::PlanProposal {
                 base_revision: 0,
-                plan: PlanSubmission {
+                plan: Plan {
                     requirements: vec![],
                     assertions,
                     tasks,

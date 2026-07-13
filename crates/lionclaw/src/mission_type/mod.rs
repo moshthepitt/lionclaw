@@ -86,7 +86,7 @@ pub struct MissionType {
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
     /// The planning DAG (how an objective becomes a proposed contract). Empty
-    /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
+    /// ⇒ no in-engine planning; a mission of this type awaits a proposed plan.
     pub planning: PlanningDag,
     /// Mission-level role recovery budget.
     pub recovery: crate::model::RecoveryConfig,

@@ -665,7 +665,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                     // The honesty bar is the mission type's, not a hardcoded default.
                     stop: engine.mission_type().stop,
                     // The planning DAG the mission type ships (empty ⇒ awaits a
-                    // manually submitted plan).
+                    // manually proposed plan).
                     planning: engine.mission_type().planning.clone(),
                     recovery: engine.mission_type().recovery.clone(),
                     // The closing review the mission type ships (None ⇒ off).
@@ -2037,7 +2037,7 @@ mod tests {
             MissionEvent::PlanProposed {
                 proposal: PlanProposal {
                     base_revision: 0,
-                    plan: PlanSubmission {
+                    plan: Plan {
                         requirements: vec![],
                         assertions: vec![Assertion {
                             id: AssertionId::new("TESTS-PASS").unwrap(),

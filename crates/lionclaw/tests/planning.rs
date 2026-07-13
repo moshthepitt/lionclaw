@@ -14,8 +14,8 @@ use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
-    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, PlanProposal,
-    PlanSubmission, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
+    PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -115,7 +115,7 @@ fn planning_dag() -> PlanningDag {
 fn proposed_plan() -> PlanProposal {
     PlanProposal {
         base_revision: 0,
-        plan: PlanSubmission {
+        plan: Plan {
             requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
             assertions: vec![Assertion {
                 id: aid("TESTS-PASS"),
@@ -513,7 +513,7 @@ async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
 
     // (b) a proposal that fails validation under the `verified` stop bar (an
     // oracle-less assertion).
-    let invalid = PlanSubmission {
+    let invalid = Plan {
         requirements: vec![covered_requirement("CHECKABLE", "UNCHECKABLE")],
         assertions: vec![Assertion {
             id: aid("UNCHECKABLE"),

@@ -13,9 +13,9 @@ use std::sync::Arc;
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, PlanProposal,
-    PlanSubmission, Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName,
-    StopBar, Task, TaskKind,
+    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, Plan, PlanProposal,
+    Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName, StopBar, Task,
+    TaskKind,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
@@ -30,7 +30,7 @@ pub fn test_mission_type() -> MissionType {
         name: "software-dev-test".to_string(),
         digest: "test-digest".to_string(),
         // `Reviewed` so the shared harness accepts both oracle-bound and
-        // advisory plans; the `Verified` submit-reachability check is exercised
+        // advisory plans; the `Verified` proposal-reachability check is exercised
         // in the plan_validation unit tests. A reviewed-bar type must declare
         // a terminal review (the loader/engine invariant) — the shipped
         // `reviewer` judge serves; missions only run it when their CONFIG
@@ -102,8 +102,8 @@ pub fn review_mission_type() -> MissionType {
 
 /// A plan with a work task and a read-only reviewer over one oracle-less
 /// assertion — advisory-only, so it can never verify.
-pub fn advisory_plan() -> PlanSubmission {
-    PlanSubmission {
+pub fn advisory_plan() -> Plan {
+    Plan {
         requirements: vec![covered_requirement("READABLE-CODE", "STYLE-OK")],
         assertions: vec![Assertion {
             id: AssertionId::new("STYLE-OK").expect("assertion id"),
@@ -131,8 +131,8 @@ pub fn advisory_plan() -> PlanSubmission {
     }
 }
 
-pub fn simple_plan() -> PlanSubmission {
-    PlanSubmission {
+pub fn simple_plan() -> Plan {
+    Plan {
         requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
         assertions: vec![Assertion {
             id: AssertionId::new("TESTS-PASS").expect("assertion id"),
@@ -161,7 +161,7 @@ pub fn covered_requirement(id: &str, assertion: &str) -> Requirement {
     }
 }
 
-pub fn proposal(base_revision: u32, plan: PlanSubmission) -> PlanProposal {
+pub fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
     PlanProposal {
         base_revision,
         plan,

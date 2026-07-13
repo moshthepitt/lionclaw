@@ -27,10 +27,10 @@ use crate::engine::{AdvanceOutcome, Engine, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
     ArtifactOutcome, Assertion, AssertionId, DecisionAction, FinishClass, Gap, GapSeverity,
-    Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef,
-    PlanProposal, PlanSubmission, ProposalError, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId,
-    TaskKind, TaskStatus,
+    Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan,
+    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId, TaskKind,
+    TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -436,8 +436,8 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// The single oracle-bound assertion + its one covering work task.
-fn oracle_plan() -> PlanSubmission {
-    PlanSubmission {
+fn oracle_plan() -> Plan {
+    Plan {
         requirements: vec![Requirement {
             id: RequirementId::new("TESTS-GREEN").expect("requirement id"),
             kind: RequirementKind::Validation,
@@ -462,7 +462,7 @@ fn oracle_plan() -> PlanSubmission {
     }
 }
 
-fn proposal(base_revision: u32, plan: PlanSubmission) -> PlanProposal {
+fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
     PlanProposal {
         base_revision,
         plan,
@@ -632,7 +632,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
         engine
             .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
             .await
-            .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
         assert_verified(&engine, &id).await?;
         // The worker's writes landed and the engine recorded the commit.
         let state = engine.load_state(&id).await?;
@@ -690,7 +690,7 @@ async fn check_prepared_input() -> Result<()> {
     engine
         .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
-        .map_err(|error| anyhow::anyhow!("submit rejected: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("plan proposal rejected: {error}"))?;
     assert_verified(&engine, &id).await?;
 
     let state = engine.load_state(&id).await?;
@@ -763,7 +763,7 @@ async fn check_oracle_honesty() -> Result<()> {
     engine
         .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     let outcome = engine.advance(&id).await?;
     let state = engine.load_state(&id).await?;
     let verdict = state
@@ -832,7 +832,7 @@ async fn check_replanning() -> Result<()> {
             "initial plan",
         )
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
 
     // Replace the sole coverer with a new-id task in one complete revision.
     let mut next = oracle_plan();
@@ -953,7 +953,7 @@ async fn check_terminal_review() -> Result<()> {
             "initial plan",
         )
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
 
     engine.advance(&mission_id).await?;
     let parked = engine.load_state(&mission_id).await?;

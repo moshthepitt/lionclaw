@@ -1,7 +1,7 @@
 //! The mission event log vocabulary.
 //!
 //! An event is a **fact the fold cannot compute**: a recorded outcome, a
-//! submitted plan, a human decision. Everything the engine can derive
+//! proposed plan, a human decision. Everything the engine can derive
 //! (task/assertion status, gate results, attention, phase, finish class) is
 //! fold-derived and never stored, so state/log divergence is unrepresentable.
 //!
@@ -77,7 +77,7 @@ pub struct MissionConfig {
     pub stop: StopBar,
     /// The mission type's planning DAG (how an objective becomes a proposed
     /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
-    /// submitted plan.
+    /// proposed plan.
     #[serde(default)]
     pub planning: PlanningDag,
     #[serde(default)]
@@ -574,14 +574,13 @@ mod compat_tests {
     #[test]
     fn plan_proposal_round_trips_strict_requirement_dispositions() {
         use crate::model::{
-            Assertion, PlanSubmission, Requirement, RequirementDisposition, RequirementId,
-            RequirementKind,
+            Assertion, Plan, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         };
 
         let event = MissionEvent::PlanProposed {
             proposal: PlanProposal {
                 base_revision: 0,
-                plan: PlanSubmission {
+                plan: Plan {
                     requirements: vec![Requirement {
                         id: RequirementId::new("OBJECTIVE-MET").unwrap(),
                         kind: RequirementKind::Capability,

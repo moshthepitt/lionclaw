@@ -18,7 +18,7 @@ use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, Handoff, MissionConfig, OracleName, OutputSemantics,
-    PlanProposal, PlanSubmission, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    Plan, PlanProposal, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -315,7 +315,7 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
             &mission_id,
             proposal(
                 0,
-                PlanSubmission {
+                Plan {
                     requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
                     assertions: vec![Assertion {
                         id: aid("TESTS-PASS"),
@@ -430,7 +430,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
 fn proposed_plan() -> PlanProposal {
     PlanProposal {
         base_revision: 0,
-        plan: PlanSubmission {
+        plan: Plan {
             requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
             assertions: vec![Assertion {
                 id: aid("TESTS-PASS"),

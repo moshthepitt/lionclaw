@@ -44,7 +44,7 @@ pub struct Engine {
 
 #[derive(Debug)]
 pub enum AdvanceOutcome {
-    /// Mission is in `Planning` with no runnable planning DAG; submit a plan to
+    /// Mission is in `Planning` with no runnable planning DAG; propose a plan to
     /// proceed.
     AwaitingPlan,
     /// Parked on open attention (durable interrupt, zero compute).
@@ -564,7 +564,7 @@ impl Engine {
         match self.role_runner.run(request).await {
             Ok(outcome) => {
                 // A planning author's proposal is validated fail-closed before
-                // it is recorded, exactly like a manually submitted plan — an
+                // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
                 if let Handoff::Plan {
                     done: true,

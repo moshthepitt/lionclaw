@@ -97,7 +97,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
 
     assert_fold_litmus(&h, &mission_id).await;
@@ -134,7 +134,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine
         .advance(&mission_id)
         .await
@@ -184,7 +184,7 @@ async fn snapshot_resume_matches_full_refold() {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
 
     // Prove the snapshot branch is actually taken (not silently full-refolding

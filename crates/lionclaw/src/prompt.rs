@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::mission_type::{RoleDefinition, SkillPackage};
-use crate::model::{Assertion, OutputSemantics, PlanSubmission, RoleName};
+use crate::model::{Assertion, OutputSemantics, Plan, RoleName};
 
 pub struct PromptContext<'a> {
     pub objective: &'a str,
@@ -64,11 +64,11 @@ pub struct PlanningPromptContext<'a> {
     /// Accepted revision this planning run must propose against.
     pub base_revision: u32,
     /// The accepted plan when authoring a later revision.
-    pub current_plan: Option<&'a PlanSubmission>,
+    pub current_plan: Option<&'a Plan>,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
     /// The mission type's canonical role definitions. The assembler exposes
-    /// only roles eligible for submitted execution tasks.
+    /// only roles eligible for proposed execution tasks.
     pub roles: &'a BTreeMap<RoleName, RoleDefinition>,
     /// The oracles the author may bind assertions to.
     pub oracle_inventory: &'a [String],

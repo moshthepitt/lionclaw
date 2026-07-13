@@ -1,8 +1,8 @@
 //! Plan vocabulary: the contract of assertions and the task DAG.
 //!
 //! Shapes ported from Zenith (Apache-2.0, Intelligent Internet) `models.py`
-//! (`Task`, `TaskType`, `TaskList`), adapted: contract + task list are
-//! submitted together as one [`PlanSubmission`], and tasks reference mission-type
+//! (`Task`, `TaskType`, `TaskList`), adapted: one [`Plan`] contains the contract
+//! and task list, and tasks reference mission-type
 //! *roles* rather than skills.
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub struct Requirement {
 /// per-assertion judge), and `EmitsGapVerdict` (the engine-owned objective
 /// reviewer). The planning kinds are `ProducesReport` (research/draft/
 /// adversary — read-only prose) and `ProposesPlan` (the author, whose handoff
-/// carries a `PlanSubmission`); both are read-only and only ever run in the
+/// carries a complete `Plan`); both are read-only and only ever run in the
 /// contract-free planning phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -72,7 +72,7 @@ impl OutputSemantics {
     }
 
     /// The execution task kind this output may serve. Planning and terminal
-    /// review outputs never appear in a submitted execution plan.
+    /// review outputs never appear in an execution plan.
     pub const fn execution_task_kind(self) -> Option<TaskKind> {
         match self {
             Self::ProducesArtifact => Some(TaskKind::Work),
@@ -133,17 +133,17 @@ pub struct Task {
     pub depends_on: Vec<TaskId>,
 }
 
-/// The orchestrator-authored plan: contract + task DAG, submitted as one
-/// unit and validated fail-closed before anything runs.
+/// The orchestrator-authored contract and task DAG, validated fail-closed as
+/// one unit before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlanSubmission {
+pub struct Plan {
     pub requirements: Vec<Requirement>,
     pub assertions: Vec<Assertion>,
     pub tasks: Vec<Task>,
 }
 
-impl PlanSubmission {
+impl Plan {
     /// Whether every assertion binds an oracle — i.e. the plan is
     /// verified-possible (each claim can be authoritatively judged). Backs the
     /// CLI `verified-possible`/`reviewed-only` ceiling display. (The `Verified`
@@ -161,7 +161,7 @@ impl PlanSubmission {
 #[serde(deny_unknown_fields)]
 pub struct PlanProposal {
     pub base_revision: u32,
-    pub plan: PlanSubmission,
+    pub plan: Plan,
 }
 
 /// A node in the contract-free planning DAG. Unlike a `Task` it has no `kind`
@@ -180,7 +180,7 @@ pub struct PlanningTask {
 
 /// The planning DAG a mission type ships: how an objective becomes a proposed
 /// contract (research → draft → adversary → author). Empty means "no in-engine
-/// planning" — the mission idles awaiting a manually submitted plan.
+/// planning" — the mission idles awaiting a manually proposed plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanningDag {

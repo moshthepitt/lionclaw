@@ -1081,7 +1081,7 @@ mod tests {
         ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
     };
     use super::super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-    use super::super::plan::{Assertion, PlanProposal, PlanSubmission, Task, TaskKind};
+    use super::super::plan::{Assertion, Plan, PlanProposal, Task, TaskKind};
     use super::super::verdict::FinishClass;
     use super::*;
 
@@ -1136,11 +1136,11 @@ mod tests {
         }
     }
 
-    fn plan_submitted(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
+    fn plan_proposed(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
         MissionEvent::PlanProposed {
             proposal: PlanProposal {
                 base_revision: 0,
-                plan: PlanSubmission {
+                plan: Plan {
                     requirements: vec![],
                     assertions,
                     tasks,
@@ -1291,7 +1291,7 @@ mod tests {
         use super::super::verdict::FinishClass;
         let state = fold_log(vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("A1", Some("cargo-test"))],
                 vec![work_task("w"), validate_task("v")],
             ),
@@ -1324,7 +1324,7 @@ mod tests {
     fn accept_on_failed_gate_unblocks_downstream() {
         let base = vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("AA", None)],
                 vec![
                     work_task("w"),
@@ -1377,7 +1377,7 @@ mod tests {
         use super::super::verdict::FinishClass;
         let base = vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("A1", Some("cargo-test"))],
                 vec![work_task("w")],
             ),
@@ -1430,7 +1430,7 @@ mod tests {
         // Two gates differing only by case, both blocked by one dissent.
         let state = fold_log(vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("AA", None)],
                 vec![
                     work_task("w"),
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(state.tasks.is_empty() && state.contract.is_empty());
 
         let non_created = [
-            plan_submitted(vec![], vec![]),
+            plan_proposed(vec![], vec![]),
             role_completed("t1", "k1", work_handoff(true, false), None),
             MissionEvent::MissionAborted {
                 reason: "stop".into(),
@@ -1484,10 +1484,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_submitted_initializes_contract_and_tasks() {
+    fn plan_proposed_initializes_contract_and_tasks() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![
                     assertion("TESTS-PASS", Some("cargo-test")),
                     assertion("NO-ORACLE", None),
@@ -1553,7 +1553,7 @@ mod tests {
         for case in cases {
             let state = fold_log(vec![
                 created(),
-                plan_submitted(vec![], vec![work_task("t1")]),
+                plan_proposed(vec![], vec![work_task("t1")]),
                 role_completed(
                     "t1",
                     "k1",
@@ -1592,7 +1592,7 @@ mod tests {
     fn a_review_handoff_on_a_plan_task_fails_instead_of_wedging() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![], vec![work_task("t1")]),
+            plan_proposed(vec![], vec![work_task("t1")]),
             role_completed(
                 "t1",
                 "k1",
@@ -1653,7 +1653,7 @@ mod tests {
         for case in cases {
             let mut events = vec![
                 created(),
-                plan_submitted(
+                plan_proposed(
                     vec![assertion("A1", None)],
                     case.verdicts
                         .iter()
@@ -1698,7 +1698,7 @@ mod tests {
         // fail on not-done. No attention is raised either.
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![assertion("A1", None)], vec![validate_task("v1")]),
+            plan_proposed(vec![assertion("A1", None)], vec![validate_task("v1")]),
             role_completed(
                 "v1",
                 "k1",
@@ -1726,7 +1726,7 @@ mod tests {
     fn role_run_failed_fails_task_and_raises_attention() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![], vec![work_task("t1")]),
+            plan_proposed(vec![], vec![work_task("t1")]),
             role_requested("t1", "k1"),
             MissionEvent::RoleRunFailed {
                 task_id: tid("t1"),
@@ -1757,7 +1757,7 @@ mod tests {
     fn artifact_outcome_moves_current_sha() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![], vec![work_task("t1")]),
+            plan_proposed(vec![], vec![work_task("t1")]),
             role_completed(
                 "t1",
                 "k1",
@@ -1782,7 +1782,7 @@ mod tests {
         ] {
             let mut events = vec![
                 created(),
-                plan_submitted(
+                plan_proposed(
                     vec![assertion("TESTS-PASS", Some("cargo-test"))],
                     vec![work_task("t1")],
                 ),
@@ -1830,7 +1830,7 @@ mod tests {
     fn classify_finish_ignores_a_stale_authoritative_pass() {
         let mut state = fold_log(vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("TESTS-PASS", Some("cargo-test"))],
                 vec![work_task("t1")],
             ),
@@ -1859,7 +1859,7 @@ mod tests {
     fn signal_killed_oracle_is_not_a_pass() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("TESTS-PASS", Some("cargo-test"))],
                 vec![work_task("t1")],
             ),
@@ -1893,7 +1893,7 @@ mod tests {
     fn oracle_run_failed_raises_attention_without_verdict() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![assertion("TESTS-PASS", Some("cargo-test"))], vec![]),
+            plan_proposed(vec![assertion("TESTS-PASS", Some("cargo-test"))], vec![]),
             oracle_requested("TESTS-PASS", "base", "ko"),
             MissionEvent::OracleRunFailed {
                 assertion_ids: vec![aid("TESTS-PASS")],
@@ -1930,7 +1930,7 @@ mod tests {
                 reason: "operator stop".into(),
                 actor: "human".into(),
             },
-            plan_submitted(vec![], vec![work_task("t1")]),
+            plan_proposed(vec![], vec![work_task("t1")]),
             role_completed("t1", "k1", work_handoff(true, false), None),
         ])
         .expect("state");
@@ -1949,7 +1949,7 @@ mod tests {
     fn attention_ids_are_kind_and_anchor_scoped_and_stable_across_refolds() {
         let events = vec![
             created(),
-            plan_submitted(vec![], vec![work_task("t1")]),
+            plan_proposed(vec![], vec![work_task("t1")]),
             role_completed("t1", "k1", work_handoff(false, false), None),
         ];
         let once = fold_log(events.clone()).expect("first fold");
@@ -1973,7 +1973,7 @@ mod tests {
     fn unknown_ids_in_events_are_tolerated() {
         let state = fold_log(vec![
             created(),
-            plan_submitted(vec![assertion("KNOWN-1", None)], vec![]),
+            plan_proposed(vec![assertion("KNOWN-1", None)], vec![]),
             // Task never declared by any plan.
             role_completed("ghost", "k1", work_handoff(true, false), None),
             // Validator verdict for an assertion the contract never heard of.
@@ -2083,7 +2083,7 @@ mod tests {
     fn events_to_the_brink() -> Vec<MissionEvent> {
         vec![
             created_with_review(),
-            plan_submitted(
+            plan_proposed(
                 vec![assertion("TESTS-PASS", Some("cargo-test"))],
                 vec![work_task("fix")],
             ),
@@ -2181,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn blocking_gaps_park_and_continue_acknowledges_at_the_judged_sha() {
+    fn blocking_gaps_park_and_accept_acknowledges_at_the_judged_sha() {
         let mut events = events_to_the_brink();
         events.push(review_completed(
             "kr",

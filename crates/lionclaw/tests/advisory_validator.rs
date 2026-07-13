@@ -84,7 +84,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             "initial plan",
         )
         .await
-        .expect("submit");
+        .expect("propose");
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
     let advisory = state

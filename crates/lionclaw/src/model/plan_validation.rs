@@ -1,11 +1,11 @@
-//! Fail-closed structural validation of a plan submission, ported from
+//! Fail-closed structural validation of a plan, ported from
 //! Zenith (Apache-2.0, Intelligent Internet) `task_validation.py`.
 //!
 //! Check groups run in zenith's order and short-circuit per group: an id
-//! error suppresses shape errors, and so on. A submission that fails any
+//! error suppresses shape errors, and so on. A plan that fails any
 //! group produces no event — the mission never advances on an invalid plan.
 //!
-//! Divergences: contract + task list validate together (one submission);
+//! Divergences: contract + task list validate together (one plan);
 //! roles replace skills, and a task's role must carry compatible output
 //! semantics (an artifact role works, a verdict role validates; the read-only
 //! planning roles — report/proposal — are rejected on every execution task);
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::event::StopBar;
 use super::ids::{OracleName, RoleName, TaskId};
 use super::plan::{
-    OutputSemantics, PlanProposal, PlanSubmission, PlanningDag, RequirementDisposition, TaskKind,
+    OutputSemantics, Plan, PlanProposal, PlanningDag, RequirementDisposition, TaskKind,
 };
 use super::state::MissionState;
 
@@ -45,21 +45,18 @@ pub struct MissionTypeInventory {
     pub stop: StopBar,
 }
 
-pub fn validate_plan_submission(
-    submission: &PlanSubmission,
-    inventory: &MissionTypeInventory,
-) -> Vec<PlanValidationError> {
+pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
-    if submission.assertions.is_empty() {
+    if plan.assertions.is_empty() {
         return vec![err(
             "empty_contract",
             "mission has no contract assertions; a plan must state falsifiable claims",
         )];
     }
-    if submission.tasks.is_empty() {
+    if plan.tasks.is_empty() {
         return vec![err("empty_task_list", "plan has no tasks")];
     }
-    if submission.requirements.is_empty() {
+    if plan.requirements.is_empty() {
         return vec![err(
             "empty_requirements",
             "plan has no objective requirements",
@@ -67,49 +64,49 @@ pub fn validate_plan_submission(
     }
 
     // Group 1: id uniqueness (charset enforced by the newtypes).
-    let errors = check_unique_ids(submission);
+    let errors = check_unique_ids(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 2: every objective requirement is explicitly covered or accepted
     // as a limitation, and every assertion proves at least one requirement.
-    let errors = check_requirements(submission);
+    let errors = check_requirements(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 3: per-kind shape + role/oracle inventory resolution.
-    let errors = check_shape(submission, inventory);
+    let errors = check_shape(plan, inventory);
     if !errors.is_empty() {
         return errors;
     }
     // Group 4: dependency resolution.
-    let errors = check_deps_resolve(submission);
+    let errors = check_deps_resolve(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 5: acyclicity (Kahn).
-    let errors = check_acyclic(submission);
+    let errors = check_acyclic(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 6: coverage.
-    let errors = check_coverage(submission);
+    let errors = check_coverage(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 7: every gate target has an upstream validator (else the gate can
     // never clear — reject at author time instead of parking at run time).
-    let errors = check_gate_coverage(submission);
+    let errors = check_gate_coverage(plan);
     if !errors.is_empty() {
         return errors;
     }
     // Group 8: the declared stop bar is reachable. A `Verified` mission must
-    // launch fully provable — every assertion bound to an oracle as submitted.
-    // An oracle-less assertion is rejected at author time. (A later
-    // later complete proposal *could* bind one, so this is a
+    // launch fully provable — every assertion bound to an oracle as proposed.
+    // An oracle-less assertion is rejected at author time. (A later complete
+    // proposal *could* bind one, so this is a
     // launch-time policy, not a permanence claim; a domain with genuinely
     // unprovable claims declares `stop = reviewed`.)
-    check_stop_bar_reachable(submission, inventory.stop)
+    check_stop_bar_reachable(plan, inventory.stop)
 }
 
 /// Validate a mission type's planning DAG (at load, fail-closed): unique ids,
@@ -121,7 +118,7 @@ pub fn validate_planning_dag(
     inventory: &MissionTypeInventory,
 ) -> Vec<PlanValidationError> {
     // An empty DAG is valid: it means "no in-engine planning" (the mission
-    // awaits a manually submitted plan).
+    // awaits a manually proposed plan).
     if dag.tasks.is_empty() {
         return Vec::new();
     }
@@ -236,15 +233,11 @@ fn planning_has_cycle(dag: &PlanningDag) -> bool {
     }
 }
 
-fn check_stop_bar_reachable(
-    submission: &PlanSubmission,
-    stop: StopBar,
-) -> Vec<PlanValidationError> {
+fn check_stop_bar_reachable(plan: &Plan, stop: StopBar) -> Vec<PlanValidationError> {
     if stop != StopBar::Verified {
         return Vec::new();
     }
-    submission
-        .assertions
+    plan.assertions
         .iter()
         .filter(|a| a.oracle.is_none())
         .map(|a| {
@@ -293,7 +286,7 @@ pub fn validate_plan_proposal(
     inventory: &MissionTypeInventory,
 ) -> Result<(), ProposalError> {
     validate_plan_transition(state, proposal)?;
-    let errors = validate_plan_submission(&proposal.plan, inventory);
+    let errors = validate_plan(&proposal.plan, inventory);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -402,11 +395,11 @@ pub(crate) fn validate_plan_transition(
     Ok(())
 }
 
-fn check_requirements(submission: &PlanSubmission) -> Vec<PlanValidationError> {
-    let assertion_ids: BTreeSet<_> = submission.assertions.iter().map(|a| &a.id).collect();
+fn check_requirements(plan: &Plan) -> Vec<PlanValidationError> {
+    let assertion_ids: BTreeSet<_> = plan.assertions.iter().map(|a| &a.id).collect();
     let mut referenced = BTreeSet::new();
     let mut errors = Vec::new();
-    for requirement in &submission.requirements {
+    for requirement in &plan.requirements {
         if requirement.prose.trim().is_empty() {
             errors.push(err(
                 "empty_requirement",
@@ -443,7 +436,7 @@ fn check_requirements(submission: &PlanSubmission) -> Vec<PlanValidationError> {
             RequirementDisposition::Limitation { .. } => {}
         }
     }
-    for assertion in &submission.assertions {
+    for assertion in &plan.assertions {
         if !referenced.contains(&assertion.id) {
             errors.push(err(
                 "assertion_without_requirement",
@@ -456,11 +449,11 @@ fn check_requirements(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     }
     errors
 }
-fn check_gate_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+fn check_gate_coverage(plan: &Plan) -> Vec<PlanValidationError> {
     let by_id: BTreeMap<&TaskId, &super::plan::Task> =
-        submission.tasks.iter().map(|t| (&t.id, t)).collect();
+        plan.tasks.iter().map(|t| (&t.id, t)).collect();
     let mut errors = Vec::new();
-    for gate in submission.tasks.iter().filter(|t| t.kind == TaskKind::Gate) {
+    for gate in plan.tasks.iter().filter(|t| t.kind == TaskKind::Gate) {
         let validators = super::gate::upstream_validators(&by_id, &gate.id);
         for target in &gate.targets {
             let covered = validators
@@ -480,10 +473,10 @@ fn check_gate_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> 
     errors
 }
 
-fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     let mut seen_requirements = BTreeSet::new();
-    for requirement in &submission.requirements {
+    for requirement in &plan.requirements {
         if !seen_requirements.insert(&requirement.id) {
             errors.push(err(
                 "duplicate_requirement_id",
@@ -492,7 +485,7 @@ fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
         }
     }
     let mut seen_assertions = BTreeSet::new();
-    for assertion in &submission.assertions {
+    for assertion in &plan.assertions {
         if !seen_assertions.insert(&assertion.id) {
             errors.push(err(
                 "duplicate_assertion_id",
@@ -501,7 +494,7 @@ fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
         }
     }
     let mut seen_tasks = BTreeSet::new();
-    for task in &submission.tasks {
+    for task in &plan.tasks {
         if !seen_tasks.insert(&task.id) {
             errors.push(err(
                 "duplicate_task_id",
@@ -524,12 +517,9 @@ fn check_unique_ids(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     errors
 }
 
-fn check_shape(
-    submission: &PlanSubmission,
-    inventory: &MissionTypeInventory,
-) -> Vec<PlanValidationError> {
+fn check_shape(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
-    for assertion in &submission.assertions {
+    for assertion in &plan.assertions {
         if let Some(oracle) = &assertion.oracle {
             if !inventory.oracles.contains(oracle) {
                 errors.push(err(
@@ -542,8 +532,8 @@ fn check_shape(
             }
         }
     }
-    let known: BTreeSet<_> = submission.assertions.iter().map(|a| &a.id).collect();
-    for task in &submission.tasks {
+    let known: BTreeSet<_> = plan.assertions.iter().map(|a| &a.id).collect();
+    for task in &plan.tasks {
         match task.kind {
             TaskKind::Gate => {
                 if task.role.is_some() {
@@ -602,7 +592,7 @@ fn check_shape(
                 // planning-only outputs are incompatible with *every* execution
                 // kind — this single chokepoint keeps a report/proposal role out
                 // of an executed plan (closing planning recursion and the
-                // manual-submit hole).
+                // manual-proposal hole).
                 let compatible = output.execution_task_kind() == Some(task.kind);
                 if !compatible {
                     errors.push(err(
@@ -627,10 +617,10 @@ fn check_shape(
     errors
 }
 
-fn check_deps_resolve(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+fn check_deps_resolve(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
-    let ids: BTreeSet<_> = submission.tasks.iter().map(|t| &t.id).collect();
-    for task in &submission.tasks {
+    let ids: BTreeSet<_> = plan.tasks.iter().map(|t| &t.id).collect();
+    for task in &plan.tasks {
         for dep in &task.depends_on {
             if dep == &task.id {
                 errors.push(err(
@@ -648,10 +638,10 @@ fn check_deps_resolve(submission: &PlanSubmission) -> Vec<PlanValidationError> {
     errors
 }
 
-fn check_acyclic(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+fn check_acyclic(plan: &Plan) -> Vec<PlanValidationError> {
     let mut indegree: BTreeMap<&TaskId, usize> = BTreeMap::new();
     let mut successors: BTreeMap<&TaskId, Vec<&TaskId>> = BTreeMap::new();
-    for task in &submission.tasks {
+    for task in &plan.tasks {
         indegree.entry(&task.id).or_insert(0);
         for dep in &task.depends_on {
             *indegree.entry(&task.id).or_insert(0) += 1;
@@ -676,7 +666,7 @@ fn check_acyclic(submission: &PlanSubmission) -> Vec<PlanValidationError> {
             }
         }
     }
-    if visited == submission.tasks.len() {
+    if visited == plan.tasks.len() {
         return Vec::new();
     }
     let remaining: Vec<String> = indegree
@@ -691,12 +681,12 @@ fn check_acyclic(submission: &PlanSubmission) -> Vec<PlanValidationError> {
 }
 
 /// Zenith invariant: each assertion has exactly one active work coverer.
-fn check_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
+fn check_coverage(plan: &Plan) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     // Distinct coverer task ids per assertion: a single work task that lists the
     // same assertion twice in `targets` covers it once, not twice.
     let mut coverers: BTreeMap<_, BTreeSet<&TaskId>> = BTreeMap::new();
-    for task in &submission.tasks {
+    for task in &plan.tasks {
         if task.kind != TaskKind::Work {
             continue;
         }
@@ -704,7 +694,7 @@ fn check_coverage(submission: &PlanSubmission) -> Vec<PlanValidationError> {
             coverers.entry(target).or_default().insert(&task.id);
         }
     }
-    for assertion in &submission.assertions {
+    for assertion in &plan.assertions {
         match coverers.get(&assertion.id).map(BTreeSet::len) {
             None | Some(0) => errors.push(err(
                 "uncovered_assertion",
@@ -826,7 +816,7 @@ mod tests {
         }
     }
 
-    fn submission(assertions: Vec<Assertion>, tasks: Vec<Task>) -> PlanSubmission {
+    fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> Plan {
         let requirements = assertions
             .iter()
             .enumerate()
@@ -839,15 +829,15 @@ mod tests {
                 },
             })
             .collect();
-        PlanSubmission {
+        Plan {
             requirements,
             assertions,
             tasks,
         }
     }
 
-    fn codes(submission: &PlanSubmission) -> Vec<&'static str> {
-        validate_plan_submission(submission, &inventory())
+    fn codes(plan: &Plan) -> Vec<&'static str> {
+        validate_plan(plan, &inventory())
             .into_iter()
             .map(|e| e.code)
             .collect()
@@ -939,11 +929,11 @@ mod tests {
     }
 
     // The check_shape chokepoint: a read-only planning role (produces-report /
-    // proposes-plan) must never masquerade as an execution worker in a submitted
+    // proposes-plan) must never masquerade as an execution worker in a proposed
     // plan. Neither arm was exercised before.
     #[test]
     fn a_planning_role_on_an_execution_task_is_rejected() {
-        let work_on_reporter = submission(
+        let work_on_reporter = plan(
             vec![assertion_with_oracle("AA", "cargo-test")],
             vec![task(
                 "t",
@@ -955,7 +945,7 @@ mod tests {
             )],
         );
         assert!(codes(&work_on_reporter).contains(&"role_output_mismatch"));
-        let validate_on_author = submission(
+        let validate_on_author = plan(
             vec![assertion_with_oracle("AA", "cargo-test")],
             vec![
                 work("w", &["AA"], &[]),
@@ -977,7 +967,7 @@ mod tests {
     // fault-injection test for this guard.
     #[test]
     fn a_gate_over_an_assertion_with_no_validator_is_rejected() {
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![work("w1", &["A1"], &[]), gate("g1", &["A1"], &["w1"])],
         );
@@ -987,7 +977,7 @@ mod tests {
     #[test]
     fn empty_contract_returned_alone() {
         // Even with an empty task list...
-        let sub = submission(vec![], vec![]);
+        let sub = plan(vec![], vec![]);
         assert_eq!(codes(&sub), vec!["empty_contract"]);
         // ...or a task list full of shape errors, only empty_contract returns.
         let bad_gate = task(
@@ -998,19 +988,19 @@ mod tests {
             &[],
             &["g1"],
         );
-        let sub = submission(vec![], vec![bad_gate]);
+        let sub = plan(vec![], vec![bad_gate]);
         assert_eq!(codes(&sub), vec!["empty_contract"]);
     }
 
     #[test]
     fn empty_task_list_rejected() {
-        let sub = submission(vec![assertion("A1")], vec![]);
+        let sub = plan(vec![assertion("A1")], vec![]);
         assert_eq!(codes(&sub), vec!["empty_task_list"]);
     }
 
     #[test]
     fn duplicate_ids_accumulate_within_the_group() {
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1"), assertion("A1")],
             vec![work("w1", &["A1"], &[]), work("w1", &["A1"], &[])],
         );
@@ -1022,10 +1012,10 @@ mod tests {
 
     #[test]
     fn shape_errors() {
-        let cases: Vec<(&str, PlanSubmission, Vec<&str>)> = vec![
+        let cases: Vec<(&str, Plan, Vec<&str>)> = vec![
             (
                 "gate_with_role",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task(
                         "g1",
@@ -1040,7 +1030,7 @@ mod tests {
             ),
             (
                 "gate_with_body",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task("g1", TaskKind::Gate, None, "not empty", &["A1"], &[])],
                 ),
@@ -1048,17 +1038,17 @@ mod tests {
             ),
             (
                 "gate_empty_targets",
-                submission(vec![assertion("A1")], vec![gate("g1", &[], &[])]),
+                plan(vec![assertion("A1")], vec![gate("g1", &[], &[])]),
                 vec!["empty_targets"],
             ),
             (
                 "validate_empty_targets",
-                submission(vec![assertion("A1")], vec![validate("v1", &[], &[])]),
+                plan(vec![assertion("A1")], vec![validate("v1", &[], &[])]),
                 vec!["empty_targets"],
             ),
             (
                 "missing_body",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task(
                         "w1",
@@ -1073,7 +1063,7 @@ mod tests {
             ),
             (
                 "missing_role",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task("w1", TaskKind::Work, None, "body", &["A1"], &[])],
                 ),
@@ -1081,7 +1071,7 @@ mod tests {
             ),
             (
                 "unknown_role",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task(
                         "w1",
@@ -1096,7 +1086,7 @@ mod tests {
             ),
             (
                 "verdict_role_on_work_task",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task(
                         "w1",
@@ -1111,7 +1101,7 @@ mod tests {
             ),
             (
                 "artifact_role_on_validate_task",
-                submission(
+                plan(
                     vec![assertion("A1")],
                     vec![task(
                         "v1",
@@ -1126,7 +1116,7 @@ mod tests {
             ),
             (
                 "unknown_oracle",
-                submission(
+                plan(
                     vec![assertion_with_oracle("A1", "psychic")],
                     vec![work("w1", &["A1"], &[])],
                 ),
@@ -1134,7 +1124,7 @@ mod tests {
             ),
             (
                 "task_targets_unknown_assertion",
-                submission(vec![assertion("A1")], vec![work("w1", &["A2"], &[])]),
+                plan(vec![assertion("A1")], vec![work("w1", &["A2"], &[])]),
                 vec!["task_targets_unknown_assertion"],
             ),
         ];
@@ -1145,7 +1135,7 @@ mod tests {
 
     #[test]
     fn work_tasks_may_have_empty_targets() {
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![work("w1", &["A1"], &[]), work("w2", &[], &["w1"])],
         );
@@ -1154,24 +1144,24 @@ mod tests {
 
     #[test]
     fn dependency_errors() {
-        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &["w1"])]);
+        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &["w1"])]);
         assert_eq!(codes(&sub), vec!["self_loop"]);
 
-        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &["ghost"])]);
+        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &["ghost"])]);
         assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
     }
 
     #[test]
     fn cycles_detected() {
         // 2-cycle.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
         );
         assert_eq!(codes(&sub), vec!["cycle_detected"]);
 
         // 3-cycle alongside an acyclic task.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![
                 work("w0", &["A1"], &[]),
@@ -1186,27 +1176,27 @@ mod tests {
     #[test]
     fn coverage_errors() {
         // A validate task targeting an assertion does not count as coverage.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1"), assertion("A2")],
             vec![work("w1", &["A1"], &[]), validate("v1", &["A2"], &[])],
         );
         assert_eq!(codes(&sub), vec!["uncovered_assertion"]);
 
         // Two work coverers is one too many.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![work("w1", &["A1"], &[]), work("w2", &["A1"], &[])],
         );
         assert_eq!(codes(&sub), vec!["over_covered_assertion"]);
 
         // Exactly one work coverer is the happy case.
-        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
+        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
         assert_eq!(codes(&sub), CLEAN);
     }
 
     #[test]
     fn one_work_task_may_own_multiple_assertions() {
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1"), assertion("A2")],
             vec![work("w1", &["A1", "A2"], &[])],
         );
@@ -1218,11 +1208,11 @@ mod tests {
     fn groups_short_circuit_in_order() {
         // Id duplication suppresses shape errors.
         let bad_gate = task("g1", TaskKind::Gate, Some("implementer"), "body", &[], &[]);
-        let sub = submission(vec![assertion("A1")], vec![bad_gate.clone(), bad_gate]);
+        let sub = plan(vec![assertion("A1")], vec![bad_gate.clone(), bad_gate]);
         assert_eq!(codes(&sub), vec!["duplicate_task_id"]);
 
         // Shape errors suppress dep errors.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![task(
                 "w1",
@@ -1236,7 +1226,7 @@ mod tests {
         assert_eq!(codes(&sub), vec!["missing_role"]);
 
         // Dep errors suppress cycle detection.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![
                 work("w1", &["A1"], &["ghost"]),
@@ -1247,7 +1237,7 @@ mod tests {
         assert_eq!(codes(&sub), vec!["dep_unknown_task"]);
 
         // Cycle detection suppresses coverage (A2 is uncovered).
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1"), assertion("A2")],
             vec![work("w1", &["A1"], &["w2"]), work("w2", &[], &["w1"])],
         );
@@ -1255,8 +1245,8 @@ mod tests {
     }
 
     #[test]
-    fn rich_valid_submission_passes() {
-        let sub = submission(
+    fn rich_valid_plan_passes() {
+        let sub = plan(
             vec![assertion_with_oracle("A1", "cargo-test"), assertion("A2")],
             vec![
                 work("w1", &["A1"], &[]),
@@ -1272,8 +1262,8 @@ mod tests {
     fn verified_bar_rejects_an_oracle_less_assertion() {
         let mut verified = inventory();
         verified.stop = StopBar::Verified;
-        let against = |sub: &PlanSubmission| -> Vec<&'static str> {
-            validate_plan_submission(sub, &verified)
+        let against = |sub: &Plan| -> Vec<&'static str> {
+            validate_plan(sub, &verified)
                 .into_iter()
                 .map(|e| e.code)
                 .collect()
@@ -1281,18 +1271,18 @@ mod tests {
 
         // Under `verified`, an assertion with no oracle can never become
         // authoritatively Verified, so it is rejected at author time.
-        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
+        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
         assert_eq!(against(&sub), vec!["assertion_unprovable"]);
 
         // Bind an oracle and the same plan is accepted.
-        let sub = submission(
+        let sub = plan(
             vec![assertion_with_oracle("A1", "cargo-test")],
             vec![work("w1", &["A1"], &[])],
         );
         assert_eq!(against(&sub), CLEAN);
 
         // The default `reviewed` inventory accepts the oracle-less plan.
-        let sub = submission(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
+        let sub = plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]);
         assert_eq!(codes(&sub), CLEAN);
     }
 
@@ -1301,7 +1291,7 @@ mod tests {
         // Regression (QA round 2): the reviewer's attempt-dir tag shares the
         // plan-task namespace; a task by that name could leave crashed-attempt
         // dirs the closing reviewer would silently reuse.
-        let sub = submission(
+        let sub = plan(
             vec![assertion("A1")],
             vec![work(
                 super::super::ids::TERMINAL_REVIEW_TASK_TAG,

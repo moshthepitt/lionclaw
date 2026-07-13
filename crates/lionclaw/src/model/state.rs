@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::event::{Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{PlanProposal, PlanSubmission};
+use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,7 +16,7 @@ use super::verdict::{AuthoritativeVerdict, FinishClass};
 pub enum MissionPhase {
     /// No execution plan yet: drives the in-engine planning DAG (research →
     /// red-team → author) toward a proposal, or — with an empty planning DAG —
-    /// idles awaiting a manually submitted plan.
+    /// idles awaiting a manually proposed plan.
     Planning,
     Running,
     /// Open attention items — parked at zero compute (durable interrupt).
@@ -512,7 +512,7 @@ pub struct MissionState {
     pub base_sha: String,
     pub config: MissionConfig,
     pub phase: MissionPhase,
-    pub plan: Option<PlanSubmission>,
+    pub plan: Option<Plan>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
     /// The contract-free planning phase: the runtime status of the mission
