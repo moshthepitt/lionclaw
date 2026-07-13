@@ -1,14 +1,12 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-
-use crate::skill_alias::validate_skill_alias;
 
 pub use lionclaw_runtime_api::{NetworkMode, RuntimeAuthKind, RuntimeProgramSpec};
 
@@ -16,142 +14,9 @@ pub const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 pub const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 pub const RUNTIME_HOME_MOUNT_TARGET: &str = "/runtime/home";
 pub const DRAFTS_MOUNT_TARGET: &str = "/drafts";
-pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
-pub const INHERITED_SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/inherited-skills";
 pub const RUNTIME_INSTALL_ENV_DIR: &str = ".lionclaw";
 pub const RUNTIME_INSTALL_ENV_FILE: &str = "install-env.sh";
 pub const RUNTIME_INSTALL_ENV_PATH: &str = "/runtime/home/.lionclaw/install-env.sh";
-
-pub fn skill_mount_target(alias: &str) -> String {
-    format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
-}
-
-pub fn runtime_skill_mount_target_alias(target: &str) -> Option<&str> {
-    target
-        .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
-        .and_then(|suffix| suffix.strip_prefix('/'))
-        .filter(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum RuntimeSkillProjectionConfig {
-    NativeDir {
-        root: String,
-        #[serde(default)]
-        format: RuntimeSkillProjectionFormat,
-        /// Existing human-managed skill roots exposed alongside mission skills.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        inherit: Vec<InheritedSkillRoot>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct InheritedSkillRoot {
-    pub source: PathBuf,
-    pub target: String,
-    #[serde(default)]
-    pub optional: bool,
-}
-
-impl RuntimeSkillProjectionConfig {
-    pub fn native_dir(root: impl Into<String>) -> Self {
-        let mut projection = Self::NativeDir {
-            root: root.into(),
-            format: RuntimeSkillProjectionFormat::SkillMd,
-            inherit: Vec::new(),
-        };
-        projection.normalize();
-        projection
-    }
-
-    pub fn native_dir_root(&self) -> &str {
-        match self {
-            Self::NativeDir { root, .. } => root,
-        }
-    }
-
-    pub fn inherited_roots(&self) -> &[InheritedSkillRoot] {
-        match self {
-            Self::NativeDir { inherit, .. } => inherit,
-        }
-    }
-
-    pub fn inherited_roots_mut(&mut self) -> &mut Vec<InheritedSkillRoot> {
-        match self {
-            Self::NativeDir { inherit, .. } => inherit,
-        }
-    }
-
-    pub fn normalize(&mut self) {
-        match self {
-            Self::NativeDir { root, inherit, .. } => {
-                *root = normalize_runtime_skill_projection_root(root);
-                for inherited in inherit {
-                    inherited.target = normalize_runtime_skill_projection_root(&inherited.target);
-                }
-            }
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        match self {
-            Self::NativeDir { root, inherit, .. } => {
-                validate_runtime_skill_projection_root(root)?;
-                for inherited in inherit {
-                    if !inherited.source.is_absolute() {
-                        anyhow::bail!(
-                            "inherited skill source '{}' must be absolute",
-                            inherited.source.display()
-                        );
-                    }
-                    validate_runtime_skill_projection_root(&inherited.target)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeSkillProjectionFormat {
-    #[default]
-    SkillMd,
-}
-
-fn normalize_runtime_skill_projection_root(root: &str) -> String {
-    root.trim().to_string()
-}
-
-fn validate_runtime_skill_projection_root(root: &str) -> Result<()> {
-    let normalized = normalize_runtime_skill_projection_root(root);
-    if normalized.is_empty() {
-        anyhow::bail!("runtime skill projection root is required");
-    }
-
-    let path = Path::new(&normalized);
-    if path.is_absolute() {
-        anyhow::bail!("runtime skill projection root must be relative");
-    }
-
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => {
-                anyhow::bail!(
-                    "runtime skill projection root must not contain traversal or absolute components"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
 
 pub fn mount_source_for_target<'a>(mounts: &'a [MountSpec], target: &str) -> Option<&'a Path> {
     mounts
@@ -413,7 +278,6 @@ pub struct EffectiveExecutionPlan {
     pub runtime_id: String,
     pub preset_name: String,
     pub confinement: ConfinementConfig,
-    pub skill_projection: Option<RuntimeSkillProjectionConfig>,
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     pub install_policy: InstallPolicy,
@@ -434,7 +298,6 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("runtime_id", &self.runtime_id)
             .field("preset_name", &self.preset_name)
             .field("confinement", &self.confinement)
-            .field("skill_projection", &self.skill_projection)
             .field("workspace_access", &self.workspace_access)
             .field("network_mode", &self.network_mode)
             .field("install_policy", &self.install_policy)
@@ -456,38 +319,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        runtime_skill_mount_target_alias, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
-        ExecutionLimits, ExecutionPreset, InheritedSkillRoot, InstallPolicy, NetworkMode,
-        OciConfinementConfig, RuntimeSkillProjectionConfig, WorkspaceAccess,
+        ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits, ExecutionPreset,
+        InstallPolicy, NetworkMode, OciConfinementConfig, WorkspaceAccess,
     };
-
-    #[test]
-    fn runtime_skill_mount_target_alias_accepts_only_exact_valid_alias_targets() {
-        assert_eq!(
-            runtime_skill_mount_target_alias("/lionclaw/skills/loopback"),
-            Some("loopback")
-        );
-        assert_eq!(
-            runtime_skill_mount_target_alias("/lionclaw/skills/channel.terminal_1"),
-            Some("channel.terminal_1")
-        );
-
-        for target in [
-            "/lionclaw/skills",
-            "/lionclaw/skills/",
-            "/lionclaw/skills/../custom",
-            "/lionclaw/skills/loopback/extra",
-            "/lionclaw/skills/.hidden",
-            "/lionclaw/skillsfoo",
-            "/other/skills/loopback",
-        ] {
-            assert_eq!(
-                runtime_skill_mount_target_alias(target),
-                None,
-                "{target} should not be a managed runtime skill target"
-            );
-        }
-    }
 
     #[test]
     fn execution_preset_round_trips_without_embedded_name() {
@@ -629,7 +463,6 @@ mod tests {
                 runtime_id: "codex".to_string(),
                 preset_name: "team-local".to_string(),
                 confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-                skill_projection: None,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
                 install_policy: InstallPolicy::User,
@@ -650,39 +483,5 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("SECRET_ENV"));
         assert!(!debug.contains("sensitive-value"));
-    }
-
-    #[test]
-    fn runtime_skill_projection_root_must_be_safe_relative_path() {
-        let valid = super::RuntimeSkillProjectionConfig::native_dir(" .config/runtime/skills ");
-        assert_eq!(valid.native_dir_root(), ".config/runtime/skills");
-        valid.validate().expect("valid projection root");
-
-        for root in ["/absolute/skills", "../skills", "skills/../other", ""] {
-            let projection = super::RuntimeSkillProjectionConfig::native_dir(root);
-            assert!(
-                projection.validate().is_err(),
-                "{root:?} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn inherited_skill_roots_require_absolute_sources_and_safe_targets() {
-        let mut relative = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
-        relative.inherited_roots_mut().push(InheritedSkillRoot {
-            source: "relative/skills".into(),
-            target: ".native/skills".to_string(),
-            optional: true,
-        });
-        assert!(relative.validate().is_err());
-
-        let mut traversal = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
-        traversal.inherited_roots_mut().push(InheritedSkillRoot {
-            source: "/home/user/skills".into(),
-            target: "../skills".to_string(),
-            optional: true,
-        });
-        assert!(traversal.validate().is_err());
     }
 }

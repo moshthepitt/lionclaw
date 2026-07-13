@@ -5,12 +5,6 @@ stop = "verified"
 # domain's toolchain (here: the pinned Rust toolchain + agent CLIs).
 image = "localhost/lionclaw-runtime-dev:v1"
 
-[skills.scrutiny-validator]
-source = { path = "skills/scrutiny-validator" }
-
-[skills.user-testing-validator]
-source = { path = "skills/user-testing-validator" }
-
 # The engine-owned closing check: once work and oracles settle, a fresh
 # contract-blind reviewer judges the delivered product against the objective
 # (oracles prove the asserted; this catches what was never asserted).

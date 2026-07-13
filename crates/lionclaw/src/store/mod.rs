@@ -104,6 +104,14 @@ impl MissionStore {
         &self.lionclaw_dir
     }
 
+    pub(crate) fn mission_type_dir(&self, mission_id: &MissionId) -> PathBuf {
+        self.mission_dir(mission_id).join("mission-type")
+    }
+
+    pub(crate) fn mission_dir(&self, mission_id: &MissionId) -> PathBuf {
+        self.lionclaw_dir.join("missions").join(mission_id.as_str())
+    }
+
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }

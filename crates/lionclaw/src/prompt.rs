@@ -186,8 +186,8 @@ fn skeleton(output: OutputSemantics) -> &'static str {
 /// A bounded, runtime-neutral assigned-skill section shared by every prompt
 /// assembler. Lists each package name and short description in
 /// `RoleDefinition.skills` declaration order (never `BTreeMap` order) and
-/// states exactly once that the harness discovers them through native skill
-/// projection. Contains no handoff JSON, schema, or completion-tool directions
+/// states exactly once that LionClaw mounted them in the runtime's native skill
+/// directory. Contains no handoff JSON, schema, or completion-tool directions
 /// — the exact role-specific handoff contract lives solely in the
 /// engine-owned skeleton.
 fn assigned_skill_section(skills: &[SkillPackage]) -> String {
@@ -196,8 +196,8 @@ fn assigned_skill_section(skills: &[SkillPackage]) -> String {
     }
     let mut section = String::from("\n\n## Assigned skills\n\n");
     section.push_str(
-        "The following skills are assigned to your role; the harness discovers \
-         them through native skill projection at runtime.\n",
+        "LionClaw mounted the following packages in your runtime's native skills \
+         directory for this role. Follow their instructions when relevant.\n",
     );
     for skill in skills {
         section.push_str(&format!("- {}: {}\n", skill.name, skill.description));

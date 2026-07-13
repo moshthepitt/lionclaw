@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{
-    bundled_mission_types_dir, install_mission_type, load_mission_type, materialize_mission_type,
-    Home, MissionType,
+    add_skill, bundled_mission_types_dir, install_mission_type, load_mission_type,
+    materialize_mission_type, remove_skill, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
     fold, short_hex, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId,
@@ -48,6 +48,9 @@ pub enum Command {
     Install(InstallArgs),
     /// Check the install: podman, git, and each installed mission type + image.
     Doctor,
+    /// Add or remove skills in a mission type bundle.
+    #[command(subcommand)]
+    Skill(SkillCommand),
     /// Mission engine commands.
     #[command(subcommand)]
     Mission(MissionCommand),
@@ -55,13 +58,51 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct InstallArgs {
-    /// Source directory of mission types to install (defaults to the ones
-    /// bundled with this binary).
-    #[arg(long)]
-    pub from: Option<PathBuf>,
+    /// Mission type directories to install (defaults to bundled mission types).
+    pub mission_types: Vec<PathBuf>,
     /// Overwrite mission types already installed.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Subcommand)]
+pub enum SkillCommand {
+    /// Copy a local or Git skill package into a mission type.
+    Add(SkillAddArgs),
+    /// Remove an unassigned skill package from a mission type.
+    Remove(SkillRemoveArgs),
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("source").required(true).args(["path", "git"])))]
+pub struct SkillAddArgs {
+    /// Installed mission type name or explicit mission type directory.
+    #[arg(long = "mission-type")]
+    pub mission_type: String,
+    /// Local skill package directory.
+    #[arg(long, conflicts_with = "git")]
+    pub path: Option<PathBuf>,
+    /// Git repository containing the skill package.
+    #[arg(long, conflicts_with = "path", requires = "rev")]
+    pub git: Option<String>,
+    /// Git revision to fetch. Required with --git.
+    #[arg(long, requires = "git")]
+    pub rev: Option<String>,
+    /// Skill package directory within the Git checkout.
+    #[arg(long, requires = "git")]
+    pub subdir: Option<PathBuf>,
+    /// Replace a different package already installed under the same name.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args)]
+pub struct SkillRemoveArgs {
+    /// Installed mission type name or explicit mission type directory.
+    #[arg(long = "mission-type")]
+    pub mission_type: String,
+    /// Skill package name.
+    pub name: String,
 }
 
 #[derive(Subcommand)]
@@ -92,7 +133,7 @@ pub enum MissionCommand {
     Plan(PlanArgs),
     /// Resolve an open attention item.
     Decide(DecideArgs),
-    /// Inspect installed mission types.
+    /// Inspect mission types.
     #[command(subcommand)]
     Type(TypeCommand),
     /// Drive the real stack end-to-end and assert the core invariants — moat,
@@ -105,7 +146,7 @@ pub enum MissionCommand {
 pub enum TypeCommand {
     /// List installed mission types.
     List(TypeListArgs),
-    /// Show one installed mission type (roles, oracles, stop bar, playbook).
+    /// Show one mission type (roles, oracles, stop bar, playbook).
     Show(TypeShowArgs),
     /// Validate a mission type directory (loader + moat) without installing it.
     Check(TypeCheckArgs),
@@ -119,23 +160,23 @@ pub struct TypeListArgs {
 
 #[derive(Args)]
 pub struct TypeShowArgs {
-    /// Installed mission type name.
-    pub name: String,
+    /// Installed mission type name or explicit mission type directory.
+    pub mission_type: String,
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args)]
 pub struct TypeCheckArgs {
-    /// Mission type directory to validate.
-    pub dir: PathBuf,
+    /// Installed mission type name or explicit mission type directory.
+    pub mission_type: String,
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Installed mission type name (see `mission type list`).
+    /// Installed mission type name or explicit mission type directory.
     #[arg(long = "type")]
     pub mission_type: String,
     /// Target repository (default: the enclosing git worktree root).
@@ -304,6 +345,7 @@ pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
     match cli.command {
         Command::Install(args) => cmd_install(args).await.map(|()| ExitCode::SUCCESS),
         Command::Doctor => cmd_doctor().await,
+        Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
         Command::Mission(cmd) => run_mission(cmd).await,
     }
 }
@@ -472,21 +514,18 @@ async fn assemble_engine(
     ))
 }
 
-/// Build an engine to CREATE a mission from an installed mission type (by name).
+/// Build an engine to create a mission from its validated snapshot.
 /// The confinement image is resolved to a content id here — once, at start — so
 /// a later rebuild of the tag cannot silently change the instrument. The engine
 /// carries the runtime + image id it records on `MissionCreated`.
 async fn build_engine_for_start(
     store: MissionStore,
     repo: &Path,
-    type_name: &str,
+    mission_type: MissionType,
     runtime: &str,
     image_override: Option<&str>,
 ) -> Result<Engine> {
     let ceiling = AuthorityCeiling::default();
-    let type_dir = Home::from_env()?.mission_type_dir(type_name);
-    let mission_type = load_mission_type(&type_dir, &ceiling)
-        .with_context(|| format!("mission type '{type_name}' (run `lionclaw install`?)"))?;
     let profiles = runtime_profiles()?;
     let default_profile = validate_mission_runtimes(&mission_type, runtime, &profiles)?;
     let engine = default_profile.confinement.oci().engine.clone();
@@ -512,9 +551,7 @@ fn start_image_ref<'a>(mission_type_image: &'a str, image_override: Option<&'a s
     image_override.unwrap_or(mission_type_image)
 }
 
-/// Build an engine for an EXISTING mission: resolve its recorded mission type (by
-/// name, from the home), runtime, and pinned image id — so no `--type`/`--runtime`
-/// is needed. `load_state` then verifies the pinned digest, fail-closed.
+/// Build an engine for an existing mission from its immutable bundle snapshot.
 async fn build_engine_for_mission(
     store: MissionStore,
     repo: &Path,
@@ -522,9 +559,7 @@ async fn build_engine_for_mission(
 ) -> Result<Engine> {
     let state = store.require_state(mission_id).await?;
     let ceiling = AuthorityCeiling::default();
-    let type_dir = Home::from_env()?.mission_type_dir(&state.mission_type.name);
-    let mission_type = load_mission_type(&type_dir, &ceiling)
-        .with_context(|| format!("mission type '{}'", state.mission_type.name))?;
+    let mission_type = load_mission_type_snapshot(&store, mission_id, &ceiling)?;
     let profiles = runtime_profiles()?;
     let default_profile = validate_mission_runtimes(&mission_type, &state.runtime, &profiles)?;
     let engine = assemble_engine(
@@ -619,35 +654,55 @@ fn read_json_arg<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 
 async fn cmd_start(args: StartArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
-    // Fail-closed: loading the mission type (and its moat check) happens before
-    // any event is written.
-    let engine = build_engine_for_start(
-        store,
-        &repo,
-        &args.mission_type,
-        &args.runtime,
-        args.image.as_deref(),
-    )
-    .await?;
     let base_sha = workspace::head_sha(&repo).await?;
-    let mission_id = engine
-        .create_mission(
-            &repo.to_string_lossy(),
-            &args.objective,
-            &base_sha,
-            MissionConfig {
-                // Default-on ratification gate; `--yes` auto-approves.
-                ratification_gate: !args.yes,
-                // The honesty bar is the mission type's, not a hardcoded default.
-                stop: engine.mission_type().stop,
-                // The planning DAG the mission type ships (empty ⇒ awaits a
-                // manually submitted plan).
-                planning: engine.mission_type().planning.clone(),
-                // The closing review the mission type ships (None ⇒ off).
-                terminal_review: engine.mission_type().terminal_review.clone(),
-            },
+    let workspace_dir = repo.to_string_lossy();
+    let clock = SystemClock;
+    let now_ms = clock.now_ms();
+    let mission_id = MissionId::for_creation(&workspace_dir, &args.objective, now_ms);
+    let mission_dir = store.mission_dir(&mission_id);
+    let source = resolve_mission_type(&args.mission_type)?;
+    create_mission_dir(&store, &mission_id)?;
+    let result = async {
+        let mission_type =
+            snapshot_mission_type(&store, &mission_id, &source, &AuthorityCeiling::default())?;
+        let engine = build_engine_for_start(
+            store,
+            &repo,
+            mission_type,
+            &args.runtime,
+            args.image.as_deref(),
         )
         .await?;
+        engine
+            .create_mission_with_id(
+                mission_id.clone(),
+                now_ms,
+                &repo.to_string_lossy(),
+                &args.objective,
+                &base_sha,
+                MissionConfig {
+                    // Default-on ratification gate; `--yes` auto-approves.
+                    ratification_gate: !args.yes,
+                    // The honesty bar is the mission type's, not a hardcoded default.
+                    stop: engine.mission_type().stop,
+                    // The planning DAG the mission type ships (empty ⇒ awaits a
+                    // manually submitted plan).
+                    planning: engine.mission_type().planning.clone(),
+                    // The closing review the mission type ships (None ⇒ off).
+                    terminal_review: engine.mission_type().terminal_review.clone(),
+                },
+            )
+            .await?;
+        Ok::<_, anyhow::Error>((mission_id.clone(), engine))
+    }
+    .await;
+    let (mission_id, engine) = match result {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&mission_dir);
+            return Err(err);
+        }
+    };
     if args.json {
         println!(
             "{}",
@@ -665,6 +720,36 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn snapshot_mission_type(
+    store: &MissionStore,
+    mission_id: &MissionId,
+    source: &Path,
+    ceiling: &AuthorityCeiling,
+) -> Result<MissionType> {
+    materialize_mission_type(source, &store.mission_type_dir(mission_id), ceiling)
+        .with_context(|| format!("mission type '{}' is invalid", source.display()))
+}
+
+fn create_mission_dir(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
+    let mission_dir = store.mission_dir(mission_id);
+    let missions_dir = mission_dir
+        .parent()
+        .context("mission directory has no parent")?;
+    std::fs::create_dir_all(missions_dir)
+        .with_context(|| format!("creating '{}'", missions_dir.display()))?;
+    std::fs::create_dir(&mission_dir)
+        .with_context(|| format!("creating new mission directory '{}'", mission_dir.display()))
+}
+
+fn load_mission_type_snapshot(
+    store: &MissionStore,
+    mission_id: &MissionId,
+    ceiling: &AuthorityCeiling,
+) -> Result<MissionType> {
+    load_mission_type(&store.mission_type_dir(mission_id), ceiling)
+        .with_context(|| format!("mission type snapshot for '{mission_id}'"))
 }
 
 fn start_next_step(planning_tasks: usize, mission_id: &MissionId, repo: &Path) -> String {
@@ -1258,30 +1343,23 @@ async fn cmd_log(args: LogArgs) -> Result<()> {
 
 async fn cmd_install(args: InstallArgs) -> Result<()> {
     let home = Home::from_env()?;
-    let source = match args.from {
-        Some(dir) => dir,
-        None => bundled_mission_types_dir()?,
+    let sources = if args.mission_types.is_empty() {
+        mission_type_directories(&bundled_mission_types_dir()?)?
+    } else {
+        args.mission_types
     };
     let dest_dir = home.mission_types_dir();
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("creating '{}'", dest_dir.display()))?;
 
     let mut installed_count = 0usize;
-    for entry in
-        std::fs::read_dir(&source).with_context(|| format!("reading '{}'", source.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let src_dir = entry.path();
+    for src_dir in sources {
         let outcome = install_mission_type(
             &src_dir,
             &dest_dir,
             args.force,
             &AuthorityCeiling::default(),
         )
-        .await
         .with_context(|| format!("mission type at '{}' is invalid", src_dir.display()))?;
         if outcome.installed {
             println!("installed {}", outcome.name);
@@ -1297,6 +1375,63 @@ async fn cmd_install(args: InstallArgs) -> Result<()> {
         println!("nothing to install (all mission types already present)");
     }
     println!("home: {}", home.root().display());
+    Ok(())
+}
+
+fn mission_type_directories(parent: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = std::fs::read_dir(parent)
+        .with_context(|| format!("reading '{}'", parent.display()))?
+        .filter_map(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => Some(Ok(entry.path())),
+                Ok(_) => None,
+                Err(err) => Some(Err(err.into())),
+            },
+            Err(err) => Some(Err(err.into())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    directories.sort();
+    Ok(directories)
+}
+
+fn resolve_mission_type(raw: &str) -> Result<PathBuf> {
+    MissionTypeLocator::parse(raw)?.resolve()
+}
+
+async fn cmd_skill(cmd: SkillCommand) -> Result<()> {
+    match cmd {
+        SkillCommand::Add(args) => {
+            let mission_root = resolve_mission_type(&args.mission_type)?;
+            let source = match (args.path, args.git) {
+                (Some(path), None) => SkillSource::Path(path),
+                (None, Some(git)) => SkillSource::Git {
+                    git,
+                    rev: args
+                        .rev
+                        .context("--rev is required when adding a Git skill")?,
+                    subdir: args.subdir.unwrap_or_default(),
+                },
+                _ => unreachable!("clap enforces exactly one skill source"),
+            };
+            let change = add_skill(
+                &mission_root,
+                source,
+                args.force,
+                &AuthorityCeiling::default(),
+            )
+            .await?;
+            if change.changed {
+                println!("added {} {}", change.name, short_hex(&change.digest));
+            } else {
+                println!("unchanged {} {}", change.name, short_hex(&change.digest));
+            }
+        }
+        SkillCommand::Remove(args) => {
+            let mission_root = resolve_mission_type(&args.mission_type)?;
+            let change = remove_skill(&mission_root, &args.name, &AuthorityCeiling::default())?;
+            println!("removed {} {}", change.name, short_hex(&change.digest));
+        }
+    }
     Ok(())
 }
 
@@ -1405,18 +1540,17 @@ async fn cmd_type(cmd: TypeCommand) -> Result<std::process::ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         TypeCommand::Show(args) => {
-            let home = Home::from_env()?;
-            let dir = home.mission_type_dir(&args.name);
+            let dir = resolve_mission_type(&args.mission_type)?;
             show_mission_type(&dir, args.json)
         }
         TypeCommand::Check(args) => {
+            let source = resolve_mission_type(&args.mission_type)?;
             let prepared = tempfile::tempdir().context("preparing mission type check")?;
             let mission_type = materialize_mission_type(
-                &args.dir,
+                &source,
                 &prepared.path().join("mission-type"),
                 &AuthorityCeiling::default(),
             )
-            .await
             .context("mission type invalid")?;
             validate_explicit_role_runtimes(&mission_type, &runtime_profiles()?)
                 .context("mission type runtime unavailable")?;
@@ -1991,5 +2125,36 @@ mod tests {
             start_next_step(0, &mid(), repo),
             "next: submit a plan, then run: lionclaw mission advance mabc123def456 --repo /tmp/repo"
         );
+    }
+
+    #[tokio::test]
+    async fn mission_snapshot_is_the_only_resume_source_and_collisions_are_preserved() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = MissionStore::open(workspace.path()).await.unwrap();
+        let source = workspace.path().join("source-type");
+        std::fs::create_dir_all(source.join("roles")).unwrap();
+        std::fs::write(
+            source.join("mission.toml"),
+            "[mission-type]\nname = \"snapshot-test\"\nstop = \"verified\"\nimage = \"img\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("roles/worker.md"),
+            "---\noutput: produces-artifact\n---\nWork.\n",
+        )
+        .unwrap();
+        let id = mid();
+        create_mission_dir(&store, &id).unwrap();
+        let snapshotted =
+            snapshot_mission_type(&store, &id, &source, &AuthorityCeiling::default()).unwrap();
+
+        std::fs::remove_dir_all(&source).unwrap();
+        let loaded = load_mission_type_snapshot(&store, &id, &AuthorityCeiling::default()).unwrap();
+        assert_eq!(loaded.digest, snapshotted.digest);
+        assert!(create_mission_dir(&store, &id).is_err());
+        assert!(store.mission_type_dir(&id).is_dir());
+
+        std::fs::remove_dir_all(store.mission_type_dir(&id)).unwrap();
+        assert!(load_mission_type_snapshot(&store, &id, &AuthorityCeiling::default()).is_err());
     }
 }

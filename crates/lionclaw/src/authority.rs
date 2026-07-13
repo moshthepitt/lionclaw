@@ -182,7 +182,6 @@ pub struct RolePlanRequest<'a> {
     pub authority: &'a CompiledAuthority,
     pub runtime_id: String,
     pub confinement: ConfinementConfig,
-    pub skill_projection: Option<lionclaw_confinement::RuntimeSkillProjectionConfig>,
     pub mounts: MissionMounts,
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
@@ -314,7 +313,6 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         runtime_id: request.runtime_id,
         preset_name: format!("mission-{}", authority.output.slug()),
         confinement: request.confinement,
-        skill_projection: request.skill_projection,
         workspace_access: authority.preset.workspace_access,
         network_mode: authority.preset.network_mode,
         install_policy: authority.preset.install_policy,
@@ -383,7 +381,6 @@ mod tests {
             authority,
             runtime_id: "codex".to_string(),
             confinement: oci(),
-            skill_projection: None,
             mounts: m,
             judged_roots: judged,
             environment: Vec::new(),

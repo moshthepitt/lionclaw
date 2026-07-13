@@ -95,7 +95,6 @@ impl OracleRunner for OciOracleRunner {
                 authority: &authority,
                 runtime_id: self.profile.name.clone(),
                 confinement: self.profile.confinement.clone(),
-                skill_projection: None,
                 mounts: MissionMounts {
                     workspace: checkout.clone(),
                     extras,
@@ -145,8 +144,19 @@ impl OracleRunner for OciOracleRunner {
         // Reap the whole attempt directory (Git checkout, staged oracle,
         // scratch target dir) on every exit path; the outcome is already in
         // `result` and the verdict is minted from it in the fold.
-        workspace::remove_dir(&dirs.root).await;
-        result
+        match (result, workspace::remove_dir(&dirs.root).await) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(err)) => Err(fail(format!(
+                "failed to remove oracle attempt directory: {err:#}"
+            ))),
+            (Err(mut failure), Err(err)) => {
+                failure.detail = format!(
+                    "{}; failed to remove oracle attempt directory: {err:#}",
+                    failure.detail
+                );
+                Err(failure)
+            }
+        }
     }
 }
 

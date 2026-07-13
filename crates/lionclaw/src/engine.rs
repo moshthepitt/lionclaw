@@ -162,19 +162,37 @@ impl Engine {
         base_sha: &str,
         config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
+        let now_ms = self.clock.now_ms();
+        let mission_id = MissionId::for_creation(workspace_dir, objective, now_ms);
+        self.create_mission_with_id(
+            mission_id,
+            now_ms,
+            workspace_dir,
+            objective,
+            base_sha,
+            config,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_mission_with_id(
+        &self,
+        mission_id: MissionId,
+        now_ms: i64,
+        workspace_dir: &str,
+        objective: &str,
+        base_sha: &str,
+        config: crate::model::MissionConfig,
+    ) -> Result<MissionId> {
         // The loader enforces both rules for mission types; enforce them here
         // too so no direct caller can mint a config the closing gate cannot
         // honor (the fold is total and cannot refuse the config).
-        //
-        // The reviewed bar is *defined* by an independent terminal review …
         if config.stop == crate::model::StopBar::Reviewed && config.terminal_review.is_none() {
             bail!(
                 "a reviewed-bar mission requires a terminal review: \
                  the reviewed bar is defined by an independent closing review"
             );
         }
-        // … and a declared reviewer must exist as a judge in the pinned type,
-        // or the closing dispatch could never resolve it.
         if let Some(review) = &config.terminal_review {
             match self.mission_type.roles.get(&review.role) {
                 Some(role) if role.output == crate::model::OutputSemantics::EmitsGapVerdict => {}
@@ -190,10 +208,6 @@ impl Engine {
                 ),
             }
         }
-        let now_ms = self.clock.now_ms();
-        let mission_id = MissionId::from_digest_prefix(&hex::encode(Sha256::digest(
-            format!("{workspace_dir}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
-        )));
         let created = NewEvent::new(MissionEvent::MissionCreated {
             objective: objective.to_string(),
             mission_type: self.mission_type_ref(),

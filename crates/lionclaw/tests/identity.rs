@@ -87,8 +87,7 @@ fn the_digest_tracks_recursive_skill_content() {
     std::fs::write(root.join("skills/rust/references/guide.md"), "first\n").unwrap();
     std::fs::write(
         root.join("mission.toml"),
-        "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"digest-test\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::write(

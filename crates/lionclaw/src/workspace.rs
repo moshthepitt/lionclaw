@@ -156,8 +156,12 @@ pub async fn capture_worker_result(
     Ok(head)
 }
 
-pub async fn remove_dir(dir: &Path) {
-    let _ = tokio::fs::remove_dir_all(dir).await;
+pub async fn remove_dir(dir: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove '{}'", dir.display())),
+    }
 }
 
 /// `chmod 0o755` — used to keep staged oracle executables executable.

@@ -63,8 +63,7 @@ fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -90,7 +89,26 @@ fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
 }
 
 #[test]
-fn role_referencing_an_undeclared_skill_is_rejected() {
+fn manifest_skill_declarations_are_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(matches!(err, MissionTypeError::Manifest(_)));
+}
+
+#[test]
+fn role_referencing_a_missing_skill_package_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
@@ -106,7 +124,7 @@ fn role_referencing_an_undeclared_skill_is_rejected() {
 
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
-        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("undeclared skill 'missing'")),
+        matches!(&err, MissionTypeError::Role { detail, .. } if detail.contains("missing skill package 'missing'")),
         "got {err:?}"
     );
 }
@@ -122,8 +140,7 @@ fn a_symlinked_skill_package_is_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -137,7 +154,31 @@ fn a_symlinked_skill_package_is_rejected() {
 
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
-        matches!(&err, MissionTypeError::Skill { detail, .. } if detail.contains("symlink")),
+        matches!(&err, MissionTypeError::Manifest(detail) if detail.contains("symlink")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_symlink_anywhere_in_the_bundle_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let external = tempfile::tempdir().expect("external");
+    std::fs::create_dir_all(dir.path().join("roles")).unwrap();
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"closed\"\nstop = \"verified\"\nimage = \"img\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("roles/worker.md"),
+        "---\noutput: produces-artifact\n---\nDo it.\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(external.path(), dir.path().join("unrelated-link")).unwrap();
+
+    let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
+    assert!(
+        matches!(&err, MissionTypeError::Manifest(detail) if detail.contains("symlink")),
         "got {err:?}"
     );
 }
@@ -155,8 +196,7 @@ fn a_skill_package_through_an_escaping_parent_symlink_is_rejected() {
     .unwrap();
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir(dir.path().join("roles")).unwrap();
@@ -169,7 +209,7 @@ fn a_skill_package_through_an_escaping_parent_symlink_is_rejected() {
 
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
-        matches!(&err, MissionTypeError::Skill { detail, .. } if detail.contains("outside mission type")),
+        matches!(&err, MissionTypeError::Manifest(detail) if detail.contains("symlink")),
         "got {err:?}"
     );
 }
@@ -179,8 +219,7 @@ fn skill_frontmatter_name_must_match_the_declared_package() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
-         \n[skills.expected]\nsource = { path = \"skills/expected\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -208,8 +247,7 @@ fn duplicate_role_skill_references_are_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"reviewed\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -330,7 +368,7 @@ fn a_symlinked_oracle_is_rejected() {
     std::fs::remove_file(&oracle).unwrap();
     std::os::unix::fs::symlink("/bin/sh", &oracle).unwrap();
     assert!(
-        matches!(&load_err(dir.path()), MissionTypeError::Oracle { detail, .. } if detail.contains("regular file")),
+        matches!(&load_err(dir.path()), MissionTypeError::Manifest(detail) if detail.contains("symlink")),
     );
 }
 
@@ -461,8 +499,7 @@ fn skill_description_is_loaded_and_trimmed_into_the_package() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\
-         \n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("roles")).unwrap();
@@ -489,7 +526,7 @@ fn load_skill_with_description(
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("mission.toml"),
-        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n\n[skills.rust]\nsource = { path = \"skills/rust\" }\n",
+        "[mission-type]\nname = \"skilled\"\nstop = \"verified\"\nimage = \"img\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("skills/rust")).unwrap();

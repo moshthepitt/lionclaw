@@ -92,7 +92,6 @@ mod tests {
                 runtime_id: "test-runtime".to_string(),
                 preset_name: "everyday".to_string(),
                 confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-                skill_projection: None,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode,
                 install_policy: crate::InstallPolicy::User,

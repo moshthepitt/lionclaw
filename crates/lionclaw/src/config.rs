@@ -1,15 +1,13 @@
 //! Data-driven mission runtime profiles. Runtime products are configuration;
 //! Rust extension points are conversation drivers, auth providers, and generic
-//! confinement/projection mechanisms.
+//! confinement mechanisms.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use lionclaw_confinement::{
-    ConfinementConfig, ExecutionLimits, OciConfinementConfig, RuntimeSkillProjectionConfig,
-};
+use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementConfig};
 use serde::Deserialize;
 
 use crate::mission_type::Home;
@@ -22,10 +20,7 @@ const DEFAULT_RUNTIMES_TOML: &str = r#"
 driver = "codex"
 command = "codex"
 auth = "codex"
-skill-projection = { kind = "native-dir", root = ".agents/skills", format = "skill-md", inherit = [
-  { source = "~/.agents/skills", target = ".agents/skills", optional = true },
-  { source = "~/.codex/skills", target = ".codex/skills", optional = true },
-] }
+skills-dir = ".agents/skills"
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.opencode]
@@ -33,10 +28,7 @@ driver = "acp"
 command = "opencode"
 args = ["acp"]
 environment = { OPENCODE_DISABLE_AUTOUPDATE = "1" }
-skill-projection = { kind = "native-dir", root = ".agents/skills", format = "skill-md", inherit = [
-  { source = "~/.agents/skills", target = ".agents/skills", optional = true },
-  { source = "~/.config/opencode/skills", target = ".config/opencode/skills", optional = true },
-] }
+skills-dir = ".agents/skills"
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
 [runtimes.hermes]
@@ -46,9 +38,7 @@ args = ["acp"]
 environment = { HERMES_HOME = "/runtime/home/.hermes" }
 mode = "dont_ask"
 auth = { kind = "native-home", source = "~/.hermes", target = ".hermes", required-files = ["config.yaml"], optional-files = [".env", "auth.json", ".anthropic_oauth.json"] }
-skill-projection = { kind = "native-dir", root = ".hermes/skills", format = "skill-md", inherit = [
-  { source = "~/.hermes/skills", target = ".hermes/skills", optional = true },
-] }
+skills-dir = ".hermes/skills"
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 "#;
 
@@ -62,7 +52,7 @@ pub struct MissionRuntimeProfile {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub auth: Option<RuntimeAuthConfig>,
-    pub skill_projection: Option<RuntimeSkillProjectionConfig>,
+    pub skills_dir: Option<RuntimeSkillsDir>,
     pub confinement: ConfinementConfig,
     pub hard_timeout: Duration,
     pub oracle_timeout: Duration,
@@ -96,10 +86,36 @@ pub struct RuntimeProfiles {
     profiles: BTreeMap<String, MissionRuntimeProfile>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSkillsDir(PathBuf);
+
+impl RuntimeSkillsDir {
+    fn new(path: PathBuf) -> Result<Self> {
+        validate_relative_path(&path, "runtime skills-dir")?;
+        Ok(Self(path))
+    }
+
+    fn relative_skill_path(&self, skill_name: &str) -> Result<PathBuf> {
+        lionclaw_confinement::validate_skill_alias(skill_name)?;
+        Ok(self.0.join(skill_name))
+    }
+
+    pub fn mount_target(&self, skill_name: &str) -> Result<String> {
+        Ok(Path::new(lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET)
+            .join(self.relative_skill_path(skill_name)?)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    pub(crate) fn host_mountpoint(&self, runtime_home: &Path, skill_name: &str) -> Result<PathBuf> {
+        Ok(runtime_home.join(self.relative_skill_path(skill_name)?))
+    }
+}
+
 impl RuntimeProfiles {
     pub fn built_in() -> Result<Self> {
         let user_home = user_home_from_env()
-            .ok_or_else(|| anyhow!("HOME is required to resolve built-in runtime skill roots"))?;
+            .ok_or_else(|| anyhow!("HOME is required to resolve built-in runtime auth paths"))?;
         Self::from_toml(DEFAULT_RUNTIMES_TOML, &user_home)
             .context("invalid built-in runtime configuration")
     }
@@ -168,7 +184,7 @@ struct RuntimeProfileFile {
     #[serde(default)]
     auth: Option<RuntimeAuthConfigFile>,
     #[serde(default)]
-    skill_projection: Option<RuntimeSkillProjectionConfig>,
+    skills_dir: Option<PathBuf>,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
     #[serde(default = "default_hard_timeout_secs")]
@@ -212,14 +228,7 @@ impl RuntimeProfileFile {
         if self.hard_timeout_secs == 0 || self.oracle_timeout_secs == 0 {
             return Err(anyhow!("runtime timeouts must be greater than zero"));
         }
-        if let Some(projection) = &mut self.skill_projection {
-            for inherited in projection.inherited_roots_mut() {
-                inherited.source =
-                    expand_home(&inherited.source, user_home, "inherited skill source")?;
-            }
-            projection.normalize();
-            projection.validate()?;
-        }
+        let skills_dir = self.skills_dir.map(RuntimeSkillsDir::new).transpose()?;
         self.confinement.oci_mut().tmpfs = self
             .confinement
             .oci()
@@ -245,7 +254,7 @@ impl RuntimeProfileFile {
             model: self.model,
             mode: self.mode,
             auth,
-            skill_projection: self.skill_projection,
+            skills_dir,
             confinement: self.confinement,
             hard_timeout: Duration::from_secs(self.hard_timeout_secs),
             oracle_timeout: Duration::from_secs(self.oracle_timeout_secs),
@@ -387,9 +396,7 @@ mod tests {
             driver = "acp"
             command = "hermes"
             args = ["acp"]
-            skill-projection = { kind = "native-dir", root = ".agents/skills", inherit = [
-              { source = "~/.hermes/skills", target = ".hermes/skills", optional = true }
-            ] }
+            skills-dir = ".agents/skills"
             "#,
             Path::new("/home/alice"),
         )
@@ -399,11 +406,13 @@ mod tests {
         assert_eq!(profile.driver, "acp");
         assert_eq!(profile.command, "hermes");
         assert_eq!(profile.args, ["acp"]);
-        let projection = profile.skill_projection.expect("skill projection");
-        assert_eq!(projection.native_dir_root(), ".agents/skills");
         assert_eq!(
-            projection.inherited_roots()[0].source,
-            PathBuf::from("/home/alice/.hermes/skills")
+            profile
+                .skills_dir
+                .expect("skills dir")
+                .mount_target("fixture")
+                .unwrap(),
+            "/runtime/home/.agents/skills/fixture"
         );
     }
 
@@ -489,13 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_projection_is_rejected_while_loading_configuration() {
+    fn invalid_skills_dir_is_rejected_while_loading_configuration() {
         let err = RuntimeProfiles::from_toml(
             r#"
             [runtimes.bad]
             driver = "acp"
             command = "bad"
-            skill-projection = { kind = "native-dir", root = "../escape" }
+            skills-dir = "../escape"
             "#,
             Path::new("/home/alice"),
         )
@@ -504,33 +513,29 @@ mod tests {
     }
 
     #[test]
-    fn custom_profiles_need_home_only_when_they_use_tilde_paths() {
-        let absolute = RuntimeProfiles::from_toml_with_home(
+    fn skills_dir_does_not_depend_on_the_host_home() {
+        let profiles = RuntimeProfiles::from_toml_with_home(
             r#"
             [runtimes.custom]
             driver = "acp"
             command = "custom"
-            skill-projection = { kind = "native-dir", root = ".agents/skills", inherit = [
-              { source = "/opt/custom/skills", target = ".custom/skills", optional = true }
-            ] }
+            skills-dir = ".custom/skills"
             "#,
             None,
         )
-        .expect("absolute roots do not need HOME");
-        assert_eq!(absolute.get("custom").unwrap().driver, "acp");
+        .expect("native skill paths do not need HOME");
+        assert_eq!(profiles.get("custom").unwrap().driver, "acp");
 
         let err = RuntimeProfiles::from_toml_with_home(
             r#"
             [runtimes.custom]
             driver = "acp"
             command = "custom"
-            skill-projection = { kind = "native-dir", root = ".agents/skills", inherit = [
-              { source = "~/.custom/skills", target = ".custom/skills", optional = true }
-            ] }
+            auth = { kind = "native-home", source = "~/.custom", target = ".custom", required-files = ["config.toml"] }
             "#,
             None,
         )
-        .expect_err("tilde roots require HOME");
+        .expect_err("native-home auth requires HOME");
         assert!(err.to_string().contains("HOME is required"), "got {err:#}");
     }
 
@@ -570,7 +575,7 @@ mod tests {
                 driver = "acp"
                 command = "custom"
                 confinement = {{ backend = "podman", additional-mounts = [
-                  {{ source = {:?}, target = "/lionclaw/skills/shadow", access = "read-only" }}
+                  {{ source = {:?}, target = "/lionclaw/internal", access = "read-only" }}
                 ] }}
                 "#,
                 source.path()
@@ -594,7 +599,7 @@ mod tests {
             [runtimes.custom]
             driver = "acp"
             command = "custom"
-            skill-projection = { kind = "native-dir", root = ".agents/skills", inheritt = [] }
+            skills-dirr = ".agents/skills"
             "#,
         ] {
             let err = RuntimeProfiles::from_toml(invalid, Path::new("/home/alice"))

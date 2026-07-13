@@ -320,7 +320,7 @@ mod tests {
             "/runtime/state",
             "/drafts",
             "/attachments/inbound",
-            "/lionclaw/skills",
+            "/lionclaw/internal",
             "/run/secrets/token",
             "/proc",
             "/sys/fs",
