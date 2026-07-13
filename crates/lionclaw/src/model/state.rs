@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind};
+use super::event::{
+    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind,
+};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
@@ -99,20 +101,18 @@ impl TaskRuntimeState {
 pub struct RunFailure {
     pub kind: RunErrorKind,
     pub detail: String,
-    pub synthesized: bool,
 }
 
 impl RunFailure {
     pub fn automatically_retryable(&self) -> bool {
-        !self.synthesized
-            && matches!(
-                self.kind,
-                RunErrorKind::TurnFailed
-                    | RunErrorKind::Timeout
-                    | RunErrorKind::HandoffMissing
-                    | RunErrorKind::HandoffInvalid
-                    | RunErrorKind::DirtyWorktree
-            )
+        matches!(
+            self.kind,
+            RunErrorKind::TurnFailed
+                | RunErrorKind::Timeout
+                | RunErrorKind::HandoffMissing
+                | RunErrorKind::HandoffInvalid
+                | RunErrorKind::DirtyWorktree
+        )
     }
 
     pub fn transient(&self) -> bool {
@@ -136,6 +136,13 @@ pub struct FailureFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<PayloadRef>,
     pub justification: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectCleanupFailure {
+    pub effect_id: super::EffectId,
+    pub resource: EffectResource,
+    pub failure: RunFailure,
 }
 
 /// Runtime status of the contract-free planning DAG. A separate map from the
@@ -183,7 +190,7 @@ pub struct AssertionState {
 pub struct TerminalReviewState {
     /// Dispatch counter (mirrors `oracle_attempts`): folded from
     /// `TerminalReviewRequested.attempt_no`; the next dispatch and its
-    /// idempotency key ride on it, so a retry re-rolls under a fresh key.
+    /// effect ID ride on it, so a retry re-rolls under a fresh identity.
     #[serde(default)]
     pub attempts: u32,
     /// The last attempt's result. A fresh verdict and a pending failure
@@ -374,8 +381,8 @@ pub struct AttentionItem {
     pub report: String,
 }
 
-/// A `…Requested` event without a recorded outcome. Drives reconcile on
-/// resume and the derived effects-queue rebuild; keyed by idempotency key.
+/// A `…Requested` event without a recorded outcome. The active driver executes
+/// it; a later driver cleans and marks it interrupted rather than replaying it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InflightEffect {
@@ -409,24 +416,23 @@ pub enum InflightEffect {
 }
 
 impl InflightEffect {
-    /// Build the inflight entry for a `…Requested` event. Single source of
-    /// truth shared by the fold and the effect-ledger enqueue.
+    /// Build the inflight entry for a `…Requested` event.
     pub fn from_request(
         event: &super::event::MissionEvent,
         requested_seq: u64,
-    ) -> Option<(String, Self)> {
+    ) -> Option<(super::EffectId, Self)> {
         use super::event::MissionEvent;
         match event {
             MissionEvent::RoleRunRequested {
                 task_id,
                 attempt_no,
-                idempotency_key,
+                effect_id,
                 role,
                 runtime,
                 prompt,
                 base_sha,
             } => Some((
-                idempotency_key.clone(),
+                effect_id.clone(),
                 Self::RoleRun {
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
@@ -442,9 +448,9 @@ impl InflightEffect {
                 oracle,
                 judged_sha,
                 attempt_no,
-                idempotency_key,
+                effect_id,
             } => Some((
-                idempotency_key.clone(),
+                effect_id.clone(),
                 Self::OracleRun {
                     assertion_ids: assertion_ids.clone(),
                     oracle: oracle.clone(),
@@ -455,14 +461,14 @@ impl InflightEffect {
             )),
             MissionEvent::TerminalReviewRequested {
                 attempt_no,
-                idempotency_key,
+                effect_id,
                 role,
                 runtime,
                 prompt,
                 judged_sha,
                 nonce,
             } => Some((
-                idempotency_key.clone(),
+                effect_id.clone(),
                 Self::TerminalReview {
                     attempt_no: *attempt_no,
                     role: role.clone(),
@@ -473,8 +479,8 @@ impl InflightEffect {
                     requested_seq,
                 },
             )),
-            // Exhaustive on purpose: a new `…Requested` event must build its
-            // inflight entry here, never silently skip the effect ledger.
+            // Exhaustive on purpose: every new `…Requested` event must build
+            // its inflight entry here.
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
             | MissionEvent::RoleRunCompleted { .. }
@@ -484,15 +490,8 @@ impl InflightEffect {
             | MissionEvent::TerminalReviewCompleted { .. }
             | MissionEvent::TerminalReviewFailed { .. }
             | MissionEvent::MissionAborted { .. }
-            | MissionEvent::DecisionRecorded { .. } => None,
-        }
-    }
-
-    pub fn kind_str(&self) -> &'static str {
-        match self {
-            Self::RoleRun { .. } => "role_run",
-            Self::OracleRun { .. } => "oracle_run",
-            Self::TerminalReview { .. } => "terminal_review",
+            | MissionEvent::DecisionRecorded { .. }
+            | MissionEvent::EffectCleanupFailed { .. } => None,
         }
     }
 }
@@ -533,7 +532,11 @@ pub struct MissionState {
     pub current_sha: String,
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
-    pub inflight: BTreeMap<String, InflightEffect>,
+    pub inflight: BTreeMap<super::EffectId, InflightEffect>,
+    /// Latest cleanup failure for an unfinished effect. Cleared only when that
+    /// effect's outcome is durably recorded.
+    #[serde(default)]
+    pub cleanup_failure: Option<EffectCleanupFailure>,
     /// Derived each fold from failed nodes, gate results, and the
     /// approval gate, minus anything a decision has resolved.
     pub open_attention: BTreeMap<String, AttentionItem>,

@@ -6,14 +6,14 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
-use lionclaw::engine::Engine;
+use common::{advisory_plan, approve_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 /// A role-aware mock: verdict roles return a ValidateHandoff, others a work
 /// handoff that "commits" HEAD_SHA.
@@ -60,9 +60,12 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
         test_mission_type(),
         "codex".to_string(),
         "test-image".to_string(),
-        Arc::new(role_aware_runner(reviewer_passes)),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(role_aware_runner(reviewer_passes)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -70,7 +73,6 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             "advisory-only mission",
             BASE_SHA,
             lionclaw::model::MissionConfig {
-                approval_required: false,
                 ..Default::default()
             },
         )
@@ -85,6 +87,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
         )
         .await
         .expect("propose");
+    approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
     let advisory = state

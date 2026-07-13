@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{covered_requirement, BASE_SHA};
-use lionclaw::engine::Engine;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
@@ -19,7 +19,7 @@ use lionclaw::model::{
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 fn rn(n: &str) -> RoleName {
     RoleName::new(n).unwrap()
@@ -194,9 +194,12 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
         planning_mission_type(),
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(planning_runner()),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(planning_runner()),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     )
 }
 
@@ -210,7 +213,6 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
             "make the tests pass",
             BASE_SHA,
             MissionConfig {
-                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
@@ -280,7 +282,6 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
             "make the tests pass",
             BASE_SHA,
             MissionConfig {
-                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
@@ -347,9 +348,8 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
     assert!(prompt.contains("not good enough"));
 }
 
-/// A failed planning node (what a crashed run reconciles to — planning is
-/// RoleRun, synthesized-failed by the same machinery) must raise a *retryable*
-/// NodeFailed, never wedge the mission.
+/// A failed planning node must raise a *retryable* NodeFailed, never wedge the
+/// mission.
 #[tokio::test]
 async fn a_failed_planning_node_is_retryable_not_a_wedge() {
     let dir = tempfile::tempdir().unwrap();
@@ -377,9 +377,12 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
         planning_mission_type(),
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let id = engine
         .create_mission(
@@ -387,7 +390,6 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
             "obj",
             BASE_SHA,
             MissionConfig {
-                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
@@ -455,9 +457,12 @@ async fn park_after_author(
         planning_mission_type(),
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let id = engine
         .create_mission(
@@ -465,7 +470,6 @@ async fn park_after_author(
             "obj",
             BASE_SHA,
             MissionConfig {
-                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),

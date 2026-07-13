@@ -41,7 +41,7 @@ scenario_fix_bug() {
         local base; base="$(git -C "$repo" rev-parse HEAD)"
         local mid; mid="$(mission_json start --type software-dev --repo "$repo" \
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
-            --yes | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
         cat > "$repo/plan.json" <<JSON
 { "base_revision": 0, "plan": {
   "requirements": [ { "id": "CORRECT-OVERLAPS", "kind": "capability", "prose": "closed intervals that touch overlap", "disposition": { "type": "covered", "assertion_ids": ["TESTS-PASS"] } } ],
@@ -49,6 +49,8 @@ scenario_fix_bug() {
   "tasks": [ { "id": "fix", "kind": "work", "body": "Fix overlaps() for closed intervals so tests::touching_intervals_overlap and merge_coalesces_touching_intervals pass. Do not modify the tests.", "targets": ["TESTS-PASS"], "role": "implementer", "depends_on": [] } ] } }
 JSON
         "$BIN" mission plan propose "$mid" --repo "$repo" --file "$repo/plan.json" >/dev/null 2>&1
+        "$BIN" mission decide "$mid" plan_proposal:mission approve --repo "$repo" \
+            --justification "eval approves the fixture plan" >/dev/null 2>&1
         timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head; finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
@@ -75,7 +77,7 @@ JSON
 # --- Scenario 2: planning-in-phase -> approve -> verified -----------------
 # No hand-written plan: the planning DAG (strategist -> red-team -> author)
 # proposes the contract, a human approves it, then execution verifies. The
-# approval gate is ON (no --yes), so planning must park before any work.
+# Plan approval is always explicit, so planning must park before any work.
 scenario_planning() {
     local pass=0
     for i in $(seq 1 "$RUNS"); do
@@ -92,7 +94,8 @@ scenario_planning() {
         # Approve the proposal (seeds the contract), then execute to a verdict.
         local item; item="$(mission_json status "$mid" --repo "$repo" \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["attention"][0]["id"])')"
-        "$BIN" mission decide "$mid" "$item" approve --repo "$repo" >/dev/null 2>&1
+        "$BIN" mission decide "$mid" "$item" approve --repo "$repo" \
+            --justification "eval approves the generated plan" >/dev/null 2>&1
         timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head

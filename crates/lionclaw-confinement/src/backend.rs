@@ -47,6 +47,9 @@ impl fmt::Debug for RuntimeSecretsMount {
 pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
+    /// Stable owner for OCI resources created by this execution. Mission
+    /// effects set this so a later process can reap resources after a crash.
+    pub resource_name: Option<String>,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
     pub runtime_auth_provider: Option<Arc<dyn RuntimeAuthProvider>>,
     pub runtime_auth_context: RuntimeAuthContext,
@@ -57,6 +60,7 @@ impl fmt::Debug for ExecutionRequest {
         f.debug_struct("ExecutionRequest")
             .field("plan", &self.plan)
             .field("program", &self.program)
+            .field("resource_name", &self.resource_name)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
             .field(
                 "runtime_auth_provider",
@@ -208,6 +212,7 @@ mod tests {
                     stdin: "hello".to_string(),
                     auth: None,
                 },
+                resource_name: None,
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),

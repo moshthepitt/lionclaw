@@ -10,7 +10,7 @@ use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
-use crate::engine::{AdvanceOutcome, Engine};
+use crate::engine::{load_mission_view, Engine, EngineServices, MissionDisposition, MissionView};
 use crate::mission_type::{
     add_skill, install_mission_type, load_mission_type, materialize_mission_type, remove_skill,
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
@@ -192,9 +192,6 @@ pub struct StartArgs {
     /// Override the mission type's confinement image for this mission.
     #[arg(long)]
     pub image: Option<String>,
-    /// Automatically approve valid plan proposals.
-    #[arg(long)]
-    pub yes: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -229,7 +226,8 @@ pub struct DecideArgs {
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    #[arg(long, default_value = "")]
+    /// Why this decision is appropriate. Required and recorded in the log.
+    #[arg(long)]
     pub justification: String,
 }
 
@@ -481,15 +479,21 @@ async fn assemble_engine(
     workspace::ensure_excluded(repo).await?;
     default_profile.confinement.oci_mut().image = Some(image_id.clone());
     let role_runner = Arc::new(OciRoleRunner::new(profiles, image_id.clone(), ceiling));
+    let effect_cleaner = Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
+        default_profile.confinement.oci().engine.clone(),
+    ));
     let oracle_runner = Arc::new(OciOracleRunner::new(default_profile));
     Ok(Engine::new(
         store,
         mission_type,
         runtime,
         image_id,
-        role_runner,
-        oracle_runner,
-        Arc::new(SystemClock),
+        EngineServices::new(
+            role_runner,
+            oracle_runner,
+            effect_cleaner,
+            Arc::new(SystemClock),
+        ),
     ))
 }
 
@@ -660,8 +664,6 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                 &args.objective,
                 &base_sha,
                 MissionConfig {
-                    // Default-on approval gate; `--yes` auto-approves.
-                    approval_required: !args.yes,
                     // The honesty bar is the mission type's, not a hardcoded default.
                     stop: engine.mission_type().stop,
                     // The planning DAG the mission type ships (empty ⇒ awaits a
@@ -1220,21 +1222,15 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     // turn is not silent (stdout stays clean for `--json`).
     let store = store.with_sink(Arc::new(StderrEventSink));
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
-    let outcome = engine.advance(&mission_id).await?;
-    let state = engine.load_state(&mission_id).await?;
-    print_advance_outcome(
-        mission_id.as_str(),
-        &state,
-        &outcome,
-        engine.store().blobs(),
-        args.json,
-    )?;
+    let view = engine.advance(&mission_id).await?;
+    let state = &view.state;
+    print_mission_view(&view, engine.store().blobs(), args.json)?;
     // Closing over acknowledged review gaps (or a waived review) was an
     // explicit, justified human decision — exit SUCCESS, but say so. The
     // summary already applies the freshness law, so a stale verdict from a
     // superseded head never triggers a false note here.
     if matches!(state.phase, MissionPhase::Done { .. }) {
-        let summary = review_summary(&state);
+        let summary = review_summary(state);
         let blocking = summary["gaps"]["blocking"].as_u64().unwrap_or(0);
         let total = blocking
             + summary["gaps"]["major"].as_u64().unwrap_or(0)
@@ -1277,20 +1273,25 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
 async fn cmd_status(args: StatusArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = store.require_state(&mission_id).await?;
+    let view = load_mission_view(&store, &mission_id).await?;
+    let state = &view.state;
     if args.json {
-        println!(
-            "{}",
-            mission_view_json(mission_id.as_str(), &state, store.blobs(), None)?
-        );
+        println!("{}", mission_view_json(&view, store.blobs())?);
     } else {
         println!(
-            "mission {mission_id}: {} (revision {})",
+            "mission {mission_id}: {} (revision {}, {})",
             phase_slug(&state.phase),
-            state.revision
+            state.revision,
+            view.disposition.slug(),
         );
         println!("objective: {}", state.objective);
-        if let Some(line) = review_line(&state) {
+        if let Some(failure) = &state.cleanup_failure {
+            println!(
+                "cleanup blocked for effect {} ({:?}): {}",
+                failure.effect_id, failure.resource, failure.failure.detail
+            );
+        }
+        if let Some(line) = review_line(state) {
             println!("{line}");
         }
         for (id, assertion) in &state.contract {
@@ -1304,6 +1305,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         for item in state.open_attention.values() {
             print_attention(store.blobs(), item, "  ")?;
         }
+        println!("next: {}", view.next_actions().join(" | "));
     }
     Ok(())
 }
@@ -1642,55 +1644,57 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
     }
 }
 
-fn print_advance_outcome(
-    mission_id: &str,
-    state: &crate::model::MissionState,
-    outcome: &AdvanceOutcome,
-    blobs: &BlobStore,
-    json: bool,
-) -> Result<()> {
+fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Result<()> {
+    let state = &view.state;
+    let mission_id = state.mission_id.as_str();
     if json {
-        println!(
-            "{}",
-            mission_view_json(mission_id, state, blobs, Some(outcome.slug()))?
-        );
+        println!("{}", mission_view_json(view, blobs)?);
     } else {
-        match outcome {
-            AdvanceOutcome::AwaitingPlan => println!("mission {mission_id}: awaiting a plan"),
-            AdvanceOutcome::Parked { attention } => {
+        match view.disposition {
+            MissionDisposition::AwaitingPlan => println!("mission {mission_id}: awaiting a plan"),
+            MissionDisposition::Parked => {
                 println!(
                     "mission {mission_id}: parked ({} attention item(s))",
-                    attention.len()
+                    state.open_attention.len()
                 );
-                for item in attention {
+                for item in state.open_attention.values() {
                     print_attention(blobs, item, "  ")?;
                 }
             }
-            AdvanceOutcome::Busy => {
-                println!("mission {mission_id}: effects in progress under another driver")
+            MissionDisposition::Running => {
+                println!("mission {mission_id}: running under another driver")
             }
-            AdvanceOutcome::Terminal { phase } => {
-                println!("mission {mission_id}: {}", phase_slug(phase));
+            MissionDisposition::CleanupBlocked => {
+                let failure = state
+                    .cleanup_failure
+                    .as_ref()
+                    .expect("cleanup-blocked view has failure detail");
+                println!(
+                    "mission {mission_id}: cleanup blocked for effect {} ({:?})",
+                    failure.effect_id, failure.resource
+                );
+                println!("  {}", failure.failure.detail);
+            }
+            MissionDisposition::Terminal => {
+                println!("mission {mission_id}: {}", phase_slug(&state.phase));
                 if let Some(line) = review_line(state) {
                     println!("  {line}");
                 }
             }
+            MissionDisposition::Ready => println!("mission {mission_id}: ready to advance"),
         }
     }
     Ok(())
 }
 
-fn mission_view_json(
-    mission_id: &str,
-    state: &crate::model::MissionState,
-    blobs: &BlobStore,
-    outcome: Option<&str>,
-) -> Result<serde_json::Value> {
+fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json::Value> {
+    let state = &view.state;
     Ok(serde_json::json!({
-        "mission_id": mission_id,
+        "mission_id": state.mission_id.as_str(),
         "phase": phase_slug(&state.phase),
         "finish": state.phase.finish().map(|finish| finish.slug()),
-        "outcome": outcome,
+        "disposition": view.disposition.slug(),
+        "next_actions": view.next_actions(),
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
@@ -1707,6 +1711,14 @@ fn mission_view_json(
         "attention": state.open_attention.values().map(|item| {
             attention_json(blobs, item)
         }).collect::<Result<Vec<_>>>()?,
+        "cleanup_failure": state.cleanup_failure.as_ref().map(|failure| {
+            serde_json::json!({
+                "effect_id": failure.effect_id.as_str(),
+                "resource": failure.resource,
+                "kind": failure.failure.kind,
+                "detail": failure.failure.detail,
+            })
+        }),
         "terminal_review": review_summary(state),
     }))
 }
@@ -1885,7 +1897,43 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{EffectId, RunErrorKind, RunFailure};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn cli_has_no_plan_approval_bypass_and_requires_decision_justification() {
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "start",
+            "--type",
+            "software-dev",
+            "--objective",
+            "fix it",
+            "--yes",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "approve",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "reviewed the proposed contract",
+        ])
+        .is_ok());
+    }
 
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
         use crate::mission_type::RoleDefinition;
@@ -2026,7 +2074,6 @@ mod tests {
                 workspace_dir: "/w".into(),
                 base_sha: "base".into(),
                 config: MissionConfig {
-                    approval_required: false,
                     recovery: RecoveryConfig { max_attempts: 1 },
                     terminal_review: Some(TerminalReviewConfig {
                         role: RoleName::new("gap-reviewer").unwrap(),
@@ -2058,10 +2105,16 @@ mod tests {
                 actor: "test".into(),
                 justification: "initial".into(),
             },
+            MissionEvent::DecisionRecorded {
+                attention_id: "plan_proposal:mission".into(),
+                action: DecisionAction::Approve,
+                justification: "test fixture approves the plan".into(),
+                actor: "test".into(),
+            },
             MissionEvent::RoleRunCompleted {
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
-                idempotency_key: "k1".into(),
+                effect_id: EffectId::for_parts(&["test", "k1"]),
                 handoff: Handoff::Work {
                     done: true,
                     report: PayloadRef::inline("done"),
@@ -2096,7 +2149,7 @@ mod tests {
             oracle: OracleName::new("cargo-test").unwrap(),
             judged_sha: "h1".into(),
             attempt_no: 1,
-            idempotency_key: "ko".into(),
+            effect_id: EffectId::for_parts(&["test", "ko"]),
             exit_code,
             exit_signal: None,
             stdout: PayloadRef::inline(""),
@@ -2129,7 +2182,7 @@ mod tests {
             oracle: OracleName::new("cargo-test").unwrap(),
             judged_sha: "h1".into(),
             attempt_no: 1,
-            idempotency_key: "ko".into(),
+            effect_id: EffectId::for_parts(&["test", "ko"]),
             exit_code: 1,
             exit_signal: None,
             stdout: PayloadRef::inline("ordinary output"),
@@ -2168,7 +2221,7 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
-                idempotency_key: "kr".into(),
+                effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
                 passed: false,
                 gaps: vec![minor("a"), minor("b")],
@@ -2191,11 +2244,12 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewFailed {
                 attempt_no: 1,
-                idempotency_key: "kr".into(),
+                effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
-                error_kind: crate::model::RunErrorKind::Timeout,
-                detail: "boom".into(),
-                synthesized: false,
+                failure: RunFailure {
+                    kind: RunErrorKind::Timeout,
+                    detail: "boom".into(),
+                },
             },
             MissionEvent::DecisionRecorded {
                 attention_id: "terminal_review_failed:mission".into(),
@@ -2229,7 +2283,7 @@ mod tests {
             oracle_completed(0),
             MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
-                idempotency_key: "kr".into(),
+                effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
                 passed: false,
                 gaps: vec![],

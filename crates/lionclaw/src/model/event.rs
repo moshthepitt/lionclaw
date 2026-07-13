@@ -6,7 +6,7 @@
 //! fold-derived and never stored, so state/log divergence is unrepresentable.
 //!
 //! Non-deterministic or side-effecting steps are two events: `…Requested`
-//! (intent + content-derived idempotency key; consumed by the effect driver)
+//! (intent + content-derived effect ID; consumed by the effect driver)
 //! then `…Completed`/`…Failed` (outcome fact; consumed by the fold). The log
 //! stores outcomes, never executable intentions.
 //!
@@ -73,7 +73,6 @@ pub struct MissionTypeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
-    pub approval_required: bool,
     pub stop: StopBar,
     /// The mission type's planning DAG (how an objective becomes a proposed
     /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
@@ -93,7 +92,6 @@ pub struct MissionConfig {
 impl Default for MissionConfig {
     fn default() -> Self {
         Self {
-            approval_required: true,
             stop: StopBar::Verified,
             planning: PlanningDag::default(),
             recovery: RecoveryConfig::default(),
@@ -256,6 +254,16 @@ pub enum RunErrorKind {
     HandoffInvalid,
     DirtyWorktree,
     Infra,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectResource {
+    Container,
+    RuntimeSecret,
+    AttemptDirectory,
+    WriterRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +295,7 @@ pub enum MissionEvent {
     RoleRunRequested {
         task_id: TaskId,
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         role: RoleName,
         /// Effective runtime profile, resolved before the request is recorded.
         runtime: String,
@@ -300,7 +308,7 @@ pub enum MissionEvent {
     RoleRunCompleted {
         task_id: TaskId,
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         handoff: Handoff,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<ArtifactOutcome>,
@@ -308,26 +316,22 @@ pub enum MissionEvent {
     RoleRunFailed {
         task_id: TaskId,
         attempt_no: u32,
-        idempotency_key: String,
-        error_kind: RunErrorKind,
-        detail: String,
-        /// True when the engine synthesized this outcome on resume for a
-        /// run whose real outcome is unknowable.
-        synthesized: bool,
+        effect_id: super::EffectId,
+        failure: super::RunFailure,
     },
     OracleRunRequested {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
     },
     OracleRunCompleted {
         assertion_ids: Vec<AssertionId>,
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         exit_code: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_signal: Option<i32>,
@@ -342,10 +346,8 @@ pub enum MissionEvent {
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
-        idempotency_key: String,
-        error_kind: RunErrorKind,
-        detail: String,
-        synthesized: bool,
+        effect_id: super::EffectId,
+        failure: super::RunFailure,
     },
     /// The closing review was dispatched: a fresh-context `emits-gap-verdict`
     /// role judging the tree at `judged_sha` against the objective,
@@ -353,7 +355,7 @@ pub enum MissionEvent {
     /// never a plan task — hence no `task_id`.
     TerminalReviewRequested {
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         role: RoleName,
         /// Effective runtime profile, resolved before the request is recorded.
         runtime: String,
@@ -372,7 +374,7 @@ pub enum MissionEvent {
     /// and `classify_finish` never reads it. It gates closure only.
     TerminalReviewCompleted {
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         judged_sha: String,
         /// The reviewer's own summary bit. A blocking gap dominates it
         /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
@@ -385,13 +387,16 @@ pub enum MissionEvent {
     /// an unfinished review), distinct from a verdict with gaps.
     TerminalReviewFailed {
         attempt_no: u32,
-        idempotency_key: String,
+        effect_id: super::EffectId,
         judged_sha: String,
-        error_kind: RunErrorKind,
-        detail: String,
-        /// True when synthesized on resume for a run whose outcome is
-        /// unknowable.
-        synthesized: bool,
+        failure: super::RunFailure,
+    },
+    /// Cleanup failed without settling the original request. The next driver
+    /// retries the same exact resource operation before any new dispatch.
+    EffectCleanupFailed {
+        effect_id: super::EffectId,
+        resource: EffectResource,
+        failure: super::RunFailure,
     },
     MissionAborted {
         reason: String,
@@ -440,9 +445,9 @@ impl DecisionAction {
     }
 }
 
-/// Idempotency role of an event within a two-event (request/outcome) pair.
+/// Role of an event within a two-event (request/outcome) effect pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdemClass {
+pub enum EffectEventClass {
     Request,
     Outcome,
 }
@@ -462,70 +467,36 @@ impl MissionEvent {
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
             Self::TerminalReviewFailed { .. } => "terminal_review_failed",
+            Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
         }
     }
 
-    /// The idempotency key and its class, for events participating in a
+    /// The effect ID and its class, for events participating in a
     /// request/outcome pair.
-    pub fn idempotency(&self) -> Option<(IdemClass, &str)> {
+    pub fn effect_identity(&self) -> Option<(EffectEventClass, &str)> {
         match self {
-            Self::RoleRunRequested {
-                idempotency_key, ..
+            Self::RoleRunRequested { effect_id, .. }
+            | Self::OracleRunRequested { effect_id, .. }
+            | Self::TerminalReviewRequested { effect_id, .. } => {
+                Some((EffectEventClass::Request, effect_id.as_str()))
             }
-            | Self::OracleRunRequested {
-                idempotency_key, ..
+            Self::RoleRunCompleted { effect_id, .. }
+            | Self::RoleRunFailed { effect_id, .. }
+            | Self::OracleRunCompleted { effect_id, .. }
+            | Self::OracleRunFailed { effect_id, .. }
+            | Self::TerminalReviewCompleted { effect_id, .. }
+            | Self::TerminalReviewFailed { effect_id, .. } => {
+                Some((EffectEventClass::Outcome, effect_id.as_str()))
             }
-            | Self::TerminalReviewRequested {
-                idempotency_key, ..
-            } => Some((IdemClass::Request, idempotency_key)),
-            Self::RoleRunCompleted {
-                idempotency_key, ..
-            }
-            | Self::RoleRunFailed {
-                idempotency_key, ..
-            }
-            | Self::OracleRunCompleted {
-                idempotency_key, ..
-            }
-            | Self::OracleRunFailed {
-                idempotency_key, ..
-            }
-            | Self::TerminalReviewCompleted {
-                idempotency_key, ..
-            }
-            | Self::TerminalReviewFailed {
-                idempotency_key, ..
-            } => Some((IdemClass::Outcome, idempotency_key)),
-            // Fact events carry no idempotency key. Exhaustive on purpose: a new
-            // effect-style event must decide its class here, never silently skip
-            // the ledger.
+            // Fact events carry no effect ID. Exhaustive on purpose: a new
+            // effect-style event must decide its class here.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
             | Self::MissionAborted { .. }
-            | Self::DecisionRecorded { .. } => None,
-        }
-    }
-
-    /// Whether an outcome event records a success (`done`) or failure
-    /// (`failed`) for its effect ledger row. Exhaustive on purpose (see
-    /// `idempotency`).
-    pub fn outcome_succeeded(&self) -> Option<bool> {
-        match self {
-            Self::RoleRunCompleted { .. }
-            | Self::OracleRunCompleted { .. }
-            | Self::TerminalReviewCompleted { .. } => Some(true),
-            Self::RoleRunFailed { .. }
-            | Self::OracleRunFailed { .. }
-            | Self::TerminalReviewFailed { .. } => Some(false),
-            Self::MissionCreated { .. }
-            | Self::PlanProposed { .. }
-            | Self::RoleRunRequested { .. }
-            | Self::OracleRunRequested { .. }
-            | Self::TerminalReviewRequested { .. }
-            | Self::MissionAborted { .. }
-            | Self::DecisionRecorded { .. } => None,
+            | Self::DecisionRecorded { .. }
+            | Self::EffectCleanupFailed { .. } => None,
         }
     }
 }
@@ -545,17 +516,15 @@ pub struct EventEnvelope {
 mod compat_tests {
     use super::*;
 
-    /// Pre-feature wire shapes must keep deserializing, and non-review
-    /// missions must keep serializing byte-identically (no new keys).
+    /// The optional review configuration stays absent from the ordinary wire
+    /// shape when it is not configured.
     #[test]
-    fn pre_terminal_review_shapes_round_trip_unchanged() {
-        // A MissionConfig written before the feature existed.
-        let old_config = r#"{"approval_required":true,"stop":"verified"}"#;
-        let config: MissionConfig = serde_json::from_str(old_config).expect("old config parses");
+    fn optional_terminal_review_stays_out_of_the_default_wire_shape() {
+        let config = MissionConfig::default();
         assert_eq!(config.terminal_review, None);
-        // A config not using the feature serializes without the key.
         let json = serde_json::to_string(&config).expect("serialize");
         assert!(!json.contains("terminal_review"));
+        assert!(!json.contains("approval_required"));
 
         // A pre-feature Validate handoff keeps its exact shape; terminal
         // review uses a separate handoff variant rather than widening it.

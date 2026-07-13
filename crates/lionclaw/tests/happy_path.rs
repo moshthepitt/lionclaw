@@ -3,8 +3,8 @@
 
 mod common;
 
-use common::{default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw::engine::AdvanceOutcome;
+use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
+use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{FinishClass, MissionPhase, TaskStatus};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -36,12 +36,11 @@ async fn passing_oracle_yields_verified_finish() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    let AdvanceOutcome::Terminal { phase } = outcome else {
-        panic!("expected terminal, got {outcome:?}");
-    };
+    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
     assert_eq!(
-        phase,
+        outcome.state.phase,
         MissionPhase::Done {
             finish: FinishClass::Verified
         }
@@ -93,14 +92,14 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
     assert!(matches!(
-        outcome,
-        AdvanceOutcome::Terminal {
-            phase: MissionPhase::Done {
-                finish: FinishClass::Verified
-            }
+        outcome.state.phase,
+        MissionPhase::Done {
+            finish: FinishClass::Verified
         }
     ));
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -139,10 +138,10 @@ async fn failing_oracle_never_reports_verified() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    let AdvanceOutcome::Parked { attention } = outcome else {
-        panic!("expected repair park, got {outcome:?}");
-    };
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    let attention: Vec<_> = outcome.state.open_attention.values().collect();
     assert_eq!(attention.len(), 1);
     assert_eq!(attention[0].id, "oracle_verdict_failed:cargo-test");
     assert_eq!(attention[0].assertion_ids[0].as_str(), "TESTS-PASS");
@@ -198,10 +197,10 @@ async fn worker_reporting_not_done_parks_with_attention() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    let AdvanceOutcome::Parked { attention } = outcome else {
-        panic!("expected parked, got {outcome:?}");
-    };
+    assert_eq!(outcome.disposition, MissionDisposition::Parked);
+    let attention: Vec<_> = outcome.state.open_attention.values().collect();
     assert_eq!(attention.len(), 1);
     // Parked means parked: no oracle ever ran.
     assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());

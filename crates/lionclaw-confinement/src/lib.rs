@@ -21,8 +21,8 @@ pub use backend::{
 };
 pub use mount_validation::{parse_runtime_tmpfs_entry, RuntimeTmpfsEntry};
 pub use oci::{
-    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
-    OciExecutionBackend,
+    remove_oci_container, remove_oci_secret, resolve_oci_image_compatibility_identity,
+    validate_oci_launch_prerequisites, OciExecutionBackend,
 };
 pub use plan::{
     map_host_path_into_runtime_mount, mount_source_for_target, runtime_native_home_mount_source,

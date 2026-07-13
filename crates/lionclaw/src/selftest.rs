@@ -23,14 +23,14 @@ use crate::authority::{
     MissionMounts, RolePlanRequest,
 };
 use crate::config::RuntimeProfiles;
-use crate::engine::{AdvanceOutcome, Engine, ProposeError};
+use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, DecisionAction, FinishClass, Gap, GapSeverity,
-    Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan,
-    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
-    RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId, TaskKind,
-    TaskStatus,
+    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
+    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName,
+    PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
+    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId,
+    TaskKind, TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -104,7 +104,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                 },
                 artifact: Some(ArtifactOutcome {
                     base_sha: request.base_sha.clone(),
-                    head_sha: "selftest-head".to_string(),
+                    head_sha: request.base_sha,
                 }),
                 model_id: None,
             })
@@ -469,6 +469,19 @@ fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
     }
 }
 
+async fn approve_plan(engine: &Engine, mission_id: &MissionId) -> Result<()> {
+    engine
+        .decide(
+            mission_id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "self-test approves the plan",
+            "self-test",
+        )
+        .await?;
+    Ok(())
+}
+
 /// A real writable worker without a model: it checks out the repo, writes a
 /// known-good fix and commits it **inside a real read-write container**, and
 /// returns the captured commit — proving the allow-side of confinement (writes
@@ -490,8 +503,8 @@ impl RoleRunner for ScriptedRoleRunner {
 
 impl ScriptedRoleRunner {
     async fn run_inner(&self, request: RoleRunRequest) -> Result<RoleRunOutcome> {
-        let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
-        let dest = request.state_dir.join("selftest-work").join(&attempt_tag);
+        let attempt_tag = request.effect_id.as_str();
+        let dest = request.state_dir.join("selftest-work").join(attempt_tag);
         workspace::create_checkout(&request.workspace_dir, &dest, &request.base_sha).await?;
         // The produces-artifact role compiles to a writable workspace.
         let authority = compile_authority(&request.role, &AuthorityCeiling::default())
@@ -514,7 +527,7 @@ impl ScriptedRoleRunner {
             &request.workspace_dir,
             &dest,
             request.mission_id.as_str(),
-            &attempt_tag,
+            &request.effect_id,
         )
         .await?;
         workspace::remove_dir(&dest).await?;
@@ -557,8 +570,11 @@ async fn run_confined_sh(
         hard_timeout: Duration::from_secs(120),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
-    let mut executor =
-        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+    let mut executor = MissionProgramExecutor::new(
+        compiled.plan().clone(),
+        RuntimeAuthRegistry::empty(),
+        &EffectId::for_parts(&["selftest", "confined-command"]),
+    );
     executor
         .execute_captured(RuntimeProgramSpec {
             executable: "/bin/sh".to_string(),
@@ -585,17 +601,23 @@ async fn build_engine(
     let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     let image = mission_type.image.clone();
     profile.confinement.oci_mut().image = Some(image.clone());
+    let effect_cleaner = Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
+        profile.confinement.oci().engine.clone(),
+    ));
     Ok(Engine::new(
         store,
         mission_type,
         "codex".to_string(),
         image,
-        role_runner,
-        Arc::new(CountingOracleRunner {
-            inner: OciOracleRunner::new(profile),
-            count: oracle_count,
-        }),
-        Arc::new(SystemClock),
+        EngineServices::new(
+            role_runner,
+            Arc::new(CountingOracleRunner {
+                inner: OciOracleRunner::new(profile),
+                count: oracle_count,
+            }),
+            effect_cleaner,
+            Arc::new(SystemClock),
+        ),
     ))
 }
 
@@ -624,7 +646,6 @@ async fn check_happy_writer_and_resume() -> Result<()> {
                 "self-test writable worker",
                 &base,
                 MissionConfig {
-                    approval_required: false,
                     ..Default::default()
                 },
             )
@@ -633,6 +654,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
             .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
             .await
             .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
+        approve_plan(&engine, &id).await?;
         assert_verified(&engine, &id).await?;
         // The worker's writes landed and the engine recorded the commit.
         let state = engine.load_state(&id).await?;
@@ -682,7 +704,6 @@ async fn check_prepared_input() -> Result<()> {
             "self-test prepared input",
             &base,
             MissionConfig {
-                approval_required: false,
                 ..Default::default()
             },
         )
@@ -691,6 +712,7 @@ async fn check_prepared_input() -> Result<()> {
         .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
         .map_err(|error| anyhow::anyhow!("plan proposal rejected: {error}"))?;
+    approve_plan(&engine, &id).await?;
     assert_verified(&engine, &id).await?;
 
     let state = engine.load_state(&id).await?;
@@ -755,7 +777,6 @@ async fn check_oracle_honesty() -> Result<()> {
             "self-test oracle honesty",
             &base,
             MissionConfig {
-                approval_required: false,
                 ..Default::default()
             },
         )
@@ -764,6 +785,7 @@ async fn check_oracle_honesty() -> Result<()> {
         .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
+    approve_plan(&engine, &id).await?;
     let outcome = engine.advance(&id).await?;
     let state = engine.load_state(&id).await?;
     let verdict = state
@@ -775,7 +797,7 @@ async fn check_oracle_honesty() -> Result<()> {
     if verdict.passed() {
         anyhow::bail!("the genuinely broken tree received an authoritative pass");
     }
-    if !matches!(outcome, AdvanceOutcome::Parked { .. })
+    if outcome.disposition != MissionDisposition::Parked
         || !state
             .open_attention
             .contains_key("oracle_verdict_failed:cargo-test")
@@ -819,7 +841,6 @@ async fn check_replanning() -> Result<()> {
             "re-planning self-test",
             &base,
             MissionConfig {
-                approval_required: false,
                 ..Default::default()
             },
         )
@@ -833,6 +854,7 @@ async fn check_replanning() -> Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
+    approve_plan(&engine, &mission_id).await?;
 
     // Replace the sole coverer with a new-id task in one complete revision.
     let mut next = oracle_plan();
@@ -853,6 +875,7 @@ async fn check_replanning() -> Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("revision rejected: {e}"))?;
+    approve_plan(&engine, &mission_id).await?;
 
     let state = engine.load_state(&mission_id).await?;
     if state.revision != 2 {
@@ -923,8 +946,8 @@ async fn check_terminal_review() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("review mission type load failed: {e}"))?;
 
     let repo = tempfile::tempdir().context("tempdir")?;
+    let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
     let config = MissionConfig {
-        approval_required: false,
         terminal_review: mission_type.terminal_review.clone(),
         ..Default::default()
     };
@@ -933,15 +956,20 @@ async fn check_terminal_review() -> Result<()> {
         mission_type,
         "codex".to_string(),
         RUNTIME_IMAGE.to_string(),
-        Arc::new(ReviewParkRoleRunner),
-        Arc::new(FixedOracleRunner(0)),
-        Arc::new(SystemClock),
+        EngineServices::new(
+            Arc::new(ReviewParkRoleRunner),
+            Arc::new(FixedOracleRunner(0)),
+            Arc::new(crate::effect_cleanup::LocalEffectCleaner::new(
+                "podman".to_string(),
+            )),
+            Arc::new(SystemClock),
+        ),
     );
     let mission_id = engine
         .create_mission(
             repo.path().to_str().context("utf8 repo path")?,
             "terminal-review self-test",
-            "selftest-base",
+            &base,
             config,
         )
         .await?;
@@ -954,6 +982,7 @@ async fn check_terminal_review() -> Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
+    approve_plan(&engine, &mission_id).await?;
 
     engine.advance(&mission_id).await?;
     let parked = engine.load_state(&mission_id).await?;
@@ -993,10 +1022,7 @@ async fn check_terminal_review() -> Result<()> {
         );
     }
     match &done.terminal_review.accepted {
-        Some(a)
-            if a.kind == ReviewAcceptanceKind::AcknowledgedGaps
-                && a.judged_sha == "selftest-head" =>
-        {
+        Some(a) if a.kind == ReviewAcceptanceKind::AcknowledgedGaps && a.judged_sha == base => {
             Ok(())
         }
         other => anyhow::bail!("acknowledgment not on record at the judged sha: {other:?}"),
@@ -1096,8 +1122,11 @@ async fn check_runtime_skill_mount() -> Result<()> {
         hard_timeout: Duration::from_secs(120),
     })
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
-    let mut executor =
-        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+    let mut executor = MissionProgramExecutor::new(
+        compiled.plan().clone(),
+        RuntimeAuthRegistry::empty(),
+        &EffectId::for_parts(&["selftest", "readonly-inspection"]),
+    );
     let output = executor
         .execute_captured(RuntimeProgramSpec {
             executable: "/bin/sh".to_string(),

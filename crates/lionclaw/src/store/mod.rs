@@ -1,5 +1,5 @@
-//! SQLite-backed mission store: append-only event log (source of truth),
-//! derived effect ledger, and the content-addressed blob store.
+//! SQLite-backed mission store: append-only event log (source of truth) and
+//! the content-addressed blob store.
 //!
 //! One database per target workspace at `<workspace>/.lionclaw/mission.db`.
 //! Connection discipline copied from the kernel's proven config: WAL,
@@ -11,7 +11,7 @@ mod events;
 mod snapshots;
 
 pub use blobs::{BlobStore, BLOB_INLINE_MAX};
-pub use events::{AppendError, EffectLease, EffectStatus, NewEvent};
+pub use events::{AppendError, NewEvent};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,6 +110,10 @@ impl MissionStore {
 
     pub(crate) fn mission_dir(&self, mission_id: &MissionId) -> PathBuf {
         self.lionclaw_dir.join("missions").join(mission_id.as_str())
+    }
+
+    pub(crate) fn driver_lock_path(&self, mission_id: &MissionId) -> PathBuf {
+        self.mission_dir(mission_id).join("driver.lock")
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {

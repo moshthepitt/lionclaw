@@ -1,6 +1,6 @@
 //! Mock port implementations for the deterministic core's tests
 //! (`feature = "testing"`). Scripted responders with call logs and per-key
-//! invocation counters — the resume tests assert an idempotency key is never
+//! invocation counters — the resume tests assert an effect ID is never
 //! executed twice.
 
 use std::collections::BTreeMap;
@@ -11,9 +11,19 @@ use async_trait::async_trait;
 
 use crate::model::{ArtifactOutcome, Gap, Handoff, PayloadRef, TaskId};
 use crate::ports::{
-    Clock, OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure,
-    RoleRunOutcome, RoleRunRequest, RoleRunner,
+    Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleFailure, OracleOutcome,
+    OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
+
+#[derive(Default)]
+pub struct NoopEffectCleaner;
+
+#[async_trait]
+impl EffectCleaner for NoopEffectCleaner {
+    async fn cleanup(&self, _request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        Ok(())
+    }
+}
 
 /// A terminal-review verdict outcome that echoes the request prompt's nonce
 /// (judges are never captured, so `artifact` is always `None`).
@@ -99,13 +109,13 @@ impl RoleRunner for MockRoleRunner {
         self.calls.lock().expect("lock").push((
             request.task_id.clone(),
             request.attempt_no,
-            request.idempotency_key.clone(),
+            request.effect_id.to_string(),
         ));
         *self
             .invocations_by_key
             .lock()
             .expect("lock")
-            .entry(request.idempotency_key.clone())
+            .entry(request.effect_id.to_string())
             .or_insert(0) += 1;
         (self.script)(&request)
     }

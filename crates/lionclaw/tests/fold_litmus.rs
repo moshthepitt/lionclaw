@@ -1,14 +1,14 @@
 //! The persistence litmus: state is a pure fold over the log. Folding the
 //! same events twice is identical; folding a prefix then applying the tail
 //! equals folding everything; state survives a serde roundtrip unchanged
-//! (snapshot readiness); and the derived effect ledger agrees with the
-//! fold's inflight set.
+//! (snapshot readiness); and the discardable snapshot rebuilds from the log.
 
 mod common;
 
 use common::{
-    blocking_gap, default_config, harness, harness_with_type, proposal, review_config,
-    review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA, HEAD_SHA,
+    approve_plan, blocking_gap, default_config, harness, harness_with_type, proposal,
+    review_config, review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA,
+    HEAD_SHA,
 };
 use lionclaw::model::{apply, fold, DecisionAction, MissionId};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -38,29 +38,10 @@ async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
     let decoded = serde_json::from_str(&encoded).expect("decode");
     assert_eq!(once, decoded);
 
-    // Cursor agreement: a finished mission has no inflight effects and no
-    // runnable ledger rows.
+    // A finished mission has no unfinished requests.
     assert!(once.inflight.is_empty());
-    for envelope in &events {
-        if let Some((lionclaw::model::IdemClass::Request, key)) = envelope.event.idempotency() {
-            let status = h
-                .engine
-                .store()
-                .effect_status(key)
-                .await
-                .expect("status")
-                .expect("row exists")
-                .status;
-            assert!(
-                status == "done" || status == "failed",
-                "effect {key} left in state {status}"
-            );
-        }
-    }
 
-    // The real litmus: delete every derived cursor (snapshot + effect
-    // ledger) and rebuild from the log alone; the rebuilt state must equal
-    // the live one.
+    // Delete the derived snapshot and rebuild from the log alone.
     let rebuilt = h
         .engine
         .store()
@@ -98,6 +79,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     h.engine.advance(&mission_id).await.expect("advance");
 
     assert_fold_litmus(&h, &mission_id).await;
@@ -135,6 +117,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     h.engine
         .advance(&mission_id)
         .await
@@ -185,6 +168,7 @@ async fn snapshot_resume_matches_full_refold() {
         )
         .await
         .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     h.engine.advance(&mission_id).await.expect("advance");
 
     // Prove the snapshot branch is actually taken (not silently full-refolding

@@ -20,20 +20,27 @@ pub struct MissionProgramExecutor {
     plan: EffectiveExecutionPlan,
     auth_registry: RuntimeAuthRegistry,
     auth_context: RuntimeAuthContext,
+    resource_name: String,
 }
 
 impl MissionProgramExecutor {
-    pub fn new(plan: EffectiveExecutionPlan, auth_registry: RuntimeAuthRegistry) -> Self {
+    pub fn new(
+        plan: EffectiveExecutionPlan,
+        auth_registry: RuntimeAuthRegistry,
+        effect_id: &crate::model::EffectId,
+    ) -> Self {
         Self {
             plan,
             auth_registry,
             auth_context: RuntimeAuthContext::default(),
+            resource_name: effect_id.resource_name(),
         }
     }
 
     fn request(&self, program: RuntimeProgramSpec) -> ExecutionRequest {
         ExecutionRequest {
             plan: self.plan.clone(),
+            resource_name: Some(self.resource_name.clone()),
             runtime_auth_provider: program
                 .auth
                 .as_ref()

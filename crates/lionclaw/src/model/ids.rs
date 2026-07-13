@@ -124,6 +124,61 @@ id_type!(
     "Mission-type prepared input name."
 );
 
+/// Effect identity: the lowercase SHA-256 digest of a durable request.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EffectId(String);
+
+impl EffectId {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, IdError> {
+        let raw = raw.into();
+        if raw.len() != 64
+            || !raw
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(IdError(format!(
+                "effect id '{raw}' must be 64 lowercase hexadecimal characters"
+            )));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn for_parts(parts: &[&str]) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self(hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes())))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn resource_name(&self) -> String {
+        format!("lionclaw-effect-{}", self.0)
+    }
+}
+
+impl TryFrom<String> for EffectId {
+    type Error = IdError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(raw)
+    }
+}
+
+impl From<EffectId> for String {
+    fn from(id: EffectId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for EffectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Mission id: `m` + 12 hex chars, derived from workspace, objective, and
 /// creation time without RNG.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -230,5 +285,14 @@ mod tests {
         assert_eq!(id.as_str(), "mabcdef012345");
         assert!(MissionId::parse(id.as_str()).is_ok());
         assert!(MissionId::parse("nope").is_err());
+    }
+
+    #[test]
+    fn effect_id_is_a_path_safe_sha256_digest() {
+        let id = EffectId::for_parts(&["mission", "request"]);
+        assert_eq!(id.as_str().len(), 64);
+        assert!(EffectId::parse(id.as_str()).is_ok());
+        assert!(EffectId::parse("ABC").is_err());
+        assert!(EffectId::parse("../escape").is_err());
     }
 }

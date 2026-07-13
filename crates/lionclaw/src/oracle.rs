@@ -46,15 +46,10 @@ fn fail(detail: impl Into<String>) -> OracleFailure {
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
-        let attempt_tag = format!(
-            "oracle-{}-{}",
-            request.oracle,
-            &request.judged_sha[..12.min(request.judged_sha.len())]
-        );
         let dirs = AttemptDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
-            &attempt_tag,
+            &request.effect_id,
         )
         .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
@@ -96,8 +91,10 @@ impl OracleRunner for OciOracleRunner {
                 prepare_inputs(
                     &self.profile,
                     &request.state_dir,
+                    &dirs.root,
                     &checkout,
                     &request.prepared_inputs,
+                    &request.effect_id,
                 )
                 .await
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
@@ -141,8 +138,11 @@ impl OracleRunner for OciOracleRunner {
                 stdin: String::new(),
                 auth: None,
             };
-            let mut executor =
-                MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+            let mut executor = MissionProgramExecutor::new(
+                compiled.plan().clone(),
+                RuntimeAuthRegistry::empty(),
+                &request.effect_id,
+            );
             // Wall-clock duration is recorded evidence, not fold state; measuring
             // it here is a runner concern that never threatens fold purity.
             #[expect(clippy::disallowed_methods)]
@@ -171,22 +171,7 @@ impl OracleRunner for OciOracleRunner {
         }
         .await;
 
-        // Reap the whole attempt directory (Git checkout, staged oracle,
-        // scratch target dir) on every exit path; the outcome is already in
-        // `result` and the verdict is minted from it in the fold.
-        match (result, workspace::remove_dir(&dirs.root).await) {
-            (result, Ok(())) => result,
-            (Ok(_), Err(err)) => Err(fail(format!(
-                "failed to remove oracle attempt directory: {err:#}"
-            ))),
-            (Err(mut failure), Err(err)) => {
-                failure.detail = format!(
-                    "{}; failed to remove oracle attempt directory: {err:#}",
-                    failure.detail
-                );
-                Err(failure)
-            }
-        }
+        result
     }
 }
 

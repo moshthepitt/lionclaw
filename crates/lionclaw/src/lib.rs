@@ -10,6 +10,8 @@
 pub mod authority;
 pub mod cli;
 pub mod config;
+mod driver_lock;
+mod effect_cleanup;
 pub mod engine;
 pub mod evidence;
 pub mod mission_type;

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use common::{default_config, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::authority::AuthorityCeiling;
-use lionclaw::engine::Engine;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 fn write_minimal_type(root: &Path) {
     std::fs::create_dir_all(root.join("roles")).unwrap();
@@ -122,9 +122,12 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
         test_mission_type(), // digest "test-digest"
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(MockRoleRunner::happy(HEAD_SHA)),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let id = engine_a
         .create_mission(
@@ -151,9 +154,12 @@ async fn opening_a_mission_whose_type_digest_changed_is_refused() {
         changed,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(MockRoleRunner::happy(HEAD_SHA)),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let err = engine_b
         .load_state(&id)

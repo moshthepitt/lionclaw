@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::{
-    covered_requirement, default_config, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
+    approve_plan, covered_requirement, default_config, proposal, simple_plan, ParseTask, BASE_SHA,
+    HEAD_SHA,
 };
-use lionclaw::engine::Engine;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, Handoff, MissionConfig, OracleName, OutputSemantics,
@@ -22,7 +23,7 @@ use lionclaw::model::{
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 fn rn(n: &str) -> RoleName {
     RoleName::new(n).unwrap()
@@ -228,9 +229,12 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         mission_type,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -250,6 +254,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         )
         .await
         .unwrap();
+    approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&engine, &mission_id, "implementer").await;
@@ -295,9 +300,12 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
         mission_type,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -347,6 +355,7 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
         )
         .await
         .unwrap();
+    approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&engine, &mission_id, "reviewer").await;
@@ -480,9 +489,12 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
         mission_type,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -490,7 +502,6 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
             "plan the work",
             BASE_SHA,
             MissionConfig {
-                approval_required: false,
                 stop: StopBar::Verified,
                 planning: PlanningDag {
                     tasks: vec![
@@ -555,9 +566,12 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
         mission_type,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -565,7 +579,6 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
             "plan the work",
             BASE_SHA,
             MissionConfig {
-                approval_required: false,
                 stop: StopBar::Verified,
                 planning: PlanningDag {
                     tasks: vec![
@@ -662,6 +675,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
         )
         .await
         .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
     h.engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&h.engine, &mission_id, "gap-reviewer").await;
@@ -720,6 +734,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
         )
         .await
         .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
     h.engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&h.engine, &mission_id, "gap-reviewer").await;
@@ -748,9 +763,12 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
         mission_type,
         "codex".to_string(),
         "img".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -770,6 +788,7 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
         )
         .await
         .unwrap();
+    approve_plan(&engine, &mission_id).await;
 
     // Advance must error — the missing skill reference cannot be resolved
     // at prompt materialization, so the mission fails closed.

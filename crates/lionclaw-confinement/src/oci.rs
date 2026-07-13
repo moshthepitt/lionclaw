@@ -317,6 +317,12 @@ fn prepare_oci_process_launch(
         "--interactive".to_string(),
     ];
 
+    if let Some(name) = &request.resource_name {
+        validate_oci_resource_name(name)?;
+        args.push("--name".to_string());
+        args.push(name.clone());
+    }
+
     if config.read_only_rootfs {
         args.push("--read-only".to_string());
     }
@@ -603,7 +609,11 @@ async fn ensure_runtime_secrets_registered(
         return Ok(None);
     };
     let engine = request.plan.confinement.oci().engine.clone();
-    let secret_name = mount.fresh_mounted_name();
+    let secret_name = request
+        .resource_name
+        .clone()
+        .unwrap_or_else(|| mount.fresh_mounted_name());
+    validate_oci_resource_name(&secret_name)?;
     let output = run_process_streaming(
         &build_runtime_secret_create_invocation(&engine, mount, &secret_name)?,
         |_| Ok(()),
@@ -774,6 +784,64 @@ fn build_runtime_secret_remove_invocation(engine: &str, secret_name: &str) -> Pr
         environment: Vec::new(),
         input: String::new(),
     }
+}
+
+/// Remove a named OCI container. Absence is success, making this suitable for
+/// crash recovery and unconditional cleanup.
+pub async fn remove_oci_container(engine: &str, name: &str) -> Result<()> {
+    remove_oci_resource(
+        engine,
+        name,
+        vec!["rm", "--force", "--ignore", name],
+        "container",
+    )
+    .await
+}
+
+/// Remove a named OCI secret. Absence is success, making this suitable for
+/// crash recovery and unconditional cleanup.
+pub async fn remove_oci_secret(engine: &str, name: &str) -> Result<()> {
+    remove_oci_resource(
+        engine,
+        name,
+        vec!["secret", "rm", "--ignore", name],
+        "secret",
+    )
+    .await
+}
+
+async fn remove_oci_resource(engine: &str, name: &str, args: Vec<&str>, kind: &str) -> Result<()> {
+    validate_oci_resource_name(name)?;
+    let output = run_oci_preflight_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        &format!("remove OCI {kind} '{name}'"),
+        OCI_PREFLIGHT_TIMEOUT,
+    )
+    .await?;
+    if output.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "failed to remove OCI {kind} '{name}' ({}): {stderr}",
+        output.status_description()
+    )
+}
+
+fn validate_oci_resource_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        bail!("invalid OCI resource name '{name}'");
+    }
+    Ok(())
 }
 
 fn path_to_arg(path: &Path) -> Result<String> {
@@ -1117,6 +1185,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oci_backend_projects_one_explicit_effect_name_to_container_and_secret() {
+        let mut request = sample_execution_request_with_runtime_secrets();
+        let name = "lionclaw-effect-0123456789abcdef".to_string();
+        request.resource_name = Some(name.clone());
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, Some(&name)).expect("prepare"),
+            &[],
+        );
+
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--name".to_string(), name.clone()]));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--secret".to_string(), name.clone()]));
+    }
+
     #[cfg(unix)]
     #[test]
     fn install_policy_user_keeps_keep_id_identity_args() {
@@ -1343,6 +1432,7 @@ mod tests {
                 stdin: String::new(),
                 auth: None,
             },
+            resource_name: None,
             runtime_secrets_mount: None,
             runtime_auth_provider: None,
             runtime_auth_context: Default::default(),
@@ -1415,6 +1505,7 @@ mod tests {
         let request = ExecutionRequest {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
+            resource_name: None,
             runtime_secrets_mount: None,
             runtime_auth_provider: None,
             runtime_auth_context: Default::default(),
@@ -1445,6 +1536,7 @@ mod tests {
                 stdin: String::new(),
                 auth: None,
             },
+            resource_name: None,
             runtime_secrets_mount: None,
             runtime_auth_provider: None,
             runtime_auth_context: Default::default(),
@@ -1502,6 +1594,7 @@ mod tests {
             &ExecutionRequest {
                 plan,
                 program: RuntimeProgramSpec::default(),
+                resource_name: None,
                 runtime_secrets_mount: None,
                 runtime_auth_provider: None,
                 runtime_auth_context: Default::default(),
@@ -1539,6 +1632,7 @@ mod tests {
             &ExecutionRequest {
                 plan,
                 program: RuntimeProgramSpec::default(),
+                resource_name: None,
                 runtime_secrets_mount: None,
                 runtime_auth_provider: None,
                 runtime_auth_context: Default::default(),
@@ -1598,6 +1692,7 @@ esac
                 stdin: "hello".to_string(),
                 auth: None,
             },
+            resource_name: None,
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
@@ -1692,6 +1787,7 @@ esac
                 stdin: "hello".to_string(),
                 auth: None,
             },
+            resource_name: None,
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: temp_dir.path().join("runtime-secrets.env"),
             }),
@@ -1799,6 +1895,7 @@ esac
                 stdin: "hello".to_string(),
                 auth: None,
             },
+            resource_name: None,
             runtime_secrets_mount: None,
             runtime_auth_provider: None,
             runtime_auth_context: Default::default(),

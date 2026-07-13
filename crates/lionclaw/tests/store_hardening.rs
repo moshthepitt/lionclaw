@@ -1,16 +1,15 @@
-//! Slice 3 store hardening: lease expiry lets a crashed worker's claim be
-//! reclaimed exactly once. (The idempotency-key store invariant is tested in
-//! `resume.rs::one_outcome_per_idempotency_key_is_a_store_invariant`.)
+//! The event log is the only durable effect queue. There is no second ledger
+//! to lease, reseed, or reconcile.
 
 mod common;
 
-use common::{default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
+use common::{default_config, effect_id, harness, BASE_SHA, HEAD_SHA};
 use lionclaw::model::{MissionEvent, PayloadRef, RoleName, TaskId};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
-async fn expired_lease_is_reclaimable_exactly_once() {
+async fn unfinished_request_is_rebuilt_from_the_log_alone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let h = harness(
         dir.path(),
@@ -28,62 +27,48 @@ async fn expired_lease_is_reclaimable_exactly_once() {
         )
         .await
         .expect("create");
+    let id = effect_id("unfinished");
+    let state = h.engine.load_state(&mission_id).await.expect("state");
     h.engine
-        .propose_plan(
+        .store()
+        .append(
             &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
+            state.head,
+            &[NewEvent::new(MissionEvent::RoleRunRequested {
+                task_id: TaskId::new("fix").unwrap(),
+                attempt_no: 1,
+                effect_id: id.clone(),
+                role: RoleName::new("implementer").unwrap(),
+                runtime: "codex".to_string(),
+                prompt: PayloadRef::inline("prompt"),
+                base_sha: BASE_SHA.to_string(),
+            })],
+            1,
         )
         .await
-        .expect("propose");
-    let store = h.engine.store();
+        .expect("append request");
 
-    // Record a request so there is a queued effect to lease.
-    let state = h.engine.load_state(&mission_id).await.expect("state");
-    let event = NewEvent::new(MissionEvent::RoleRunRequested {
-        task_id: TaskId::new("fix").unwrap(),
-        attempt_no: 1,
-        idempotency_key: "lease-key".to_string(),
-        role: RoleName::new("implementer").unwrap(),
-        runtime: "codex".to_string(),
-        prompt: PayloadRef::inline("p"),
-        base_sha: BASE_SHA.to_string(),
-    });
-    store
-        .append(&mission_id, state.head, &[event], 1_000)
+    let before = h.engine.load_state(&mission_id).await.expect("state");
+    assert!(before.inflight.contains_key(&id));
+    let rebuilt = h
+        .engine
+        .store()
+        .rebuild_cursors(&mission_id, 2)
         .await
-        .expect("append");
+        .expect("rebuild");
+    assert_eq!(rebuilt, before);
 
-    // Worker A leases at t=1000 with a 5s lease (expires 6000).
-    let a = store
-        .pull_due(&mission_id, "worker-a", 1, 5_000, 1_000)
-        .await
-        .expect("lease a");
-    assert_eq!(a.len(), 1);
-
-    // Before expiry, no one else can lease it.
-    let b_early = store
-        .pull_due(&mission_id, "worker-b", 1, 5_000, 3_000)
-        .await
-        .expect("lease b");
-    assert!(b_early.is_empty(), "a live lease must not be reclaimable");
-
-    // After expiry (t=7000), worker B reclaims it — exactly once.
-    let b_late = store
-        .pull_due(&mission_id, "worker-b", 1, 5_000, 7_000)
-        .await
-        .expect("lease b late");
-    assert_eq!(b_late.len(), 1, "expired lease must be reclaimable");
-    assert_eq!(b_late[0].effect_id, a[0].effect_id);
-
-    // A second puller at the same instant gets nothing (single reclaim).
-    let c = store
-        .pull_due(&mission_id, "worker-c", 1, 5_000, 7_000)
-        .await
-        .expect("lease c");
-    assert!(
-        c.is_empty(),
-        "a freshly reclaimed lease is not double-leased"
-    );
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open schema");
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mission_effects'",
+    )
+    .fetch_all(&database)
+    .await
+    .expect("schema query");
+    assert!(tables.is_empty(), "parallel effect ledger must not exist");
 }

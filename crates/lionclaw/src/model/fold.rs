@@ -78,6 +78,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
+        cleanup_failure: None,
         open_attention: Default::default(),
         proposal_approved: false,
         revision: 0,
@@ -101,7 +102,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             if super::plan_validation::validate_plan_transition(state, proposal).is_ok() {
                 state.proposal = Some(proposal.clone());
                 state.planning_base_revision = None;
-                state.proposal_approved = !state.config.approval_required;
+                state.proposal_approved = false;
             }
         }
         MissionEvent::RoleRunRequested {
@@ -118,12 +119,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::RoleRunCompleted {
             task_id,
             attempt_no,
-            idempotency_key,
+            effect_id,
             handoff,
             artifact,
             ..
         } => {
-            state.inflight.remove(idempotency_key);
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
             if let Some(artifact) = artifact {
                 state.current_sha = artifact.head_sha.clone();
             }
@@ -135,21 +137,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::RoleRunFailed {
             task_id,
             attempt_no,
-            idempotency_key,
-            error_kind,
-            detail,
-            synthesized,
+            effect_id,
+            failure,
             ..
         } => {
-            state.inflight.remove(idempotency_key);
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
             if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
                 task.attempts = task.attempts.max(*attempt_no);
                 task.status = TaskStatus::Failed;
-                task.last_failure = Some(RunFailure {
-                    kind: *error_kind,
-                    detail: detail.clone(),
-                    synthesized: *synthesized,
-                });
+                task.last_failure = Some(failure.clone());
             }
         }
         MissionEvent::OracleRunRequested {
@@ -162,7 +159,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             assertion_ids,
             oracle,
             judged_sha,
-            idempotency_key,
+            effect_id,
             exit_code,
             exit_signal,
             stdout,
@@ -170,7 +167,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             prepared_inputs,
             ..
         } => {
-            state.inflight.remove(idempotency_key);
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
             state.oracle_failures.remove(oracle); // the oracle ran; recovered
             let verdict = AuthoritativeVerdict::from_oracle_outcome(
                 oracle.clone(),
@@ -189,26 +187,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         }
         MissionEvent::OracleRunFailed {
             oracle,
-            idempotency_key,
-            error_kind,
-            detail,
-            synthesized,
+            effect_id,
+            failure,
             ..
         } => {
-            state.inflight.remove(idempotency_key);
-            state.oracle_failures.insert(
-                oracle.clone(),
-                RunFailure {
-                    kind: *error_kind,
-                    detail: detail.clone(),
-                    synthesized: *synthesized,
-                },
-            );
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
+            state
+                .oracle_failures
+                .insert(oracle.clone(), failure.clone());
         }
         // `attempts` is the highest attempt number the log has seen — from
         // ANY review event, not just requests: the materialize fallback
         // records a `Failed` without a `Requested`, and a retry must still
-        // dispatch under a fresh attempt (⇒ a fresh idempotency key), never
+        // dispatch under a fresh attempt (and a fresh effect ID), never
         // spin the drive loop re-appending a duplicate.
         MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
@@ -216,13 +208,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         }
         MissionEvent::TerminalReviewCompleted {
             attempt_no,
-            idempotency_key,
+            effect_id,
             judged_sha,
             passed,
             gaps,
             report,
         } => {
-            state.inflight.remove(idempotency_key);
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             state.terminal_review.outcome = Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
                 judged_sha: judged_sha.clone(),
@@ -233,20 +226,15 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         }
         MissionEvent::TerminalReviewFailed {
             attempt_no,
-            idempotency_key,
-            error_kind,
-            detail,
-            synthesized,
+            effect_id,
+            failure,
             ..
         } => {
-            state.inflight.remove(idempotency_key);
+            state.inflight.remove(effect_id);
+            clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             state.terminal_review.outcome = Some(ReviewOutcome::Failed {
-                failure: RunFailure {
-                    kind: *error_kind,
-                    detail: detail.clone(),
-                    synthesized: *synthesized,
-                },
+                failure: failure.clone(),
             });
         }
         MissionEvent::MissionAborted { reason, .. } => {
@@ -262,6 +250,17 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             apply_decision(state, attention_id, action, actor, justification);
         }
+        MissionEvent::EffectCleanupFailed {
+            effect_id,
+            resource,
+            failure,
+        } => {
+            state.cleanup_failure = Some(super::EffectCleanupFailure {
+                effect_id: effect_id.clone(),
+                resource: *resource,
+                failure: failure.clone(),
+            });
+        }
     }
     state.head = seq;
     // Promotion runs first: a just-approved proposal must seed the contract
@@ -271,6 +270,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+fn clear_cleanup_failure(state: &mut MissionState, effect_id: &super::EffectId) {
+    if state
+        .cleanup_failure
+        .as_ref()
+        .is_some_and(|failure| &failure.effect_id == effect_id)
+    {
+        state.cleanup_failure = None;
+    }
 }
 
 /// Promote one complete, approved proposal. Retained task ids are immutable;
@@ -539,7 +548,7 @@ fn apply_decision(
         ) => {
             // Discard the outcome and re-roll a fresh-context reviewer.
             // Attempts are preserved, so the re-dispatch gets a fresh
-            // idempotency key. Any prior acceptance goes with the discarded
+            // effect ID. Any prior acceptance goes with the discarded
             // outcome — the receipt must never cite a decision this retry
             // just walked away from.
             state.terminal_review.outcome = None;
@@ -633,6 +642,17 @@ fn derive_attention(state: &mut MissionState) {
             },
         );
     };
+    let failure_report = |label: &str, task_id: &TaskId, task: &TaskRuntimeState| {
+        task.last_failure.as_ref().map_or_else(
+            || format!("{label} '{task_id}' failed"),
+            |failure| {
+                format!(
+                    "{label} '{task_id}' failed ({:?}): {}",
+                    failure.kind, failure.detail
+                )
+            },
+        )
+    };
 
     if state.proposal.is_some() && !state.proposal_approved {
         raise(
@@ -724,7 +744,7 @@ fn derive_attention(state: &mut MissionState) {
                     None,
                     Vec::new(),
                     None,
-                    format!("planning task '{task_id}' failed"),
+                    failure_report("planning task", task_id, rt),
                 );
             } else if state.flagged_nodes.contains(task_id) {
                 raise(
@@ -779,7 +799,7 @@ fn derive_attention(state: &mut MissionState) {
                         None,
                         Vec::new(),
                         None,
-                        format!("task '{}' failed", task.id),
+                        failure_report("task", &task.id, &state.tasks[&task.id]),
                     );
                 } else if state.flagged_nodes.contains(&task.id) {
                     raise(
@@ -910,7 +930,6 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 task.last_failure = (!done).then(|| RunFailure {
                     kind: super::event::RunErrorKind::HandoffInvalid,
                     detail: "role reported done=false".to_string(),
-                    synthesized: false,
                 });
             }
             // A done task that asks for a look is flagged (derived into a
@@ -940,7 +959,6 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 task.last_failure = (!done).then(|| RunFailure {
                     kind: super::event::RunErrorKind::HandoffInvalid,
                     detail: "planning author reported done=false".to_string(),
-                    synthesized: false,
                 });
             }
             if *done {
@@ -950,7 +968,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                     {
                         state.proposal = Some(proposal.clone());
                         state.planning_base_revision = None;
-                        state.proposal_approved = !state.config.approval_required;
+                        state.proposal_approved = false;
                     }
                 }
                 if *request_attention {
@@ -1080,8 +1098,9 @@ mod tests {
     use super::super::event::{
         ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
     };
-    use super::super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
+    use super::super::ids::{AssertionId, EffectId, MissionId, OracleName, RoleName, TaskId};
     use super::super::plan::{Assertion, Plan, PlanProposal, Task, TaskKind};
+    use super::super::state::RunFailure;
     use super::super::verdict::FinishClass;
     use super::*;
 
@@ -1109,9 +1128,17 @@ mod tests {
 
     /// Fold hand-built events with sequence numbers assigned by position.
     fn fold_log(events: Vec<MissionEvent>) -> Option<MissionState> {
+        let events = events.into_iter().flat_map(|event| {
+            let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
+                decision(
+                    "plan_proposal:mission",
+                    super::super::event::DecisionAction::Approve,
+                )
+            });
+            std::iter::once(event).chain(approve)
+        });
         fold(
             events
-                .into_iter()
                 .enumerate()
                 .map(|(i, event)| envelope(i as u64, event)),
         )
@@ -1129,7 +1156,6 @@ mod tests {
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {
-                approval_required: false,
                 recovery: super::super::event::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
@@ -1210,7 +1236,7 @@ mod tests {
         MissionEvent::RoleRunRequested {
             task_id: tid(task),
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             role: RoleName::new("implementer").expect("role name"),
             runtime: "codex".into(),
             prompt: PayloadRef::inline("prompt"),
@@ -1227,7 +1253,7 @@ mod tests {
         MissionEvent::RoleRunCompleted {
             task_id: tid(task),
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             handoff,
             artifact,
         }
@@ -1239,7 +1265,7 @@ mod tests {
             oracle: oracle("cargo-test"),
             judged_sha: judged.into(),
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
         }
     }
 
@@ -1254,7 +1280,7 @@ mod tests {
             oracle: oracle("cargo-test"),
             judged_sha: judged.into(),
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             exit_code,
             exit_signal: None,
             stdout: PayloadRef::inline("out"),
@@ -1396,10 +1422,11 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "sha-1".into(),
                 attempt_no: 1,
-                idempotency_key: "ko".into(),
-                error_kind: RunErrorKind::Infra,
-                detail: "binary missing".into(),
-                synthesized: false,
+                effect_id: EffectId::for_parts(&["test", "ko"]),
+                failure: RunFailure {
+                    kind: RunErrorKind::Infra,
+                    detail: "binary missing".into(),
+                },
             },
         ];
         let parked = fold_log(base.clone()).expect("state");
@@ -1731,10 +1758,11 @@ mod tests {
             MissionEvent::RoleRunFailed {
                 task_id: tid("t1"),
                 attempt_no: 1,
-                idempotency_key: "k1".into(),
-                error_kind: RunErrorKind::Timeout,
-                detail: "took too long".into(),
-                synthesized: false,
+                effect_id: EffectId::for_parts(&["test", "k1"]),
+                failure: RunFailure {
+                    kind: RunErrorKind::Timeout,
+                    detail: "took too long".into(),
+                },
             },
         ])
         .expect("state");
@@ -1797,7 +1825,11 @@ mod tests {
 
             events.push(oracle_requested("TESTS-PASS", "base", "ko"));
             let mid = fold_log(events.clone()).expect("mid state");
-            assert!(mid.inflight.contains_key("ko"), "request is inflight");
+            assert!(
+                mid.inflight
+                    .contains_key(&EffectId::for_parts(&["test", "ko"])),
+                "request is inflight"
+            );
             assert_eq!(mid.phase, MissionPhase::Running);
 
             events.push(oracle_completed("TESTS-PASS", "base", "ko", exit_code));
@@ -1870,7 +1902,7 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "base".into(),
                 attempt_no: 1,
-                idempotency_key: "ko".into(),
+                effect_id: EffectId::for_parts(&["test", "ko"]),
                 exit_code: 0,
                 exit_signal: Some(9), // SIGKILL (timeout/OOM) despite exit 0
                 stdout: PayloadRef::inline("out"),
@@ -1900,10 +1932,11 @@ mod tests {
                 oracle: oracle("cargo-test"),
                 judged_sha: "base".into(),
                 attempt_no: 1,
-                idempotency_key: "ko".into(),
-                error_kind: RunErrorKind::Infra,
-                detail: "spawn failed".into(),
-                synthesized: false,
+                effect_id: EffectId::for_parts(&["test", "ko"]),
+                failure: RunFailure {
+                    kind: RunErrorKind::Infra,
+                    detail: "spawn failed".into(),
+                },
             },
         ])
         .expect("state");
@@ -1926,11 +1959,11 @@ mod tests {
     fn mission_aborted_is_sticky() {
         let state = fold_log(vec![
             created(),
+            plan_proposed(vec![], vec![work_task("t1")]),
             MissionEvent::MissionAborted {
                 reason: "operator stop".into(),
                 actor: "human".into(),
             },
-            plan_proposed(vec![], vec![work_task("t1")]),
             role_completed("t1", "k1", work_handoff(true, false), None),
         ])
         .expect("state");
@@ -1942,7 +1975,7 @@ mod tests {
         );
         // Later facts still fold; only the phase is pinned.
         assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Cleared);
-        assert_eq!(state.head, 3);
+        assert_eq!(state.head, 4);
     }
 
     #[test]
@@ -1986,10 +2019,11 @@ mod tests {
             MissionEvent::RoleRunFailed {
                 task_id: tid("specter"),
                 attempt_no: 1,
-                idempotency_key: "k3".into(),
-                error_kind: RunErrorKind::Infra,
-                detail: "gone".into(),
-                synthesized: false,
+                effect_id: EffectId::for_parts(&["test", "k3"]),
+                failure: RunFailure {
+                    kind: RunErrorKind::Infra,
+                    detail: "gone".into(),
+                },
             },
         ])
         .expect("state");
@@ -2046,7 +2080,7 @@ mod tests {
     fn review_requested(attempt_no: u32, key: &str, judged: &str) -> MissionEvent {
         MissionEvent::TerminalReviewRequested {
             attempt_no,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             role: RoleName::new("gap-reviewer").expect("role name"),
             runtime: "codex".into(),
             prompt: PayloadRef::inline("review prompt"),
@@ -2058,7 +2092,7 @@ mod tests {
     fn review_completed(key: &str, judged: &str, passed: bool, gaps: Vec<Gap>) -> MissionEvent {
         MissionEvent::TerminalReviewCompleted {
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
             passed,
             gaps,
@@ -2069,11 +2103,12 @@ mod tests {
     fn review_failed(key: &str, judged: &str, detail: &str) -> MissionEvent {
         MissionEvent::TerminalReviewFailed {
             attempt_no: 1,
-            idempotency_key: key.into(),
+            effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
-            error_kind: RunErrorKind::Timeout,
-            detail: detail.into(),
-            synthesized: false,
+            failure: RunFailure {
+                kind: RunErrorKind::Timeout,
+                detail: detail.into(),
+            },
         }
     }
 
@@ -2253,7 +2288,7 @@ mod tests {
         assert_eq!(state.terminal_review.outcome, None);
         assert_eq!(state.terminal_review.accepted, None);
         // Attempts are preserved (the next dispatch is attempt 2 under a
-        // fresh idempotency key) and the obligation holds the phase.
+        // fresh effect ID) and the obligation holds the phase.
         assert_eq!(state.terminal_review.attempts, 1);
         assert!(terminal_review_outstanding(&state));
         assert_eq!(state.phase, MissionPhase::Running);

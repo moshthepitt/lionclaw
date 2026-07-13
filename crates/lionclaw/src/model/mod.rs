@@ -18,15 +18,16 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Gap, GapSeverity, Handoff, IdemClass,
-    MissionConfig, MissionEvent, MissionTypeRef, PayloadRef, PreparedInputRef, RecoveryConfig,
-    RunErrorKind, StopBar, TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    ArtifactOutcome, BlobRef, DecisionAction, EffectEventClass, EffectResource, EventEnvelope, Gap,
+    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionTypeRef, PayloadRef,
+    PreparedInputRef, RecoveryConfig, RunErrorKind, StopBar, TerminalReviewConfig, ValidationItem,
+    VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{
-    short_hex, AssertionId, IdError, InputName, MissionId, OracleName, RequirementId, RoleName,
-    TaskId, TERMINAL_REVIEW_TASK_TAG,
+    short_hex, AssertionId, EffectId, IdError, InputName, MissionId, OracleName, RequirementId,
+    RoleName, TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
     Assertion, OutputSemantics, Plan, PlanProposal, PlanningDag, PlanningTask, Requirement,
@@ -37,10 +38,10 @@ pub use plan_validation::{
     PlanValidationError, ProposalError,
 };
 pub use state::{
-    AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, FailureEvidence, FailureFeedback,
-    InflightEffect, MissionPhase, MissionState, PlanningState, ReviewAcceptance,
-    ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState, TaskStatus,
-    TerminalReviewState, TerminalReviewVerdict,
+    AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,
+    FailureEvidence, FailureFeedback, InflightEffect, MissionPhase, MissionState, PlanningState,
+    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState,
+    TaskStatus, TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

@@ -11,6 +11,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+
+use crate::model::EffectId;
 use tokio::process::Command;
 
 pub async fn head_sha(repo: &Path) -> Result<String> {
@@ -120,7 +122,7 @@ pub async fn capture_worker_result(
     repo: &Path,
     checkout: &Path,
     mission_id: &str,
-    attempt_tag: &str,
+    effect_id: &EffectId,
 ) -> Result<String, CaptureError> {
     let status = git(checkout, &["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
@@ -129,7 +131,8 @@ pub async fn capture_worker_result(
     let head = head_sha(checkout).await?;
     // Fetch the checkout's HEAD commit so the object we report is the object we
     // store, regardless of which refs the agent created or moved locally.
-    let refspec = format!("+HEAD:refs/mission/{mission_id}/{attempt_tag}");
+    let mission_ref = format!("refs/mission/{mission_id}/{effect_id}");
+    let refspec = format!("+HEAD:{mission_ref}");
     let mut fetch = Command::new("git");
     fetch
         .current_dir(repo)
@@ -144,7 +147,7 @@ pub async fn capture_worker_result(
     run(&mut fetch, "git fetch from worker checkout").await?;
     // The engine observes the commit from Git, never trusts the agent: verify
     // that the exact durable ref landed at the reported head.
-    let stored = resolve_commit(repo, &format!("refs/mission/{mission_id}/{attempt_tag}"))
+    let stored = resolve_commit(repo, &mission_ref)
         .await
         .map_err(CaptureError::Infra)?;
     if stored.trim() != head {
@@ -154,6 +157,18 @@ pub async fn capture_worker_result(
         )));
     }
     Ok(head)
+}
+
+/// Delete the captured ref for an effect whose outcome was never committed.
+/// A missing ref is already clean.
+pub async fn discard_worker_result(
+    repo: &Path,
+    mission_id: &str,
+    effect_id: &EffectId,
+) -> Result<()> {
+    let mission_ref = format!("refs/mission/{mission_id}/{effect_id}");
+    git(repo, &["update-ref", "-d", &mission_ref]).await?;
+    Ok(())
 }
 
 pub async fn remove_dir(dir: &Path) -> Result<()> {
@@ -283,7 +298,8 @@ mod tests {
         let detached = head_sha(&checkout).await.unwrap();
         assert_ne!(detached, base);
 
-        let recorded = capture_worker_result(repo.path(), &checkout, "mabc123def456", "fix-a1")
+        let effect_id = EffectId::for_parts(&["test", "fix-a1"]);
+        let recorded = capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id)
             .await
             .unwrap();
         // The recorded head is the worker's actual HEAD, and it really landed
@@ -321,8 +337,9 @@ mod tests {
         std::fs::write(checkout.join("f.txt"), "uncommitted\n").unwrap();
         // An uncommitted tree is DirtyWorktree specifically — not the Infra
         // bucket, which would mislabel the persisted failure.
+        let effect_id = EffectId::for_parts(&["test", "a1"]);
         assert!(matches!(
-            capture_worker_result(repo.path(), &checkout, "mabc123def456", "a1").await,
+            capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id).await,
             Err(CaptureError::DirtyWorktree(_))
         ));
     }

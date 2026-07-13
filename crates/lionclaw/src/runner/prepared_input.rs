@@ -26,8 +26,10 @@ pub(crate) struct PreparedInputs {
 pub(crate) async fn prepare_inputs(
     profile: &MissionRuntimeProfile,
     state_dir: &Path,
+    attempt_dir: &Path,
     checkout: &Path,
     inputs: &[PreparedInput],
+    effect_id: &crate::model::EffectId,
 ) -> Result<PreparedInputs> {
     let mut prepared = PreparedInputs {
         mounts: Vec::new(),
@@ -36,7 +38,16 @@ pub(crate) async fn prepare_inputs(
     };
     for input in inputs {
         let digest = input_cache_key(profile, checkout, input)?;
-        let directory = prepare_one(profile, state_dir, checkout, input, &digest).await?;
+        let directory = prepare_one(
+            profile,
+            state_dir,
+            attempt_dir,
+            checkout,
+            input,
+            &digest,
+            effect_id,
+        )
+        .await?;
         prepared.mounts.push(MountSpec {
             source: directory,
             target: format!("{INPUTS_MOUNT_TARGET}/{}", input.name),
@@ -131,9 +142,11 @@ fn feed_key_path(
 async fn prepare_one(
     profile: &MissionRuntimeProfile,
     state_dir: &Path,
+    attempt_dir: &Path,
     checkout: &Path,
     input: &PreparedInput,
     digest: &str,
+    effect_id: &crate::model::EffectId,
 ) -> Result<PathBuf> {
     let parent = state_dir
         .join("inputs")
@@ -151,12 +164,11 @@ async fn prepare_one(
         );
     }
     std::fs::create_dir_all(&parent)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".staging-")
-        .tempdir_in(&parent)?;
-    let output = staging.path().join("output");
-    let scratch = staging.path().join("scratch");
-    let program_dir = staging.path().join("program");
+    let staging = attempt_dir.join(format!("input-{}", input.name));
+    crate::workspace::remove_dir(&staging).await?;
+    let output = staging.join("output");
+    let scratch = staging.join("scratch");
+    let program_dir = staging.join("program");
     for directory in [&output, &scratch, &program_dir] {
         std::fs::create_dir_all(directory)?;
     }
@@ -202,8 +214,11 @@ async fn prepare_one(
         stdin: String::new(),
         auth: None,
     };
-    let mut executor =
-        MissionProgramExecutor::new(compiled.plan().clone(), RuntimeAuthRegistry::empty());
+    let mut executor = MissionProgramExecutor::new(
+        compiled.plan().clone(),
+        RuntimeAuthRegistry::empty(),
+        effect_id,
+    );
     let run = tokio::time::timeout(profile.oracle_timeout, executor.execute_captured(program))
         .await
         .with_context(|| {

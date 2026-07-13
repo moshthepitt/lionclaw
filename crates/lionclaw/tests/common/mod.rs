@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use lionclaw::engine::Engine;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::{MissionType, RoleDefinition};
 use lionclaw::model::{
     Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, Plan, PlanProposal,
@@ -18,10 +18,27 @@ use lionclaw::model::{
     TaskKind,
 };
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 pub const BASE_SHA: &str = "0000000000000000000000000000000000000001";
 pub const HEAD_SHA: &str = "0000000000000000000000000000000000000002";
+
+pub fn effect_id(label: &str) -> lionclaw::model::EffectId {
+    lionclaw::model::EffectId::for_parts(&["test", label])
+}
+
+pub async fn approve_plan(engine: &Engine, mission_id: &lionclaw::model::MissionId) {
+    engine
+        .decide(
+            mission_id,
+            "plan_proposal:mission",
+            lionclaw::model::DecisionAction::Approve,
+            "test approval",
+            "test",
+        )
+        .await
+        .expect("approve plan");
+}
 
 pub fn test_mission_type() -> MissionType {
     let implementer = RoleName::new("implementer").expect("role name");
@@ -209,9 +226,12 @@ pub async fn harness_with_type(
         mission_type,
         "codex".to_string(),
         "localhost/lionclaw-runtime-dev:v1".to_string(),
-        role_runner.clone(),
-        oracle_runner.clone(),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            role_runner.clone(),
+            oracle_runner.clone(),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     TestHarness {
         engine,
@@ -221,16 +241,12 @@ pub async fn harness_with_type(
 }
 
 pub fn default_config() -> MissionConfig {
-    MissionConfig {
-        approval_required: false,
-        ..Default::default()
-    }
+    MissionConfig::default()
 }
 
 /// `default_config` plus the closing review (matches `review_mission_type`).
 pub fn review_config() -> MissionConfig {
     MissionConfig {
-        approval_required: false,
         terminal_review: Some(lionclaw::model::TerminalReviewConfig {
             role: RoleName::new("gap-reviewer").expect("role name"),
         }),

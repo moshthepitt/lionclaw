@@ -1,15 +1,9 @@
-//! Event log append/load and the derived effect ledger.
+//! Event log append/load.
 //!
 //! Append discipline (kernel `session_turns` + `audit` patterns): one
 //! `BEGIN IMMEDIATE` transaction takes the write lock up front, verifies the
 //! expected head (structural optimistic concurrency via the
-//! `(mission_id, sequence_no)` primary key), inserts the events, and keeps
-//! the effect ledger in lockstep — a `…Requested` event enqueues its effect
-//! row and an outcome event settles it, atomically with the log.
-//!
-//! Effect leasing (kernel `channel_outbox` pattern): `pull_due` CAS-leases
-//! queued rows, re-checking eligibility in the UPDATE's WHERE clause so
-//! concurrent pullers can't double-lease.
+//! `(mission_id, sequence_no)` primary key), and inserts the events.
 //!
 //! Payload externalization (>100KB → blob) happens where payloads are
 //! constructed (engine/runners); events reaching append are ref-carrying.
@@ -17,8 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    EventEnvelope, IdemClass, InflightEffect, MissionEvent, MissionId, VersionStamps,
-    SCHEMA_VERSION,
+    EffectEventClass, EventEnvelope, MissionEvent, MissionId, VersionStamps, SCHEMA_VERSION,
 };
 
 use super::MissionStore;
@@ -57,8 +50,8 @@ impl NewEvent {
 pub enum AppendError {
     #[error("append conflict: expected head {expected}, log is at {actual}")]
     Conflict { expected: u64, actual: u64 },
-    #[error("duplicate idempotency key '{key}'")]
-    Duplicate { key: String },
+    #[error("duplicate effect id '{effect_id}'")]
+    Duplicate { effect_id: String },
     #[error("{0}")]
     AlreadyExists(String),
     #[error(transparent)]
@@ -104,8 +97,7 @@ impl MissionStore {
         Ok(())
     }
 
-    /// Append events after `expected_head`, keeping the effect ledger in
-    /// lockstep. Returns the new head.
+    /// Append events after `expected_head`. Returns the new head.
     pub async fn append(
         &self,
         mission_id: &MissionId,
@@ -172,67 +164,6 @@ impl MissionStore {
         decode_rows(mission_id, rows)
     }
 
-    /// Rebuild the effect ledger from a folded state's inflight set (cursor
-    /// rebuild). Inflight effects whose outcome is already recorded are, by
-    /// definition, absent from `inflight`.
-    ///
-    /// Reproducible effects (oracles) reseed as `queued` — a re-run is safe.
-    /// An LLM turn (a role run or the terminal review) reseeds as an
-    /// **expired lease**: the "an attempt was started" fact is otherwise
-    /// ledger-only, and losing it would let a rebuild re-invoke the LLM. An
-    /// expired lease makes reconcile synthesize failure instead (never re-run
-    /// a possibly-already-run LLM).
-    pub async fn reseed_effects(
-        &self,
-        state: &crate::model::MissionState,
-        now_ms: i64,
-    ) -> anyhow::Result<()> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        for (key, effect) in &state.inflight {
-            let request_json = serde_json::to_string(effect)?;
-            let source_seq = inflight_source_seq(effect);
-            let is_llm_turn = matches!(
-                effect,
-                InflightEffect::RoleRun { .. } | InflightEffect::TerminalReview { .. }
-            );
-            if is_llm_turn {
-                sqlx::query(
-                    "INSERT INTO mission_effects
-                         (effect_id, mission_id, source_seq, kind, request_json, status,
-                          lease_owner, lease_expires_at_ms, created_at_ms, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'leased', 'rebuild-orphan', 0, ?6, ?6)
-                     ON CONFLICT(effect_id) DO NOTHING",
-                )
-                .bind(key)
-                .bind(state.mission_id.as_str())
-                .bind(source_seq as i64)
-                .bind(effect.kind_str())
-                .bind(&request_json)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query(
-                    "INSERT INTO mission_effects
-                         (effect_id, mission_id, source_seq, kind, request_json, status,
-                          created_at_ms, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)
-                     ON CONFLICT(effect_id) DO NOTHING",
-                )
-                .bind(key)
-                .bind(state.mission_id.as_str())
-                .bind(source_seq as i64)
-                .bind(effect.kind_str())
-                .bind(&request_json)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Mission ids in creation order.
     pub async fn list_missions(&self) -> anyhow::Result<Vec<MissionId>> {
         let rows: Vec<(String,)> =
@@ -243,116 +174,6 @@ impl MissionStore {
             .map(|(id,)| Ok(MissionId::parse(id)?))
             .collect()
     }
-
-    /// Lease due effects for execution (CAS in the WHERE clause; the ledger
-    /// is derived state and rebuildable from the log).
-    pub async fn pull_due(
-        &self,
-        mission_id: &MissionId,
-        worker_id: &str,
-        limit: u32,
-        lease_ms: i64,
-        now_ms: i64,
-    ) -> anyhow::Result<Vec<EffectLease>> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        // Due = queued, or leased with an expired lease (a crashed worker's
-        // claim is reclaimable). The CAS UPDATE below re-checks this so a
-        // concurrent puller can never double-lease.
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT effect_id, request_json FROM mission_effects
-             WHERE mission_id = ?1
-               AND (status = 'queued'
-                    OR (status = 'leased' AND lease_expires_at_ms <= ?3))
-             ORDER BY source_seq LIMIT ?2",
-        )
-        .bind(mission_id.as_str())
-        .bind(limit as i64)
-        .bind(now_ms)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut leases = Vec::with_capacity(rows.len());
-        for (effect_id, request_json) in rows {
-            let claimed = sqlx::query(
-                "UPDATE mission_effects
-                 SET status = 'leased',
-                     lease_owner = ?2, lease_expires_at_ms = ?3,
-                     updated_at_ms = ?4
-                 WHERE effect_id = ?1
-                   AND (status = 'queued'
-                        OR (status = 'leased' AND lease_expires_at_ms <= ?4))",
-            )
-            .bind(&effect_id)
-            .bind(worker_id)
-            .bind(now_ms + lease_ms)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if claimed == 0 {
-                continue;
-            }
-            let request: InflightEffect = serde_json::from_str(&request_json)
-                .map_err(|err| anyhow::anyhow!("corrupt effect '{effect_id}': {err}"))?;
-            leases.push(EffectLease { effect_id, request });
-        }
-        tx.commit().await?;
-        Ok(leases)
-    }
-
-    /// Current ledger status of an effect (`queued`/`leased`/`done`/`failed`),
-    /// plus its lease expiry (if leased). `None` if the row is missing.
-    pub async fn effect_status(&self, effect_id: &str) -> anyhow::Result<Option<EffectStatus>> {
-        let row: Option<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT status, lease_expires_at_ms FROM mission_effects WHERE effect_id = ?1",
-        )
-        .bind(effect_id)
-        .fetch_optional(self.pool())
-        .await?;
-        Ok(row.map(|(status, lease_expires_at_ms)| EffectStatus {
-            status,
-            lease_expires_at_ms,
-        }))
-    }
-
-    /// Reset an effect to `queued` (reconcile path for safely re-runnable
-    /// effects — engine-run oracles, never LLM role runs). Refuses to steal a
-    /// live (unexpired) lease held by a concurrent driver.
-    pub async fn requeue_effect(&self, effect_id: &str, now_ms: i64) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE mission_effects
-             SET status = 'queued', lease_owner = NULL, lease_expires_at_ms = NULL,
-                 updated_at_ms = ?2
-             WHERE effect_id = ?1
-               AND (status = 'queued'
-                    OR (status = 'leased' AND lease_expires_at_ms <= ?2))",
-        )
-        .bind(effect_id)
-        .bind(now_ms)
-        .execute(self.pool())
-        .await?;
-        Ok(())
-    }
-}
-
-/// An effect's ledger status and lease expiry.
-#[derive(Debug, Clone)]
-pub struct EffectStatus {
-    pub status: String,
-    pub lease_expires_at_ms: Option<i64>,
-}
-
-impl EffectStatus {
-    /// Whether a concurrent driver still holds a live claim on this effect
-    /// (leased with a lease that has not yet expired).
-    pub fn is_live_lease(&self, now_ms: i64) -> bool {
-        self.status == "leased" && self.lease_expires_at_ms.is_some_and(|exp| exp > now_ms)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EffectLease {
-    pub effect_id: String,
-    pub request: InflightEffect,
 }
 
 async fn insert_event(
@@ -367,16 +188,16 @@ async fn insert_event(
         event: event.event.clone(),
     })
     .map_err(anyhow::Error::from)?;
-    let idem = event.event.idempotency();
-    let (idem_key, idem_class) = match &idem {
-        Some((IdemClass::Request, key)) => (Some(*key), Some("request")),
-        Some((IdemClass::Outcome, key)) => (Some(*key), Some("outcome")),
+    let effect_identity = event.event.effect_identity();
+    let (effect_id, effect_class) = match &effect_identity {
+        Some((EffectEventClass::Request, effect_id)) => (Some(*effect_id), Some("request")),
+        Some((EffectEventClass::Outcome, effect_id)) => (Some(*effect_id), Some("outcome")),
         None => (None, None),
     };
     sqlx::query(
         "INSERT INTO mission_events
              (mission_id, sequence_no, recorded_at_ms, schema_version,
-              payload_json, idempotency_key, idem_class)
+              payload_json, effect_id, effect_class)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(mission_id.as_str())
@@ -384,60 +205,18 @@ async fn insert_event(
     .bind(now_ms)
     .bind(event.stamps.schema_version)
     .bind(&payload)
-    .bind(idem_key)
-    .bind(idem_class)
+    .bind(effect_id)
+    .bind(effect_class)
     .execute(&mut **tx)
     .await
-    .map_err(|err| match &idem {
-        Some((_, key)) if is_unique_violation(&err) => AppendError::Duplicate {
-            key: (*key).to_string(),
+    .map_err(|err| match &effect_identity {
+        Some((_, effect_id)) if is_unique_violation(&err) => AppendError::Duplicate {
+            effect_id: (*effect_id).to_string(),
         },
         _ => AppendError::Store(err.into()),
     })?;
 
-    // Keep the effect ledger in lockstep, in the same transaction.
-    if let Some((key, effect)) = InflightEffect::from_request(&event.event, sequence_no) {
-        let request_json = serde_json::to_string(&effect).map_err(anyhow::Error::from)?;
-        sqlx::query(
-            "INSERT INTO mission_effects
-                 (effect_id, mission_id, source_seq, kind, request_json, status,
-                  created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
-        )
-        .bind(&key)
-        .bind(mission_id.as_str())
-        .bind(sequence_no as i64)
-        .bind(effect.kind_str())
-        .bind(&request_json)
-        .bind(now_ms)
-        .execute(&mut **tx)
-        .await
-        .map_err(anyhow::Error::from)?;
-    } else if let Some(succeeded) = event.event.outcome_succeeded() {
-        let (_, key) = idem.expect("outcome events carry an idempotency key");
-        let status = if succeeded { "done" } else { "failed" };
-        sqlx::query(
-            "UPDATE mission_effects
-             SET status = ?2, lease_owner = NULL, lease_expires_at_ms = NULL,
-                 updated_at_ms = ?3
-             WHERE effect_id = ?1",
-        )
-        .bind(key)
-        .bind(status)
-        .bind(now_ms)
-        .execute(&mut **tx)
-        .await
-        .map_err(anyhow::Error::from)?;
-    }
     Ok(())
-}
-
-fn inflight_source_seq(effect: &InflightEffect) -> u64 {
-    match effect {
-        InflightEffect::RoleRun { requested_seq, .. }
-        | InflightEffect::OracleRun { requested_seq, .. }
-        | InflightEffect::TerminalReview { requested_seq, .. } => *requested_seq,
-    }
 }
 
 /// Decode `(sequence_no, recorded_at_ms, payload_json)` rows into envelopes.
@@ -473,7 +252,7 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
         .is_some_and(|db| db.is_unique_violation())
 }
 
-/// Map a `missions`-table insert error: a PK collision (not an idempotency key)
+/// Map a `missions`-table insert error: a PK collision (not an effect ID)
 /// becomes `AlreadyExists` with `detail` as its message.
 fn map_sqlx(err: sqlx::Error, detail: &str) -> AppendError {
     if is_unique_violation(&err) {
@@ -514,7 +293,6 @@ mod sink_tests {
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {
-                approval_required: false,
                 // Verified: a reviewed-bar config without a terminal review
                 // is a shape production refuses (create_mission + loader).
                 stop: StopBar::Verified,

@@ -35,8 +35,8 @@ pub struct OciRoleRunner {
     profiles: RuntimeProfiles,
     image_id: String,
     ceiling: AuthorityCeiling,
-    /// Serializes Git checkout/capture operations inside this process; the store
-    /// lease owns cross-process coordination.
+    /// Serializes Git checkout/capture operations inside this process. The
+    /// mission driver lock provides cross-process coordination.
     repo_lock: Arc<Mutex<()>>,
 }
 
@@ -135,11 +135,10 @@ impl RoleRunner for OciRoleRunner {
         }
         let profile = self.profile(&request.runtime)?;
 
-        let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dirs = AttemptDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
-            &attempt_tag,
+            &request.effect_id,
         )
         .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
 
@@ -203,7 +202,7 @@ impl RoleRunner for OciRoleRunner {
                     &request.workspace_dir,
                     &workspace_source,
                     request.mission_id.as_str(),
-                    &attempt_tag,
+                    &request.effect_id,
                 )
                 .await
                 .map_err(|e| RoleRunFailure {
@@ -230,25 +229,7 @@ impl RoleRunner for OciRoleRunner {
         }
         .await;
 
-        // Unconditional teardown of the whole attempt directory (workspace
-        // checkout, handoff, scratch=CARGO_TARGET_DIR, runtime homes) on
-        // every exit path: the handoff is already read into `result` and the
-        // worker's commit already survives in the target repo's mission ref, so
-        // nothing here is load-bearing once the run has settled.
-        match (result, workspace::remove_dir(&dirs.root).await) {
-            (result, Ok(())) => result,
-            (Ok(_), Err(err)) => Err(RoleRunFailure {
-                kind: RunErrorKind::Infra,
-                detail: format!("failed to remove role attempt directory: {err:#}"),
-            }),
-            (Err(mut failure), Err(err)) => {
-                failure.detail = format!(
-                    "{}; failed to remove role attempt directory: {err:#}",
-                    failure.detail
-                );
-                Err(failure)
-            }
-        }
+        result
     }
 }
 
@@ -282,7 +263,7 @@ impl OciRoleRunner {
             .map(|m| m.source.clone());
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
-                session_id: uuid_from_key(&request.idempotency_key),
+                session_id: uuid_from_key(request.effect_id.as_str()),
                 working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
                 environment: plan.environment.clone(),
                 runtime_state_root: state_root,
@@ -311,7 +292,11 @@ impl OciRoleRunner {
                     fresh_prompt: None,
                 },
                 context,
-                executor: Box::new(MissionProgramExecutor::new(plan, auth_registry)),
+                executor: Box::new(MissionProgramExecutor::new(
+                    plan,
+                    auth_registry,
+                    &request.effect_id,
+                )),
             },
             journal_tx,
         );
@@ -372,7 +357,7 @@ fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
     .collect()
 }
 
-/// Deterministic session UUID derived from the idempotency key (no RNG).
+/// Deterministic session UUID derived from the effect ID (no RNG).
 fn uuid_from_key(key: &str) -> uuid::Uuid {
     let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
     let mut bytes = [0u8; 16];

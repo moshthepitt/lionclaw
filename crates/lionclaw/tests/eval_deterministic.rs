@@ -7,9 +7,9 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{covered_requirement, proposal};
+use common::{approve_plan, covered_requirement, proposal};
 use lionclaw::authority::AuthorityCeiling;
-use lionclaw::engine::Engine;
+use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
     AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
@@ -17,7 +17,7 @@ use lionclaw::model::{
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
-use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner};
+use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -100,9 +100,12 @@ async fn advisory_only_mission_type_never_verifies() {
         mission_type,
         "codex".to_string(),
         "test-image".to_string(),
-        Arc::new(runner),
-        Arc::new(MockOracleRunner::exiting(0)),
-        Arc::new(MockClock::default()),
+        EngineServices::new(
+            Arc::new(runner),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
     );
     let mission_id = engine
         .create_mission(
@@ -110,7 +113,6 @@ async fn advisory_only_mission_type_never_verifies() {
             "make it readable",
             "base-0",
             MissionConfig {
-                approval_required: false,
                 stop: StopBar::Reviewed,
                 planning: Default::default(),
                 recovery: Default::default(),
@@ -150,6 +152,7 @@ async fn advisory_only_mission_type_never_verifies() {
         .propose_plan(&mission_id, proposal(0, plan), "test", "initial plan")
         .await
         .expect("propose");
+    approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
 

@@ -1,14 +1,12 @@
-//! The impure shell around the pure core: load → fold → reconcile → drive
+//! The impure shell around the pure core: lock → load → recover → drive
 //! effects → step → append, until the mission parks (durable interrupt) or
 //! reaches a terminal phase. Structure ported from Zenith (Apache-2.0,
 //! Intelligent Internet) `controller.py::advance_project` /
 //! `coordinator.py::step`, re-based onto the event-sourced store.
 //!
-//! Every effect flows through the leased ledger; every outcome is recorded
-//! in the same transaction that settles its effect row. Resume reconciles
-//! before retrying: an unfinished LLM role run is synthesized as failed
-//! (its outcome is unknowable without probing — Slice 3 adds probes), an
-//! unfinished oracle run is simply re-queued (engine-run, reproducible).
+//! A request without an outcome belongs to a previous driver process. Resume
+//! reaps its resources and records an interrupted failure; it never guesses
+//! whether an external turn completed and never silently replays one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,13 +14,18 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
-    step, validate_plan_proposal, AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId,
+    step, validate_plan_proposal, EffectId, Handoff, InflightEffect, MissionEvent, MissionId,
     MissionPhase, MissionState, OracleDispatchIntent, PayloadRef, PlanProposal, ProposalError,
-    RoleDispatchIntent, RunErrorKind, StepDecision, TaskId, TerminalReviewDispatchIntent,
+    RoleDispatchIntent, RunErrorKind, RunFailure, StepDecision, TaskId,
+    TerminalReviewDispatchIntent,
 };
-use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
+use crate::ports::{
+    Clock, EffectCleaner, EffectCleanupRequest, OracleRunRequest, OracleRunner, RoleRunRequest,
+    RoleRunner,
+};
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
     PlanningPromptContext, PromptContext, TerminalReviewPromptContext,
@@ -38,34 +41,107 @@ pub struct Engine {
     image_id: String,
     role_runner: Arc<dyn RoleRunner>,
     oracle_runner: Arc<dyn OracleRunner>,
+    effect_cleaner: Arc<dyn EffectCleaner>,
     clock: Arc<dyn Clock>,
-    worker_id: String,
 }
 
-#[derive(Debug)]
-pub enum AdvanceOutcome {
-    /// Mission is in `Planning` with no runnable planning DAG; propose a plan to
-    /// proceed.
-    AwaitingPlan,
-    /// Parked on open attention (durable interrupt, zero compute).
-    Parked { attention: Vec<AttentionItem> },
-    /// Effects are in flight under live leases held by another driver; this
-    /// invocation has nothing to do. The next advance resumes.
-    Busy,
-    /// Done or aborted.
-    Terminal { phase: MissionPhase },
+pub struct EngineServices {
+    role_runner: Arc<dyn RoleRunner>,
+    oracle_runner: Arc<dyn OracleRunner>,
+    effect_cleaner: Arc<dyn EffectCleaner>,
+    clock: Arc<dyn Clock>,
 }
 
-impl AdvanceOutcome {
-    /// The stable snake_case name for `--json` output.
-    pub const fn slug(&self) -> &'static str {
-        match self {
-            Self::AwaitingPlan => "awaiting_plan",
-            Self::Parked { .. } => "parked",
-            Self::Busy => "busy",
-            Self::Terminal { .. } => "terminal",
+impl EngineServices {
+    pub fn new(
+        role_runner: Arc<dyn RoleRunner>,
+        oracle_runner: Arc<dyn OracleRunner>,
+        effect_cleaner: Arc<dyn EffectCleaner>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            role_runner,
+            oracle_runner,
+            effect_cleaner,
+            clock,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionDisposition {
+    Ready,
+    Running,
+    AwaitingPlan,
+    Parked,
+    CleanupBlocked,
+    Terminal,
+}
+
+impl MissionDisposition {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::AwaitingPlan => "awaiting_plan",
+            Self::Parked => "parked",
+            Self::CleanupBlocked => "cleanup_blocked",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MissionView {
+    pub state: MissionState,
+    pub disposition: MissionDisposition,
+}
+
+impl MissionView {
+    fn from_state(state: MissionState, driver_running: bool) -> Self {
+        let disposition = if driver_running {
+            MissionDisposition::Running
+        } else if state
+            .cleanup_failure
+            .as_ref()
+            .is_some_and(|failure| state.inflight.contains_key(&failure.effect_id))
+        {
+            MissionDisposition::CleanupBlocked
+        } else if state.phase.is_terminal() {
+            MissionDisposition::Terminal
+        } else if !state.open_attention.is_empty() {
+            MissionDisposition::Parked
+        } else if state.phase == MissionPhase::Planning
+            && state.config.planning.tasks.is_empty()
+            && state.proposal.is_none()
+        {
+            MissionDisposition::AwaitingPlan
+        } else {
+            MissionDisposition::Ready
+        };
+        Self { state, disposition }
+    }
+
+    pub fn next_actions(&self) -> Vec<&'static str> {
+        match self.disposition {
+            MissionDisposition::Ready => vec!["mission advance"],
+            MissionDisposition::Running => vec!["mission status"],
+            MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
+            MissionDisposition::Parked => vec!["mission decide"],
+            MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
+            MissionDisposition::Terminal => vec!["mission report", "mission apply"],
+        }
+    }
+}
+
+pub async fn load_mission_view(
+    store: &MissionStore,
+    mission_id: &MissionId,
+) -> Result<MissionView> {
+    let state = store.require_state(mission_id).await?;
+    let driver_running = DriverGuard::is_held(&store.driver_lock_path(mission_id))?;
+    Ok(MissionView::from_state(state, driver_running))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,7 +154,6 @@ pub enum ProposeError {
     Other(#[from] anyhow::Error),
 }
 
-const EFFECT_LEASE_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_LOOP_ITERATIONS: usize = 10_000;
 
 pub use crate::model::TERMINAL_REVIEW_TASK_TAG;
@@ -103,20 +178,17 @@ impl Engine {
         mission_type: MissionType,
         runtime: String,
         image_id: String,
-        role_runner: Arc<dyn RoleRunner>,
-        oracle_runner: Arc<dyn OracleRunner>,
-        clock: Arc<dyn Clock>,
+        services: EngineServices,
     ) -> Self {
-        let worker_id = format!("mission-engine-{}", std::process::id());
         Self {
             store,
             mission_type,
             runtime,
             image_id,
-            role_runner,
-            oracle_runner,
-            clock,
-            worker_id,
+            role_runner: services.role_runner,
+            oracle_runner: services.oracle_runner,
+            effect_cleaner: services.effect_cleaner,
+            clock: services.clock,
         }
     }
 
@@ -217,14 +289,7 @@ impl Engine {
         actor: &str,
         justification: &str,
     ) -> Result<(), ProposeError> {
-        let mut state = self.load_state(mission_id).await?;
-        while !state.inflight.is_empty() {
-            if self.reconcile(&state).await? {
-                state = self.load_state(mission_id).await?;
-            } else {
-                break;
-            }
-        }
+        let state = self.load_state(mission_id).await?;
         if !state.inflight.is_empty() {
             return Err(ProposeError::MissionBusy);
         }
@@ -288,47 +353,44 @@ impl Engine {
     }
 
     /// Drive the mission until it parks, terminates, or awaits input.
-    pub async fn advance(&self, mission_id: &MissionId) -> Result<AdvanceOutcome> {
-        let outcome = self.drive(mission_id).await?;
+    pub async fn advance(&self, mission_id: &MissionId) -> Result<MissionView> {
+        let Some(_guard) = DriverGuard::try_acquire(&self.store.driver_lock_path(mission_id))?
+        else {
+            return load_mission_view(&self.store, mission_id).await;
+        };
+        if !self.recover_interrupted(mission_id).await? {
+            return Ok(MissionView::from_state(
+                self.load_state(mission_id).await?,
+                false,
+            ));
+        }
+        self.drive(mission_id).await?;
         // Persist a fold snapshot before parking or exiting so the next
         // invocation resumes without re-folding the whole log.
         let state = self.load_state(mission_id).await?;
         self.store
             .save_snapshot(&state, self.clock.now_ms())
             .await?;
-        Ok(outcome)
+        Ok(MissionView::from_state(state, false))
     }
 
-    async fn drive(&self, mission_id: &MissionId) -> Result<AdvanceOutcome> {
+    async fn drive(&self, mission_id: &MissionId) -> Result<()> {
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             if !state.inflight.is_empty() {
-                if self.reconcile(&state).await? {
-                    continue; // reconcile appended an outcome; refold
-                }
                 if self.drive_one(&state).await? {
-                    continue; // drove an effect; refold
+                    continue;
                 }
-                // Inflight effects remain but none were reconcilable or due:
-                // they are held by live leases (another driver is running
-                // them). Return rather than spin; the next advance resumes.
-                return Ok(AdvanceOutcome::Busy);
+                return Ok(());
             }
             match step(&state) {
                 StepDecision::Idle => {
                     return match state.phase {
-                        MissionPhase::Planning => Ok(AdvanceOutcome::AwaitingPlan),
+                        MissionPhase::Planning => Ok(()),
                         phase => bail!("engine idle in unexpected phase {phase:?}"),
                     };
                 }
-                StepDecision::Park => {
-                    return Ok(AdvanceOutcome::Parked {
-                        attention: state.open_attention.values().cloned().collect(),
-                    });
-                }
-                StepDecision::Terminal => {
-                    return Ok(AdvanceOutcome::Terminal { phase: state.phase });
-                }
+                StepDecision::Park | StepDecision::Terminal => return Ok(()),
                 StepDecision::DispatchRole(intent) => {
                     self.materialize_role_request(&state, intent).await?;
                 }
@@ -344,130 +406,109 @@ impl Engine {
         bail!("advance exceeded {MAX_LOOP_ITERATIONS} iterations; aborting as a safety stop")
     }
 
-    /// Settle inflight effects whose ledger row is no longer runnable: a
-    /// role run mid-crash is unknowable → synthesized failure (zenith's
-    /// `_reconcile_pending_attempts` discipline); an oracle run is
-    /// reproducible → re-queued. Returns true when an event was appended
-    /// (caller must refold before driving).
-    ///
-    /// A **live (unexpired) lease is left alone**: another driver still owns
-    /// the effect, and stealing it would fabricate failure over a running LLM
-    /// or double-run an oracle. Only expired or never-leased effects are
-    /// reconciled — mirroring `pull_due`'s eligibility.
-    async fn reconcile(&self, state: &MissionState) -> Result<bool> {
-        let now_ms = self.clock.now_ms();
-        for (key, effect) in &state.inflight {
-            let Some(status) = self.store.effect_status(key).await? else {
-                continue; // ledger row missing; nothing to reconcile
+    /// Abandon requests inherited from a previous driver process. The lock
+    /// proves no live driver still owns them; cleanup must finish before the
+    /// interrupted outcome is recorded.
+    async fn recover_interrupted(&self, mission_id: &MissionId) -> Result<bool> {
+        loop {
+            let state = self.load_state(mission_id).await?;
+            let Some((effect_id, effect)) = state.inflight.iter().next() else {
+                return Ok(true);
             };
-            if status.status == "queued" {
-                continue; // normal path: drive_one will lease it
+            if !self.cleanup_effect(&state, effect_id, true).await? {
+                return Ok(false);
             }
-            if status.is_live_lease(now_ms) {
-                continue; // a concurrent driver owns it; do not disturb
-            }
-            match effect {
-                InflightEffect::RoleRun {
-                    task_id,
-                    attempt_no,
-                    ..
-                } => {
-                    let event = NewEvent::new(MissionEvent::RoleRunFailed {
-                        task_id: task_id.clone(),
-                        attempt_no: *attempt_no,
-                        idempotency_key: key.clone(),
-                        error_kind: RunErrorKind::Infra,
-                        detail: "resumed with an expired role-run lease; outcome unknowable"
-                            .to_string(),
-                        synthesized: true,
-                    });
-                    self.append_idempotent(&state.mission_id, state.head, &[event])
-                        .await?;
-                    // One reconcile action per pass; refold before the next.
-                    return Ok(true);
-                }
-                InflightEffect::OracleRun { .. } => {
-                    self.store.requeue_effect(key, now_ms).await?;
-                }
-                InflightEffect::TerminalReview {
-                    attempt_no,
-                    judged_sha,
-                    ..
-                } => {
-                    // An LLM turn mid-crash is unknowable, exactly like a role
-                    // run — synthesize failure, never re-queue.
-                    let event = NewEvent::new(MissionEvent::TerminalReviewFailed {
-                        attempt_no: *attempt_no,
-                        idempotency_key: key.clone(),
-                        judged_sha: judged_sha.clone(),
-                        error_kind: RunErrorKind::Infra,
-                        detail: "resumed with an expired terminal-review lease; outcome unknowable"
-                            .to_string(),
-                        synthesized: true,
-                    });
-                    self.append_idempotent(&state.mission_id, state.head, &[event])
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Lease and execute one due effect, recording its outcome. Returns
-    /// whether an effect was driven (false = nothing was due to lease).
-    /// One driver turn claims one effect; durable leases coordinate concurrent
-    /// drivers without requiring an in-process scheduler.
-    async fn drive_one(&self, state: &MissionState) -> Result<bool> {
-        let now_ms = self.clock.now_ms();
-        let leases = self
-            .store
-            .pull_due(
+            self.append_outcome(
                 &state.mission_id,
-                &self.worker_id,
-                1,
-                EFFECT_LEASE_MS,
-                now_ms,
+                state.head,
+                interrupted_outcome(effect_id, effect),
             )
             .await?;
-        let Some(lease) = leases.into_iter().next() else {
+        }
+    }
+
+    /// Execute one request materialized by this driver, clean its transient
+    /// resources, then durably record the outcome.
+    async fn drive_one(&self, state: &MissionState) -> Result<bool> {
+        let Some((effect_id, effect)) = state.inflight.iter().next() else {
             return Ok(false);
         };
-        let outcome = match &lease.request {
+        let outcome = match effect {
             InflightEffect::RoleRun { .. } => {
-                self.execute_role_run(state, &lease.effect_id, &lease.request)
-                    .await?
+                self.execute_role_run(state, effect_id, effect).await?
             }
             InflightEffect::OracleRun { .. } => {
-                self.execute_oracle_run(state, &lease.effect_id, &lease.request)
-                    .await?
+                self.execute_oracle_run(state, effect_id, effect).await?
             }
             InflightEffect::TerminalReview { .. } => {
-                self.execute_terminal_review(state, &lease.effect_id, &lease.request)
+                self.execute_terminal_review(state, effect_id, effect)
                     .await?
             }
         };
-        // The computed outcome is unique — for a role run, not reproducible — so a
-        // stale head must NOT discard it (unlike the request/reconcile appends). A
-        // concurrent driver settling a DIFFERENT effect moved the head, but our
-        // outcome is still unrecorded, so re-append at the refreshed head. A
-        // Duplicate means it is already in the log (we hold the lease, so only a
-        // zombie re-drive), which is genuinely done.
-        let mut head = state.head;
+        let discard_artifact = !matches!(outcome.event, MissionEvent::RoleRunCompleted { .. });
+        if !self
+            .cleanup_effect(state, effect_id, discard_artifact)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.append_outcome(&state.mission_id, state.head, outcome)
+            .await?;
+        Ok(true)
+    }
+
+    async fn cleanup_effect(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+        discard_artifact: bool,
+    ) -> Result<bool> {
+        let request = EffectCleanupRequest {
+            mission_id: state.mission_id.clone(),
+            effect_id: effect_id.clone(),
+            workspace_dir: state.workspace_dir.clone().into(),
+            state_dir: self.store.lionclaw_dir().to_path_buf(),
+            discard_artifact,
+        };
+        match self.effect_cleaner.cleanup(request).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                let event = NewEvent::new(MissionEvent::EffectCleanupFailed {
+                    effect_id: effect_id.clone(),
+                    resource: error.resource,
+                    failure: RunFailure {
+                        kind: RunErrorKind::Infra,
+                        detail: error.detail,
+                    },
+                });
+                self.append_fact(&state.mission_id, state.head, event)
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn append_outcome(
+        &self,
+        mission_id: &MissionId,
+        initial_head: u64,
+        outcome: NewEvent,
+    ) -> Result<()> {
+        let mut head = initial_head;
         for _ in 0..MAX_LOOP_ITERATIONS {
             match self
                 .store
                 .append(
-                    &state.mission_id,
+                    mission_id,
                     head,
                     std::slice::from_ref(&outcome),
                     self.clock.now_ms(),
                 )
                 .await
             {
-                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(true),
+                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(()),
                 Err(AppendError::Conflict { .. }) => {
-                    head = self.load_state(&state.mission_id).await?.head;
+                    head = self.load_state(mission_id).await?.head;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -475,11 +516,35 @@ impl Engine {
         bail!("outcome append kept conflicting after {MAX_LOOP_ITERATIONS} retries")
     }
 
+    async fn append_fact(
+        &self,
+        mission_id: &MissionId,
+        initial_head: u64,
+        event: NewEvent,
+    ) -> Result<()> {
+        let mut head = initial_head;
+        for _ in 0..MAX_LOOP_ITERATIONS {
+            match self
+                .store
+                .append(
+                    mission_id,
+                    head,
+                    std::slice::from_ref(&event),
+                    self.clock.now_ms(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(AppendError::Conflict { .. }) => head = self.load_state(mission_id).await?.head,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        bail!("event append kept conflicting after {MAX_LOOP_ITERATIONS} retries")
+    }
+
     /// Append events, treating a `Conflict`/`Duplicate` as an idempotent no-op.
-    /// Safe only for *request* and *reconcile* appends: a Conflict means a
-    /// concurrent driver moved the head, and the next fold re-derives the same
-    /// dispatch. Outcome appends do NOT use this — `drive_one` must re-append its
-    /// unique computed outcome rather than discard it.
+    /// Safe only for request appends: a Conflict means a non-driver decision
+    /// moved the head, and the next fold re-derives the same dispatch.
     async fn append_idempotent(
         &self,
         mission_id: &MissionId,
@@ -501,7 +566,7 @@ impl Engine {
     async fn execute_role_run(
         &self,
         state: &MissionState,
-        idempotency_key: &str,
+        effect_id: &EffectId,
         effect: &InflightEffect,
     ) -> Result<NewEvent> {
         let InflightEffect::RoleRun {
@@ -521,10 +586,8 @@ impl Engine {
             NewEvent::new(MissionEvent::RoleRunFailed {
                 task_id: task_id.clone(),
                 attempt_no,
-                idempotency_key: idempotency_key.to_string(),
-                error_kind: kind,
-                detail,
-                synthesized: false,
+                effect_id: effect_id.clone(),
+                failure: RunFailure { kind, detail },
             })
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
@@ -542,7 +605,7 @@ impl Engine {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
             attempt_no,
-            idempotency_key: idempotency_key.to_string(),
+            effect_id: effect_id.clone(),
             role: role.clone(),
             runtime: runtime.clone(),
             skills,
@@ -591,7 +654,7 @@ impl Engine {
                 Ok(NewEvent::new(MissionEvent::RoleRunCompleted {
                     task_id: task_id.clone(),
                     attempt_no,
-                    idempotency_key: idempotency_key.to_string(),
+                    effect_id: effect_id.clone(),
                     handoff,
                     artifact: outcome.artifact,
                 })
@@ -604,7 +667,7 @@ impl Engine {
     async fn execute_oracle_run(
         &self,
         state: &MissionState,
-        idempotency_key: &str,
+        effect_id: &EffectId,
         effect: &InflightEffect,
     ) -> Result<NewEvent> {
         let InflightEffect::OracleRun {
@@ -624,10 +687,11 @@ impl Engine {
                 oracle: oracle.clone(),
                 judged_sha: judged_sha.to_string(),
                 attempt_no,
-                idempotency_key: idempotency_key.to_string(),
-                error_kind: RunErrorKind::Infra,
-                detail,
-                synthesized: false,
+                effect_id: effect_id.clone(),
+                failure: RunFailure {
+                    kind: RunErrorKind::Infra,
+                    detail,
+                },
             })
         };
         let Some(oracle_path) = self.mission_type.oracles.get(oracle) else {
@@ -637,6 +701,7 @@ impl Engine {
         };
         let request = OracleRunRequest {
             mission_id: state.mission_id.clone(),
+            effect_id: effect_id.clone(),
             oracle: oracle.clone(),
             oracle_path: oracle_path.clone(),
             judged_sha: judged_sha.to_string(),
@@ -650,7 +715,7 @@ impl Engine {
                 oracle: oracle.clone(),
                 judged_sha: judged_sha.to_string(),
                 attempt_no,
-                idempotency_key: idempotency_key.to_string(),
+                effect_id: effect_id.clone(),
                 exit_code: outcome.exit_code,
                 exit_signal: outcome.exit_signal,
                 stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
@@ -672,7 +737,7 @@ impl Engine {
     async fn execute_terminal_review(
         &self,
         state: &MissionState,
-        idempotency_key: &str,
+        effect_id: &EffectId,
         effect: &InflightEffect,
     ) -> Result<NewEvent> {
         let InflightEffect::TerminalReview {
@@ -691,11 +756,9 @@ impl Engine {
         let failed = |kind: RunErrorKind, detail: String| {
             NewEvent::new(MissionEvent::TerminalReviewFailed {
                 attempt_no,
-                idempotency_key: idempotency_key.to_string(),
+                effect_id: effect_id.clone(),
                 judged_sha: judged_sha.clone(),
-                error_kind: kind,
-                detail,
-                synthesized: false,
+                failure: RunFailure { kind, detail },
             })
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
@@ -715,7 +778,7 @@ impl Engine {
             mission_id: state.mission_id.clone(),
             task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
             attempt_no,
-            idempotency_key: idempotency_key.to_string(),
+            effect_id: effect_id.clone(),
             role: role.clone(),
             runtime: runtime.clone(),
             skills,
@@ -756,7 +819,7 @@ impl Engine {
         }
         Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {
             attempt_no,
-            idempotency_key: idempotency_key.to_string(),
+            effect_id: effect_id.clone(),
             judged_sha: judged_sha.clone(),
             passed,
             gaps,
@@ -795,7 +858,7 @@ impl Engine {
         Ok(feedback)
     }
 
-    /// Assemble an execution role's prompt (`("role", …)` idempotency namespace).
+    /// Assemble an execution role's prompt (`("role", …)` effect namespace).
     fn assemble_execution_request(
         &self,
         state: &MissionState,
@@ -892,7 +955,7 @@ impl Engine {
     }
 
     /// Turn a role-dispatch intent into a recorded request: assemble the
-    /// prompt (engine-owned), persist it, derive the idempotency key.
+    /// prompt (engine-owned), persist it, derive the effect ID.
     async fn materialize_role_request(
         &self,
         state: &MissionState,
@@ -903,10 +966,10 @@ impl Engine {
             .roles
             .get(&intent.role)
             .with_context(|| format!("role '{}' missing from the mission type", intent.role))?;
-        // Planning and execution assemble prompts and namespace idempotency keys
+        // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
-        // a planning id can never collide with an execution one.
-        let (prompt_text, idem_namespace) = if state.planning_base_revision.is_some() {
+        // a planning effect can never collide with an execution one.
+        let (prompt_text, effect_namespace) = if state.planning_base_revision.is_some() {
             self.assemble_planning_request(state, role, &intent)?
         } else {
             self.assemble_execution_request(state, role, &intent)?
@@ -916,8 +979,8 @@ impl Engine {
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
-        let idempotency_key = idem_key(&[
-            idem_namespace,
+        let effect_id = effect_id_for(&[
+            effect_namespace,
             state.mission_id.as_str(),
             intent.task_id.as_str(),
             &intent.attempt_no.to_string(),
@@ -926,7 +989,7 @@ impl Engine {
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
             task_id: intent.task_id,
             attempt_no: intent.attempt_no,
-            idempotency_key,
+            effect_id,
             role: intent.role,
             runtime: role
                 .runtime
@@ -941,46 +1004,30 @@ impl Engine {
     }
 
     /// Turn a terminal-review intent into a recorded request
-    /// (`("terminal-review", …)` idempotency namespace). Fresh-context by
+    /// (`("terminal-review", …)` effect namespace). Fresh-context by
     /// construction: the assembler takes only the objective. The nonce is
     /// random per materialization — never derived from a deterministic recipe
     /// that worker-planted code could precompute — so, unlike role runs, the
-    /// idempotency key deliberately excludes the prompt hash (oracle-key
-    /// shape): two racing drivers mint the SAME key with different nonces,
-    /// the second append is a Duplicate no-op, and execution reads the
-    /// winning event's nonce.
+    /// effect ID deliberately excludes the prompt hash. The identity names the
+    /// logical review attempt; the recorded request remains the source of its
+    /// random nonce.
     async fn materialize_terminal_review_request(
         &self,
         state: &MissionState,
         intent: TerminalReviewDispatchIntent,
     ) -> Result<()> {
-        let idempotency_key = idem_key(&[
+        let effect_id = effect_id_for(&[
             "terminal-review",
             state.mission_id.as_str(),
             &intent.judged_sha,
             &intent.attempt_no.to_string(),
         ]);
-        // create_mission refuses a config whose reviewer the pinned type
-        // cannot resolve, so this is unreachable through the public API —
-        // but a hostile log must degrade to a durable park a human can
-        // retry/waive/abort, never a permanently wedged mission whose every
-        // advance errors before any event lands.
-        let Some(role) = self.mission_type.roles.get(&intent.role) else {
-            let event = NewEvent::new(MissionEvent::TerminalReviewFailed {
-                attempt_no: intent.attempt_no,
-                idempotency_key,
-                judged_sha: intent.judged_sha,
-                error_kind: RunErrorKind::Launch,
-                detail: format!(
-                    "terminal-review role '{}' is not provided by the mission type",
-                    intent.role
-                ),
-                synthesized: false,
-            });
-            return self
-                .append_idempotent(&state.mission_id, state.head, &[event])
-                .await;
-        };
+        let role = self.mission_type.roles.get(&intent.role).with_context(|| {
+            format!(
+                "terminal-review role '{}' is not provided by the pinned mission type",
+                intent.role
+            )
+        })?;
         // The nonce is recorded on the event and only ever *copied* by the
         // fold, so randomness here never threatens fold purity — same
         // discipline as the oracle's wall-clock duration. It must be random
@@ -1017,7 +1064,7 @@ impl Engine {
             .externalize(PayloadRef::inline(prompt_text))?;
         let event = NewEvent::new(MissionEvent::TerminalReviewRequested {
             attempt_no: intent.attempt_no,
-            idempotency_key,
+            effect_id,
             role: intent.role,
             runtime: role
                 .runtime
@@ -1040,7 +1087,7 @@ impl Engine {
         let events: Vec<NewEvent> = intents
             .into_iter()
             .map(|intent| {
-                let idempotency_key = idem_key(&[
+                let effect_id = effect_id_for(&[
                     "oracle",
                     state.mission_id.as_str(),
                     intent.oracle.as_str(),
@@ -1052,7 +1099,7 @@ impl Engine {
                     oracle: intent.oracle,
                     judged_sha: intent.judged_sha,
                     attempt_no: intent.attempt_no,
-                    idempotency_key,
+                    effect_id,
                 })
             })
             .collect();
@@ -1115,10 +1162,53 @@ impl Engine {
     }
 }
 
-/// Content-derived idempotency key: stable across resume, unique per
+/// Content-derived effect identity: stable across resume, unique per
 /// logical effect.
-fn idem_key(parts: &[&str]) -> String {
-    hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes()))
+fn effect_id_for(parts: &[&str]) -> EffectId {
+    EffectId::for_parts(parts)
+}
+
+fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEvent {
+    let failure = RunFailure {
+        kind: RunErrorKind::Interrupted,
+        detail: "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed".to_string(),
+    };
+    NewEvent::new(match effect {
+        InflightEffect::RoleRun {
+            task_id,
+            attempt_no,
+            ..
+        } => MissionEvent::RoleRunFailed {
+            task_id: task_id.clone(),
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            failure,
+        },
+        InflightEffect::OracleRun {
+            assertion_ids,
+            oracle,
+            judged_sha,
+            attempt_no,
+            ..
+        } => MissionEvent::OracleRunFailed {
+            assertion_ids: assertion_ids.clone(),
+            oracle: oracle.clone(),
+            judged_sha: judged_sha.clone(),
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            failure,
+        },
+        InflightEffect::TerminalReview {
+            attempt_no,
+            judged_sha,
+            ..
+        } => MissionEvent::TerminalReviewFailed {
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            judged_sha: judged_sha.clone(),
+            failure,
+        },
+    })
 }
 
 /// Record a decision without a full engine (the CLI's `decide` needs

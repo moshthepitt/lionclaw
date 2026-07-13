@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::{default_config, harness, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
+use common::{
+    approve_plan, default_config, harness, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
+};
 use lionclaw::engine::ProposeError;
 use lionclaw::model::{
     Assertion, AssertionId, DecisionAction, OracleName, PlanProposal, ProposalError, Requirement,
@@ -48,6 +50,7 @@ async fn started() -> (
         .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
     (dir, h, id)
 }
 
@@ -60,6 +63,7 @@ async fn complete_revision_retires_omitted_tasks_and_seeds_new_tasks() {
         .propose_plan(&id, proposal(1, next), "test", "new approach")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
 
     let state = h.engine.load_state(&id).await.unwrap();
     assert_eq!(state.revision, 2);
@@ -157,6 +161,7 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
         .propose_plan(&id, proposal(0, initial.clone()), "test", "initial")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
 
     initial.requirements[1].disposition = RequirementDisposition::Covered {
         assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
@@ -166,6 +171,7 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
         .propose_plan(&id, proposal(1, initial), "test", "cover limitation")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
 }
 
 #[tokio::test]
@@ -212,6 +218,7 @@ async fn retained_task_ids_are_immutable_and_retired_ids_never_revive() {
         .propose_plan(&id, proposal(1, revision.clone()), "test", "retire fix")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
     revision.tasks.push(new_task("fix"));
     assert!(matches!(
         h.engine
@@ -224,8 +231,7 @@ async fn retained_task_ids_are_immutable_and_retired_ids_never_revive() {
 #[tokio::test]
 async fn approval_policy_applies_to_every_revision() {
     let (_dir, h) = test_harness().await;
-    let mut config = default_config();
-    config.approval_required = true;
+    let config = default_config();
     let id = h
         .engine
         .create_mission("/repo", "approval", BASE_SHA, config)

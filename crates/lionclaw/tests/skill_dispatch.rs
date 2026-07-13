@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    default_config, harness_with_type, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+    approve_plan, default_config, harness_with_type, proposal, simple_plan, test_mission_type,
+    BASE_SHA, HEAD_SHA,
 };
 use lionclaw::mission_type::SkillPackage;
 use lionclaw::model::{ArtifactOutcome, Handoff, PayloadRef, RoleName};
@@ -77,6 +78,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
         )
         .await
         .unwrap();
+    approve_plan(&harness.engine, &mission_id).await;
 
     harness.engine.advance(&mission_id).await.unwrap();
     assert_eq!(
@@ -137,6 +139,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
         )
         .await
         .unwrap();
+    approve_plan(&harness.engine, &mission_id).await;
 
     harness.engine.advance(&mission_id).await.unwrap();
 }

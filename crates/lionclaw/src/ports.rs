@@ -12,11 +12,12 @@ use async_trait::async_trait;
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
-    ArtifactOutcome, Handoff, MissionId, OracleName, PreparedInputRef, RunErrorKind, TaskId,
+    ArtifactOutcome, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
+    RunErrorKind, TaskId,
 };
 
 /// One full autonomous agent run — the engine never micromanages how a role
-/// works. The engine guarantees an idempotency key with a recorded outcome
+/// works. The engine guarantees an effect ID with a recorded outcome
 /// is never re-invoked.
 #[async_trait]
 pub trait RoleRunner: Send + Sync {
@@ -28,7 +29,7 @@ pub struct RoleRunRequest {
     pub mission_id: MissionId,
     pub task_id: TaskId,
     pub attempt_no: u32,
-    pub idempotency_key: String,
+    pub effect_id: EffectId,
     pub role: RoleDefinition,
     /// Runtime profile resolved when the request event was recorded.
     pub runtime: String,
@@ -71,6 +72,7 @@ pub trait OracleRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct OracleRunRequest {
     pub mission_id: MissionId,
+    pub effect_id: EffectId,
     pub oracle: OracleName,
     /// Resolved oracle executable (engine resolves from the mission type; the
     /// runner stays domain-blind — it never sees which assertions it judges).
@@ -79,6 +81,27 @@ pub struct OracleRunRequest {
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectCleanupRequest {
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub workspace_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub discard_artifact: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("failed to clean up {resource:?}: {detail}")]
+pub struct EffectCleanupFailure {
+    pub resource: EffectResource,
+    pub detail: String,
+}
+
+#[async_trait]
+pub trait EffectCleaner: Send + Sync {
+    async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure>;
 }
 
 #[derive(Debug, Clone)]

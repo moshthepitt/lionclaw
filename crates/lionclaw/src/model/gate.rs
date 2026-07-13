@@ -106,7 +106,7 @@ mod tests {
         EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps,
     };
     use crate::model::fold::fold;
-    use crate::model::ids::{AssertionId, MissionId, RoleName};
+    use crate::model::ids::{AssertionId, EffectId, MissionId, RoleName};
     use crate::model::plan::{Assertion, Task};
     use crate::model::MissionConfig;
 
@@ -175,7 +175,6 @@ mod tests {
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {
-                        approval_required: false,
                         ..Default::default()
                     },
                 },
@@ -193,8 +192,18 @@ mod tests {
                     justification: "initial".into(),
                 },
             ),
+            env(
+                &mission_id,
+                3,
+                MissionEvent::DecisionRecorded {
+                    attention_id: "plan_proposal:mission".into(),
+                    action: crate::model::DecisionAction::Approve,
+                    justification: "test fixture approves the plan".into(),
+                    actor: "test".into(),
+                },
+            ),
         ];
-        let mut seq = 3;
+        let mut seq = 4;
         for (validator, items) in verdicts {
             events.push(env(
                 &mission_id,
@@ -202,7 +211,7 @@ mod tests {
                 MissionEvent::RoleRunRequested {
                     task_id: tid(validator),
                     attempt_no: 1,
-                    idempotency_key: format!("k{validator}"),
+                    effect_id: EffectId::for_parts(&["test", validator]),
                     role: RoleName::new("reviewer").unwrap(),
                     runtime: "codex".into(),
                     prompt: PayloadRef::inline("p"),
@@ -216,7 +225,7 @@ mod tests {
                 MissionEvent::RoleRunCompleted {
                     task_id: tid(validator),
                     attempt_no: 1,
-                    idempotency_key: format!("k{validator}"),
+                    effect_id: EffectId::for_parts(&["test", validator]),
                     handoff: Handoff::Validate {
                         done: true,
                         report: PayloadRef::inline("r"),

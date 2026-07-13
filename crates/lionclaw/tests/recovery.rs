@@ -2,8 +2,8 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::{default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw::engine::AdvanceOutcome;
+use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
+use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
     ArtifactOutcome, DecisionAction, Handoff, MissionPhase, PayloadRef, RunErrorKind,
 };
@@ -59,9 +59,10 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
         .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
         .await
         .unwrap();
+    approve_plan(&h.engine, &id).await;
 
     let outcome = h.engine.advance(&id).await.unwrap();
-    assert!(matches!(outcome, AdvanceOutcome::Terminal { .. }));
+    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("Required rework"));
@@ -98,10 +99,11 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
         .await
         .unwrap();
-    assert!(matches!(
-        h.engine.advance(&id).await.unwrap(),
-        AdvanceOutcome::Terminal { .. }
-    ));
+    approve_plan(&h.engine, &id).await;
+    assert_eq!(
+        h.engine.advance(&id).await.unwrap().disposition,
+        MissionDisposition::Terminal
+    );
     assert_eq!(*attempts.lock().unwrap(), 2);
 
     let dir = tempfile::tempdir().unwrap();
@@ -121,9 +123,10 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
         .await
         .unwrap();
-    let AdvanceOutcome::Parked { attention } = h.engine.advance(&id).await.unwrap() else {
-        panic!("launch failure must park");
-    };
+    approve_plan(&h.engine, &id).await;
+    let view = h.engine.advance(&id).await.unwrap();
+    assert_eq!(view.disposition, MissionDisposition::Parked);
+    let attention: Vec<_> = view.state.open_attention.values().collect();
     assert_eq!(attention[0].id, "node_failed:fix");
     assert_eq!(h.role_runner.calls.lock().unwrap().len(), 1);
 }
@@ -171,10 +174,11 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
         .await
         .unwrap();
-    assert!(matches!(
-        h.engine.advance(&id).await.unwrap(),
-        AdvanceOutcome::Parked { .. }
-    ));
+    approve_plan(&h.engine, &id).await;
+    assert_eq!(
+        h.engine.advance(&id).await.unwrap().disposition,
+        MissionDisposition::Parked
+    );
     h.engine
         .decide(
             &id,
@@ -185,12 +189,9 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        h.engine.advance(&id).await.unwrap(),
-        AdvanceOutcome::Terminal {
-            phase: MissionPhase::Done { .. }
-        }
-    ));
+    let view = h.engine.advance(&id).await.unwrap();
+    assert_eq!(view.disposition, MissionDisposition::Terminal);
+    assert!(matches!(view.state.phase, MissionPhase::Done { .. }));
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 2);
     for expected in [

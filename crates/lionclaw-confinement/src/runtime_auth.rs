@@ -123,6 +123,7 @@ mod tests {
                 stdin: "hello".to_string(),
                 auth: Some(RuntimeAuthKind::from_static(TEST_AUTH_KIND)),
             },
+            resource_name: None,
             runtime_secrets_mount: None,
             runtime_auth_provider: Some(std::sync::Arc::new(TestRuntimeAuthProvider)),
             runtime_auth_context: Default::default(),

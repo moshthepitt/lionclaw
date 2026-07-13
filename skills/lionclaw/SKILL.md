@@ -24,8 +24,13 @@ binary separately from its skill instructions.
    runtime profile.
 5. Treat `lionclaw mission status --json` as the current playbook: it reports
    mission state, evidence, and legal actions for every open attention item.
-   Use `mission advance` to drive automatic work and `mission decide` for an
-   open item.
+   `mission advance` is a blocking driver call: let it run until it returns and
+   do not wrap it in a shorter caller timeout. A concurrent caller should use
+   `mission status --json`, which truthfully reports `running` without starting
+   the work again. If the caller itself is interrupted, run `mission advance`
+   again; LionClaw cleans the abandoned effect and reports why it stopped.
+   Use `mission decide` only for an open item and always provide the required
+   justification.
 6. Preserve human plan approval or acceptance decisions for the human. Routine
    retries, repair, and replanning may be driven autonomously when the CLI
    presents those actions and the evidence supports them.

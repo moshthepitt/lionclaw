@@ -149,8 +149,8 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::Idle;
     };
 
-    // A running task without an inflight effect can only mean an outcome is
-    // about to be reconciled; never double-dispatch.
+    // A running task without an inflight effect is an impossible folded state;
+    // never double-dispatch if a future reducer encounters one.
     let any_running = state
         .tasks
         .values()
@@ -271,8 +271,9 @@ mod tests {
         RunErrorKind, VersionStamps,
     };
     use crate::model::fold::fold;
-    use crate::model::ids::MissionId;
+    use crate::model::ids::{EffectId, MissionId};
     use crate::model::plan::{Assertion, Plan, Task};
+    use crate::model::state::RunFailure;
     use crate::model::verdict::FinishClass;
 
     fn aid(raw: &str) -> AssertionId {
@@ -365,7 +366,6 @@ mod tests {
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {
-                approval_required: false,
                 recovery: crate::model::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
@@ -392,7 +392,7 @@ mod tests {
         MissionEvent::RoleRunRequested {
             task_id: tid(task),
             attempt_no,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
             role: rname("implementer"),
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
@@ -404,7 +404,7 @@ mod tests {
         MissionEvent::RoleRunCompleted {
             task_id: tid(task),
             attempt_no: 1,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
             handoff: Handoff::Work {
                 done: true,
                 report: PayloadRef::inline("done"),
@@ -421,10 +421,11 @@ mod tests {
         MissionEvent::RoleRunFailed {
             task_id: tid(task),
             attempt_no: 1,
-            idempotency_key: key.to_string(),
-            error_kind: RunErrorKind::Timeout,
-            detail: "runner timed out".to_string(),
-            synthesized: false,
+            effect_id: EffectId::for_parts(&["test", key]),
+            failure: RunFailure {
+                kind: RunErrorKind::Timeout,
+                detail: "runner timed out".to_string(),
+            },
         }
     }
 
@@ -440,7 +441,7 @@ mod tests {
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
         }
     }
 
@@ -457,7 +458,7 @@ mod tests {
             oracle: oname(oracle),
             judged_sha: judged_sha.to_string(),
             attempt_no,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
             exit_code,
             exit_signal: None,
             stdout: PayloadRef::inline("oracle stdout"),
@@ -470,18 +471,24 @@ mod tests {
     /// Fold hand-built events with sequence numbers 1..=n so every state a
     /// test steps is one the real fold produced.
     fn fold_log(events: Vec<MissionEvent>) -> MissionState {
-        fold(
-            events
-                .into_iter()
-                .enumerate()
-                .map(|(i, event)| EventEnvelope {
-                    mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
-                    sequence_no: i as u64 + 1,
-                    recorded_at_ms: 0,
-                    stamps: VersionStamps::default(),
-                    event,
-                }),
-        )
+        let events = events.into_iter().flat_map(|event| {
+            let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
+                MissionEvent::DecisionRecorded {
+                    attention_id: "plan_proposal:mission".into(),
+                    action: crate::model::DecisionAction::Approve,
+                    justification: "test fixture approves the plan".into(),
+                    actor: "test".into(),
+                }
+            });
+            std::iter::once(event).chain(approve)
+        });
+        fold(events.enumerate().map(|(i, event)| EventEnvelope {
+            mission_id: MissionId::parse("mabc123abc123").expect("valid mission id"),
+            sequence_no: i as u64 + 1,
+            recorded_at_ms: 0,
+            stamps: VersionStamps::default(),
+            event,
+        }))
         .expect("log begins with MissionCreated")
     }
 
@@ -592,8 +599,7 @@ mod tests {
             plan(vec![assertion("A1")], vec![work("w1", &[], &[])]),
             role_requested("w1", 1, "k-w1-1"),
         ]);
-        // The reconcile window: the run's outcome exists in the world but has
-        // not folded in yet. No Slice-1 fold transition leaves a task Running
+        // No current fold transition leaves a task Running
         // with an empty inflight map, so drain the map by hand.
         state.inflight.clear();
         assert_eq!(state.tasks[&tid("w1")].status, TaskStatus::Running);
@@ -844,7 +850,7 @@ mod tests {
     fn review_requested(attempt_no: u32, key: &str, judged_sha: &str) -> MissionEvent {
         MissionEvent::TerminalReviewRequested {
             attempt_no,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
             role: rname("gap-reviewer"),
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("review prompt"),
@@ -862,7 +868,7 @@ mod tests {
         use crate::model::event::{Gap, GapSeverity};
         MissionEvent::TerminalReviewCompleted {
             attempt_no: 1,
-            idempotency_key: key.to_string(),
+            effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged_sha.to_string(),
             passed,
             gaps: (0..blocking_gaps)
@@ -974,7 +980,7 @@ mod tests {
         });
         let state = fold_log(events);
         // Attempts are preserved: the re-roll runs under attempt 2 (⇒ a
-        // fresh idempotency key) at the unchanged head.
+        // fresh effect ID) at the unchanged head.
         let intent = review_dispatched(&state);
         assert_eq!(intent.attempt_no, 2);
         assert_eq!(intent.judged_sha, "sha-1");

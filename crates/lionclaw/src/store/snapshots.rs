@@ -108,30 +108,20 @@ impl MissionStore {
             .ok_or_else(|| anyhow::anyhow!("mission {mission_id} not found"))
     }
 
-    /// Drop all derived cursors for a mission (snapshot + effect ledger) and
-    /// rebuild them from the log alone — the litmus that state is a pure fold
+    /// Drop the derived snapshot for a mission and rebuild it from the log
+    /// alone — the litmus that state is a pure fold
     /// (delete cursors, rebuild, assert equality).
     pub async fn rebuild_cursors(
         &self,
         mission_id: &MissionId,
         now_ms: i64,
     ) -> Result<MissionState> {
-        {
-            let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-            sqlx::query("DELETE FROM mission_snapshots WHERE mission_id = ?1")
-                .bind(mission_id.as_str())
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM mission_effects WHERE mission_id = ?1")
-                .bind(mission_id.as_str())
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-        }
+        sqlx::query("DELETE FROM mission_snapshots WHERE mission_id = ?1")
+            .bind(mission_id.as_str())
+            .execute(self.pool())
+            .await?;
         let state = fold(self.load(mission_id).await?)
             .ok_or_else(|| anyhow::anyhow!("mission {mission_id} has no creation event"))?;
-        // Re-derive queued effect rows from the fold's inflight set.
-        self.reseed_effects(&state, now_ms).await?;
         self.save_snapshot(&state, now_ms).await?;
         Ok(state)
     }

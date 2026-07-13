@@ -20,6 +20,7 @@ use lionclaw_confinement::{
 
 use crate::config::RuntimeSkillsDir;
 use crate::mission_type::SkillPackage;
+use crate::model::EffectId;
 
 /// Container mount targets the mission owns.
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
@@ -35,12 +36,16 @@ pub struct AttemptDirs {
 }
 
 impl AttemptDirs {
-    pub fn prepare(state_dir: &Path, mission_id: &str, attempt_tag: &str) -> std::io::Result<Self> {
+    pub fn prepare(
+        state_dir: &Path,
+        mission_id: &str,
+        effect_id: &EffectId,
+    ) -> std::io::Result<Self> {
         let root = state_dir
             .join("missions")
             .join(mission_id)
             .join("attempts")
-            .join(attempt_tag);
+            .join(effect_id.as_str());
         let dirs = Self {
             handoff: root.join("handoff"),
             scratch: root.join("scratch"),
