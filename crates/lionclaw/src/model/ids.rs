@@ -106,8 +106,8 @@ id_type!(
     "Mission-type oracle name."
 );
 
-/// Mission id: `m` + 12 hex chars, derived by the shell from
-/// (workspace, objective, creation time) — no RNG in this crate.
+/// Mission id: `m` + 12 hex chars, derived from workspace, objective, and
+/// creation time without RNG.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct MissionId(String);
@@ -140,6 +140,14 @@ impl MissionId {
 
     pub fn from_digest_prefix(digest_hex: &str) -> Self {
         Self(format!("m{}", &digest_hex[..12]))
+    }
+
+    pub(crate) fn for_creation(workspace: &str, objective: &str, now_ms: i64) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self::from_digest_prefix(&hex::encode(Sha256::digest(
+            format!("{workspace}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
+        )))
     }
 
     pub fn as_str(&self) -> &str {

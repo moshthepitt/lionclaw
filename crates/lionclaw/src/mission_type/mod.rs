@@ -11,16 +11,21 @@
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
+mod digest;
 mod frontmatter;
 mod home;
 mod install;
 mod loader;
+mod locator;
 mod manifest;
+mod skill_install;
 mod skills;
 
 pub use home::{bundled_mission_types_dir, Home};
 pub use install::{install_mission_type, materialize_mission_type, InstallOutcome};
 pub use loader::{load_mission_type, MissionTypeError};
+pub use locator::MissionTypeLocator;
+pub use skill_install::{add_skill, remove_skill, SkillChange, SkillSource};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

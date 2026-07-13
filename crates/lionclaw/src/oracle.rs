@@ -95,7 +95,6 @@ impl OracleRunner for OciOracleRunner {
                 authority: &authority,
                 runtime_id: self.profile.name.clone(),
                 confinement: self.profile.confinement.clone(),
-                skill_projection: None,
                 mounts: MissionMounts {
                     workspace: checkout.clone(),
                     extras,

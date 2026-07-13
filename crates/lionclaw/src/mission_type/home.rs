@@ -1,8 +1,7 @@
 //! The global install home: `~/.lionclaw`. Mission types are installed here
-//! (`~/.lionclaw/mission-types/<name>/`) and resolved by name — so a mission
-//! command never needs a `--type <path>` once the type is installed. Mission
-//! *state* (the event store, blobs, attempt dirs) stays repo-local; only the
-//! installation is global.
+//! (`~/.lionclaw/mission-types/<name>/`) and resolved by short name. Explicit
+//! path references remain available for bundles stored anywhere. Mission state
+//! stays repo-local; only the optional short-name catalog is global.
 
 use std::path::{Path, PathBuf};
 
@@ -100,7 +99,7 @@ pub fn bundled_mission_types_dir() -> Result<PathBuf> {
     }
     Err(anyhow!(
         "no bundled mission types found (looked next to the binary and in the source tree); \
-         pass `--from <dir>`"
+         pass a mission type directory to `lionclaw install`"
     ))
 }
 

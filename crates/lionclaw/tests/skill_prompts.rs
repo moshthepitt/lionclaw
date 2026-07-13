@@ -98,17 +98,12 @@ async fn persisted_prompt(
 
 fn assert_no_skill_section(prompt: &str) {
     assert!(!prompt.contains("## Assigned skills"));
-    assert!(!prompt.contains("native skill projection"));
+    assert!(!prompt.contains("LionClaw mounted"));
 }
 
 fn assert_skill_section(prompt: &str, skills: &[(&str, &str)], schema: &str) {
     assert_eq!(prompt.matches("## Assigned skills").count(), 1);
-    assert_eq!(
-        prompt
-            .matches("the harness discovers them through native skill projection")
-            .count(),
-        1
-    );
+    assert_eq!(prompt.matches("LionClaw mounted").count(), 1);
     let section = assigned_skill_section(prompt);
     for (name, description) in skills {
         assert_eq!(section.matches(name).count(), 1, "skill name {name}");

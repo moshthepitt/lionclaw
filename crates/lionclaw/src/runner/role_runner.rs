@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lionclaw_confinement::{
-    inherited_skill_mounts, skill_mount_target, MountAccess, MountSpec, WORKSPACE_MOUNT_TARGET,
-};
+use lionclaw_confinement::{MountAccess, MountSpec, WORKSPACE_MOUNT_TARGET};
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
@@ -23,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
-use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
+use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles, RuntimeSkillsDir};
 use crate::mission_type::SkillPackage;
 use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
 use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
@@ -127,21 +125,24 @@ fn launch(detail: String) -> RoleRunFailure {
 
 fn role_skill_mounts(
     skills: &[SkillPackage],
-    projection: Option<&lionclaw_confinement::RuntimeSkillProjectionConfig>,
+    skills_dir: Option<&RuntimeSkillsDir>,
 ) -> anyhow::Result<Vec<MountSpec>> {
-    if !skills.is_empty() && projection.is_none() {
-        anyhow::bail!("runtime profile has no skill projection for mission-assigned skills");
-    }
-    let mut mounts = skills
+    let Some(skills_dir) = skills_dir else {
+        if skills.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("runtime profile has no skills-dir for mission-assigned skills");
+    };
+    skills
         .iter()
-        .map(|skill| MountSpec {
-            source: skill.root.clone(),
-            target: skill_mount_target(&skill.name),
-            access: MountAccess::ReadOnly,
+        .map(|skill| {
+            Ok(MountSpec {
+                source: skill.root.clone(),
+                target: skills_dir.mount_target(&skill.name)?,
+                access: MountAccess::ReadOnly,
+            })
         })
-        .collect::<Vec<_>>();
-    mounts.extend(inherited_skill_mounts(projection)?);
-    Ok(mounts)
+        .collect::<anyhow::Result<Vec<_>>>()
 }
 
 #[async_trait]
@@ -156,7 +157,7 @@ impl RoleRunner for OciRoleRunner {
             }
         }
         let profile = self.profile(&request.runtime)?;
-        let skill_mounts = role_skill_mounts(&request.skills, profile.skill_projection.as_ref())
+        let skill_mounts = role_skill_mounts(&request.skills, profile.skills_dir.as_ref())
             .map_err(|err| launch(format!("failed to resolve role skills: {err:#}")))?;
 
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
@@ -199,7 +200,6 @@ impl RoleRunner for OciRoleRunner {
                 authority: &authority,
                 runtime_id: profile.name.clone(),
                 confinement: profile.confinement.clone(),
-                skill_projection: profile.skill_projection.clone(),
                 mounts: MissionMounts {
                     workspace: workspace_source.clone(),
                     extras,
@@ -390,7 +390,6 @@ fn uuid_from_key(key: &str) -> uuid::Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lionclaw_confinement::{InheritedSkillRoot, RuntimeSkillProjectionConfig};
     use std::path::Path;
 
     #[test]
@@ -413,18 +412,14 @@ mod tests {
     }
 
     #[test]
-    fn role_skill_mounts_combine_mission_and_inherited_packages_read_only() {
+    fn role_skill_mounts_use_the_runtime_native_directory_read_only() {
         let temp = tempfile::tempdir().unwrap();
-        let inherited_root = temp.path().join("inherited");
-        let inherited_skill = inherited_root.join("human-skill");
-        std::fs::create_dir_all(&inherited_skill).unwrap();
-        std::fs::write(inherited_skill.join("SKILL.md"), "fixture").unwrap();
-        let mut projection = RuntimeSkillProjectionConfig::native_dir(".agents/skills");
-        projection.inherited_roots_mut().push(InheritedSkillRoot {
-            source: inherited_root,
-            target: ".native/skills".to_string(),
-            optional: false,
-        });
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nskills-dir = \".native/skills\"\n",
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let profile = profiles.get("example").unwrap();
 
         let mounts = role_skill_mounts(
             &[SkillPackage {
@@ -432,24 +427,21 @@ mod tests {
                 root: temp.path().join("mission-skill"),
                 description: "mission skill".to_string(),
             }],
-            Some(&projection),
+            profile.skills_dir.as_ref(),
         )
         .unwrap();
 
-        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts.len(), 1);
         assert!(mounts
             .iter()
             .all(|mount| mount.access == MountAccess::ReadOnly));
         assert!(mounts
             .iter()
-            .any(|mount| mount.target == "/lionclaw/skills/mission-skill"));
-        assert!(mounts
-            .iter()
-            .any(|mount| { mount.target == "/lionclaw/inherited-skills/0/human-skill" }));
+            .any(|mount| mount.target == "/runtime/home/.native/skills/mission-skill"));
     }
 
     #[test]
-    fn mission_skills_require_a_runtime_projection() {
+    fn mission_skills_require_a_runtime_skills_directory() {
         let err = role_skill_mounts(
             &[SkillPackage {
                 name: "mission-skill".to_string(),
@@ -460,7 +452,7 @@ mod tests {
         )
         .expect_err("missing projection");
 
-        assert!(err.to_string().contains("no skill projection"));
+        assert!(err.to_string().contains("no skills-dir"));
         assert!(role_skill_mounts(&[], None).unwrap().is_empty());
     }
 }

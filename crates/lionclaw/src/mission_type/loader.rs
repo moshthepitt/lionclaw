@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig};
 
+use super::digest::ContentDigest;
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
+use super::install::validate_closed_tree;
 use super::manifest::{is_path_safe_name, ManifestFile, MISSION_LOCK_FILE};
 use super::skills::{load_skills, package_files};
 use super::{MissionType, RoleDefinition, SkillPackage};
@@ -42,6 +44,17 @@ pub fn load_mission_type(
     root: &Path,
     ceiling: &AuthorityCeiling,
 ) -> Result<MissionType, MissionTypeError> {
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|source| MissionTypeError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(MissionTypeError::Manifest(format!(
+            "mission type root '{}' must be a directory, not a symlink",
+            root.display()
+        )));
+    }
+    validate_closed_tree(root).map_err(|err| MissionTypeError::Manifest(err.to_string()))?;
     let manifest_path = root.join("mission.toml");
     let manifest_text = read(&manifest_path)?;
     let manifest: ManifestFile = toml::from_str(&manifest_text)
@@ -62,7 +75,7 @@ pub fn load_mission_type(
         }
     };
 
-    let skills = load_skills(root, &manifest.skills)?;
+    let skills = load_skills(root)?;
     let oracles = load_oracles(&root.join("oracles"))?;
     let roles = load_roles(&root.join("roles"), ceiling, &skills)?;
     if roles.is_empty() {
@@ -188,7 +201,7 @@ fn load_roles(
             if !packages.contains_key(skill) {
                 return Err(MissionTypeError::Role {
                     role: stem.to_string(),
-                    detail: format!("references undeclared skill '{skill}'"),
+                    detail: format!("references missing skill package '{skill}'"),
                 });
             }
         }
@@ -296,25 +309,17 @@ fn compute_digest(
     root: &Path,
     skills: &BTreeMap<String, SkillPackage>,
 ) -> Result<String, MissionTypeError> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut feed = |rel: &str, bytes: &[u8], exec: bool| {
-        hasher.update((rel.len() as u64).to_le_bytes());
-        hasher.update(rel.as_bytes());
-        hasher.update([exec as u8]);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    };
-    feed(
+    let mut digest = ContentDigest::new();
+    digest.feed(
         "mission.toml",
         &read_bytes(&root.join("mission.toml"))?,
         false,
     );
     if let Ok(lock) = std::fs::read(root.join(MISSION_LOCK_FILE)) {
-        feed(MISSION_LOCK_FILE, &lock, false);
+        digest.feed(MISSION_LOCK_FILE, &lock, false);
     }
     if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
-        feed("playbook.md", &playbook, false);
+        digest.feed("playbook.md", &playbook, false);
     }
     for (subdir, hash_exec) in [("roles", false), ("oracles", true)] {
         let dir = root.join(subdir);
@@ -324,7 +329,7 @@ fn compute_digest(
         for entry in read_dir(&dir)? {
             let path = entry.path();
             let rel = format!("{subdir}/{}", entry.file_name().to_string_lossy());
-            feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
+            digest.feed(&rel, &read_bytes(&path)?, hash_exec && is_executable(&path));
         }
     }
     for (name, package) in skills {
@@ -336,10 +341,10 @@ fn compute_digest(
                         detail: format!("package entry '{}' escaped its root", path.display()),
                     })?;
             let logical = format!("skills/{name}/{}", relative.to_string_lossy());
-            feed(&logical, &read_bytes(&path)?, is_executable(&path));
+            digest.feed(&logical, &read_bytes(&path)?, is_executable(&path));
         }
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(digest.finish())
 }
 
 fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>, MissionTypeError> {

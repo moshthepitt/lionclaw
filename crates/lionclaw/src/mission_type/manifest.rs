@@ -26,8 +26,6 @@ pub(crate) struct ManifestFile {
     /// stop bar and resolved against the loaded role inventory.
     #[serde(default, rename = "terminal-review")]
     pub terminal_review: Option<ManifestTerminalReview>,
-    #[serde(default)]
-    pub skills: BTreeMap<String, ManifestSkill>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,50 +42,23 @@ pub(crate) struct ManifestMissionType {
     pub image: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestSkill {
-    pub source: ManifestSkillSource,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum ManifestSkillSource {
-    Path(PathSkillSource),
-    Git(GitSkillSource),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PathSkillSource {
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct GitSkillSource {
-    pub git: String,
-    pub rev: String,
-    #[serde(default)]
-    pub subdir: PathBuf,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct MissionLockFile {
     pub version: u32,
+    #[serde(default)]
     pub skills: BTreeMap<String, LockedSkill>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct LockedSkill {
-    pub path: PathBuf,
+    pub digest: String,
     pub source: LockedSkillSource,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum LockedSkillSource {
     Path {
         path: PathBuf,
