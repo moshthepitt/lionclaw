@@ -2,8 +2,9 @@
 //! Internet) `controller.py::_validate_decisions`: a decision must target an
 //! open attention item, and the action must be legal for that item's kind
 //! (`retry` for reruns, `revise` for planning, and `accept` for explicit
-//! waivers). Invalid decisions are rejected before any event
-//! is recorded, so the fold only ever applies legal transitions.
+//! waivers), and every decision carries a nonempty reason. Invalid decisions
+//! are rejected before any event is recorded, so the fold only ever applies
+//! legal transitions.
 
 use super::event::DecisionAction;
 use super::state::{AttentionKind, MissionState};
@@ -72,7 +73,7 @@ pub enum DecisionError {
         action: DecisionAction,
         kind: AttentionKind,
     },
-    #[error("accept requires a non-empty justification")]
+    #[error("a decision requires a non-empty justification")]
     JustificationRequired,
 }
 
@@ -85,16 +86,15 @@ pub fn validate_decision(
     let Some(item) = state.open_attention.get(attention_id) else {
         return Err(DecisionError::UnknownItem(attention_id.to_string()));
     };
-    if matches!(action, DecisionAction::Accept) && justification.trim().is_empty() {
-        return Err(DecisionError::JustificationRequired);
-    }
     let legal = allowed_actions(item.kind).contains(action);
-    if legal {
-        Ok(())
-    } else {
-        Err(DecisionError::InvalidAction {
+    if !legal {
+        return Err(DecisionError::InvalidAction {
             action: action.clone(),
             kind: item.kind,
-        })
+        });
     }
+    if justification.trim().is_empty() {
+        return Err(DecisionError::JustificationRequired);
+    }
+    Ok(())
 }

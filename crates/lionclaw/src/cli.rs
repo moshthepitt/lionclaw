@@ -120,7 +120,7 @@ pub enum MissionCommand {
     Apply(ApplyArgs),
     /// Print a mission's event log.
     Log(LogArgs),
-    /// List missions parked on open attention (durable interrupts).
+    /// List missions awaiting input or blocked on cleanup.
     Inbox(InboxArgs),
     /// Inspect or propose complete plan revisions.
     #[command(subcommand)]
@@ -748,36 +748,31 @@ fn start_next_step(planning_tasks: usize, mission_id: &MissionId, repo: &Path) -
 
 async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
-    let mut parked = Vec::new();
+    let mut pending = Vec::new();
     for mission_id in store.list_missions().await? {
-        let events = store.load(&mission_id).await?;
-        let Some(state) = fold(events) else { continue };
-        if !state.open_attention.is_empty() {
-            parked.push((mission_id, state));
+        let view = load_mission_view(&store, &mission_id).await?;
+        if matches!(
+            view.disposition,
+            MissionDisposition::AwaitingPlan
+                | MissionDisposition::Parked
+                | MissionDisposition::CleanupBlocked
+        ) {
+            pending.push(view);
         }
     }
     if args.json {
-        let items: Vec<_> = parked
+        let missions: Vec<_> = pending
             .iter()
-            .map(|(id, state)| -> Result<_> {
-                Ok(serde_json::json!({
-                    "mission_id": id.as_str(),
-                    "objective": state.objective,
-                    "attention": state.open_attention.values().map(|item| {
-                        attention_json(store.blobs(), item)
-                    }).collect::<Result<Vec<_>>>()?,
-                }))
-            })
+            .map(|view| mission_view_json(view, store.blobs()))
             .collect::<Result<Vec<_>>>()?;
-        println!("{}", serde_json::json!({ "parked": items }));
-    } else if parked.is_empty() {
-        println!("inbox empty: no missions awaiting attention");
+        println!("{}", serde_json::json!({ "missions": missions }));
+    } else if pending.is_empty() {
+        println!("inbox empty: no missions awaiting input or cleanup");
     } else {
-        for (id, state) in &parked {
-            println!("{id}: {}", state.objective);
-            for item in state.open_attention.values() {
-                print_attention(store.blobs(), item, "  ")?;
-            }
+        for view in &pending {
+            print_mission_view(view, store.blobs(), false)?;
+            println!("  objective: {}", view.state.objective);
+            println!("  next: {}", view.next_actions().join(" | "));
         }
     }
     Ok(())
@@ -895,7 +890,8 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
 async fn cmd_report(args: ReportArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let state = store.require_state(&mission_id).await?;
+    let view = load_mission_view(&store, &mission_id).await?;
+    let state = &view.state;
 
     let finish = state.phase.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
@@ -954,7 +950,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         // Gated together with the summary: a config-less mission has no
         // review, whatever a hostile log writer recorded — the three review
         // fields must never contradict each other.
-        let review = review_summary(&state);
+        let review = review_summary(state);
         let (review_gaps, review_report, review_accepted_by) = if review.is_null() {
             (
                 serde_json::Value::Null,
@@ -1000,6 +996,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "base_sha": state.base_sha,
                 "current_sha": state.current_sha,
                 "finish": finish.map(|f| f.slug()),
+                "disposition": view.disposition.slug(),
+                "next_actions": view.next_actions(),
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -1016,6 +1014,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "attention": state.open_attention.values().map(|item| {
                     attention_json(store.blobs(), item)
                 }).collect::<Result<Vec<_>>>()?,
+                "cleanup_failure": cleanup_failure_json(state),
             })
         );
         return Ok(());
@@ -1051,7 +1050,18 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         ),
     }
     println!("  bar:     {:?}", state.config.stop);
-    if let Some(line) = review_line(&state) {
+    println!(
+        "  state:   {} ({})",
+        phase_slug(&state.phase),
+        view.disposition.slug()
+    );
+    if let Some(failure) = &state.cleanup_failure {
+        println!(
+            "  cleanup: blocked for effect {} ({:?}): {}",
+            failure.effect_id, failure.resource, failure.failure.detail
+        );
+    }
+    if let Some(line) = review_line(state) {
         println!("  {line}");
         if let Some(a) = &state.terminal_review.accepted {
             println!(
@@ -1175,6 +1185,15 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+    if !state.open_attention.is_empty() {
+        println!("\n  attention:");
+        for item in state.open_attention.values() {
+            print_attention(store.blobs(), item, "    ")?;
+        }
+    }
+    if !matches!(view.disposition, MissionDisposition::Terminal) {
+        println!("\n  next: {}", view.next_actions().join(" | "));
     }
     if args.patch && state.current_sha != state.base_sha {
         let diff = workspace::diff(&repo, &state.base_sha, &state.current_sha).await?;
@@ -1711,16 +1730,24 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "attention": state.open_attention.values().map(|item| {
             attention_json(blobs, item)
         }).collect::<Result<Vec<_>>>()?,
-        "cleanup_failure": state.cleanup_failure.as_ref().map(|failure| {
+        "cleanup_failure": cleanup_failure_json(state),
+        "terminal_review": review_summary(state),
+    }))
+}
+
+fn cleanup_failure_json(state: &crate::model::MissionState) -> serde_json::Value {
+    state
+        .cleanup_failure
+        .as_ref()
+        .map(|failure| {
             serde_json::json!({
                 "effect_id": failure.effect_id.as_str(),
                 "resource": failure.resource,
                 "kind": failure.failure.kind,
                 "detail": failure.failure.detail,
             })
-        }),
-        "terminal_review": review_summary(state),
-    }))
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn attention_json(
@@ -2201,6 +2228,24 @@ mod tests {
         assert_eq!(json["evidence"]["stdout"], "ordinary output");
         assert_eq!(json["evidence"]["stderr"], "the actual diagnostic");
         assert_eq!(json["actions"][1], "repair");
+    }
+
+    #[test]
+    fn mission_view_json_carries_one_disposition_and_action_projection() {
+        let state = review_state(vec![oracle_completed(1)]);
+        let view = MissionView {
+            state,
+            disposition: MissionDisposition::Parked,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path().join("blobs"));
+        let json = mission_view_json(&view, &blobs).unwrap();
+
+        assert_eq!(json["phase"], "attention_needed");
+        assert_eq!(json["disposition"], "parked");
+        assert_eq!(json["next_actions"], serde_json::json!(["mission decide"]));
+        assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
+        assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
     }
 
     #[test]

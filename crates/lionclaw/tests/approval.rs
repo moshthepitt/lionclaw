@@ -58,6 +58,19 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
     assert_eq!(attention.len(), 1);
     assert_eq!(attention[0].id, "plan_proposal:mission");
 
+    // The model contract rejects an empty reason even when the action itself
+    // is legal; callers cannot bypass the CLI's required flag.
+    assert!(engine
+        .decide(
+            &mission_id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "  ",
+            "test"
+        )
+        .await
+        .is_err());
+
     // An invalid decision (retry on the approve item) is refused.
     assert!(engine
         .decide(

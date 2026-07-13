@@ -43,18 +43,15 @@ mod tests {
 
     use super::*;
 
-    fn is_held(path: &Path) -> bool {
-        DriverGuard::try_acquire(path).unwrap().is_none()
-    }
-
     #[test]
     fn lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("driver.lock");
         let first = DriverGuard::try_acquire(&path).unwrap().unwrap();
-        assert!(is_held(&path));
+        assert!(DriverGuard::try_acquire(&path).unwrap().is_none());
         drop(first);
-        assert!(!is_held(&path));
+        let second = DriverGuard::try_acquire(&path).unwrap();
+        assert!(second.is_some());
     }
 
     #[test]
@@ -100,7 +97,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.is_file(), "child did not acquire the lock");
-        assert!(is_held(&path));
+        assert!(DriverGuard::try_acquire(&path).unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(DriverGuard::try_acquire(&path).unwrap().is_some());
