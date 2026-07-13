@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
 use crate::engine::{AdvanceOutcome, Engine};
 use crate::mission_type::{
-    add_skill, bundled_mission_types_dir, install_mission_type, load_mission_type,
-    materialize_mission_type, remove_skill, Home, MissionType, MissionTypeLocator, SkillSource,
+    add_skill, install_mission_type, load_mission_type, materialize_mission_type, remove_skill,
+    BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
     fold, short_hex, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId,
@@ -54,6 +54,8 @@ pub enum Command {
     /// Mission engine commands.
     #[command(subcommand)]
     Mission(MissionCommand),
+    /// Render the lionclaw(1) manual page to stdout.
+    Man,
 }
 
 #[derive(Args)]
@@ -347,6 +349,10 @@ pub async fn run(cli: Cli) -> Result<std::process::ExitCode> {
         Command::Doctor => cmd_doctor().await,
         Command::Skill(cmd) => cmd_skill(cmd).await.map(|()| ExitCode::SUCCESS),
         Command::Mission(cmd) => run_mission(cmd).await,
+        Command::Man => {
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -1343,10 +1349,14 @@ async fn cmd_log(args: LogArgs) -> Result<()> {
 
 async fn cmd_install(args: InstallArgs) -> Result<()> {
     let home = Home::from_env()?;
-    let sources = if args.mission_types.is_empty() {
-        mission_type_directories(&bundled_mission_types_dir()?)?
+    let bundled = if args.mission_types.is_empty() {
+        Some(BundledMissionTypes::materialize()?)
     } else {
-        args.mission_types
+        None
+    };
+    let sources = match &bundled {
+        Some(bundle) => mission_type_directories(bundle.root())?,
+        None => args.mission_types,
     };
     let dest_dir = home.mission_types_dir();
     std::fs::create_dir_all(&dest_dir)
@@ -2143,6 +2153,7 @@ mod tests {
             "---\noutput: produces-artifact\n---\nWork.\n",
         )
         .unwrap();
+        std::fs::write(source.join("playbook.md"), "# Snapshot test\n").unwrap();
         let id = mid();
         create_mission_dir(&store, &id).unwrap();
         let snapshotted =

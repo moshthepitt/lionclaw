@@ -434,6 +434,7 @@ mod tests {
             format!("---\noutput: produces-artifact\n{skills}---\nWork.\n"),
         )
         .unwrap();
+        std::fs::write(root.join("playbook.md"), "# Skill test\n").unwrap();
     }
 
     fn write_skill(root: &Path, name: &str, body: &str) {

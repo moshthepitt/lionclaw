@@ -184,6 +184,7 @@ mod tests {
             "---\noutput: produces-artifact\n---\nDo it.\n",
         )
         .unwrap();
+        std::fs::write(source.join("playbook.md"), "# Install test\n").unwrap();
         let installed = temp.path().join("mission-types");
         install_mission_type(&source, &installed, false, &AuthorityCeiling::default()).unwrap();
 

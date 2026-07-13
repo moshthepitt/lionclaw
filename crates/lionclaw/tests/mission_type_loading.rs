@@ -78,6 +78,7 @@ fn role_declaring_a_bundled_skill_loads_the_resolved_package() {
         "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();
     let mission_type =
         load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("mission type loads");
     let role = mission_type.roles.values().next().expect("worker role");
@@ -102,6 +103,7 @@ fn manifest_skill_declarations_are_rejected() {
         "---\noutput: produces-artifact\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "# Planning\n").unwrap();
 
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(matches!(err, MissionTypeError::Manifest(_)));
@@ -287,6 +289,7 @@ fn a_planning_dag_naming_an_execution_role_fails_to_load() {
         "---\noutput: produces-artifact\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "# Planning\n").unwrap();
     let err = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect_err("must refuse");
     assert!(
         matches!(&err, MissionTypeError::Manifest(detail) if detail.contains("planning")),
@@ -318,6 +321,7 @@ fn write_valid_type(root: &std::path::Path) {
         "---\noutput: produces-artifact\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(root.join("playbook.md"), "# Guarded\n").unwrap();
     write_oracle(
         &root.join("oracles/cargo-test"),
         "#!/bin/sh\nexit 0\n",
@@ -514,6 +518,7 @@ fn skill_description_is_loaded_and_trimmed_into_the_package() {
         "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();
     let mission_type = load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("loads");
     let pkg = mission_type.skills.get("rust").expect("rust package");
     // Leading and trailing whitespace trimmed, inner spacing preserved.
@@ -536,6 +541,7 @@ fn load_skill_with_description(
         "---\noutput: produces-artifact\nskills: [rust]\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("playbook.md"), "# Skilled\n").unwrap();
     let description = description_line
         .map(|value| format!("description: {value}\n"))
         .unwrap_or_default();

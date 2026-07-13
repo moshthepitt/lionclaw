@@ -115,7 +115,12 @@ pub fn load_mission_type(
         }
     };
 
-    let playbook = read(&root.join("playbook.md")).ok();
+    let playbook = read(&root.join("playbook.md"))?;
+    if playbook.trim().is_empty() {
+        return Err(MissionTypeError::Manifest(
+            "playbook.md must not be empty".to_string(),
+        ));
+    }
     let digest = compute_digest(root, &skills)?;
 
     let mission_type = MissionType {
@@ -125,7 +130,7 @@ pub fn load_mission_type(
         image: manifest.mission_type.image,
         planning: manifest.planning,
         terminal_review,
-        playbook,
+        playbook: Some(playbook),
         roles,
         skills,
         oracles,
