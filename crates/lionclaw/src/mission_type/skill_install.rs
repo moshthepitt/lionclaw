@@ -141,22 +141,19 @@ fn edit_skill_package(
         .canonicalize()
         .with_context(|| format!("resolving mission type '{}'", mission_root.display()))?;
     let skills_root = mission_root.join("skills");
-    match std::fs::symlink_metadata(&skills_root) {
+    let had_skills_root = match std::fs::symlink_metadata(&skills_root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             bail!(
                 "'{}' must be a directory, not a symlink",
                 skills_root.display()
             )
         }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&skills_root)
-                .with_context(|| format!("creating '{}'", skills_root.display()))?;
-        }
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(err) => {
             return Err(err).with_context(|| format!("statting '{}'", skills_root.display()))
         }
-    }
+    };
 
     let transaction = tempfile::Builder::new()
         .prefix(".lionclaw-skill@")
@@ -183,7 +180,13 @@ fn edit_skill_package(
     let had_package = destination.exists();
     let had_lock = lock_path.exists();
 
+    let mut created_skills_root = false;
     let publish = (|| -> Result<()> {
+        if !had_skills_root {
+            std::fs::create_dir(&skills_root)
+                .with_context(|| format!("creating '{}'", skills_root.display()))?;
+            created_skills_root = true;
+        }
         if had_package {
             std::fs::rename(&destination, &previous_package)
                 .context("backing up existing skill package")?;
@@ -210,6 +213,7 @@ fn edit_skill_package(
             &lock_path,
             &previous_lock,
             had_lock,
+            created_skills_root.then_some(skills_root.as_path()),
         );
         return match rollback {
             Ok(()) => Err(err),
@@ -241,6 +245,7 @@ fn rollback_skill_edit(
     lock_path: &Path,
     previous_lock: &Path,
     had_lock: bool,
+    created_skills_root: Option<&Path>,
 ) -> Result<()> {
     if destination.exists() {
         std::fs::remove_dir_all(destination).context("removing failed skill package")?;
@@ -253,6 +258,9 @@ fn rollback_skill_edit(
     }
     if had_lock && previous_lock.exists() {
         std::fs::rename(previous_lock, lock_path).context("restoring mission lock")?;
+    }
+    if let Some(skills_root) = created_skills_root.filter(|root| root.exists()) {
+        std::fs::remove_dir(skills_root).context("removing empty skills directory")?;
     }
     Ok(())
 }
@@ -503,6 +511,32 @@ mod tests {
         assert!(added.changed);
         load_mission_type(&mission, &AuthorityCeiling::default())
             .expect("the repaired bundle should be valid");
+    }
+
+    #[tokio::test]
+    async fn failed_add_leaves_a_bundle_without_a_skills_directory_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission = temp.path().join("mission");
+        let source = temp.path().join("source");
+        write_mission(&mission, None);
+        std::fs::write(
+            mission.join("roles/worker.md"),
+            "---\noutput: not-an-output\n---\nWork.\n",
+        )
+        .unwrap();
+        write_skill(&source, "research", "Research carefully.");
+
+        add_skill(
+            &mission,
+            SkillSource::Path(source),
+            false,
+            &AuthorityCeiling::default(),
+        )
+        .await
+        .expect_err("an unrelated invalid role must reject the edited bundle");
+
+        assert!(!mission.join("skills").exists());
+        assert!(!mission.join(MISSION_LOCK_FILE).exists());
     }
 
     #[tokio::test]
