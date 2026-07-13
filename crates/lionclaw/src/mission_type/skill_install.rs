@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::authority::AuthorityCeiling;
 
-use super::install::copy_tree_strict;
+use super::install::{copy_tree_strict, validate_closed_tree};
 use super::load_mission_type;
 use super::manifest::{LockedSkill, LockedSkillSource, MissionLockFile, MISSION_LOCK_FILE};
 use super::skills::{load_lock, validate_skill_package, ValidatedSkillPackage};
@@ -39,8 +39,12 @@ pub async fn add_skill(
     force: bool,
     ceiling: &AuthorityCeiling,
 ) -> Result<SkillChange> {
-    load_mission_type(mission_root, ceiling)
-        .with_context(|| format!("mission type at '{}' is invalid", mission_root.display()))?;
+    validate_closed_tree(mission_root).with_context(|| {
+        format!(
+            "mission type at '{}' is not a closed directory tree",
+            mission_root.display()
+        )
+    })?;
     let resolved = resolve_skill(source).await?;
     let source_package = validate_skill_package(&resolved.package).with_context(|| {
         format!(
@@ -66,6 +70,9 @@ pub async fn add_skill(
         if existing.digest == source_package.digest
             && lock.skills.get(&source_package.name) == Some(&receipt)
         {
+            load_mission_type(mission_root, ceiling).with_context(|| {
+                format!("mission type at '{}' is invalid", mission_root.display())
+            })?;
             return Ok(SkillChange {
                 name: source_package.name,
                 digest: source_package.digest,
@@ -474,6 +481,28 @@ mod tests {
         assert!(!mission.join("skills/research").exists());
         assert!(!mission.join(MISSION_LOCK_FILE).exists());
         load_mission_type(&mission, &AuthorityCeiling::default()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_repairs_a_missing_assigned_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission = temp.path().join("mission");
+        let source = temp.path().join("source");
+        write_mission(&mission, Some("research"));
+        write_skill(&source, "research", "Research carefully.");
+
+        let added = add_skill(
+            &mission,
+            SkillSource::Path(source),
+            false,
+            &AuthorityCeiling::default(),
+        )
+        .await
+        .expect("adding the missing package should repair the bundle");
+
+        assert!(added.changed);
+        load_mission_type(&mission, &AuthorityCeiling::default())
+            .expect("the repaired bundle should be valid");
     }
 
     #[tokio::test]
