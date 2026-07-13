@@ -368,7 +368,7 @@ fn seed_assertion(contract: &mut BTreeMap<AssertionId, AssertionState>, assertio
 /// cleared evaluates its upstream validators (AND semantics). A cleared gate
 /// still raises a checkpoint (zenith's discipline — a human confirms before
 /// the mission proceeds past it); a failed gate raises `gate_failed`. Both
-/// pause the mission until a human decision (`decide … continue`) resolves them.
+/// pause the mission until a human decision resolves them.
 fn derive_gates(state: &mut MissionState) {
     let Some(plan) = state.plan.clone() else {
         return;
@@ -1318,10 +1318,10 @@ mod tests {
             .contains_key("oracle_verdict_failed:cargo-test"));
     }
 
-    // Regression (review): Continue on a GateFailed must let downstream
+    // Regression (review): accepting a GateFailed must let downstream
     // proceed, not wedge the mission in Running forever.
     #[test]
-    fn continue_on_failed_gate_unblocks_downstream() {
+    fn accept_on_failed_gate_unblocks_downstream() {
         let base = vec![
             created(),
             plan_submitted(
@@ -1370,10 +1370,10 @@ mod tests {
         );
     }
 
-    // Regression (review): Continue on an OracleFailed waives the obligation
+    // Regression (review): accepting an OracleFailed waives the obligation
     // so the mission can finish (unverified) instead of looping forever.
     #[test]
-    fn continue_on_oracle_failure_waives_and_finishes() {
+    fn accept_on_oracle_failure_waives_and_finishes() {
         use super::super::verdict::FinishClass;
         let base = vec![
             created(),
@@ -2423,17 +2423,30 @@ mod tests {
         failed_events.push(review_failed("kr", "h1", "boom"));
         let failed_state = fold_log(failed_events).expect("state");
 
-        for (state, item) in [
-            (&gaps_state, "terminal_review_gaps:mission"),
-            (&failed_state, "terminal_review_failed:mission"),
+        for (state, item, allowed) in [
+            (
+                &gaps_state,
+                "terminal_review_gaps:mission",
+                &[
+                    DecisionAction::Retry,
+                    DecisionAction::Revise,
+                    DecisionAction::Accept,
+                    DecisionAction::Abort,
+                ][..],
+            ),
+            (
+                &failed_state,
+                "terminal_review_failed:mission",
+                &[
+                    DecisionAction::Retry,
+                    DecisionAction::Accept,
+                    DecisionAction::Abort,
+                ][..],
+            ),
         ] {
-            for action in [
-                DecisionAction::Retry,
-                DecisionAction::Accept,
-                DecisionAction::Abort,
-            ] {
+            for action in allowed {
                 assert!(
-                    validate_decision(state, item, &action, "accepted").is_ok(),
+                    validate_decision(state, item, action, "accepted").is_ok(),
                     "{item} must accept {action:?}"
                 );
             }

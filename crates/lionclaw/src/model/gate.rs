@@ -156,7 +156,7 @@ mod tests {
         }
     }
 
-    /// Build a state by folding: create → submit plan → validators report
+    /// Build a state by folding: create → accept a plan → validators report
     /// the given verdicts.
     fn state_with_verdicts(
         plan: PlanSubmission,

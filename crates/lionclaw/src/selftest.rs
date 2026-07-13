@@ -885,7 +885,7 @@ async fn check_replanning() -> Result<()> {
 
 /// (6) Terminal review gates closure: a mission type declaring a closing
 /// review does not close on a blocking verdict — it parks for a human, and
-/// only an explicit `continue` (acknowledge) lets it finish, with the
+/// only an explicit `accept` (acknowledge) lets it finish, with the
 /// acknowledgment on record. Also: the loader refuses `stop = "reviewed"`
 /// without the declaration (that bar is *defined* by the review). Pure — no
 /// agent turn, no oracle run — so it always runs.

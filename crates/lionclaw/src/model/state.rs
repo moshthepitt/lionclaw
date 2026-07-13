@@ -234,9 +234,9 @@ pub enum ReviewOutcome {
     },
 }
 
-/// How a human accepted closure despite the review: `continue` on a gap park
-/// acknowledges the blocking verdict, `continue` on a failure park waives the
-/// review outright. One value, so waived-and-acknowledged is unrepresentable;
+/// How a human accepted closure despite the review: `accept` on a gap park
+/// acknowledges the blocking verdict, while `accept` on a failure park waives
+/// the review outright. One value, so waived-and-acknowledged is unrepresentable;
 /// the receipt distinguishes the kinds and cites who accepted and why.
 ///
 /// Both kinds are keyed to the head they were granted at: a later artifact

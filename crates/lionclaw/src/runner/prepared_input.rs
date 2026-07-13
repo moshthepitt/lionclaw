@@ -42,9 +42,7 @@ pub(crate) async fn prepare_inputs(
             target: format!("{INPUTS_MOUNT_TARGET}/{}", input.name),
             access: MountAccess::ReadOnly,
         });
-        prepared
-            .environment
-            .extend(input.environment.clone().into_iter());
+        prepared.environment.extend(input.environment.clone());
         prepared.refs.push(PreparedInputRef {
             name: input.name.clone(),
             digest,
