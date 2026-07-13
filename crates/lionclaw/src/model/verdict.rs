@@ -68,6 +68,10 @@ impl AuthoritativeVerdict {
         self.exit_code
     }
 
+    pub fn exit_signal(&self) -> Option<i32> {
+        self.exit_signal
+    }
+
     pub fn evidence(&self) -> (&PayloadRef, &PayloadRef) {
         (&self.stdout, &self.stderr)
     }

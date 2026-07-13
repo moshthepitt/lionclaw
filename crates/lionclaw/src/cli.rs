@@ -16,13 +16,12 @@ use crate::mission_type::{
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, AttentionKind, EventEnvelope, FinishClass, MissionConfig, MissionId,
-    MissionPhase,
+    fold, short_hex, EventEnvelope, FinishClass, MissionConfig, MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EventSink, SystemClock};
 use crate::runner::OciRoleRunner;
-use crate::store::MissionStore;
+use crate::store::{BlobStore, MissionStore};
 use crate::workspace;
 
 /// Streams committed events to stderr so a long `advance` is not silent. Stderr,
@@ -111,11 +110,6 @@ pub struct SkillRemoveArgs {
 pub enum MissionCommand {
     /// Create a mission over a target repo.
     Start(StartArgs),
-    /// Submit a plan (contract + task DAG) from a JSON file.
-    SubmitPlan(SubmitPlanArgs),
-    /// Amend a running mission's plan (add/supersede/cancel tasks, strengthen
-    /// the contract) from an ops JSON file.
-    Amend(AmendArgs),
     /// Drive a mission until it parks, finishes, or awaits input.
     Advance(AdvanceArgs),
     /// Show a mission's state (contract, phase, finish grade).
@@ -128,11 +122,9 @@ pub enum MissionCommand {
     Log(LogArgs),
     /// List missions parked on open attention (durable interrupts).
     Inbox(InboxArgs),
-    /// Approve the plan at the ratification gate.
-    Ratify(RatifyArgs),
-    /// Show the proposed contract awaiting ratification (assertion→oracle
-    /// bindings and the verified/reviewed ceiling).
-    Plan(PlanArgs),
+    /// Inspect or propose complete plan revisions.
+    #[command(subcommand)]
+    Plan(PlanCommand),
     /// Resolve an open attention item.
     Decide(DecideArgs),
     /// Inspect mission types.
@@ -142,6 +134,14 @@ pub enum MissionCommand {
     /// oracle honesty, writable-worker resume, confinement, re-planning (needs
     /// podman; model-auth-free).
     SelfTest(SelfTestArgs),
+}
+
+#[derive(Subcommand)]
+pub enum PlanCommand {
+    /// Show the current or pending plan.
+    Show(PlanShowArgs),
+    /// Propose a complete plan revision from JSON.
+    Propose(PlanProposeArgs),
 }
 
 #[derive(Subcommand)]
@@ -192,8 +192,7 @@ pub struct StartArgs {
     /// Override the mission type's confinement image for this mission.
     #[arg(long)]
     pub image: Option<String>,
-    /// Skip the ratification gate for manually submitted plans. Engine-authored
-    /// proposals still require `mission ratify`.
+    /// Automatically approve valid plan proposals.
     #[arg(long)]
     pub yes: bool,
     #[arg(long)]
@@ -210,18 +209,7 @@ pub struct InboxArgs {
 }
 
 #[derive(Args)]
-pub struct RatifyArgs {
-    /// Mission id (default: the sole live mission in this repo).
-    pub mission_id: Option<String>,
-    /// Target repo (default: the enclosing git worktree root).
-    #[arg(long)]
-    pub repo: Option<PathBuf>,
-    #[arg(long, default_value = "approved")]
-    pub justification: String,
-}
-
-#[derive(Args)]
-pub struct PlanArgs {
+pub struct PlanShowArgs {
     /// Mission id (default: the sole live mission in this repo).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
@@ -236,7 +224,7 @@ pub struct DecideArgs {
     pub mission_id: String,
     /// The attention item id (see `mission status`/`inbox`).
     pub item: String,
-    /// One of: ratify | retry | continue | abort.
+    /// One of: approve | retry | repair | revise | accept | abort.
     pub action: String,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
@@ -246,31 +234,15 @@ pub struct DecideArgs {
 }
 
 #[derive(Args)]
-pub struct SubmitPlanArgs {
+pub struct PlanProposeArgs {
     /// Mission id (default: the sole live mission in this repo).
     pub mission_id: Option<String>,
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Plan JSON file ({ "assertions": [...], "tasks": [...] }); `-` reads stdin.
-    #[arg(long)]
-    pub plan: PathBuf,
-}
-
-#[derive(Args)]
-pub struct AmendArgs {
-    /// Mission id (default: the sole live mission in this repo).
-    pub mission_id: Option<String>,
-    /// Target repo (default: the enclosing git worktree root).
-    #[arg(long)]
-    pub repo: Option<PathBuf>,
-    /// Amendment ops JSON ({ "add": [...], "supersede": [...], "cancel": [...],
-    /// "add_assertion": [...], "bind_oracle": [...] }); `-` reads stdin.
-    #[arg(long)]
-    pub ops: PathBuf,
-    /// The plan revision this amendment was authored against (see `status`).
-    #[arg(long)]
-    pub base_revision: u32,
+    /// Proposal JSON ({ "base_revision": N, "plan": {...} }); `-` reads stdin.
+    #[arg(long = "file")]
+    pub file: PathBuf,
     #[arg(long, default_value = "orchestrator")]
     pub actor: String,
     #[arg(long, default_value = "")]
@@ -385,17 +357,21 @@ impl MissionCommand {
             Self::Start(a) => a.json,
             Self::Status(a) => a.json,
             Self::Report(a) => a.json,
-            Self::Plan(a) => a.json,
+            Self::Plan(a) => a.is_json(),
             Self::Inbox(a) => a.json,
             Self::Advance(a) => a.json,
             Self::SelfTest(a) => a.json,
             Self::Type(t) => t.is_json(),
-            Self::SubmitPlan(_)
-            | Self::Amend(_)
-            | Self::Apply(_)
-            | Self::Log(_)
-            | Self::Ratify(_)
-            | Self::Decide(_) => false,
+            Self::Apply(_) | Self::Log(_) | Self::Decide(_) => false,
+        }
+    }
+}
+
+impl PlanCommand {
+    fn is_json(&self) -> bool {
+        match self {
+            Self::Show(args) => args.json,
+            Self::Propose(_) => false,
         }
     }
 }
@@ -414,16 +390,13 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
     use std::process::ExitCode;
     match cmd {
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::SubmitPlan(args) => cmd_submit_plan(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Amend(args) => cmd_amend(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Advance(args) => cmd_advance(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Log(args) => cmd_log(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Ratify(args) => cmd_ratify(args).await.map(|()| ExitCode::SUCCESS),
-        MissionCommand::Plan(args) => cmd_plan(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Plan(cmd) => cmd_plan(cmd).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Type(cmd) => cmd_type(cmd).await,
         MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
@@ -687,13 +660,14 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                 &args.objective,
                 &base_sha,
                 MissionConfig {
-                    // Default-on ratification gate; `--yes` auto-approves.
-                    ratification_gate: !args.yes,
+                    // Default-on approval gate; `--yes` auto-approves.
+                    approval_required: !args.yes,
                     // The honesty bar is the mission type's, not a hardcoded default.
                     stop: engine.mission_type().stop,
                     // The planning DAG the mission type ships (empty ⇒ awaits a
                     // manually submitted plan).
                     planning: engine.mission_type().planning.clone(),
+                    recovery: engine.mission_type().recovery.clone(),
                     // The closing review the mission type ships (None ⇒ off).
                     terminal_review: engine.mission_type().terminal_review.clone(),
                 },
@@ -764,7 +738,7 @@ fn start_next_step(planning_tasks: usize, mission_id: &MissionId, repo: &Path) -
         repo.display()
     );
     if planning_tasks == 0 {
-        format!("next: submit a plan, then run: {advance}")
+        format!("next: propose a plan with `lionclaw mission plan propose`, then run: {advance}")
     } else {
         format!("next: {advance}")
     }
@@ -783,16 +757,16 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     if args.json {
         let items: Vec<_> = parked
             .iter()
-            .map(|(id, state)| {
-                serde_json::json!({
+            .map(|(id, state)| -> Result<_> {
+                Ok(serde_json::json!({
                     "mission_id": id.as_str(),
                     "objective": state.objective,
-                    "attention": state.open_attention.values().map(|a| {
-                        serde_json::json!({ "id": a.id, "kind": a.kind.slug(), "report": a.report })
-                    }).collect::<Vec<_>>(),
-                })
+                    "attention": state.open_attention.values().map(|item| {
+                        attention_json(store.blobs(), item)
+                    }).collect::<Result<Vec<_>>>()?,
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         println!("{}", serde_json::json!({ "parked": items }));
     } else if parked.is_empty() {
         println!("inbox empty: no missions awaiting attention");
@@ -800,60 +774,40 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
         for (id, state) in &parked {
             println!("{id}: {}", state.objective);
             for item in state.open_attention.values() {
-                println!("  [{}] {}", item.id, item.report);
+                print_attention(store.blobs(), item, "  ")?;
             }
         }
     }
     Ok(())
 }
 
-async fn cmd_ratify(args: RatifyArgs) -> Result<()> {
-    let (_repo, store) = open_store(args.repo).await?;
-    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    // Resolve whichever ratification item is open — a proposed contract
-    // (RatifyProposal) or a post-amendment re-ratification (Ratify) — so the
-    // human never has to type the item id.
-    let state = store.require_state(&mission_id).await?;
-    let item = state
-        .open_attention
-        .values()
-        .find(|a| {
-            matches!(
-                a.kind,
-                AttentionKind::Ratify | AttentionKind::RatifyProposal
-            )
-        })
-        .context("nothing is awaiting ratification for this mission")?;
-    crate::engine::record_decision(
-        &store,
-        SystemClock.now_ms(),
-        &mission_id,
-        &item.id,
-        crate::model::DecisionAction::Ratify,
-        &args.justification,
-        "cli",
-    )
-    .await?;
-    println!("ratified mission {mission_id}");
-    Ok(())
+async fn cmd_plan(command: PlanCommand) -> Result<()> {
+    match command {
+        PlanCommand::Show(args) => cmd_plan_show(args).await,
+        PlanCommand::Propose(args) => cmd_plan_propose(args).await,
+    }
 }
 
-async fn cmd_plan(args: PlanArgs) -> Result<()> {
+async fn cmd_plan_show(args: PlanShowArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store.require_state(&mission_id).await?;
-    let Some(proposal) = &state.proposal else {
-        bail!("no proposal is awaiting ratification for mission {mission_id}");
+    let (plan, pending, base_revision) = if let Some(proposal) = &state.proposal {
+        (&proposal.plan, true, proposal.base_revision)
+    } else if let Some(plan) = &state.plan {
+        (plan, false, state.revision)
+    } else {
+        bail!("mission {mission_id} has no current or pending plan");
     };
     // The verified/reviewed ceiling: a plan is verified-possible iff every
     // assertion binds an oracle.
-    let ceiling = if proposal.all_assertions_bound() {
+    let ceiling = if plan.all_assertions_bound() {
         "verified-possible"
     } else {
         "reviewed-only"
     };
     if args.json {
-        let bindings: Vec<_> = proposal
+        let bindings: Vec<_> = plan
             .assertions
             .iter()
             .map(|a| {
@@ -868,25 +822,45 @@ async fn cmd_plan(args: PlanArgs) -> Result<()> {
             "{}",
             serde_json::json!({
                 "mission_id": mission_id.as_str(),
+                "pending": pending,
+                "base_revision": base_revision,
                 "ceiling": ceiling,
+                "requirements": plan.requirements,
                 "assertions": bindings,
-                "tasks": proposal.tasks.len(),
+                "tasks": plan.tasks,
             })
         );
     } else {
-        println!("proposed contract for mission {mission_id} ({ceiling}):");
-        for a in &proposal.assertions {
+        let label = if pending { "pending" } else { "current" };
+        println!("{label} plan for mission {mission_id} ({ceiling}):");
+        for requirement in &plan.requirements {
+            println!(
+                "  {} [{:?}] {}",
+                requirement.id, requirement.kind, requirement.prose
+            );
+        }
+        for a in &plan.assertions {
             let oracle = a
                 .oracle
                 .as_ref()
-                .map_or("— no oracle (advisory)", |o| o.as_str());
-            println!("  {} → {}\n    {}", a.id, oracle, a.prose);
+                .map_or("- no oracle (advisory)", |o| o.as_str());
+            println!("  {} -> {}\n    {}", a.id, oracle, a.prose);
         }
-        println!(
-            "  ({} tasks) — ratify to seed the contract and begin work",
-            proposal.tasks.len()
-        );
+        println!("  ({} tasks)", plan.tasks.len());
     }
+    Ok(())
+}
+
+async fn cmd_plan_propose(args: PlanProposeArgs) -> Result<()> {
+    let (repo, store) = open_store(args.repo).await?;
+    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
+    let proposal = read_json_arg(&args.file)?;
+    engine
+        .propose_plan(&mission_id, proposal, &args.actor, &args.justification)
+        .await
+        .context("plan proposal rejected")?;
+    println!("plan proposed for mission {mission_id}");
     Ok(())
 }
 
@@ -935,24 +909,26 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     }
     let mut rows = Vec::new();
     for (aid, a) in &state.contract {
-        let verdict = a.last_authoritative.as_ref().map(|v| {
-            let (stdout, _stderr) = v.evidence();
-            // The excerpt is only rendered in --json; don't resolve the blob for
-            // the text receipt, which never prints it.
-            let excerpt = args
-                .json
-                .then(|| store.blobs().resolve(stdout).ok())
-                .flatten()
-                .map(|s| s.chars().take(160).collect::<String>());
-            serde_json::json!({
+        let verdict = if let Some(v) = a.last_authoritative.as_ref() {
+            let (stdout, stderr) = v.evidence();
+            let evidence = crate::model::FailureEvidence {
+                exit_code: v.exit_code(),
+                exit_signal: v.exit_signal(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            };
+            Some(serde_json::json!({
                 "oracle": v.oracle().as_str(),
                 "passed": v.passed(),
                 "exit_code": v.exit_code(),
+                "exit_signal": v.exit_signal(),
                 "judged_sha": v.judged_sha(),
                 "fresh": v.is_fresh_at(&state.current_sha),
-                "evidence_excerpt": excerpt,
-            })
-        });
+                "evidence": crate::evidence::evidence_json(store.blobs(), &evidence)?,
+            }))
+        } else {
+            None
+        };
         rows.push(ReportRow {
             id: aid.as_str().to_string(),
             oracle: a.oracle.as_ref().map(|o| o.as_str().to_string()),
@@ -1034,6 +1010,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "terminal_review_gaps": review_gaps,
                 "terminal_review_report": review_report,
                 "terminal_review_accepted_by": review_accepted_by,
+                "attention": state.open_attention.values().map(|item| {
+                    attention_json(store.blobs(), item)
+                }).collect::<Result<Vec<_>>>()?,
             })
         );
         return Ok(());
@@ -1138,6 +1117,22 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                         " [STALE — not at the final commit]"
                     },
                 );
+                if !passed {
+                    let assertion = state.contract.get(
+                        &crate::model::AssertionId::new(id).expect("stored assertion id")
+                    ).expect("stored assertion");
+                    let verdict = assertion.last_authoritative.as_ref().expect("report verdict");
+                    let (stdout, stderr) = verdict.evidence();
+                    let evidence = crate::model::FailureEvidence {
+                        exit_code: verdict.exit_code(),
+                        exit_signal: verdict.exit_signal(),
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                    };
+                    for line in crate::evidence::render_evidence(store.blobs(), &evidence)?.lines() {
+                        println!("      {line}");
+                    }
+                }
             }
             None if row.waived => println!(
                 "    {id}: WAIVED — its oracle failed to run and a human accepted closing without it"
@@ -1177,11 +1172,13 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = MissionId::parse(&args.mission_id)?;
     let action = match args.action.as_str() {
-        "ratify" => crate::model::DecisionAction::Ratify,
+        "approve" => crate::model::DecisionAction::Approve,
         "retry" => crate::model::DecisionAction::Retry,
-        "continue" => crate::model::DecisionAction::Continue,
+        "repair" => crate::model::DecisionAction::Repair,
+        "revise" => crate::model::DecisionAction::Revise,
+        "accept" => crate::model::DecisionAction::Accept,
         "abort" => crate::model::DecisionAction::Abort,
-        other => bail!("unknown action '{other}' (ratify|retry|continue|abort)"),
+        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
     };
     crate::engine::record_decision(
         &store,
@@ -1200,38 +1197,6 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_submit_plan(args: SubmitPlanArgs) -> Result<()> {
-    let (repo, store) = open_store(args.repo).await?;
-    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
-    let submission = read_json_arg(&args.plan)?;
-    engine
-        .submit_plan(&mission_id, submission)
-        .await
-        .context("plan rejected")?;
-    println!("plan accepted for mission {mission_id}");
-    Ok(())
-}
-
-async fn cmd_amend(args: AmendArgs) -> Result<()> {
-    let (repo, store) = open_store(args.repo).await?;
-    let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
-    let ops = read_json_arg(&args.ops)?;
-    engine
-        .amend_plan(
-            &mission_id,
-            ops,
-            &args.actor,
-            &args.justification,
-            args.base_revision,
-        )
-        .await
-        .context("amendment rejected")?;
-    println!("amendment accepted for mission {mission_id}");
-    Ok(())
-}
-
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
@@ -1241,7 +1206,13 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let outcome = engine.advance(&mission_id).await?;
     let state = engine.load_state(&mission_id).await?;
-    print_advance_outcome(mission_id.as_str(), &state, &outcome, args.json);
+    print_advance_outcome(
+        mission_id.as_str(),
+        &state,
+        &outcome,
+        engine.store().blobs(),
+        args.json,
+    )?;
     // Closing over acknowledged review gaps (or a waived review) was an
     // explicit, justified human decision — exit SUCCESS, but say so. The
     // summary already applies the freshness law, so a stale verdict from a
@@ -1292,25 +1263,9 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store.require_state(&mission_id).await?;
     if args.json {
-        let finish = state.phase.finish().map(|f| f.slug());
         println!(
             "{}",
-            serde_json::json!({
-                "mission_id": mission_id.as_str(),
-                "phase": phase_slug(&state.phase),
-                "finish": finish,
-                "revision": state.revision,
-                "current_sha": state.current_sha,
-                "objective": state.objective,
-                "contract": state.contract.iter().map(|(id, a)| {
-                    serde_json::json!({
-                        "id": id.as_str(),
-                        "advisory": a.advisory.slug(),
-                        "authoritative_pass": a.last_authoritative.as_ref().map(|v| v.passed()),
-                    })
-                }).collect::<Vec<_>>(),
-                "terminal_review": review_summary(&state),
-            })
+            mission_view_json(mission_id.as_str(), &state, store.blobs(), None)?
         );
     } else {
         println!(
@@ -1329,6 +1284,9 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 .map(|v| if v.passed() { "pass" } else { "fail" })
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
+        }
+        for item in state.open_attention.values() {
+            print_attention(store.blobs(), item, "  ")?;
         }
     }
     Ok(())
@@ -1646,20 +1604,13 @@ fn print_advance_outcome(
     mission_id: &str,
     state: &crate::model::MissionState,
     outcome: &AdvanceOutcome,
+    blobs: &BlobStore,
     json: bool,
-) {
-    let phase = &state.phase;
-    let finish = phase.finish().map(|f| f.slug());
+) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::json!({
-                "mission_id": mission_id,
-                "phase": phase_slug(phase),
-                "finish": finish,
-                "outcome": outcome.slug(),
-                "terminal_review": review_summary(state),
-            })
+            mission_view_json(mission_id, state, blobs, Some(outcome.slug()))?
         );
     } else {
         match outcome {
@@ -1670,7 +1621,7 @@ fn print_advance_outcome(
                     attention.len()
                 );
                 for item in attention {
-                    println!("  [{}] {}", item.id, item.report);
+                    print_attention(blobs, item, "  ")?;
                 }
             }
             AdvanceOutcome::Busy => {
@@ -1684,6 +1635,86 @@ fn print_advance_outcome(
             }
         }
     }
+    Ok(())
+}
+
+fn mission_view_json(
+    mission_id: &str,
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+    outcome: Option<&str>,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "mission_id": mission_id,
+        "phase": phase_slug(&state.phase),
+        "finish": state.phase.finish().map(|finish| finish.slug()),
+        "outcome": outcome,
+        "revision": state.revision,
+        "current_sha": state.current_sha,
+        "objective": state.objective,
+        "contract": state.contract.iter().map(|(id, assertion)| {
+            serde_json::json!({
+                "id": id.as_str(),
+                "advisory": assertion.advisory.slug(),
+                "authoritative_pass": assertion
+                    .last_authoritative
+                    .as_ref()
+                    .map(|verdict| verdict.passed()),
+            })
+        }).collect::<Vec<_>>(),
+        "attention": state.open_attention.values().map(|item| {
+            attention_json(blobs, item)
+        }).collect::<Result<Vec<_>>>()?,
+        "terminal_review": review_summary(state),
+    }))
+}
+
+fn attention_json(
+    blobs: &BlobStore,
+    item: &crate::model::AttentionItem,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "id": item.id,
+        "kind": item.kind.slug(),
+        "report": item.report,
+        "assertion_ids": item.assertion_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        "actions": crate::model::decision::allowed_actions(item.kind)
+            .iter()
+            .map(crate::model::DecisionAction::slug)
+            .collect::<Vec<_>>(),
+        "evidence": item.evidence.as_ref()
+            .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
+            .transpose()?,
+        "details": item.details.as_ref()
+            .map(|details| blobs.resolve(details).map(|text| crate::evidence::excerpt(&text)))
+            .transpose()?,
+    }))
+}
+
+fn print_attention(
+    blobs: &BlobStore,
+    item: &crate::model::AttentionItem,
+    indent: &str,
+) -> Result<()> {
+    println!("{indent}[{}] {}", item.id, item.report);
+    let actions = crate::model::decision::allowed_actions(item.kind)
+        .iter()
+        .map(crate::model::DecisionAction::slug)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("{indent}  actions: {actions}");
+    if let Some(evidence) = &item.evidence {
+        for line in crate::evidence::render_evidence(blobs, evidence)?.lines() {
+            println!("{indent}  {line}");
+        }
+    }
+    if let Some(details) = &item.details {
+        println!("{indent}  detailed report:");
+        for line in crate::evidence::excerpt(&blobs.resolve(details)?).lines() {
+            println!("{indent}    {line}");
+        }
+    }
+    Ok(())
 }
 
 /// The mission phase as a slug, carrying the finish grade for `Done`
@@ -1699,7 +1730,7 @@ fn phase_slug(phase: &MissionPhase) -> String {
 /// banner, `status`, `report`, and every `--json` output. `Null` when the
 /// mission declares no review.
 fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
-    use crate::model::{GapSeverity, ReviewOutcome};
+    use crate::model::{AttentionKind, GapSeverity, ReviewOutcome};
     let Some(config) = &state.config.terminal_review else {
         return serde_json::Value::Null;
     };
@@ -1709,6 +1740,12 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
     // never burns a review; an abort ends everything) — never report it as
     // still "owed".
     let done = state.phase.is_terminal();
+    let proof_failed = state.open_attention.values().any(|item| {
+        matches!(
+            item.kind,
+            AttentionKind::OracleFailed | AttentionKind::OracleVerdictFailed
+        )
+    });
     let waived = tr.waived_at(&state.current_sha);
     let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
         Some(ReviewOutcome::Verdict(v)) => {
@@ -1735,7 +1772,7 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
         }
         Some(ReviewOutcome::Failed { .. }) => ("failed", None, None, None, false),
         None if waived => ("waived", None, None, None, false),
-        None if done => ("skipped", None, None, None, false),
+        None if done || proof_failed => ("skipped", None, None, None, false),
         None => ("owed", None, None, None, false),
     };
     serde_json::json!({
@@ -1791,7 +1828,7 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
         "failed" if state.phase.is_terminal() => {
             "review: FAILED to run before the mission ended".to_string()
         }
-        "failed" => "review: FAILED to run — retry, waive (continue), or abort".to_string(),
+        "failed" => "review: FAILED to run — retry, accept, or abort".to_string(),
         "waived" => "review: WAIVED after a failure — no verdict was recorded".to_string(),
         "skipped" if matches!(state.phase, MissionPhase::Aborted { .. }) => {
             "review: none — the mission was aborted before a review settled".to_string()
@@ -1819,6 +1856,7 @@ mod tests {
             stop: StopBar::Verified,
             image: "image".to_string(),
             planning: Default::default(),
+            recovery: Default::default(),
             terminal_review: None,
             playbook: None,
             roles: BTreeMap::from([(
@@ -1945,30 +1983,37 @@ mod tests {
                 workspace_dir: "/w".into(),
                 base_sha: "base".into(),
                 config: MissionConfig {
-                    ratification_gate: false,
+                    approval_required: false,
+                    recovery: RecoveryConfig { max_attempts: 1 },
                     terminal_review: Some(TerminalReviewConfig {
                         role: RoleName::new("gap-reviewer").unwrap(),
                     }),
                     ..Default::default()
                 },
             },
-            MissionEvent::PlanSubmitted {
-                plan: PlanSubmission {
-                    assertions: vec![Assertion {
-                        id: AssertionId::new("TESTS-PASS").unwrap(),
-                        prose: "tests pass".into(),
-                        oracle: Some(OracleName::new("cargo-test").unwrap()),
-                    }],
-                    tasks: vec![Task {
-                        id: TaskId::new("fix").unwrap(),
-                        kind: TaskKind::Work,
-                        body: "fix".into(),
-                        targets: vec![AssertionId::new("TESTS-PASS").unwrap()],
-                        role: Some(RoleName::new("implementer").unwrap()),
-                        depends_on: vec![],
-                    }],
+            MissionEvent::PlanProposed {
+                proposal: PlanProposal {
+                    base_revision: 0,
+                    plan: PlanSubmission {
+                        requirements: vec![],
+                        assertions: vec![Assertion {
+                            id: AssertionId::new("TESTS-PASS").unwrap(),
+                            prose: "tests pass".into(),
+                            oracle: Some(OracleName::new("cargo-test").unwrap()),
+                        }],
+                        tasks: vec![Task {
+                            id: TaskId::new("fix").unwrap(),
+                            kind: TaskKind::Work,
+                            body: "fix".into(),
+                            targets: vec![AssertionId::new("TESTS-PASS").unwrap()],
+                            role: Some(RoleName::new("implementer").unwrap()),
+                            depends_on: vec![],
+                        }],
+                    },
                 },
                 plan_hash: "h".into(),
+                actor: "test".into(),
+                justification: "initial".into(),
             },
             MissionEvent::RoleRunCompleted {
                 task_id: TaskId::new("fix").unwrap(),
@@ -2019,17 +2064,45 @@ mod tests {
 
     #[test]
     fn a_below_bar_close_reports_the_review_as_skipped_not_owed() {
-        // Regression (QA round 2): a fresh oracle FAIL closes below the bar
+        // A fresh oracle FAIL parks below the bar for repair, while the closing
         // and the engine deliberately never dispatches the reviewer — the
-        // receipt must never say a review is still "owed" on a finished
-        // mission.
+        // review remains deliberately skipped rather than "owed".
         let state = review_state(vec![oracle_completed(1)]);
-        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+        assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
         let summary = review_summary(&state);
         assert_eq!(summary["verdict"], serde_json::json!("skipped"));
         let line = review_line(&state).expect("line");
         assert!(line.contains("skipped"), "got: {line}");
         assert!(!line.contains("not yet judged"), "got: {line}");
+    }
+
+    #[test]
+    fn attention_json_keeps_labelled_stderr_failure_evidence() {
+        use crate::model::{AssertionId, MissionEvent, OracleName, PayloadRef};
+
+        let state = review_state(vec![MissionEvent::OracleRunCompleted {
+            assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
+            oracle: OracleName::new("cargo-test").unwrap(),
+            judged_sha: "h1".into(),
+            attempt_no: 1,
+            idempotency_key: "ko".into(),
+            exit_code: 1,
+            exit_signal: None,
+            stdout: PayloadRef::inline("ordinary output"),
+            stderr: PayloadRef::inline("the actual diagnostic"),
+            duration_ms: 1,
+        }]);
+        let item = state
+            .open_attention
+            .get("oracle_verdict_failed:cargo-test")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path().join("blobs"));
+        let json = attention_json(&blobs, item).unwrap();
+
+        assert_eq!(json["evidence"]["stdout"], "ordinary output");
+        assert_eq!(json["evidence"]["stderr"], "the actual diagnostic");
+        assert_eq!(json["actions"][1], "repair");
     }
 
     #[test]
@@ -2133,7 +2206,7 @@ mod tests {
         );
         assert_eq!(
             start_next_step(0, &mid(), repo),
-            "next: submit a plan, then run: lionclaw mission advance mabc123def456 --repo /tmp/repo"
+            "next: propose a plan with `lionclaw mission plan propose`, then run: lionclaw mission advance mabc123def456 --repo /tmp/repo"
         );
     }
 

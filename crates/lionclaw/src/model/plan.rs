@@ -7,7 +7,38 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{AssertionId, OracleName, RoleName, TaskId};
+use super::ids::{AssertionId, OracleName, RequirementId, RoleName, TaskId};
+
+/// What part of the objective a requirement captures. This is descriptive
+/// contract structure for people and planning roles; enforcement remains in
+/// assertions and authoritative oracles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementKind {
+    Capability,
+    Constraint,
+    Preservation,
+    Validation,
+}
+
+/// How a plan accounts for one objective requirement. Every requirement is
+/// either covered by falsifiable assertions or called out as an explicit
+/// limitation; silent omission is not representable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequirementDisposition {
+    Covered { assertion_ids: Vec<AssertionId> },
+    Limitation { rationale: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirement {
+    pub id: RequirementId,
+    pub kind: RequirementKind,
+    pub prose: String,
+    pub disposition: RequirementDisposition,
+}
 
 /// How the drive loop consumes a role's handoff. The single closed axis the
 /// engine routes on — names never enter enforcement or routing.
@@ -107,6 +138,7 @@ pub struct Task {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanSubmission {
+    pub requirements: Vec<Requirement>,
     pub assertions: Vec<Assertion>,
     pub tasks: Vec<Task>,
 }
@@ -120,6 +152,16 @@ impl PlanSubmission {
     pub fn all_assertions_bound(&self) -> bool {
         self.assertions.iter().all(|a| a.oracle.is_some())
     }
+}
+
+/// A complete candidate plan authored against one accepted plan revision.
+/// Initial plans use `base_revision = 0`; every later proposal contains the
+/// whole next plan rather than a second language of patch operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProposal {
+    pub base_revision: u32,
+    pub plan: PlanSubmission,
 }
 
 /// A node in the contract-free planning DAG. Unlike a `Task` it has no `kind`

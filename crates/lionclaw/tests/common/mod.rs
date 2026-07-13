@@ -13,7 +13,8 @@ use std::sync::Arc;
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition};
 use lionclaw::model::{
-    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, PlanSubmission, RoleName,
+    Assertion, AssertionId, MissionConfig, OracleName, OutputSemantics, PlanProposal,
+    PlanSubmission, Requirement, RequirementDisposition, RequirementId, RequirementKind, RoleName,
     StopBar, Task, TaskKind,
 };
 use lionclaw::store::MissionStore;
@@ -37,6 +38,7 @@ pub fn test_mission_type() -> MissionType {
         stop: StopBar::Reviewed,
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
+        recovery: Default::default(),
         terminal_review: Some(lionclaw::model::TerminalReviewConfig {
             role: RoleName::new("reviewer").expect("role name"),
         }),
@@ -101,6 +103,7 @@ pub fn review_mission_type() -> MissionType {
 /// assertion — advisory-only, so it can never verify.
 pub fn advisory_plan() -> PlanSubmission {
     PlanSubmission {
+        requirements: vec![covered_requirement("READABLE-CODE", "STYLE-OK")],
         assertions: vec![Assertion {
             id: AssertionId::new("STYLE-OK").expect("assertion id"),
             prose: "the code reads cleanly".to_string(),
@@ -129,6 +132,7 @@ pub fn advisory_plan() -> PlanSubmission {
 
 pub fn simple_plan() -> PlanSubmission {
     PlanSubmission {
+        requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
         assertions: vec![Assertion {
             id: AssertionId::new("TESTS-PASS").expect("assertion id"),
             prose: "cargo test exits 0".to_string(),
@@ -142,6 +146,24 @@ pub fn simple_plan() -> PlanSubmission {
             role: Some(RoleName::new("implementer").expect("role name")),
             depends_on: Vec::new(),
         }],
+    }
+}
+
+pub fn covered_requirement(id: &str, assertion: &str) -> Requirement {
+    Requirement {
+        id: RequirementId::new(id).expect("requirement id"),
+        kind: RequirementKind::Capability,
+        prose: id.to_ascii_lowercase().replace('-', " "),
+        disposition: RequirementDisposition::Covered {
+            assertion_ids: vec![AssertionId::new(assertion).expect("assertion id")],
+        },
+    }
+}
+
+pub fn proposal(base_revision: u32, plan: PlanSubmission) -> PlanProposal {
+    PlanProposal {
+        base_revision,
+        plan,
     }
 }
 
@@ -199,7 +221,7 @@ pub async fn harness_with_type(
 
 pub fn default_config() -> MissionConfig {
     MissionConfig {
-        ratification_gate: false,
+        approval_required: false,
         ..Default::default()
     }
 }
@@ -207,7 +229,7 @@ pub fn default_config() -> MissionConfig {
 /// `default_config` plus the closing review (matches `review_mission_type`).
 pub fn review_config() -> MissionConfig {
     MissionConfig {
-        ratification_gate: false,
+        approval_required: false,
         terminal_review: Some(lionclaw::model::TerminalReviewConfig {
             role: RoleName::new("gap-reviewer").expect("role name"),
         }),

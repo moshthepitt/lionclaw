@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
+use common::{default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::AdvanceOutcome;
 use lionclaw::model::{FinishClass, MissionPhase, TaskStatus};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -28,7 +28,12 @@ async fn passing_oracle_yields_verified_finish() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
@@ -80,7 +85,12 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
 
@@ -121,19 +131,22 @@ async fn failing_oracle_never_reports_verified() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
-    let AdvanceOutcome::Terminal { phase } = outcome else {
-        panic!("expected terminal, got {outcome:?}");
+    let AdvanceOutcome::Parked { attention } = outcome else {
+        panic!("expected repair park, got {outcome:?}");
     };
-    assert_eq!(
-        phase,
-        MissionPhase::Done {
-            finish: FinishClass::Unverified
-        }
-    );
+    assert_eq!(attention.len(), 1);
+    assert_eq!(attention[0].id, "oracle_verdict_failed:cargo-test");
+    assert_eq!(attention[0].assertion_ids[0].as_str(), "TESTS-PASS");
+    assert_eq!(attention[0].evidence.as_ref().unwrap().exit_code, 1);
     let state = h.engine.load_state(&mission_id).await.expect("state");
     let verdict = state
         .contract
@@ -177,7 +190,12 @@ async fn worker_reporting_not_done_parks_with_attention() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");

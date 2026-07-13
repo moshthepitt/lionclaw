@@ -75,6 +75,8 @@ pub struct MissionType {
     /// The planning DAG (how an objective becomes a proposed contract). Empty
     /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
     pub planning: PlanningDag,
+    /// Mission-level role recovery budget.
+    pub recovery: crate::model::RecoveryConfig,
     /// The closing review (the pure-core config type, threaded verbatim into
     /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
     pub terminal_review: Option<TerminalReviewConfig>,

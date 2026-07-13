@@ -87,8 +87,9 @@ fn is_runnable(
     id: &TaskId,
     deps: &[TaskId],
     status_of: &impl Fn(&TaskId) -> Option<TaskStatus>,
+    retryable: &impl Fn(&TaskId) -> bool,
 ) -> bool {
-    status_of(id) == Some(TaskStatus::Pending)
+    (status_of(id) == Some(TaskStatus::Pending) || retryable(id))
         && deps
             .iter()
             .all(|dep| status_of(dep) == Some(TaskStatus::Cleared))
@@ -97,7 +98,7 @@ fn is_runnable(
 /// The contract-free planning phase: dispatch the next runnable planning role.
 /// Planning roles are read-only, so the workspace never moves — every node is
 /// judged at `base_sha`. When nothing is runnable the mission idles (an empty
-/// planning DAG ⇒ `AwaitingPlan`; a finished author ⇒ parked on `RatifyProposal`).
+/// planning DAG ⇒ `AwaitingPlan`; a finished author parks on `PlanProposal`).
 fn step_planning(state: &MissionState) -> StepDecision {
     if !state.inflight.is_empty() {
         return StepDecision::Idle;
@@ -111,13 +112,19 @@ fn step_planning(state: &MissionState) -> StepDecision {
     {
         return StepDecision::Idle;
     }
-    let status_of = |id: &TaskId| state.planning.tasks.get(id).map(|t| t.status);
+    let status_of = |id: &TaskId| state.planning.tasks.get(id).map(|task| task.status);
+    let retryable =
+        |id: &TaskId| {
+            state.planning.tasks.get(id).is_some_and(|task| {
+                task.automatic_retry_remaining(state.config.recovery.max_attempts)
+            })
+        };
     let Some(task) = state
         .config
         .planning
         .tasks
         .iter()
-        .find(|t| is_runnable(&t.id, &t.depends_on, &status_of))
+        .find(|t| is_runnable(&t.id, &t.depends_on, &status_of, &retryable))
     else {
         return StepDecision::Idle;
     };
@@ -157,10 +164,16 @@ fn step_running(state: &MissionState) -> StepDecision {
     // (writers) go first and serialize; a runnable validator (read-only
     // judge) dispatches once no work is runnable. Gates are never
     // "runnable" — their status is fold-derived (see `derive_gates`).
-    let status_of = |id: &TaskId| state.tasks.get(id).map(|t| t.status);
+    let status_of = |id: &TaskId| state.tasks.get(id).map(|task| task.status);
+    let retryable = |id: &TaskId| {
+        state
+            .tasks
+            .get(id)
+            .is_some_and(|task| task.automatic_retry_remaining(state.config.recovery.max_attempts))
+    };
     let runnable = |kind: TaskKind| {
         plan.tasks.iter().find(move |task| {
-            task.kind == kind && is_runnable(&task.id, &task.depends_on, &status_of)
+            task.kind == kind && is_runnable(&task.id, &task.depends_on, &status_of, &retryable)
         })
     };
     if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {
@@ -221,11 +234,17 @@ fn step_running(state: &MissionState) -> StepDecision {
     // review without a fresh verdict at the current head dispatches the
     // closing reviewer. A parked failure never re-dispatches (attention parks
     // first; the guard mirrors the failed-oracle skip above).
+    let review_retryable = matches!(
+        &state.terminal_review.outcome,
+        Some(ReviewOutcome::Failed { failure })
+            if failure.automatically_retryable()
+                && state.terminal_review.attempts < state.config.recovery.max_attempts
+    );
     if terminal_review_outstanding(state)
-        && !matches!(
+        && (!matches!(
             state.terminal_review.outcome,
             Some(ReviewOutcome::Failed { .. })
-        )
+        ) || review_retryable)
     {
         let config = state
             .config
@@ -346,16 +365,26 @@ mod tests {
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
+                recovery: crate::model::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
     }
 
     fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
-        MissionEvent::PlanSubmitted {
-            plan: PlanSubmission { assertions, tasks },
+        MissionEvent::PlanProposed {
+            proposal: crate::model::PlanProposal {
+                base_revision: 0,
+                plan: PlanSubmission {
+                    requirements: vec![],
+                    assertions,
+                    tasks,
+                },
+            },
             plan_hash: "deadbeef".to_string(),
+            actor: "test".into(),
+            justification: "initial".into(),
         }
     }
 
@@ -765,8 +794,7 @@ mod tests {
     #[test]
     fn fresh_verdict_settles_the_obligation() {
         // A fresh verdict at the current head — pass or fail — settles the
-        // obligation: no re-request, the phase closes, and the step is
-        // Terminal. Retry-after-fail is a human decision, not an engine loop.
+        // obligation. Pass closes; fail parks on the repair path.
         let cases = [(0, FinishClass::Verified), (1, FinishClass::Unverified)];
         for (exit_code, finish) in cases {
             let state = fold_log(vec![
@@ -780,12 +808,22 @@ mod tests {
                 oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
                 oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", exit_code),
             ]);
+            assert_eq!(crate::model::classify_finish(&state), finish);
+            let expected = if exit_code == 0 {
+                MissionPhase::Done { finish }
+            } else {
+                MissionPhase::AttentionNeeded
+            };
+            assert_eq!(state.phase, expected, "exit {exit_code}");
             assert_eq!(
-                state.phase,
-                MissionPhase::Done { finish },
+                step(&state),
+                if exit_code == 0 {
+                    StepDecision::Terminal
+                } else {
+                    StepDecision::Park
+                },
                 "exit {exit_code}"
             );
-            assert_eq!(step(&state), StepDecision::Terminal, "exit {exit_code}");
         }
     }
 

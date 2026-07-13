@@ -12,9 +12,13 @@ image = "localhost/lionclaw-runtime-dev:v1"
 [terminal-review]
 role = "gap-reviewer"
 
+[recovery]
+max-attempts = 3
+
 # The planning DAG: an objective becomes a proposed contract via research →
 # adversarial critique → authored proposal. All read-only; the author (the
-# unique sink) emits the proposal, which a human ratifies before execution.
+# unique sink) emits the complete proposal, which mission policy approves
+# before execution.
 [[planning.tasks]]
 id = "strategist"
 role = "strategist"

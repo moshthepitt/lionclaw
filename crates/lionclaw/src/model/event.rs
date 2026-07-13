@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{Assertion, PlanSubmission, PlanningDag, Task};
+use super::plan::{PlanProposal, PlanningDag};
 
 pub const SCHEMA_VERSION: u32 = 3;
 
@@ -73,13 +73,15 @@ pub struct MissionTypeRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
-    pub ratification_gate: bool,
+    pub approval_required: bool,
     pub stop: StopBar,
     /// The mission type's planning DAG (how an objective becomes a proposed
     /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
     /// submitted plan.
     #[serde(default)]
     pub planning: PlanningDag,
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
     /// The mission type's closing review (a fresh-context judge of the final
     /// tree against the objective). `None` ⇒ feature off: every derivation
     /// short-circuits, so pre-feature event logs re-derive identically.
@@ -91,11 +93,24 @@ pub struct MissionConfig {
 impl Default for MissionConfig {
     fn default() -> Self {
         Self {
-            ratification_gate: true,
+            approval_required: true,
             stop: StopBar::Verified,
             planning: PlanningDag::default(),
+            recovery: RecoveryConfig::default(),
             terminal_review: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RecoveryConfig {
+    pub max_attempts: u32,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self { max_attempts: 3 }
     }
 }
 
@@ -152,12 +167,12 @@ pub enum Handoff {
     },
     /// The planning author's deliverable: a proposed contract + task DAG. It has
     /// **no verdict field** — a proposal is gradeless and can never mint
-    /// authority; it becomes `state.contract` only after a human ratifies it.
+    /// authority; it becomes `state.contract` only after approval.
     Plan {
         done: bool,
         report: PayloadRef,
         #[serde(default)]
-        proposal: Option<PlanSubmission>,
+        proposal: Option<PlanProposal>,
         request_attention: bool,
     },
 }
@@ -170,7 +185,7 @@ pub struct ValidationItem {
 
 /// One typed product gap from a terminal review. `severity` is the only
 /// field the engine branches on; the rest is structured evidence for the
-/// human and for remediation amendments. Strict fields (`deny_unknown_fields`,
+/// human and for remediation revisions. Strict fields (`deny_unknown_fields`,
 /// required prose) force the reviewer to decompose instead of hand-waving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -256,10 +271,12 @@ pub enum MissionEvent {
         base_sha: String,
         config: MissionConfig,
     },
-    PlanSubmitted {
-        plan: PlanSubmission,
+    PlanProposed {
+        proposal: PlanProposal,
         /// sha256 of the canonical plan JSON.
         plan_hash: String,
+        actor: String,
+        justification: String,
     },
     RoleRunRequested {
         task_id: TaskId,
@@ -318,6 +335,7 @@ pub enum MissionEvent {
         judged_sha: String,
         attempt_no: u32,
         idempotency_key: String,
+        error_kind: RunErrorKind,
         detail: String,
         synthesized: bool,
     },
@@ -381,77 +399,37 @@ pub enum MissionEvent {
         justification: String,
         actor: String,
     },
-    /// A mid-mission amendment: add / supersede / cancel tasks and *strengthen*
-    /// the contract (add assertions, bind oracles), applied atomically as one
-    /// transition between two valid plan revisions (ADRs 0003–0011). A fact
-    /// event like `DecisionRecorded` — no idempotency key, no effect-ledger
-    /// row. `base_revision` is the plan revision the amendment was authored
-    /// against; the fold no-ops the whole event if it no longer matches
-    /// (never trust the writer).
-    PlanAmended {
-        base_revision: u32,
-        ops: AmendmentOps,
-        actor: String,
-        justification: String,
-    },
-}
-
-/// The operation set of one amendment. All fields default-empty, so an
-/// amendment carries only the ops it uses. Task ops are legal on any live
-/// task; contract ops are strengthen-only (never remove/unbind/weaken).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct AmendmentOps {
-    /// New tasks, seeded `Pending`.
-    #[serde(default)]
-    pub add: Vec<Task>,
-    /// Replace a live task: `old → Superseded`, downstream `depends_on`
-    /// rewritten `old → new`. `new` must be among `add`.
-    #[serde(default)]
-    pub supersede: Vec<Supersession>,
-    /// Retire a live task without replacement: `old → Superseded`, downstream
-    /// `depends_on` drops `old`.
-    #[serde(default)]
-    pub cancel: Vec<TaskId>,
-    /// New contract assertions (must arrive with a covering work task in the
-    /// same amendment — coverage is re-validated over the whole plan).
-    #[serde(default)]
-    pub add_assertion: Vec<Assertion>,
-    /// Bind an oracle to a currently-unbound assertion (strengthening). Never
-    /// replaces or removes an existing binding.
-    #[serde(default)]
-    pub bind_oracle: Vec<OracleBinding>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Supersession {
-    pub old: TaskId,
-    pub new: TaskId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OracleBinding {
-    pub assertion: AssertionId,
-    pub oracle: OracleName,
 }
 
 /// The actions a decision can take on an open attention item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DecisionAction {
-    /// Approve the plan/contract at the ratification gate.
-    Ratify,
-    /// Re-run a failed node, re-run a rejected proposal's planning DAG, or
-    /// re-open a failed oracle (valid for `node_failed`, `ratify_proposal`,
-    /// `oracle_failed`).
+    /// Approve a proposed plan or a cleared gate checkpoint.
+    Approve,
+    /// Re-run the same failed attempt without changing the plan.
     Retry,
-    /// Accept the current situation and proceed (accept a node failure, or
-    /// confirm a cleared gate checkpoint).
-    Continue,
+    /// Reopen the work that owns a failed authoritative assertion.
+    Repair,
+    /// Re-enter the planning DAG to propose a complete next plan revision.
+    Revise,
+    /// Accept a below-bar outcome and proceed, with explicit justification.
+    Accept,
     /// Abort the mission.
     Abort,
+}
+
+impl DecisionAction {
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Retry => "retry",
+            Self::Repair => "repair",
+            Self::Revise => "revise",
+            Self::Accept => "accept",
+            Self::Abort => "abort",
+        }
+    }
 }
 
 /// Idempotency role of an event within a two-event (request/outcome) pair.
@@ -466,7 +444,7 @@ impl MissionEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::MissionCreated { .. } => "mission_created",
-            Self::PlanSubmitted { .. } => "plan_submitted",
+            Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
             Self::RoleRunCompleted { .. } => "role_run_completed",
             Self::RoleRunFailed { .. } => "role_run_failed",
@@ -478,7 +456,6 @@ impl MissionEvent {
             Self::TerminalReviewFailed { .. } => "terminal_review_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
-            Self::PlanAmended { .. } => "plan_amended",
         }
     }
 
@@ -517,10 +494,9 @@ impl MissionEvent {
             // effect-style event must decide its class here, never silently skip
             // the ledger.
             Self::MissionCreated { .. }
-            | Self::PlanSubmitted { .. }
+            | Self::PlanProposed { .. }
             | Self::MissionAborted { .. }
-            | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. } => None,
+            | Self::DecisionRecorded { .. } => None,
         }
     }
 
@@ -536,13 +512,12 @@ impl MissionEvent {
             | Self::OracleRunFailed { .. }
             | Self::TerminalReviewFailed { .. } => Some(false),
             Self::MissionCreated { .. }
-            | Self::PlanSubmitted { .. }
+            | Self::PlanProposed { .. }
             | Self::RoleRunRequested { .. }
             | Self::OracleRunRequested { .. }
             | Self::TerminalReviewRequested { .. }
             | Self::MissionAborted { .. }
-            | Self::DecisionRecorded { .. }
-            | Self::PlanAmended { .. } => None,
+            | Self::DecisionRecorded { .. } => None,
         }
     }
 }
@@ -567,7 +542,7 @@ mod compat_tests {
     #[test]
     fn pre_terminal_review_shapes_round_trip_unchanged() {
         // A MissionConfig written before the feature existed.
-        let old_config = r#"{"ratification_gate":true,"stop":"verified"}"#;
+        let old_config = r#"{"approval_required":true,"stop":"verified"}"#;
         let config: MissionConfig = serde_json::from_str(old_config).expect("old config parses");
         assert_eq!(config.terminal_review, None);
         // A config not using the feature serializes without the key.
@@ -586,5 +561,41 @@ mod compat_tests {
         // A validate serializes without terminal-review keys.
         let json = serde_json::to_string(&handoff).expect("serialize");
         assert!(!json.contains("gaps") && !json.contains("nonce"));
+    }
+
+    #[test]
+    fn plan_proposal_round_trips_strict_requirement_dispositions() {
+        use crate::model::{
+            Assertion, PlanSubmission, Requirement, RequirementDisposition, RequirementId,
+            RequirementKind,
+        };
+
+        let event = MissionEvent::PlanProposed {
+            proposal: PlanProposal {
+                base_revision: 0,
+                plan: PlanSubmission {
+                    requirements: vec![Requirement {
+                        id: RequirementId::new("OBJECTIVE-MET").unwrap(),
+                        kind: RequirementKind::Capability,
+                        prose: "the objective is met".into(),
+                        disposition: RequirementDisposition::Covered {
+                            assertion_ids: vec![AssertionId::new("VAL-OBJECTIVE").unwrap()],
+                        },
+                    }],
+                    assertions: vec![Assertion {
+                        id: AssertionId::new("VAL-OBJECTIVE").unwrap(),
+                        prose: "the objective is demonstrably met".into(),
+                        oracle: None,
+                    }],
+                    tasks: vec![],
+                },
+            },
+            plan_hash: "hash".into(),
+            actor: "author".into(),
+            justification: "initial proposal".into(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<MissionEvent>(&json).unwrap(), event);
     }
 }

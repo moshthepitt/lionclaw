@@ -10,12 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::event::{AmendmentOps, EventEnvelope, GapSeverity, Handoff, MissionEvent};
-use super::ids::{AssertionId, OracleName, TaskId};
-use super::plan::{Assertion, PlanSubmission};
+use super::event::{EventEnvelope, GapSeverity, Handoff, MissionEvent};
+use super::ids::{AssertionId, TaskId};
+use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RunFailure,
     TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
@@ -72,12 +72,14 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         planning: PlanningState {
             tasks: planning_tasks,
         },
+        planning_base_revision: (!config.planning.tasks.is_empty()).then_some(0),
+        planning_feedback: Vec::new(),
         proposal: None,
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
         open_attention: Default::default(),
-        ratified: false,
+        proposal_approved: false,
         revision: 0,
         acknowledged_gates: Default::default(),
         flagged_nodes: Default::default(),
@@ -95,15 +97,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     let seq = envelope.sequence_no;
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
-        MissionEvent::PlanSubmitted { plan, .. } => {
-            for assertion in &plan.assertions {
-                seed_assertion(&mut state.contract, assertion);
+        MissionEvent::PlanProposed { proposal, .. } => {
+            if super::plan_validation::validate_plan_transition(state, proposal).is_ok() {
+                state.proposal = Some(proposal.clone());
+                state.planning_base_revision = None;
+                state.proposal_approved = !state.config.approval_required;
             }
-            for task in &plan.tasks {
-                seed_task(&mut state.tasks, &task.id);
-            }
-            state.plan = Some(plan.clone());
-            state.revision = 1;
         }
         MissionEvent::RoleRunRequested {
             task_id,
@@ -118,6 +117,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         }
         MissionEvent::RoleRunCompleted {
             task_id,
+            attempt_no,
             idempotency_key,
             handoff,
             artifact,
@@ -127,16 +127,29 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             if let Some(artifact) = artifact {
                 state.current_sha = artifact.head_sha.clone();
             }
+            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+                task.attempts = task.attempts.max(*attempt_no);
+            }
             apply_handoff(state, task_id, handoff);
         }
         MissionEvent::RoleRunFailed {
             task_id,
+            attempt_no,
             idempotency_key,
+            error_kind,
+            detail,
+            synthesized,
             ..
         } => {
             state.inflight.remove(idempotency_key);
             if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+                task.attempts = task.attempts.max(*attempt_no);
                 task.status = TaskStatus::Failed;
+                task.last_failure = Some(RunFailure {
+                    kind: *error_kind,
+                    detail: detail.clone(),
+                    synthesized: *synthesized,
+                });
             }
         }
         MissionEvent::OracleRunRequested {
@@ -175,11 +188,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::OracleRunFailed {
             oracle,
             idempotency_key,
+            error_kind,
             detail,
+            synthesized,
             ..
         } => {
             state.inflight.remove(idempotency_key);
-            state.oracle_failures.insert(oracle.clone(), detail.clone());
+            state.oracle_failures.insert(
+                oracle.clone(),
+                RunFailure {
+                    kind: *error_kind,
+                    detail: detail.clone(),
+                    synthesized: *synthesized,
+                },
+            );
         }
         // `attempts` is the highest attempt number the log has seen — from
         // ANY review event, not just requests: the materialize fallback
@@ -210,13 +232,19 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::TerminalReviewFailed {
             attempt_no,
             idempotency_key,
+            error_kind,
             detail,
+            synthesized,
             ..
         } => {
             state.inflight.remove(idempotency_key);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             state.terminal_review.outcome = Some(ReviewOutcome::Failed {
-                detail: detail.clone(),
+                failure: RunFailure {
+                    kind: *error_kind,
+                    detail: detail.clone(),
+                    synthesized: *synthesized,
+                },
             });
         }
         MissionEvent::MissionAborted { reason, .. } => {
@@ -232,14 +260,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             apply_decision(state, attention_id, action, actor, justification);
         }
-        MissionEvent::PlanAmended {
-            base_revision, ops, ..
-        } => {
-            apply_amendment(state, *base_revision, ops);
-        }
     }
     state.head = seq;
-    // Promotion runs first: a just-ratified proposal must seed the contract
+    // Promotion runs first: a just-approved proposal must seed the contract
     // before gates/attention/phase are derived this same fold (a plan whose only
     // sink is a gate would otherwise hang one event behind).
     derive_promotion(state);
@@ -248,182 +271,52 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_phase(state);
 }
 
-/// Seed the execution contract + task DAG from a ratified *proposal* (the
-/// in-engine author flow) — the sole promotion path, guarded by
-/// `plan.is_none()`. A proposal is gradeless until here; an engine-authored one
-/// (or any, under the ratification gate) needs a human `Ratify` first. A
-/// manually submitted plan is the other way the contract is seeded — directly,
-/// via the `PlanSubmitted` arm, gated instead by the ratification attention.
+/// Promote one complete, approved proposal. Retained task ids are immutable;
+/// omitted tasks become audit tombstones and new task ids start pending.
 fn derive_promotion(state: &mut MissionState) {
-    if state.plan.is_some() || state.proposal.is_none() {
+    if state.proposal.is_none() || !state.proposal_approved {
         return;
     }
-    // Every proposal is engine-authored, so it always needs a human `Ratify`
-    // first (regardless of `--yes`/ratification_gate, which govern only the
-    // manual PlanSubmitted path).
-    if !state.ratified {
+    let proposal = state.proposal.as_ref().expect("proposal present");
+    if super::plan_validation::validate_plan_transition(state, proposal).is_err() {
         return;
     }
     let proposal = state
         .proposal
         .take()
         .expect("proposal present (checked above)");
-    for assertion in &proposal.assertions {
-        seed_assertion(&mut state.contract, assertion);
-    }
-    for task in &proposal.tasks {
-        seed_task(&mut state.tasks, &task.id);
-    }
-    state.plan = Some(proposal);
-    state.revision = 1;
-}
-
-/// Apply an amendment (ADR 0011). The fold guards the *honesty-relevant*
-/// invariants against a bad writer: the whole event no-ops unless it targets
-/// the current revision and every `bind_oracle` strengthens (never unbinds).
-/// It does NOT re-run the engine's structural validation (coverage, acyclicity,
-/// materiality) — those bound liveness, not honesty, and a structurally-broken
-/// amendment can at worst leave the mission unverifiable, never falsely
-/// Verified. Honesty needs no sealing check either: an amendment only ever
-/// *strengthens* the contract, and the oracle re-judges the real tree at the
-/// final head, so it cannot launder a verdict.
-fn apply_amendment(state: &mut MissionState, base_revision: u32, ops: &AmendmentOps) {
-    if state.plan.is_none() || base_revision != state.revision {
-        return;
-    }
-    for b in &ops.bind_oracle {
-        if !bind_strengthens(&state.contract, &b.assertion, &b.oracle) {
-            return;
-        }
-    }
-
-    // Reconcile the runtime maps: seed added tasks/assertions, tombstone
-    // retired tasks, apply oracle bindings. (Re-adding a retired id is rejected
-    // by validation, so `seed_task` never collides with a tombstone here.)
-    for task in &ops.add {
-        seed_task(&mut state.tasks, &task.id);
-    }
-    for old in ops
-        .supersede
+    let next = proposal.plan;
+    let live: BTreeSet<_> = next.tasks.iter().map(|task| &task.id).collect();
+    let retired: Vec<_> = state
+        .plan
         .iter()
-        .map(|s| &s.old)
-        .chain(ops.cancel.iter())
-    {
-        if let Some(rt) = state.tasks.get_mut(old) {
-            rt.status = TaskStatus::Superseded;
-        }
-    }
-    for assertion in &ops.add_assertion {
-        seed_assertion(&mut state.contract, assertion);
-    }
-    for b in &ops.bind_oracle {
-        if let Some(a) = state.contract.get_mut(&b.assertion) {
-            if a.oracle.is_none() {
-                a.oracle = Some(b.oracle.clone());
-            }
-        }
-    }
-
-    // Replace the plan with the resulting *live* plan (retired tasks removed,
-    // dependencies reconciled) — the same transform validation ran.
-    let old_plan = state.plan.as_ref().expect("plan present");
-    let new_plan = resulting_plan(old_plan, ops);
-    // Re-open the advisory nodes whose basis this amendment invalidated. A
-    // Validate/Gate that is transitively downstream of a retired task judged a
-    // now-discarded tree, so reset it to Pending: derive_gates re-derives a
-    // Pending gate, and step re-dispatches a Pending validator against the new
-    // head. (Work is cumulative — no rewind — so only advisory nodes stale;
-    // the oracle re-judges the real tree regardless, so Verified is untouched.)
-    let retired: BTreeSet<&TaskId> = ops
-        .supersede
-        .iter()
-        .map(|s| &s.old)
-        .chain(ops.cancel.iter())
+        .flat_map(|plan| &plan.tasks)
+        .filter(|task| !live.contains(&task.id))
+        .map(|task| task.id.clone())
         .collect();
-    if !retired.is_empty() {
-        let live: BTreeSet<&TaskId> = new_plan.tasks.iter().map(|t| &t.id).collect();
-        let to_reset: Vec<TaskId> = old_plan
-            .tasks
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t.kind,
-                    super::plan::TaskKind::Validate | super::plan::TaskKind::Gate
-                )
-            })
-            .filter(|t| live.contains(&t.id))
-            .filter(|t| depends_on_retired(old_plan, &t.id, &retired))
-            .map(|t| t.id.clone())
-            .collect();
-        for id in to_reset {
-            if let Some(rt) = state.tasks.get_mut(&id) {
-                rt.status = TaskStatus::Pending;
-            }
-            // Scrub every latch that pinned the node's stale judgment, so the
-            // re-run re-establishes them against the new tree: the gate
-            // acknowledgement, the attention flag, and the advisory verdicts it
-            // recorded. Removing a verdict also re-derives the assertion's
-            // sticky advisory from the *surviving* validators — else a re-run
-            // that now fails would leave a stale `Passed` and finish
-            // InternallyConsistent on a tree the validator just rejected. Gate
-            // ids are absent from the flag/verdict maps, so this is uniform.
-            state.acknowledged_gates.remove(&id);
-            state.flagged_nodes.remove(&id);
-            for assertion in state.contract.values_mut() {
-                if assertion.last_advisory.remove(&id).is_some() {
-                    assertion.advisory = recompute_advisory(&assertion.last_advisory);
-                }
+    for task_id in retired {
+        if let Some(task) = state.tasks.get_mut(&task_id) {
+            task.status = TaskStatus::Superseded;
+        }
+        state.acknowledged_gates.remove(&task_id);
+        state.flagged_nodes.remove(&task_id);
+        for assertion in state.contract.values_mut() {
+            if assertion.last_advisory.remove(&task_id).is_some() {
+                assertion.advisory = recompute_advisory(&assertion.last_advisory);
             }
         }
     }
-    state.plan = Some(new_plan);
+    for assertion in &next.assertions {
+        seed_assertion(&mut state.contract, assertion);
+        if let Some(existing) = state.contract.get_mut(&assertion.id) {
+            existing.oracle = assertion.oracle.clone();
+        }
+    }
+    for task in &next.tasks {
+        seed_task(&mut state.tasks, &task.id);
+    }
+    state.plan = Some(next);
     state.revision += 1;
-    // A material amendment re-opens the ratification gate for the new revision
-    // (ADR 0006); with the gate off this is a no-op.
-    if state.config.ratification_gate {
-        state.ratified = false;
-    }
-}
-
-/// The live plan after applying `ops`: add new tasks, retire superseded/
-/// cancelled tasks (removed from the live plan, downstream `depends_on`
-/// rewritten old→new for supersede / dropped for cancel), add assertions, and
-/// bind oracles (None→Some). Pure and shared by the fold and amendment
-/// validation so the two can never disagree about the resulting plan.
-pub(crate) fn resulting_plan(current: &PlanSubmission, ops: &AmendmentOps) -> PlanSubmission {
-    let mut plan = current.clone();
-    plan.tasks.extend(ops.add.iter().cloned());
-    for s in &ops.supersede {
-        plan.tasks.retain(|t| t.id != s.old);
-        for task in &mut plan.tasks {
-            for dep in &mut task.depends_on {
-                if *dep == s.old {
-                    *dep = s.new.clone();
-                }
-            }
-        }
-    }
-    for old in &ops.cancel {
-        plan.tasks.retain(|t| &t.id != old);
-        for task in &mut plan.tasks {
-            task.depends_on.retain(|dep| dep != old);
-        }
-    }
-    // A supersede old→new can duplicate a dependency (a task that depended on
-    // both). Dedup, preserving order, so the plan has no redundant edges.
-    for task in &mut plan.tasks {
-        let mut seen = BTreeSet::new();
-        task.depends_on.retain(|dep| seen.insert(dep.clone()));
-    }
-    plan.assertions.extend(ops.add_assertion.iter().cloned());
-    for b in &ops.bind_oracle {
-        if let Some(a) = plan.assertions.iter_mut().find(|a| a.id == b.assertion) {
-            if a.oracle.is_none() {
-                a.oracle = Some(b.oracle.clone());
-            }
-        }
-    }
-    plan
 }
 
 /// The sticky advisory status implied by a set of per-validator verdicts: a
@@ -440,36 +333,16 @@ fn recompute_advisory(last_advisory: &BTreeMap<TaskId, bool>) -> AdvisoryStatus 
     }
 }
 
-/// Whether `start` transitively depends (over `plan.depends_on`) on any task
-/// in `retired` — i.e. a retired task sits in its upstream closure.
-fn depends_on_retired(plan: &PlanSubmission, start: &TaskId, retired: &BTreeSet<&TaskId>) -> bool {
-    let mut stack = vec![start];
-    let mut seen = BTreeSet::new();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let Some(task) = plan.tasks.iter().find(|t| &t.id == id) else {
-            continue;
-        };
-        for dep in &task.depends_on {
-            if retired.contains(dep) {
-                return true;
-            }
-            stack.push(dep);
-        }
-    }
-    false
-}
-
 /// Seed a task's runtime as `Pending` (idempotent — keeps any existing entry).
-/// Shared by the initial submission and amendment folds.
+/// Shared by initial and revision proposal folds.
 /// A freshly-seeded task: pending, no attempts, no report.
 fn pending_task() -> TaskRuntimeState {
     TaskRuntimeState {
         status: TaskStatus::Pending,
         attempts: 0,
         last_report: None,
+        last_failure: None,
+        feedback: Vec::new(),
     }
 }
 
@@ -487,20 +360,6 @@ fn seed_assertion(contract: &mut BTreeMap<AssertionId, AssertionState>, assertio
             last_advisory: Default::default(),
             last_authoritative: None,
         });
-}
-
-/// A `bind_oracle` op strengthens (never weakens) iff the target assertion
-/// exists and is currently unbound, or re-binds the identical oracle
-/// (idempotent). Shared by the fold's defensive re-check and validation so the
-/// two can never disagree.
-pub(crate) fn bind_strengthens(
-    contract: &BTreeMap<AssertionId, AssertionState>,
-    assertion: &AssertionId,
-    oracle: &OracleName,
-) -> bool {
-    contract
-        .get(assertion)
-        .is_some_and(|a| a.oracle.is_none() || a.oracle.as_ref() == Some(oracle))
 }
 
 /// Gate status is derived, never an event: a gate whose dependencies are all
@@ -553,27 +412,27 @@ fn apply_decision(
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return; // unknown or already-resolved item
     };
-    // Planning nodes live in `planning.tasks`, execution nodes in `tasks`; a
-    // node decision resets whichever era the mission is in.
+    // Planning and execution ids live in separate maps. Prefer the active
+    // planning run, then fall back to execution so decisions do not infer an
+    // era from whether an accepted plan exists.
     let node_status = |state: &mut MissionState, task_id, status| {
-        if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+        if let Some(task) = state.planning.tasks.get_mut(task_id) {
+            task.status = status;
+        } else if let Some(task) = state.tasks.get_mut(task_id) {
             task.status = status;
         }
     };
     match (action, item.kind) {
-        (DecisionAction::Ratify, AttentionKind::Ratify)
-        | (DecisionAction::Ratify, AttentionKind::RatifyProposal) => state.ratified = true,
-        (DecisionAction::Retry, AttentionKind::RatifyProposal) => {
-            // Reject the proposal and re-run the whole planning DAG. Attempts are
-            // preserved, so a re-dispatched node gets a fresh idempotency key.
-            // Scrub any `request_attention` flags the discarded run left, or a
-            // stale node_attention item would re-park the mission and block the
-            // re-plan (mirrors the NodeFailed retry scrub below).
+        (DecisionAction::Approve, AttentionKind::PlanProposal) => state.proposal_approved = true,
+        (DecisionAction::Revise, AttentionKind::PlanProposal) => {
             state.proposal = None;
-            for (id, task) in &mut state.planning.tasks {
-                task.status = TaskStatus::Pending;
-                state.flagged_nodes.remove(id);
-            }
+            state.planning_feedback.push(super::state::FailureFeedback {
+                summary: item.report,
+                evidence: None,
+                details: None,
+                justification: justification.to_string(),
+            });
+            start_replanning(state);
         }
         (DecisionAction::Retry, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
@@ -581,17 +440,18 @@ fn apply_decision(
                 state.flagged_nodes.remove(task_id);
             }
         }
-        (DecisionAction::Continue, AttentionKind::NodeFailed) => {
+        (DecisionAction::Accept, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
                 node_status(state, task_id, TaskStatus::Cleared); // accept the failure
             }
         }
-        (DecisionAction::Continue, AttentionKind::NodeAttention) => {
+        (DecisionAction::Accept, AttentionKind::NodeAttention) => {
             if let Some(task_id) = &item.task_id {
                 state.flagged_nodes.remove(task_id);
             }
         }
-        (DecisionAction::Continue, AttentionKind::GateCheckpoint | AttentionKind::GateFailed) => {
+        (DecisionAction::Approve, AttentionKind::GateCheckpoint)
+        | (DecisionAction::Accept, AttentionKind::GateFailed) => {
             if let Some(task_id) = &item.task_id {
                 state.acknowledged_gates.insert(task_id.clone());
                 // Accepting a gate (cleared checkpoint or blocked gate) lets
@@ -608,7 +468,43 @@ fn apply_decision(
                 state.oracle_failures.remove(oracle);
             }
         }
-        (DecisionAction::Continue, AttentionKind::OracleFailed) => {
+        (DecisionAction::Retry, AttentionKind::OracleVerdictFailed) => {
+            for assertion_id in &item.assertion_ids {
+                if let Some(assertion) = state.contract.get_mut(assertion_id) {
+                    assertion.last_authoritative = None;
+                }
+            }
+        }
+        (DecisionAction::Repair, AttentionKind::OracleVerdictFailed) => {
+            let feedback = super::state::FailureFeedback {
+                summary: item.report.clone(),
+                evidence: item.evidence.clone(),
+                details: item.details.clone(),
+                justification: justification.to_string(),
+            };
+            for assertion_id in &item.assertion_ids {
+                if let Some(assertion) = state.contract.get_mut(assertion_id) {
+                    assertion.last_authoritative = None;
+                }
+            }
+            if let Some(plan) = &state.plan {
+                for task in plan.tasks.iter().filter(|task| {
+                    task.kind == super::plan::TaskKind::Work
+                        && task
+                            .targets
+                            .iter()
+                            .any(|target| item.assertion_ids.contains(target))
+                }) {
+                    if let Some(runtime) = state.tasks.get_mut(&task.id) {
+                        runtime.status = TaskStatus::Pending;
+                        runtime.feedback.push(feedback.clone());
+                    }
+                }
+            }
+            state.terminal_review.outcome = None;
+            state.terminal_review.accepted = None;
+        }
+        (DecisionAction::Accept, AttentionKind::OracleFailed) => {
             // Accept the infra failure: waive the obligation so the mission
             // can finish (never verified — there is no authoritative verdict).
             if let Some(oracle) = &item.oracle {
@@ -616,7 +512,12 @@ fn apply_decision(
                 state.waived_oracles.insert(oracle.clone());
             }
         }
-        (DecisionAction::Continue, AttentionKind::TerminalReviewGaps) => {
+        (DecisionAction::Accept, AttentionKind::OracleVerdictFailed) => {
+            if let Some(oracle) = &item.oracle {
+                state.waived_oracles.insert(oracle.clone());
+            }
+        }
+        (DecisionAction::Accept, AttentionKind::TerminalReviewGaps) => {
             // Acknowledge the blocking verdict AT ITS SHA (the gap item only
             // raises fresh, so the verdict's sha is the current head): the
             // mission may close with these gaps on record; a later head move
@@ -642,7 +543,7 @@ fn apply_decision(
             state.terminal_review.outcome = None;
             state.terminal_review.accepted = None;
         }
-        (DecisionAction::Continue, AttentionKind::TerminalReviewFailed) => {
+        (DecisionAction::Accept, AttentionKind::TerminalReviewFailed) => {
             // Accept the infra failure: waive the review AT THIS HEAD so the
             // mission can close without a verdict. Later work stales the
             // waiver and re-opens the review — the instrument may have
@@ -655,6 +556,21 @@ fn apply_decision(
                 justification: justification.to_string(),
             });
         }
+        (
+            DecisionAction::Revise,
+            AttentionKind::OracleVerdictFailed
+            | AttentionKind::GateFailed
+            | AttentionKind::TerminalReviewGaps,
+        ) => {
+            state.terminal_review.accepted = None;
+            state.planning_feedback.push(super::state::FailureFeedback {
+                summary: item.report,
+                evidence: item.evidence,
+                details: item.details,
+                justification: justification.to_string(),
+            });
+            start_replanning(state);
+        }
         (DecisionAction::Abort, _) => {
             state.phase = MissionPhase::Aborted {
                 reason: "aborted by decision".to_string(),
@@ -664,7 +580,16 @@ fn apply_decision(
     }
 }
 
-/// Rebuild the open-attention set from scratch: the ratification gate, failed
+fn start_replanning(state: &mut MissionState) {
+    state.planning_base_revision = Some(state.revision);
+    for (id, task) in &mut state.planning.tasks {
+        task.status = TaskStatus::Pending;
+        task.last_report = None;
+        state.flagged_nodes.remove(id);
+    }
+}
+
+/// Rebuild the open-attention set from scratch: the approval gate, failed
 /// nodes, human-flagged nodes, and gate results — minus anything a decision
 /// resolved. Attention is a pure function of state, so a decision that
 /// changed a task's status or set a flag removes its item automatically.
@@ -680,6 +605,8 @@ fn derive_attention(state: &mut MissionState) {
     let mut raise = |kind: AttentionKind,
                      task_id: Option<TaskId>,
                      oracle: Option<super::ids::OracleName>,
+                     assertion_ids: Vec<AssertionId>,
+                     evidence: Option<super::state::FailureEvidence>,
                      report: String| {
         let anchor = task_id
             .as_ref()
@@ -697,39 +624,103 @@ fn derive_attention(state: &mut MissionState) {
                 kind,
                 task_id,
                 oracle,
+                assertion_ids,
+                evidence,
+                details: None,
                 report,
             },
         );
     };
 
-    // Ratification gate: park before any work until the plan is approved.
-    if state.plan.is_some() && state.config.ratification_gate && !state.ratified {
+    if state.proposal.is_some() && !state.proposal_approved {
         raise(
-            AttentionKind::Ratify,
+            AttentionKind::PlanProposal,
             None,
             None,
-            "ratify the plan and contract before work begins".to_string(),
+            Vec::new(),
+            None,
+            format!(
+                "approve the complete plan proposed against revision {}",
+                state.revision
+            ),
         );
     }
 
     // Oracle infrastructure failures: park rather than re-request forever.
-    for (oracle, detail) in &state.oracle_failures {
+    for (oracle, failure) in &state.oracle_failures {
         raise(
             AttentionKind::OracleFailed,
             None,
             Some(oracle.clone()),
-            format!("oracle '{oracle}' failed to run: {detail}"),
+            Vec::new(),
+            None,
+            format!("oracle '{oracle}' failed to run: {}", failure.detail),
         );
     }
 
-    // Planning phase (no plan yet): surface failed/flagged planning nodes, and
-    // the ratify-proposal gate once the author has proposed.
-    if state.plan.is_none() {
+    // A fresh nonzero exit is a valid authoritative verdict, but it is not a
+    // terminal dead end. Park it on an explicit repair path with the exact
+    // assertion set and evidence references the oracle produced.
+    let mut failed_by_oracle: BTreeMap<_, (Vec<AssertionId>, super::state::FailureEvidence)> =
+        BTreeMap::new();
+    for (assertion_id, assertion) in &state.contract {
+        let Some(verdict) = assertion
+            .last_authoritative
+            .as_ref()
+            .filter(|verdict| verdict.is_fresh_at(&state.current_sha) && !verdict.passed())
+        else {
+            continue;
+        };
+        if state.waived_oracles.contains(verdict.oracle()) {
+            continue;
+        }
+        let (stdout, stderr) = verdict.evidence();
+        failed_by_oracle
+            .entry(verdict.oracle().clone())
+            .or_insert_with(|| {
+                (
+                    Vec::new(),
+                    super::state::FailureEvidence {
+                        exit_code: verdict.exit_code(),
+                        exit_signal: verdict.exit_signal(),
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                    },
+                )
+            })
+            .0
+            .push(assertion_id.clone());
+    }
+    for (oracle, (assertion_ids, evidence)) in failed_by_oracle {
+        let targets = assertion_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        raise(
+            AttentionKind::OracleVerdictFailed,
+            None,
+            Some(oracle),
+            assertion_ids,
+            Some(evidence.clone()),
+            format!(
+                "authoritative oracle failed assertions [{targets}] with exit {}",
+                evidence.exit_code
+            ),
+        );
+    }
+
+    // The planning DAG can author both the initial plan and later revisions.
+    if state.planning_base_revision.is_some() {
         for (task_id, rt) in &state.planning.tasks {
-            if rt.status == TaskStatus::Failed {
+            if rt.status == TaskStatus::Failed
+                && !rt.automatic_retry_remaining(state.config.recovery.max_attempts)
+            {
                 raise(
                     AttentionKind::NodeFailed,
                     Some(task_id.clone()),
+                    None,
+                    Vec::new(),
                     None,
                     format!("planning task '{task_id}' failed"),
                 );
@@ -738,17 +729,11 @@ fn derive_attention(state: &mut MissionState) {
                     AttentionKind::NodeAttention,
                     Some(task_id.clone()),
                     None,
+                    Vec::new(),
+                    None,
                     format!("planning task '{task_id}' asks for a look"),
                 );
             }
-        }
-        if state.proposal.is_some() && !state.ratified {
-            raise(
-                AttentionKind::RatifyProposal,
-                None,
-                None,
-                "ratify the proposed contract before execution begins".to_string(),
-            );
         }
     }
 
@@ -764,11 +749,15 @@ fn derive_attention(state: &mut MissionState) {
                     AttentionKind::GateCheckpoint,
                     Some(task.id.clone()),
                     None,
+                    Vec::new(),
+                    None,
                     format!("gate '{}' cleared; confirm to proceed", task.id),
                 ),
                 Some(TaskStatus::Failed) if !state.acknowledged_gates.contains(&task.id) => raise(
                     AttentionKind::GateFailed,
                     Some(task.id.clone()),
+                    None,
+                    Vec::new(),
                     None,
                     format!(
                         "gate '{}' is blocked by dissenting or missing verdicts",
@@ -778,10 +767,15 @@ fn derive_attention(state: &mut MissionState) {
                 _ => {}
             },
             super::plan::TaskKind::Work | super::plan::TaskKind::Validate => {
-                if status == Some(TaskStatus::Failed) {
+                if status == Some(TaskStatus::Failed)
+                    && !state.tasks[&task.id]
+                        .automatic_retry_remaining(state.config.recovery.max_attempts)
+                {
                     raise(
                         AttentionKind::NodeFailed,
                         Some(task.id.clone()),
+                        None,
+                        Vec::new(),
                         None,
                         format!("task '{}' failed", task.id),
                     );
@@ -789,6 +783,8 @@ fn derive_attention(state: &mut MissionState) {
                     raise(
                         AttentionKind::NodeAttention,
                         Some(task.id.clone()),
+                        None,
+                        Vec::new(),
                         None,
                         format!("task '{}' asked for a human look", task.id),
                     );
@@ -802,19 +798,28 @@ fn derive_attention(state: &mut MissionState) {
         match &state.terminal_review.outcome {
             // Infra failure: park rather than re-request forever (the
             // OracleFailed mirror; raised until a decision retries or waives).
-            Some(ReviewOutcome::Failed { detail }) => raise(
-                AttentionKind::TerminalReviewFailed,
-                None,
-                None,
-                format!(
-                    "terminal review failed to run: {detail}; retry to re-run \
-                     the review, continue to waive it, or abort"
-                ),
-            ),
+            Some(ReviewOutcome::Failed { failure })
+                if !failure.automatically_retryable()
+                    || state.terminal_review.attempts >= state.config.recovery.max_attempts =>
+            {
+                raise(
+                    AttentionKind::TerminalReviewFailed,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    format!(
+                        "terminal review failed to run: {}; retry to re-run \
+                     the review, accept to waive it, or abort",
+                        failure.detail
+                    ),
+                )
+            }
+            Some(ReviewOutcome::Failed { .. }) => {}
             // A fresh blocking verdict parks — but only when the mission
             // would otherwise close. While remediation tasks / inflight
             // effects / owed oracles are live the park auto-clears: an
-            // amendment resumes the mission without a second decision, and
+            // a revision resumes the mission without a second decision, and
             // the head move re-opens the review for free.
             Some(ReviewOutcome::Verdict(v)) => {
                 let acknowledged = state.terminal_review.acknowledges(v);
@@ -846,14 +851,19 @@ fn derive_attention(state: &mut MissionState) {
                         AttentionKind::TerminalReviewGaps,
                         None,
                         None,
+                        Vec::new(),
+                        None,
                         format!(
-                            "{finding} at {} (attempt {}); amend the plan to \
-                             remediate, retry to re-roll the review, continue to \
+                            "{finding} at {} (attempt {}); revise the plan to \
+                             remediate, retry to re-run the review, accept to \
                              acknowledge and close, or abort",
                             super::ids::short_hex(&v.judged_sha),
                             state.terminal_review.attempts,
                         ),
                     );
+                    if let Some(item) = attention.get_mut("terminal_review_gaps:mission") {
+                        item.details = Some(v.report.clone());
+                    }
                 }
             }
             None => {}
@@ -868,12 +878,9 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
     }
 }
 
-/// The task map for the mission's current era: planning nodes live in
-/// `planning.tasks` until a plan exists, execution nodes in `tasks` after. The
-/// two id spaces are disjoint because `plan` goes `None → Some` monotonically —
-/// so this one routing decision has a single name, not a copy at every site.
+/// The task map for the currently dispatched role run.
 fn era_tasks_mut(state: &mut MissionState) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
-    if state.plan.is_none() {
+    if state.planning_base_revision.is_some() {
         &mut state.planning.tasks
     } else {
         &mut state.tasks
@@ -898,6 +905,11 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
+                task.last_failure = (!done).then(|| RunFailure {
+                    kind: super::event::RunErrorKind::HandoffInvalid,
+                    detail: "role reported done=false".to_string(),
+                    synthesized: false,
+                });
             }
             // A done task that asks for a look is flagged (derived into a
             // node_attention item); a not-done task is Failed (derived into a
@@ -914,7 +926,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
         } => {
             // Planning-only: the author's handoff. A `done` proposal (the shell
             // has already validated it) becomes the gradeless `state.proposal`;
-            // it seeds the contract only after ratification (`derive_promotion`).
+            // it seeds the contract only after approval (`derive_promotion`).
             let status = if *done {
                 TaskStatus::Cleared
             } else {
@@ -923,11 +935,20 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
+                task.last_failure = (!done).then(|| RunFailure {
+                    kind: super::event::RunErrorKind::HandoffInvalid,
+                    detail: "planning author reported done=false".to_string(),
+                    synthesized: false,
+                });
             }
             if *done {
-                if let Some(plan) = proposal {
-                    if state.plan.is_none() && state.proposal.is_none() {
-                        state.proposal = Some(plan.clone());
+                if let Some(proposal) = proposal {
+                    if state.proposal.is_none()
+                        && state.planning_base_revision == Some(proposal.base_revision)
+                    {
+                        state.proposal = Some(proposal.clone());
+                        state.planning_base_revision = None;
+                        state.proposal_approved = !state.config.approval_required;
                     }
                 }
                 if *request_attention {
@@ -946,6 +967,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Cleared;
                 task.last_report = Some(report.clone());
+                task.last_failure = None;
             }
             for item in items {
                 if let Some(assertion) = state.contract.get_mut(&item.item_id) {
@@ -981,7 +1003,7 @@ fn derive_phase(state: &mut MissionState) {
     }
     state.phase = if !state.open_attention.is_empty() {
         MissionPhase::AttentionNeeded
-    } else if state.plan.is_none() {
+    } else if state.plan.is_none() || state.planning_base_revision.is_some() {
         MissionPhase::Planning
     } else if work_outstanding(state) || terminal_review_outstanding(state) {
         MissionPhase::Running
@@ -1054,10 +1076,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::super::event::{
-        ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, Supersession, ValidationItem,
+        ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
     };
     use super::super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-    use super::super::plan::{Assertion, PlanSubmission, Task, TaskKind};
+    use super::super::plan::{Assertion, PlanProposal, PlanSubmission, Task, TaskKind};
     use super::super::verdict::FinishClass;
     use super::*;
 
@@ -1105,16 +1127,26 @@ mod tests {
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
+                recovery: super::super::event::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
     }
 
     fn plan_submitted(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
-        MissionEvent::PlanSubmitted {
-            plan: PlanSubmission { assertions, tasks },
+        MissionEvent::PlanProposed {
+            proposal: PlanProposal {
+                base_revision: 0,
+                plan: PlanSubmission {
+                    requirements: vec![],
+                    assertions,
+                    tasks,
+                },
+            },
             plan_hash: "hash".into(),
+            actor: "test".into(),
+            justification: "initial".into(),
         }
     }
 
@@ -1249,235 +1281,6 @@ mod tests {
         }
     }
 
-    fn covering_work(id: &str, target: &str, deps: &[&str]) -> Task {
-        Task {
-            id: tid(id),
-            kind: TaskKind::Work,
-            body: "do".into(),
-            targets: vec![aid(target)],
-            role: Some(RoleName::new("implementer").expect("role")),
-            depends_on: deps.iter().map(|d| tid(d)).collect(),
-        }
-    }
-
-    fn reviewer_of(id: &str, target: &str, deps: &[&str]) -> Task {
-        Task {
-            id: tid(id),
-            kind: TaskKind::Validate,
-            body: "check".into(),
-            targets: vec![aid(target)],
-            role: Some(RoleName::new("reviewer").expect("role")),
-            depends_on: deps.iter().map(|d| tid(d)).collect(),
-        }
-    }
-
-    fn commit(head: &str) -> Option<ArtifactOutcome> {
-        Some(ArtifactOutcome {
-            base_sha: "base".into(),
-            head_sha: head.into(),
-        })
-    }
-
-    fn plan_amended(base_revision: u32, ops: AmendmentOps) -> MissionEvent {
-        MissionEvent::PlanAmended {
-            base_revision,
-            ops,
-            actor: "test".into(),
-            justification: "j".into(),
-        }
-    }
-
-    fn supersede(old: &str, new: &str) -> Supersession {
-        Supersession {
-            old: tid(old),
-            new: tid(new),
-        }
-    }
-
-    // Honesty (review G1): re-planning ALREADY-VERIFIED work cannot launder —
-    // the oracle re-runs at the new head and the grade follows the real tree.
-    // The automated stand-in for the removed seal-enforcement test.
-    #[test]
-    fn superseding_verified_work_re_judges_at_the_new_head() {
-        // A is oracle-verified at h1; a pending `keep` holds the mission Running
-        // (so the amendment is reachable, exactly as in a multi-node mission).
-        let verified = vec![
-            created(),
-            plan_submitted(
-                vec![assertion("AA", Some("cargo-test"))],
-                vec![covering_work("wa", "AA", &[]), work_task("keep")],
-            ),
-            role_completed("wa", "kwa", work_handoff(true, false), commit("h1")),
-            oracle_completed("AA", "h1", "koa", 0),
-        ];
-        let mid = fold_log(verified.clone()).expect("state");
-        assert_eq!(mid.phase, MissionPhase::Running, "keep pending → not Done");
-        assert_eq!(
-            mid.contract[&aid("AA")]
-                .last_authoritative
-                .as_ref()
-                .map(|v| v.passed()),
-            Some(true),
-            "A is verified at h1"
-        );
-
-        // Supersede the verified work with a regression; the oracle re-judges h2.
-        let mut events = verified;
-        events.extend([
-            plan_amended(
-                1,
-                AmendmentOps {
-                    add: vec![covering_work("wa2", "AA", &[])],
-                    supersede: vec![supersede("wa", "wa2")],
-                    ..Default::default()
-                },
-            ),
-            role_completed("wa2", "kwa2", work_handoff(true, false), commit("h2")),
-            role_completed("keep", "kk", work_handoff(true, false), None),
-            oracle_completed("AA", "h2", "koa2", 1),
-        ]);
-        let state = fold_log(events).expect("state");
-        assert_eq!(
-            state.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Unverified
-            },
-            "regressed re-plan of verified work drops to Unverified"
-        );
-    }
-
-    // Honesty (review #1): superseding a validator's upstream work resets the
-    // validator AND re-derives the assertion's sticky advisory — a re-review
-    // that now fails must not finish InternallyConsistent on the discarded tree.
-    #[test]
-    fn re_reviewed_advisory_re_derives_and_cannot_launder() {
-        let base = vec![
-            created(),
-            plan_submitted(
-                vec![assertion("STYLE-OK", None)],
-                vec![
-                    covering_work("w", "STYLE-OK", &[]),
-                    reviewer_of("v", "STYLE-OK", &["w"]),
-                ],
-            ),
-            role_completed("w", "kw", work_handoff(true, false), commit("h1")),
-            role_completed("v", "kv", validate_handoff(&[("STYLE-OK", true)]), None),
-        ];
-        assert_eq!(
-            fold_log(base.clone()).expect("state").phase,
-            MissionPhase::Done {
-                finish: FinishClass::InternallyConsistent
-            },
-            "v passed → advisory-green"
-        );
-
-        // Supersede the reviewed work; v re-reviews the new tree as FAILING.
-        let mut events = base;
-        events.extend([
-            plan_amended(
-                1,
-                AmendmentOps {
-                    add: vec![covering_work("w2", "STYLE-OK", &[])],
-                    supersede: vec![supersede("w", "w2")],
-                    ..Default::default()
-                },
-            ),
-            role_completed("w2", "kw2", work_handoff(true, false), commit("h2")),
-            role_completed("v", "kv2", validate_handoff(&[("STYLE-OK", false)]), None),
-        ]);
-        let state = fold_log(events).expect("state");
-        assert_eq!(
-            state.contract[&aid("STYLE-OK")].advisory,
-            AdvisoryStatus::Failed,
-            "sticky advisory re-derived from the failing re-review"
-        );
-        assert_eq!(
-            state.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Unverified
-            },
-            "must not finish InternallyConsistent on the rejected tree"
-        );
-    }
-
-    #[test]
-    fn supersede_dedups_downstream_dependencies() {
-        // A downstream task depending on both the superseded task and its
-        // replacement ends with a single, deduped edge.
-        let plan = PlanSubmission {
-            assertions: Vec::new(),
-            tasks: vec![work_task("a"), work_task("b"), {
-                let mut c = work_task("c");
-                c.depends_on = vec![tid("a"), tid("b")];
-                c
-            }],
-        };
-        let ops = AmendmentOps {
-            supersede: vec![supersede("a", "b")],
-            ..Default::default()
-        };
-        let result = resulting_plan(&plan, &ops);
-        let c = result.tasks.iter().find(|t| t.id == tid("c")).expect("c");
-        assert_eq!(c.depends_on, vec![tid("b")]);
-    }
-
-    // Regression (QA): the fold's own "never trust the writer" amendment guards.
-    // Even if a malformed PlanAmended reaches the fold (bypassing the engine's
-    // pre-append validation), a stale base_revision and a non-strengthening
-    // bind_oracle each no-op the whole amendment.
-    #[test]
-    fn the_fold_no_ops_a_stale_or_weakening_amendment() {
-        use crate::model::OracleBinding;
-        let base = vec![
-            created(),
-            plan_submitted(
-                vec![assertion("A1", Some("cargo-test"))],
-                vec![work_task("w")],
-            ),
-        ];
-        let bound = fold_log(base.clone()).expect("seeded").contract[&aid("A1")]
-            .oracle
-            .clone();
-
-        // (a) A stale base_revision (targets 0; the plan is at 1) seeds nothing.
-        let mut stale = base.clone();
-        stale.push(plan_amended(
-            0,
-            AmendmentOps {
-                add_assertion: vec![assertion("GHOST", None)],
-                ..Default::default()
-            },
-        ));
-        let after = fold_log(stale).expect("state");
-        assert_eq!(after.revision, 1, "stale amendment does not bump revision");
-        assert!(!after.contract.contains_key(&aid("GHOST")));
-
-        // (b) Rebinding an already-bound assertion to a different oracle is not
-        // strengthening — the whole amendment no-ops.
-        let mut weaken = base;
-        weaken.push(plan_amended(
-            1,
-            AmendmentOps {
-                bind_oracle: vec![OracleBinding {
-                    assertion: aid("A1"),
-                    oracle: oracle("cargo-clippy"),
-                }],
-                add_assertion: vec![assertion("ALSO", None)],
-                ..Default::default()
-            },
-        ));
-        let after = fold_log(weaken).expect("state");
-        assert_eq!(
-            after.contract[&aid("A1")].oracle,
-            bound,
-            "A1 oracle unchanged"
-        );
-        assert!(
-            !after.contract.contains_key(&aid("ALSO")),
-            "weakening no-ops"
-        );
-    }
-
     // Regression (review): a fresh authoritative FAIL must dominate a green
     // advisory verdict — Unverified, never InternallyConsistent.
     #[test]
@@ -1505,13 +1308,11 @@ mod tests {
             oracle_completed("A1", "sha-1", "ko", 1),
         ])
         .expect("state");
-        assert_eq!(
-            state.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Unverified
-            },
-            "a real oracle failure is not laundered to internally-consistent"
-        );
+        assert_eq!(classify_finish(&state), FinishClass::Unverified);
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+        assert!(state
+            .open_attention
+            .contains_key("oracle_verdict_failed:cargo-test"));
     }
 
     // Regression (review): Continue on a GateFailed must let downstream
@@ -1544,7 +1345,7 @@ mod tests {
         let mut resolved = base;
         resolved.push(decision(
             "gate_failed:g",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         let state = fold_log(resolved).expect("state");
         // Gate accepted → cleared → downstream w2 is runnable, not wedged.
@@ -1593,6 +1394,7 @@ mod tests {
                 judged_sha: "sha-1".into(),
                 attempt_no: 1,
                 idempotency_key: "ko".into(),
+                error_kind: RunErrorKind::Infra,
                 detail: "binary missing".into(),
                 synthesized: false,
             },
@@ -1605,7 +1407,7 @@ mod tests {
         let mut resolved = base;
         resolved.push(decision(
             "oracle_failed:cargo-test",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         let state = fold_log(resolved).expect("state");
         assert!(state.waived_oracles.contains(&oracle("cargo-test")));
@@ -2006,14 +1808,14 @@ mod tests {
             assert_eq!(verdict.passed(), expect_passed, "exit {exit_code}");
             assert_eq!(verdict.exit_code(), exit_code);
             assert_eq!(verdict.judged_sha(), "base");
-            // A fresh verdict — pass or fail — settles the obligation.
-            assert_eq!(
-                state.phase,
-                MissionPhase::Done {
-                    finish: expect_finish
-                },
-                "exit {exit_code}"
-            );
+            assert_eq!(classify_finish(&state), expect_finish);
+            if expect_passed {
+                assert!(matches!(state.phase, MissionPhase::Done { .. }));
+            } else {
+                assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+                let item = &state.open_attention["oracle_verdict_failed:cargo-test"];
+                assert_eq!(item.evidence.as_ref().unwrap().exit_code, exit_code);
+            }
         }
     }
 
@@ -2079,12 +1881,8 @@ mod tests {
             .as_ref()
             .expect("verdict minted");
         assert!(!verdict.passed(), "a signal-killed oracle must not pass");
-        assert_eq!(
-            state.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Unverified
-            }
-        );
+        assert_eq!(classify_finish(&state), FinishClass::Unverified);
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     }
 
     #[test]
@@ -2099,6 +1897,7 @@ mod tests {
                 judged_sha: "base".into(),
                 attempt_no: 1,
                 idempotency_key: "ko".into(),
+                error_kind: RunErrorKind::Infra,
                 detail: "spawn failed".into(),
                 synthesized: false,
             },
@@ -2394,7 +2193,7 @@ mod tests {
 
         events.push(decision(
             "terminal_review_gaps:mission",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         let state = fold_log(events).expect("state");
         assert_eq!(
@@ -2467,7 +2266,7 @@ mod tests {
         ));
         events.push(decision(
             "terminal_review_gaps:mission",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         assert!(matches!(
             fold_log(events.clone()).expect("state").phase,
@@ -2506,35 +2305,6 @@ mod tests {
     }
 
     #[test]
-    fn an_amendment_auto_clears_the_gap_park_and_resumes_remediation() {
-        let mut events = events_to_the_brink();
-        events.push(review_completed(
-            "kr",
-            "h1",
-            false,
-            vec![gap(GapSeverity::Blocking)],
-        ));
-        assert_eq!(
-            fold_log(events.clone()).expect("parked").phase,
-            MissionPhase::AttentionNeeded
-        );
-
-        // Remediation lands as an amendment: pending work makes the mission
-        // no longer otherwise-closing, so the park clears in the same fold —
-        // no second human decision to resume.
-        events.push(plan_amended(
-            1,
-            AmendmentOps {
-                add: vec![work_task("fix-gap")],
-                ..Default::default()
-            },
-        ));
-        let state = fold_log(events).expect("state");
-        assert!(state.open_attention.is_empty());
-        assert_eq!(state.phase, MissionPhase::Running);
-    }
-
-    #[test]
     fn terminal_review_failure_parks_then_retry_reopens() {
         let mut events = events_to_the_brink();
         events.push(review_requested(1, "kr", "h1"));
@@ -2561,7 +2331,7 @@ mod tests {
         events.push(review_failed("kr", "h1", "agent timed out"));
         events.push(decision(
             "terminal_review_failed:mission",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         let state = fold_log(events).expect("state");
         // The waiver kind keeps the receipt honest: no verdict exists, and
@@ -2590,7 +2360,7 @@ mod tests {
         events.push(review_failed("kr", "h1", "agent timed out"));
         events.push(decision(
             "terminal_review_failed:mission",
-            super::super::event::DecisionAction::Continue,
+            super::super::event::DecisionAction::Accept,
         ));
         assert!(matches!(
             fold_log(events.clone()).expect("state").phase,
@@ -2655,40 +2425,37 @@ mod tests {
         ] {
             for action in [
                 DecisionAction::Retry,
-                DecisionAction::Continue,
+                DecisionAction::Accept,
                 DecisionAction::Abort,
             ] {
                 assert!(
-                    validate_decision(state, item, &action).is_ok(),
+                    validate_decision(state, item, &action, "accepted").is_ok(),
                     "{item} must accept {action:?}"
                 );
             }
             assert!(
                 matches!(
-                    validate_decision(state, item, &DecisionAction::Ratify),
+                    validate_decision(state, item, &DecisionAction::Approve, ""),
                     Err(DecisionError::InvalidAction { .. })
                 ),
-                "{item} must refuse Ratify"
+                "{item} must refuse Approve"
             );
         }
     }
 
     #[test]
-    fn below_bar_finish_closes_without_review() {
-        // A fresh authoritative FAIL settles the oracle obligation and the
-        // finish is below the verified bar — the mission closes (nonzero exit
-        // at the CLI) without burning a reviewer turn; the review is the last
-        // gate on an otherwise-passing mission only.
+    fn failed_authoritative_verdict_parks_for_repair_without_review() {
+        // A fresh authoritative FAIL is proof that the judged artifact needs
+        // work, so it parks on the repair path without burning a reviewer
+        // turn. The review remains the last gate on a passing artifact only.
         let mut events = events_to_the_brink();
         events.pop(); // replace the passing oracle run …
         events.push(oracle_completed("TESTS-PASS", "h1", "ko", 1)); // … with a fail
         let state = fold_log(events).expect("state");
         assert!(!terminal_review_outstanding(&state));
-        assert_eq!(
-            state.phase,
-            MissionPhase::Done {
-                finish: FinishClass::Unverified
-            }
-        );
+        assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+        assert!(state
+            .open_attention
+            .contains_key("oracle_verdict_failed:cargo-test"));
     }
 }

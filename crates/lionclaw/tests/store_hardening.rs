@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{default_config, harness, simple_plan, BASE_SHA, HEAD_SHA};
+use common::{default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 use lionclaw::model::{MissionEvent, PayloadRef, RoleName, TaskId};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -29,7 +29,12 @@ async fn expired_lease_is_reclaimable_exactly_once() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
     let store = h.engine.store();

@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{advisory_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{advisory_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::Engine;
 use lionclaw::model::{
     AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
@@ -70,14 +70,19 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             "advisory-only mission",
             BASE_SHA,
             lionclaw::model::MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 ..Default::default()
             },
         )
         .await
         .expect("create");
     engine
-        .submit_plan(&mission_id, advisory_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, advisory_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .expect("submit");
     engine.advance(&mission_id).await.expect("advance");

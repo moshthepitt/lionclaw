@@ -118,7 +118,11 @@ mod tests {
     }
 
     fn plan_with(assertions: Vec<Assertion>, tasks: Vec<Task>) -> PlanSubmission {
-        PlanSubmission { assertions, tasks }
+        PlanSubmission {
+            requirements: vec![],
+            assertions,
+            tasks,
+        }
     }
 
     fn work(id: &str, targets: &[&str]) -> Task {
@@ -174,7 +178,7 @@ mod tests {
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {
-                        ratification_gate: false,
+                        approval_required: false,
                         ..Default::default()
                     },
                 },
@@ -182,9 +186,14 @@ mod tests {
             env(
                 &mission_id,
                 2,
-                MissionEvent::PlanSubmitted {
-                    plan: plan.clone(),
+                MissionEvent::PlanProposed {
+                    proposal: crate::model::PlanProposal {
+                        base_revision: 0,
+                        plan: plan.clone(),
+                    },
                     plan_hash: "h".into(),
+                    actor: "test".into(),
+                    justification: "initial".into(),
                 },
             ),
         ];

@@ -74,6 +74,11 @@ pub fn load_mission_type(
             )))
         }
     };
+    if manifest.recovery.max_attempts == 0 {
+        return Err(MissionTypeError::Manifest(
+            "[recovery] max-attempts must be at least 1".to_string(),
+        ));
+    }
 
     let skills = load_skills(root)?;
     let oracles = load_oracles(&root.join("oracles"))?;
@@ -129,6 +134,7 @@ pub fn load_mission_type(
         stop,
         image: manifest.mission_type.image,
         planning: manifest.planning,
+        recovery: manifest.recovery,
         terminal_review,
         playbook: Some(playbook),
         roles,

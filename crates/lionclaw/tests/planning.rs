@@ -1,6 +1,6 @@
 //! Planning-in-phase, end to end: an objective drives a contract-free planning
 //! DAG (research → adversary → author), the author's proposal is gradeless and
-//! parks for ratification, and only a human `ratify` seeds the contract — after
+//! parks for approval, and only a human `approve` seeds the contract — after
 //! which execution runs and an oracle mints the `Verified` finish.
 
 mod common;
@@ -9,13 +9,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::BASE_SHA;
+use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
-    MissionPhase, OracleName, OutputSemantics, PayloadRef, PlanSubmission, PlanningDag,
-    PlanningTask, RoleName, StopBar, Task, TaskKind,
+    MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, PlanProposal,
+    PlanSubmission, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -65,6 +65,7 @@ fn planning_mission_type() -> MissionType {
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: planning_dag(),
+        recovery: Default::default(),
         terminal_review: None,
         playbook: Some("plan carefully".to_string()),
         roles,
@@ -110,21 +111,25 @@ fn planning_dag() -> PlanningDag {
 
 /// What the author proposes: one oracle-bound assertion, one implementer work
 /// task. (Verified-possible, so it clears the `verified` bar.)
-fn proposed_plan() -> PlanSubmission {
-    PlanSubmission {
-        assertions: vec![Assertion {
-            id: aid("TESTS-PASS"),
-            prose: "cargo test exits 0".to_string(),
-            oracle: Some(OracleName::new("cargo-test").unwrap()),
-        }],
-        tasks: vec![Task {
-            id: tid("fix"),
-            kind: TaskKind::Work,
-            body: "make it pass".to_string(),
-            targets: vec![aid("TESTS-PASS")],
-            role: Some(rn("implementer")),
-            depends_on: vec![],
-        }],
+fn proposed_plan() -> PlanProposal {
+    PlanProposal {
+        base_revision: 0,
+        plan: PlanSubmission {
+            requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
+            assertions: vec![Assertion {
+                id: aid("TESTS-PASS"),
+                prose: "cargo test exits 0".to_string(),
+                oracle: Some(OracleName::new("cargo-test").unwrap()),
+            }],
+            tasks: vec![Task {
+                id: tid("fix"),
+                kind: TaskKind::Work,
+                body: "make it pass".to_string(),
+                targets: vec![aid("TESTS-PASS")],
+                role: Some(rn("implementer")),
+                depends_on: vec![],
+            }],
+        },
     }
 }
 
@@ -195,7 +200,7 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
 }
 
 #[tokio::test]
-async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
+async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     let dir = tempfile::tempdir().unwrap();
     let engine = planning_engine(dir.path()).await;
     let id = engine
@@ -204,9 +209,10 @@ async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
             "make the tests pass",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: true,
+                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -219,31 +225,31 @@ async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert!(state.plan.is_none(), "planning must not seed a plan");
-    assert!(state.contract.is_empty(), "no contract before ratification");
+    assert!(state.contract.is_empty(), "no contract before approval");
     assert!(state.proposal.is_some(), "the author proposed a contract");
-    let ratify = state
+    let approve = state
         .open_attention
         .values()
-        .find(|a| a.kind == AttentionKind::RatifyProposal)
-        .expect("parked on RatifyProposal");
+        .find(|a| a.kind == AttentionKind::PlanProposal)
+        .expect("parked on PlanProposal");
 
-    // A malformed advance can't launder past ratification: still no contract.
+    // A malformed advance can't launder past approval: still no contract.
     engine.advance(&id).await.unwrap();
     assert!(engine.load_state(&id).await.unwrap().plan.is_none());
 
-    // Ratify: derive_promotion seeds the contract for the first time.
+    // Approve: derive_promotion seeds the contract for the first time.
     engine
         .decide(
             &id,
-            &ratify.id,
-            DecisionAction::Ratify,
+            &approve.id,
+            DecisionAction::Approve,
             "looks good",
             "human",
         )
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
-    assert!(state.plan.is_some(), "ratification seeds the plan");
+    assert!(state.plan.is_some(), "approval seeds the plan");
     assert!(state.contract.contains_key(&aid("TESTS-PASS")));
     assert_eq!(state.revision, 1);
 
@@ -264,7 +270,7 @@ async fn planning_proposes_then_ratify_seeds_the_contract_and_verifies() {
 }
 
 #[tokio::test]
-async fn retrying_a_proposal_rejects_it_and_re_runs_planning() {
+async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
     let dir = tempfile::tempdir().unwrap();
     let engine = planning_engine(dir.path()).await;
     let id = engine
@@ -273,9 +279,10 @@ async fn retrying_a_proposal_rejects_it_and_re_runs_planning() {
             "make the tests pass",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: true,
+                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -283,19 +290,19 @@ async fn retrying_a_proposal_rejects_it_and_re_runs_planning() {
         .unwrap();
     engine.advance(&id).await.unwrap();
     let state = engine.load_state(&id).await.unwrap();
-    let ratify = state
+    let approve = state
         .open_attention
         .values()
-        .find(|a| a.kind == AttentionKind::RatifyProposal)
-        .expect("parked on RatifyProposal");
+        .find(|a| a.kind == AttentionKind::PlanProposal)
+        .expect("parked on PlanProposal");
 
     // Retry: the proposal is discarded and the planning DAG is re-runnable.
     // Nothing was seeded, so nothing is weakened.
     engine
         .decide(
             &id,
-            &ratify.id,
-            DecisionAction::Retry,
+            &approve.id,
+            DecisionAction::Revise,
             "not good enough",
             "human",
         )
@@ -313,6 +320,30 @@ async fn retrying_a_proposal_rejects_it_and_re_runs_planning() {
         MissionPhase::Planning,
         "planning is re-runnable"
     );
+    assert_eq!(state.planning_feedback.len(), 1);
+    assert_eq!(state.planning_feedback[0].justification, "not good enough");
+
+    engine.advance(&id).await.unwrap();
+    let events = engine.store().load(&id).await.unwrap();
+    let second_strategist_prompt = events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            MissionEvent::RoleRunRequested {
+                task_id,
+                attempt_no: 2,
+                prompt,
+                ..
+            } if task_id == &tid("strategist") => Some(prompt),
+            _ => None,
+        })
+        .expect("second strategist prompt");
+    let prompt = engine
+        .store()
+        .blobs()
+        .resolve(second_strategist_prompt)
+        .unwrap();
+    assert!(prompt.contains("Required rework"));
+    assert!(prompt.contains("not good enough"));
 }
 
 /// A failed planning node (what a crashed run reconciles to — planning is
@@ -355,9 +386,10 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
             "obj",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: true,
+                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -432,9 +464,10 @@ async fn park_after_author(
             "obj",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: true,
+                approval_required: true,
                 stop: StopBar::Verified,
                 planning: planning_dag(),
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -459,7 +492,7 @@ fn assert_author_failed_seeding_nothing(state: &lionclaw::model::MissionState) {
 }
 
 /// The engine re-validates the author's Handoff::Plan fail-closed before it can
-/// become a ratifiable proposal — neither a done-with-no-proposal nor a proposal
+/// become a approvable proposal — neither a done-with-no-proposal nor a proposal
 /// that fails plan validation slips through.
 #[tokio::test]
 async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
@@ -480,6 +513,7 @@ async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
     // (b) a proposal that fails validation under the `verified` stop bar (an
     // oracle-less assertion).
     let invalid = PlanSubmission {
+        requirements: vec![covered_requirement("CHECKABLE", "UNCHECKABLE")],
         assertions: vec![Assertion {
             id: aid("UNCHECKABLE"),
             prose: "no oracle can prove this".to_string(),
@@ -500,7 +534,10 @@ async fn a_bad_author_proposal_fails_the_node_and_seeds_nothing() {
         Handoff::Plan {
             done: true,
             report: PayloadRef::inline("bad plan"),
-            proposal: Some(invalid),
+            proposal: Some(PlanProposal {
+                base_revision: 0,
+                plan: invalid,
+            }),
             request_attention: false,
         },
     )

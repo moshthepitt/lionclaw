@@ -11,6 +11,7 @@ pub mod authority;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod evidence;
 pub mod mission_type;
 pub mod model;
 pub mod oracle;

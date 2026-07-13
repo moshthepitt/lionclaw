@@ -68,7 +68,8 @@ missed.
 
 Do not add a final catch-all review task to the plan to pre-empt it, and do
 not write assertions "for the reviewer" — plan the contract on its own
-merits. If the terminal review reports blocking gaps, the right response is
-an **amendment**: new falsifiable assertions bound to oracles plus the fix
-tasks that cover them. Remediation automatically re-runs the review at the
-new commit.
+merits. If the terminal review reports blocking gaps, revise the plan. A
+revision is a complete next plan, not a patch language: retain the still-valid
+requirements and assertions, add any missing falsifiable assertions and their
+oracle bindings, retire completed work, and add the repair work. Remediation
+automatically re-runs the review at the new commit.

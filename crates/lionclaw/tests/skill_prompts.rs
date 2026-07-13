@@ -11,12 +11,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{default_config, simple_plan, ParseTask, BASE_SHA, HEAD_SHA};
+use common::{
+    covered_requirement, default_config, proposal, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
+};
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, Handoff, MissionConfig, OracleName, OutputSemantics,
-    PlanSubmission, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    PlanProposal, PlanSubmission, PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -200,6 +202,7 @@ fn execution_mission_type(
         stop: StopBar::Verified,
         image: "img".to_string(),
         planning: PlanningDag::default(),
+        recovery: Default::default(),
         terminal_review: None,
         playbook: None,
         roles,
@@ -238,7 +241,12 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         .await
         .unwrap();
     engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .unwrap();
     engine.advance(&mission_id).await.unwrap();
@@ -302,33 +310,39 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
     // A plan with a validate task so the reviewer runs. The assertion is
     // oracle-bound so it clears the `verified` stop bar.
     engine
-        .submit_plan(
+        .propose_plan(
             &mission_id,
-            PlanSubmission {
-                assertions: vec![Assertion {
-                    id: aid("TESTS-PASS"),
-                    prose: "cargo test exits 0".to_string(),
-                    oracle: Some(OracleName::new("cargo-test").unwrap()),
-                }],
-                tasks: vec![
-                    Task {
-                        id: "write".parse_task(),
-                        kind: TaskKind::Work,
-                        body: "Write.".to_string(),
-                        targets: vec![aid("TESTS-PASS")],
-                        role: Some(rn("implementer")),
-                        depends_on: vec![],
-                    },
-                    Task {
-                        id: "review".parse_task(),
-                        kind: TaskKind::Validate,
-                        body: "Review.".to_string(),
-                        targets: vec![aid("TESTS-PASS")],
-                        role: Some(rn("reviewer")),
-                        depends_on: vec!["write".parse_task()],
-                    },
-                ],
-            },
+            proposal(
+                0,
+                PlanSubmission {
+                    requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
+                    assertions: vec![Assertion {
+                        id: aid("TESTS-PASS"),
+                        prose: "cargo test exits 0".to_string(),
+                        oracle: Some(OracleName::new("cargo-test").unwrap()),
+                    }],
+                    tasks: vec![
+                        Task {
+                            id: "write".parse_task(),
+                            kind: TaskKind::Work,
+                            body: "Write.".to_string(),
+                            targets: vec![aid("TESTS-PASS")],
+                            role: Some(rn("implementer")),
+                            depends_on: vec![],
+                        },
+                        Task {
+                            id: "review".parse_task(),
+                            kind: TaskKind::Validate,
+                            body: "Review.".to_string(),
+                            targets: vec![aid("TESTS-PASS")],
+                            role: Some(rn("reviewer")),
+                            depends_on: vec!["write".parse_task()],
+                        },
+                    ],
+                },
+            ),
+            "test",
+            "initial plan",
         )
         .await
         .unwrap();
@@ -392,6 +406,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
                 },
             ],
         },
+        recovery: Default::default(),
         terminal_review: None,
         playbook: None,
         roles,
@@ -410,21 +425,25 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
     }
 }
 
-fn proposed_plan() -> PlanSubmission {
-    PlanSubmission {
-        assertions: vec![Assertion {
-            id: aid("TESTS-PASS"),
-            prose: "cargo test exits 0".to_string(),
-            oracle: Some(OracleName::new("cargo-test").unwrap()),
-        }],
-        tasks: vec![Task {
-            id: tid("fix"),
-            kind: TaskKind::Work,
-            body: "make it pass".to_string(),
-            targets: vec![aid("TESTS-PASS")],
-            role: Some(rn("implementer")),
-            depends_on: vec![],
-        }],
+fn proposed_plan() -> PlanProposal {
+    PlanProposal {
+        base_revision: 0,
+        plan: PlanSubmission {
+            requirements: vec![covered_requirement("GREEN-TESTS", "TESTS-PASS")],
+            assertions: vec![Assertion {
+                id: aid("TESTS-PASS"),
+                prose: "cargo test exits 0".to_string(),
+                oracle: Some(OracleName::new("cargo-test").unwrap()),
+            }],
+            tasks: vec![Task {
+                id: tid("fix"),
+                kind: TaskKind::Work,
+                body: "make it pass".to_string(),
+                targets: vec![aid("TESTS-PASS")],
+                role: Some(rn("implementer")),
+                depends_on: vec![],
+            }],
+        },
     }
 }
 
@@ -469,7 +488,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
             "plan the work",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 stop: StopBar::Verified,
                 planning: PlanningDag {
                     tasks: vec![
@@ -487,6 +506,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
                         },
                     ],
                 },
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -543,7 +563,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
             "plan the work",
             BASE_SHA,
             MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 stop: StopBar::Verified,
                 planning: PlanningDag {
                     tasks: vec![
@@ -561,6 +581,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
                         },
                     ],
                 },
+                recovery: Default::default(),
                 terminal_review: None,
             },
         )
@@ -631,7 +652,12 @@ async fn terminal_review_prompt_lists_assigned_skills() {
         .await
         .unwrap();
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .unwrap();
     h.engine.advance(&mission_id).await.unwrap();
@@ -684,7 +710,12 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
         .await
         .unwrap();
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .unwrap();
     h.engine.advance(&mission_id).await.unwrap();
@@ -729,7 +760,12 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
         .await
         .unwrap();
     engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
         .unwrap();
 

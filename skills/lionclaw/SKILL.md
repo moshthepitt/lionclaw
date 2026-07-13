@@ -22,10 +22,11 @@ binary separately from its skill instructions.
 3. Read its method with `lionclaw mission type show <mission-type>`.
 4. Start the mission with an explicit objective, repository, mission type, and
    runtime profile.
-5. Follow only the legal next actions returned by the CLI. Use `mission
-   advance` to drive automatic work and `mission decide` for an open attention
-   item.
-6. Preserve human ratification or acceptance decisions for the human. Routine
+5. Treat `lionclaw mission status --json` as the current playbook: it reports
+   mission state, evidence, and legal actions for every open attention item.
+   Use `mission advance` to drive automatic work and `mission decide` for an
+   open item.
+6. Preserve human plan approval or acceptance decisions for the human. Routine
    retries, repair, and replanning may be driven autonomously when the CLI
    presents those actions and the evidence supports them.
 7. Finish by reading `lionclaw mission report` and state clearly what was

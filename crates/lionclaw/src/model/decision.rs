@@ -1,12 +1,67 @@
 //! Decision validation, ported from Zenith (Apache-2.0, Intelligent
 //! Internet) `controller.py::_validate_decisions`: a decision must target an
 //! open attention item, and the action must be legal for that item's kind
-//! (`retry`/`continue` only for node failures, `ratify` only for the
-//! ratification gate, etc.). Invalid decisions are rejected before any event
+//! (`retry` for reruns, `revise` for planning, and `accept` for explicit
+//! waivers). Invalid decisions are rejected before any event
 //! is recorded, so the fold only ever applies legal transitions.
 
 use super::event::DecisionAction;
 use super::state::{AttentionKind, MissionState};
+
+const PLAN_PROPOSAL: &[DecisionAction] = &[
+    DecisionAction::Approve,
+    DecisionAction::Revise,
+    DecisionAction::Abort,
+];
+const NODE_FAILED: &[DecisionAction] = &[
+    DecisionAction::Retry,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+const NODE_ATTENTION: &[DecisionAction] = &[DecisionAction::Accept, DecisionAction::Abort];
+const ORACLE_FAILED: &[DecisionAction] = &[
+    DecisionAction::Retry,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+const ORACLE_VERDICT_FAILED: &[DecisionAction] = &[
+    DecisionAction::Retry,
+    DecisionAction::Repair,
+    DecisionAction::Revise,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+const GATE_FAILED: &[DecisionAction] = &[
+    DecisionAction::Revise,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+const GATE_CHECKPOINT: &[DecisionAction] = &[DecisionAction::Approve, DecisionAction::Abort];
+const TERMINAL_REVIEW_GAPS: &[DecisionAction] = &[
+    DecisionAction::Retry,
+    DecisionAction::Revise,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+const TERMINAL_REVIEW_FAILED: &[DecisionAction] = &[
+    DecisionAction::Retry,
+    DecisionAction::Accept,
+    DecisionAction::Abort,
+];
+
+pub fn allowed_actions(kind: AttentionKind) -> &'static [DecisionAction] {
+    match kind {
+        AttentionKind::PlanProposal => PLAN_PROPOSAL,
+        AttentionKind::NodeFailed => NODE_FAILED,
+        AttentionKind::NodeAttention => NODE_ATTENTION,
+        AttentionKind::OracleFailed => ORACLE_FAILED,
+        AttentionKind::OracleVerdictFailed => ORACLE_VERDICT_FAILED,
+        AttentionKind::GateFailed => GATE_FAILED,
+        AttentionKind::GateCheckpoint => GATE_CHECKPOINT,
+        AttentionKind::TerminalReviewGaps => TERMINAL_REVIEW_GAPS,
+        AttentionKind::TerminalReviewFailed => TERMINAL_REVIEW_FAILED,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecisionError {
@@ -17,44 +72,23 @@ pub enum DecisionError {
         action: DecisionAction,
         kind: AttentionKind,
     },
+    #[error("accept requires a non-empty justification")]
+    JustificationRequired,
 }
 
 pub fn validate_decision(
     state: &MissionState,
     attention_id: &str,
     action: &DecisionAction,
+    justification: &str,
 ) -> Result<(), DecisionError> {
     let Some(item) = state.open_attention.get(attention_id) else {
         return Err(DecisionError::UnknownItem(attention_id.to_string()));
     };
-    let legal = match (action, item.kind) {
-        (DecisionAction::Ratify, AttentionKind::Ratify | AttentionKind::RatifyProposal) => true,
-        // Retry a rejected proposal (re-run planning), a failed node, a failed
-        // oracle, or the terminal review (re-roll the reviewer).
-        (
-            DecisionAction::Retry,
-            AttentionKind::RatifyProposal
-            | AttentionKind::NodeFailed
-            | AttentionKind::OracleFailed
-            | AttentionKind::TerminalReviewGaps
-            | AttentionKind::TerminalReviewFailed,
-        ) => true,
-        // Continue = accept the situation and proceed: acknowledge review gaps
-        // at their sha, or waive a review that failed to run.
-        (
-            DecisionAction::Continue,
-            AttentionKind::NodeFailed
-            | AttentionKind::NodeAttention
-            | AttentionKind::OracleFailed
-            | AttentionKind::GateCheckpoint
-            | AttentionKind::GateFailed
-            | AttentionKind::TerminalReviewGaps
-            | AttentionKind::TerminalReviewFailed,
-        ) => true,
-        // Abort is always available while an item is open.
-        (DecisionAction::Abort, _) => true,
-        _ => false,
-    };
+    if matches!(action, DecisionAction::Accept) && justification.trim().is_empty() {
+        return Err(DecisionError::JustificationRequired);
+    }
+    let legal = allowed_actions(item.kind).contains(action);
     if legal {
         Ok(())
     } else {
