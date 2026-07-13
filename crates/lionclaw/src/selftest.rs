@@ -472,7 +472,7 @@ impl ScriptedRoleRunner {
             &attempt_tag,
         )
         .await?;
-        workspace::remove_dir(&dest).await;
+        workspace::remove_dir(&dest).await?;
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
@@ -951,18 +951,20 @@ async fn check_runtime_skill_mount() -> Result<()> {
 
     let mut profile = RuntimeProfiles::built_in()?.get("codex")?;
     profile.confinement.oci_mut().image = Some(RUNTIME_IMAGE.to_string());
-    let extras = vec![
-        MountSpec {
-            source: runtime_home.path().to_path_buf(),
-            target: lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
-            access: MountAccess::ReadWrite,
-        },
-        MountSpec {
-            source: skill.path().to_path_buf(),
-            target: "/runtime/home/.agents/skills/mission-probe".to_string(),
-            access: MountAccess::ReadOnly,
-        },
-    ];
+    let mut extras = vec![MountSpec {
+        source: runtime_home.path().to_path_buf(),
+        target: lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
+        access: MountAccess::ReadWrite,
+    }];
+    extras.extend(crate::runner::prepare_skill_mounts(
+        runtime_home.path(),
+        &[crate::mission_type::SkillPackage {
+            name: "mission-probe".to_string(),
+            root: skill.path().to_path_buf(),
+            description: "mission skill probe".to_string(),
+        }],
+        profile.skills_dir.as_ref(),
+    )?);
     let authority = oracle_authority("skill-mount-probe");
     let judged_roots = [workspace.path().to_path_buf()];
     let compiled = compile_role_plan(RolePlanRequest {
@@ -1004,5 +1006,7 @@ async fn check_runtime_skill_mount() -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    std::fs::remove_dir_all(runtime_home.path().join(".agents"))
+        .context("native skill mountpoints were not removable after the container exited")?;
     Ok(())
 }

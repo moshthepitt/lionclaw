@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lionclaw_confinement::{MountAccess, MountSpec, WORKSPACE_MOUNT_TARGET};
+use lionclaw_confinement::WORKSPACE_MOUNT_TARGET;
 use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
@@ -21,15 +21,14 @@ use tokio::sync::Mutex;
 use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
-use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles, RuntimeSkillsDir};
-use crate::mission_type::SkillPackage;
+use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
 use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
 use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{AttemptDirs, SCRATCH_MOUNT_TARGET};
+use super::{prepare_skill_mounts, AttemptDirs, SCRATCH_MOUNT_TARGET};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -123,28 +122,6 @@ fn launch(detail: String) -> RoleRunFailure {
     }
 }
 
-fn role_skill_mounts(
-    skills: &[SkillPackage],
-    skills_dir: Option<&RuntimeSkillsDir>,
-) -> anyhow::Result<Vec<MountSpec>> {
-    let Some(skills_dir) = skills_dir else {
-        if skills.is_empty() {
-            return Ok(Vec::new());
-        }
-        anyhow::bail!("runtime profile has no skills-dir for mission-assigned skills");
-    };
-    skills
-        .iter()
-        .map(|skill| {
-            Ok(MountSpec {
-                source: skill.root.clone(),
-                target: skills_dir.mount_target(&skill.name)?,
-                access: MountAccess::ReadOnly,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()
-}
-
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
@@ -157,8 +134,6 @@ impl RoleRunner for OciRoleRunner {
             }
         }
         let profile = self.profile(&request.runtime)?;
-        let skill_mounts = role_skill_mounts(&request.skills, profile.skills_dir.as_ref())
-            .map_err(|err| launch(format!("failed to resolve role skills: {err:#}")))?;
 
         let attempt_tag = format!("{}-a{}", request.task_id, request.attempt_no);
         let dirs = AttemptDirs::prepare(
@@ -173,6 +148,12 @@ impl RoleRunner for OciRoleRunner {
         // directory on EVERY exit path — a failure in workspace isolation or
         // moat compilation, not only after the turn has run.
         let result: Result<RoleRunOutcome, RoleRunFailure> = async {
+            let skill_mounts = prepare_skill_mounts(
+                &dirs.runtime_home,
+                &request.skills,
+                profile.skills_dir.as_ref(),
+            )
+            .map_err(|err| launch(format!("failed to prepare role skills: {err:#}")))?;
             let authority = compile_authority(&request.role, &self.ceiling)
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
@@ -254,8 +235,20 @@ impl RoleRunner for OciRoleRunner {
         // every exit path: the handoff is already read into `result` and the
         // worker's commit already survives in the target repo's mission ref, so
         // nothing here is load-bearing once the run has settled.
-        workspace::remove_dir(&dirs.root).await;
-        result
+        match (result, workspace::remove_dir(&dirs.root).await) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(err)) => Err(RoleRunFailure {
+                kind: RunErrorKind::Infra,
+                detail: format!("failed to remove role attempt directory: {err:#}"),
+            }),
+            (Err(mut failure), Err(err)) => {
+                failure.detail = format!(
+                    "{}; failed to remove role attempt directory: {err:#}",
+                    failure.detail
+                );
+                Err(failure)
+            }
+        }
     }
 }
 
@@ -390,6 +383,8 @@ fn uuid_from_key(key: &str) -> uuid::Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission_type::SkillPackage;
+    use lionclaw_confinement::MountAccess;
     use std::path::Path;
 
     #[test]
@@ -421,7 +416,9 @@ mod tests {
         .unwrap();
         let profile = profiles.get("example").unwrap();
 
-        let mounts = role_skill_mounts(
+        let runtime_home = temp.path().join("runtime-home");
+        let mounts = prepare_skill_mounts(
+            &runtime_home,
             &[SkillPackage {
                 name: "mission-skill".to_string(),
                 root: temp.path().join("mission-skill"),
@@ -438,11 +435,13 @@ mod tests {
         assert!(mounts
             .iter()
             .any(|mount| mount.target == "/runtime/home/.native/skills/mission-skill"));
+        assert!(runtime_home.join(".native/skills/mission-skill").is_dir());
     }
 
     #[test]
     fn mission_skills_require_a_runtime_skills_directory() {
-        let err = role_skill_mounts(
+        let err = prepare_skill_mounts(
+            Path::new("/runtime-home"),
             &[SkillPackage {
                 name: "mission-skill".to_string(),
                 root: "/mission-type/skills/mission-skill".into(),
@@ -453,6 +452,8 @@ mod tests {
         .expect_err("missing projection");
 
         assert!(err.to_string().contains("no skills-dir"));
-        assert!(role_skill_mounts(&[], None).unwrap().is_empty());
+        assert!(prepare_skill_mounts(Path::new("/runtime-home"), &[], None)
+            .unwrap()
+            .is_empty());
     }
 }

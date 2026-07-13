@@ -95,13 +95,20 @@ impl RuntimeSkillsDir {
         Ok(Self(path))
     }
 
-    pub fn mount_target(&self, skill_name: &str) -> Result<String> {
+    fn relative_skill_path(&self, skill_name: &str) -> Result<PathBuf> {
         lionclaw_confinement::validate_skill_alias(skill_name)?;
+        Ok(self.0.join(skill_name))
+    }
+
+    pub fn mount_target(&self, skill_name: &str) -> Result<String> {
         Ok(Path::new(lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET)
-            .join(&self.0)
-            .join(skill_name)
+            .join(self.relative_skill_path(skill_name)?)
             .to_string_lossy()
             .into_owned())
+    }
+
+    pub(crate) fn host_mountpoint(&self, runtime_home: &Path, skill_name: &str) -> Result<PathBuf> {
+        Ok(runtime_home.join(self.relative_skill_path(skill_name)?))
     }
 }
 

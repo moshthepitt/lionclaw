@@ -11,9 +11,13 @@ pub use role_runner::OciRoleRunner;
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use lionclaw_confinement::{
     MountAccess, MountSpec, RUNTIME_HOME_MOUNT_TARGET, RUNTIME_MOUNT_TARGET,
 };
+
+use crate::config::RuntimeSkillsDir;
+use crate::mission_type::SkillPackage;
 
 /// Container mount targets the mission owns.
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
@@ -71,4 +75,34 @@ fn rw(source: &Path, target: &str) -> MountSpec {
         target: target.to_string(),
         access: MountAccess::ReadWrite,
     }
+}
+
+pub(crate) fn prepare_skill_mounts(
+    runtime_home: &Path,
+    skills: &[SkillPackage],
+    skills_dir: Option<&RuntimeSkillsDir>,
+) -> Result<Vec<MountSpec>> {
+    let Some(skills_dir) = skills_dir else {
+        if skills.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("runtime profile has no skills-dir for mission-assigned skills");
+    };
+    skills
+        .iter()
+        .map(|skill| {
+            let mountpoint = skills_dir.host_mountpoint(runtime_home, &skill.name)?;
+            std::fs::create_dir_all(&mountpoint).with_context(|| {
+                format!(
+                    "creating native skill mountpoint '{}'",
+                    mountpoint.display()
+                )
+            })?;
+            Ok(MountSpec {
+                source: skill.root.clone(),
+                target: skills_dir.mount_target(&skill.name)?,
+                access: MountAccess::ReadOnly,
+            })
+        })
+        .collect()
 }
