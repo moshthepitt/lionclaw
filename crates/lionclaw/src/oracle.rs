@@ -53,10 +53,9 @@ impl OracleRunner for OciOracleRunner {
         )
         .map_err(|e| fail(format!("failed to prepare oracle dirs: {e}")))?;
 
-        // Everything after the attempt dirs exist runs inside one block so the
-        // whole attempt directory is reclaimed on every exit path — the checkout
-        // (a full checkout), the moat-compile, and the staging steps can all fail
-        // before the run.
+        // Keep every fallible stage in one result. The engine owns the one
+        // cleanup path after this runner returns, including failures before a
+        // run starts and recovery after this process exits.
         let checkout = dirs.root.join("work");
         let result = async {
             // Complete checkout of the judged commit. The oracle receives it

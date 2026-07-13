@@ -142,10 +142,9 @@ impl RoleRunner for OciRoleRunner {
         )
         .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
 
-        // Everything after the attempt dirs exist runs inside one block whose
-        // Result is captured, so the teardown below reaps the whole attempt
-        // directory on EVERY exit path — a failure in workspace isolation or
-        // moat compilation, not only after the turn has run.
+        // Keep every fallible stage in one result. The engine owns the one
+        // cleanup path after this runner returns, including failures before a
+        // turn starts and recovery after this process exits.
         let result: Result<RoleRunOutcome, RoleRunFailure> = async {
             let skill_mounts = prepare_skill_mounts(
                 &dirs.runtime_home,
