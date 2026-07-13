@@ -280,6 +280,9 @@ fn walk_skill_files(
 ) -> Result<Vec<PathBuf>, MissionTypeError> {
     let mut files = Vec::new();
     for entry in read_dir(directory)? {
+        if entry.file_name() == ".git" {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type().map_err(|source| MissionTypeError::Io {
             path: path.clone(),

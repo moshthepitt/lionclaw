@@ -567,6 +567,37 @@ mod tests {
         assert_eq!(locked_subdir, &subdir);
     }
 
+    #[tokio::test]
+    async fn git_add_accepts_a_skill_at_repository_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let mission = temp.path().join("mission");
+        let repository = temp.path().join("repository");
+        write_mission(&mission, None);
+        write_skill(&repository, "root-skill", "Use the root package.");
+        git(&repository, &["init", "--quiet"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Test"]);
+        git(&repository, &["config", "commit.gpgsign", "false"]);
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "--quiet", "-m", "skill"]);
+
+        add_skill(
+            &mission,
+            SkillSource::Git {
+                git: repository.to_string_lossy().into_owned(),
+                rev: "HEAD".to_string(),
+                subdir: PathBuf::new(),
+            },
+            false,
+            &AuthorityCeiling::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(mission.join("skills/root-skill/SKILL.md").is_file());
+        assert!(!mission.join("skills/root-skill/.git").exists());
+    }
+
     fn git(repository: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
