@@ -79,30 +79,6 @@ impl Home {
     }
 }
 
-/// Resolve the directory of mission types bundled with this binary — the source
-/// `install` copies from. Next to the executable in a release
-/// (`<exe_dir>/mission-types`), or the repo's `mission-types/` in a dev build.
-/// Follows the same exe-relative-then-source-tree pattern the kernel used for
-/// bundled assets.
-pub fn bundled_mission_types_dir() -> Result<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("mission-types");
-            if candidate.is_dir() {
-                return Ok(candidate);
-            }
-        }
-    }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mission-types");
-    if dev.is_dir() {
-        return Ok(dev);
-    }
-    Err(anyhow!(
-        "no bundled mission types found (looked next to the binary and in the source tree); \
-         pass a mission type directory to `lionclaw install`"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

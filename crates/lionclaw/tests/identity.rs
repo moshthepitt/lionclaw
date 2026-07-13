@@ -27,6 +27,7 @@ fn write_minimal_type(root: &Path) {
         "---\noutput: produces-artifact\n---\nDo it.\n",
     )
     .unwrap();
+    std::fs::write(root.join("playbook.md"), "# Digest test\n").unwrap();
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]

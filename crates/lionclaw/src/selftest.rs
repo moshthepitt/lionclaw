@@ -1,7 +1,7 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
-//! four Slice-1 invariants, re-planning/amendment, terminal-review closure,
-//! and native read-only skill mounting (seven numbered checks). Hermetic and
+//! four Slice-1 invariants, complete plan revision, terminal-review closure,
+//! native read-only skill mounting, and prepared inputs (eight checks). Hermetic and
 //! model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
@@ -23,13 +23,14 @@ use crate::authority::{
     MissionMounts, RolePlanRequest,
 };
 use crate::config::RuntimeProfiles;
-use crate::engine::{AmendError, Engine};
+use crate::engine::{AdvanceOutcome, Engine, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    AmendmentError, AmendmentOps, ArtifactOutcome, Assertion, AssertionId, DecisionAction,
-    FinishClass, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase,
-    OracleBinding, OracleName, PayloadRef, PlanSubmission, ReviewAcceptanceKind, RoleName,
-    RunErrorKind, Supersession, Task, TaskId, TaskKind, TaskStatus,
+    ArtifactOutcome, Assertion, AssertionId, DecisionAction, FinishClass, Gap, GapSeverity,
+    Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName, PayloadRef, Plan,
+    PlanProposal, ProposalError, Requirement, RequirementDisposition, RequirementId,
+    RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId, TaskKind,
+    TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
@@ -123,6 +124,7 @@ impl OracleRunner for FixedOracleRunner {
             exit_signal: None,
             stdout: format!("self-test oracle exit {}", self.0).into_bytes(),
             stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
             duration_ms: 1,
         })
     }
@@ -166,7 +168,7 @@ pub async fn run(json: bool) -> Result<ExitCode> {
         status: to_status(check_moat().await),
     });
     checks.push(Check {
-        name: "replanning-amends-atomically-and-strengthen-only",
+        name: "replanning-revises-atomically-and-strengthen-only",
         status: to_status(check_replanning().await),
     });
     checks.push(Check {
@@ -202,6 +204,9 @@ fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
         }),
         ("runtime-native-skill-mount", || {
             Box::pin(check_runtime_skill_mount())
+        }),
+        ("prepared-input-feeds-network-off-oracle", || {
+            Box::pin(check_prepared_input())
         }),
     ]
 }
@@ -323,6 +328,10 @@ runtime: codex
 Self-test worker.
 ";
 const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
+const PREPARED_CARGO_TEST_ORACLE: &str =
+    "#!/bin/sh\nset -e\ntest \"$(cat /inputs/fixture/sentinel)\" = prepared\ncd /workspace\nexec cargo test --locked\n";
+const PREPARE_FIXTURE_INPUT: &str =
+    "#!/bin/sh\nset -e\nprintf prepared > \"$LIONCLAW_OUTPUT/sentinel\"\n";
 
 // A verdict role that illegally requests secrets — the loader must refuse it.
 // (A judge can't be declared *writable* in a mission type — workspace access is
@@ -341,6 +350,7 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::create_dir_all(root.join("oracles"))?;
     std::fs::write(root.join("mission.toml"), manifest_toml("selftest"))?;
+    std::fs::write(root.join("playbook.md"), "# Self-test\n")?;
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
@@ -348,9 +358,29 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn materialize_input_mission_type(root: &Path) -> Result<()> {
+    materialize_sw_mission_type(root)?;
+    std::fs::write(
+        root.join("mission.toml"),
+        format!(
+            "{}\n[[inputs]]\nname = \"fixture\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+            manifest_toml("input-selftest")
+        ),
+    )?;
+    std::fs::create_dir_all(root.join("inputs"))?;
+    let input = root.join("inputs/fixture");
+    std::fs::write(&input, PREPARE_FIXTURE_INPUT)?;
+    workspace::make_executable(&input)?;
+    let oracle = root.join("oracles/cargo-test");
+    std::fs::write(&oracle, PREPARED_CARGO_TEST_ORACLE)?;
+    workspace::make_executable(&oracle)?;
+    Ok(())
+}
+
 fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::write(root.join("mission.toml"), manifest_toml("secrets-judge"))?;
+    std::fs::write(root.join("playbook.md"), "# Secrets judge\n")?;
     std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
     Ok(())
 }
@@ -406,8 +436,16 @@ async fn git(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// The single oracle-bound assertion + its one covering work task.
-fn oracle_plan() -> PlanSubmission {
-    PlanSubmission {
+fn oracle_plan() -> Plan {
+    Plan {
+        requirements: vec![Requirement {
+            id: RequirementId::new("TESTS-GREEN").expect("requirement id"),
+            kind: RequirementKind::Validation,
+            prose: "the project test suite passes".to_string(),
+            disposition: RequirementDisposition::Covered {
+                assertion_ids: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
+            },
+        }],
         assertions: vec![Assertion {
             id: AssertionId::new("TESTS-PASS").expect("assertion id"),
             prose: "cargo test passes at the judged commit".to_string(),
@@ -421,6 +459,13 @@ fn oracle_plan() -> PlanSubmission {
             role: Some(RoleName::new("implementer").expect("role name")),
             depends_on: Vec::new(),
         }],
+    }
+}
+
+fn proposal(base_revision: u32, plan: Plan) -> PlanProposal {
+    PlanProposal {
+        base_revision,
+        plan,
     }
 }
 
@@ -579,15 +624,15 @@ async fn check_happy_writer_and_resume() -> Result<()> {
                 "self-test writable worker",
                 &base,
                 MissionConfig {
-                    ratification_gate: false,
+                    approval_required: false,
                     ..Default::default()
                 },
             )
             .await?;
         engine
-            .submit_plan(&id, oracle_plan())
+            .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
             .await
-            .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
         assert_verified(&engine, &id).await?;
         // The worker's writes landed and the engine recorded the commit.
         let state = engine.load_state(&id).await?;
@@ -618,6 +663,65 @@ async fn check_happy_writer_and_resume() -> Result<()> {
     Ok(())
 }
 
+async fn check_prepared_input() -> Result<()> {
+    let repo = tempfile::tempdir().context("tempdir")?;
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_input_mission_type(type_dir.path())?;
+    let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let engine = build_engine(
+        repo.path(),
+        type_dir.path(),
+        Arc::new(NoopRoleRunner),
+        count,
+    )
+    .await?;
+    let id = engine
+        .create_mission(
+            &repo.path().to_string_lossy(),
+            "self-test prepared input",
+            &base,
+            MissionConfig {
+                approval_required: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+    engine
+        .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
+        .await
+        .map_err(|error| anyhow::anyhow!("plan proposal rejected: {error}"))?;
+    assert_verified(&engine, &id).await?;
+
+    let state = engine.load_state(&id).await?;
+    let verdict = state
+        .contract
+        .values()
+        .next()
+        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .context("prepared-input oracle verdict missing")?;
+    let input = verdict
+        .prepared_inputs()
+        .first()
+        .context("oracle receipt omitted its prepared input")?;
+    if input.name.as_str() != "fixture" {
+        anyhow::bail!("unexpected prepared input '{}'", input.name);
+    }
+    let cache = repo
+        .path()
+        .join(".lionclaw/inputs/sha256")
+        .join(&input.digest[..2])
+        .join(&input.digest[2..4])
+        .join(&input.digest);
+    if !cache.join("sentinel").is_file() {
+        anyhow::bail!(
+            "prepared input was not atomically published at '{}'",
+            cache.display()
+        );
+    }
+    Ok(())
+}
+
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = engine.advance(id).await?;
     let state = engine.load_state(id).await?;
@@ -629,9 +733,9 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     }
 }
 
-/// (2) The real cargo-test oracle on a genuinely-broken tree ⇒ the mission
-/// finishes Unverified (specifically — not merely "not verified"). The noop
-/// worker leaves the tree broken so the oracle is what decides.
+/// (2) The real cargo-test oracle on a genuinely-broken tree records a valid
+/// authoritative failure and parks on the repair path. The noop worker leaves
+/// the tree broken so the oracle is what decides.
 async fn check_oracle_honesty() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     let type_dir = tempfile::tempdir().context("tempdir")?;
@@ -651,27 +755,34 @@ async fn check_oracle_honesty() -> Result<()> {
             "self-test oracle honesty",
             &base,
             MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 ..Default::default()
             },
         )
         .await?;
     engine
-        .submit_plan(&id, oracle_plan())
+        .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
-    engine.advance(&id).await?;
-    match engine.load_state(&id).await?.phase {
-        MissionPhase::Done {
-            finish: FinishClass::Unverified,
-        } => Ok(()),
-        MissionPhase::Done { finish } => {
-            anyhow::bail!("a failing oracle produced finish {finish:?}; expected unverified")
-        }
-        other => {
-            anyhow::bail!("mission did not finish (phase {other:?}); oracle infra may be broken")
-        }
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
+    let outcome = engine.advance(&id).await?;
+    let state = engine.load_state(&id).await?;
+    let verdict = state
+        .contract
+        .values()
+        .next()
+        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .context("failing oracle produced no authoritative verdict")?;
+    if verdict.passed() {
+        anyhow::bail!("the genuinely broken tree received an authoritative pass");
     }
+    if !matches!(outcome, AdvanceOutcome::Parked { .. })
+        || !state
+            .open_attention
+            .contains_key("oracle_verdict_failed:cargo-test")
+    {
+        anyhow::bail!("failing oracle did not park on its repair path: {outcome:?}");
+    }
+    Ok(())
 }
 
 /// (3) A mission type declaring an over-privileged judge refuses to load with a
@@ -686,9 +797,9 @@ async fn check_moat() -> Result<()> {
     }
 }
 
-/// (5) Re-planning through the shipped binary: an amendment supersedes a live
+/// (5) Re-planning through the shipped binary: a revision supersedes a live
 /// task and strengthens the contract atomically (revision bumps, the old task
-/// becomes a `Superseded` tombstone), while a contract-weakening amendment is
+/// becomes a `Superseded` tombstone), while a contract-weakening revision is
 /// refused. Pure — no agent turn, no oracle run — so it always runs.
 async fn check_replanning() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
@@ -708,43 +819,44 @@ async fn check_replanning() -> Result<()> {
             "re-planning self-test",
             &base,
             MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 ..Default::default()
             },
         )
         .await?;
     engine
-        .submit_plan(&mission_id, oracle_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, oracle_plan()),
+            "self-test",
+            "initial plan",
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
 
-    // Supersede the sole coverer with a replacement (atomic — both in one op).
-    let ops = AmendmentOps {
-        add: vec![Task {
-            id: TaskId::new("build2").expect("task id"),
-            kind: TaskKind::Work,
-            body: "produce the change again".to_string(),
-            targets: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
-            role: Some(RoleName::new("implementer").expect("role name")),
-            depends_on: Vec::new(),
-        }],
-        supersede: vec![Supersession {
-            old: TaskId::new("build").expect("task id"),
-            new: TaskId::new("build2").expect("task id"),
-        }],
-        ..Default::default()
-    };
+    // Replace the sole coverer with a new-id task in one complete revision.
+    let mut next = oracle_plan();
+    next.tasks = vec![Task {
+        id: TaskId::new("build2").expect("task id"),
+        kind: TaskKind::Work,
+        body: "produce the change again".to_string(),
+        targets: vec![AssertionId::new("TESTS-PASS").expect("assertion id")],
+        role: Some(RoleName::new("implementer").expect("role name")),
+        depends_on: Vec::new(),
+    }];
     engine
-        .amend_plan(&mission_id, ops, "self-test", "swap the coverer", 1)
+        .propose_plan(
+            &mission_id,
+            proposal(1, next),
+            "self-test",
+            "swap the coverer",
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("amendment rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("revision rejected: {e}"))?;
 
     let state = engine.load_state(&mission_id).await?;
     if state.revision != 2 {
-        anyhow::bail!(
-            "expected revision 2 after amendment, got {}",
-            state.revision
-        );
+        anyhow::bail!("expected revision 2 after revision, got {}", state.revision);
     }
     if state.tasks[&TaskId::new("build").unwrap()].status != TaskStatus::Superseded {
         anyhow::bail!("superseded task is not a tombstone");
@@ -757,27 +869,23 @@ async fn check_replanning() -> Result<()> {
         anyhow::bail!("superseded task still in the live plan");
     }
 
-    // A contract-weakening amendment (rebind the bound oracle) is refused.
-    let weaken = AmendmentOps {
-        bind_oracle: vec![OracleBinding {
-            assertion: AssertionId::new("TESTS-PASS").expect("assertion id"),
-            oracle: OracleName::new("cargo-clippy").expect("oracle name"),
-        }],
-        ..Default::default()
-    };
+    // A complete revision still cannot weaken the contract by rebinding an
+    // existing assertion to a different oracle.
+    let mut weaken = state.plan.clone().expect("accepted plan");
+    weaken.assertions[0].oracle = Some(OracleName::new("cargo-clippy").expect("oracle name"));
     match engine
-        .amend_plan(&mission_id, weaken, "self-test", "weaken", 2)
+        .propose_plan(&mission_id, proposal(2, weaken), "self-test", "weaken")
         .await
     {
-        Err(AmendError::Rejected(AmendmentError::OracleUnbound { .. })) => Ok(()),
-        Ok(()) => anyhow::bail!("contract-weakening amendment was accepted"),
-        Err(other) => anyhow::bail!("weakening refused, but not as OracleUnbound: {other}"),
+        Err(ProposeError::Rejected(ProposalError::AssertionWeakened { .. })) => Ok(()),
+        Ok(()) => anyhow::bail!("contract-weakening revision was accepted"),
+        Err(other) => anyhow::bail!("weakening refused for the wrong reason: {other}"),
     }
 }
 
 /// (6) Terminal review gates closure: a mission type declaring a closing
 /// review does not close on a blocking verdict — it parks for a human, and
-/// only an explicit `continue` (acknowledge) lets it finish, with the
+/// only an explicit `accept` (acknowledge) lets it finish, with the
 /// acknowledgment on record. Also: the loader refuses `stop = "reviewed"`
 /// without the declaration (that bar is *defined* by the review). Pure — no
 /// agent turn, no oracle run — so it always runs.
@@ -816,7 +924,7 @@ async fn check_terminal_review() -> Result<()> {
 
     let repo = tempfile::tempdir().context("tempdir")?;
     let config = MissionConfig {
-        ratification_gate: false,
+        approval_required: false,
         terminal_review: mission_type.terminal_review.clone(),
         ..Default::default()
     };
@@ -838,9 +946,14 @@ async fn check_terminal_review() -> Result<()> {
         )
         .await?;
     engine
-        .submit_plan(&mission_id, oracle_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, oracle_plan()),
+            "self-test",
+            "initial plan",
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
 
     engine.advance(&mission_id).await?;
     let parked = engine.load_state(&mission_id).await?;
@@ -861,7 +974,7 @@ async fn check_terminal_review() -> Result<()> {
         .decide(
             &mission_id,
             "terminal_review_gaps:mission",
-            DecisionAction::Continue,
+            DecisionAction::Accept,
             "self-test acknowledges the gap",
             "self-test",
         )

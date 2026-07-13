@@ -7,12 +7,13 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::{covered_requirement, proposal};
 use lionclaw::authority::AuthorityCeiling;
 use lionclaw::engine::Engine;
 use lionclaw::mission_type::load_mission_type;
 use lionclaw::model::{
     AssertionId, FinishClass, Handoff, MissionConfig, MissionPhase, OutputSemantics, PayloadRef,
-    PlanSubmission, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
+    Plan, RoleName, StopBar, Task, TaskId, TaskKind, ValidationItem,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -40,8 +41,8 @@ fn moat_refuses_over_privileged_judge_mission_type() {
 /// Scenario 4 — the fold-level honesty cap: a mission type with a reviewer and
 /// no oracles finishes internally-consistent even when the reviewer passes
 /// everything. Never verified — an agent-only verdict can't mint authority.
-/// (Its bar is `reviewed`, so the advisory plan is submittable; a `verified`
-/// type would reject the oracle-less plan at submit — see
+/// (Its bar is `reviewed`, so the advisory plan is valid; a `verified`
+/// type would reject the oracle-less plan when proposed — see
 /// `plan_validation::tests::verified_bar_rejects_an_oracle_less_assertion`.)
 #[tokio::test]
 async fn advisory_only_mission_type_never_verifies() {
@@ -109,16 +110,18 @@ async fn advisory_only_mission_type_never_verifies() {
             "make it readable",
             "base-0",
             MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 stop: StopBar::Reviewed,
                 planning: Default::default(),
+                recovery: Default::default(),
                 terminal_review,
             },
         )
         .await
         .expect("create");
     // One oracle-less assertion, covered by a worker and judged by a reviewer.
-    let plan = PlanSubmission {
+    let plan = Plan {
+        requirements: vec![covered_requirement("READABLE-CODE", "READABLE")],
         assertions: vec![lionclaw::model::Assertion {
             id: AssertionId::new("READABLE").unwrap(),
             prose: "the code reads cleanly".to_string(),
@@ -143,7 +146,10 @@ async fn advisory_only_mission_type_never_verifies() {
             },
         ],
     };
-    engine.submit_plan(&mission_id, plan).await.expect("submit");
+    engine
+        .propose_plan(&mission_id, proposal(0, plan), "test", "initial plan")
+        .await
+        .expect("propose");
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
 

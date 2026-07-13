@@ -71,6 +71,14 @@ fn validate_assertion_id(raw: &str) -> Result<(), IdError> {
     Ok(())
 }
 
+fn validate_requirement_id(raw: &str) -> Result<(), IdError> {
+    validate_assertion_id(raw).map_err(|_| {
+        IdError(format!(
+            "requirement id '{raw}' must match ^[A-Z][A-Z0-9-]+$"
+        ))
+    })
+}
+
 /// `^[A-Za-z][A-Za-z0-9_-]*$`.
 fn validate_task_id(raw: &str) -> Result<(), IdError> {
     let mut chars = raw.chars();
@@ -98,12 +106,22 @@ fn validate_component_name(raw: &str) -> Result<(), IdError> {
 }
 
 id_type!(AssertionId, validate_assertion_id, "Contract assertion id.");
+id_type!(
+    RequirementId,
+    validate_requirement_id,
+    "Objective requirement id."
+);
 id_type!(TaskId, validate_task_id, "Plan task id.");
 id_type!(RoleName, validate_component_name, "Mission-type role name.");
 id_type!(
     OracleName,
     validate_component_name,
     "Mission-type oracle name."
+);
+id_type!(
+    InputName,
+    validate_component_name,
+    "Mission-type prepared input name."
 );
 
 /// Mission id: `m` + 12 hex chars, derived from workspace, objective, and

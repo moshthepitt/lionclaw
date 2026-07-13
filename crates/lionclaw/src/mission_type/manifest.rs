@@ -22,10 +22,24 @@ pub(crate) struct ManifestFile {
     pub mission_type: ManifestMissionType,
     #[serde(default)]
     pub planning: crate::model::PlanningDag,
+    #[serde(default)]
+    pub recovery: crate::model::RecoveryConfig,
     /// The optional engine-owned closing review. Required for the reviewed
     /// stop bar and resolved against the loaded role inventory.
     #[serde(default, rename = "terminal-review")]
     pub terminal_review: Option<ManifestTerminalReview>,
+    #[serde(default)]
+    pub inputs: Vec<ManifestInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct ManifestInput {
+    pub name: String,
+    pub network: bool,
+    pub key_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,12 +1,12 @@
-//! Slice 4: the default-on ratification gate parks the mission before any
-//! work; a ratify decision lets it proceed; an unrelated/invalid decision is
+//! Slice 4: the default-on approval gate parks the mission before any
+//! work; a approve decision lets it proceed; an unrelated/invalid decision is
 //! refused; abort terminates.
 
 mod common;
 
 use std::sync::Arc;
 
-use common::{simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{AdvanceOutcome, Engine};
 use lionclaw::model::{DecisionAction, FinishClass, MissionConfig, MissionPhase};
 use lionclaw::store::MissionStore;
@@ -26,7 +26,7 @@ async fn gated_engine(dir: &std::path::Path) -> Engine {
 }
 
 #[tokio::test]
-async fn ratification_gate_parks_then_ratify_proceeds_to_verified() {
+async fn approval_required_parks_then_approve_proceeds_to_verified() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = gated_engine(dir.path()).await;
     let mission_id = engine
@@ -34,28 +34,33 @@ async fn ratification_gate_parks_then_ratify_proceeds_to_verified() {
             dir.path().to_str().unwrap(),
             "gated mission",
             BASE_SHA,
-            MissionConfig::default(), // ratification_gate: true
+            MissionConfig::default(), // approval_required: true
         )
         .await
         .expect("create");
     engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
 
-    // Advance parks at the ratification gate — no work has run.
+    // Advance parks at the approval gate — no work has run.
     let parked = engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = parked else {
-        panic!("expected parked at ratify, got {parked:?}");
+        panic!("expected parked at approve, got {parked:?}");
     };
     assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, "ratify:mission");
+    assert_eq!(attention[0].id, "plan_proposal:mission");
 
-    // An invalid decision (retry on the ratify item) is refused.
+    // An invalid decision (retry on the approve item) is refused.
     assert!(engine
         .decide(
             &mission_id,
-            "ratify:mission",
+            "plan_proposal:mission",
             DecisionAction::Retry,
             "",
             "test"
@@ -67,24 +72,24 @@ async fn ratification_gate_parks_then_ratify_proceeds_to_verified() {
         .decide(
             &mission_id,
             "node_failed:ghost",
-            DecisionAction::Continue,
+            DecisionAction::Accept,
             "",
             "test"
         )
         .await
         .is_err());
 
-    // Ratify, then advance runs the mission to a verified finish.
+    // Approve, then advance runs the mission to a verified finish.
     engine
         .decide(
             &mission_id,
-            "ratify:mission",
-            DecisionAction::Ratify,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
             "ok",
             "test",
         )
         .await
-        .expect("ratify");
+        .expect("approve");
     let done = engine.advance(&mission_id).await.expect("advance 2");
     assert!(matches!(
         done,
@@ -110,15 +115,20 @@ async fn abort_decision_terminates_the_mission() {
         .await
         .expect("create");
     engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     engine.advance(&mission_id).await.expect("advance");
 
     engine
         .decide(
             &mission_id,
-            "ratify:mission",
+            "plan_proposal:mission",
             DecisionAction::Abort,
             "stop",
             "test",

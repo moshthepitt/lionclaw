@@ -18,28 +18,29 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    AmendmentOps, ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Gap, GapSeverity,
-    Handoff, IdemClass, MissionConfig, MissionEvent, MissionTypeRef, OracleBinding, PayloadRef,
-    RunErrorKind, StopBar, Supersession, TerminalReviewConfig, ValidationItem, VersionStamps,
-    SCHEMA_VERSION,
+    ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Gap, GapSeverity, Handoff, IdemClass,
+    MissionConfig, MissionEvent, MissionTypeRef, PayloadRef, PreparedInputRef, RecoveryConfig,
+    RunErrorKind, StopBar, TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{
-    short_hex, AssertionId, IdError, MissionId, OracleName, RoleName, TaskId,
-    TERMINAL_REVIEW_TASK_TAG,
+    short_hex, AssertionId, IdError, InputName, MissionId, OracleName, RequirementId, RoleName,
+    TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
-    Assertion, OutputSemantics, PlanSubmission, PlanningDag, PlanningTask, Task, TaskKind,
+    Assertion, OutputSemantics, Plan, PlanProposal, PlanningDag, PlanningTask, Requirement,
+    RequirementDisposition, RequirementKind, Task, TaskKind,
 };
 pub use plan_validation::{
-    validate_plan_amendment, validate_plan_submission, validate_planning_dag, AmendmentError,
-    MissionTypeInventory, PlanValidationError,
+    validate_plan, validate_plan_proposal, validate_planning_dag, MissionTypeInventory,
+    PlanValidationError, ProposalError,
 };
 pub use state::{
-    AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
-    TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, FailureEvidence, FailureFeedback,
+    InflightEffect, MissionPhase, MissionState, PlanningState, ReviewAcceptance,
+    ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState, TaskStatus,
+    TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

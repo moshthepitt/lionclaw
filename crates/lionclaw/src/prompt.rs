@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::mission_type::{RoleDefinition, SkillPackage};
-use crate::model::{Assertion, OutputSemantics, RoleName};
+use crate::model::{Assertion, OutputSemantics, Plan, RoleName};
 
 pub struct PromptContext<'a> {
     pub objective: &'a str,
@@ -22,6 +22,8 @@ pub struct PromptContext<'a> {
     /// Resolved skill packages assigned to this role, in declaration order.
     /// Empty ⇒ no assigned-skill section is rendered.
     pub skills: &'a [SkillPackage],
+    /// Engine-routed failure evidence and repair guidance from prior attempts.
+    pub feedback: &'a [String],
 }
 
 pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> String {
@@ -36,6 +38,7 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
         prompt.push_str("\n\n## Task\n\n");
         prompt.push_str(ctx.task_body);
     }
+    append_feedback(&mut prompt, ctx.feedback);
     if !ctx.targets.is_empty() {
         prompt.push_str("\n\n## Contract assertions in scope\n\n");
         for assertion in ctx.targets {
@@ -58,10 +61,14 @@ pub fn assemble_role_prompt(role: &RoleDefinition, ctx: &PromptContext<'_>) -> S
 /// and execution judges are only ever built by `assemble_role_prompt`.
 pub struct PlanningPromptContext<'a> {
     pub objective: &'a str,
+    /// Accepted revision this planning run must propose against.
+    pub base_revision: u32,
+    /// The accepted plan when authoring a later revision.
+    pub current_plan: Option<&'a Plan>,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
     /// The mission type's canonical role definitions. The assembler exposes
-    /// only roles eligible for submitted execution tasks.
+    /// only roles eligible for proposed execution tasks.
     pub roles: &'a BTreeMap<RoleName, RoleDefinition>,
     /// The oracles the author may bind assertions to.
     pub oracle_inventory: &'a [String],
@@ -70,6 +77,8 @@ pub struct PlanningPromptContext<'a> {
     pub upstream_reports: &'a [String],
     /// Resolved skill packages assigned to this role, in declaration order.
     pub skills: &'a [SkillPackage],
+    /// Rejection or failure evidence that caused this planning pass.
+    pub feedback: &'a [String],
 }
 
 pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
@@ -80,6 +89,15 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
     prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
+    prompt.push_str(&format!(
+        "\n\n## Proposal base revision\n\n{}",
+        ctx.base_revision
+    ));
+    if let Some(plan) = ctx.current_plan {
+        prompt.push_str("\n\n## Current accepted plan\n\n```json\n");
+        prompt.push_str(&serde_json::to_string_pretty(plan).expect("plan serializes"));
+        prompt.push_str("\n```\nRetain requirements and assertions monotonically. Retained task ids are immutable; omit a task to retire it and use a new id for changed work.\n");
+    }
     if let Some(playbook) = ctx.playbook {
         prompt.push_str("\n\n## Playbook\n\n");
         prompt.push_str(playbook);
@@ -120,6 +138,7 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
         prompt.push_str("\n\n## Task\n\n");
         prompt.push_str(ctx.task_body);
     }
+    append_feedback(&mut prompt, ctx.feedback);
     if !ctx.upstream_reports.is_empty() {
         prompt.push_str("\n\n## Upstream planning reports\n\n");
         for report in ctx.upstream_reports {
@@ -135,6 +154,9 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
 /// keeps planning prose out of execution judges), not a filter.
 pub struct TerminalReviewPromptContext<'a> {
     pub objective: &'a str,
+    /// Limitations explicitly disclosed by the accepted plan. These are
+    /// context for coverage, not waivers of the objective.
+    pub limitations: &'a [String],
     /// Per-attempt random token the reviewer must echo in its handoff. Proves
     /// the handoff was written by the agent that read this prompt, not by
     /// worker-planted code executed during the review.
@@ -154,6 +176,13 @@ pub fn assemble_terminal_review_prompt(
     prompt.push_str(&assigned_skill_section(ctx.skills));
     prompt.push_str("\n\n## Mission objective\n\n");
     prompt.push_str(ctx.objective);
+    if !ctx.limitations.is_empty() {
+        prompt.push_str("\n\n## Disclosed limitations\n\n");
+        prompt.push_str("The accepted plan disclosed these limitations. Include them in your requirement map and judge their product impact; disclosure is not proof or a waiver.\n");
+        for limitation in ctx.limitations {
+            prompt.push_str(&format!("- {limitation}\n"));
+        }
+    }
     prompt.push_str("\n\n## Handoff nonce\n\n");
     prompt.push_str(ctx.nonce);
     prompt
@@ -203,6 +232,19 @@ fn assigned_skill_section(skills: &[SkillPackage]) -> String {
         section.push_str(&format!("- {}: {}\n", skill.name, skill.description));
     }
     section
+}
+
+fn append_feedback(prompt: &mut String, feedback: &[String]) {
+    if feedback.is_empty() {
+        return;
+    }
+    prompt.push_str("\n\n## Required rework\n\n");
+    prompt.push_str("Address the following evidence in this attempt. Return the normal role handoff when done.\n");
+    for item in feedback {
+        prompt.push_str("\n---\n");
+        prompt.push_str(item);
+        prompt.push('\n');
+    }
 }
 
 const TERMINAL_REVIEW_SKELETON: &str = "\
@@ -345,6 +387,8 @@ You are the planning author. Read the workspace (mounted read-only at
 task DAG. You do not modify anything; your deliverable is the proposal itself.
 
 A proposal separates outcomes from proof:
+- requirements decompose the objective; each is covered by assertion ids or
+  records an explicit limitation with a rationale
 - a `work` task owns one coherent outcome; one work task may own multiple assertions
 - assertions are independently provable properties of the resulting mission state
 - each assertion has exactly one active `work` owner; dependencies express
@@ -353,6 +397,8 @@ A proposal separates outcomes from proof:
 
 Rules the engine enforces (an invalid proposal is rejected):
 - assertion ids match ^[A-Z][A-Z0-9-]+$ ; task ids match ^[A-Za-z][A-Za-z0-9_-]*$
+- requirement ids follow the assertion-id format; every assertion covers at
+  least one requirement
 - each assertion is covered by exactly one `work` task (via its `targets`)
 - an assertion an oracle can check should bind that oracle by name; under a
   `verified` mission type EVERY assertion must bind an oracle
@@ -369,10 +415,15 @@ When you are finished you MUST write /mission/handoff/handoff.json exactly like:
     \"type\": \"plan\",
     \"done\": true,
     \"report\": {\"kind\": \"inline\", \"text\": \"<why this contract>\"},
-    \"proposal\": {\"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
-                   \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
-                               \"targets\": [\"OUTCOME-HOLDS\"], \"role\": \"<available-work-role>\",
-                               \"depends_on\": []}]},
+    \"proposal\": {\"base_revision\": <the proposal base revision below>,
+                   \"plan\": {
+                     \"requirements\": [{\"id\": \"OBJECTIVE-MET\", \"kind\": \"capability\",
+                       \"prose\": \"...\", \"disposition\": {\"type\": \"covered\",
+                       \"assertion_ids\": [\"OUTCOME-HOLDS\"]}}],
+                     \"assertions\": [{\"id\": \"OUTCOME-HOLDS\", \"prose\": \"...\"}],
+                     \"tasks\": [{\"id\": \"change\", \"kind\": \"work\", \"body\": \"...\",
+                                 \"targets\": [\"OUTCOME-HOLDS\"], \"role\": \"<available-work-role>\",
+                                 \"depends_on\": []}]}},
     \"request_attention\": false}";
 
 #[cfg(test)]
@@ -403,6 +454,7 @@ mod tests {
             targets: &[],
             upstream_reports: upstream,
             skills: &[],
+            feedback: &[],
         }
     }
 
@@ -456,12 +508,15 @@ mod tests {
             &role(OutputSemantics::ProposesPlan),
             &PlanningPromptContext {
                 objective: "revise the novel",
+                base_revision: 0,
+                current_plan: None,
                 playbook: None,
                 roles: &roles,
                 oracle_inventory: &[],
                 task_body: "author the plan",
                 upstream_reports: &[],
                 skills: &[],
+                feedback: &[],
             },
         );
 
@@ -489,6 +544,7 @@ mod tests {
             &role,
             &TerminalReviewPromptContext {
                 objective: "document our ## Handoff nonce protocol",
+                limitations: &[],
                 nonce: "the-real-nonce",
                 skills: &[],
             },

@@ -514,11 +514,12 @@ mod sink_tests {
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 // Verified: a reviewed-bar config without a terminal review
                 // is a shape production refuses (create_mission + loader).
                 stop: StopBar::Verified,
                 planning: Default::default(),
+                recovery: Default::default(),
                 terminal_review: None,
             },
         })
@@ -527,7 +528,7 @@ mod sink_tests {
     fn decision() -> NewEvent {
         NewEvent::new(MissionEvent::DecisionRecorded {
             attention_id: "x".into(),
-            action: DecisionAction::Continue,
+            action: DecisionAction::Accept,
             justification: String::new(),
             actor: "t".into(),
         })

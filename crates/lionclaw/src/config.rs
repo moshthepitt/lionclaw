@@ -27,7 +27,9 @@ confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,s
 driver = "acp"
 command = "opencode"
 args = ["acp"]
-environment = { OPENCODE_DISABLE_AUTOUPDATE = "1" }
+environment = { OPENCODE_DISABLE_AUTOUPDATE = "1", OPENCODE_CONFIG_CONTENT = '{"permission":{"*":"allow"}}' }
+mode = "build"
+auth = { kind = "native-home", source = "~/.local/share/opencode", target = ".local/share/opencode", required-files = ["auth.json"] }
 skills-dir = ".agents/skills"
 confinement = { backend = "podman", read-only-rootfs = true, tmpfs = ["/tmp:rw,size=512m"] }
 
@@ -494,7 +496,22 @@ mod tests {
         let hermes = profiles.get("hermes").unwrap();
         assert_eq!(hermes.driver, "acp");
         assert_eq!(hermes.mode.as_deref(), Some("dont_ask"));
-        assert_eq!(profiles.get("opencode").unwrap().driver, "acp");
+        let opencode = profiles.get("opencode").unwrap();
+        assert_eq!(opencode.driver, "acp");
+        assert_eq!(opencode.mode.as_deref(), Some("build"));
+        assert!(opencode.environment.contains(&(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            r#"{"permission":{"*":"allow"}}"#.to_string(),
+        )));
+        assert_eq!(
+            opencode.auth,
+            Some(RuntimeAuthConfig::NativeHome(NativeHomeAuthConfig {
+                source: PathBuf::from("/home/alice/.local/share/opencode"),
+                target: PathBuf::from(".local/share/opencode"),
+                required_files: vec![PathBuf::from("auth.json")],
+                optional_files: Vec::new(),
+            }))
+        );
     }
 
     #[test]

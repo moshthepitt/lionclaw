@@ -5,12 +5,14 @@
 //! ```text
 //! <domain>/
 //! ├─ mission.toml            # identity + the honesty bar (stop)
-//! ├─ playbook.md             # the method (optional)
+//! ├─ playbook.md             # required mission-specific method
 //! ├─ roles/<name>.md         # frontmatter (output, network, secrets, runtime) + prompt
 //! ├─ skills/<name>/SKILL.md   # optional role skills and their resources
+//! ├─ inputs/<name>            # optional prepared-input program
 //! └─ oracles/<name>          # executable; exit 0 = pass
 //! ```
 
+mod bundled;
 mod digest;
 mod frontmatter;
 mod home;
@@ -21,7 +23,9 @@ mod manifest;
 mod skill_install;
 mod skills;
 
-pub use home::{bundled_mission_types_dir, Home};
+pub use bundled::BundledMissionTypes;
+pub(crate) use digest::ContentDigest;
+pub use home::Home;
 pub use install::{install_mission_type, materialize_mission_type, InstallOutcome};
 pub use loader::{load_mission_type, MissionTypeError};
 pub use locator::MissionTypeLocator;
@@ -31,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::model::{
-    MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
+    InputName, MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
     TerminalReviewConfig,
 };
 
@@ -61,6 +65,17 @@ pub struct SkillPackage {
     pub description: String,
 }
 
+/// One mission-declared input producer. The program receives the judged tree
+/// read-only at `/workspace` and writes its complete output to `/output`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedInput {
+    pub name: InputName,
+    pub program: PathBuf,
+    pub network: bool,
+    pub key_files: Vec<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MissionType {
     pub name: String,
@@ -71,14 +86,17 @@ pub struct MissionType {
     /// The confinement image every role and oracle runs in (from `mission.toml`).
     pub image: String,
     /// The planning DAG (how an objective becomes a proposed contract). Empty
-    /// ⇒ no in-engine planning; a mission of this type awaits a submitted plan.
+    /// ⇒ no in-engine planning; a mission of this type awaits a proposed plan.
     pub planning: PlanningDag,
+    /// Mission-level role recovery budget.
+    pub recovery: crate::model::RecoveryConfig,
     /// The closing review (the pure-core config type, threaded verbatim into
     /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
     pub terminal_review: Option<TerminalReviewConfig>,
     pub playbook: Option<String>,
     pub roles: BTreeMap<RoleName, RoleDefinition>,
     pub skills: BTreeMap<String, SkillPackage>,
+    pub inputs: BTreeMap<InputName, PreparedInput>,
     pub oracles: BTreeMap<OracleName, PathBuf>,
 }
 

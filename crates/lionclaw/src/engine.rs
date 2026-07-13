@@ -11,16 +11,16 @@
 //! unfinished oracle run is simply re-queued (engine-run, reproducible).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::mission_type::MissionType;
 use crate::model::{
-    step, validate_plan_amendment, validate_plan_submission, AmendmentError, AmendmentOps,
-    AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId, MissionPhase, MissionState,
-    OracleDispatchIntent, PayloadRef, PlanSubmission, PlanValidationError, RoleDispatchIntent,
-    RunErrorKind, StepDecision, TaskId, TerminalReviewDispatchIntent,
+    step, validate_plan_proposal, AttentionItem, Handoff, InflightEffect, MissionEvent, MissionId,
+    MissionPhase, MissionState, OracleDispatchIntent, PayloadRef, PlanProposal, ProposalError,
+    RoleDispatchIntent, RunErrorKind, StepDecision, TaskId, TerminalReviewDispatchIntent,
 };
 use crate::ports::{Clock, OracleRunRequest, OracleRunner, RoleRunRequest, RoleRunner};
 use crate::prompt::{
@@ -44,7 +44,7 @@ pub struct Engine {
 
 #[derive(Debug)]
 pub enum AdvanceOutcome {
-    /// Mission is in `Planning` with no runnable planning DAG; submit a plan to
+    /// Mission is in `Planning` with no runnable planning DAG; propose a plan to
     /// proceed.
     AwaitingPlan,
     /// Parked on open attention (durable interrupt, zero compute).
@@ -69,27 +69,11 @@ impl AdvanceOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SubmitError {
-    #[error("plan rejected:\n{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
-    Invalid(Vec<PlanValidationError>),
-    #[error("mission is not awaiting a plan (phase: {0})")]
-    WrongPhase(String),
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AmendError {
+pub enum ProposeError {
     #[error("mission is busy (an effect is in flight); retry once it quiesces")]
     MissionBusy,
-    #[error("mission is not amendable (phase: {0}); amend a running or parked mission")]
-    WrongPhase(String),
-    #[error(
-        "stale amendment: you targeted revision {targeted}, the plan is now revision {current}"
-    )]
-    StaleRevision { targeted: u32, current: u32 },
     #[error(transparent)]
-    Rejected(#[from] AmendmentError),
+    Rejected(#[from] ProposalError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -224,68 +208,16 @@ impl Engine {
         Ok(mission_id)
     }
 
-    /// Validate and record a plan. Fail-closed: an invalid submission
-    /// appends nothing.
-    pub async fn submit_plan(
+    /// Validate and record one complete plan proposal. Initial and revised
+    /// plans use the same boundary; invalid or stale proposals append nothing.
+    pub async fn propose_plan(
         &self,
         mission_id: &MissionId,
-        submission: PlanSubmission,
-    ) -> Result<(), SubmitError> {
-        let state = self.load_state(mission_id).await?;
-        if !matches!(state.phase, MissionPhase::Planning) {
-            return Err(SubmitError::WrongPhase(format!("{:?}", state.phase)));
-        }
-        let errors = validate_plan_submission(&submission, &self.mission_type.inventory());
-        if !errors.is_empty() {
-            return Err(SubmitError::Invalid(errors));
-        }
-        let plan_json = serde_json::to_string(&submission).map_err(anyhow::Error::from)?;
-        let plan_hash = hex::encode(Sha256::digest(plan_json.as_bytes()));
-        let event = NewEvent::new(MissionEvent::PlanSubmitted {
-            plan: submission,
-            plan_hash,
-        });
-        self.store
-            .append(mission_id, state.head, &[event], self.clock.now_ms())
-            .await
-            .map_err(|e| SubmitError::Other(e.into()))?;
-        Ok(())
-    }
-
-    /// Amend a running mission's plan (add / supersede / cancel tasks,
-    /// strengthen the contract). Fail-closed and quiescent: reconcile crashed
-    /// leases first, then refuse (`MissionBusy`) if any effect is still in
-    /// flight; refuse a stale amendment (`StaleRevision`); validate the whole
-    /// resulting plan; append one `PlanAmended` fact event under the head
-    /// guard. An invalid amendment records nothing.
-    pub async fn amend_plan(
-        &self,
-        mission_id: &MissionId,
-        ops: AmendmentOps,
+        proposal: PlanProposal,
         actor: &str,
         justification: &str,
-        base_revision: u32,
-    ) -> Result<(), AmendError> {
-        // Check the cheap guards BEFORE reconciling, so a rejected amendment
-        // has no side effects (reconcile appends synthesized-failure events).
-        // Neither guard can be invalidated by reconcile: it never changes the
-        // revision, nor moves a Running/AttentionNeeded mission out of those
-        // phases (it only synthesizes a failure or re-queues an oracle).
+    ) -> Result<(), ProposeError> {
         let mut state = self.load_state(mission_id).await?;
-        if !matches!(
-            state.phase,
-            MissionPhase::Running | MissionPhase::AttentionNeeded
-        ) {
-            return Err(AmendError::WrongPhase(format!("{:?}", state.phase)));
-        }
-        if base_revision != state.revision {
-            return Err(AmendError::StaleRevision {
-                targeted: base_revision,
-                current: state.revision,
-            });
-        }
-        // Quiesce: reconcile crashed leases so only genuinely-live effects
-        // block, then require an empty in-flight set (whole-mission quiesce).
         while !state.inflight.is_empty() {
             if self.reconcile(&state).await? {
                 state = self.load_state(mission_id).await?;
@@ -294,19 +226,21 @@ impl Engine {
             }
         }
         if !state.inflight.is_empty() {
-            return Err(AmendError::MissionBusy);
+            return Err(ProposeError::MissionBusy);
         }
-        validate_plan_amendment(&state, &ops, &self.mission_type.inventory())?;
-        let event = NewEvent::new(MissionEvent::PlanAmended {
-            base_revision,
-            ops,
+        validate_plan_proposal(&state, &proposal, &self.mission_type.inventory())?;
+        let proposal_json = serde_json::to_string(&proposal).map_err(anyhow::Error::from)?;
+        let plan_hash = hex::encode(Sha256::digest(proposal_json.as_bytes()));
+        let event = NewEvent::new(MissionEvent::PlanProposed {
+            proposal,
+            plan_hash,
             actor: actor.to_string(),
             justification: justification.to_string(),
         });
         self.store
             .append(mission_id, state.head, &[event], self.clock.now_ms())
             .await
-            .map_err(|e| AmendError::Other(e.into()))?;
+            .map_err(|e| ProposeError::Other(e.into()))?;
         Ok(())
     }
 
@@ -337,7 +271,7 @@ impl Engine {
         // The instrument of judgment is pinned: this verifies the mission type's
         // content digest against the one recorded at start, so a mutated role or
         // oracle cannot advance this mission (the fake-green vector). Every method
-        // that loads the pinned type — submit_plan, amend_plan, advance/drive —
+        // that loads the pinned type — propose_plan and advance/drive —
         // funnels here. `decide`/`record_decision` are deliberately store-only
         // (no type loaded): a decision mints no verdict, and the next `advance`
         // re-verifies the digest before any oracle can run.
@@ -617,10 +551,20 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
+        let previous_failure = state
+            .planning
+            .tasks
+            .get(task_id)
+            .or_else(|| state.tasks.get(task_id))
+            .and_then(|task| task.last_failure.as_ref());
+        if attempt_no > 1 && previous_failure.is_some_and(crate::model::RunFailure::transient) {
+            let seconds = 1_u64 << (attempt_no.saturating_sub(2)).min(2);
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+        }
         match self.role_runner.run(request).await {
             Ok(outcome) => {
                 // A planning author's proposal is validated fail-closed before
-                // it is recorded, exactly like a manually submitted plan — an
+                // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
                 if let Handoff::Plan {
                     done: true,
@@ -628,22 +572,18 @@ impl Engine {
                     ..
                 } = &outcome.handoff
                 {
-                    let Some(plan) = proposal else {
+                    let Some(proposal) = proposal else {
                         return Ok(failed(
                             RunErrorKind::HandoffInvalid,
                             "planning author reported done but proposed no plan".to_string(),
                         ));
                     };
-                    let errors = validate_plan_submission(plan, &self.mission_type.inventory());
-                    if !errors.is_empty() {
-                        let detail = errors
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; ");
+                    if let Err(error) =
+                        validate_plan_proposal(state, proposal, &self.mission_type.inventory())
+                    {
                         return Ok(failed(
                             RunErrorKind::HandoffInvalid,
-                            format!("proposed plan is invalid: {detail}"),
+                            format!("proposed plan is invalid: {error}"),
                         ));
                     }
                 }
@@ -685,6 +625,7 @@ impl Engine {
                 judged_sha: judged_sha.to_string(),
                 attempt_no,
                 idempotency_key: idempotency_key.to_string(),
+                error_kind: RunErrorKind::Infra,
                 detail,
                 synthesized: false,
             })
@@ -701,6 +642,7 @@ impl Engine {
             judged_sha: judged_sha.to_string(),
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
+            prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
         };
         match self.oracle_runner.run(request).await {
             Ok(outcome) => Ok(NewEvent::new(MissionEvent::OracleRunCompleted {
@@ -713,6 +655,7 @@ impl Engine {
                 exit_signal: outcome.exit_signal,
                 stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
                 stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
+                prepared_inputs: outcome.prepared_inputs,
                 duration_ms: outcome.duration_ms,
             })),
             Err(failure) => Ok(failed(failure.detail)),
@@ -838,6 +781,20 @@ impl Engine {
         Ok(reports)
     }
 
+    fn resolve_task_feedback(&self, task: &crate::model::TaskRuntimeState) -> Result<Vec<String>> {
+        let mut feedback = Vec::new();
+        if let Some(failure) = &task.last_failure {
+            feedback.push(format!(
+                "Previous attempt failed ({:?}): {}",
+                failure.kind, failure.detail
+            ));
+        }
+        for item in &task.feedback {
+            feedback.push(crate::evidence::render_feedback(self.store.blobs(), item)?);
+        }
+        Ok(feedback)
+    }
+
     /// Assemble an execution role's prompt (`("role", …)` idempotency namespace).
     fn assemble_execution_request(
         &self,
@@ -860,6 +817,12 @@ impl Engine {
             .find(|t| t.id == intent.task_id)
             .context("dispatched task not in plan")?;
         let upstream_reports = self.resolve_upstream_reports(&state.tasks, &task.depends_on)?;
+        let feedback = state
+            .tasks
+            .get(&task.id)
+            .map(|runtime| self.resolve_task_feedback(runtime))
+            .transpose()?
+            .unwrap_or_default();
         let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
         let prompt = assemble_role_prompt(
             role,
@@ -869,6 +832,7 @@ impl Engine {
                 targets: &targets,
                 upstream_reports: &upstream_reports,
                 skills: &skills,
+                feedback: &feedback,
             },
         );
         Ok((prompt, "role"))
@@ -892,6 +856,16 @@ impl Engine {
             .context("dispatched planning task not in the DAG")?;
         let upstream_reports =
             self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
+        let mut feedback = state
+            .planning
+            .tasks
+            .get(&task.id)
+            .map(|runtime| self.resolve_task_feedback(runtime))
+            .transpose()?
+            .unwrap_or_default();
+        for item in &state.planning_feedback {
+            feedback.push(crate::evidence::render_feedback(self.store.blobs(), item)?);
+        }
         let oracle_inventory: Vec<String> = self
             .mission_type
             .oracles
@@ -903,12 +877,15 @@ impl Engine {
             role,
             &PlanningPromptContext {
                 objective: &state.objective,
+                base_revision: state.planning_base_revision.unwrap_or(state.revision),
+                current_plan: state.plan.as_ref(),
                 playbook: self.mission_type.playbook.as_deref(),
                 roles: &self.mission_type.roles,
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
                 skills: &skills,
+                feedback: &feedback,
             },
         );
         Ok((prompt, "plan-role"))
@@ -929,7 +906,7 @@ impl Engine {
         // Planning and execution assemble prompts and namespace idempotency keys
         // separately, so a planning report can never reach an execution judge and
         // a planning id can never collide with an execution one.
-        let (prompt_text, idem_namespace) = if state.plan.is_none() {
+        let (prompt_text, idem_namespace) = if state.planning_base_revision.is_some() {
             self.assemble_planning_request(state, role, &intent)?
         } else {
             self.assemble_execution_request(state, role, &intent)?
@@ -1012,10 +989,23 @@ impl Engine {
         #[expect(clippy::disallowed_methods)]
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let skills = self.resolve_role_skills(role).map_err(anyhow::Error::msg)?;
+        let limitations: Vec<String> = state
+            .plan
+            .iter()
+            .flat_map(|plan| &plan.requirements)
+            .filter_map(|requirement| match &requirement.disposition {
+                crate::model::RequirementDisposition::Limitation { rationale } => Some(format!(
+                    "{}: {} ({rationale})",
+                    requirement.id, requirement.prose
+                )),
+                crate::model::RequirementDisposition::Covered { .. } => None,
+            })
+            .collect();
         let prompt_text = assemble_terminal_review_prompt(
             role,
             &TerminalReviewPromptContext {
                 objective: &state.objective,
+                limitations: &limitations,
                 nonce: &nonce,
                 skills: &skills,
             },
@@ -1131,7 +1121,7 @@ fn idem_key(parts: &[&str]) -> String {
     hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes()))
 }
 
-/// Record a decision without a full engine (the CLI's `ratify`/`decide` need
+/// Record a decision without a full engine (the CLI's `decide` needs
 /// only the store). Folds current state, validates fail-closed, appends.
 pub async fn record_decision(
     store: &MissionStore,
@@ -1146,7 +1136,7 @@ pub async fn record_decision(
     // Preserve the typed `DecisionError` as the error source (its `Display` is
     // already specific: unknown item vs illegal action for the item's kind), so
     // a JSON caller sees the real reason, not a flattened string.
-    crate::model::validate_decision(&state, attention_id, &action)?;
+    crate::model::validate_decision(&state, attention_id, &action, justification)?;
     let event = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
         action,

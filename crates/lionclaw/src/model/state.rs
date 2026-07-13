@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef};
+use super::event::{Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind};
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
-use super::plan::PlanSubmission;
+use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,7 +16,7 @@ use super::verdict::{AuthoritativeVerdict, FinishClass};
 pub enum MissionPhase {
     /// No execution plan yet: drives the in-engine planning DAG (research →
     /// red-team → author) toward a proposal, or — with an empty planning DAG —
-    /// idles awaiting a manually submitted plan.
+    /// idles awaiting a manually proposed plan.
     Planning,
     Running,
     /// Open attention items — parked at zero compute (durable interrupt).
@@ -63,7 +63,7 @@ pub enum TaskStatus {
     Running,
     Cleared,
     Failed,
-    /// Retired by an amendment (superseded or cancelled). A tombstone: the
+    /// Retired by a later plan revision. A tombstone: the
     /// task is removed from the live `plan.tasks`, so no derivation dispatches
     /// or judges it; this row survives in `tasks` (with its `attempts`) for
     /// audit. Never transitions to any other status.
@@ -77,6 +77,65 @@ pub struct TaskRuntimeState {
     /// The latest handoff report, for threading into downstream prompts.
     #[serde(default)]
     pub last_report: Option<PayloadRef>,
+    #[serde(default)]
+    pub last_failure: Option<RunFailure>,
+    /// Engine-routed repair feedback for this task's next attempt.
+    #[serde(default)]
+    pub feedback: Vec<FailureFeedback>,
+}
+
+impl TaskRuntimeState {
+    pub fn automatic_retry_remaining(&self, max_attempts: u32) -> bool {
+        self.status == TaskStatus::Failed
+            && self.attempts < max_attempts
+            && self
+                .last_failure
+                .as_ref()
+                .is_some_and(RunFailure::automatically_retryable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFailure {
+    pub kind: RunErrorKind,
+    pub detail: String,
+    pub synthesized: bool,
+}
+
+impl RunFailure {
+    pub fn automatically_retryable(&self) -> bool {
+        !self.synthesized
+            && matches!(
+                self.kind,
+                RunErrorKind::TurnFailed
+                    | RunErrorKind::Timeout
+                    | RunErrorKind::HandoffMissing
+                    | RunErrorKind::HandoffInvalid
+                    | RunErrorKind::DirtyWorktree
+            )
+    }
+
+    pub fn transient(&self) -> bool {
+        matches!(self.kind, RunErrorKind::TurnFailed | RunErrorKind::Timeout)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureEvidence {
+    pub exit_code: i32,
+    pub exit_signal: Option<i32>,
+    pub stdout: PayloadRef,
+    pub stderr: PayloadRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureFeedback {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<FailureEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<PayloadRef>,
+    pub justification: String,
 }
 
 /// Runtime status of the contract-free planning DAG. A separate map from the
@@ -171,13 +230,13 @@ pub enum ReviewOutcome {
     /// until a decision clears it. Prevents a broken reviewer from
     /// re-requesting forever (mirrors `oracle_failures`).
     Failed {
-        detail: String,
+        failure: RunFailure,
     },
 }
 
-/// How a human accepted closure despite the review: `continue` on a gap park
-/// acknowledges the blocking verdict, `continue` on a failure park waives the
-/// review outright. One value, so waived-and-acknowledged is unrepresentable;
+/// How a human accepted closure despite the review: `accept` on a gap park
+/// acknowledges the blocking verdict, while `accept` on a failure park waives
+/// the review outright. One value, so waived-and-acknowledged is unrepresentable;
 /// the receipt distinguishes the kinds and cites who accepted and why.
 ///
 /// Both kinds are keyed to the head they were granted at: a later artifact
@@ -255,20 +314,19 @@ impl TerminalReviewVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
-    /// The default-on ratification gate: approve the plan before work runs.
-    Ratify,
     NodeFailed,
     NodeAttention,
     /// An oracle failed to *run* (infrastructure), distinct from a nonzero
     /// exit (which is a valid verdict).
     OracleFailed,
+    /// An oracle ran and returned an authoritative nonzero verdict.
+    OracleVerdictFailed,
     GateFailed,
     GateCheckpoint,
-    /// The in-engine author's proposal awaits a human's ratification before it
-    /// seeds the contract.
-    RatifyProposal,
-    /// The terminal review's blocking verdict awaits a human (amend to
-    /// remediate / retry to re-roll / continue to acknowledge-and-close /
+    /// A complete plan proposal awaits approval before promotion.
+    PlanProposal,
+    /// The terminal review's blocking verdict awaits a human (revise to
+    /// remediate / retry to re-run / accept to acknowledge-and-close /
     /// abort). Raised only when the mission would otherwise close, so
     /// remediation work auto-clears it.
     TerminalReviewGaps,
@@ -283,13 +341,13 @@ impl AttentionKind {
     /// the id a user reads is exactly the id they pass back to `decide`.
     pub const fn slug(self) -> &'static str {
         match self {
-            Self::Ratify => "ratify",
             Self::NodeFailed => "node_failed",
             Self::NodeAttention => "node_attention",
             Self::OracleFailed => "oracle_failed",
+            Self::OracleVerdictFailed => "oracle_verdict_failed",
             Self::GateFailed => "gate_failed",
             Self::GateCheckpoint => "gate_checkpoint",
-            Self::RatifyProposal => "ratify_proposal",
+            Self::PlanProposal => "plan_proposal",
             Self::TerminalReviewGaps => "terminal_review_gaps",
             Self::TerminalReviewFailed => "terminal_review_failed",
         }
@@ -307,6 +365,12 @@ pub struct AttentionItem {
     /// The oracle this item is about, if any (oracle infra failures).
     #[serde(default)]
     pub oracle: Option<OracleName>,
+    #[serde(default)]
+    pub assertion_ids: Vec<AssertionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<FailureEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<PayloadRef>,
     pub report: String,
 }
 
@@ -412,7 +476,7 @@ impl InflightEffect {
             // Exhaustive on purpose: a new `…Requested` event must build its
             // inflight entry here, never silently skip the effect ledger.
             MissionEvent::MissionCreated { .. }
-            | MissionEvent::PlanSubmitted { .. }
+            | MissionEvent::PlanProposed { .. }
             | MissionEvent::RoleRunCompleted { .. }
             | MissionEvent::RoleRunFailed { .. }
             | MissionEvent::OracleRunCompleted { .. }
@@ -420,8 +484,7 @@ impl InflightEffect {
             | MissionEvent::TerminalReviewCompleted { .. }
             | MissionEvent::TerminalReviewFailed { .. }
             | MissionEvent::MissionAborted { .. }
-            | MissionEvent::DecisionRecorded { .. }
-            | MissionEvent::PlanAmended { .. } => None,
+            | MissionEvent::DecisionRecorded { .. } => None,
         }
     }
 
@@ -449,19 +512,22 @@ pub struct MissionState {
     pub base_sha: String,
     pub config: MissionConfig,
     pub phase: MissionPhase,
-    pub plan: Option<PlanSubmission>,
+    pub plan: Option<Plan>,
     pub contract: BTreeMap<AssertionId, AssertionState>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
     /// The contract-free planning phase: the runtime status of the mission
     /// type's planning DAG. Disjoint from `tasks` (execution) — planning and
     /// execution ids never coexist, since `plan` goes monotonically `None → Some`.
     pub planning: PlanningState,
-    /// The author's proposed plan, awaiting ratification. Gradeless: it becomes
-    /// `contract`/`tasks` only via `derive_promotion` once ratified. `None`
-    /// before a proposal and after promotion. Every proposal is engine-authored
-    /// and always requires a human `Ratify` (the manual path is `PlanSubmitted`,
-    /// which seeds the contract directly and never populates this field).
-    pub proposal: Option<PlanSubmission>,
+    /// Revision the active planning DAG is authoring against. `None` means the
+    /// planning DAG is idle; this is independent of whether an accepted plan
+    /// already exists, so the same DAG can author repairs.
+    pub planning_base_revision: Option<u32>,
+    /// Evidence and human guidance projected into the active planning run.
+    #[serde(default)]
+    pub planning_feedback: Vec<FailureFeedback>,
+    /// Complete plan proposal awaiting approval or automatic promotion.
+    pub proposal: Option<PlanProposal>,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
     /// are fresh only when judged at this commit.
     pub current_sha: String,
@@ -469,17 +535,17 @@ pub struct MissionState {
     pub oracle_attempts: BTreeMap<OracleName, u32>,
     pub inflight: BTreeMap<String, InflightEffect>,
     /// Derived each fold from failed nodes, gate results, and the
-    /// ratification gate, minus anything a decision has resolved.
+    /// approval gate, minus anything a decision has resolved.
     pub open_attention: BTreeMap<String, AttentionItem>,
-    /// The plan was ratified (the durable ratification gate was answered).
-    /// Cleared on any accepted amendment when the gate is on, so approval of
+    /// The pending proposal was approved (the durable approval gate was answered).
+    /// Cleared on every new proposal when the gate is on, so approval of
     /// one plan revision never authorizes the next (ADR 0006).
-    pub ratified: bool,
-    /// Plan revision: the initial submission is 1, each accepted amendment the
-    /// next. Used for the amendment staleness guard (`base_revision`) and
+    pub proposal_approved: bool,
+    /// Plan revision: the initial proposal promotes to 1, each later proposal
+    /// to the next. Used for the proposal staleness guard (`base_revision`) and
     /// status display; the initial `MissionCreated` state (no plan) is 0.
     pub revision: u32,
-    /// Gate checkpoints the human confirmed (`continue`) — the mission
+    /// Gate checkpoints the human approved — the mission
     /// proceeds past them without re-raising the checkpoint.
     pub acknowledged_gates: std::collections::BTreeSet<TaskId>,
     /// Nodes whose handoff asked for a human look (`request_attention`),
@@ -488,8 +554,8 @@ pub struct MissionState {
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
-    pub oracle_failures: BTreeMap<OracleName, String>,
-    /// Oracles whose obligation a human waived (`continue` on an oracle
+    pub oracle_failures: BTreeMap<OracleName, RunFailure>,
+    /// Oracles whose obligation a human waived (`accept` on an oracle
     /// failure): the mission may finish, but never *verified* — there is no
     /// authoritative verdict.
     pub waived_oracles: std::collections::BTreeSet<OracleName>,
@@ -524,13 +590,13 @@ mod slug_tests {
     #[test]
     fn slugs_match_the_serde_repr() {
         for k in [
-            AttentionKind::Ratify,
             AttentionKind::NodeFailed,
             AttentionKind::NodeAttention,
             AttentionKind::OracleFailed,
+            AttentionKind::OracleVerdictFailed,
             AttentionKind::GateFailed,
             AttentionKind::GateCheckpoint,
-            AttentionKind::RatifyProposal,
+            AttentionKind::PlanProposal,
             AttentionKind::TerminalReviewGaps,
             AttentionKind::TerminalReviewFailed,
         ] {

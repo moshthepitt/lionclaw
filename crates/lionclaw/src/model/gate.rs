@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::ids::TaskId;
-use super::plan::{PlanSubmission, TaskKind};
+use super::plan::{Plan, TaskKind};
 use super::state::MissionState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub enum GateResult {
 
 /// Evaluate a gate given the current advisory state. `gate` must be a gate
 /// task in the plan.
-pub fn evaluate_gate(state: &MissionState, plan: &PlanSubmission, gate_id: &TaskId) -> GateResult {
+pub fn evaluate_gate(state: &MissionState, plan: &Plan, gate_id: &TaskId) -> GateResult {
     let by_id: BTreeMap<&TaskId, &super::plan::Task> =
         plan.tasks.iter().map(|t| (&t.id, t)).collect();
     let Some(gate) = by_id.get(gate_id) else {
@@ -117,8 +117,12 @@ mod tests {
         TaskId::new(s).unwrap()
     }
 
-    fn plan_with(assertions: Vec<Assertion>, tasks: Vec<Task>) -> PlanSubmission {
-        PlanSubmission { assertions, tasks }
+    fn plan_with(assertions: Vec<Assertion>, tasks: Vec<Task>) -> Plan {
+        Plan {
+            requirements: vec![],
+            assertions,
+            tasks,
+        }
     }
 
     fn work(id: &str, targets: &[&str]) -> Task {
@@ -152,12 +156,9 @@ mod tests {
         }
     }
 
-    /// Build a state by folding: create → submit plan → validators report
+    /// Build a state by folding: create → accept a plan → validators report
     /// the given verdicts.
-    fn state_with_verdicts(
-        plan: PlanSubmission,
-        verdicts: &[(&str, &[(&str, bool)])],
-    ) -> MissionState {
+    fn state_with_verdicts(plan: Plan, verdicts: &[(&str, &[(&str, bool)])]) -> MissionState {
         let mission_id = MissionId::from_digest_prefix("abcdef0123456789");
         let mut events = vec![
             env(
@@ -174,7 +175,7 @@ mod tests {
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {
-                        ratification_gate: false,
+                        approval_required: false,
                         ..Default::default()
                     },
                 },
@@ -182,9 +183,14 @@ mod tests {
             env(
                 &mission_id,
                 2,
-                MissionEvent::PlanSubmitted {
-                    plan: plan.clone(),
+                MissionEvent::PlanProposed {
+                    proposal: crate::model::PlanProposal {
+                        base_revision: 0,
+                        plan: plan.clone(),
+                    },
                     plan_hash: "h".into(),
+                    actor: "test".into(),
+                    justification: "initial".into(),
                 },
             ),
         ];

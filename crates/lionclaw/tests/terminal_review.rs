@@ -8,7 +8,7 @@ mod common;
 use std::sync::Mutex;
 
 use common::{
-    blocking_gap, default_config, harness_with_type, review_config, review_mission_type,
+    blocking_gap, default_config, harness_with_type, proposal, review_config, review_mission_type,
     review_runner, simple_plan, ParseTask, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{AdvanceOutcome, TERMINAL_REVIEW_TASK_TAG as REVIEW_TAG};
@@ -38,6 +38,14 @@ async fn started(
     dir: &tempfile::TempDir,
     runner: MockRoleRunner,
 ) -> (common::TestHarness, lionclaw::model::MissionId) {
+    started_with_config(dir, runner, review_config()).await
+}
+
+async fn started_with_config(
+    dir: &tempfile::TempDir,
+    runner: MockRoleRunner,
+    config: lionclaw::model::MissionConfig,
+) -> (common::TestHarness, lionclaw::model::MissionId) {
     let h = harness_with_type(
         dir.path(),
         review_mission_type(),
@@ -51,14 +59,19 @@ async fn started(
             dir.path().to_str().expect("utf8"),
             "make the failing test pass",
             BASE_SHA,
-            review_config(),
+            config,
         )
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     (h, mission_id)
 }
 
@@ -184,15 +197,20 @@ async fn terminal_review_receives_its_declared_skill_packages() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
     assert_eq!(review_calls(&h).len(), 1);
 }
 
 #[tokio::test]
-async fn blocking_gaps_park_then_continue_closes_with_acknowledged_gaps() {
+async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (h, mission_id) = started(&dir, review_runner(vec![(false, vec![blocking_gap()])])).await;
 
@@ -207,7 +225,7 @@ async fn blocking_gaps_park_then_continue_closes_with_acknowledged_gaps() {
         .decide(
             &mission_id,
             "terminal_review_gaps:mission",
-            DecisionAction::Continue,
+            DecisionAction::Accept,
             "gap is acceptable for this release",
             "test",
         )
@@ -225,7 +243,34 @@ async fn blocking_gaps_park_then_continue_closes_with_acknowledged_gaps() {
 }
 
 #[tokio::test]
-async fn an_amendment_resumes_work_and_re_reviews_at_the_new_head() {
+async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (h, mission_id) = started(&dir, review_runner(vec![(false, vec![blocking_gap()])])).await;
+
+    h.engine.advance(&mission_id).await.expect("advance");
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_gaps:mission",
+            DecisionAction::Revise,
+            "repair the observed behavior",
+            "test",
+        )
+        .await
+        .expect("revise");
+
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let feedback = state.planning_feedback.last().expect("planning feedback");
+    assert_eq!(feedback.justification, "repair the observed behavior");
+    let details = feedback.details.as_ref().expect("review report reference");
+    assert_eq!(
+        h.engine.store().blobs().resolve(details).unwrap(),
+        "requirement map + observations"
+    );
+}
+
+#[tokio::test]
+async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
     let dir = tempfile::tempdir().expect("tempdir");
     // First verdict blocks; the re-review after remediation is clean. The
     // worker commits a NEW head on its second run so the verdict stales.
@@ -255,27 +300,25 @@ async fn an_amendment_resumes_work_and_re_reviews_at_the_new_head() {
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(outcome, AdvanceOutcome::Parked { .. }));
 
-    // Remediation is an amendment; the park auto-clears (no second decision).
+    // Remediation is a complete next plan; the park auto-clears.
+    let mut next = simple_plan();
+    next.tasks = vec![Task {
+        id: "fix-gap".parse_task(),
+        kind: TaskKind::Work,
+        body: "Close the reported gap.".to_string(),
+        targets: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
+        role: Some(lionclaw::model::RoleName::new("implementer").expect("role")),
+        depends_on: vec![],
+    }];
     h.engine
-        .amend_plan(
+        .propose_plan(
             &mission_id,
-            lionclaw::model::AmendmentOps {
-                add: vec![Task {
-                    id: "fix-gap".parse_task(),
-                    kind: TaskKind::Work,
-                    body: "Close the reported gap.".to_string(),
-                    targets: vec![],
-                    role: Some(lionclaw::model::RoleName::new("implementer").expect("role")),
-                    depends_on: vec![],
-                }],
-                ..Default::default()
-            },
+            proposal(1, next),
             "test",
             "close the review gap",
-            1,
         )
         .await
-        .expect("amend");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("re-advance");
     assert!(
         matches!(outcome, AdvanceOutcome::Terminal { .. }),
@@ -316,7 +359,9 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
             Ok(work_outcome(request, HEAD_SHA))
         }
     }));
-    let (h, mission_id) = started(&dir, runner).await;
+    let mut config = review_config();
+    config.recovery.max_attempts = 1;
+    let (h, mission_id) = started_with_config(&dir, runner, config).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {
@@ -363,7 +408,9 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
             Ok(work_outcome(request, HEAD_SHA))
         }
     }));
-    let (h, mission_id) = started(&dir, runner).await;
+    let mut config = review_config();
+    config.recovery.max_attempts = 1;
+    let (h, mission_id) = started_with_config(&dir, runner, config).await;
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {
@@ -410,10 +457,10 @@ async fn a_crashed_review_synthesizes_failure_without_rerunning_the_llm() {
     );
     let state = h.engine.load_state(&mission_id).await.expect("state");
     assert!(state.inflight.is_empty());
-    let Some(ReviewOutcome::Failed { detail }) = &state.terminal_review.outcome else {
+    let Some(ReviewOutcome::Failed { failure }) = &state.terminal_review.outcome else {
         panic!("synthesized failure recorded");
     };
-    assert!(detail.contains("unknowable"));
+    assert!(failure.detail.contains("unknowable"));
     assert_eq!(
         h.role_runner
             .invocations_by_key
@@ -448,9 +495,14 @@ async fn a_mission_without_the_config_never_dispatches_a_review() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     assert!(matches!(outcome, AdvanceOutcome::Terminal { .. }));
     assert!(review_calls(&h).is_empty(), "no config, no reviewer");
@@ -532,7 +584,7 @@ async fn a_reviewed_bar_mission_without_the_config_is_refused_at_creation() {
             "obj",
             BASE_SHA,
             lionclaw::model::MissionConfig {
-                ratification_gate: false,
+                approval_required: false,
                 stop: lionclaw::model::StopBar::Reviewed,
                 terminal_review: None,
                 ..Default::default()
@@ -546,8 +598,8 @@ async fn a_reviewed_bar_mission_without_the_config_is_refused_at_creation() {
 #[tokio::test]
 async fn a_stale_waiver_reopens_the_review_after_new_work() {
     // Regression (QA round 1): a waiver is granted at a head, never
-    // inherited. The live sequence: park on a review failure, amend
-    // remediation in WHILE parked, waive the failure — the amended work then
+    // inherited. The live sequence: park on a review failure, propose
+    // remediation in WHILE parked, waive the failure — the revised work then
     // moves the head, the waiver goes stale, and the review re-dispatches at
     // the new head instead of the mission closing reviewless.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -575,36 +627,31 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
             Ok(work_outcome(request, &head))
         }
     }));
-    let (h, mission_id) = started(&dir, runner).await;
+    let mut config = review_config();
+    config.recovery.max_attempts = 1;
+    let (h, mission_id) = started_with_config(&dir, runner, config).await;
 
-    // Park on the review failure; amend follow-up work in while parked.
+    // Park on the review failure; propose follow-up work while parked.
     h.engine.advance(&mission_id).await.expect("advance");
+    let mut next = simple_plan();
+    next.tasks = vec![Task {
+        id: "more".parse_task(),
+        kind: TaskKind::Work,
+        body: "Follow-up work proposed while parked.".to_string(),
+        targets: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
+        role: Some(lionclaw::model::RoleName::new("implementer").expect("role")),
+        depends_on: vec![],
+    }];
     h.engine
-        .amend_plan(
-            &mission_id,
-            lionclaw::model::AmendmentOps {
-                add: vec![Task {
-                    id: "more".parse_task(),
-                    kind: TaskKind::Work,
-                    body: "Follow-up work amended in while parked.".to_string(),
-                    targets: vec![],
-                    role: Some(lionclaw::model::RoleName::new("implementer").expect("role")),
-                    depends_on: vec![],
-                }],
-                ..Default::default()
-            },
-            "test",
-            "follow-up work",
-            1,
-        )
+        .propose_plan(&mission_id, proposal(1, next), "test", "follow-up work")
         .await
-        .expect("amend");
+        .expect("propose");
     // Waive the failure at the CURRENT head; the pending work resumes.
     h.engine
         .decide(
             &mission_id,
             "terminal_review_failed:mission",
-            DecisionAction::Continue,
+            DecisionAction::Accept,
             "reviewer infra is down today",
             "test",
         )
@@ -616,7 +663,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
         matches!(outcome, AdvanceOutcome::Terminal { .. }),
         "got {outcome:?}"
     );
-    // The amended work moved the head, staling the waiver: a second review
+    // The revised work moved the head, staling the waiver: a second review
     // ran at the new head and its verdict is on record.
     assert_eq!(review_calls(&h).len(), 2, "the stale waiver must re-review");
     let state = h.engine.load_state(&mission_id).await.expect("state");
@@ -651,7 +698,7 @@ async fn a_config_naming_an_unknown_or_non_verdict_reviewer_is_refused_at_creati
                 "obj",
                 BASE_SHA,
                 lionclaw::model::MissionConfig {
-                    ratification_gate: false,
+                    approval_required: false,
                     terminal_review: Some(lionclaw::model::TerminalReviewConfig {
                         role: lionclaw::model::RoleName::new(role).expect("role name"),
                     }),
@@ -691,7 +738,7 @@ async fn a_hostile_log_with_an_unresolvable_reviewer_parks_instead_of_wedging() 
         workspace_dir: dir.path().to_string_lossy().into_owned(),
         base_sha: BASE_SHA.into(),
         config: lionclaw::model::MissionConfig {
-            ratification_gate: false,
+            approval_required: false,
             terminal_review: Some(lionclaw::model::TerminalReviewConfig {
                 role: lionclaw::model::RoleName::new("ghost").expect("role name"),
             }),
@@ -710,9 +757,14 @@ async fn a_hostile_log_with_an_unresolvable_reviewer_parks_instead_of_wedging() 
         .await
         .expect("hostile create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
 
     let outcome = h.engine.advance(&mission_id).await.expect("advance");
     let AdvanceOutcome::Parked { attention } = outcome else {

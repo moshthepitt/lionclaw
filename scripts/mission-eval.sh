@@ -16,7 +16,7 @@ trap 'rm -rf "$WORK"' EXIT
 # Install the mission types into an isolated home so `--type software-dev`
 # resolves and the dev's real ~/.lionclaw is untouched.
 export LIONCLAW_HOME="$WORK/home"
-"$BIN" install --from "$ROOT/mission-types" >/dev/null
+"$BIN" install "$ROOT/mission-types/software-dev" >/dev/null
 
 git_quiet() { git -c user.name=eval -c user.email=eval@local -c commit.gpgsign=false "$@"; }
 
@@ -43,10 +43,12 @@ scenario_fix_bug() {
             --objective "Fix the off-by-one in overlaps() so all tests pass. Do not weaken any test." \
             --yes | python3 -c 'import sys,json;print(json.load(sys.stdin)["mission_id"])')"
         cat > "$repo/plan.json" <<JSON
-{ "assertions": [ { "id": "TESTS-PASS", "prose": "cargo test passes at the final commit", "oracle": "cargo-test" } ],
-  "tasks": [ { "id": "fix", "kind": "work", "body": "Fix overlaps() for closed intervals so tests::touching_intervals_overlap and merge_coalesces_touching_intervals pass. Do not modify the tests.", "targets": ["TESTS-PASS"], "role": "implementer", "depends_on": [] } ] }
+{ "base_revision": 0, "plan": {
+  "requirements": [ { "id": "CORRECT-OVERLAPS", "kind": "capability", "prose": "closed intervals that touch overlap", "disposition": { "type": "covered", "assertion_ids": ["TESTS-PASS"] } } ],
+  "assertions": [ { "id": "TESTS-PASS", "prose": "cargo test passes at the final commit", "oracle": "cargo-test" } ],
+  "tasks": [ { "id": "fix", "kind": "work", "body": "Fix overlaps() for closed intervals so tests::touching_intervals_overlap and merge_coalesces_touching_intervals pass. Do not modify the tests.", "targets": ["TESTS-PASS"], "role": "implementer", "depends_on": [] } ] } }
 JSON
-        "$BIN" mission submit-plan "$mid" --repo "$repo" --plan "$repo/plan.json" >/dev/null 2>&1
+        "$BIN" mission plan propose "$mid" --repo "$repo" --file "$repo/plan.json" >/dev/null 2>&1
         timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head; finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
@@ -62,18 +64,18 @@ JSON
 }
 
 # NOTE: the former "reviewer catches a planted regression" scenario was removed.
-# It needs a reviewer-only (oracle-less) assertion, which is only submittable
+# It needs a reviewer-only (oracle-less) assertion, which is only valid
 # under a `stop = reviewed` mission type — and no product mission type ships with
 # that bar today (software-dev is `verified`, which rejects an oracle-less
-# assertion at submit). The advisory-only-can't-verify behavior it checked stays
+# assertion when proposed). The advisory-only-can't-verify behavior it checked stays
 # covered deterministically by `cargo test --test eval_deterministic`. Restore an
 # agentic reviewer scenario once a `reviewed`-stop mission type (e.g. code-review)
 # ships.
 
-# --- Scenario 2: planning-in-phase -> ratify -> verified -------------------
+# --- Scenario 2: planning-in-phase -> approve -> verified -----------------
 # No hand-written plan: the planning DAG (strategist -> red-team -> author)
-# proposes the contract, a human ratifies it, then execution verifies. The
-# ratification gate is ON (no --yes), so planning must park before any work.
+# proposes the contract, a human approves it, then execution verifies. The
+# approval gate is ON (no --yes), so planning must park before any work.
 scenario_planning() {
     local pass=0
     for i in $(seq 1 "$RUNS"); do
@@ -87,25 +89,27 @@ scenario_planning() {
         timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
         local phase; phase="$(mission_json status "$mid" --repo "$repo" \
             | python3 -c 'import sys,json;print(json.load(sys.stdin).get("phase"))')"
-        # Ratify the proposal (seeds the contract), then execute to a verdict.
-        "$BIN" mission ratify "$mid" --repo "$repo" >/dev/null 2>&1
+        # Approve the proposal (seeds the contract), then execute to a verdict.
+        local item; item="$(mission_json status "$mid" --repo "$repo" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["attention"][0]["id"])')"
+        "$BIN" mission decide "$mid" "$item" approve --repo "$repo" >/dev/null 2>&1
         timeout 900 "$BIN" mission advance "$mid" --repo "$repo" >/dev/null 2>&1
         local status; status="$(mission_json status "$mid" --repo "$repo")"
         local finish head
         finish="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("finish"))')"
         head="$(echo "$status" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("current_sha"))')"
         if [ "$finish" = "verified" ] && [ "$head" != "$base" ]; then
-            echo "  run $i: PASS (planned, ratified, verified; head $head)"; pass=$((pass+1))
+            echo "  run $i: PASS (planned, approved, verified; head $head)"; pass=$((pass+1))
         else
             echo "  run $i: FAIL (phase-after-plan=$phase, finish=$finish, head=$head, base=$base)"
         fi
     done
-    echo "scenario 2 (planning -> ratify -> verified): $pass/$RUNS verified"
+    echo "scenario 2 (planning -> approve -> verified): $pass/$RUNS verified"
     [ "$pass" -ge 2 ] && echo "  => SCENARIO 2 PASS" || echo "  => SCENARIO 2 FAIL"
 }
 
 echo "== Slice 6 agentic eval ($RUNS runs each) =="
 echo "[1] fixes the bug -> verified"
 scenario_fix_bug
-echo "[2] planning -> ratify -> verified"
+echo "[2] planning -> approve -> verified"
 scenario_planning

@@ -7,8 +7,8 @@
 mod common;
 
 use common::{
-    blocking_gap, default_config, harness, harness_with_type, review_config, review_mission_type,
-    review_runner, simple_plan, TestHarness, BASE_SHA, HEAD_SHA,
+    blocking_gap, default_config, harness, harness_with_type, proposal, review_config,
+    review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::model::{apply, fold, DecisionAction, MissionId};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -90,9 +90,14 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
 
     assert_fold_litmus(&h, &mission_id).await;
@@ -122,9 +127,14 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine
         .advance(&mission_id)
         .await
@@ -133,7 +143,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         .decide(
             &mission_id,
             "terminal_review_gaps:mission",
-            DecisionAction::Continue,
+            DecisionAction::Accept,
             "acceptable",
             "test",
         )
@@ -167,9 +177,14 @@ async fn snapshot_resume_matches_full_refold() {
         .await
         .expect("create");
     h.engine
-        .submit_plan(&mission_id, simple_plan())
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
         .await
-        .expect("submit");
+        .expect("propose");
     h.engine.advance(&mission_id).await.expect("advance");
 
     // Prove the snapshot branch is actually taken (not silently full-refolding

@@ -10,8 +10,10 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::mission_type::{RoleDefinition, SkillPackage};
-use crate::model::{ArtifactOutcome, Handoff, MissionId, OracleName, RunErrorKind, TaskId};
+use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
+use crate::model::{
+    ArtifactOutcome, Handoff, MissionId, OracleName, PreparedInputRef, RunErrorKind, TaskId,
+};
 
 /// One full autonomous agent run — the engine never micromanages how a role
 /// works. The engine guarantees an idempotency key with a recorded outcome
@@ -76,6 +78,7 @@ pub struct OracleRunRequest {
     pub judged_sha: String,
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub prepared_inputs: Vec<PreparedInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,7 @@ pub struct OracleOutcome {
     pub exit_signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub prepared_inputs: Vec<PreparedInputRef>,
     pub duration_ms: u64,
 }
 

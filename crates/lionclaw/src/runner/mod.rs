@@ -4,9 +4,11 @@
 mod executor;
 mod handoff;
 mod native_home_auth;
+mod prepared_input;
 mod role_runner;
 
 pub use executor::MissionProgramExecutor;
+pub(crate) use prepared_input::{prepare_inputs, PreparedInputs};
 pub use role_runner::OciRoleRunner;
 
 use std::path::{Path, PathBuf};
