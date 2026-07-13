@@ -11,10 +11,10 @@ proves it.
    the finished code, with an uppercase id (`^[A-Z][A-Z0-9-]+$`) and prose the
    reviewer and oracles can judge against. This mission type stops at **verified**, so
    **every** contract assertion must bind an **oracle** — the engine rejects an
-   oracle-less assertion when the plan is proposed. A claim no command can check (design,
-   readability, intent) does not belong in the contract here; capture it as a
-   reviewer's remit on an oracle-bound assertion (point 3), never as an
-   assertion of its own.
+   oracle-less assertion when the plan is proposed. A claim no command can
+   check (design, readability, intent) does not belong in the contract here;
+   capture it as a reviewer's remit on an oracle-bound assertion (point 3),
+   never as an assertion of its own.
 
 2. **Choose work boundaries by coherent outcome ownership.** Assertions are
    units of proof; work tasks own implementation outcomes. Exactly one active
