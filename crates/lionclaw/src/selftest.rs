@@ -1,7 +1,7 @@
 //! `lionclaw mission self-test`: drive the real stack (real store + fold +
 //! loop + real podman confinement + real engine-run oracle) and assert the
 //! four Slice-1 invariants, complete plan revision, terminal-review closure,
-//! and native read-only skill mounting (seven numbered checks). Hermetic and
+//! native read-only skill mounting, and prepared inputs (eight checks). Hermetic and
 //! model-auth-free — the *oracle*
 //! decides every outcome, so no agent turn (and no model credentials) is
 //! required. The agentic multi-run eval stays in `scripts/mission-eval.sh`.
@@ -23,7 +23,7 @@ use crate::authority::{
     MissionMounts, RolePlanRequest,
 };
 use crate::config::RuntimeProfiles;
-use crate::engine::{Engine, ProposeError};
+use crate::engine::{AdvanceOutcome, Engine, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
     ArtifactOutcome, Assertion, AssertionId, DecisionAction, FinishClass, Gap, GapSeverity,
@@ -124,6 +124,7 @@ impl OracleRunner for FixedOracleRunner {
             exit_signal: None,
             stdout: format!("self-test oracle exit {}", self.0).into_bytes(),
             stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
             duration_ms: 1,
         })
     }
@@ -203,6 +204,9 @@ fn runtime_checks() -> Vec<(&'static str, RuntimeCheck)> {
         }),
         ("runtime-native-skill-mount", || {
             Box::pin(check_runtime_skill_mount())
+        }),
+        ("prepared-input-feeds-network-off-oracle", || {
+            Box::pin(check_prepared_input())
         }),
     ]
 }
@@ -324,6 +328,10 @@ runtime: codex
 Self-test worker.
 ";
 const CARGO_TEST_ORACLE: &str = "#!/bin/sh\nset -e\ncd /workspace\nexec cargo test --locked\n";
+const PREPARED_CARGO_TEST_ORACLE: &str =
+    "#!/bin/sh\nset -e\ntest \"$(cat /inputs/fixture/sentinel)\" = prepared\ncd /workspace\nexec cargo test --locked\n";
+const PREPARE_FIXTURE_INPUT: &str =
+    "#!/bin/sh\nset -e\nprintf prepared > \"$LIONCLAW_OUTPUT/sentinel\"\n";
 
 // A verdict role that illegally requests secrets — the loader must refuse it.
 // (A judge can't be declared *writable* in a mission type — workspace access is
@@ -342,6 +350,7 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::create_dir_all(root.join("oracles"))?;
     std::fs::write(root.join("mission.toml"), manifest_toml("selftest"))?;
+    std::fs::write(root.join("playbook.md"), "# Self-test\n")?;
     std::fs::write(root.join("roles/implementer.md"), IMPLEMENTER_ROLE)?;
     let oracle = root.join("oracles/cargo-test");
     std::fs::write(&oracle, CARGO_TEST_ORACLE)?;
@@ -349,9 +358,29 @@ fn materialize_sw_mission_type(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn materialize_input_mission_type(root: &Path) -> Result<()> {
+    materialize_sw_mission_type(root)?;
+    std::fs::write(
+        root.join("mission.toml"),
+        format!(
+            "{}\n[[inputs]]\nname = \"fixture\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\n",
+            manifest_toml("input-selftest")
+        ),
+    )?;
+    std::fs::create_dir_all(root.join("inputs"))?;
+    let input = root.join("inputs/fixture");
+    std::fs::write(&input, PREPARE_FIXTURE_INPUT)?;
+    workspace::make_executable(&input)?;
+    let oracle = root.join("oracles/cargo-test");
+    std::fs::write(&oracle, PREPARED_CARGO_TEST_ORACLE)?;
+    workspace::make_executable(&oracle)?;
+    Ok(())
+}
+
 fn materialize_secrets_judge_mission_type(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("roles"))?;
     std::fs::write(root.join("mission.toml"), manifest_toml("secrets-judge"))?;
+    std::fs::write(root.join("playbook.md"), "# Secrets judge\n")?;
     std::fs::write(root.join("roles/reviewer.md"), SECRETS_JUDGE_REVIEWER)?;
     Ok(())
 }
@@ -634,6 +663,65 @@ async fn check_happy_writer_and_resume() -> Result<()> {
     Ok(())
 }
 
+async fn check_prepared_input() -> Result<()> {
+    let repo = tempfile::tempdir().context("tempdir")?;
+    let type_dir = tempfile::tempdir().context("tempdir")?;
+    materialize_input_mission_type(type_dir.path())?;
+    let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let engine = build_engine(
+        repo.path(),
+        type_dir.path(),
+        Arc::new(NoopRoleRunner),
+        count,
+    )
+    .await?;
+    let id = engine
+        .create_mission(
+            &repo.path().to_string_lossy(),
+            "self-test prepared input",
+            &base,
+            MissionConfig {
+                approval_required: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+    engine
+        .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
+        .await
+        .map_err(|error| anyhow::anyhow!("submit rejected: {error}"))?;
+    assert_verified(&engine, &id).await?;
+
+    let state = engine.load_state(&id).await?;
+    let verdict = state
+        .contract
+        .values()
+        .next()
+        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .context("prepared-input oracle verdict missing")?;
+    let input = verdict
+        .prepared_inputs()
+        .first()
+        .context("oracle receipt omitted its prepared input")?;
+    if input.name.as_str() != "fixture" {
+        anyhow::bail!("unexpected prepared input '{}'", input.name);
+    }
+    let cache = repo
+        .path()
+        .join(".lionclaw/inputs/sha256")
+        .join(&input.digest[..2])
+        .join(&input.digest[2..4])
+        .join(&input.digest);
+    if !cache.join("sentinel").is_file() {
+        anyhow::bail!(
+            "prepared input was not atomically published at '{}'",
+            cache.display()
+        );
+    }
+    Ok(())
+}
+
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     let outcome = engine.advance(id).await?;
     let state = engine.load_state(id).await?;
@@ -645,9 +733,9 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
     }
 }
 
-/// (2) The real cargo-test oracle on a genuinely-broken tree ⇒ the mission
-/// finishes Unverified (specifically — not merely "not verified"). The noop
-/// worker leaves the tree broken so the oracle is what decides.
+/// (2) The real cargo-test oracle on a genuinely-broken tree records a valid
+/// authoritative failure and parks on the repair path. The noop worker leaves
+/// the tree broken so the oracle is what decides.
 async fn check_oracle_honesty() -> Result<()> {
     let repo = tempfile::tempdir().context("tempdir")?;
     let type_dir = tempfile::tempdir().context("tempdir")?;
@@ -676,18 +764,25 @@ async fn check_oracle_honesty() -> Result<()> {
         .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
         .await
         .map_err(|e| anyhow::anyhow!("submit rejected: {e}"))?;
-    engine.advance(&id).await?;
-    match engine.load_state(&id).await?.phase {
-        MissionPhase::Done {
-            finish: FinishClass::Unverified,
-        } => Ok(()),
-        MissionPhase::Done { finish } => {
-            anyhow::bail!("a failing oracle produced finish {finish:?}; expected unverified")
-        }
-        other => {
-            anyhow::bail!("mission did not finish (phase {other:?}); oracle infra may be broken")
-        }
+    let outcome = engine.advance(&id).await?;
+    let state = engine.load_state(&id).await?;
+    let verdict = state
+        .contract
+        .values()
+        .next()
+        .and_then(|assertion| assertion.last_authoritative.as_ref())
+        .context("failing oracle produced no authoritative verdict")?;
+    if verdict.passed() {
+        anyhow::bail!("the genuinely broken tree received an authoritative pass");
     }
+    if !matches!(outcome, AdvanceOutcome::Parked { .. })
+        || !state
+            .open_attention
+            .contains_key("oracle_verdict_failed:cargo-test")
+    {
+        anyhow::bail!("failing oracle did not park on its repair path: {outcome:?}");
+    }
+    Ok(())
 }
 
 /// (3) A mission type declaring an over-privileged judge refuses to load with a
@@ -702,7 +797,7 @@ async fn check_moat() -> Result<()> {
     }
 }
 
-/// (5) Re-planning through the shipped binary: an revision supersedes a live
+/// (5) Re-planning through the shipped binary: a revision supersedes a live
 /// task and strengthens the contract atomically (revision bumps, the old task
 /// becomes a `Superseded` tombstone), while a contract-weakening revision is
 /// refused. Pure — no agent turn, no oracle run — so it always runs.

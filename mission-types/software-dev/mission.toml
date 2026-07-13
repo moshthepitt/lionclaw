@@ -15,6 +15,12 @@ role = "gap-reviewer"
 [recovery]
 max-attempts = 3
 
+[[inputs]]
+name = "cargo-home"
+network = true
+key-files = ["Cargo.lock"]
+environment = { CARGO_HOME = "/inputs/cargo-home" }
+
 # The planning DAG: an objective becomes a proposed contract via research →
 # adversarial critique → authored proposal. All read-only; the author (the
 # unique sink) emits the complete proposal, which mission policy approves

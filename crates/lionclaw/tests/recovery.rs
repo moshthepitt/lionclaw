@@ -147,6 +147,7 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
                 exit_signal: None,
                 stdout: b"test output".to_vec(),
                 stderr: b"compiler diagnostic".to_vec(),
+                prepared_inputs: Vec::new(),
                 duration_ms: 1,
             }
         } else {
@@ -155,6 +156,7 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
                 exit_signal: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
+                prepared_inputs: Vec::new(),
                 duration_ms: 1,
             }
         })

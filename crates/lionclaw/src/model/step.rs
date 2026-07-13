@@ -462,6 +462,7 @@ mod tests {
             exit_signal: None,
             stdout: PayloadRef::inline("oracle stdout"),
             stderr: PayloadRef::inline(""),
+            prepared_inputs: Vec::new(),
             duration_ms: 0,
         }
     }

@@ -340,6 +340,55 @@ fn the_minimal_type_loads() {
     load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid type loads");
 }
 
+fn add_input_program(root: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(root.join("inputs")).unwrap();
+    write_oracle(
+        &root.join("inputs").join(name),
+        "#!/bin/sh\ncp /workspace/Cargo.lock /output/Cargo.lock\n",
+        true,
+    );
+}
+
+#[test]
+fn prepared_input_declarations_load_as_plain_mission_type_data() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cargo-home");
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[[inputs]]\nname = \"cargo-home\"\nnetwork = true\nkey-files = [\"Cargo.lock\"]\nenvironment = { CARGO_HOME = \"/inputs/cargo-home\" }\n",
+    )
+    .unwrap();
+
+    let mission_type =
+        load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid input");
+    let input = &mission_type.inputs[&lionclaw::model::InputName::new("cargo-home").unwrap()];
+    assert!(input.network);
+    assert_eq!(input.key_files, [PathBuf::from("Cargo.lock")]);
+    assert_eq!(input.environment["CARGO_HOME"], "/inputs/cargo-home");
+}
+
+#[test]
+fn prepared_inputs_require_explicit_authority_and_safe_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    add_input_program(dir.path(), "cargo-home");
+    for declaration in [
+        "name = \"cargo-home\"\nkey-files = [\"Cargo.lock\"]",
+        "name = \"cargo-home\"\nnetwork = false\nkey-files = [\"../Cargo.lock\"]",
+    ] {
+        std::fs::write(
+            dir.path().join("mission.toml"),
+            format!(
+                "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\n[[inputs]]\n{declaration}\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_mission_type(dir.path(), &AuthorityCeiling::default()).is_err());
+    }
+}
+
 #[test]
 fn a_non_executable_oracle_is_rejected() {
     let dir = tempfile::tempdir().unwrap();

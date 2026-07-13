@@ -207,6 +207,7 @@ fn execution_mission_type(
         playbook: None,
         roles,
         skills: skills.clone(),
+        inputs: BTreeMap::new(),
         oracles: BTreeMap::from([(
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),
@@ -418,6 +419,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
                 description: "A methodical planning approach".to_string(),
             },
         )]),
+        inputs: BTreeMap::new(),
         oracles: BTreeMap::from([(
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),

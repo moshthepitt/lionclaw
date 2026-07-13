@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
+use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
 pub const SCHEMA_VERSION: u32 = 3;
@@ -240,6 +240,12 @@ pub struct ArtifactOutcome {
     pub head_sha: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedInputRef {
+    pub name: InputName,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunErrorKind {
@@ -327,6 +333,8 @@ pub enum MissionEvent {
         exit_signal: Option<i32>,
         stdout: PayloadRef,
         stderr: PayloadRef,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prepared_inputs: Vec<PreparedInputRef>,
         duration_ms: u64,
     },
     OracleRunFailed {

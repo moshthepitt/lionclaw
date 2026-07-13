@@ -167,6 +167,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             exit_signal,
             stdout,
             stderr,
+            prepared_inputs,
             ..
         } => {
             state.inflight.remove(idempotency_key);
@@ -178,6 +179,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 *exit_signal,
                 stdout.clone(),
                 stderr.clone(),
+                prepared_inputs.clone(),
             );
             for assertion_id in assertion_ids {
                 if let Some(assertion) = state.contract.get_mut(assertion_id) {
@@ -1257,6 +1259,7 @@ mod tests {
             exit_signal: None,
             stdout: PayloadRef::inline("out"),
             stderr: PayloadRef::inline("err"),
+            prepared_inputs: Vec::new(),
             duration_ms: 5,
         }
     }
@@ -1872,6 +1875,7 @@ mod tests {
                 exit_signal: Some(9), // SIGKILL (timeout/OOM) despite exit 0
                 stdout: PayloadRef::inline("out"),
                 stderr: PayloadRef::inline("err"),
+                prepared_inputs: Vec::new(),
                 duration_ms: 5,
             },
         ])

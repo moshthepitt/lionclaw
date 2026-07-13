@@ -32,6 +32,8 @@ const RESERVED_TARGETS: &[&str] = &[
     RUNTIME_HOME_MOUNT_TARGET,
     "/mission",
     "/scratch",
+    "/inputs",
+    "/output",
     "/lionclaw",
 ];
 
@@ -159,6 +161,27 @@ pub fn oracle_authority(oracle_name: &str) -> CompiledAuthority {
         preset: ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadOnly,
             network_mode: NetworkMode::None,
+            install_policy: InstallPolicy::None,
+            mount_runtime_secrets: false,
+            escape_classes: BTreeSet::new(),
+        },
+    }
+}
+
+/// Authority for producing one declared, immutable mission input. The source
+/// workspace is read-only and secret-free; only the declaration controls
+/// network access, and the output mount lives outside the judged tree.
+pub fn prepared_input_authority(input_name: &str, network: bool) -> CompiledAuthority {
+    CompiledAuthority {
+        role_name: format!("input:{input_name}"),
+        output: OutputSemantics::EmitsVerdict,
+        preset: ExecutionPreset {
+            workspace_access: WorkspaceAccess::ReadOnly,
+            network_mode: if network {
+                NetworkMode::On
+            } else {
+                NetworkMode::None
+            },
             install_policy: InstallPolicy::None,
             mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),

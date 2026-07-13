@@ -924,6 +924,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "exit_signal": v.exit_signal(),
                 "judged_sha": v.judged_sha(),
                 "fresh": v.is_fresh_at(&state.current_sha),
+                "prepared_inputs": v.prepared_inputs(),
                 "evidence": crate::evidence::evidence_json(store.blobs(), &evidence)?,
             }))
         } else {
@@ -1117,6 +1118,21 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                         " [STALE — not at the final commit]"
                     },
                 );
+                let prepared = v["prepared_inputs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|input| {
+                        Some(format!(
+                            "{}@{}",
+                            input["name"].as_str()?,
+                            short_hex(input["digest"].as_str()?)
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                if !prepared.is_empty() {
+                    println!("      prepared inputs: {}", prepared.join(", "));
+                }
                 if !passed {
                     let assertion = state.contract.get(
                         &crate::model::AssertionId::new(id).expect("stored assertion id")
@@ -1559,6 +1575,14 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
                     (role.name.as_str(), &role.skills)
                 }).collect::<std::collections::BTreeMap<_, _>>(),
                 "skills": mt.skills.keys().collect::<Vec<_>>(),
+                "inputs": mt.inputs.values().map(|input| {
+                    serde_json::json!({
+                        "name": input.name.as_str(),
+                        "network": input.network,
+                        "key_files": input.key_files,
+                        "environment": input.environment,
+                    })
+                }).collect::<Vec<_>>(),
                 "oracles": mt.oracles.keys().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "terminal_review": mt.terminal_review.as_ref().map(|tr| {
                     serde_json::json!({ "role": tr.role.as_str() })
@@ -1586,6 +1610,24 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
     println!(
         "  skills: {}",
         mt.skills.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    println!(
+        "  inputs: {}",
+        mt.inputs
+            .values()
+            .map(|input| format!(
+                "{} (network={}, keys={})",
+                input.name,
+                input.network,
+                input
+                    .key_files
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "  oracles: {}",
@@ -1872,6 +1914,7 @@ mod tests {
                 },
             )]),
             skills: BTreeMap::new(),
+            inputs: BTreeMap::new(),
             oracles: BTreeMap::new(),
         }
     }
@@ -2058,6 +2101,7 @@ mod tests {
             exit_signal: None,
             stdout: PayloadRef::inline(""),
             stderr: PayloadRef::inline(""),
+            prepared_inputs: Vec::new(),
             duration_ms: 1,
         }
     }
@@ -2090,6 +2134,7 @@ mod tests {
             exit_signal: None,
             stdout: PayloadRef::inline("ordinary output"),
             stderr: PayloadRef::inline("the actual diagnostic"),
+            prepared_inputs: Vec::new(),
             duration_ms: 1,
         }]);
         let item = state

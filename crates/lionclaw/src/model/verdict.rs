@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{PayloadRef, StopBar};
+use super::event::{PayloadRef, PreparedInputRef, StopBar};
 use super::ids::OracleName;
 use super::state::{AdvisoryStatus, MissionState};
 
@@ -23,6 +23,8 @@ pub struct AuthoritativeVerdict {
     exit_signal: Option<i32>,
     stdout: PayloadRef,
     stderr: PayloadRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prepared_inputs: Vec<PreparedInputRef>,
 }
 
 impl AuthoritativeVerdict {
@@ -33,6 +35,7 @@ impl AuthoritativeVerdict {
         exit_signal: Option<i32>,
         stdout: PayloadRef,
         stderr: PayloadRef,
+        prepared_inputs: Vec<PreparedInputRef>,
     ) -> Self {
         Self {
             passed: exit_code == 0 && exit_signal.is_none(),
@@ -42,6 +45,7 @@ impl AuthoritativeVerdict {
             exit_signal,
             stdout,
             stderr,
+            prepared_inputs,
         }
     }
 
@@ -74,6 +78,10 @@ impl AuthoritativeVerdict {
 
     pub fn evidence(&self) -> (&PayloadRef, &PayloadRef) {
         (&self.stdout, &self.stderr)
+    }
+
+    pub fn prepared_inputs(&self) -> &[PreparedInputRef] {
+        &self.prepared_inputs
     }
 }
 

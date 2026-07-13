@@ -135,6 +135,7 @@ impl MockOracleRunner {
                 exit_signal: None,
                 stdout: format!("oracle exit {exit_code}").into_bytes(),
                 stderr: Vec::new(),
+                prepared_inputs: Vec::new(),
                 duration_ms: 42,
             })
         }))

@@ -68,8 +68,10 @@ mod tests {
         assert!(root.join("skills/scrutiny-validator/SKILL.md").is_file());
 
         let oracle = std::fs::metadata(root.join("oracles/cargo-test")).unwrap();
+        let input = std::fs::metadata(root.join("inputs/cargo-home")).unwrap();
         let playbook = std::fs::metadata(root.join("playbook.md")).unwrap();
         assert_ne!(oracle.permissions().mode() & 0o111, 0);
+        assert_ne!(input.permissions().mode() & 0o111, 0);
         assert_eq!(playbook.permissions().mode() & 0o111, 0);
     }
 }

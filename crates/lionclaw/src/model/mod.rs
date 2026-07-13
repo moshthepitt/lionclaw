@@ -19,14 +19,14 @@ pub mod verdict;
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     ArtifactOutcome, BlobRef, DecisionAction, EventEnvelope, Gap, GapSeverity, Handoff, IdemClass,
-    MissionConfig, MissionEvent, MissionTypeRef, PayloadRef, RecoveryConfig, RunErrorKind, StopBar,
-    TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    MissionConfig, MissionEvent, MissionTypeRef, PayloadRef, PreparedInputRef, RecoveryConfig,
+    RunErrorKind, StopBar, TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
 pub use ids::{
-    short_hex, AssertionId, IdError, MissionId, OracleName, RequirementId, RoleName, TaskId,
-    TERMINAL_REVIEW_TASK_TAG,
+    short_hex, AssertionId, IdError, InputName, MissionId, OracleName, RequirementId, RoleName,
+    TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
     Assertion, OutputSemantics, PlanProposal, PlanSubmission, PlanningDag, PlanningTask,

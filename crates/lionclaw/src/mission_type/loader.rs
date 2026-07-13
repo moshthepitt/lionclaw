@@ -6,14 +6,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
-use crate::model::{OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig};
+use crate::model::{
+    InputName, OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig,
+};
 
 use super::digest::ContentDigest;
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
 use super::install::validate_closed_tree;
-use super::manifest::{is_path_safe_name, ManifestFile, MISSION_LOCK_FILE};
+use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput, MISSION_LOCK_FILE};
 use super::skills::{load_skills, package_files};
-use super::{MissionType, RoleDefinition, SkillPackage};
+use super::{MissionType, PreparedInput, RoleDefinition, SkillPackage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionTypeError {
@@ -34,6 +36,8 @@ pub enum MissionTypeError {
     },
     #[error("oracle '{oracle}' is invalid: {detail}")]
     Oracle { oracle: String, detail: String },
+    #[error("prepared input '{input}' is invalid: {detail}")]
+    Input { input: String, detail: String },
     #[error("skill '{skill}' is invalid: {detail}")]
     Skill { skill: String, detail: String },
     #[error("mission type at '{0}' has no roles")]
@@ -81,6 +85,7 @@ pub fn load_mission_type(
     }
 
     let skills = load_skills(root)?;
+    let inputs = load_inputs(root, manifest.inputs)?;
     let oracles = load_oracles(&root.join("oracles"))?;
     let roles = load_roles(&root.join("roles"), ceiling, &skills)?;
     if roles.is_empty() {
@@ -139,6 +144,7 @@ pub fn load_mission_type(
         playbook: Some(playbook),
         roles,
         skills,
+        inputs,
         oracles,
     };
     // Validate the planning DAG fail-closed at load against this type's own
@@ -156,6 +162,114 @@ pub fn load_mission_type(
         )));
     }
     Ok(mission_type)
+}
+
+fn load_inputs(
+    root: &Path,
+    declared: Vec<ManifestInput>,
+) -> Result<BTreeMap<InputName, PreparedInput>, MissionTypeError> {
+    let mut inputs = BTreeMap::new();
+    let mut environment_owners = BTreeMap::<String, InputName>::new();
+    for input in declared {
+        let name = InputName::new(&input.name).map_err(|error| MissionTypeError::Input {
+            input: input.name.clone(),
+            detail: error.to_string(),
+        })?;
+        if input.key_files.is_empty() {
+            return Err(MissionTypeError::Input {
+                input: input.name,
+                detail: "key-files must contain at least one workspace path".to_string(),
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for path in &input.key_files {
+            if !safe_relative_path(path) {
+                return Err(MissionTypeError::Input {
+                    input: input.name.clone(),
+                    detail: format!(
+                        "key-file '{}' must be a non-empty relative path without traversal",
+                        path.display()
+                    ),
+                });
+            }
+            if !seen.insert(path) {
+                return Err(MissionTypeError::Input {
+                    input: input.name.clone(),
+                    detail: format!("key-file '{}' is declared more than once", path.display()),
+                });
+            }
+        }
+        for variable in input.environment.keys() {
+            if !valid_environment_name(variable) {
+                return Err(MissionTypeError::Input {
+                    input: input.name.clone(),
+                    detail: format!("environment key '{variable}' is invalid"),
+                });
+            }
+            if let Some(owner) = environment_owners.insert(variable.clone(), name.clone()) {
+                return Err(MissionTypeError::Input {
+                    input: input.name.clone(),
+                    detail: format!(
+                        "environment key '{variable}' is already provided by input '{owner}'"
+                    ),
+                });
+            }
+        }
+        let program = root.join("inputs").join(name.as_str());
+        let metadata =
+            std::fs::symlink_metadata(&program).map_err(|source| MissionTypeError::Io {
+                path: program.clone(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(MissionTypeError::Input {
+                input: input.name,
+                detail: "program must be a regular file (no symlinks)".to_string(),
+            });
+        }
+        if !is_executable(&program) || !has_shebang(&program) {
+            return Err(MissionTypeError::Input {
+                input: name.to_string(),
+                detail: "program must be executable and start with a #! shebang".to_string(),
+            });
+        }
+        if inputs
+            .insert(
+                name.clone(),
+                PreparedInput {
+                    name,
+                    program,
+                    network: input.network,
+                    key_files: input.key_files,
+                    environment: input.environment,
+                },
+            )
+            .is_some()
+        {
+            return Err(MissionTypeError::Input {
+                input: input.name,
+                detail: "name is declared more than once".to_string(),
+            });
+        }
+    }
+    Ok(inputs)
+}
+
+fn safe_relative_path(path: &Path) -> bool {
+    use std::path::Component;
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn load_roles(
@@ -332,7 +446,7 @@ fn compute_digest(
     if let Ok(playbook) = std::fs::read(root.join("playbook.md")) {
         digest.feed("playbook.md", &playbook, false);
     }
-    for (subdir, hash_exec) in [("roles", false), ("oracles", true)] {
+    for (subdir, hash_exec) in [("roles", false), ("inputs", true), ("oracles", true)] {
         let dir = root.join(subdir);
         if !dir.exists() {
             continue;

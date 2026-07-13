@@ -70,6 +70,7 @@ pub fn test_mission_type() -> MissionType {
             ),
         ]),
         skills: BTreeMap::new(),
+        inputs: BTreeMap::new(),
         oracles: BTreeMap::from([(
             cargo_test,
             "/nonexistent-mission-type/oracles/cargo-test".into(),

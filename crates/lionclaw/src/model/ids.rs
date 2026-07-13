@@ -118,6 +118,11 @@ id_type!(
     validate_component_name,
     "Mission-type oracle name."
 );
+id_type!(
+    InputName,
+    validate_component_name,
+    "Mission-type prepared input name."
+);
 
 /// Mission id: `m` + 12 hex chars, derived from workspace, objective, and
 /// creation time without RNG.

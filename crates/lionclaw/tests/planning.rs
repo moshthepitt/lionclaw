@@ -77,6 +77,7 @@ fn planning_mission_type() -> MissionType {
                 description: "planning method".to_string(),
             },
         )]),
+        inputs: BTreeMap::new(),
         oracles: BTreeMap::from([(
             OracleName::new("cargo-test").unwrap(),
             PathBuf::from("/nonexistent/oracles/cargo-test"),

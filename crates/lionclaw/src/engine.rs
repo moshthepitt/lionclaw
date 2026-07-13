@@ -642,6 +642,7 @@ impl Engine {
             judged_sha: judged_sha.to_string(),
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
+            prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
         };
         match self.oracle_runner.run(request).await {
             Ok(outcome) => Ok(NewEvent::new(MissionEvent::OracleRunCompleted {
@@ -654,6 +655,7 @@ impl Engine {
                 exit_signal: outcome.exit_signal,
                 stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
                 stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
+                prepared_inputs: outcome.prepared_inputs,
                 duration_ms: outcome.duration_ms,
             })),
             Err(failure) => Ok(failed(failure.detail)),
