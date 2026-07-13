@@ -52,6 +52,22 @@ struct FailOnceCleaner {
     attempts: AtomicUsize,
 }
 
+#[derive(Default)]
+struct AlwaysFailCleaner {
+    calls: Mutex<Vec<EffectCleanupRequest>>,
+}
+
+#[async_trait]
+impl EffectCleaner for AlwaysFailCleaner {
+    async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        self.calls.lock().unwrap().push(request);
+        Err(EffectCleanupFailure {
+            resource: EffectResource::RuntimeSecret,
+            detail: "injected persistent runtime-secret cleanup failure".to_string(),
+        })
+    }
+}
+
 #[async_trait]
 impl EffectCleaner for FailOnceCleaner {
     async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
@@ -191,4 +207,49 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     assert_eq!(calls[0].effect_id, calls[1].effect_id);
     assert!(!calls[0].discard_artifact);
     assert!(calls[1].discard_artifact);
+}
+
+#[tokio::test]
+async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));
+    let cleaner = Arc::new(AlwaysFailCleaner::default());
+    let engine = Engine::new(
+        MissionStore::open(dir.path()).await.unwrap(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            runner.clone(),
+            Arc::new(MockOracleRunner::exiting(0)),
+            cleaner.clone(),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+
+    for _ in 0..3 {
+        let blocked = engine.advance(&mission_id).await.unwrap();
+        assert_eq!(blocked.disposition, MissionDisposition::CleanupBlocked);
+        assert_eq!(blocked.state.inflight.len(), 1);
+        assert_eq!(
+            blocked
+                .state
+                .cleanup_failure
+                .as_ref()
+                .unwrap()
+                .failure
+                .detail,
+            "injected persistent runtime-secret cleanup failure"
+        );
+    }
+
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    let calls = cleaner.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert!(calls
+        .windows(2)
+        .all(|pair| pair[0].effect_id == pair[1].effect_id));
+    assert!(!calls[0].discard_artifact);
+    assert!(calls[1..].iter().all(|request| request.discard_artifact));
 }

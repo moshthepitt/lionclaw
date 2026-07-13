@@ -139,8 +139,9 @@ pub async fn load_mission_view(
     store: &MissionStore,
     mission_id: &MissionId,
 ) -> Result<MissionView> {
+    let guard = DriverGuard::try_acquire(&store.driver_lock_path(mission_id))?;
+    let driver_running = guard.is_none();
     let state = store.require_state(mission_id).await?;
-    let driver_running = DriverGuard::is_held(&store.driver_lock_path(mission_id))?;
     Ok(MissionView::from_state(state, driver_running))
 }
 
@@ -356,7 +357,8 @@ impl Engine {
     pub async fn advance(&self, mission_id: &MissionId) -> Result<MissionView> {
         let Some(_guard) = DriverGuard::try_acquire(&self.store.driver_lock_path(mission_id))?
         else {
-            return load_mission_view(&self.store, mission_id).await;
+            let state = self.store.require_state(mission_id).await?;
+            return Ok(MissionView::from_state(state, true));
         };
         if !self.recover_interrupted(mission_id).await? {
             return Ok(MissionView::from_state(

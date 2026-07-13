@@ -7,7 +7,10 @@ use common::{
     approve_plan, default_config, effect_id, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::MissionDisposition;
-use lionclaw::model::{MissionEvent, MissionPhase, RunErrorKind};
+use lionclaw::model::{
+    ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, PayloadRef, RunErrorKind,
+    TaskId,
+};
 use lionclaw::store::{AppendError, NewEvent};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -133,6 +136,105 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         })
         .collect();
     assert_eq!(failures.len(), 1);
+}
+
+#[tokio::test]
+async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(
+            &mission_id,
+            proposal(0, simple_plan()),
+            "test",
+            "initial plan",
+        )
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+
+    let task_id = TaskId::new("fix").expect("task id");
+    let role_effect = effect_id("completed-role");
+    let oracle_effect = effect_id("crashed-oracle");
+    let oracle = OracleName::new("cargo-test").expect("oracle");
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    h.engine
+        .store()
+        .append(
+            &mission_id,
+            state.head,
+            &[
+                NewEvent::new(MissionEvent::RoleRunRequested {
+                    task_id: task_id.clone(),
+                    attempt_no: 1,
+                    effect_id: role_effect.clone(),
+                    role: lionclaw::model::RoleName::new("implementer").expect("role"),
+                    runtime: "codex".to_string(),
+                    prompt: PayloadRef::inline("prompt"),
+                    base_sha: BASE_SHA.to_string(),
+                }),
+                NewEvent::new(MissionEvent::RoleRunCompleted {
+                    task_id,
+                    attempt_no: 1,
+                    effect_id: role_effect,
+                    handoff: Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("done"),
+                        request_attention: false,
+                    },
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: BASE_SHA.to_string(),
+                        head_sha: HEAD_SHA.to_string(),
+                    }),
+                }),
+                NewEvent::new(MissionEvent::OracleRunRequested {
+                    assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
+                    oracle: oracle.clone(),
+                    judged_sha: HEAD_SHA.to_string(),
+                    attempt_no: 1,
+                    effect_id: oracle_effect.clone(),
+                }),
+            ],
+            1,
+        )
+        .await
+        .expect("append requests");
+
+    let view = h.engine.advance(&mission_id).await.expect("advance");
+    assert_eq!(view.disposition, MissionDisposition::Parked);
+    assert!(view.state.inflight.is_empty());
+    assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
+    assert_eq!(
+        view.state.oracle_failures.get(&oracle).unwrap().kind,
+        RunErrorKind::Interrupted
+    );
+    let events = h.engine.store().load(&mission_id).await.expect("load");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                MissionEvent::OracleRunFailed { effect_id, failure, .. }
+                    if effect_id == &oracle_effect && failure.kind == RunErrorKind::Interrupted
+            ))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
