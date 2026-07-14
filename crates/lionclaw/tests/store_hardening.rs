@@ -72,3 +72,72 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
     .expect("schema query");
     assert!(tables.is_empty(), "parallel effect ledger must not exist");
 }
+
+#[tokio::test]
+async fn an_old_event_schema_is_refused_instead_of_accepted_by_accident() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "obj",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let mut old = NewEvent::new(MissionEvent::MissionAborted {
+        reason: "old writer".to_string(),
+    });
+    old.stamps.schema_version = lionclaw::model::SCHEMA_VERSION - 1;
+    h.engine
+        .store()
+        .append(&mission_id, state.head, &[old], 2)
+        .await
+        .expect("store accepts opaque event bytes");
+
+    let error = h
+        .engine
+        .store()
+        .load(&mission_id)
+        .await
+        .expect_err("reader must reject the old schema");
+    assert!(
+        error.to_string().contains("unsupported schema version"),
+        "got: {error:#}"
+    );
+
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open database");
+    sqlx::query(
+        "UPDATE mission_events SET schema_version = ?1 \
+         WHERE mission_id = ?2 AND sequence_no = ?3",
+    )
+    .bind(i64::from(lionclaw::model::SCHEMA_VERSION))
+    .bind(mission_id.as_str())
+    .bind((state.head + 1) as i64)
+    .execute(&database)
+    .await
+    .expect("corrupt redundant stamp");
+    let error = h
+        .engine
+        .store()
+        .load(&mission_id)
+        .await
+        .expect_err("conflicting stamps must be rejected");
+    assert!(
+        error.to_string().contains("conflicting schema stamps"),
+        "got: {error:#}"
+    );
+}

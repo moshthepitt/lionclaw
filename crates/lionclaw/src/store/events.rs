@@ -136,8 +136,8 @@ impl MissionStore {
 
     /// Load the full event stream in order.
     pub async fn load(&self, mission_id: &MissionId) -> anyhow::Result<Vec<EventEnvelope>> {
-        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
-            "SELECT sequence_no, recorded_at_ms, payload_json
+        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT sequence_no, recorded_at_ms, schema_version, payload_json
              FROM mission_events WHERE mission_id = ?1 ORDER BY sequence_no",
         )
         .bind(mission_id.as_str())
@@ -152,8 +152,8 @@ impl MissionStore {
         mission_id: &MissionId,
         after_seq: u64,
     ) -> anyhow::Result<Vec<EventEnvelope>> {
-        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
-            "SELECT sequence_no, recorded_at_ms, payload_json
+        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT sequence_no, recorded_at_ms, schema_version, payload_json
              FROM mission_events WHERE mission_id = ?1 AND sequence_no > ?2
              ORDER BY sequence_no",
         )
@@ -219,15 +219,15 @@ async fn insert_event(
     Ok(())
 }
 
-/// Decode `(sequence_no, recorded_at_ms, payload_json)` rows into envelopes.
+/// Decode persisted rows into envelopes.
 /// Shared by `load` and `load_after` so the tail loader gets the same rich
 /// "engine older than the log?" diagnostic on an undecodable event.
 fn decode_rows(
     mission_id: &MissionId,
-    rows: Vec<(i64, i64, String)>,
+    rows: Vec<(i64, i64, i64, String)>,
 ) -> anyhow::Result<Vec<EventEnvelope>> {
     rows.into_iter()
-        .map(|(sequence_no, recorded_at_ms, payload_json)| {
+        .map(|(sequence_no, recorded_at_ms, stored_schema, payload_json)| {
             // Unknown event types are a hard error: an engine older than the log
             // must refuse loudly, never skip silently.
             let doc: PayloadDoc = serde_json::from_str(&payload_json).map_err(|err| {
@@ -236,6 +236,18 @@ fn decode_rows(
                      (engine older than the log?)"
                 )
             })?;
+            if stored_schema != i64::from(doc.stamps.schema_version) {
+                anyhow::bail!(
+                    "event {sequence_no} of mission {mission_id} has conflicting schema stamps"
+                );
+            }
+            if doc.stamps.schema_version != SCHEMA_VERSION {
+                anyhow::bail!(
+                    "event {sequence_no} of mission {mission_id} uses unsupported schema version {} (this engine requires {})",
+                    doc.stamps.schema_version,
+                    SCHEMA_VERSION,
+                );
+            }
             Ok(EventEnvelope {
                 mission_id: mission_id.clone(),
                 sequence_no: sequence_no as u64,
