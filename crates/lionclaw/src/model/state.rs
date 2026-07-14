@@ -244,7 +244,7 @@ pub enum ReviewOutcome {
 /// How a human accepted closure despite the review: `accept` on a gap park
 /// acknowledges the blocking verdict, while `accept` on a failure park waives
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
-/// the receipt distinguishes the kinds and cites who accepted and why.
+/// the receipt distinguishes the kinds and cites why it was accepted.
 ///
 /// Both kinds are keyed to the head they were granted at: a later artifact
 /// commit stales the acceptance and re-opens the review, so neither an
@@ -255,9 +255,6 @@ pub struct ReviewAcceptance {
     /// `current_sha` at the moment of acceptance (for an acknowledgment this
     /// is also the verdict's `judged_sha` — the gap item only raises fresh).
     pub judged_sha: String,
-    /// Provenance from the `DecisionRecorded` event, folded into state so
-    /// the receipt can never cite a decision a later retry discarded.
-    pub actor: String,
     pub justification: String,
 }
 

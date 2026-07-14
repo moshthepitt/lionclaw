@@ -383,8 +383,6 @@ mod tests {
                 },
             },
             plan_hash: "deadbeef".to_string(),
-            actor: "test".into(),
-            justification: "initial".into(),
         }
     }
 
@@ -477,7 +475,6 @@ mod tests {
                     attention_id: "plan_proposal:mission".into(),
                     action: crate::model::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
-                    actor: "test".into(),
                 }
             });
             std::iter::once(event).chain(approve)
@@ -530,7 +527,6 @@ mod tests {
             created("sha-0"),
             MissionEvent::MissionAborted {
                 reason: "operator stop".to_string(),
-                actor: "human".to_string(),
             },
         ]);
         assert!(matches!(aborted.phase, MissionPhase::Aborted { .. }));
@@ -976,7 +972,6 @@ mod tests {
             attention_id: "terminal_review_gaps:mission".to_string(),
             action: DecisionAction::Retry,
             justification: "re-roll".to_string(),
-            actor: "test".to_string(),
         });
         let state = fold_log(events);
         // Attempts are preserved: the re-roll runs under attempt 2 (⇒ a

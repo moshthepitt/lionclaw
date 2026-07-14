@@ -246,12 +246,7 @@ async fn execution_prompt_lists_assigned_skills_in_declaration_order() {
         .await
         .unwrap();
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&engine, &mission_id).await;
@@ -350,8 +345,6 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
                     ],
                 },
             ),
-            "test",
-            "initial plan",
         )
         .await
         .unwrap();
@@ -613,7 +606,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
 #[tokio::test]
 async fn terminal_review_prompt_lists_assigned_skills() {
     let dir = tempfile::tempdir().unwrap();
-    let skill_root = write_skill(dir.path(), "gap-check", "Hunt gaps in the product");
+    let skill_root = write_skill(dir.path());
 
     let mut mission_type = common::review_mission_type();
     mission_type.skills.insert(
@@ -667,12 +660,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
         .await
         .unwrap();
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &mission_id).await;
@@ -726,12 +714,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
         .await
         .unwrap();
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &mission_id).await;
@@ -780,12 +763,7 @@ async fn a_role_referencing_a_missing_skill_fails_closed_at_prompt_materializati
         .await
         .unwrap();
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&engine, &mission_id).await;

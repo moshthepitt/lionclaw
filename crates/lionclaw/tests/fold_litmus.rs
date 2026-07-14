@@ -71,12 +71,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -109,12 +104,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -128,7 +118,6 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
             "terminal_review_gaps:mission",
             DecisionAction::Accept,
             "acceptable",
-            "test",
         )
         .await
         .expect("decide");
@@ -160,12 +149,7 @@ async fn snapshot_resume_matches_full_refold() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;

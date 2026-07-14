@@ -287,8 +287,6 @@ impl Engine {
         &self,
         mission_id: &MissionId,
         proposal: PlanProposal,
-        actor: &str,
-        justification: &str,
     ) -> Result<(), ProposeError> {
         let state = self.load_state(mission_id).await?;
         if !state.inflight.is_empty() {
@@ -300,8 +298,6 @@ impl Engine {
         let event = NewEvent::new(MissionEvent::PlanProposed {
             proposal,
             plan_hash,
-            actor: actor.to_string(),
-            justification: justification.to_string(),
         });
         self.store
             .append(mission_id, state.head, &[event], self.clock.now_ms())
@@ -318,7 +314,6 @@ impl Engine {
         attention_id: &str,
         action: crate::model::DecisionAction,
         justification: &str,
-        actor: &str,
     ) -> Result<()> {
         record_decision(
             &self.store,
@@ -327,7 +322,6 @@ impl Engine {
             attention_id,
             action,
             justification,
-            actor,
         )
         .await
     }
@@ -1222,7 +1216,6 @@ pub async fn record_decision(
     attention_id: &str,
     action: crate::model::DecisionAction,
     justification: &str,
-    actor: &str,
 ) -> Result<()> {
     let state = store.require_state(mission_id).await?;
     // Preserve the typed `DecisionError` as the error source (its `Display` is
@@ -1231,12 +1224,17 @@ pub async fn record_decision(
     crate::model::validate_decision(&state, attention_id, &action, justification)?;
     let event = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
-        action,
+        action: action.clone(),
         justification: justification.to_string(),
-        actor: actor.to_string(),
     });
+    let mut events = vec![event];
+    if action == crate::model::DecisionAction::Abort {
+        events.push(NewEvent::new(MissionEvent::MissionAborted {
+            reason: justification.to_string(),
+        }));
+    }
     store
-        .append(mission_id, state.head, &[event], now_ms)
+        .append(mission_id, state.head, &events, now_ms)
         .await?;
     Ok(())
 }

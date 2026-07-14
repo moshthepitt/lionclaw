@@ -241,10 +241,6 @@ pub struct PlanProposeArgs {
     /// Proposal JSON ({ "base_revision": N, "plan": {...} }); `-` reads stdin.
     #[arg(long = "file")]
     pub file: PathBuf,
-    #[arg(long, default_value = "orchestrator")]
-    pub actor: String,
-    #[arg(long, default_value = "")]
-    pub justification: String,
 }
 
 #[derive(Args)]
@@ -854,7 +850,7 @@ async fn cmd_plan_propose(args: PlanProposeArgs) -> Result<()> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let proposal = read_json_arg(&args.file)?;
     engine
-        .propose_plan(&mission_id, proposal, &args.actor, &args.justification)
+        .propose_plan(&mission_id, proposal)
         .await
         .context("plan proposal rejected")?;
     println!("plan proposed for mission {mission_id}");
@@ -951,7 +947,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         // review, whatever a hostile log writer recorded — the three review
         // fields must never contradict each other.
         let review = review_summary(state);
-        let (review_gaps, review_report, review_accepted_by) = if review.is_null() {
+        let (review_gaps, review_report, review_acceptance) = if review.is_null() {
             (
                 serde_json::Value::Null,
                 serde_json::Value::Null,
@@ -977,7 +973,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                         "kind": a.kind.slug(),
                         "judged_sha": a.judged_sha,
                         "fresh": a.is_fresh_at(&state.current_sha),
-                        "actor": a.actor,
                         "justification": a.justification,
                     })
                 })
@@ -1010,7 +1005,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
                 "terminal_review_report": review_report,
-                "terminal_review_accepted_by": review_accepted_by,
+                "terminal_review_acceptance": review_acceptance,
                 "attention": state.open_attention.values().map(|item| {
                     attention_json(store.blobs(), item)
                 }).collect::<Result<Vec<_>>>()?,
@@ -1065,10 +1060,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         println!("  {line}");
         if let Some(a) = &state.terminal_review.accepted {
             println!(
-                "           {} at {} by {}: \"{}\"{}",
+                "           {} at {}: \"{}\"{}",
                 a.kind.slug(),
                 short_hex(&a.judged_sha),
-                a.actor,
                 a.justification,
                 if a.is_fresh_at(&state.current_sha) {
                     ""
@@ -1224,7 +1218,6 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
         &args.item,
         action,
         &args.justification,
-        "cli",
     )
     .await?;
     println!(
@@ -1960,6 +1953,33 @@ mod tests {
             "reviewed the proposed contract",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "approve",
+            "--justification",
+            "reviewed the proposed contract",
+            "--actor",
+            "caller-supplied",
+        ])
+        .is_err());
+        for removed in ["--actor", "--justification"] {
+            assert!(Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "plan",
+                "propose",
+                "mabc123def456",
+                "--file",
+                "proposal.json",
+                removed,
+                "caller-supplied",
+            ])
+            .is_err());
+        }
     }
 
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
@@ -2129,14 +2149,11 @@ mod tests {
                     },
                 },
                 plan_hash: "h".into(),
-                actor: "test".into(),
-                justification: "initial".into(),
             },
             MissionEvent::DecisionRecorded {
                 attention_id: "plan_proposal:mission".into(),
                 action: DecisionAction::Approve,
                 justification: "test fixture approves the plan".into(),
-                actor: "test".into(),
             },
             MissionEvent::RoleRunCompleted {
                 task_id: TaskId::new("fix").unwrap(),
@@ -2300,7 +2317,6 @@ mod tests {
                 attention_id: "terminal_review_failed:mission".into(),
                 action: crate::model::DecisionAction::Abort,
                 justification: "give up".into(),
-                actor: "test".into(),
             },
         ]);
         assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
@@ -2311,7 +2327,6 @@ mod tests {
         // Aborted before any review dispatch: "none", not "owed" forever.
         let state = review_state(vec![MissionEvent::MissionAborted {
             reason: "operator stop".into(),
-            actor: "test".into(),
         }]);
         let line = review_line(&state).expect("line");
         assert!(line.contains("the mission was aborted"), "got: {line}");

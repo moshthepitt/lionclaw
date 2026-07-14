@@ -149,7 +149,7 @@ async fn advisory_only_mission_type_never_verifies() {
         ],
     };
     engine
-        .propose_plan(&mission_id, proposal(0, plan), "test", "initial plan")
+        .propose_plan(&mission_id, proposal(0, plan))
         .await
         .expect("propose");
     approve_plan(&engine, &mission_id).await;

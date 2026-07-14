@@ -242,13 +242,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
 
     // Approve: derive_promotion seeds the contract for the first time.
     engine
-        .decide(
-            &id,
-            &approve.id,
-            DecisionAction::Approve,
-            "looks good",
-            "human",
-        )
+        .decide(&id, &approve.id, DecisionAction::Approve, "looks good")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
@@ -301,13 +295,7 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
     // Retry: the proposal is discarded and the planning DAG is re-runnable.
     // Nothing was seeded, so nothing is weakened.
     engine
-        .decide(
-            &id,
-            &approve.id,
-            DecisionAction::Revise,
-            "not good enough",
-            "human",
-        )
+        .decide(&id, &approve.id, DecisionAction::Revise, "not good enough")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
@@ -411,13 +399,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
 
     // Retry re-pends the planning node (a fresh attempt would re-dispatch it).
     engine
-        .decide(
-            &id,
-            &node_failed.id,
-            DecisionAction::Retry,
-            "try again",
-            "human",
-        )
+        .decide(&id, &node_failed.id, DecisionAction::Retry, "try again")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();

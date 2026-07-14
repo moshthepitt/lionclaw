@@ -56,7 +56,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -96,7 +96,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -120,7 +120,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -171,7 +171,7 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -185,7 +185,6 @@ async fn oracle_repair_reopens_the_owner_with_both_evidence_streams() {
             "oracle_verdict_failed:cargo-test",
             DecisionAction::Repair,
             "fix the compiler error",
-            "human",
         )
         .await
         .unwrap();

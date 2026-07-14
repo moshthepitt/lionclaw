@@ -77,12 +77,7 @@ async fn started_with_config(
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -207,12 +202,7 @@ async fn terminal_review_receives_its_declared_skill_packages() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -236,7 +226,6 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
             "terminal_review_gaps:mission",
             DecisionAction::Accept,
             "gap is acceptable for this release",
-            "test",
         )
         .await
         .expect("decide");
@@ -246,8 +235,7 @@ async fn blocking_gaps_park_then_accept_closes_with_acknowledged_gaps() {
     let accepted = state.terminal_review.accepted.expect("acceptance recorded");
     assert_eq!(accepted.kind, ReviewAcceptanceKind::AcknowledgedGaps);
     assert_eq!(accepted.judged_sha, HEAD_SHA);
-    // Provenance is folded into state — the receipt cites who and why.
-    assert_eq!(accepted.actor, "test");
+    // The receipt preserves the exact reason without claiming a caller actor.
     assert_eq!(accepted.justification, "gap is acceptable for this release");
 }
 
@@ -263,7 +251,6 @@ async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
             "terminal_review_gaps:mission",
             DecisionAction::Revise,
             "repair the observed behavior",
-            "test",
         )
         .await
         .expect("revise");
@@ -320,12 +307,7 @@ async fn a_revision_resumes_work_and_re_reviews_at_the_new_head() {
         depends_on: vec![],
     }];
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(1, next),
-            "test",
-            "close the review gap",
-        )
+        .propose_plan(&mission_id, proposal(1, next))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -380,7 +362,6 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
             "terminal_review_failed:mission",
             DecisionAction::Retry,
             "transient timeout",
-            "test",
         )
         .await
         .expect("decide");
@@ -487,12 +468,7 @@ async fn a_mission_without_the_config_never_dispatches_a_review() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -625,7 +601,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
         depends_on: vec![],
     }];
     h.engine
-        .propose_plan(&mission_id, proposal(1, next), "test", "follow-up work")
+        .propose_plan(&mission_id, proposal(1, next))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -636,7 +612,6 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
             "terminal_review_failed:mission",
             DecisionAction::Accept,
             "reviewer infra is down today",
-            "test",
         )
         .await
         .expect("waive");

@@ -246,9 +246,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attention_id,
             action,
             justification,
-            actor,
         } => {
-            apply_decision(state, attention_id, action, actor, justification);
+            apply_decision(state, attention_id, action, justification);
         }
         MissionEvent::EffectCleanupFailed {
             effect_id,
@@ -416,7 +415,6 @@ fn apply_decision(
     state: &mut MissionState,
     attention_id: &str,
     action: &super::event::DecisionAction,
-    actor: &str,
     justification: &str,
 ) {
     use super::event::DecisionAction;
@@ -537,7 +535,6 @@ fn apply_decision(
                 state.terminal_review.accepted = Some(ReviewAcceptance {
                     kind: ReviewAcceptanceKind::AcknowledgedGaps,
                     judged_sha: v.judged_sha.clone(),
-                    actor: actor.to_string(),
                     justification: justification.to_string(),
                 });
             }
@@ -563,7 +560,6 @@ fn apply_decision(
             state.terminal_review.accepted = Some(ReviewAcceptance {
                 kind: ReviewAcceptanceKind::Waived,
                 judged_sha: state.current_sha.clone(),
-                actor: actor.to_string(),
                 justification: justification.to_string(),
             });
         }
@@ -584,7 +580,7 @@ fn apply_decision(
         }
         (DecisionAction::Abort, _) => {
             state.phase = MissionPhase::Aborted {
-                reason: "aborted by decision".to_string(),
+                reason: justification.to_string(),
             };
         }
         _ => {}
@@ -1173,8 +1169,6 @@ mod tests {
                 },
             },
             plan_hash: "hash".into(),
-            actor: "test".into(),
-            justification: "initial".into(),
         }
     }
 
@@ -1295,7 +1289,6 @@ mod tests {
             attention_id: item.into(),
             action,
             justification: "j".into(),
-            actor: "test".into(),
         }
     }
 
@@ -1498,7 +1491,6 @@ mod tests {
             role_completed("t1", "k1", work_handoff(true, false), None),
             MissionEvent::MissionAborted {
                 reason: "stop".into(),
-                actor: "human".into(),
             },
         ];
         for event in non_created {
@@ -1962,7 +1954,6 @@ mod tests {
             plan_proposed(vec![], vec![work_task("t1")]),
             MissionEvent::MissionAborted {
                 reason: "operator stop".into(),
-                actor: "human".into(),
             },
             role_completed("t1", "k1", work_handoff(true, false), None),
         ])
@@ -2044,13 +2035,12 @@ mod tests {
     use super::super::event::{Gap, GapSeverity, TerminalReviewConfig};
     use super::super::state::{ReviewAcceptanceKind, ReviewOutcome};
 
-    /// The acceptance a `decision(...)` builder produces (actor "test",
-    /// justification "j"), for exact-equality assertions.
+    /// The acceptance a `decision(...)` builder produces for exact-equality
+    /// assertions.
     fn accepted(kind: ReviewAcceptanceKind, judged_sha: &str) -> ReviewAcceptance {
         ReviewAcceptance {
             kind,
             judged_sha: judged_sha.into(),
-            actor: "test".into(),
             justification: "j".into(),
         }
     }
