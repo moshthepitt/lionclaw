@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::mission_type::{RoleDefinition, SkillPackage};
-use crate::model::{Assertion, OutputSemantics, Plan, RoleName};
+use crate::model::{Assertion, OutputSemantics, Plan, PlanProposal, RoleName};
 
 pub struct PromptContext<'a> {
     pub objective: &'a str,
@@ -63,10 +63,8 @@ pub struct PlanningPromptContext<'a> {
     pub objective: &'a str,
     /// Accepted revision this planning run must propose against.
     pub base_revision: u32,
-    /// The accepted plan when authoring a later revision.
-    pub current_plan: Option<&'a Plan>,
-    /// The newest complete plan candidate rejected by ratification.
-    pub latest_rejected_plan: Option<&'a Plan>,
+    /// The complete accepted/rejected/refinement input for this planning run.
+    pub input: PlanningPromptInput<'a>,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
     /// The mission type's canonical role definitions. The assembler exposes
@@ -79,8 +77,20 @@ pub struct PlanningPromptContext<'a> {
     pub upstream_reports: &'a [String],
     /// Resolved skill packages assigned to this role, in declaration order.
     pub skills: &'a [SkillPackage],
-    /// Rejection or failure evidence that caused this planning pass.
-    pub feedback: &'a [String],
+    /// Rework for this planning role's current attempt, separate from the
+    /// mission-level planning input above.
+    pub task_feedback: &'a [String],
+}
+
+pub struct PlanningPromptInput<'a> {
+    pub accepted_plan: Option<&'a Plan>,
+    pub latest_rejected_candidate: Option<&'a PlanProposal>,
+    pub refinement: Option<PlanningPromptRefinement<'a>>,
+}
+
+pub enum PlanningPromptRefinement<'a> {
+    HumanGuidance(&'a str),
+    FailureEvidence(String),
 }
 
 pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptContext<'_>) -> String {
@@ -95,15 +105,28 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
         "\n\n## Proposal base revision\n\n{}",
         ctx.base_revision
     ));
-    if let Some(plan) = ctx.current_plan {
+    if let Some(plan) = ctx.input.accepted_plan {
         prompt.push_str("\n\n## Current accepted plan\n\n```json\n");
         prompt.push_str(&serde_json::to_string_pretty(plan).expect("plan serializes"));
         prompt.push_str("\n```\nRetain requirements and assertions monotonically. Retained task ids are immutable; omit a task to retire it and use a new id for changed work.\n");
     }
-    if let Some(plan) = ctx.latest_rejected_plan {
+    if let Some(proposal) = ctx.input.latest_rejected_candidate {
         prompt.push_str("\n\n## Latest rejected plan candidate\n\n```json\n");
-        prompt.push_str(&serde_json::to_string_pretty(plan).expect("plan serializes"));
+        prompt.push_str(&serde_json::to_string_pretty(proposal).expect("proposal serializes"));
         prompt.push_str("\n```\nUse this only as the last rejected candidate; your next handoff must contain a complete replacement proposal.\n");
+    }
+    if let Some(refinement) = &ctx.input.refinement {
+        prompt.push_str("\n\n## Active planning input\n\n");
+        match refinement {
+            PlanningPromptRefinement::HumanGuidance(guidance) => {
+                prompt.push_str("### Human guidance\n\n");
+                prompt.push_str(guidance);
+            }
+            PlanningPromptRefinement::FailureEvidence(evidence) => {
+                prompt.push_str("### Failure evidence\n\n");
+                prompt.push_str(evidence);
+            }
+        }
     }
     if let Some(playbook) = ctx.playbook {
         prompt.push_str("\n\n## Playbook\n\n");
@@ -145,7 +168,7 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
         prompt.push_str("\n\n## Task\n\n");
         prompt.push_str(ctx.task_body);
     }
-    append_feedback(&mut prompt, ctx.feedback);
+    append_feedback(&mut prompt, ctx.task_feedback);
     if !ctx.upstream_reports.is_empty() {
         prompt.push_str("\n\n## Upstream planning reports\n\n");
         for report in ctx.upstream_reports {
@@ -516,15 +539,18 @@ mod tests {
             &PlanningPromptContext {
                 objective: "revise the novel",
                 base_revision: 0,
-                current_plan: None,
-                latest_rejected_plan: None,
+                input: PlanningPromptInput {
+                    accepted_plan: None,
+                    latest_rejected_candidate: None,
+                    refinement: None,
+                },
                 playbook: None,
                 roles: &roles,
                 oracle_inventory: &[],
                 task_body: "author the plan",
                 upstream_reports: &[],
                 skills: &[],
-                feedback: &[],
+                task_feedback: &[],
             },
         );
 
@@ -540,6 +566,58 @@ mod tests {
         assert!(!prompt.contains("<available-oracle>"));
         assert!(!prompt.contains("Planning-only private instructions."));
         assert!(!prompt.contains("Terminal-review-only private instructions."));
+    }
+
+    #[test]
+    fn planning_prompt_keeps_plan_inputs_distinct_and_complete() {
+        let accepted = Plan {
+            requirements: Vec::new(),
+            assertions: Vec::new(),
+            tasks: Vec::new(),
+        };
+        let rejected = PlanProposal {
+            base_revision: 7,
+            plan: Plan {
+                requirements: Vec::new(),
+                assertions: Vec::new(),
+                tasks: Vec::new(),
+            },
+        };
+        let task_feedback = vec!["retry only this planning role".to_string()];
+        let prompt = assemble_planning_prompt(
+            &role(OutputSemantics::ProposesPlan),
+            &PlanningPromptContext {
+                objective: "obj",
+                base_revision: 7,
+                input: PlanningPromptInput {
+                    accepted_plan: Some(&accepted),
+                    latest_rejected_candidate: Some(&rejected),
+                    refinement: Some(PlanningPromptRefinement::FailureEvidence(
+                        "cargo test failed\nstderr:\ncompiler error".to_string(),
+                    )),
+                },
+                playbook: None,
+                roles: &BTreeMap::new(),
+                oracle_inventory: &[],
+                task_body: "author the replacement",
+                upstream_reports: &[],
+                skills: &[],
+                task_feedback: &task_feedback,
+            },
+        );
+
+        assert_eq!(prompt.matches("## Current accepted plan").count(), 1);
+        assert_eq!(
+            prompt.matches("## Latest rejected plan candidate").count(),
+            1
+        );
+        assert_eq!(prompt.matches("## Active planning input").count(), 1);
+        assert!(prompt.contains("\"base_revision\": 7"));
+        assert!(
+            prompt.contains("### Failure evidence\n\ncargo test failed\nstderr:\ncompiler error")
+        );
+        assert!(prompt.contains("## Required rework"));
+        assert!(prompt.contains("\n---\nretry only this planning role\n"));
     }
 
     #[test]

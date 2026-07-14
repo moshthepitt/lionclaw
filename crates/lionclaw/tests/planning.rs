@@ -31,6 +31,17 @@ fn aid(n: &str) -> AssertionId {
     AssertionId::new(n).unwrap()
 }
 
+fn markdown_section<'a>(prompt: &'a str, heading: &str) -> &'a str {
+    let marker = format!("## {heading}\n\n");
+    prompt
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing prompt section '{heading}'"))
+        .1
+        .split("\n\n## ")
+        .next()
+        .expect("section body")
+}
+
 fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
     RoleDefinition {
         name: rn(name),
@@ -138,6 +149,29 @@ fn candidate(task_id: &str) -> PlanProposal {
     let mut proposal = proposed_plan();
     proposal.plan.tasks[0].id = tid(task_id);
     proposal.plan.tasks[0].body = format!("make {task_id} pass");
+    proposal
+}
+
+fn expanded_candidate(base_revision: u32) -> PlanProposal {
+    let mut proposal = proposed_plan();
+    proposal.base_revision = base_revision;
+    proposal
+        .plan
+        .requirements
+        .push(covered_requirement("EXTRA-WORK", "EXTRA-HOLDS"));
+    proposal.plan.assertions.push(Assertion {
+        id: aid("EXTRA-HOLDS"),
+        prose: "the additional behavior works".to_string(),
+        oracle: Some(OracleName::new("cargo-test").unwrap()),
+    });
+    proposal.plan.tasks.push(Task {
+        id: tid("extra"),
+        kind: TaskKind::Work,
+        body: "implement the additional behavior".to_string(),
+        targets: vec![aid("EXTRA-HOLDS")],
+        role: Some(rn("implementer")),
+        depends_on: vec![],
+    });
     proposal
 }
 
@@ -348,10 +382,79 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         .blobs()
         .resolve(second_strategist_prompt)
         .unwrap();
-    assert!(prompt.contains("Required rework"));
-    assert!(prompt.contains("not good enough"));
-    assert!(prompt.contains("Latest rejected plan candidate"));
-    assert!(prompt.contains("make it pass"));
+    assert_eq!(
+        markdown_section(&prompt, "Active planning input"),
+        "### Human guidance\n\nnot good enough"
+    );
+    let rejected = markdown_section(&prompt, "Latest rejected plan candidate");
+    assert!(rejected.contains("\"base_revision\": 0"));
+    assert!(rejected.contains("make it pass"));
+}
+
+#[tokio::test]
+async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine.propose_plan(&id, proposed_plan()).await.unwrap();
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "initial plan is sound",
+        )
+        .await
+        .unwrap();
+    let rejected = expanded_candidate(1);
+    engine.propose_plan(&id, rejected.clone()).await.unwrap();
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Revise,
+            "keep the new requirement but use one coherent task",
+        )
+        .await
+        .unwrap();
+
+    engine.advance(&id).await.unwrap();
+    let events = engine.store().load(&id).await.unwrap();
+    let prompt_ref = events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            MissionEvent::RoleRunRequested {
+                task_id, prompt, ..
+            } if task_id == &tid("strategist") => Some(prompt),
+            _ => None,
+        })
+        .expect("strategist prompt");
+    let prompt = engine.store().blobs().resolve(prompt_ref).unwrap();
+
+    let accepted = markdown_section(&prompt, "Current accepted plan");
+    assert!(accepted.contains("TESTS-PASS"));
+    assert!(!accepted.contains("EXTRA-HOLDS"));
+    let rejected_section = markdown_section(&prompt, "Latest rejected plan candidate");
+    assert!(rejected_section.contains("\"base_revision\": 1"));
+    assert!(rejected_section.contains("EXTRA-HOLDS"));
+    assert_eq!(
+        markdown_section(&prompt, "Active planning input"),
+        "### Human guidance\n\nkeep the new requirement but use one coherent task"
+    );
 }
 
 #[tokio::test]

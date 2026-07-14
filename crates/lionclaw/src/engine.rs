@@ -28,7 +28,8 @@ use crate::ports::{
 };
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
-    PlanningPromptContext, PromptContext, TerminalReviewPromptContext,
+    PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, PromptContext,
+    TerminalReviewPromptContext,
 };
 use crate::store::{AppendError, MissionStore, NewEvent};
 
@@ -915,19 +916,14 @@ impl Engine {
             .context("dispatched planning task not in the DAG")?;
         let upstream_reports =
             self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
-        let mut feedback = state
+        let task_feedback = state
             .planning
             .tasks
             .get(&task.id)
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        if let Some(refinement) = &state.planning_input.refinement {
-            feedback.push(crate::evidence::render_planning_refinement(
-                self.store.blobs(),
-                refinement,
-            )?);
-        }
+        let planning_input = self.resolve_planning_prompt_input(state)?;
         let oracle_inventory: Vec<String> = self
             .mission_type
             .oracles
@@ -940,22 +936,39 @@ impl Engine {
             &PlanningPromptContext {
                 objective: &state.objective,
                 base_revision: state.planning_base_revision.unwrap_or(state.revision),
-                current_plan: state.plan.as_ref(),
-                latest_rejected_plan: state
-                    .planning_input
-                    .latest_rejected_proposal
-                    .as_ref()
-                    .map(|proposal| &proposal.plan),
+                input: planning_input,
                 playbook: self.mission_type.playbook.as_deref(),
                 roles: &self.mission_type.roles,
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
                 skills: &skills,
-                feedback: &feedback,
+                task_feedback: &task_feedback,
             },
         );
         Ok((prompt, "plan-role"))
+    }
+
+    fn resolve_planning_prompt_input<'a>(
+        &self,
+        state: &'a MissionState,
+    ) -> Result<PlanningPromptInput<'a>> {
+        let refinement = match state.planning_input.refinement.as_ref() {
+            Some(crate::model::PlanningRefinement::Guidance(guidance)) => {
+                Some(PlanningPromptRefinement::HumanGuidance(guidance))
+            }
+            Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
+                Some(PlanningPromptRefinement::FailureEvidence(
+                    crate::evidence::render_feedback(self.store.blobs(), feedback)?,
+                ))
+            }
+            None => None,
+        };
+        Ok(PlanningPromptInput {
+            accepted_plan: state.plan.as_ref(),
+            latest_rejected_candidate: state.planning_input.latest_rejected_proposal.as_ref(),
+            refinement,
+        })
     }
 
     /// Turn a role-dispatch intent into a recorded request: assemble the
