@@ -139,6 +139,22 @@ pub struct FailureFeedback {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningRefinement {
+    Guidance(String),
+    FailureEvidence(FailureFeedback),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningInput {
+    /// Latest complete candidate rejected during plan ratification. Kept as
+    /// planning input until a candidate is approved.
+    pub latest_rejected_proposal: Option<PlanProposal>,
+    /// The single active refinement input for the next planning pass.
+    pub refinement: Option<PlanningRefinement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectCleanupFailure {
     pub effect_id: super::EffectId,
     pub resource: EffectResource,
@@ -519,9 +535,8 @@ pub struct MissionState {
     /// planning DAG is idle; this is independent of whether an accepted plan
     /// already exists, so the same DAG can author repairs.
     pub planning_base_revision: Option<u32>,
-    /// Evidence and human guidance projected into the active planning run.
-    #[serde(default)]
-    pub planning_feedback: Vec<FailureFeedback>,
+    /// Active candidate/guidance/evidence input for the next planning pass.
+    pub planning_input: PlanningInput,
     /// Complete plan proposal awaiting approval or automatic promotion.
     pub proposal: Option<PlanProposal>,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts

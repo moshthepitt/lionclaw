@@ -39,9 +39,9 @@ pub use plan_validation::{
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,
-    FailureEvidence, FailureFeedback, InflightEffect, MissionPhase, MissionState, PlanningState,
-    ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState,
-    TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    FailureEvidence, FailureFeedback, InflightEffect, MissionPhase, MissionState, PlanningInput,
+    PlanningRefinement, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
+    RunFailure, TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

@@ -413,8 +413,7 @@ pub enum MissionEvent {
 }
 
 /// The actions a decision can take on an open attention item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionAction {
     /// Approve a proposed plan or a cleared gate checkpoint.
     Approve,
@@ -428,6 +427,50 @@ pub enum DecisionAction {
     Accept,
     /// Abort the mission.
     Abort,
+}
+
+impl Serialize for DecisionAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            action: &'a str,
+        }
+
+        Wire {
+            action: self.slug(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DecisionAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            action: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.action.as_str() {
+            "approve" => Ok(Self::Approve),
+            "retry" => Ok(Self::Retry),
+            "repair" => Ok(Self::Repair),
+            "revise" => Ok(Self::Revise),
+            "accept" => Ok(Self::Accept),
+            "abort" => Ok(Self::Abort),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["approve", "retry", "repair", "revise", "accept", "abort"],
+            )),
+        }
+    }
 }
 
 impl DecisionAction {

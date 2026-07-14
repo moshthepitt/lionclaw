@@ -922,8 +922,11 @@ impl Engine {
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        for item in &state.planning_feedback {
-            feedback.push(crate::evidence::render_feedback(self.store.blobs(), item)?);
+        if let Some(refinement) = &state.planning_input.refinement {
+            feedback.push(crate::evidence::render_planning_refinement(
+                self.store.blobs(),
+                refinement,
+            )?);
         }
         let oracle_inventory: Vec<String> = self
             .mission_type
@@ -938,6 +941,11 @@ impl Engine {
                 objective: &state.objective,
                 base_revision: state.planning_base_revision.unwrap_or(state.revision),
                 current_plan: state.plan.as_ref(),
+                latest_rejected_plan: state
+                    .planning_input
+                    .latest_rejected_proposal
+                    .as_ref()
+                    .map(|proposal| &proposal.plan),
                 playbook: self.mission_type.playbook.as_deref(),
                 roles: &self.mission_type.roles,
                 oracle_inventory: &oracle_inventory,

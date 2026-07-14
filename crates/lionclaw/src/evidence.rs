@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use crate::model::{FailureEvidence, FailureFeedback};
+use crate::model::{FailureEvidence, FailureFeedback, PlanningRefinement};
 use crate::store::BlobStore;
 
 const HALF_EXCERPT_BYTES: usize = 4096;
@@ -46,6 +46,16 @@ pub fn render_feedback(blobs: &BlobStore, feedback: &FailureFeedback) -> Result<
         rendered.push_str(&excerpt(&blobs.resolve(details)?));
     }
     Ok(rendered)
+}
+
+pub fn render_planning_refinement(
+    blobs: &BlobStore,
+    refinement: &PlanningRefinement,
+) -> Result<String> {
+    match refinement {
+        PlanningRefinement::Guidance(guidance) => Ok(format!("Decision guidance: {guidance}")),
+        PlanningRefinement::FailureEvidence(feedback) => render_feedback(blobs, feedback),
+    }
 }
 
 pub fn excerpt(text: &str) -> String {

@@ -256,7 +256,14 @@ async fn revising_terminal_gaps_carries_the_review_report_into_planning() {
         .expect("revise");
 
     let state = h.engine.load_state(&mission_id).await.expect("state");
-    let feedback = state.planning_feedback.last().expect("planning feedback");
+    let lionclaw::model::PlanningRefinement::FailureEvidence(feedback) = state
+        .planning_input
+        .refinement
+        .as_ref()
+        .expect("planning refinement")
+    else {
+        panic!("terminal review revise must carry structured failure evidence");
+    };
     assert_eq!(feedback.justification, "repair the observed behavior");
     let details = feedback.details.as_ref().expect("review report reference");
     assert_eq!(

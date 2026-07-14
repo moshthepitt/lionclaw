@@ -15,14 +15,15 @@ use super::ids::{AssertionId, TaskId};
 use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome, RunFailure,
-    TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
+    MissionState, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
+    ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState, TaskStatus,
+    TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 4;
+pub const REDUCER_VERSION: u32 = 5;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -73,7 +74,10 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
             tasks: planning_tasks,
         },
         planning_base_revision: (!config.planning.tasks.is_empty()).then_some(0),
-        planning_feedback: Vec::new(),
+        planning_input: PlanningInput {
+            latest_rejected_proposal: None,
+            refinement: None,
+        },
         proposal: None,
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
@@ -432,15 +436,15 @@ fn apply_decision(
         }
     };
     match (action, item.kind) {
-        (DecisionAction::Approve, AttentionKind::PlanProposal) => state.proposal_approved = true,
+        (DecisionAction::Approve, AttentionKind::PlanProposal) => {
+            state.proposal_approved = true;
+            state.planning_input.latest_rejected_proposal = None;
+            state.planning_input.refinement = None;
+        }
         (DecisionAction::Revise, AttentionKind::PlanProposal) => {
-            state.proposal = None;
-            state.planning_feedback.push(super::state::FailureFeedback {
-                summary: item.report,
-                evidence: None,
-                details: None,
-                justification: justification.to_string(),
-            });
+            state.planning_input.latest_rejected_proposal = state.proposal.take();
+            state.planning_input.refinement =
+                Some(PlanningRefinement::Guidance(justification.to_string()));
             start_replanning(state);
         }
         (DecisionAction::Retry, AttentionKind::NodeFailed) => {
@@ -570,12 +574,16 @@ fn apply_decision(
             | AttentionKind::TerminalReviewGaps,
         ) => {
             state.terminal_review.accepted = None;
-            state.planning_feedback.push(super::state::FailureFeedback {
-                summary: item.report,
-                evidence: item.evidence,
-                details: item.details,
-                justification: justification.to_string(),
-            });
+            state.proposal = None;
+            state.proposal_approved = false;
+            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(
+                super::state::FailureFeedback {
+                    summary: item.report,
+                    evidence: item.evidence,
+                    details: item.details,
+                    justification: justification.to_string(),
+                },
+            ));
             start_replanning(state);
         }
         (DecisionAction::Abort, _) => {
@@ -592,6 +600,8 @@ fn start_replanning(state: &mut MissionState) {
     for (id, task) in &mut state.planning.tasks {
         task.status = TaskStatus::Pending;
         task.last_report = None;
+        task.last_failure = None;
+        task.feedback.clear();
         state.flagged_nodes.remove(id);
     }
 }

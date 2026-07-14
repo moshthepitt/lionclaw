@@ -606,7 +606,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
 #[tokio::test]
 async fn terminal_review_prompt_lists_assigned_skills() {
     let dir = tempfile::tempdir().unwrap();
-    let skill_root = write_skill(dir.path());
+    let skill_root = write_skill(dir.path(), "gap-check", "Hunt gaps in the product");
 
     let mut mission_type = common::review_mission_type();
     mission_type.skills.insert(

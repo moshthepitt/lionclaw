@@ -65,6 +65,8 @@ pub struct PlanningPromptContext<'a> {
     pub base_revision: u32,
     /// The accepted plan when authoring a later revision.
     pub current_plan: Option<&'a Plan>,
+    /// The newest complete plan candidate rejected by ratification.
+    pub latest_rejected_plan: Option<&'a Plan>,
     /// The mission type's playbook (its method), if any.
     pub playbook: Option<&'a str>,
     /// The mission type's canonical role definitions. The assembler exposes
@@ -97,6 +99,11 @@ pub fn assemble_planning_prompt(role: &RoleDefinition, ctx: &PlanningPromptConte
         prompt.push_str("\n\n## Current accepted plan\n\n```json\n");
         prompt.push_str(&serde_json::to_string_pretty(plan).expect("plan serializes"));
         prompt.push_str("\n```\nRetain requirements and assertions monotonically. Retained task ids are immutable; omit a task to retire it and use a new id for changed work.\n");
+    }
+    if let Some(plan) = ctx.latest_rejected_plan {
+        prompt.push_str("\n\n## Latest rejected plan candidate\n\n```json\n");
+        prompt.push_str(&serde_json::to_string_pretty(plan).expect("plan serializes"));
+        prompt.push_str("\n```\nUse this only as the last rejected candidate; your next handoff must contain a complete replacement proposal.\n");
     }
     if let Some(playbook) = ctx.playbook {
         prompt.push_str("\n\n## Playbook\n\n");
@@ -510,6 +517,7 @@ mod tests {
                 objective: "revise the novel",
                 base_revision: 0,
                 current_plan: None,
+                latest_rejected_plan: None,
                 playbook: None,
                 roles: &roles,
                 oracle_inventory: &[],
