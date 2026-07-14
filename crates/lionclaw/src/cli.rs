@@ -16,7 +16,8 @@ use crate::mission_type::{
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, EventEnvelope, FinishClass, MissionConfig, MissionId, MissionPhase,
+    fold, short_hex, DecisionAction, EventEnvelope, FinishClass, MissionConfig, MissionId,
+    MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EventSink, SystemClock};
@@ -226,9 +227,15 @@ pub struct DecideArgs {
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Why this decision is appropriate. Required and recorded in the log.
-    #[arg(long)]
-    pub justification: String,
+    /// Why a non-revise decision is appropriate. Recorded in the log.
+    #[arg(long, conflicts_with_all = ["feedback_file", "feedback_stdin"])]
+    pub justification: Option<String>,
+    /// Read exact revise feedback from this UTF-8 file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["justification", "feedback_stdin"])]
+    pub feedback_file: Option<PathBuf>,
+    /// Read exact revise feedback from stdin.
+    #[arg(long, conflicts_with_all = ["justification", "feedback_file"])]
+    pub feedback_stdin: bool,
 }
 
 #[derive(Args)]
@@ -1200,24 +1207,17 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
 }
 
 async fn cmd_decide(args: DecideArgs) -> Result<()> {
-    let (_repo, store) = open_store(args.repo).await?;
+    let action = parse_decision_action(&args.action)?;
     let mission_id = MissionId::parse(&args.mission_id)?;
-    let action = match args.action.as_str() {
-        "approve" => crate::model::DecisionAction::Approve,
-        "retry" => crate::model::DecisionAction::Retry,
-        "repair" => crate::model::DecisionAction::Repair,
-        "revise" => crate::model::DecisionAction::Revise,
-        "accept" => crate::model::DecisionAction::Accept,
-        "abort" => crate::model::DecisionAction::Abort,
-        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
-    };
+    let justification = decision_text(&args, &action)?;
+    let (_repo, store) = open_store(args.repo).await?;
     crate::engine::record_decision(
         &store,
         SystemClock.now_ms(),
         &mission_id,
         &args.item,
         action,
-        &args.justification,
+        &justification,
     )
     .await?;
     println!(
@@ -1225,6 +1225,65 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
         args.item
     );
     Ok(())
+}
+
+fn parse_decision_action(action: &str) -> Result<DecisionAction> {
+    Ok(match action {
+        "approve" => DecisionAction::Approve,
+        "retry" => DecisionAction::Retry,
+        "repair" => DecisionAction::Repair,
+        "revise" => DecisionAction::Revise,
+        "accept" => DecisionAction::Accept,
+        "abort" => DecisionAction::Abort,
+        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
+    })
+}
+
+fn decision_text(args: &DecideArgs, action: &DecisionAction) -> Result<String> {
+    if action == &DecisionAction::Revise {
+        if args.justification.is_some() {
+            bail!(
+                "revise does not accept --justification; use --feedback-file or --feedback-stdin"
+            );
+        }
+        return match (&args.feedback_file, args.feedback_stdin) {
+            (Some(path), false) => read_feedback_file(path),
+            (None, true) => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut bytes)
+                    .context("failed to read revise feedback from stdin")?;
+                decode_feedback(bytes, "stdin")
+            }
+            _ => bail!("revise requires exactly one of --feedback-file PATH or --feedback-stdin"),
+        };
+    }
+
+    if args.feedback_file.is_some() || args.feedback_stdin {
+        bail!("--feedback-file and --feedback-stdin are only valid with revise");
+    }
+    let justification = args
+        .justification
+        .as_deref()
+        .context("non-revise decisions require --justification")?;
+    if justification.trim().is_empty() {
+        bail!("non-revise decisions require a non-empty --justification");
+    }
+    Ok(justification.to_string())
+}
+
+fn read_feedback_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read revise feedback from '{}'", path.display()))?;
+    decode_feedback(bytes, &format!("'{}'", path.display()))
+}
+
+fn decode_feedback(bytes: Vec<u8>, source: &str) -> Result<String> {
+    if bytes.is_empty() {
+        bail!("revise feedback from {source} is empty");
+    }
+    String::from_utf8(bytes).with_context(|| format!("revise feedback from {source} is not UTF-8"))
 }
 
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
@@ -1921,7 +1980,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn cli_has_no_plan_approval_bypass_and_requires_decision_justification() {
+    fn cli_has_no_plan_approval_bypass_and_exposes_only_explicit_decision_inputs() {
         assert!(Cli::try_parse_from([
             "lionclaw",
             "mission",
@@ -1940,19 +1999,43 @@ mod tests {
             "mabc123def456",
             "plan_proposal:mission",
             "approve",
+            "--justification",
+            "reviewed the proposed contract",
         ])
-        .is_err());
+        .is_ok());
         assert!(Cli::try_parse_from([
             "lionclaw",
             "mission",
             "decide",
             "mabc123def456",
             "plan_proposal:mission",
-            "approve",
-            "--justification",
-            "reviewed the proposed contract",
+            "revise",
+            "--feedback-file",
+            "feedback.md",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-stdin",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-file",
+            "feedback.md",
+            "--feedback-stdin",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "lionclaw",
             "mission",
@@ -1980,6 +2063,88 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    fn decision_args(action: &str) -> DecideArgs {
+        DecideArgs {
+            mission_id: "mabc123def456".to_string(),
+            item: "plan_proposal:mission".to_string(),
+            action: action.to_string(),
+            repo: None,
+            justification: None,
+            feedback_file: None,
+            feedback_stdin: false,
+        }
+    }
+
+    #[test]
+    fn decision_inputs_are_action_specific() {
+        let mut approve = decision_args("approve");
+        assert!(decision_text(&approve, &DecisionAction::Approve)
+            .unwrap_err()
+            .to_string()
+            .contains("require --justification"));
+        approve.justification = Some(" \n\t".to_string());
+        assert!(decision_text(&approve, &DecisionAction::Approve)
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty"));
+        approve.justification = Some("contract checked".to_string());
+        assert_eq!(
+            decision_text(&approve, &DecisionAction::Approve).unwrap(),
+            "contract checked"
+        );
+
+        let revise = decision_args("revise");
+        assert!(decision_text(&revise, &DecisionAction::Revise)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+        let mut revise_with_justification = decision_args("revise");
+        revise_with_justification.justification = Some("inline".to_string());
+        assert!(
+            decision_text(&revise_with_justification, &DecisionAction::Revise)
+                .unwrap_err()
+                .to_string()
+                .contains("does not accept --justification")
+        );
+        let mut retry = decision_args("retry");
+        retry.feedback_file = Some(PathBuf::from("feedback.md"));
+        assert!(decision_text(&retry, &DecisionAction::Retry)
+            .unwrap_err()
+            .to_string()
+            .contains("only valid with revise"));
+    }
+
+    #[test]
+    fn revise_feedback_file_preserves_large_utf8_input_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feedback.md");
+        let feedback = format!("  first\0line\n{}\t", "x".repeat(140 * 1024));
+        std::fs::write(&path, feedback.as_bytes()).unwrap();
+        let mut args = decision_args("revise");
+        args.feedback_file = Some(path);
+
+        assert_eq!(
+            decision_text(&args, &DecisionAction::Revise).unwrap(),
+            feedback
+        );
+    }
+
+    #[test]
+    fn revise_feedback_rejects_empty_or_invalid_utf8_input() {
+        assert!(decode_feedback(Vec::new(), "stdin")
+            .unwrap_err()
+            .to_string()
+            .contains("is empty"));
+        assert!(decode_feedback(vec![0xff], "stdin")
+            .unwrap_err()
+            .to_string()
+            .contains("is not UTF-8"));
+        assert_eq!(
+            decode_feedback(b" \n\t".to_vec(), "stdin").unwrap(),
+            " \n\t"
+        );
     }
 
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
