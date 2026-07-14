@@ -413,7 +413,8 @@ pub enum MissionEvent {
 }
 
 /// The actions a decision can take on an open attention item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionAction {
     /// Approve a proposed plan or a cleared gate checkpoint.
     Approve,
@@ -427,50 +428,6 @@ pub enum DecisionAction {
     Accept,
     /// Abort the mission.
     Abort,
-}
-
-impl Serialize for DecisionAction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            action: &'a str,
-        }
-
-        Wire {
-            action: self.slug(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for DecisionAction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            action: String,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        match wire.action.as_str() {
-            "approve" => Ok(Self::Approve),
-            "retry" => Ok(Self::Retry),
-            "repair" => Ok(Self::Repair),
-            "revise" => Ok(Self::Revise),
-            "accept" => Ok(Self::Accept),
-            "abort" => Ok(Self::Abort),
-            other => Err(serde::de::Error::unknown_variant(
-                other,
-                &["approve", "retry", "repair", "revise", "accept", "abort"],
-            )),
-        }
-    }
 }
 
 impl DecisionAction {
@@ -695,7 +652,7 @@ mod compat_tests {
                 serde_json::json!({
                     "type": "decision_recorded",
                     "attention_id": format!("attn-{}", action.slug()),
-                    "action": { "action": action.slug() },
+                    "action": action.slug(),
                     "justification": format!("because {}", action.slug())
                 })
             );
@@ -709,9 +666,10 @@ mod compat_tests {
             r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]}},"plan_hash":"hash","actor":"caller"}"#,
             r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]}},"plan_hash":"hash","justification":"dead prose"}"#,
             r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]},"unexpected":"nested"}},"plan_hash":"hash"}"#,
-            r#"{"type":"decision_recorded","attention_id":"a","action":{"action":"approve"},"justification":"ok","actor":"caller"}"#,
-            r#"{"type":"decision_recorded","attention_id":"a","action":{"action":"approve"},"justification":"ok","unexpected":"field"}"#,
-            r#"{"type":"decision_recorded","attention_id":"a","action":{"action":"approve","unexpected":"nested"},"justification":"ok"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"approve","justification":"ok","actor":"caller"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"approve","justification":"ok","unexpected":"field"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":{"action":"approve"},"justification":"ok"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"unknown","justification":"ok"}"#,
             r#"{"type":"mission_aborted","reason":"stop","actor":"caller"}"#,
             r#"{"type":"mission_aborted","reason":"stop","unexpected":"field"}"#,
         ];
