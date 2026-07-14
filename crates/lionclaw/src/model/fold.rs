@@ -576,14 +576,14 @@ fn apply_decision(
             state.terminal_review.accepted = None;
             state.proposal = None;
             state.proposal_approved = false;
-            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(
+            state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
                 super::state::FailureFeedback {
                     summary: item.report,
                     evidence: item.evidence,
                     details: item.details,
                     justification: justification.to_string(),
                 },
-            ));
+            )));
             start_replanning(state);
         }
         (DecisionAction::Abort, _) => {

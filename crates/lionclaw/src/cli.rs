@@ -2537,8 +2537,8 @@ mod tests {
         );
 
         let mut state = view.state;
-        state.planning_input.refinement =
-            Some(PlanningRefinement::FailureEvidence(FailureFeedback {
+        state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
+            FailureFeedback {
                 summary: "oracle failed".to_string(),
                 evidence: Some(FailureEvidence {
                     exit_code: 1,
@@ -2548,7 +2548,8 @@ mod tests {
                 }),
                 details: Some(crate::model::PayloadRef::inline("review detail")),
                 justification: "repair this".to_string(),
-            }));
+            },
+        )));
         let json = planning_input_json(&state, &blobs).unwrap();
         assert_eq!(json["refinement"]["kind"], "failure_evidence");
         assert_eq!(json["refinement"]["evidence"]["stdout"], "ordinary output");

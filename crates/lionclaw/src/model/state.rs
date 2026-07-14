@@ -142,7 +142,7 @@ pub struct FailureFeedback {
 #[serde(rename_all = "snake_case")]
 pub enum PlanningRefinement {
     Guidance(String),
-    FailureEvidence(FailureFeedback),
+    FailureEvidence(Box<FailureFeedback>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
