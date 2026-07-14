@@ -12,6 +12,15 @@ pub struct DriverGuard {
     _file: File,
 }
 
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can duplicate this descriptor before CLOEXEC takes
+        // effect. Unlock explicitly so such a short-lived duplicate cannot
+        // retain mission ownership after this guard is dropped.
+        let _ = flock(&self._file, FlockOperation::Unlock);
+    }
+}
+
 impl DriverGuard {
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
@@ -52,6 +61,19 @@ mod tests {
         drop(first);
         let second = DriverGuard::try_acquire(&path).unwrap();
         assert!(second.is_some());
+    }
+
+    #[test]
+    fn drop_unlocks_even_when_the_descriptor_was_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("driver.lock");
+        let guard = DriverGuard::try_acquire(&path).unwrap().unwrap();
+        let inherited = guard._file.try_clone().unwrap();
+
+        drop(guard);
+
+        assert!(DriverGuard::try_acquire(&path).unwrap().is_some());
+        drop(inherited);
     }
 
     #[test]
