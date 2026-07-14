@@ -1373,6 +1373,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
         }
+        print_planning_input(store.blobs(), state, "")?;
         for item in state.open_attention.values() {
             print_attention(store.blobs(), item, "  ")?;
         }
@@ -1722,7 +1723,10 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
         println!("{}", mission_view_json(view, blobs)?);
     } else {
         match view.disposition {
-            MissionDisposition::AwaitingPlan => println!("mission {mission_id}: awaiting a plan"),
+            MissionDisposition::AwaitingPlan => {
+                println!("mission {mission_id}: awaiting a plan");
+                print_planning_input(blobs, state, "  ")?;
+            }
             MissionDisposition::Parked => {
                 println!(
                     "mission {mission_id}: parked ({} attention item(s))",
@@ -1769,6 +1773,7 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
+        "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
             serde_json::json!({
                 "id": id.as_str(),
@@ -1785,6 +1790,74 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "cleanup_failure": cleanup_failure_json(state),
         "terminal_review": review_summary(state),
     }))
+}
+
+fn planning_input_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> Result<serde_json::Value> {
+    if state.planning_input.latest_rejected_proposal.is_none()
+        && state.planning_input.refinement.is_none()
+    {
+        return Ok(serde_json::Value::Null);
+    }
+    let refinement = match state.planning_input.refinement.as_ref() {
+        Some(crate::model::PlanningRefinement::Guidance(guidance)) => serde_json::json!({
+            "kind": "guidance",
+            "text": guidance,
+        }),
+        Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => serde_json::json!({
+            "kind": "failure_evidence",
+            "summary": feedback.summary,
+            "justification": feedback.justification,
+            "evidence": feedback.evidence.as_ref()
+                .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
+                .transpose()?,
+            "details": feedback.details.as_ref()
+                .map(|details| blobs.resolve(details).map(|text| crate::evidence::excerpt(&text)))
+                .transpose()?,
+        }),
+        None => serde_json::Value::Null,
+    };
+    Ok(serde_json::json!({
+        "base_revision": state.planning_base_revision.unwrap_or(state.revision),
+        "latest_rejected_proposal": state.planning_input.latest_rejected_proposal,
+        "refinement": refinement,
+    }))
+}
+
+fn print_planning_input(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) -> Result<()> {
+    let input = &state.planning_input;
+    if input.latest_rejected_proposal.is_none() && input.refinement.is_none() {
+        return Ok(());
+    }
+    println!("{indent}active planning input:");
+    if let Some(proposal) = &input.latest_rejected_proposal {
+        println!(
+            "{indent}  latest rejected complete proposal targeted revision {}",
+            proposal.base_revision
+        );
+    }
+    match input.refinement.as_ref() {
+        Some(crate::model::PlanningRefinement::Guidance(guidance)) => {
+            println!("{indent}  human guidance:");
+            for line in guidance.lines() {
+                println!("{indent}    {line}");
+            }
+        }
+        Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
+            println!("{indent}  failure evidence:");
+            for line in crate::evidence::render_feedback(blobs, feedback)?.lines() {
+                println!("{indent}    {line}");
+            }
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn cleanup_failure_json(state: &crate::model::MissionState) -> serde_json::Value {
@@ -2426,8 +2499,65 @@ mod tests {
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
         assert_eq!(json["next_actions"], serde_json::json!(["mission decide"]));
+        assert_eq!(json["planning_input"], serde_json::Value::Null);
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
+    }
+
+    #[test]
+    fn mission_view_json_projects_complete_manual_replanning_input() {
+        use crate::model::{FailureEvidence, FailureFeedback, PlanningRefinement};
+
+        let mut state = review_state(vec![]);
+        state.planning_base_revision = Some(1);
+        state.planning_input.latest_rejected_proposal = Some(crate::model::PlanProposal {
+            base_revision: 1,
+            plan: state.plan.clone().expect("accepted plan"),
+        });
+        state.planning_input.refinement = Some(PlanningRefinement::Guidance(
+            "  preserve this exactly\n\t".to_string(),
+        ));
+        let view = MissionView {
+            state,
+            disposition: MissionDisposition::AwaitingPlan,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path().join("blobs"));
+        let json = mission_view_json(&view, &blobs).unwrap();
+
+        assert_eq!(json["planning_input"]["base_revision"], 1);
+        assert_eq!(
+            json["planning_input"]["latest_rejected_proposal"]["base_revision"],
+            1
+        );
+        assert_eq!(json["planning_input"]["refinement"]["kind"], "guidance");
+        assert_eq!(
+            json["planning_input"]["refinement"]["text"],
+            "  preserve this exactly\n\t"
+        );
+
+        let mut state = view.state;
+        state.planning_input.refinement =
+            Some(PlanningRefinement::FailureEvidence(FailureFeedback {
+                summary: "oracle failed".to_string(),
+                evidence: Some(FailureEvidence {
+                    exit_code: 1,
+                    exit_signal: None,
+                    stdout: crate::model::PayloadRef::inline("ordinary output"),
+                    stderr: crate::model::PayloadRef::inline("actual diagnostic"),
+                }),
+                details: Some(crate::model::PayloadRef::inline("review detail")),
+                justification: "repair this".to_string(),
+            }));
+        let json = planning_input_json(&state, &blobs).unwrap();
+        assert_eq!(json["refinement"]["kind"], "failure_evidence");
+        assert_eq!(json["refinement"]["evidence"]["stdout"], "ordinary output");
+        assert_eq!(
+            json["refinement"]["evidence"]["stderr"],
+            "actual diagnostic"
+        );
+        assert_eq!(json["refinement"]["details"], "review detail");
+        assert_eq!(json["refinement"]["justification"], "repair this");
     }
 
     #[test]
