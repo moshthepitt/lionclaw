@@ -219,6 +219,10 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     );
     assert!(parked.state.parked_effects.contains_key(&effect_id));
     assert_eq!(
+        parked.next_actions(),
+        ["mission continue", "mission decide"]
+    );
+    assert_eq!(
         parked
             .state
             .tasks
@@ -270,6 +274,18 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         requests.lock().unwrap().as_slice(),
         &[(BASE_SHA.into(), 1), (BASE_SHA.into(), 1)]
     );
+    assert!(record_control(
+        &store,
+        6,
+        &mission_id,
+        &effect_id,
+        ControlAction::Continue { automatic: false },
+        "must not reopen a terminal mission",
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("terminal"));
 }
 
 #[tokio::test]

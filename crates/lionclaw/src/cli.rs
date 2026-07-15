@@ -1605,6 +1605,13 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             println!("  {id}: authoritative={auth}");
         }
         print_activity(&store, &mission_id)?;
+        for (effect_id, parked) in &state.parked_effects {
+            println!(
+                "parked effect {}: {:?}; legal control=continue",
+                short_hex(effect_id.as_str()),
+                parked
+            );
+        }
         print_planning_input(store.blobs(), state, "")?;
         for item in state.open_attention.values() {
             print_attention(store.blobs(), item, "  ")?;
@@ -2092,6 +2099,13 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
         "oracle_failures": state.oracle_failures,
+        "parked_effects": state.parked_effects.iter().map(|(effect_id, parked)| {
+            serde_json::json!({
+                "effect_id": effect_id.as_str(),
+                "kind": parked,
+                "legal_controls": ["continue"],
+            })
+        }).collect::<Vec<_>>(),
         "terminal_review": review_summary(state),
     }))
 }

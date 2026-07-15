@@ -130,6 +130,9 @@ impl MissionView {
             MissionDisposition::Ready => vec!["mission advance"],
             MissionDisposition::Running => vec!["mission status"],
             MissionDisposition::AwaitingPlan => vec!["mission plan propose"],
+            MissionDisposition::Parked if !self.state.parked_effects.is_empty() => {
+                vec!["mission continue", "mission decide"]
+            }
             MissionDisposition::Parked => vec!["mission decide"],
             MissionDisposition::CleanupBlocked => vec!["mission advance", "mission log"],
             MissionDisposition::Terminal => vec!["mission report", "mission apply"],
@@ -1497,6 +1500,9 @@ pub async fn record_control(
         bail!("control reason must not be empty");
     }
     let state = store.require_state(mission_id).await?;
+    if state.phase.is_terminal() {
+        bail!("mission '{mission_id}' is terminal; controls are not legal");
+    }
     match &action {
         crate::model::ControlAction::Stop => {
             if !state.inflight.contains_key(effect_id) {
