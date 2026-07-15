@@ -36,6 +36,7 @@ mod capability;
 mod context;
 mod driver;
 mod event;
+mod failure;
 mod program;
 mod program_backed;
 mod registry;
@@ -65,6 +66,7 @@ pub use event::{
     RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus,
     RuntimeMessageLane, RuntimeTurnJournalSender, TurnEvent,
 };
+pub use failure::{bounded_text, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT};
 pub use program::{
     ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
     RuntimeProgramSpec, RuntimeProgramStdoutSender,

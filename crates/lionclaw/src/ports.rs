@@ -9,11 +9,12 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use lionclaw_runtime_api::TypedFailure;
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
     ArtifactOutcome, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
-    RunErrorKind, RuntimeConfigurationEvidence, TaskId,
+    RuntimeConfigurationEvidence, TaskId,
 };
 
 /// One full autonomous agent run — the engine never micromanages how a role
@@ -21,7 +22,7 @@ use crate::model::{
 /// is never re-invoked.
 #[async_trait]
 pub trait RoleRunner: Send + Sync {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure>;
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -59,18 +60,10 @@ pub struct RoleRunOutcome {
     pub final_response: String,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("role run failed ({kind:?}): {detail}")]
-pub struct RoleRunFailure {
-    pub kind: RunErrorKind,
-    pub detail: String,
-    pub final_response: String,
-}
-
 /// An engine-run, worker-independent, reproducible check. Exit 0 = pass.
 #[async_trait]
 pub trait OracleRunner: Send + Sync {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure>;
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure>;
 }
 
 #[derive(Debug, Clone)]
@@ -116,14 +109,6 @@ pub struct OracleOutcome {
     pub stderr: Vec<u8>,
     pub prepared_inputs: Vec<PreparedInputRef>,
     pub duration_ms: u64,
-}
-
-/// Infrastructure failure — distinct from a nonzero exit (which is a valid,
-/// recorded verdict).
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("oracle failed to run: {detail}")]
-pub struct OracleFailure {
-    pub detail: String,
 }
 
 pub trait Clock: Send + Sync {

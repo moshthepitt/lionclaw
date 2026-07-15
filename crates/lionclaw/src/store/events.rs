@@ -35,14 +35,6 @@ impl NewEvent {
         }
     }
 
-    pub fn with_runtime_configuration(
-        mut self,
-        configuration: crate::model::RuntimeConfigurationEvidence,
-    ) -> Self {
-        self.stamps.runtime_configuration = Some(configuration);
-        self
-    }
-
     pub fn with_prompt_hash(mut self, prompt_hash: impl Into<String>) -> Self {
         self.stamps.prompt_hash = Some(prompt_hash.into());
         self

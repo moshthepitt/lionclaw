@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use lionclaw_runtime_api::TypedFailure;
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,12 +170,30 @@ pub(crate) fn acp_is_server_request(message: &Value) -> bool {
 
 pub(crate) fn parse_acp_response(message: AcpMessage, method: &str) -> Result<AcpResponse> {
     if let Some(error) = message.value.get("error") {
-        return Err(anyhow!("ACP {method} failed: {}", acp_error_text(error)));
+        return Err(acp_typed_failure(method, error).into());
     }
     Ok(AcpResponse {
         raw: message.raw,
         result: message.value.get("result").cloned().unwrap_or(Value::Null),
     })
+}
+
+pub(crate) fn acp_typed_failure(method: &str, error: &Value) -> TypedFailure {
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .map_or_else(|| "acp.error".to_string(), |code| code.to_string());
+    let detail = format!("ACP {method} failed: {}", acp_error_text(error));
+    let data = error.get("data").unwrap_or(&Value::Null);
+    if data.get("retryable").and_then(Value::as_bool) == Some(true) {
+        TypedFailure::transient(
+            code,
+            detail,
+            data.get("retryAfterMs").and_then(Value::as_u64),
+        )
+    } else {
+        TypedFailure::permanent(code, detail)
+    }
 }
 
 fn acp_error_text(error: &Value) -> String {
@@ -186,5 +205,30 @@ fn acp_error_text(error: &Value) -> String {
     match code {
         Some(code) => format!("{code}: {message}"),
         None => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn retryability_uses_structured_json_rpc_evidence_not_prose() {
+        let prose = "rate limited, retry later";
+        assert!(matches!(
+            acp_typed_failure("session/prompt", &json!({"code": -32000, "message": prose})),
+            TypedFailure::PermanentRuntime { .. }
+        ));
+        assert!(matches!(
+            acp_typed_failure(
+                "session/prompt",
+                &json!({"code": -32000, "message": prose, "data": {"retryable": true, "retryAfterMs": 25}})
+            ),
+            TypedFailure::TransientRuntime {
+                retry_after_ms: Some(25),
+                ..
+            }
+        ));
     }
 }

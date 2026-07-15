@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use lionclaw_runtime_api::TypedFailure;
 
 use crate::model::{ArtifactOutcome, Gap, Handoff, PayloadRef, TaskId};
 use crate::ports::{
-    Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleFailure, OracleOutcome,
-    OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner,
+    Clock, EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, OracleOutcome,
+    OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 
 #[derive(Default)]
@@ -61,7 +62,7 @@ impl Clock for MockClock {
 }
 
 type RoleScript =
-    Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> + Send + Sync>;
+    Box<dyn Fn(&RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> + Send + Sync>;
 
 pub struct MockRoleRunner {
     script: RoleScript,
@@ -115,7 +116,7 @@ impl MockRoleRunner {
 
 #[async_trait]
 impl RoleRunner for MockRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         self.calls.lock().expect("lock").push((
             request.task_id.clone(),
             request.attempt_no,
@@ -132,7 +133,7 @@ impl RoleRunner for MockRoleRunner {
 }
 
 type OracleScript =
-    Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, OracleFailure> + Send + Sync>;
+    Box<dyn Fn(&OracleRunRequest) -> Result<OracleOutcome, TypedFailure> + Send + Sync>;
 
 pub struct MockOracleRunner {
     script: OracleScript,
@@ -164,7 +165,7 @@ impl MockOracleRunner {
 
 #[async_trait]
 impl OracleRunner for MockOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         self.calls
             .lock()
             .expect("lock")

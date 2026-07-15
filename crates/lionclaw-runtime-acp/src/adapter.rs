@@ -13,7 +13,7 @@ use lionclaw_runtime_api::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
     RuntimeMcpServerSpec, RuntimeProgramExecutor, RuntimeProgramSpec, RuntimeProgramTurnExecution,
     RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
-    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult,
+    RuntimeTurnJournalSender, RuntimeTurnMode, RuntimeTurnResult, TypedFailure,
 };
 
 use crate::client::{finish_acp_session, AcpClient, AcpEnsureSession};
@@ -205,6 +205,7 @@ impl AcpTurnRunner {
         let session = self.executor.spawn(program).await?;
         let mut client = AcpClient::new(session);
         let mut active_turn = None;
+        let mut applied_configuration = None;
 
         let result = async {
             let session_capabilities = client.initialize().await?;
@@ -226,6 +227,7 @@ impl AcpTurnRunner {
                     &opened_session.selections,
                 )
                 .await?;
+            applied_configuration = Some(configuration.clone());
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
                 &self.sessions,
@@ -249,8 +251,25 @@ impl AcpTurnRunner {
         }
         .await;
 
-        let result = finish_acp_session(client, result).await;
+        let result = finish_acp_session(client, result).await.map_err(|error| {
+            configured_failure(error, applied_configuration.as_ref(), "acp.runtime")
+        });
         drop(active_turn);
         result
     }
+}
+
+fn configured_failure(
+    error: anyhow::Error,
+    configuration: Option<&lionclaw_runtime_api::AppliedRuntimeConfiguration>,
+    code: &str,
+) -> anyhow::Error {
+    let mut failure = error
+        .downcast_ref::<TypedFailure>()
+        .cloned()
+        .unwrap_or_else(|| TypedFailure::permanent(code, error.to_string()));
+    if let Some(configuration) = configuration {
+        failure.evidence_mut().configuration = configuration.clone();
+    }
+    anyhow::Error::new(failure.projected())
 }

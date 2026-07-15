@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +62,8 @@ pub struct RuntimeCapabilityResult {
     pub output: Value,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppliedRuntimeConfiguration {
     pub requested_model: Option<String>,
     pub applied_model: Option<String>,

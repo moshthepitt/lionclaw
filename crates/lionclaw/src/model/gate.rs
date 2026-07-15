@@ -225,21 +225,25 @@ mod tests {
                     task_id: tid(validator),
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", validator]),
-                    handoff: Handoff::Validate {
-                        done: true,
-                        report: PayloadRef::inline("r"),
-                        items: items
-                            .iter()
-                            .map(|(a, p)| ValidationItem {
-                                item_id: aid(a),
-                                passed: *p,
-                            })
-                            .collect(),
-                        passed: items.iter().all(|(_, p)| *p),
-                        request_attention: false,
-                    },
-                    artifact: None,
-                    final_response: PayloadRef::inline("reviewed"),
+                    outcome: Ok(crate::model::RoleRunSuccess {
+                        handoff: Handoff::Validate {
+                            done: true,
+                            report: PayloadRef::inline("r"),
+                            items: items
+                                .iter()
+                                .map(|(a, p)| ValidationItem {
+                                    item_id: aid(a),
+                                    passed: *p,
+                                })
+                                .collect(),
+                            passed: items.iter().all(|(_, p)| *p),
+                            request_attention: false,
+                        },
+                        artifact: None,
+                        final_response: PayloadRef::inline("reviewed"),
+                        runtime_configuration: crate::model::RuntimeConfigurationEvidence::default(
+                        ),
+                    }),
                 },
             ));
             seq += 1;

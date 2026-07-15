@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use crate::model::{Handoff, OutputSemantics, RunErrorKind};
-use crate::ports::RoleRunFailure;
+use crate::model::{Handoff, OutputSemantics};
+use lionclaw_runtime_api::TypedFailure;
 
 pub const WORK_HANDOFF_SCHEMA: &str = "lionclaw.mission.work-handoff.v1";
 pub const VALIDATE_HANDOFF_SCHEMA: &str = "lionclaw.mission.validate-handoff.v1";
@@ -32,7 +32,7 @@ const MAX_HANDOFF_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_GAPS_BYTES: usize = 256 * 1024;
 
 /// Read and validate the handoff file for a finished role run.
-pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, RoleRunFailure> {
+pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, TypedFailure> {
     use std::io::Read;
     let path = dir.join("handoff.json");
     // The agent controls this file (the handoff mount is read-write). Reject
@@ -40,48 +40,46 @@ pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, Role
     // the host read outside the mount, and a FIFO would block this thread
     // forever on open (never reaping the attempt dir). The agent's turn has
     // already ended, so there is no live race between this stat and the open.
-    let meta = std::fs::symlink_metadata(&path).map_err(|err| RoleRunFailure {
-        kind: RunErrorKind::HandoffMissing,
-        detail: format!("no handoff at '{}': {err}", path.display()),
-        final_response: String::new(),
+    let invalid = |code: &str, detail: String| TypedFailure::invalid(code, detail);
+    let meta = std::fs::symlink_metadata(&path).map_err(|err| {
+        invalid(
+            "handoff.missing",
+            format!("no handoff at '{}': {err}", path.display()),
+        )
     })?;
     if !meta.file_type().is_file() {
-        return Err(RoleRunFailure {
-            kind: RunErrorKind::HandoffInvalid,
-            detail: format!("handoff at '{}' is not a regular file", path.display()),
-            final_response: String::new(),
-        });
+        return Err(invalid(
+            "handoff.file_type",
+            format!("handoff at '{}' is not a regular file", path.display()),
+        ));
     }
-    let file = std::fs::File::open(&path).map_err(|err| RoleRunFailure {
-        kind: RunErrorKind::HandoffMissing,
-        detail: format!("no handoff at '{}': {err}", path.display()),
-        final_response: String::new(),
+    let file = std::fs::File::open(&path).map_err(|err| {
+        invalid(
+            "handoff.missing",
+            format!("no handoff at '{}': {err}", path.display()),
+        )
     })?;
     // Read one byte past the cap so an over-limit file is detected.
     let mut raw = String::new();
     file.take(MAX_HANDOFF_BYTES + 1)
         .read_to_string(&mut raw)
-        .map_err(|err| RoleRunFailure {
-            kind: RunErrorKind::HandoffInvalid,
-            detail: format!("handoff at '{}' is not valid UTF-8: {err}", path.display()),
-            final_response: String::new(),
+        .map_err(|err| {
+            invalid(
+                "handoff.utf8",
+                format!("handoff at '{}' is not valid UTF-8: {err}", path.display()),
+            )
         })?;
     if raw.len() as u64 > MAX_HANDOFF_BYTES {
-        return Err(RoleRunFailure {
-            kind: RunErrorKind::HandoffInvalid,
-            detail: format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
-            final_response: String::new(),
-        });
+        return Err(invalid(
+            "handoff.too_large",
+            format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
+        ));
     }
     parse_handoff(&raw, output)
 }
 
-fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunFailure> {
-    let invalid = |detail: String| RoleRunFailure {
-        kind: RunErrorKind::HandoffInvalid,
-        detail,
-        final_response: String::new(),
-    };
+fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFailure> {
+    let invalid = |detail: String| TypedFailure::invalid("handoff.schema", detail);
     let mut value: serde_json::Value =
         serde_json::from_str(raw).map_err(|err| invalid(format!("handoff is not JSON: {err}")))?;
     let object = value
@@ -161,7 +159,7 @@ mod tests {
         );
         std::fs::write(dir.path().join("handoff.json"), big).expect("write");
         let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        assert!(err.is_invalid_output());
     }
 
     // A malicious agent could leave a symlink (traverse to a host file) or a
@@ -176,7 +174,7 @@ mod tests {
         std::fs::write(&secret, "host bytes").unwrap();
         std::os::unix::fs::symlink(&secret, dir.path().join("handoff.json")).unwrap();
         let err = read_handoff(dir.path(), OutputSemantics::ProducesArtifact).expect_err("reject");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        assert!(err.is_invalid_output());
 
         // FIFO — a plain open would block here forever; the stat gate must catch
         // it first and return promptly.
@@ -190,7 +188,7 @@ mod tests {
         if made {
             let err = read_handoff(fifo_dir.path(), OutputSemantics::ProducesArtifact)
                 .expect_err("reject");
-            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+            assert!(err.is_invalid_output());
         }
     }
 
@@ -233,7 +231,7 @@ mod tests {
                       "nonce":"terminal-only","gaps":[]}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict)
             .expect_err("terminal-review fields must not enter a validator handoff");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        assert!(err.is_invalid_output());
     }
 
     #[test]
@@ -271,7 +269,7 @@ mod tests {
         ] {
             let err = parse_handoff(raw, OutputSemantics::EmitsGapVerdict)
                 .expect_err("review and validator contracts must stay disjoint");
-            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+            assert!(err.is_invalid_output());
         }
     }
 
@@ -289,8 +287,8 @@ mod tests {
                 }}"#
         );
         let err = parse_handoff(&raw, OutputSemantics::EmitsGapVerdict).expect_err("must refuse");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
-        assert!(err.detail.contains("cite short excerpts"));
+        assert!(err.is_invalid_output());
+        assert!(err.detail().contains("cite short excerpts"));
     }
 
     #[test]
@@ -314,7 +312,7 @@ mod tests {
             );
             let err =
                 parse_handoff(&raw, OutputSemantics::EmitsGapVerdict).expect_err("must refuse");
-            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+            assert!(err.is_invalid_output());
         }
     }
 
@@ -325,14 +323,14 @@ mod tests {
                       "done":true,"report":{"kind":"inline","text":"looks great"},
                       "request_attention":false}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        assert!(err.is_invalid_output());
     }
 
     #[test]
     fn rejects_missing_schema_and_bad_json() {
         for raw in [r#"{"type":"work","done":true}"#, "not json"] {
             let err = parse_handoff(raw, OutputSemantics::ProducesArtifact).expect_err("refuse");
-            assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+            assert!(err.is_invalid_output());
         }
     }
 
@@ -344,6 +342,6 @@ mod tests {
                       "items":[{"item_id":"lowercase-bad","passed":true}],
                       "passed":true,"request_attention":false}"#;
         let err = parse_handoff(raw, OutputSemantics::EmitsVerdict).expect_err("must refuse");
-        assert_eq!(err.kind, RunErrorKind::HandoffInvalid);
+        assert!(err.is_invalid_output());
     }
 }

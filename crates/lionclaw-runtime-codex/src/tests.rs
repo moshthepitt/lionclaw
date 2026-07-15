@@ -16,7 +16,8 @@ use lionclaw_runtime_api::{
     RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec,
     RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
     RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent, RUNTIME_SESSION_READY_MARKER,
+    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent, TypedFailure,
+    RUNTIME_SESSION_READY_MARKER,
 };
 
 use crate::codex_runtime_auth_kind;
@@ -1639,7 +1640,9 @@ async fn codex_app_server_turn_journals_project_to_canonical_events() {
     let (interrupted, client) = codex_fixture_canonical_journal("turn_interrupt_v2").await;
     assert!(interrupted.is_empty());
     assert_eq!(
-        client.turn_failure(Some("turn_1")),
+        client
+            .turn_failure(Some("turn_1"))
+            .map(TypedFailure::detail),
         Some("codex turn interrupted")
     );
 }
@@ -1872,12 +1875,38 @@ async fn codex_app_server_unmatched_terminal_error_returns_error() {
         .expect_err("unmatched terminal errors should fail a specific turn");
 
     assert!(err.to_string().contains("global app-server failure"));
+    assert!(matches!(
+        err.downcast_ref::<TypedFailure>(),
+        Some(TypedFailure::PermanentRuntime { .. })
+    ));
     let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
     assert!(!events
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Done)));
 
     adapter.close(&handle).await.expect("close");
+}
+
+#[test]
+fn codex_turn_failure_classification_uses_only_will_retry() {
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    client.remember_turn_failure(
+        &json!({"turnId": "transient", "willRetry": true, "message": "overloaded"}),
+        "overloaded".into(),
+    );
+    client.remember_turn_failure(
+        &json!({"turnId": "unknown", "message": "please retry later"}),
+        "please retry later".into(),
+    );
+
+    assert!(matches!(
+        client.turn_failure(Some("transient")),
+        Some(TypedFailure::TransientRuntime { .. })
+    ));
+    assert!(matches!(
+        client.turn_failure(Some("unknown")),
+        Some(TypedFailure::PermanentRuntime { .. })
+    ));
 }
 
 #[tokio::test]

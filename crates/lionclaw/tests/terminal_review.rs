@@ -5,6 +5,8 @@
 
 mod common;
 
+use lionclaw_runtime_api::TypedFailure;
+
 use std::sync::Mutex;
 
 use common::{
@@ -16,7 +18,7 @@ use lionclaw::model::{
     ArtifactOutcome, DecisionAction, FinishClass, Handoff, MissionEvent, MissionPhase, PayloadRef,
     ReviewAcceptanceKind, ReviewOutcome, Task, TaskKind,
 };
-use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::testing::{review_verdict, MockOracleRunner, MockRoleRunner};
 
 fn parked(view: &MissionView) -> Vec<&lionclaw::model::AttentionItem> {
@@ -345,11 +347,11 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
             let mut seen = reviews.lock().expect("lock");
             *seen += 1;
             if *seen == 1 {
-                Err(RoleRunFailure {
-                    kind: lionclaw::model::RunErrorKind::Timeout,
-                    detail: "agent timed out".to_string(),
-                    final_response: String::new(),
-                })
+                Err(TypedFailure::transient(
+                    "runtime.fixture",
+                    "agent timed out".to_string(),
+                    None,
+                ))
             } else {
                 Ok(review_verdict(request, true, vec![]))
             }
@@ -443,7 +445,7 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
     let Some(ReviewOutcome::Failed { failure }) = &state.terminal_review.outcome else {
         panic!("interrupted failure recorded");
     };
-    assert_eq!(failure.kind, lionclaw::model::RunErrorKind::Interrupted);
+    assert_eq!(failure.category(), "interrupted");
     assert_eq!(
         h.role_runner
             .invocations_by_key
@@ -529,8 +531,8 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
     );
     let events = h.engine.store().load(&mission_id).await.expect("load");
     assert!(events.iter().any(|event| matches!(&event.event,
-        MissionEvent::TerminalReviewFailed { effect_id, failure, .. }
-            if effect_id == &id && failure.kind == lionclaw::model::RunErrorKind::Interrupted)));
+        MissionEvent::TerminalReviewCompleted { effect_id, outcome: Err(failure), .. }
+            if effect_id == &id && failure.category() == "interrupted")));
 }
 
 #[tokio::test]
@@ -578,11 +580,11 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
             let mut seen = reviews.lock().expect("lock");
             *seen += 1;
             if *seen == 1 {
-                Err(RoleRunFailure {
-                    kind: lionclaw::model::RunErrorKind::Timeout,
-                    detail: "agent timed out".to_string(),
-                    final_response: String::new(),
-                })
+                Err(TypedFailure::transient(
+                    "runtime.fixture",
+                    "agent timed out".to_string(),
+                    None,
+                ))
             } else {
                 Ok(review_verdict(request, true, vec![]))
             }

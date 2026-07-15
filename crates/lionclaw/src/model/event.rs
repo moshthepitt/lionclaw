@@ -7,19 +7,21 @@
 //!
 //! Non-deterministic or side-effecting steps are two events: `…Requested`
 //! (intent + content-derived effect ID; consumed by the effect driver)
-//! then `…Completed`/`…Failed` (outcome fact; consumed by the fold). The log
+//! then `…Completed` with a typed success/failure result (outcome fact;
+//! consumed by the fold). The log
 //! stores outcomes, never executable intentions.
 //!
 //! Events are additive-only and version-stamped; never rewrite history.
 
+use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
-/// Bumped for the strict decision/proposal/abort wire break that removes
-/// caller-supplied provenance from authoritative events.
-pub const SCHEMA_VERSION: u32 = 6;
+/// Bumped for unified typed effect outcomes and removal of legacy failed
+/// event variants and envelope-level runtime configuration evidence.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,8 +131,6 @@ pub struct TerminalReviewConfig {
 pub struct VersionStamps {
     pub schema_version: u32,
     pub engine_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_hash: Option<String>,
 }
@@ -254,17 +254,38 @@ pub struct PreparedInputRef {
     pub digest: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunErrorKind {
-    Launch,
-    TurnFailed,
-    Timeout,
-    HandoffMissing,
-    HandoffInvalid,
-    DirtyWorktree,
-    Infra,
-    Interrupted,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRunSuccess {
+    pub handoff: Handoff,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactOutcome>,
+    pub final_response: PayloadRef,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleRunSuccess {
+    pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    pub stdout: PayloadRef,
+    pub stderr: PayloadRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_inputs: Vec<PreparedInputRef>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalReviewSuccess {
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<Gap>,
+    pub report: PayloadRef,
+    pub final_response: PayloadRef,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,17 +343,7 @@ pub enum MissionEvent {
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
-        handoff: Handoff,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        artifact: Option<ArtifactOutcome>,
-        final_response: PayloadRef,
-    },
-    RoleRunFailed {
-        task_id: TaskId,
-        attempt_no: u32,
-        effect_id: super::EffectId,
-        failure: super::RunFailure,
-        final_response: PayloadRef,
+        outcome: Result<RoleRunSuccess, TypedFailure>,
     },
     OracleRunRequested {
         assertion_ids: Vec<AssertionId>,
@@ -347,22 +358,7 @@ pub enum MissionEvent {
         judged_sha: String,
         attempt_no: u32,
         effect_id: super::EffectId,
-        exit_code: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_signal: Option<i32>,
-        stdout: PayloadRef,
-        stderr: PayloadRef,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        prepared_inputs: Vec<PreparedInputRef>,
-        duration_ms: u64,
-    },
-    OracleRunFailed {
-        assertion_ids: Vec<AssertionId>,
-        oracle: OracleName,
-        judged_sha: String,
-        attempt_no: u32,
-        effect_id: super::EffectId,
-        failure: super::RunFailure,
+        outcome: Result<OracleRunSuccess, TypedFailure>,
     },
     /// The closing review was dispatched: a fresh-context `emits-gap-verdict`
     /// role judging the tree at `judged_sha` against the objective,
@@ -393,25 +389,14 @@ pub enum MissionEvent {
         judged_sha: String,
         /// The reviewer's own summary bit. A blocking gap dominates it
         /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
-        passed: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        gaps: Vec<Gap>,
-        report: PayloadRef,
-    },
-    /// The reviewer failed to *run or hand off a verdict* (infrastructure or
-    /// an unfinished review), distinct from a verdict with gaps.
-    TerminalReviewFailed {
-        attempt_no: u32,
-        effect_id: super::EffectId,
-        judged_sha: String,
-        failure: super::RunFailure,
+        outcome: Result<TerminalReviewSuccess, TypedFailure>,
     },
     /// Cleanup failed without settling the original request. The next driver
     /// retries the same exact resource operation before any new dispatch.
     EffectCleanupFailed {
         effect_id: super::EffectId,
         resource: EffectResource,
-        failure: super::RunFailure,
+        failure: TypedFailure,
     },
     MissionAborted {
         reason: String,
@@ -473,13 +458,10 @@ impl MissionEvent {
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
             Self::RoleRunCompleted { .. } => "role_run_completed",
-            Self::RoleRunFailed { .. } => "role_run_failed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
-            Self::OracleRunFailed { .. } => "oracle_run_failed",
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
-            Self::TerminalReviewFailed { .. } => "terminal_review_failed",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
@@ -496,11 +478,8 @@ impl MissionEvent {
                 Some((EffectEventClass::Request, effect_id.as_str()))
             }
             Self::RoleRunCompleted { effect_id, .. }
-            | Self::RoleRunFailed { effect_id, .. }
             | Self::OracleRunCompleted { effect_id, .. }
-            | Self::OracleRunFailed { effect_id, .. }
-            | Self::TerminalReviewCompleted { effect_id, .. }
-            | Self::TerminalReviewFailed { effect_id, .. } => {
+            | Self::TerminalReviewCompleted { effect_id, .. } => {
                 Some((EffectEventClass::Outcome, effect_id.as_str()))
             }
             // Fact events carry no effect ID. Exhaustive on purpose: a new

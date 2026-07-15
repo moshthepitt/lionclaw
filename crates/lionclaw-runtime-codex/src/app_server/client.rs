@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, bail, Context, Result};
 use lionclaw_runtime_api::{
     ExecutionOutput, RuntimeArtifact, RuntimeEvent, RuntimeExecutionContext, RuntimeMessageLane,
+    TypedFailure,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -33,8 +34,8 @@ pub(crate) struct CodexAppServerClient<T> {
     completed_turns: HashSet<String>,
     completed_turn_threads: HashSet<String>,
     unmatched_turn_completed: bool,
-    failed_turns: HashMap<String, String>,
-    unmatched_turn_failure: Option<String>,
+    failed_turns: HashMap<String, TypedFailure>,
+    unmatched_turn_failure: Option<TypedFailure>,
     started_thread_turns: HashMap<String, String>,
     agent_message_lanes: HashMap<String, RuntimeMessageLane>,
     active_agent_message_item_id: Option<String>,
@@ -136,8 +137,8 @@ where
                 return parse_app_server_response(message.into_value(), method);
             }
             self.dispatch_message(message, sink, thread_state).await?;
-            if let Some(message) = self.turn_failure(None) {
-                bail!("{message}");
+            if let Some(failure) = self.turn_failure(None) {
+                return Err(failure.clone().into());
             }
         }
     }
@@ -152,8 +153,8 @@ where
         mut interrupt_rx: Option<&mut mpsc::UnboundedReceiver<CodexInterruptRequest>>,
     ) -> Result<()> {
         let sink = sink.into();
-        if let Some(message) = self.turn_failure(turn_id) {
-            bail!("{message}");
+        if let Some(failure) = self.turn_failure(turn_id) {
+            return Err(failure.clone().into());
         }
         let mut registered_turn_id = None;
         let result = async {
@@ -203,8 +204,8 @@ where
                     &mut registered_turn_id,
                     thread_state,
                 )?;
-                if let Some(message) = self.turn_failure(turn_id) {
-                    bail!("{message}");
+                if let Some(failure) = self.turn_failure(turn_id) {
+                    return Err(failure.clone().into());
                 }
                 if self.wait_turn_completed(turn_id, thread_id) {
                     return Ok(());
@@ -228,8 +229,8 @@ where
         thread_state: &CodexThreadState,
     ) -> Result<()> {
         let sink = sink.into();
-        if let Some(message) = self.turn_failure(None) {
-            bail!("{message}");
+        if let Some(failure) = self.turn_failure(None) {
+            return Err(failure.clone().into());
         }
         if self.context_compaction_completed(thread_id) && self.thread_turn_completed(thread_id) {
             return Ok(());
@@ -272,8 +273,8 @@ where
                     &mut registered_turn_id,
                     thread_state,
                 )?;
-                if let Some(message) = self.turn_failure(None) {
-                    bail!("{message}");
+                if let Some(failure) = self.turn_failure(None) {
+                    return Err(failure.clone().into());
                 }
                 if self.context_compaction_completed(thread_id)
                     && self.thread_turn_completed(thread_id)
@@ -401,25 +402,40 @@ where
         Ok(())
     }
 
-    pub(crate) fn turn_failure(&self, turn_id: Option<&str>) -> Option<&str> {
+    pub(crate) fn turn_failure(&self, turn_id: Option<&str>) -> Option<&TypedFailure> {
         match turn_id {
             Some(turn_id) => self
                 .failed_turns
                 .get(turn_id)
-                .map(String::as_str)
-                .or(self.unmatched_turn_failure.as_deref()),
+                .or(self.unmatched_turn_failure.as_ref()),
             None => self
                 .unmatched_turn_failure
-                .as_deref()
-                .or_else(|| self.failed_turns.values().next().map(String::as_str)),
+                .as_ref()
+                .or_else(|| self.failed_turns.values().next()),
         }
     }
 
     pub(crate) fn remember_turn_failure(&mut self, params: &Value, message: String) {
-        if let Some(turn_id) = extract_app_server_turn_id(params) {
-            self.failed_turns.insert(turn_id, message);
+        let code = params
+            .pointer("/error/code")
+            .or_else(|| params.pointer("/turn/error/code"))
+            .or_else(|| params.get("code"))
+            .map(Value::to_string)
+            .unwrap_or_else(|| "codex.turn".to_string());
+        let will_retry = params
+            .get("willRetry")
+            .or_else(|| params.pointer("/error/willRetry"))
+            .or_else(|| params.pointer("/turn/error/willRetry"))
+            .and_then(Value::as_bool);
+        let failure = if will_retry == Some(true) {
+            TypedFailure::transient(code, message, None)
         } else {
-            self.unmatched_turn_failure = Some(message);
+            TypedFailure::permanent(code, message)
+        };
+        if let Some(turn_id) = extract_app_server_turn_id(params) {
+            self.failed_turns.insert(turn_id, failure);
+        } else {
+            self.unmatched_turn_failure = Some(failure);
         }
     }
 
@@ -757,16 +773,23 @@ fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        bail!(
+    let detail = if stderr.is_empty() {
+        format!(
             "codex app-server exited with {}",
             output.status_description()
-        );
-    }
-    bail!(
-        "codex app-server exited with {}: {stderr}",
-        output.status_description()
-    );
+        )
+    } else {
+        format!(
+            "codex app-server exited with {}: {stderr}",
+            output.status_description()
+        )
+    };
+    let mut failure = TypedFailure::permanent("codex.process_exit", detail);
+    failure.evidence_mut().exit_code = output.exit_code;
+    failure.evidence_mut().stop_reason =
+        output.exit_signal.map(|signal| format!("signal {signal}"));
+    failure.evidence_mut().stderr = stderr;
+    Err(anyhow::Error::new(failure.projected()))
 }
 
 pub(crate) async fn finish_app_server_session<T, R>(
@@ -792,5 +815,24 @@ where
             );
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn signal_exit_preserves_structured_process_evidence() {
+        let error = ensure_app_server_exit_success(ExecutionOutput {
+            stderr: b"transport closed".to_vec(),
+            exit_signal: Some(9),
+            ..Default::default()
+        })
+        .expect_err("signal exit must fail");
+        let failure = error.downcast_ref::<TypedFailure>().expect("typed failure");
+        assert!(matches!(failure, TypedFailure::PermanentRuntime { .. }));
+        assert_eq!(failure.evidence().stop_reason.as_deref(), Some("signal 9"));
+        assert_eq!(failure.evidence().stderr, "transport closed");
     }
 }

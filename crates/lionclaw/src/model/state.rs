@@ -4,10 +4,11 @@
 
 use std::collections::BTreeMap;
 
+use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
 
 use super::event::{
-    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind,
+    EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef,
     RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
@@ -85,7 +86,7 @@ pub struct TaskRuntimeState {
     #[serde(default)]
     pub last_report: Option<PayloadRef>,
     #[serde(default)]
-    pub last_failure: Option<RunFailure>,
+    pub last_failure: Option<TypedFailure>,
     /// Engine-routed repair feedback for this task's next attempt.
     #[serde(default)]
     pub feedback: Vec<FailureFeedback>,
@@ -106,30 +107,7 @@ impl TaskRuntimeState {
             && self
                 .last_failure
                 .as_ref()
-                .is_some_and(RunFailure::automatically_retryable)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunFailure {
-    pub kind: RunErrorKind,
-    pub detail: String,
-}
-
-impl RunFailure {
-    pub fn automatically_retryable(&self) -> bool {
-        matches!(
-            self.kind,
-            RunErrorKind::TurnFailed
-                | RunErrorKind::Timeout
-                | RunErrorKind::HandoffMissing
-                | RunErrorKind::HandoffInvalid
-                | RunErrorKind::DirtyWorktree
-        )
-    }
-
-    pub fn transient(&self) -> bool {
-        matches!(self.kind, RunErrorKind::TurnFailed | RunErrorKind::Timeout)
+                .is_some_and(|failure| failure.is_transient() || failure.is_invalid_output())
     }
 }
 
@@ -171,7 +149,7 @@ pub struct PlanningInput {
 pub struct EffectCleanupFailure {
     pub effect_id: super::EffectId,
     pub resource: EffectResource,
-    pub failure: RunFailure,
+    pub failure: TypedFailure,
 }
 
 /// Runtime status of the contract-free planning DAG. A separate map from the
@@ -269,7 +247,7 @@ pub enum ReviewOutcome {
     /// until a decision clears it. Prevents a broken reviewer from
     /// re-requesting forever (mirrors `oracle_failures`).
     Failed {
-        failure: RunFailure,
+        failure: TypedFailure,
     },
 }
 
@@ -519,11 +497,8 @@ impl InflightEffect {
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
             | MissionEvent::RoleRunCompleted { .. }
-            | MissionEvent::RoleRunFailed { .. }
             | MissionEvent::OracleRunCompleted { .. }
-            | MissionEvent::OracleRunFailed { .. }
             | MissionEvent::TerminalReviewCompleted { .. }
-            | MissionEvent::TerminalReviewFailed { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
@@ -591,7 +566,7 @@ pub struct MissionState {
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
-    pub oracle_failures: BTreeMap<OracleName, RunFailure>,
+    pub oracle_failures: BTreeMap<OracleName, TypedFailure>,
     /// Oracles whose obligation a human waived (`accept` on an oracle
     /// failure): the mission may finish, but never *verified* — there is no
     /// authoritative verdict.

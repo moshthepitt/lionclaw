@@ -268,14 +268,15 @@ fn step_running(state: &MissionState) -> StepDecision {
 mod tests {
     use super::*;
     use crate::model::event::{
-        ArtifactOutcome, EventEnvelope, Handoff, MissionConfig, MissionEvent, PayloadRef,
-        RunErrorKind, VersionStamps,
+        ArtifactOutcome, EventEnvelope, Handoff, MissionConfig, MissionEvent, OracleRunSuccess,
+        PayloadRef, RoleRunSuccess, RuntimeConfigurationEvidence, TerminalReviewSuccess,
+        VersionStamps,
     };
     use crate::model::fold::fold;
     use crate::model::ids::{EffectId, MissionId};
     use crate::model::plan::{Assertion, Plan, Task};
-    use crate::model::state::RunFailure;
     use crate::model::verdict::FinishClass;
+    use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
@@ -406,29 +407,30 @@ mod tests {
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
-            handoff: Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("done"),
-                request_attention: false,
-            },
-            artifact: artifact.map(|(base_sha, head_sha)| ArtifactOutcome {
-                base_sha: base_sha.to_string(),
-                head_sha: head_sha.to_string(),
+            outcome: Ok(RoleRunSuccess {
+                handoff: Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("done"),
+                    request_attention: false,
+                },
+                artifact: artifact.map(|(base_sha, head_sha)| ArtifactOutcome {
+                    base_sha: base_sha.to_string(),
+                    head_sha: head_sha.to_string(),
+                }),
+                final_response: PayloadRef::inline("done"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
             }),
-            final_response: PayloadRef::inline("done"),
         }
     }
 
     fn role_failed(task: &str, key: &str) -> MissionEvent {
-        MissionEvent::RoleRunFailed {
+        MissionEvent::RoleRunCompleted {
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
-            failure: RunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: "runner timed out".to_string(),
-            },
-            final_response: PayloadRef::inline(""),
+            outcome: Err(TypedFailure::DeadlineExhausted {
+                evidence: Box::new(TypedFailureEvidence::new(None, "runner timed out")),
+            }),
         }
     }
 
@@ -462,12 +464,14 @@ mod tests {
             judged_sha: judged_sha.to_string(),
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
-            exit_code,
-            exit_signal: None,
-            stdout: PayloadRef::inline("oracle stdout"),
-            stderr: PayloadRef::inline(""),
-            prepared_inputs: Vec::new(),
-            duration_ms: 0,
+            outcome: Ok(OracleRunSuccess {
+                exit_code,
+                exit_signal: None,
+                stdout: PayloadRef::inline("oracle stdout"),
+                stderr: PayloadRef::inline(""),
+                prepared_inputs: Vec::new(),
+                duration_ms: 0,
+            }),
         }
     }
 
@@ -724,7 +728,7 @@ mod tests {
         ]);
         assert_eq!(state.tasks[&tid("w1")].attempts, 1);
         // Hand-apply the post-state of the failure→retry re-pend (a
-        // RoleRunFailed + DecisionRecorded(Retry, node_failed:…) sequence,
+        // Failed RoleRunCompleted outcome + DecisionRecorded(Retry, node_failed:…) sequence,
         // covered in the fold tests) to pin the attempt-numbering contract here.
         state.inflight.clear();
         state.tasks.get_mut(&tid("w1")).expect("w1 exists").status = TaskStatus::Pending;
@@ -871,18 +875,22 @@ mod tests {
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged_sha.to_string(),
-            passed,
-            gaps: (0..blocking_gaps)
-                .map(|_| Gap {
-                    id: None,
-                    severity: GapSeverity::Blocking,
-                    requirement: "r".into(),
-                    expected: "e".into(),
-                    observed: "o".into(),
-                    evidence: "v".into(),
-                })
-                .collect(),
-            report: PayloadRef::inline("map + observations"),
+            outcome: Ok(TerminalReviewSuccess {
+                passed,
+                gaps: (0..blocking_gaps)
+                    .map(|_| Gap {
+                        id: None,
+                        severity: GapSeverity::Blocking,
+                        requirement: "r".into(),
+                        expected: "e".into(),
+                        observed: "o".into(),
+                        evidence: "v".into(),
+                    })
+                    .collect(),
+                report: PayloadRef::inline("map + observations"),
+                final_response: PayloadRef::inline("review complete"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
         }
     }
 

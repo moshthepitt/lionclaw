@@ -14,6 +14,7 @@ chrono = { workspace = true, features = ["serde", "clock"] }
 lionclaw-durable-fs.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["macros", "sync"] }
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }

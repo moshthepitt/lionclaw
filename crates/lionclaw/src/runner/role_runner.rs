@@ -12,6 +12,7 @@ use lionclaw_runtime_acp::AcpRuntimeDriver;
 use lionclaw_runtime_api::{
     RuntimeAuthProvider, RuntimeAuthRegistry, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTurnInput,
+    TypedFailure, TypedFailureEvidence,
 };
 use lionclaw_runtime_codex::{
     CodexRuntimeAuthProvider, CodexRuntimeDriver, CODEX_RUNTIME_AUTH_KIND,
@@ -22,8 +23,8 @@ use crate::authority::{
     compile_authority, compile_role_plan, AuthorityCeiling, MissionMounts, RolePlanRequest,
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
-use crate::model::{ArtifactOutcome, OutputSemantics, RunErrorKind};
-use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
+use crate::model::{ArtifactOutcome, OutputSemantics};
+use crate::ports::{RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
@@ -50,7 +51,7 @@ impl OciRoleRunner {
         }
     }
 
-    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, RoleRunFailure> {
+    fn profile(&self, runtime: &str) -> Result<MissionRuntimeProfile, TypedFailure> {
         let mut profile = self
             .profiles
             .get(runtime)
@@ -115,12 +116,8 @@ impl OciRoleRunner {
     }
 }
 
-fn launch(detail: String) -> RoleRunFailure {
-    RoleRunFailure {
-        kind: RunErrorKind::Launch,
-        detail,
-        final_response: String::new(),
-    }
+fn launch(detail: String) -> TypedFailure {
+    TypedFailure::permanent("kernel.launch", detail)
 }
 
 async fn prepare_writer_checkout(
@@ -128,7 +125,7 @@ async fn prepare_writer_checkout(
     workspace: &std::path::Path,
     base_sha: &str,
     recreate_workspace: bool,
-) -> Result<(), RoleRunFailure> {
+) -> Result<(), TypedFailure> {
     if workspace.exists() && !recreate_workspace {
         return Ok(());
     }
@@ -148,7 +145,7 @@ async fn prepare_writer_checkout(
 
 #[async_trait]
 impl RoleRunner for OciRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if let Some(declared) = &request.role.runtime {
             if declared != &request.runtime {
                 return Err(launch(format!(
@@ -169,7 +166,7 @@ impl RoleRunner for OciRoleRunner {
         // Keep every fallible stage in one result. The engine owns the one
         // cleanup path after this runner returns, including failures before a
         // turn starts and recovery after this process exits.
-        let result: Result<RoleRunOutcome, RoleRunFailure> = async {
+        let result: Result<RoleRunOutcome, TypedFailure> = async {
             let skill_mounts = prepare_skill_mounts(
                 &dirs.runtime_home,
                 &request.skills,
@@ -238,7 +235,8 @@ impl RoleRunner for OciRoleRunner {
                 .await?;
             let handoff =
                 read_handoff(&dirs.handoff, request.role.output).map_err(|mut failure| {
-                    failure.final_response = final_response.clone();
+                    failure.evidence_mut().final_response = final_response.clone();
+                    failure.evidence_mut().configuration = applied.clone();
                     failure
                 })?;
             let artifact = if is_writer {
@@ -250,15 +248,18 @@ impl RoleRunner for OciRoleRunner {
                     &request.effect_id,
                 )
                 .await
-                .map_err(|e| RoleRunFailure {
-                    // Only an uncommitted tree is agent behavior; Git
-                    // infrastructure failures remain infrastructure.
-                    kind: match e {
-                        workspace::CaptureError::DirtyWorktree(_) => RunErrorKind::DirtyWorktree,
-                        workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
-                    },
-                    detail: e.to_string(),
-                    final_response: final_response.clone(),
+                .map_err(|e| {
+                    let mut failure = match e {
+                        workspace::CaptureError::DirtyWorktree(_) => {
+                            TypedFailure::invalid("workspace.dirty", e.to_string())
+                        }
+                        workspace::CaptureError::Infra(_) => {
+                            TypedFailure::permanent("workspace.capture", e.to_string())
+                        }
+                    };
+                    failure.evidence_mut().final_response = final_response.clone();
+                    failure.evidence_mut().configuration = applied.clone();
+                    failure
                 })?;
                 Some(ArtifactOutcome {
                     base_sha: request.base_sha.clone(),
@@ -291,7 +292,7 @@ impl OciRoleRunner {
         profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
-    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), RoleRunFailure> {
+    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
         let driver = Self::driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         let config = Self::driver_config(profile)
@@ -371,19 +372,27 @@ impl OciRoleRunner {
         let (last_error, final_response) = drain.await.unwrap_or_default();
 
         match result {
-            Err(_) => Err(RoleRunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: format!("agent turn exceeded {:?}", profile.hard_timeout),
-                final_response,
+            Err(_) => Err(TypedFailure::DeadlineExhausted {
+                evidence: Box::new(turn_failure_evidence(
+                    profile,
+                    format!("agent turn exceeded {:?}", profile.hard_timeout),
+                    last_error.unwrap_or_default(),
+                    final_response,
+                )),
             }),
-            Ok(Err(err)) => Err(RoleRunFailure {
-                kind: RunErrorKind::TurnFailed,
-                detail: match last_error {
-                    Some(e) => format!("{err}: {e}"),
-                    None => err.to_string(),
-                },
-                final_response,
-            }),
+            Ok(Err(err)) => {
+                let mut failure = err
+                    .downcast_ref::<TypedFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()));
+                let evidence = failure.evidence_mut();
+                evidence.stderr =
+                    lionclaw_runtime_api::bounded_text(last_error.as_deref().unwrap_or_default());
+                evidence.final_response = lionclaw_runtime_api::bounded_text(&final_response);
+                evidence.configuration.requested_model = profile.model.clone();
+                evidence.configuration.requested_mode = profile.mode.clone();
+                Err(failure.projected())
+            }
             Ok(Ok(result)) => {
                 let configuration = result.configuration;
                 if configuration.requested_model != profile.model
@@ -399,6 +408,25 @@ impl OciRoleRunner {
                 Ok((configuration, final_response))
             }
         }
+    }
+}
+
+fn turn_failure_evidence(
+    profile: &MissionRuntimeProfile,
+    detail: String,
+    stderr: String,
+    final_response: String,
+) -> TypedFailureEvidence {
+    TypedFailureEvidence {
+        detail: lionclaw_runtime_api::bounded_text(&detail),
+        stderr: lionclaw_runtime_api::bounded_text(&stderr),
+        final_response: lionclaw_runtime_api::bounded_text(&final_response),
+        configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_model: profile.model.clone(),
+            requested_mode: profile.mode.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -597,7 +625,7 @@ mod tests {
         let error = prepare_writer_checkout(&repo, &task_work, &base, true)
             .await
             .unwrap_err();
-        assert!(error.detail.contains("refusing to recreate"));
+        assert!(error.detail().contains("refusing to recreate"));
         assert_eq!(
             std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
             "preserve me\n"

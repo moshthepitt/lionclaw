@@ -10,7 +10,7 @@ use lionclaw_runtime_api::{
     RuntimeMcpServerSpec, RuntimeNativeHomeArtifactDir, RuntimeProgramExecutor, RuntimeProgramSpec,
     RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
     RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode,
-    RuntimeTurnResult,
+    RuntimeTurnResult, TypedFailure,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -57,6 +57,7 @@ impl CodexAppServerTurnRunner<'_> {
         let mut client =
             CodexAppServerClient::new_with_runtime_context(transport, self.context.clone());
         let sink = CodexAppServerEventSink::journal(&journal);
+        let mut applied_configuration = None;
 
         let result = async {
             client.initialize(sink, &thread_state).await?;
@@ -84,6 +85,12 @@ impl CodexAppServerTurnRunner<'_> {
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
             let applied_model = extract_app_server_model(&response);
+            applied_configuration = Some(lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                requested_model: self.adapter.config.model.clone(),
+                applied_model: applied_model.clone(),
+                requested_mode: None,
+                applied_mode: None,
+            });
             if self.adapter.config.model.is_some() && applied_model.is_none() {
                 return Err(anyhow!(
                     "codex app-server did not report the applied model in turn/start"
@@ -112,7 +119,18 @@ impl CodexAppServerTurnRunner<'_> {
         }
         .await;
 
-        finish_app_server_session(client, result).await
+        finish_app_server_session(client, result)
+            .await
+            .map_err(|error| {
+                let mut failure = error
+                    .downcast_ref::<TypedFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| TypedFailure::permanent("codex.runtime", error.to_string()));
+                if let Some(configuration) = applied_configuration {
+                    failure.evidence_mut().configuration = configuration;
+                }
+                anyhow::Error::new(failure.projected())
+            })
     }
 }
 

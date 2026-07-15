@@ -1,13 +1,12 @@
 mod common;
 
+use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
 use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::MissionDisposition;
-use lionclaw::model::{
-    ArtifactOutcome, DecisionAction, Handoff, MissionPhase, PayloadRef, RunErrorKind,
-};
-use lionclaw::ports::{OracleOutcome, RoleRunFailure, RoleRunOutcome};
+use lionclaw::model::{ArtifactOutcome, DecisionAction, Handoff, MissionPhase, PayloadRef};
+use lionclaw::ports::{OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 fn completed_work(base_sha: &str) -> RoleRunOutcome {
@@ -83,11 +82,11 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         let mut count = seen.lock().unwrap();
         *count += 1;
         if *count == 1 {
-            return Err(RoleRunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: "provider temporarily unavailable".into(),
-                final_response: String::new(),
-            });
+            return Err(TypedFailure::transient(
+                "runtime.fixture",
+                "provider temporarily unavailable",
+                None,
+            ));
         }
         assert!(request.prompt.contains("provider temporarily unavailable"));
         Ok(completed_work(&request.base_sha))
@@ -111,11 +110,10 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
 
     let dir = tempfile::tempdir().unwrap();
     let runner = MockRoleRunner::new(Box::new(|_| {
-        Err(RoleRunFailure {
-            kind: RunErrorKind::Launch,
-            detail: "runtime profile is invalid".into(),
-            final_response: String::new(),
-        })
+        Err(TypedFailure::permanent(
+            "runtime.launch",
+            "runtime profile is invalid",
+        ))
     }));
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
     let id = h

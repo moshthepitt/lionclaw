@@ -8,12 +8,14 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
-use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeProgramExecutor};
+use lionclaw_runtime_api::{
+    RuntimeAuthRegistry, RuntimeProgramExecutor, TypedFailure, TypedFailureEvidence,
+};
 use tokio::sync::Mutex;
 
 use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RolePlanRequest};
 use crate::config::MissionRuntimeProfile;
-use crate::ports::{OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner};
+use crate::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
 use crate::runner::{
     prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
 };
@@ -37,15 +39,13 @@ impl OciOracleRunner {
     }
 }
 
-fn fail(detail: impl Into<String>) -> OracleFailure {
-    OracleFailure {
-        detail: detail.into(),
-    }
+fn fail(detail: impl Into<String>) -> TypedFailure {
+    TypedFailure::permanent("oracle.infrastructure", detail)
 }
 
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         let dirs = EffectDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
@@ -153,10 +153,12 @@ impl OracleRunner for OciOracleRunner {
             .await;
             let duration_ms = started.elapsed().as_millis() as u64;
             match run {
-                Err(_) => Err(fail(format!(
-                    "oracle exceeded {:?}",
-                    self.profile.oracle_timeout
-                ))),
+                Err(_) => Err(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence::new(
+                        Some("oracle.deadline".to_string()),
+                        format!("oracle exceeded {:?}", self.profile.oracle_timeout),
+                    )),
+                }),
                 Ok(Err(err)) => Err(fail(format!("oracle failed to run: {err}"))),
                 Ok(Ok(output)) => Ok(OracleOutcome {
                     exit_code: output.exit_code.unwrap_or(-1),

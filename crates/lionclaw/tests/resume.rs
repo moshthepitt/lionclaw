@@ -8,8 +8,8 @@ use common::{
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
-    ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, PayloadRef, RunErrorKind,
-    TaskId,
+    ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, PayloadRef, RoleRunSuccess,
+    RuntimeConfigurationEvidence, TaskId,
 };
 use lionclaw::store::{AppendError, NewEvent};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -123,8 +123,8 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         .iter()
         .filter(|event| {
             matches!(&event.event,
-                MissionEvent::RoleRunFailed { effect_id, failure, .. }
-                    if effect_id == &id && failure.kind == RunErrorKind::Interrupted)
+                MissionEvent::RoleRunCompleted { effect_id, outcome: Err(failure), .. }
+                    if effect_id == &id && matches!(failure, lionclaw_runtime_api::TypedFailure::Interrupted { .. }))
         })
         .collect();
     assert_eq!(failures.len(), 1);
@@ -181,16 +181,19 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     task_id,
                     attempt_no: 1,
                     effect_id: role_effect,
-                    handoff: Handoff::Work {
-                        done: true,
-                        report: PayloadRef::inline("done"),
-                        request_attention: false,
-                    },
-                    artifact: Some(ArtifactOutcome {
-                        base_sha: BASE_SHA.to_string(),
-                        head_sha: HEAD_SHA.to_string(),
+                    outcome: Ok(RoleRunSuccess {
+                        handoff: Handoff::Work {
+                            done: true,
+                            report: PayloadRef::inline("done"),
+                            request_attention: false,
+                        },
+                        artifact: Some(ArtifactOutcome {
+                            base_sha: BASE_SHA.to_string(),
+                            head_sha: HEAD_SHA.to_string(),
+                        }),
+                        final_response: PayloadRef::inline("done"),
+                        runtime_configuration: RuntimeConfigurationEvidence::default(),
                     }),
-                    final_response: PayloadRef::inline("done"),
                 }),
                 NewEvent::new(MissionEvent::OracleRunRequested {
                     assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
@@ -210,8 +213,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
     assert!(view.state.inflight.is_empty());
     assert!(h.oracle_runner.calls.lock().expect("lock").is_empty());
     assert_eq!(
-        view.state.oracle_failures.get(&oracle).unwrap().kind,
-        RunErrorKind::Interrupted
+        view.state.oracle_failures.get(&oracle).unwrap().category(),
+        "interrupted"
     );
     let events = h.engine.store().load(&mission_id).await.expect("load");
     assert_eq!(
@@ -219,8 +222,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
             .iter()
             .filter(|event| matches!(
                 &event.event,
-                MissionEvent::OracleRunFailed { effect_id, failure, .. }
-                    if effect_id == &oracle_effect && failure.kind == RunErrorKind::Interrupted
+                MissionEvent::OracleRunCompleted { effect_id, outcome: Err(failure), .. }
+                    if effect_id == &oracle_effect && matches!(failure, lionclaw_runtime_api::TypedFailure::Interrupted { .. })
             ))
             .count(),
         1

@@ -29,17 +29,18 @@ use crate::model::{
     ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
     GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName,
     PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
-    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, RunErrorKind, Task, TaskId,
-    TaskKind, TaskStatus,
+    RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind,
+    TaskStatus,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{
-    OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner, RoleRunFailure, RoleRunOutcome,
-    RoleRunRequest, RoleRunner, SystemClock,
+    OracleOutcome, OracleRunRequest, OracleRunner, RoleRunOutcome, RoleRunRequest, RoleRunner,
+    SystemClock,
 };
 use crate::runner::MissionProgramExecutor;
 use crate::store::MissionStore;
 use crate::workspace;
+use lionclaw_runtime_api::TypedFailure;
 
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
@@ -53,7 +54,7 @@ struct NoopRoleRunner;
 
 #[async_trait]
 impl RoleRunner for NoopRoleRunner {
-    async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, _request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {
                 done: true,
@@ -74,7 +75,7 @@ struct ReviewParkRoleRunner;
 
 #[async_trait]
 impl RoleRunner for ReviewParkRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         if request.task_id.as_str() == crate::engine::TERMINAL_REVIEW_TASK_TAG {
             Ok(RoleRunOutcome {
                 handoff: Handoff::Review {
@@ -121,7 +122,7 @@ struct FixedOracleRunner(i32);
 
 #[async_trait]
 impl OracleRunner for FixedOracleRunner {
-    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, _request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         Ok(OracleOutcome {
             exit_code: self.0,
             exit_signal: None,
@@ -142,7 +143,7 @@ struct CountingOracleRunner {
 
 #[async_trait]
 impl OracleRunner for CountingOracleRunner {
-    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
+    async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, TypedFailure> {
         self.count.fetch_add(1, Ordering::SeqCst);
         self.inner.run(request).await
     }
@@ -495,12 +496,10 @@ struct ScriptedRoleRunner {
 
 #[async_trait]
 impl RoleRunner for ScriptedRoleRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
-        self.run_inner(request).await.map_err(|e| RoleRunFailure {
-            kind: RunErrorKind::Launch,
-            detail: format!("{e:#}"),
-            final_response: String::new(),
-        })
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.run_inner(request)
+            .await
+            .map_err(|e| TypedFailure::permanent("selftest.runner", format!("{e:#}")))
     }
 }
 

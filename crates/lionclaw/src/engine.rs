@@ -12,15 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use lionclaw_runtime_api::TypedFailure;
 use sha2::{Digest, Sha256};
 
 use crate::driver_lock::DriverGuard;
 use crate::mission_type::MissionType;
 use crate::model::{
     step, validate_plan_proposal, EffectId, Handoff, InflightEffect, MissionEvent, MissionId,
-    MissionPhase, MissionState, OracleDispatchIntent, PayloadRef, PlanProposal, ProposalError,
-    RoleDispatchIntent, RunErrorKind, RunFailure, StepDecision, TaskId,
-    TerminalReviewDispatchIntent,
+    MissionPhase, MissionState, OracleDispatchIntent, OracleRunSuccess, PayloadRef, PlanProposal,
+    ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision, TaskId,
+    TerminalReviewDispatchIntent, TerminalReviewSuccess,
 };
 use crate::ports::{
     Clock, EffectCleaner, EffectCleanupRequest, OracleRunRequest, OracleRunner, RoleRunRequest,
@@ -473,10 +474,7 @@ impl Engine {
                 let event = NewEvent::new(MissionEvent::EffectCleanupFailed {
                     effect_id: effect_id.clone(),
                     resource: error.resource,
-                    failure: RunFailure {
-                        kind: RunErrorKind::Infra,
-                        detail: error.detail,
-                    },
+                    failure: TypedFailure::permanent("cleanup.infrastructure", error.detail),
                 });
                 self.append_fact(&state.mission_id, state.head, event)
                     .await?;
@@ -581,29 +579,29 @@ impl Engine {
             bail!("execute_role_run called with a non-role effect");
         };
         let attempt_no = *attempt_no;
-        let failed = |kind: RunErrorKind, detail: String, final_response: String| -> Result<_> {
-            Ok(NewEvent::new(MissionEvent::RoleRunFailed {
+        let completed = |outcome| {
+            NewEvent::new(MissionEvent::RoleRunCompleted {
                 task_id: task_id.clone(),
                 attempt_no,
                 effect_id: effect_id.clone(),
-                failure: RunFailure { kind, detail },
-                final_response: self
-                    .store
-                    .blobs()
-                    .externalize(PayloadRef::inline(final_response))?,
-            }))
+                outcome,
+            })
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
-            return failed(
-                RunErrorKind::Launch,
+            return Ok(completed(Err(TypedFailure::permanent(
+                "role.missing",
                 format!("role '{role_name}' is no longer provided by the mission type"),
-                String::new(),
-            );
+            ))));
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
-            Err(detail) => return failed(RunErrorKind::Launch, detail, String::new()),
+            Err(detail) => {
+                return Ok(completed(Err(TypedFailure::permanent(
+                    "skills.resolve",
+                    detail,
+                ))))
+            }
         };
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
@@ -621,19 +619,37 @@ impl Engine {
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
         let previous_task = state.active_tasks().get(task_id);
-        if previous_task
+        if let Some(failure) = previous_task
             .and_then(|task| task.last_failure.as_ref())
-            .is_some_and(crate::model::RunFailure::transient)
+            .filter(|failure| failure.is_transient())
         {
-            let exponent = previous_task
-                .map(|task| task.consecutive_failures.saturating_sub(1))
-                .unwrap_or(0)
-                .min(2);
-            let seconds = 1_u64 << exponent;
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            let remaining_ms = failure
+                .next_eligible_at_ms()
+                .map(|eligible| eligible.saturating_sub(self.clock.now_ms()).max(0) as u64)
+                .unwrap_or_else(|| {
+                    transient_backoff_ms(
+                        previous_task.map_or(0, |task| task.consecutive_failures),
+                        failure.retry_after_ms(),
+                    )
+                });
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
         }
         match self.role_runner.run(request).await {
             Ok(outcome) => {
+                let incomplete = match &outcome.handoff {
+                    Handoff::Work { done: false, .. } => Some("role reported done=false"),
+                    Handoff::Plan { done: false, .. } => {
+                        Some("planning author reported done=false")
+                    }
+                    _ => None,
+                };
+                if let Some(detail) = incomplete {
+                    let mut failure = TypedFailure::invalid("handoff.incomplete", detail);
+                    failure.evidence_mut().final_response = outcome.final_response.clone();
+                    failure.evidence_mut().configuration =
+                        runtime_configuration_evidence(&outcome.runtime_configuration);
+                    return Ok(completed(Err(failure)));
+                }
                 // A planning author's proposal is validated fail-closed before
                 // it is recorded, exactly like a manually proposed plan — an
                 // invalid proposal is a failed attempt, never a bad contract.
@@ -644,37 +660,51 @@ impl Engine {
                 } = &outcome.handoff
                 {
                     let Some(proposal) = proposal else {
-                        return failed(
-                            RunErrorKind::HandoffInvalid,
-                            "planning author reported done but proposed no plan".to_string(),
-                            outcome.final_response.clone(),
+                        let mut failure = TypedFailure::invalid(
+                            "plan.missing",
+                            "planning author reported done but proposed no plan",
                         );
+                        failure.evidence_mut().final_response = outcome.final_response.clone();
+                        failure.evidence_mut().configuration =
+                            runtime_configuration_evidence(&outcome.runtime_configuration);
+                        return Ok(completed(Err(failure)));
                     };
                     if let Err(error) =
                         validate_plan_proposal(state, proposal, &self.mission_type.inventory())
                     {
-                        return failed(
-                            RunErrorKind::HandoffInvalid,
+                        let mut failure = TypedFailure::invalid(
+                            "plan.invalid",
                             format!("proposed plan is invalid: {error}"),
-                            outcome.final_response.clone(),
                         );
+                        failure.evidence_mut().final_response = outcome.final_response.clone();
+                        failure.evidence_mut().configuration =
+                            runtime_configuration_evidence(&outcome.runtime_configuration);
+                        return Ok(completed(Err(failure)));
                     }
                 }
                 let handoff = self.externalize_handoff(outcome.handoff)?;
-                Ok(NewEvent::new(MissionEvent::RoleRunCompleted {
-                    task_id: task_id.clone(),
-                    attempt_no,
-                    effect_id: effect_id.clone(),
+                Ok(completed(Ok(RoleRunSuccess {
                     handoff,
                     artifact: outcome.artifact,
                     final_response: self
                         .store
                         .blobs()
                         .externalize(PayloadRef::inline(outcome.final_response))?,
-                })
-                .with_runtime_configuration(outcome.runtime_configuration))
+                    runtime_configuration: outcome.runtime_configuration,
+                })))
             }
-            Err(failure) => failed(failure.kind, failure.detail, failure.final_response),
+            Err(mut failure) => {
+                if failure.is_transient() {
+                    let delay_ms = transient_backoff_ms(
+                        previous_task.map_or(0, |task| task.consecutive_failures),
+                        failure.retry_after_ms(),
+                    );
+                    failure.set_next_eligible_at_ms(
+                        self.clock.now_ms().saturating_add(delay_ms as i64),
+                    );
+                }
+                Ok(completed(Err(failure.projected())))
+            }
         }
     }
 
@@ -695,23 +725,21 @@ impl Engine {
             bail!("execute_oracle_run called with a non-oracle effect");
         };
         let attempt_no = *attempt_no;
-        let failed = |detail: String| {
-            NewEvent::new(MissionEvent::OracleRunFailed {
+        let completed = |outcome| {
+            NewEvent::new(MissionEvent::OracleRunCompleted {
                 assertion_ids: assertion_ids.to_vec(),
                 oracle: oracle.clone(),
                 judged_sha: judged_sha.to_string(),
                 attempt_no,
                 effect_id: effect_id.clone(),
-                failure: RunFailure {
-                    kind: RunErrorKind::Infra,
-                    detail,
-                },
+                outcome,
             })
         };
         let Some(oracle_path) = self.mission_type.oracles.get(oracle) else {
-            return Ok(failed(format!(
-                "oracle '{oracle}' is no longer provided by the mission type"
-            )));
+            return Ok(completed(Err(TypedFailure::permanent(
+                "oracle.missing",
+                format!("oracle '{oracle}' is no longer provided by the mission type"),
+            ))));
         };
         let request = OracleRunRequest {
             mission_id: state.mission_id.clone(),
@@ -724,20 +752,15 @@ impl Engine {
             prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
         };
         match self.oracle_runner.run(request).await {
-            Ok(outcome) => Ok(NewEvent::new(MissionEvent::OracleRunCompleted {
-                assertion_ids: assertion_ids.to_vec(),
-                oracle: oracle.clone(),
-                judged_sha: judged_sha.to_string(),
-                attempt_no,
-                effect_id: effect_id.clone(),
+            Ok(outcome) => Ok(completed(Ok(OracleRunSuccess {
                 exit_code: outcome.exit_code,
                 exit_signal: outcome.exit_signal,
                 stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
                 stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
                 prepared_inputs: outcome.prepared_inputs,
                 duration_ms: outcome.duration_ms,
-            })),
-            Err(failure) => Ok(failed(failure.detail)),
+            }))),
+            Err(failure) => Ok(completed(Err(failure.projected()))),
         }
     }
 
@@ -767,25 +790,30 @@ impl Engine {
             bail!("execute_terminal_review called with a non-review effect");
         };
         let attempt_no = *attempt_no;
-        let failed = |kind: RunErrorKind, detail: String| {
-            NewEvent::new(MissionEvent::TerminalReviewFailed {
+        let completed = |outcome| {
+            NewEvent::new(MissionEvent::TerminalReviewCompleted {
                 attempt_no,
                 effect_id: effect_id.clone(),
                 judged_sha: judged_sha.clone(),
-                failure: RunFailure { kind, detail },
+                outcome,
             })
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
-            return Ok(failed(
-                RunErrorKind::Launch,
+            return Ok(completed(Err(TypedFailure::permanent(
+                "role.missing",
                 format!(
                     "terminal-review role '{role_name}' is no longer provided by the mission type"
                 ),
-            ));
+            ))));
         };
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
-            Err(detail) => return Ok(failed(RunErrorKind::Launch, detail)),
+            Err(detail) => {
+                return Ok(completed(Err(TypedFailure::permanent(
+                    "skills.resolve",
+                    detail,
+                ))))
+            }
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
         let request = RoleRunRequest {
@@ -805,7 +833,7 @@ impl Engine {
         };
         let outcome = match self.role_runner.run(request).await {
             Ok(outcome) => outcome,
-            Err(failure) => return Ok(failed(failure.kind, failure.detail)),
+            Err(failure) => return Ok(completed(Err(failure.projected()))),
         };
         let Handoff::Review {
             done,
@@ -816,32 +844,33 @@ impl Engine {
         } = outcome.handoff
         else {
             // Unreachable via the runner's schema check; fail closed anyway.
-            return Ok(failed(
-                RunErrorKind::HandoffInvalid,
+            return Ok(completed(Err(TypedFailure::invalid(
+                "handoff.review_shape",
                 "terminal reviewer handed back a non-review handoff".to_string(),
-            ));
+            ))));
         };
         if echoed != *nonce {
-            return Ok(failed(
-                RunErrorKind::HandoffInvalid,
+            return Ok(completed(Err(TypedFailure::invalid(
+                "handoff.nonce",
                 "handoff nonce mismatch: the handoff was not written by the reviewer".to_string(),
-            ));
+            ))));
         }
         if !done {
-            return Ok(failed(
-                RunErrorKind::TurnFailed,
+            return Ok(completed(Err(TypedFailure::invalid(
+                "handoff.incomplete",
                 "reviewer handed off done=false: the review itself did not complete".to_string(),
-            ));
+            ))));
         }
-        Ok(NewEvent::new(MissionEvent::TerminalReviewCompleted {
-            attempt_no,
-            effect_id: effect_id.clone(),
-            judged_sha: judged_sha.clone(),
+        Ok(completed(Ok(TerminalReviewSuccess {
             passed,
             gaps,
             report: self.store.blobs().externalize(report)?,
-        })
-        .with_runtime_configuration(outcome.runtime_configuration))
+            final_response: self
+                .store
+                .blobs()
+                .externalize(PayloadRef::inline(outcome.final_response))?,
+            runtime_configuration: outcome.runtime_configuration,
+        })))
     }
 
     /// Resolve the `last_report` blobs of a task's dependencies (in either era's
@@ -864,8 +893,9 @@ impl Engine {
         let mut feedback = Vec::new();
         if let Some(failure) = &task.last_failure {
             feedback.push(format!(
-                "Previous attempt failed ({:?}): {}",
-                failure.kind, failure.detail
+                "Previous attempt failed ({}): {}",
+                failure.category(),
+                failure.detail()
             ));
         }
         for item in &task.feedback {
@@ -1239,21 +1269,22 @@ fn effect_id_for(parts: &[&str]) -> EffectId {
 }
 
 fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEvent {
-    let failure = RunFailure {
-        kind: RunErrorKind::Interrupted,
-        detail: "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed".to_string(),
+    let failure = TypedFailure::Interrupted {
+        evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence::new(
+            Some("driver.interrupted".to_string()),
+            "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed",
+        )),
     };
     NewEvent::new(match effect {
         InflightEffect::RoleRun {
             task_id,
             attempt_no,
             ..
-        } => MissionEvent::RoleRunFailed {
+        } => MissionEvent::RoleRunCompleted {
             task_id: task_id.clone(),
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
-            failure,
-            final_response: PayloadRef::inline(""),
+            outcome: Err(failure),
         },
         InflightEffect::OracleRun {
             assertion_ids,
@@ -1261,23 +1292,23 @@ fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEven
             judged_sha,
             attempt_no,
             ..
-        } => MissionEvent::OracleRunFailed {
+        } => MissionEvent::OracleRunCompleted {
             assertion_ids: assertion_ids.clone(),
             oracle: oracle.clone(),
             judged_sha: judged_sha.clone(),
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
-            failure,
+            outcome: Err(failure),
         },
         InflightEffect::TerminalReview {
             attempt_no,
             judged_sha,
             ..
-        } => MissionEvent::TerminalReviewFailed {
+        } => MissionEvent::TerminalReviewCompleted {
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
             judged_sha: judged_sha.clone(),
-            failure,
+            outcome: Err(failure),
         },
     })
 }
@@ -1314,10 +1345,29 @@ pub async fn record_decision(
     Ok(())
 }
 
+fn transient_backoff_ms(consecutive_failures: u32, adapter_retry_after_ms: Option<u64>) -> u64 {
+    const MAX_BACKOFF_MS: u64 = 30_000;
+    let policy_ms = 1_000_u64 << consecutive_failures.min(4);
+    policy_ms
+        .max(adapter_retry_after_ms.unwrap_or_default())
+        .min(MAX_BACKOFF_MS)
+}
+
+fn runtime_configuration_evidence(
+    evidence: &crate::model::RuntimeConfigurationEvidence,
+) -> lionclaw_runtime_api::AppliedRuntimeConfiguration {
+    lionclaw_runtime_api::AppliedRuntimeConfiguration {
+        requested_model: evidence.requested_model.clone(),
+        applied_model: evidence.applied_model.clone(),
+        requested_mode: evidence.requested_mode.clone(),
+        applied_mode: evidence.applied_mode.clone(),
+    }
+}
+
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
-    use crate::model::{RunErrorKind, TaskRuntimeState, TaskStatus};
+    use crate::model::{TaskRuntimeState, TaskStatus};
 
     fn task(status: TaskStatus, base: &str, epoch: u32) -> TaskRuntimeState {
         TaskRuntimeState {
@@ -1355,13 +1405,21 @@ mod assignment_tests {
     fn retry_retains_the_original_workspace_base_and_epoch() {
         let mut failed = task(TaskStatus::Failed, "h1", 4);
         failed.consecutive_failures = 1;
-        failed.last_failure = Some(RunFailure {
-            kind: RunErrorKind::TurnFailed,
-            detail: "driver died".to_string(),
-        });
+        failed.last_failure = Some(TypedFailure::transient(
+            "runtime.fixture",
+            "driver died",
+            None,
+        ));
         assert_eq!(
             resolve_task_assignment(Some(&failed), "h2", 3),
             ("h1".into(), 4, false)
         );
+    }
+
+    #[test]
+    fn transient_backoff_is_bounded_and_honors_structured_retry_after() {
+        assert_eq!(transient_backoff_ms(0, None), 1_000);
+        assert_eq!(transient_backoff_ms(1, Some(2_500)), 2_500);
+        assert_eq!(transient_backoff_ms(99, Some(90_000)), 30_000);
     }
 }

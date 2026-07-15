@@ -10,13 +10,14 @@ use common::{
     approve_plan, default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{ArtifactOutcome, EffectResource, Handoff, PayloadRef, RunErrorKind};
+use lionclaw::model::{ArtifactOutcome, EffectResource, Handoff, PayloadRef};
 use lionclaw::ports::{
-    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunFailure, RoleRunOutcome,
-    RoleRunRequest, RoleRunner,
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunOutcome, RoleRunRequest,
+    RoleRunner,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
+use lionclaw_runtime_api::TypedFailure;
 use tokio::sync::Barrier;
 
 struct BlockingRunner {
@@ -27,7 +28,7 @@ struct BlockingRunner {
 
 #[async_trait]
 impl RoleRunner for BlockingRunner {
-    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, RoleRunFailure> {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.wait().await;
         self.release.wait().await;
@@ -179,7 +180,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
     assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
-        failure.failure.detail,
+        failure.failure.detail(),
         "injected attempt-directory cleanup failure"
     );
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
@@ -195,8 +196,8 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         .get(&lionclaw::model::TaskId::new("fix").unwrap())
         .unwrap();
     assert_eq!(
-        task.last_failure.as_ref().unwrap().kind,
-        RunErrorKind::Interrupted
+        task.last_failure.as_ref().unwrap().category(),
+        "interrupted"
     );
     let attention = parked.state.open_attention.values().next().unwrap();
     assert!(attention.report.contains("previous mission driver exited"));
@@ -239,7 +240,7 @@ async fn persistent_cleanup_failure_never_settles_or_replays_the_effect() {
                 .as_ref()
                 .unwrap()
                 .failure
-                .detail,
+                .detail(),
             "injected persistent runtime-secret cleanup failure"
         );
     }

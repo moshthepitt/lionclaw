@@ -19,9 +19,10 @@ pub mod verdict;
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
     ArtifactOutcome, BlobRef, DecisionAction, EffectEventClass, EffectResource, EventEnvelope, Gap,
-    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionTypeRef, PayloadRef,
-    PreparedInputRef, RecoveryConfig, RunErrorKind, RuntimeConfigurationEvidence, StopBar,
-    TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess,
+    PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess, RuntimeConfigurationEvidence,
+    StopBar, TerminalReviewConfig, TerminalReviewSuccess, ValidationItem, VersionStamps,
+    SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};
@@ -41,7 +42,7 @@ pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,
     FailureEvidence, FailureFeedback, InflightEffect, MissionPhase, MissionState, PlanningInput,
     PlanningRefinement, PlanningState, ReviewAcceptance, ReviewAcceptanceKind, ReviewOutcome,
-    RunFailure, TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

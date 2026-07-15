@@ -5,6 +5,7 @@
 
 mod common;
 
+use lionclaw_runtime_api::TypedFailure;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,10 +16,10 @@ use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
     MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, RunErrorKind, StopBar,
-    Task, TaskKind, TaskStatus,
+    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, StopBar, Task,
+    TaskKind, TaskStatus,
 };
-use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -639,11 +640,11 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             let mut calls = seen.lock().unwrap();
             *calls += 1;
             if *calls == 4 {
-                return Err(RoleRunFailure {
-                    kind: RunErrorKind::Timeout,
-                    detail: "temporary provider timeout".to_string(),
-                    final_response: String::new(),
-                });
+                return Err(TypedFailure::transient(
+                    "runtime.fixture",
+                    "temporary provider timeout".to_string(),
+                    None,
+                ));
             }
         }
         Ok(successful_role_outcome(request))
@@ -793,11 +794,11 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
     // A runner that fails the first planning node.
     let runner = MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
         if req.role.name.as_str() == "strategist" {
-            return Err(lionclaw::ports::RoleRunFailure {
-                kind: lionclaw::model::RunErrorKind::Timeout,
-                detail: "crashed mid-planning".to_string(),
-                final_response: String::new(),
-            });
+            return Err(TypedFailure::transient(
+                "runtime.fixture",
+                "crashed mid-planning".to_string(),
+                None,
+            ));
         }
         Ok(RoleRunOutcome {
             handoff: Handoff::Work {

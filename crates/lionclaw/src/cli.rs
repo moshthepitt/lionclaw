@@ -1012,6 +1012,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "not_covered_by_an_oracle": uncovered,
                 "waived_oracles": state.waived_oracles.iter().map(|o| o.as_str()).collect::<Vec<_>>(),
                 "acknowledged_gates": state.acknowledged_gates.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "oracle_failures": state.oracle_failures,
                 "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
                 "terminal_review_report": review_report,
@@ -1061,6 +1062,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         view.disposition.slug()
     );
     for (task_id, task) in &state.tasks {
+        if let Some(failure) = &task.last_failure {
+            print_typed_failure(failure, &format!("  task {task_id} failure: "));
+        }
         if let Some(configuration) = &task.last_runtime_configuration {
             println!(
                 "  task {task_id}: model {:?} -> {:?}, mode {:?} -> {:?}",
@@ -1077,10 +1081,13 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             }
         }
     }
+    print_non_task_failures(state);
     if let Some(failure) = &state.cleanup_failure {
         println!(
             "  cleanup: blocked for effect {} ({:?}): {}",
-            failure.effect_id, failure.resource, failure.failure.detail
+            failure.effect_id,
+            failure.resource,
+            failure.failure.detail()
         );
     }
     if let Some(line) = review_line(state) {
@@ -1379,7 +1386,9 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
         if let Some(failure) = &state.cleanup_failure {
             println!(
                 "cleanup blocked for effect {} ({:?}): {}",
-                failure.effect_id, failure.resource, failure.failure.detail
+                failure.effect_id,
+                failure.resource,
+                failure.failure.detail()
             );
         }
         if let Some(line) = review_line(state) {
@@ -1756,6 +1765,9 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
                     print_attention(blobs, item, "  ")?;
                 }
                 for (task_id, task) in &state.tasks {
+                    if let Some(failure) = &task.last_failure {
+                        print_typed_failure(failure, &format!("  task {task_id} failure: "));
+                    }
                     if let Some(response) = &task.final_response {
                         println!("  task {task_id} final response:");
                         for line in blobs.resolve(response)?.lines() {
@@ -1763,6 +1775,7 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
                         }
                     }
                 }
+                print_non_task_failures(state);
             }
             MissionDisposition::Running => {
                 println!("mission {mission_id}: running under another driver")
@@ -1776,7 +1789,7 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
                     "mission {mission_id}: cleanup blocked for effect {} ({:?})",
                     failure.effect_id, failure.resource
                 );
-                println!("  {}", failure.failure.detail);
+                println!("  {}", failure.failure.detail());
             }
             MissionDisposition::Terminal => {
                 println!("mission {mission_id}: {}", phase_slug(&state.phase));
@@ -1819,6 +1832,7 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
             attention_json(blobs, item)
         }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
+        "oracle_failures": state.oracle_failures,
         "terminal_review": review_summary(state),
     }))
 }
@@ -1834,6 +1848,7 @@ fn task_runtime_json(
         "workspace_base_sha": task.workspace_base_sha,
         "assignment_epoch": task.assignment_epoch,
         "runtime_configuration": task.last_runtime_configuration,
+        "failure": task.last_failure,
         "final_response": task.final_response.as_ref()
             .map(|response| blobs.resolve(response))
             .transpose()?,
@@ -1916,11 +1931,54 @@ fn cleanup_failure_json(state: &crate::model::MissionState) -> serde_json::Value
             serde_json::json!({
                 "effect_id": failure.effect_id.as_str(),
                 "resource": failure.resource,
-                "kind": failure.failure.kind,
-                "detail": failure.failure.detail,
+                "kind": failure.failure.category(),
+                "detail": failure.failure.detail(),
             })
         })
         .unwrap_or(serde_json::Value::Null)
+}
+
+fn print_typed_failure(failure: &lionclaw_runtime_api::TypedFailure, prefix: &str) {
+    let evidence = failure.evidence();
+    println!("{prefix}{}: {}", failure.category(), evidence.detail);
+    if let Some(code) = &evidence.code {
+        println!("    code: {code}");
+    }
+    if let Some(reason) = &evidence.stop_reason {
+        println!("    stop reason: {reason}");
+    }
+    if let Some(code) = evidence.exit_code {
+        println!("    exit code: {code}");
+    }
+    if !evidence.stderr.is_empty() {
+        println!("    stderr: {}", evidence.stderr);
+    }
+    if !evidence.final_response.is_empty() {
+        println!("    final response: {}", evidence.final_response);
+    }
+    let configuration = &evidence.configuration;
+    if configuration.requested_model.is_some()
+        || configuration.applied_model.is_some()
+        || configuration.requested_mode.is_some()
+        || configuration.applied_mode.is_some()
+    {
+        println!(
+            "    runtime configuration: model {:?} -> {:?}, mode {:?} -> {:?}",
+            configuration.requested_model,
+            configuration.applied_model,
+            configuration.requested_mode,
+            configuration.applied_mode,
+        );
+    }
+}
+
+fn print_non_task_failures(state: &crate::model::MissionState) {
+    for (oracle, failure) in &state.oracle_failures {
+        print_typed_failure(failure, &format!("  oracle {oracle} failure: "));
+    }
+    if let Some(crate::model::ReviewOutcome::Failed { failure }) = &state.terminal_review.outcome {
+        print_typed_failure(failure, "  terminal review failure: ");
+    }
 }
 
 fn attention_json(
@@ -2038,6 +2096,10 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
         "acknowledged": acknowledged,
         "waived": waived,
         "attempts": tr.attempts,
+        "failure": match &tr.outcome {
+            Some(ReviewOutcome::Failed { failure }) => serde_json::to_value(failure).ok(),
+            _ => None,
+        },
     })
 }
 
@@ -2097,7 +2159,10 @@ fn review_line(state: &crate::model::MissionState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EffectId, RunErrorKind, RunFailure};
+    use crate::model::{
+        EffectId, OracleRunSuccess, PayloadRef, RuntimeConfigurationEvidence, TerminalReviewSuccess,
+    };
+    use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
     use std::collections::BTreeMap;
 
     #[test]
@@ -2445,16 +2510,19 @@ mod tests {
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k1"]),
-                handoff: Handoff::Work {
-                    done: true,
-                    report: PayloadRef::inline("done"),
-                    request_attention: false,
-                },
-                artifact: Some(ArtifactOutcome {
-                    base_sha: "base".into(),
-                    head_sha: "h1".into(),
+                outcome: Ok(RoleRunSuccess {
+                    handoff: Handoff::Work {
+                        done: true,
+                        report: PayloadRef::inline("done"),
+                        request_attention: false,
+                    },
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: "base".into(),
+                        head_sha: "h1".into(),
+                    }),
+                    final_response: PayloadRef::inline("done"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
                 }),
-                final_response: PayloadRef::inline("done"),
             },
         ];
         events.extend(tail);
@@ -2481,12 +2549,14 @@ mod tests {
             judged_sha: "h1".into(),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", "ko"]),
-            exit_code,
-            exit_signal: None,
-            stdout: PayloadRef::inline(""),
-            stderr: PayloadRef::inline(""),
-            prepared_inputs: Vec::new(),
-            duration_ms: 1,
+            outcome: Ok(OracleRunSuccess {
+                exit_code,
+                exit_signal: None,
+                stdout: PayloadRef::inline(""),
+                stderr: PayloadRef::inline(""),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            }),
         }
     }
 
@@ -2514,12 +2584,14 @@ mod tests {
             judged_sha: "h1".into(),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", "ko"]),
-            exit_code: 1,
-            exit_signal: None,
-            stdout: PayloadRef::inline("ordinary output"),
-            stderr: PayloadRef::inline("the actual diagnostic"),
-            prepared_inputs: Vec::new(),
-            duration_ms: 1,
+            outcome: Ok(OracleRunSuccess {
+                exit_code: 1,
+                exit_signal: None,
+                stdout: PayloadRef::inline("ordinary output"),
+                stderr: PayloadRef::inline("the actual diagnostic"),
+                prepared_inputs: Vec::new(),
+                duration_ms: 1,
+            }),
         }]);
         let item = state
             .open_attention
@@ -2630,9 +2702,13 @@ mod tests {
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
-                passed: false,
-                gaps: vec![minor("a"), minor("b")],
-                report: crate::model::PayloadRef::inline("failed overall"),
+                outcome: Ok(TerminalReviewSuccess {
+                    passed: false,
+                    gaps: vec![minor("a"), minor("b")],
+                    report: crate::model::PayloadRef::inline("failed overall"),
+                    final_response: PayloadRef::inline("reviewed"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
             },
         ]);
         assert!(matches!(state.phase, MissionPhase::AttentionNeeded));
@@ -2649,14 +2725,13 @@ mod tests {
         // Aborted while parked on a review failure.
         let state = review_state(vec![
             oracle_completed(0),
-            MissionEvent::TerminalReviewFailed {
+            MissionEvent::TerminalReviewCompleted {
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
-                failure: RunFailure {
-                    kind: RunErrorKind::Timeout,
-                    detail: "boom".into(),
-                },
+                outcome: Err(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "boom")),
+                }),
             },
             MissionEvent::DecisionRecorded {
                 attention_id: "terminal_review_failed:mission".into(),
@@ -2690,9 +2765,13 @@ mod tests {
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "kr"]),
                 judged_sha: "h1".into(),
-                passed: false,
-                gaps: vec![],
-                report: crate::model::PayloadRef::inline("it does not work"),
+                outcome: Ok(TerminalReviewSuccess {
+                    passed: false,
+                    gaps: vec![],
+                    report: crate::model::PayloadRef::inline("it does not work"),
+                    final_response: PayloadRef::inline("reviewed"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
             },
         ]);
         assert!(matches!(state.phase, MissionPhase::AttentionNeeded));

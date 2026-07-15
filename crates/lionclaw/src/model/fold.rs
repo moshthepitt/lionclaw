@@ -10,20 +10,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::event::{EventEnvelope, GapSeverity, Handoff, MissionEvent};
+use super::event::{
+    EventEnvelope, GapSeverity, Handoff, MissionEvent, PayloadRef, RuntimeConfigurationEvidence,
+};
 use super::ids::{AssertionId, TaskId};
 use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
-    ReviewAcceptanceKind, ReviewOutcome, RunFailure, TaskRuntimeState, TaskStatus,
-    TerminalReviewVerdict,
+    ReviewAcceptanceKind, ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 8;
+pub const REDUCER_VERSION: u32 = 9;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -128,45 +129,48 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             task_id,
             attempt_no,
             effect_id,
-            handoff,
-            artifact,
-            final_response,
-            ..
+            outcome,
         } => {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
-            if let Some(artifact) = artifact {
-                state.current_sha = artifact.head_sha.clone();
-            }
-            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
-                task.attempts = task.attempts.max(*attempt_no);
-            }
-            apply_handoff(state, task_id, handoff);
-            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
-                task.last_runtime_configuration = envelope.stamps.runtime_configuration.clone();
-                task.final_response = Some(final_response.clone());
-                if task.status == TaskStatus::Failed {
-                    task.consecutive_failures = task.consecutive_failures.saturating_add(1);
-                } else {
-                    task.consecutive_failures = 0;
+            match outcome {
+                Ok(success) => {
+                    if let Some(artifact) = &success.artifact {
+                        state.current_sha = artifact.head_sha.clone();
+                    }
+                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                        task.attempts = task.attempts.max(*attempt_no);
+                    }
+                    apply_handoff(state, task_id, &success.handoff);
+                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                        task.last_runtime_configuration =
+                            Some(success.runtime_configuration.clone());
+                        task.final_response = Some(success.final_response.clone());
+                        if task.status == TaskStatus::Failed {
+                            task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+                        } else {
+                            task.last_failure = None;
+                            task.consecutive_failures = 0;
+                        }
+                    }
                 }
-            }
-        }
-        MissionEvent::RoleRunFailed {
-            task_id,
-            attempt_no,
-            effect_id,
-            failure,
-            final_response,
-        } => {
-            state.inflight.remove(effect_id);
-            clear_cleanup_failure(state, effect_id);
-            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
-                task.attempts = task.attempts.max(*attempt_no);
-                task.status = TaskStatus::Failed;
-                task.last_failure = Some(failure.clone());
-                task.final_response = Some(final_response.clone());
-                task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+                Err(failure) => {
+                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                        task.attempts = task.attempts.max(*attempt_no);
+                        task.status = TaskStatus::Failed;
+                        task.last_failure = Some(failure.clone());
+                        let evidence = failure.evidence();
+                        task.final_response = (!evidence.final_response.is_empty())
+                            .then(|| PayloadRef::inline(evidence.final_response.clone()));
+                        task.last_runtime_configuration = Some(RuntimeConfigurationEvidence {
+                            requested_model: evidence.configuration.requested_model.clone(),
+                            applied_model: evidence.configuration.applied_model.clone(),
+                            requested_mode: evidence.configuration.requested_mode.clone(),
+                            applied_mode: evidence.configuration.applied_mode.clone(),
+                        });
+                        task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+                    }
+                }
             }
         }
         MissionEvent::OracleRunRequested {
@@ -180,42 +184,35 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             oracle,
             judged_sha,
             effect_id,
-            exit_code,
-            exit_signal,
-            stdout,
-            stderr,
-            prepared_inputs,
+            outcome,
             ..
         } => {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
-            state.oracle_failures.remove(oracle); // the oracle ran; recovered
-            let verdict = AuthoritativeVerdict::from_oracle_outcome(
-                oracle.clone(),
-                judged_sha.clone(),
-                *exit_code,
-                *exit_signal,
-                stdout.clone(),
-                stderr.clone(),
-                prepared_inputs.clone(),
-            );
-            for assertion_id in assertion_ids {
-                if let Some(assertion) = state.contract.get_mut(assertion_id) {
-                    assertion.last_authoritative = Some(verdict.clone());
+            match outcome {
+                Ok(success) => {
+                    state.oracle_failures.remove(oracle);
+                    let verdict = AuthoritativeVerdict::from_oracle_outcome(
+                        oracle.clone(),
+                        judged_sha.clone(),
+                        success.exit_code,
+                        success.exit_signal,
+                        success.stdout.clone(),
+                        success.stderr.clone(),
+                        success.prepared_inputs.clone(),
+                    );
+                    for assertion_id in assertion_ids {
+                        if let Some(assertion) = state.contract.get_mut(assertion_id) {
+                            assertion.last_authoritative = Some(verdict.clone());
+                        }
+                    }
+                }
+                Err(failure) => {
+                    state
+                        .oracle_failures
+                        .insert(oracle.clone(), failure.clone());
                 }
             }
-        }
-        MissionEvent::OracleRunFailed {
-            oracle,
-            effect_id,
-            failure,
-            ..
-        } => {
-            state.inflight.remove(effect_id);
-            clear_cleanup_failure(state, effect_id);
-            state
-                .oracle_failures
-                .insert(oracle.clone(), failure.clone());
         }
         // `attempts` is the highest attempt number the log has seen — from
         // ANY review event, not just requests: the materialize fallback
@@ -230,35 +227,30 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attempt_no,
             effect_id,
             judged_sha,
-            passed,
-            gaps,
-            report,
+            outcome,
         } => {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
-            state.terminal_review.consecutive_failures = 0;
-            state.terminal_review.outcome = Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
-                judged_sha: judged_sha.clone(),
-                passed: *passed,
-                gaps: gaps.clone(),
-                report: report.clone(),
-            }));
-        }
-        MissionEvent::TerminalReviewFailed {
-            attempt_no,
-            effect_id,
-            failure,
-            ..
-        } => {
-            state.inflight.remove(effect_id);
-            clear_cleanup_failure(state, effect_id);
-            state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
-            state.terminal_review.consecutive_failures =
-                state.terminal_review.consecutive_failures.saturating_add(1);
-            state.terminal_review.outcome = Some(ReviewOutcome::Failed {
-                failure: failure.clone(),
-            });
+            match outcome {
+                Ok(success) => {
+                    state.terminal_review.consecutive_failures = 0;
+                    state.terminal_review.outcome =
+                        Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
+                            judged_sha: judged_sha.clone(),
+                            passed: success.passed,
+                            gaps: success.gaps.clone(),
+                            report: success.report.clone(),
+                        }));
+                }
+                Err(failure) => {
+                    state.terminal_review.consecutive_failures =
+                        state.terminal_review.consecutive_failures.saturating_add(1);
+                    state.terminal_review.outcome = Some(ReviewOutcome::Failed {
+                        failure: failure.clone(),
+                    });
+                }
+            }
         }
         MissionEvent::MissionAborted { reason, .. } => {
             state.phase = MissionPhase::Aborted {
@@ -684,8 +676,9 @@ fn derive_attention(state: &mut MissionState) {
             || format!("{label} '{task_id}' failed"),
             |failure| {
                 format!(
-                    "{label} '{task_id}' failed ({:?}): {}",
-                    failure.kind, failure.detail
+                    "{label} '{task_id}' failed ({}): {}",
+                    failure.category(),
+                    failure.detail()
                 )
             },
         )
@@ -750,7 +743,7 @@ fn derive_attention(state: &mut MissionState) {
             Some(oracle.clone()),
             Vec::new(),
             None,
-            format!("oracle '{oracle}' failed to run: {}", failure.detail),
+            format!("oracle '{oracle}' failed to run: {}", failure.detail()),
         );
     }
 
@@ -881,7 +874,7 @@ fn derive_attention(state: &mut MissionState) {
                     format!(
                         "terminal review failed to run: {}; retry to re-run \
                      the review, accept to waive it, or abort",
-                        failure.detail
+                        failure.detail()
                     ),
                 )
             }
@@ -966,9 +959,11 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
-                task.last_failure = (!done).then(|| RunFailure {
-                    kind: super::event::RunErrorKind::HandoffInvalid,
-                    detail: "role reported done=false".to_string(),
+                task.last_failure = (!done).then(|| {
+                    lionclaw_runtime_api::TypedFailure::invalid(
+                        "handoff.incomplete",
+                        "role reported done=false",
+                    )
                 });
             }
             // A done task that asks for a look is flagged (derived into a
@@ -995,9 +990,11 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
-                task.last_failure = (!done).then(|| RunFailure {
-                    kind: super::event::RunErrorKind::HandoffInvalid,
-                    detail: "planning author reported done=false".to_string(),
+                task.last_failure = (!done).then(|| {
+                    lionclaw_runtime_api::TypedFailure::invalid(
+                        "handoff.incomplete",
+                        "planning author reported done=false",
+                    )
                 });
             }
             if *done {
@@ -1074,10 +1071,10 @@ fn derive_phase(state: &mut MissionState) {
 }
 
 fn tasks_active(state: &MissionState) -> bool {
-    state
-        .tasks
-        .values()
-        .any(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Running))
+    state.tasks.values().any(|task| {
+        matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+            || task.automatic_retry_remaining(state.config.recovery.max_attempts)
+    })
 }
 
 /// Work the mission still owes before it could close: active tasks, inflight
@@ -1135,13 +1132,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::super::event::{
-        ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
+        ArtifactOutcome, MissionConfig, OracleRunSuccess, PayloadRef, RoleRunSuccess,
+        RuntimeConfigurationEvidence, TerminalReviewSuccess, ValidationItem,
     };
     use super::super::ids::{AssertionId, EffectId, MissionId, OracleName, RoleName, TaskId};
     use super::super::plan::{Assertion, Plan, PlanProposal, PlanningTask, Task, TaskKind};
-    use super::super::state::RunFailure;
     use super::super::verdict::FinishClass;
     use super::*;
+    use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
 
     fn tid(raw: &str) -> TaskId {
         TaskId::new(raw).expect("task id")
@@ -1293,9 +1291,12 @@ mod tests {
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
-            handoff,
-            artifact,
-            final_response: PayloadRef::inline("final response"),
+            outcome: Ok(RoleRunSuccess {
+                handoff,
+                artifact,
+                final_response: PayloadRef::inline("final response"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
         }
     }
 
@@ -1321,12 +1322,14 @@ mod tests {
             judged_sha: judged.into(),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
-            exit_code,
-            exit_signal: None,
-            stdout: PayloadRef::inline("out"),
-            stderr: PayloadRef::inline("err"),
-            prepared_inputs: Vec::new(),
-            duration_ms: 5,
+            outcome: Ok(OracleRunSuccess {
+                exit_code,
+                exit_signal: None,
+                stdout: PayloadRef::inline("out"),
+                stderr: PayloadRef::inline("err"),
+                prepared_inputs: Vec::new(),
+                duration_ms: 5,
+            }),
         }
     }
 
@@ -1512,16 +1515,13 @@ mod tests {
                 }),
             ),
             oracle_requested("A1", "sha-1", "ko"),
-            MissionEvent::OracleRunFailed {
+            MissionEvent::OracleRunCompleted {
                 assertion_ids: vec![aid("A1")],
                 oracle: oracle("cargo-test"),
                 judged_sha: "sha-1".into(),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "ko"]),
-                failure: RunFailure {
-                    kind: RunErrorKind::Infra,
-                    detail: "binary missing".into(),
-                },
+                outcome: Err(TypedFailure::permanent("oracle.spawn", "binary missing")),
             },
         ];
         let parked = fold_log(base.clone()).expect("state");
@@ -1849,15 +1849,17 @@ mod tests {
             created(),
             plan_proposed(vec![], vec![work_task("t1")]),
             role_requested("t1", "k1"),
-            MissionEvent::RoleRunFailed {
+            MissionEvent::RoleRunCompleted {
                 task_id: tid("t1"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k1"]),
-                failure: RunFailure {
-                    kind: RunErrorKind::Timeout,
-                    detail: "took too long".into(),
-                },
-                final_response: PayloadRef::inline("partial but useful response"),
+                outcome: Err(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence {
+                        detail: "took too long".into(),
+                        final_response: "partial but useful response".into(),
+                        ..Default::default()
+                    }),
+                }),
             },
         ])
         .expect("state");
@@ -1881,6 +1883,79 @@ mod tests {
     }
 
     #[test]
+    fn typed_failure_classes_drive_only_bounded_correctable_recovery() {
+        let cases = [
+            (TypedFailure::invalid("handoff.schema", "bad shape"), true),
+            (
+                TypedFailure::transient("runtime.busy", "busy", Some(10)),
+                true,
+            ),
+            (TypedFailure::permanent("runtime.auth", "denied"), false),
+            (
+                TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "deadline")),
+                },
+                false,
+            ),
+            (
+                TypedFailure::Interrupted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "driver died")),
+                },
+                false,
+            ),
+            (
+                TypedFailure::OperatorStopped {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "stop requested")),
+                },
+                false,
+            ),
+            (
+                TypedFailure::OperatorAborted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "abort requested")),
+                },
+                false,
+            ),
+        ];
+
+        for (index, (failure, retryable)) in cases.into_iter().enumerate() {
+            let mut mission_created = created();
+            let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+                unreachable!()
+            };
+            config.recovery.max_attempts = 3;
+            let state = fold_log(vec![
+                mission_created,
+                plan_proposed(vec![], vec![work_task("t1")]),
+                role_requested("t1", &format!("request-{index}")),
+                MissionEvent::RoleRunCompleted {
+                    task_id: tid("t1"),
+                    attempt_no: 1,
+                    effect_id: EffectId::for_parts(&["test", &format!("request-{index}")]),
+                    outcome: Err(failure.clone()),
+                },
+            ])
+            .expect("state");
+
+            assert_eq!(
+                state.open_attention.is_empty(),
+                retryable,
+                "unexpected attention behavior for {}",
+                failure.category()
+            );
+            assert_eq!(
+                state.phase,
+                if retryable {
+                    MissionPhase::Running
+                } else {
+                    MissionPhase::AttentionNeeded
+                },
+                "unexpected phase for {}",
+                failure.category()
+            );
+        }
+    }
+
+    #[test]
     fn node_decisions_target_the_active_task_era_when_ids_overlap() {
         let mut created = created();
         let MissionEvent::MissionCreated { config, .. } = &mut created else {
@@ -1898,15 +1973,13 @@ mod tests {
             role_completed("same-id", "planning", work_handoff(true, false), None),
             plan_proposed(vec![], vec![work_task("same-id")]),
             role_requested("same-id", "execution"),
-            MissionEvent::RoleRunFailed {
+            MissionEvent::RoleRunCompleted {
                 task_id: tid("same-id"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "execution"]),
-                failure: RunFailure {
-                    kind: RunErrorKind::Timeout,
-                    detail: "took too long".into(),
-                },
-                final_response: PayloadRef::inline(""),
+                outcome: Err(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(TypedFailureEvidence::new(None, "took too long")),
+                }),
             },
             decision(
                 "node_failed:same-id",
@@ -2046,12 +2119,14 @@ mod tests {
                 judged_sha: "base".into(),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "ko"]),
-                exit_code: 0,
-                exit_signal: Some(9), // SIGKILL (timeout/OOM) despite exit 0
-                stdout: PayloadRef::inline("out"),
-                stderr: PayloadRef::inline("err"),
-                prepared_inputs: Vec::new(),
-                duration_ms: 5,
+                outcome: Ok(OracleRunSuccess {
+                    exit_code: 0,
+                    exit_signal: Some(9),
+                    stdout: PayloadRef::inline("out"),
+                    stderr: PayloadRef::inline("err"),
+                    prepared_inputs: Vec::new(),
+                    duration_ms: 5,
+                }),
             },
         ])
         .expect("state");
@@ -2070,16 +2145,13 @@ mod tests {
             created(),
             plan_proposed(vec![assertion("TESTS-PASS", Some("cargo-test"))], vec![]),
             oracle_requested("TESTS-PASS", "base", "ko"),
-            MissionEvent::OracleRunFailed {
+            MissionEvent::OracleRunCompleted {
                 assertion_ids: vec![aid("TESTS-PASS")],
                 oracle: oracle("cargo-test"),
                 judged_sha: "base".into(),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "ko"]),
-                failure: RunFailure {
-                    kind: RunErrorKind::Infra,
-                    detail: "spawn failed".into(),
-                },
+                outcome: Err(TypedFailure::permanent("oracle.spawn", "spawn failed")),
             },
         ])
         .expect("state");
@@ -2158,15 +2230,11 @@ mod tests {
                 validate_handoff(&[("UNKNOWN-1", true)]),
                 None,
             ),
-            MissionEvent::RoleRunFailed {
+            MissionEvent::RoleRunCompleted {
                 task_id: tid("specter"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k3"]),
-                failure: RunFailure {
-                    kind: RunErrorKind::Infra,
-                    detail: "gone".into(),
-                },
-                final_response: PayloadRef::inline(""),
+                outcome: Err(TypedFailure::permanent("runtime.gone", "gone")),
             },
         ])
         .expect("state");
@@ -2242,9 +2310,13 @@ mod tests {
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
-            passed,
-            gaps,
-            report: PayloadRef::inline("requirement map + observations"),
+            outcome: Ok(TerminalReviewSuccess {
+                passed,
+                gaps,
+                report: PayloadRef::inline("requirement map + observations"),
+                final_response: PayloadRef::inline("review complete"),
+                runtime_configuration: RuntimeConfigurationEvidence::default(),
+            }),
         }
     }
 
@@ -2253,19 +2325,32 @@ mod tests {
     }
 
     fn review_failed_at(attempt_no: u32, key: &str, judged: &str, detail: &str) -> MissionEvent {
-        MissionEvent::TerminalReviewFailed {
+        MissionEvent::TerminalReviewCompleted {
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
-            failure: RunFailure {
-                kind: RunErrorKind::Timeout,
-                detail: detail.into(),
-            },
+            outcome: Err(TypedFailure::DeadlineExhausted {
+                evidence: Box::new(TypedFailureEvidence::new(None, detail)),
+            }),
         }
     }
 
     fn review_failed(key: &str, judged: &str, detail: &str) -> MissionEvent {
         review_failed_at(1, key, judged, detail)
+    }
+
+    fn review_transient_failed_at(
+        attempt_no: u32,
+        key: &str,
+        judged: &str,
+        detail: &str,
+    ) -> MissionEvent {
+        MissionEvent::TerminalReviewCompleted {
+            attempt_no,
+            effect_id: EffectId::for_parts(&["test", key]),
+            judged_sha: judged.into(),
+            outcome: Err(TypedFailure::transient("runtime.busy", detail, None)),
+        }
     }
 
     /// A review-configured mission driven to the brink of closure: work
@@ -2542,7 +2627,12 @@ mod tests {
         ));
         events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
         events.push(review_requested(5, "kr5", "h2"));
-        events.push(review_failed_at(5, "kr5", "h2", "temporary timeout"));
+        events.push(review_transient_failed_at(
+            5,
+            "kr5",
+            "h2",
+            "temporary overload",
+        ));
 
         let state = fold_log(events).expect("state");
         assert_eq!(state.terminal_review.attempts, 5);

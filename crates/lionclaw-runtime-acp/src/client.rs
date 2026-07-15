@@ -8,7 +8,7 @@ use tracing::warn;
 
 use lionclaw_runtime_api::{
     AppliedRuntimeConfiguration, ExecutionOutput, RawTurnPayload, RuntimeEvent,
-    RuntimeMcpServerSpec, RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent,
+    RuntimeMcpServerSpec, RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent, TypedFailure,
 };
 
 use crate::driver::{AcpRuntimeConfig, ACP_PROTOCOL_NAME};
@@ -504,14 +504,37 @@ fn ensure_acp_exit_success(output: ExecutionOutput) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        return Err(anyhow!(
-            "ACP process exited with {}",
+    let detail = if stderr.is_empty() {
+        format!("ACP process exited with {}", output.status_description())
+    } else {
+        format!(
+            "ACP process exited with {}: {stderr}",
             output.status_description()
-        ));
+        )
+    };
+    let mut failure = TypedFailure::permanent("acp.process_exit", detail);
+    failure.evidence_mut().exit_code = output.exit_code;
+    failure.evidence_mut().stop_reason =
+        output.exit_signal.map(|signal| format!("signal {signal}"));
+    failure.evidence_mut().stderr = stderr;
+    Err(anyhow::Error::new(failure.projected()))
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn nonzero_exit_preserves_structured_process_evidence() {
+        let error = ensure_acp_exit_success(ExecutionOutput {
+            stderr: b"fatal protocol error".to_vec(),
+            exit_code: Some(17),
+            ..Default::default()
+        })
+        .expect_err("nonzero exit must fail");
+        let failure = error.downcast_ref::<TypedFailure>().expect("typed failure");
+        assert!(matches!(failure, TypedFailure::PermanentRuntime { .. }));
+        assert_eq!(failure.evidence().exit_code, Some(17));
+        assert_eq!(failure.evidence().stderr, "fatal protocol error");
     }
-    Err(anyhow!(
-        "ACP process exited with {}: {stderr}",
-        output.status_description()
-    ))
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lionclaw_runtime_api::NetworkMode;
+use lionclaw_runtime_api::{NetworkMode, TypedFailure};
 use serde_json::{json, Value};
 
 use super::event_mapping::app_server_error_text;
@@ -35,41 +35,21 @@ pub(crate) fn response_id(message: &Value) -> Option<u64> {
 
 pub(crate) fn parse_app_server_response(message: Value, method: &str) -> Result<Value> {
     if let Some(error) = message.get("error") {
-        return Err(CodexAppServerResponseError {
-            method: method.to_string(),
-            code: error.get("code").and_then(Value::as_i64),
-            message: app_server_error_text(error),
-        }
+        let code = error
+            .get("code")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "codex.app_server".to_string());
+        return Err(TypedFailure::permanent(
+            code,
+            format!(
+                "codex app-server {method} failed: {}",
+                app_server_error_text(error)
+            ),
+        )
         .into());
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
-
-#[derive(Debug)]
-pub(crate) struct CodexAppServerResponseError {
-    method: String,
-    code: Option<i64>,
-    message: String,
-}
-
-impl std::fmt::Display for CodexAppServerResponseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.code {
-            Some(code) => write!(
-                formatter,
-                "codex app-server {} failed with code {}: {}",
-                self.method, code, self.message
-            ),
-            None => write!(
-                formatter,
-                "codex app-server {} failed: {}",
-                self.method, self.message
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CodexAppServerResponseError {}
 
 pub(crate) fn thread_start_params(model: Option<&str>) -> Value {
     let mut params = json!({
