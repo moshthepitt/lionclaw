@@ -143,7 +143,7 @@ pub fn classify_finish(state: &MissionState) -> FinishClass {
         let fresh = assertion
             .last_authoritative
             .as_ref()
-            .filter(|v| v.is_fresh_at(&state.current_sha));
+            .filter(|v| v.is_fresh_at(state.deliverable_head()));
         match fresh {
             Some(v) if v.passed() => {}
             Some(_) => {

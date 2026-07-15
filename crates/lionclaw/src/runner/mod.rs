@@ -20,22 +20,23 @@ use lionclaw_confinement::{
 
 use crate::config::RuntimeSkillsDir;
 use crate::mission_type::SkillPackage;
-use crate::model::EffectId;
+use crate::model::{EffectId, TaskId};
 
 /// Container mount targets the mission owns.
 pub const HANDOFF_MOUNT_TARGET: &str = "/mission/handoff";
 pub const SCRATCH_MOUNT_TARGET: &str = "/scratch";
 
-/// Per-attempt host directories under `<state_dir>/missions/<mission>/attempts/<attempt>`.
-pub struct AttemptDirs {
+/// Effect-scoped resources. Cleanup may remove this entire tree after any
+/// outcome; no recoverable task work lives here.
+pub struct EffectDirs {
     pub root: PathBuf,
     pub handoff: PathBuf,
-    pub scratch: PathBuf,
+    pub read_scratch: PathBuf,
     pub runtime: PathBuf,
     pub runtime_home: PathBuf,
 }
 
-impl AttemptDirs {
+impl EffectDirs {
     pub fn prepare(
         state_dir: &Path,
         mission_id: &str,
@@ -44,18 +45,18 @@ impl AttemptDirs {
         let root = state_dir
             .join("missions")
             .join(mission_id)
-            .join("attempts")
+            .join("effects")
             .join(effect_id.as_str());
         let dirs = Self {
             handoff: root.join("handoff"),
-            scratch: root.join("scratch"),
+            read_scratch: root.join("scratch"),
             runtime: root.join("runtime"),
             runtime_home: root.join("runtime-home"),
             root,
         };
         for dir in [
             &dirs.handoff,
-            &dirs.scratch,
+            &dirs.read_scratch,
             &dirs.runtime,
             &dirs.runtime_home,
         ] {
@@ -64,15 +65,38 @@ impl AttemptDirs {
         Ok(dirs)
     }
 
-    /// The read-write mounts every role gets (handoff, scratch, runtime
-    /// state, runtime home for agent auth/config).
-    pub fn agent_mounts(&self) -> Vec<MountSpec> {
+    pub fn effect_mounts(&self, scratch: &Path) -> Vec<MountSpec> {
         vec![
             rw(&self.handoff, HANDOFF_MOUNT_TARGET),
-            rw(&self.scratch, SCRATCH_MOUNT_TARGET),
+            rw(scratch, SCRATCH_MOUNT_TARGET),
             rw(&self.runtime, RUNTIME_MOUNT_TARGET),
             rw(&self.runtime_home, RUNTIME_HOME_MOUNT_TARGET),
         ]
+    }
+}
+
+/// Durable task-owned writer resources. `work` and `scratch` survive every
+/// effect outcome and are removed only by explicit mission cleanup.
+pub struct TaskDirs {
+    pub root: PathBuf,
+    pub work: PathBuf,
+    pub scratch: PathBuf,
+}
+
+impl TaskDirs {
+    pub fn prepare(state_dir: &Path, mission_id: &str, task_id: &TaskId) -> std::io::Result<Self> {
+        let root = state_dir
+            .join("missions")
+            .join(mission_id)
+            .join("tasks")
+            .join(task_id.as_str());
+        let dirs = Self {
+            work: root.join("work"),
+            scratch: root.join("scratch"),
+            root,
+        };
+        std::fs::create_dir_all(&dirs.scratch)?;
+        Ok(dirs)
     }
 }
 

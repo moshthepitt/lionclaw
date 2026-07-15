@@ -15,7 +15,7 @@ use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RoleP
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{OracleFailure, OracleOutcome, OracleRunRequest, OracleRunner};
 use crate::runner::{
-    prepare_inputs, AttemptDirs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
+    prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
 };
 use crate::workspace;
 
@@ -46,7 +46,7 @@ fn fail(detail: impl Into<String>) -> OracleFailure {
 #[async_trait]
 impl OracleRunner for OciOracleRunner {
     async fn run(&self, request: OracleRunRequest) -> Result<OracleOutcome, OracleFailure> {
-        let dirs = AttemptDirs::prepare(
+        let dirs = EffectDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
             &request.effect_id,
@@ -107,7 +107,7 @@ impl OracleRunner for OciOracleRunner {
                     access: MountAccess::ReadOnly,
                 },
                 MountSpec {
-                    source: dirs.scratch.clone(),
+                    source: dirs.read_scratch.clone(),
                     target: SCRATCH_MOUNT_TARGET.to_string(),
                     access: MountAccess::ReadWrite,
                 },

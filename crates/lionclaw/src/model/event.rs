@@ -19,7 +19,7 @@ use super::plan::{PlanProposal, PlanningDag};
 
 /// Bumped for the strict decision/proposal/abort wire break that removes
 /// caller-supplied provenance from authoritative events.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,7 +272,7 @@ pub enum RunErrorKind {
 pub enum EffectResource {
     Container,
     RuntimeSecret,
-    AttemptDirectory,
+    EffectDirectory,
     WriterRef,
 }
 
@@ -312,6 +312,11 @@ pub enum MissionEvent {
         prompt: PayloadRef,
         /// Commit the role's workspace is created at.
         base_sha: String,
+        /// Monotonic identity for a fresh task assignment. Retries and
+        /// continues retain the epoch and workspace.
+        assignment_epoch: u32,
+        /// True only when a fresh assignment moved the required base.
+        recreate_workspace: bool,
     },
     RoleRunCompleted {
         task_id: TaskId,
@@ -320,12 +325,14 @@ pub enum MissionEvent {
         handoff: Handoff,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<ArtifactOutcome>,
+        final_response: PayloadRef,
     },
     RoleRunFailed {
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
         failure: super::RunFailure,
+        final_response: PayloadRef,
     },
     OracleRunRequested {
         assertion_ids: Vec<AssertionId>,

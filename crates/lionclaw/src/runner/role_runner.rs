@@ -28,7 +28,7 @@ use crate::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest, RoleRunner};
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{prepare_skill_mounts, AttemptDirs, SCRATCH_MOUNT_TARGET};
+use super::{prepare_skill_mounts, EffectDirs, TaskDirs, SCRATCH_MOUNT_TARGET};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -119,7 +119,31 @@ fn launch(detail: String) -> RoleRunFailure {
     RoleRunFailure {
         kind: RunErrorKind::Launch,
         detail,
+        final_response: String::new(),
     }
+}
+
+async fn prepare_writer_checkout(
+    repo: &std::path::Path,
+    workspace: &std::path::Path,
+    base_sha: &str,
+    recreate_workspace: bool,
+) -> Result<(), RoleRunFailure> {
+    if workspace.exists() && !recreate_workspace {
+        return Ok(());
+    }
+    if workspace.exists()
+        && workspace::is_dirty(workspace)
+            .await
+            .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
+    {
+        return Err(launch(
+            "refusing to recreate a dirty task workspace on a moved base".to_string(),
+        ));
+    }
+    workspace::create_checkout(repo, workspace, base_sha)
+        .await
+        .map_err(|e| launch(format!("failed to create checkout: {e}")))
 }
 
 #[async_trait]
@@ -135,7 +159,7 @@ impl RoleRunner for OciRoleRunner {
         }
         let profile = self.profile(&request.runtime)?;
 
-        let dirs = AttemptDirs::prepare(
+        let dirs = EffectDirs::prepare(
             &request.state_dir,
             request.mission_id.as_str(),
             &request.effect_id,
@@ -155,23 +179,41 @@ impl RoleRunner for OciRoleRunner {
             let authority = compile_authority(&request.role, &self.ceiling)
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
-            // Every role gets the same complete checkout. Compiled authority is
-            // the only source of workspace mutability.
-            let workspace_source = dirs.root.join("work");
+            let (workspace_source, scratch_source) = if is_writer {
+                let task_dirs = TaskDirs::prepare(
+                    &request.state_dir,
+                    request.mission_id.as_str(),
+                    &request.task_id,
+                )
+                .map_err(|e| launch(format!("failed to prepare task dirs: {e}")))?;
+                (task_dirs.work.clone(), task_dirs.scratch.clone())
+            } else {
+                (dirs.root.join("work"), dirs.read_scratch.clone())
+            };
             {
                 let _guard = self.repo_lock.lock().await;
-                workspace::create_checkout(
-                    &request.workspace_dir,
-                    &workspace_source,
-                    &request.base_sha,
-                )
-                .await
-                .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+                if is_writer {
+                    prepare_writer_checkout(
+                        &request.workspace_dir,
+                        &workspace_source,
+                        &request.base_sha,
+                        request.recreate_workspace,
+                    )
+                    .await?;
+                } else {
+                    workspace::create_checkout(
+                        &request.workspace_dir,
+                        &workspace_source,
+                        &request.base_sha,
+                    )
+                    .await
+                    .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+                }
             }
             // Compile the plan through the moat. Judged roots = the workspace
             // the verdict is about (only meaningful for verdict roles, but the
             // predicate is applied uniformly).
-            let mut extras = dirs.agent_mounts();
+            let mut extras = dirs.effect_mounts(&scratch_source);
             extras.extend(skill_mounts);
             let environment = mission_environment(&dirs);
             let judged_roots = [crate::authority::canonical_or_lexical(&workspace_source)];
@@ -191,10 +233,14 @@ impl RoleRunner for OciRoleRunner {
 
             // Run the agent turn under confinement, then capture the artifact
             // (writer only) before the workspace is torn down.
-            let applied = self
+            let (applied, final_response) = self
                 .run_turn(&profile, &request, compiled.plan().clone())
                 .await?;
-            let handoff = read_handoff(&dirs.handoff, request.role.output)?;
+            let handoff =
+                read_handoff(&dirs.handoff, request.role.output).map_err(|mut failure| {
+                    failure.final_response = final_response.clone();
+                    failure
+                })?;
             let artifact = if is_writer {
                 let _guard = self.repo_lock.lock().await;
                 let head_sha = workspace::capture_worker_result(
@@ -212,6 +258,7 @@ impl RoleRunner for OciRoleRunner {
                         workspace::CaptureError::Infra(_) => RunErrorKind::Infra,
                     },
                     detail: e.to_string(),
+                    final_response: final_response.clone(),
                 })?;
                 Some(ArtifactOutcome {
                     base_sha: request.base_sha.clone(),
@@ -229,6 +276,7 @@ impl RoleRunner for OciRoleRunner {
                     requested_mode: applied.requested_mode,
                     applied_mode: applied.applied_mode,
                 },
+                final_response,
             })
         }
         .await;
@@ -243,7 +291,7 @@ impl OciRoleRunner {
         profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
-    ) -> Result<lionclaw_runtime_api::AppliedRuntimeConfiguration, RoleRunFailure> {
+    ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), RoleRunFailure> {
         let driver = Self::driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         let config = Self::driver_config(profile)
@@ -280,12 +328,25 @@ impl OciRoleRunner {
             tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
         let drain = tokio::spawn(async move {
             let mut last_error = None;
+            let mut final_response = String::new();
             while let Some(event) = journal_rx.recv().await {
-                if let lionclaw_runtime_api::RuntimeEvent::Error { text, .. } = &event.event {
-                    last_error = Some(text.clone());
+                match &event.event {
+                    lionclaw_runtime_api::RuntimeEvent::Error { text, .. } => {
+                        last_error = Some(text.clone());
+                    }
+                    lionclaw_runtime_api::RuntimeEvent::MessageDelta {
+                        lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                        text,
+                    } => {
+                        lionclaw_runtime_api::append_streamed_text_delta(&mut final_response, text)
+                    }
+                    lionclaw_runtime_api::RuntimeEvent::MessageBoundary {
+                        lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                    } => lionclaw_runtime_api::append_streamed_text_boundary(&mut final_response),
+                    _ => {}
                 }
             }
-            last_error
+            (last_error, final_response.trim_end().to_string())
         });
 
         let turn = adapter.program_backed_turn(
@@ -307,12 +368,13 @@ impl OciRoleRunner {
 
         let result = tokio::time::timeout(profile.hard_timeout, turn).await;
         let _ = adapter.close(&handle).await;
-        let last_error = drain.await.ok().flatten();
+        let (last_error, final_response) = drain.await.unwrap_or_default();
 
         match result {
             Err(_) => Err(RoleRunFailure {
                 kind: RunErrorKind::Timeout,
                 detail: format!("agent turn exceeded {:?}", profile.hard_timeout),
+                final_response,
             }),
             Ok(Err(err)) => Err(RoleRunFailure {
                 kind: RunErrorKind::TurnFailed,
@@ -320,6 +382,7 @@ impl OciRoleRunner {
                     Some(e) => format!("{err}: {e}"),
                     None => err.to_string(),
                 },
+                final_response,
             }),
             Ok(Ok(result)) => {
                 let configuration = result.configuration;
@@ -333,7 +396,7 @@ impl OciRoleRunner {
                         profile.model, profile.mode
                     )));
                 }
-                Ok(configuration)
+                Ok((configuration, final_response))
             }
         }
     }
@@ -343,7 +406,7 @@ impl OciRoleRunner {
 /// cargo (CARGO_HOME/CARGO_TARGET_DIR) under the writable scratch mount so
 /// builds stay out of the read-only rootfs. Kept minimal and mission-specific
 /// rather than importing the kernel planner's env builder.
-fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
+fn mission_environment(dirs: &EffectDirs) -> Vec<(String, String)> {
     let home = lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET;
     vec![
         ("HOME".to_string(), home.to_string()),
@@ -368,7 +431,7 @@ fn mission_environment(dirs: &AttemptDirs) -> Vec<(String, String)> {
     ]
     .into_iter()
     .chain(std::iter::once((
-        "MISSION_ATTEMPT".to_string(),
+        "MISSION_EFFECT".to_string(),
         dirs.root.to_string_lossy().into_owned(),
     )))
     .collect()
@@ -457,5 +520,87 @@ mod tests {
         assert!(prepare_skill_mounts(Path::new("/runtime-home"), &[], None)
             .unwrap()
             .is_empty());
+    }
+
+    async fn git(repo: &Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn writer_workspace_reuse_preserves_dirty_work_and_clean_rebase_moves_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
+        prepare_writer_checkout(&repo, &task_work, &base, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
+            "preserve me\n"
+        );
+
+        std::fs::remove_file(task_work.join("substantial-uncommitted")).unwrap();
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        prepare_writer_checkout(&repo, &task_work, &moved, true)
+            .await
+            .unwrap();
+        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), moved);
+    }
+
+    #[tokio::test]
+    async fn moved_base_never_recreates_a_dirty_writer_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+        std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
+
+        let error = prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap_err();
+        assert!(error.detail.contains("refusing to recreate"));
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
+            "preserve me\n"
+        );
     }
 }

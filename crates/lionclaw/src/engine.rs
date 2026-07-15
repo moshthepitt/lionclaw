@@ -573,30 +573,37 @@ impl Engine {
             runtime,
             prompt,
             base_sha,
+            assignment_epoch,
+            recreate_workspace,
             ..
         } = effect
         else {
             bail!("execute_role_run called with a non-role effect");
         };
         let attempt_no = *attempt_no;
-        let failed = |kind: RunErrorKind, detail: String| {
-            NewEvent::new(MissionEvent::RoleRunFailed {
+        let failed = |kind: RunErrorKind, detail: String, final_response: String| -> Result<_> {
+            Ok(NewEvent::new(MissionEvent::RoleRunFailed {
                 task_id: task_id.clone(),
                 attempt_no,
                 effect_id: effect_id.clone(),
                 failure: RunFailure { kind, detail },
-            })
+                final_response: self
+                    .store
+                    .blobs()
+                    .externalize(PayloadRef::inline(final_response))?,
+            }))
         };
         let Some(role) = self.mission_type.roles.get(role_name) else {
-            return Ok(failed(
+            return failed(
                 RunErrorKind::Launch,
                 format!("role '{role_name}' is no longer provided by the mission type"),
-            ));
+                String::new(),
+            );
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
-            Err(detail) => return Ok(failed(RunErrorKind::Launch, detail)),
+            Err(detail) => return failed(RunErrorKind::Launch, detail, String::new()),
         };
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
@@ -608,6 +615,8 @@ impl Engine {
             skills,
             prompt: prompt_text,
             base_sha: base_sha.to_string(),
+            assignment_epoch: *assignment_epoch,
+            recreate_workspace: *recreate_workspace,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -635,18 +644,20 @@ impl Engine {
                 } = &outcome.handoff
                 {
                     let Some(proposal) = proposal else {
-                        return Ok(failed(
+                        return failed(
                             RunErrorKind::HandoffInvalid,
                             "planning author reported done but proposed no plan".to_string(),
-                        ));
+                            outcome.final_response.clone(),
+                        );
                     };
                     if let Err(error) =
                         validate_plan_proposal(state, proposal, &self.mission_type.inventory())
                     {
-                        return Ok(failed(
+                        return failed(
                             RunErrorKind::HandoffInvalid,
                             format!("proposed plan is invalid: {error}"),
-                        ));
+                            outcome.final_response.clone(),
+                        );
                     }
                 }
                 let handoff = self.externalize_handoff(outcome.handoff)?;
@@ -656,10 +667,14 @@ impl Engine {
                     effect_id: effect_id.clone(),
                     handoff,
                     artifact: outcome.artifact,
+                    final_response: self
+                        .store
+                        .blobs()
+                        .externalize(PayloadRef::inline(outcome.final_response))?,
                 })
                 .with_runtime_configuration(outcome.runtime_configuration))
             }
-            Err(failure) => Ok(failed(failure.kind, failure.detail)),
+            Err(failure) => failed(failure.kind, failure.detail, failure.final_response),
         }
     }
 
@@ -783,6 +798,8 @@ impl Engine {
             skills,
             prompt: prompt_text,
             base_sha: judged_sha.clone(),
+            assignment_epoch: attempt_no,
+            recreate_workspace: true,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -998,11 +1015,17 @@ impl Engine {
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
+        let (base_sha, assignment_epoch, recreate_workspace) = resolve_task_assignment(
+            state.active_tasks().get(&intent.task_id),
+            &intent.base_sha,
+            state.config.recovery.max_attempts,
+        );
         let effect_id = effect_id_for(&[
             effect_namespace,
             state.mission_id.as_str(),
             intent.task_id.as_str(),
             &intent.attempt_no.to_string(),
+            &assignment_epoch.to_string(),
             &prompt_hash,
         ]);
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
@@ -1015,7 +1038,9 @@ impl Engine {
                 .clone()
                 .unwrap_or_else(|| state.runtime.clone()),
             prompt,
-            base_sha: intent.base_sha,
+            base_sha,
+            assignment_epoch,
+            recreate_workspace,
         })
         .with_prompt_hash(prompt_hash);
         self.append_idempotent(&state.mission_id, state.head, &[event])
@@ -1181,6 +1206,32 @@ impl Engine {
     }
 }
 
+fn resolve_task_assignment(
+    previous: Option<&crate::model::TaskRuntimeState>,
+    required_base: &str,
+    max_attempts: u32,
+) -> (String, u32, bool) {
+    let retrying_failure =
+        previous.is_some_and(|task| task.automatic_retry_remaining(max_attempts));
+    let base_sha = if retrying_failure {
+        previous
+            .and_then(|task| task.workspace_base_sha.clone())
+            .unwrap_or_else(|| required_base.to_string())
+    } else {
+        required_base.to_string()
+    };
+    let previous_epoch = previous.map_or(0, |task| task.assignment_epoch);
+    let recreate = previous.and_then(|task| task.workspace_base_sha.as_deref())
+        != Some(base_sha.as_str())
+        && !retrying_failure;
+    let epoch = match (previous_epoch, recreate) {
+        (0, _) => 1,
+        (epoch, true) => epoch.saturating_add(1),
+        (epoch, false) => epoch,
+    };
+    (base_sha, epoch, recreate)
+}
+
 /// Content-derived effect identity: stable across resume, unique per
 /// logical effect.
 fn effect_id_for(parts: &[&str]) -> EffectId {
@@ -1202,6 +1253,7 @@ fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEven
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),
             failure,
+            final_response: PayloadRef::inline(""),
         },
         InflightEffect::OracleRun {
             assertion_ids,
@@ -1260,4 +1312,56 @@ pub async fn record_decision(
         .append(mission_id, state.head, &events, now_ms)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+    use crate::model::{RunErrorKind, TaskRuntimeState, TaskStatus};
+
+    fn task(status: TaskStatus, base: &str, epoch: u32) -> TaskRuntimeState {
+        TaskRuntimeState {
+            status,
+            attempts: epoch,
+            consecutive_failures: 0,
+            last_report: None,
+            last_failure: None,
+            feedback: Vec::new(),
+            last_runtime_configuration: None,
+            workspace_base_sha: Some(base.to_string()),
+            assignment_epoch: epoch,
+            final_response: None,
+        }
+    }
+
+    #[test]
+    fn fresh_assignment_rebases_only_when_the_required_deliverable_moved() {
+        assert_eq!(
+            resolve_task_assignment(None, "h1", 3),
+            ("h1".into(), 1, true)
+        );
+        let pending = task(TaskStatus::Pending, "h1", 1);
+        assert_eq!(
+            resolve_task_assignment(Some(&pending), "h2", 3),
+            ("h2".into(), 2, true)
+        );
+        assert_eq!(
+            resolve_task_assignment(Some(&pending), "h1", 3),
+            ("h1".into(), 1, false)
+        );
+    }
+
+    #[test]
+    fn retry_retains_the_original_workspace_base_and_epoch() {
+        let mut failed = task(TaskStatus::Failed, "h1", 4);
+        failed.consecutive_failures = 1;
+        failed.last_failure = Some(RunFailure {
+            kind: RunErrorKind::TurnFailed,
+            detail: "driver died".to_string(),
+        });
+        assert_eq!(
+            resolve_task_assignment(Some(&failed), "h2", 3),
+            ("h1".into(), 4, false)
+        );
+    }
 }

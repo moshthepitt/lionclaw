@@ -136,7 +136,7 @@ fn step_planning(state: &MissionState) -> StepDecision {
         body: task.body.clone(),
         // Planning has no contract; its roles are read-only at the base commit.
         targets: Vec::new(),
-        base_sha: state.current_sha.clone(),
+        base_sha: state.deliverable_head().to_string(),
     })
 }
 
@@ -188,7 +188,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             body: task.body.clone(),
             targets: task.targets.clone(),
             // Work stacks on the latest artifact; a validator judges it.
-            base_sha: state.current_sha.clone(),
+            base_sha: state.deliverable_head().to_string(),
         });
     }
 
@@ -207,7 +207,7 @@ fn step_running(state: &MissionState) -> StepDecision {
             let fresh = assertion
                 .last_authoritative
                 .as_ref()
-                .is_some_and(|v| v.is_fresh_at(&state.current_sha));
+                .is_some_and(|v| v.is_fresh_at(state.deliverable_head()));
             if !fresh {
                 by_oracle
                     .entry(oracle.clone())
@@ -222,7 +222,7 @@ fn step_running(state: &MissionState) -> StepDecision {
                 OracleDispatchIntent {
                     oracle,
                     assertion_ids,
-                    judged_sha: state.current_sha.clone(),
+                    judged_sha: state.deliverable_head().to_string(),
                     attempt_no,
                 }
             })
@@ -255,7 +255,7 @@ fn step_running(state: &MissionState) -> StepDecision {
         return StepDecision::ReviewTerminal(TerminalReviewDispatchIntent {
             role: config.role.clone(),
             attempt_no: state.terminal_review.attempts + 1,
-            judged_sha: state.current_sha.clone(),
+            judged_sha: state.deliverable_head().to_string(),
         });
     }
 
@@ -396,6 +396,8 @@ mod tests {
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
             base_sha: "sha-0".to_string(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
         }
     }
 
@@ -413,6 +415,7 @@ mod tests {
                 base_sha: base_sha.to_string(),
                 head_sha: head_sha.to_string(),
             }),
+            final_response: PayloadRef::inline("done"),
         }
     }
 
@@ -425,6 +428,7 @@ mod tests {
                 kind: RunErrorKind::Timeout,
                 detail: "runner timed out".to_string(),
             },
+            final_response: PayloadRef::inline(""),
         }
     }
 

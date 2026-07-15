@@ -23,7 +23,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 7;
+pub const REDUCER_VERSION: u32 = 8;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -112,12 +112,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::RoleRunRequested {
             task_id,
             attempt_no,
+            base_sha,
+            assignment_epoch,
             ..
         } => {
             let tasks = state.active_tasks_mut();
             let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
+            task.workspace_base_sha = Some(base_sha.clone());
+            task.assignment_epoch = *assignment_epoch;
             track_inflight(state, &envelope.event, seq);
         }
         MissionEvent::RoleRunCompleted {
@@ -126,6 +130,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             handoff,
             artifact,
+            final_response,
             ..
         } => {
             state.inflight.remove(effect_id);
@@ -139,6 +144,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             apply_handoff(state, task_id, handoff);
             if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                 task.last_runtime_configuration = envelope.stamps.runtime_configuration.clone();
+                task.final_response = Some(final_response.clone());
                 if task.status == TaskStatus::Failed {
                     task.consecutive_failures = task.consecutive_failures.saturating_add(1);
                 } else {
@@ -151,7 +157,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attempt_no,
             effect_id,
             failure,
-            ..
+            final_response,
         } => {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
@@ -159,6 +165,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 task.attempts = task.attempts.max(*attempt_no);
                 task.status = TaskStatus::Failed;
                 task.last_failure = Some(failure.clone());
+                task.final_response = Some(final_response.clone());
                 task.consecutive_failures = task.consecutive_failures.saturating_add(1);
             }
         }
@@ -371,6 +378,9 @@ fn pending_task() -> TaskRuntimeState {
         last_failure: None,
         feedback: Vec::new(),
         last_runtime_configuration: None,
+        workspace_base_sha: None,
+        assignment_epoch: 0,
+        final_response: None,
     }
 }
 
@@ -583,7 +593,7 @@ fn apply_decision(
             state.terminal_review.consecutive_failures = 0;
             state.terminal_review.accepted = Some(ReviewAcceptance {
                 kind: ReviewAcceptanceKind::Waived,
-                judged_sha: state.current_sha.clone(),
+                judged_sha: state.deliverable_head().to_string(),
                 justification: justification.to_string(),
             });
         }
@@ -753,7 +763,7 @@ fn derive_attention(state: &mut MissionState) {
         let Some(verdict) = assertion
             .last_authoritative
             .as_ref()
-            .filter(|verdict| verdict.is_fresh_at(&state.current_sha) && !verdict.passed())
+            .filter(|verdict| verdict.is_fresh_at(state.deliverable_head()) && !verdict.passed())
         else {
             continue;
         };
@@ -883,7 +893,7 @@ fn derive_attention(state: &mut MissionState) {
             // the head move re-opens the review for free.
             Some(ReviewOutcome::Verdict(v)) => {
                 let acknowledged = state.terminal_review.acknowledges(v);
-                if v.is_fresh_at(&state.current_sha)
+                if v.is_fresh_at(state.deliverable_head())
                     && v.blocking()
                     && !acknowledged
                     && !work_outstanding(state)
@@ -1091,7 +1101,7 @@ pub(crate) fn oracle_obligation_outstanding(state: &MissionState) -> bool {
             && assertion
                 .last_authoritative
                 .as_ref()
-                .is_none_or(|v| !v.is_fresh_at(&state.current_sha))
+                .is_none_or(|v| !v.is_fresh_at(state.deliverable_head()))
     })
 }
 
@@ -1108,7 +1118,7 @@ pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
     if state.config.terminal_review.is_none() {
         return false; // config-gated: pre-feature logs derive identically
     }
-    if state.terminal_review.waived_at(&state.current_sha) {
+    if state.terminal_review.waived_at(state.deliverable_head()) {
         return false;
     }
     if !state.config.stop.satisfied_by(classify_finish(state)) {
@@ -1116,7 +1126,7 @@ pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
     }
     !matches!(
         &state.terminal_review.outcome,
-        Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(&state.current_sha)
+        Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(state.deliverable_head())
     )
 }
 
@@ -1268,6 +1278,8 @@ mod tests {
             runtime: "codex".into(),
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
         }
     }
 
@@ -1283,6 +1295,7 @@ mod tests {
             effect_id: EffectId::for_parts(&["test", key]),
             handoff,
             artifact,
+            final_response: PayloadRef::inline("final response"),
         }
     }
 
@@ -1416,7 +1429,7 @@ mod tests {
                     attempt_no: 1,
                     body: "do".into(),
                     targets: vec![],
-                    base_sha: state.current_sha.clone(),
+                    base_sha: state.deliverable_head().to_string(),
                 }
             )
         );
@@ -1844,11 +1857,16 @@ mod tests {
                     kind: RunErrorKind::Timeout,
                     detail: "took too long".into(),
                 },
+                final_response: PayloadRef::inline("partial but useful response"),
             },
         ])
         .expect("state");
         let task = &state.tasks[&tid("t1")];
         assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.final_response,
+            Some(PayloadRef::inline("partial but useful response"))
+        );
         assert_eq!(task.attempts, 1);
         assert!(state.inflight.is_empty(), "outcome settles the request");
         let item = state
@@ -1888,6 +1906,7 @@ mod tests {
                     kind: RunErrorKind::Timeout,
                     detail: "took too long".into(),
                 },
+                final_response: PayloadRef::inline(""),
             },
             decision(
                 "node_failed:same-id",
@@ -2147,6 +2166,7 @@ mod tests {
                     kind: RunErrorKind::Infra,
                     detail: "gone".into(),
                 },
+                final_response: PayloadRef::inline(""),
             },
         ])
         .expect("state");

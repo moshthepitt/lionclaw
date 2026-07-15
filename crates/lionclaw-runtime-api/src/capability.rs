@@ -73,4 +73,5 @@ pub struct AppliedRuntimeConfiguration {
 pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
     pub configuration: AppliedRuntimeConfiguration,
+    pub final_response: String,
 }

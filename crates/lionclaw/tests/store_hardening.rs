@@ -42,6 +42,8 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
                 runtime: "codex".to_string(),
                 prompt: PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.to_string(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
             })],
             1,
         )

@@ -158,6 +158,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         })),
         MockOracleRunner::exiting(0),

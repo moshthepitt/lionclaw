@@ -44,6 +44,7 @@ pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) ->
             applied_model: Some("mock-model".to_string()),
             ..Default::default()
         },
+        final_response: "requirement map + observations".to_string(),
     }
 }
 
@@ -96,6 +97,7 @@ impl MockRoleRunner {
                     applied_model: Some("mock-model".to_string()),
                     ..Default::default()
                 },
+                final_response: "did the work".to_string(),
             })
         }))
     }

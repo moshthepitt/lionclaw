@@ -48,6 +48,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
             handoff,
             artifact,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }))
 }

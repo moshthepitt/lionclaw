@@ -213,6 +213,8 @@ mod tests {
                     runtime: "codex".into(),
                     prompt: PayloadRef::inline("p"),
                     base_sha: "s0".into(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
                 },
             ));
             seq += 1;
@@ -237,6 +239,7 @@ mod tests {
                         request_attention: false,
                     },
                     artifact: None,
+                    final_response: PayloadRef::inline("reviewed"),
                 },
             ));
             seq += 1;

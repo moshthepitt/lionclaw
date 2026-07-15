@@ -53,6 +53,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 applied_model: Some("mock".to_string()),
                 ..Default::default()
             },
+            final_response: String::new(),
         })
     }));
     let harness = harness_with_type(
@@ -113,6 +114,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 applied_model: Some("mock".to_string()),
                 ..Default::default()
             },
+            final_response: String::new(),
         })
     }));
     let harness = harness_with_type(

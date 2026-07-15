@@ -291,6 +291,7 @@ pub fn review_runner(verdicts: Vec<(bool, Vec<lionclaw::model::Gap>)>) -> MockRo
                     head_sha: HEAD_SHA.to_string(),
                 }),
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         }
     }))

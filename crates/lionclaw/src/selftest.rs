@@ -62,6 +62,7 @@ impl RoleRunner for NoopRoleRunner {
             },
             artifact: None,
             runtime_configuration: Default::default(),
+            final_response: "self-test noop worker".to_string(),
         })
     }
 }
@@ -94,6 +95,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: "self-test scripted review".to_string(),
             })
         } else {
             Ok(RoleRunOutcome {
@@ -107,6 +109,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                     head_sha: request.base_sha,
                 }),
                 runtime_configuration: Default::default(),
+                final_response: "self-test worker".to_string(),
             })
         }
     }
@@ -496,6 +499,7 @@ impl RoleRunner for ScriptedRoleRunner {
         self.run_inner(request).await.map_err(|e| RoleRunFailure {
             kind: RunErrorKind::Launch,
             detail: format!("{e:#}"),
+            final_response: String::new(),
         })
     }
 }
@@ -541,6 +545,7 @@ impl ScriptedRoleRunner {
                 head_sha: head,
             }),
             runtime_configuration: Default::default(),
+            final_response: "self-test scripted fix".to_string(),
         })
     }
 }

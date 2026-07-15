@@ -46,6 +46,7 @@ impl RoleRunner for BlockingRunner {
                 applied_model: Some("blocking-test".to_string()),
                 ..Default::default()
             },
+            final_response: String::new(),
         })
     }
 }
@@ -78,7 +79,7 @@ impl EffectCleaner for FailOnceCleaner {
         self.calls.lock().unwrap().push(request);
         if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(EffectCleanupFailure {
-                resource: EffectResource::AttemptDirectory,
+                resource: EffectResource::EffectDirectory,
                 detail: "injected attempt-directory cleanup failure".to_string(),
             });
         }
@@ -176,7 +177,7 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         vec!["mission advance", "mission log"]
     );
     let failure = blocked.state.cleanup_failure.as_ref().unwrap();
-    assert_eq!(failure.resource, EffectResource::AttemptDirectory);
+    assert_eq!(failure.resource, EffectResource::EffectDirectory);
     assert_eq!(
         failure.failure.detail,
         "injected attempt-directory cleanup failure"

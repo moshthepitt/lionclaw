@@ -44,6 +44,7 @@ fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
             head_sha: head_sha.to_string(),
         }),
         runtime_configuration: Default::default(),
+        final_response: String::new(),
     }
 }
 
@@ -347,6 +348,7 @@ async fn a_failed_review_parks_then_retry_re_rolls() {
                 Err(RoleRunFailure {
                     kind: lionclaw::model::RunErrorKind::Timeout,
                     detail: "agent timed out".to_string(),
+                    final_response: String::new(),
                 })
             } else {
                 Ok(review_verdict(request, true, vec![]))
@@ -396,6 +398,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))
@@ -578,6 +581,7 @@ async fn a_stale_waiver_reopens_the_review_after_new_work() {
                 Err(RoleRunFailure {
                     kind: lionclaw::model::RunErrorKind::Timeout,
                     detail: "agent timed out".to_string(),
+                    final_response: String::new(),
                 })
             } else {
                 Ok(review_verdict(request, true, vec![]))
@@ -692,6 +696,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))
@@ -721,6 +726,7 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))

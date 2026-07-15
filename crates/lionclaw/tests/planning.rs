@@ -224,6 +224,7 @@ fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
         handoff,
         artifact,
         runtime_configuration: Default::default(),
+        final_response: String::new(),
     }
 }
 
@@ -641,6 +642,7 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
                 return Err(RoleRunFailure {
                     kind: RunErrorKind::Timeout,
                     detail: "temporary provider timeout".to_string(),
+                    final_response: String::new(),
                 });
             }
         }
@@ -794,6 +796,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
             return Err(lionclaw::ports::RoleRunFailure {
                 kind: lionclaw::model::RunErrorKind::Timeout,
                 detail: "crashed mid-planning".to_string(),
+                final_response: String::new(),
             });
         }
         Ok(RoleRunOutcome {
@@ -804,6 +807,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
             },
             artifact: None,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let engine = Engine::new(
@@ -878,6 +882,7 @@ async fn park_after_author(
             handoff,
             artifact: None,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let engine = Engine::new(

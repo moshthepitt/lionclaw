@@ -51,6 +51,7 @@ fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
             applied_model: Some("mock".to_string()),
             ..Default::default()
         },
+        final_response: String::new(),
     }
 }
 
@@ -295,6 +296,7 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
                 applied_model: Some("mock".to_string()),
                 ..Default::default()
             },
+            final_response: String::new(),
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -482,6 +484,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
             handoff,
             artifact: None,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -559,6 +562,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
             handoff,
             artifact: None,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -647,6 +651,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
                     head_sha: HEAD_SHA.to_string(),
                 }),
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         }
     }));
@@ -701,6 +706,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
                     head_sha: HEAD_SHA.to_string(),
                 }),
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             })
         }
     }));

@@ -89,6 +89,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
             configuration: Default::default(),
+            final_response: String::new(),
         })
     }
 

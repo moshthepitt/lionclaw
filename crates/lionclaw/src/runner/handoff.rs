@@ -43,16 +43,19 @@ pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, Role
     let meta = std::fs::symlink_metadata(&path).map_err(|err| RoleRunFailure {
         kind: RunErrorKind::HandoffMissing,
         detail: format!("no handoff at '{}': {err}", path.display()),
+        final_response: String::new(),
     })?;
     if !meta.file_type().is_file() {
         return Err(RoleRunFailure {
             kind: RunErrorKind::HandoffInvalid,
             detail: format!("handoff at '{}' is not a regular file", path.display()),
+            final_response: String::new(),
         });
     }
     let file = std::fs::File::open(&path).map_err(|err| RoleRunFailure {
         kind: RunErrorKind::HandoffMissing,
         detail: format!("no handoff at '{}': {err}", path.display()),
+        final_response: String::new(),
     })?;
     // Read one byte past the cap so an over-limit file is detected.
     let mut raw = String::new();
@@ -61,11 +64,13 @@ pub fn read_handoff(dir: &Path, output: OutputSemantics) -> Result<Handoff, Role
         .map_err(|err| RoleRunFailure {
             kind: RunErrorKind::HandoffInvalid,
             detail: format!("handoff at '{}' is not valid UTF-8: {err}", path.display()),
+            final_response: String::new(),
         })?;
     if raw.len() as u64 > MAX_HANDOFF_BYTES {
         return Err(RoleRunFailure {
             kind: RunErrorKind::HandoffInvalid,
             detail: format!("handoff exceeds {MAX_HANDOFF_BYTES} bytes"),
+            final_response: String::new(),
         });
     }
     parse_handoff(&raw, output)
@@ -75,6 +80,7 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, RoleRunF
     let invalid = |detail: String| RoleRunFailure {
         kind: RunErrorKind::HandoffInvalid,
         detail,
+        final_response: String::new(),
     };
     let mut value: serde_json::Value =
         serde_json::from_str(raw).map_err(|err| invalid(format!("handoff is not JSON: {err}")))?;

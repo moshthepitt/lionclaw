@@ -90,6 +90,7 @@ async fn advisory_only_mission_type_never_verifies() {
             handoff,
             artifact,
             runtime_configuration: Default::default(),
+            final_response: String::new(),
         })
     }));
     // The reviewed bar requires the closing review (create_mission refuses

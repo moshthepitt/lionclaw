@@ -24,6 +24,13 @@ pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
     resolve_commit(repo, sha).await.is_ok()
 }
 
+pub async fn is_dirty(repo: &Path) -> Result<bool> {
+    Ok(!git(repo, &["status", "--porcelain"])
+        .await?
+        .trim()
+        .is_empty())
+}
+
 /// Keep mission state out of the user's `git status` without touching tracked
 /// files. Resolves the exclude file via git rather than assuming
 /// `.git/info/exclude`: in a linked worktree `.git` is a file and the exclude

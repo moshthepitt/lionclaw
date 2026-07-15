@@ -39,6 +39,8 @@ pub struct RoleRunRequest {
     pub prompt: String,
     /// Commit the role's workspace is created at.
     pub base_sha: String,
+    pub assignment_epoch: u32,
+    pub recreate_workspace: bool,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
@@ -54,6 +56,7 @@ pub struct RoleRunOutcome {
     /// this is `None` for them.
     pub artifact: Option<ArtifactOutcome>,
     pub runtime_configuration: RuntimeConfigurationEvidence,
+    pub final_response: String,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -61,6 +64,7 @@ pub struct RoleRunOutcome {
 pub struct RoleRunFailure {
     pub kind: RunErrorKind,
     pub detail: String,
+    pub final_response: String,
 }
 
 /// An engine-run, worker-independent, reproducible check. Exit 0 = pass.

@@ -91,6 +91,12 @@ pub struct TaskRuntimeState {
     pub feedback: Vec<FailureFeedback>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_runtime_configuration: Option<RuntimeConfigurationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_base_sha: Option<String>,
+    #[serde(default)]
+    pub assignment_epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<PayloadRef>,
 }
 
 impl TaskRuntimeState {
@@ -416,6 +422,8 @@ pub enum InflightEffect {
         runtime: String,
         prompt: PayloadRef,
         base_sha: String,
+        assignment_epoch: u32,
+        recreate_workspace: bool,
         requested_seq: u64,
     },
     OracleRun {
@@ -454,6 +462,8 @@ impl InflightEffect {
                 runtime,
                 prompt,
                 base_sha,
+                assignment_epoch,
+                recreate_workspace,
             } => Some((
                 effect_id.clone(),
                 Self::RoleRun {
@@ -463,6 +473,8 @@ impl InflightEffect {
                     runtime: runtime.clone(),
                     prompt: prompt.clone(),
                     base_sha: base_sha.clone(),
+                    assignment_epoch: *assignment_epoch,
+                    recreate_workspace: *recreate_workspace,
                     requested_seq,
                 },
             )),
@@ -593,6 +605,12 @@ pub struct MissionState {
 }
 
 impl MissionState {
+    /// The authoritative serial artifact head. Later slices may change how
+    /// this value is produced; proof and closure consumers use this boundary.
+    pub fn deliverable_head(&self) -> &str {
+        &self.current_sha
+    }
+
     /// Runtime state for the task era currently allowed to dispatch roles.
     pub(crate) fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
         if self.planning_base_revision.is_some() {

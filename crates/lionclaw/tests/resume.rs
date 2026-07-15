@@ -98,6 +98,8 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
                 runtime: "codex".to_string(),
                 prompt: lionclaw::model::PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.to_string(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
             })],
             1,
         )
@@ -172,6 +174,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     runtime: "codex".to_string(),
                     prompt: PayloadRef::inline("prompt"),
                     base_sha: BASE_SHA.to_string(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
                 }),
                 NewEvent::new(MissionEvent::RoleRunCompleted {
                     task_id,
@@ -186,6 +190,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                         base_sha: BASE_SHA.to_string(),
                         head_sha: HEAD_SHA.to_string(),
                     }),
+                    final_response: PayloadRef::inline("done"),
                 }),
                 NewEvent::new(MissionEvent::OracleRunRequested {
                     assertion_ids: vec![lionclaw::model::AssertionId::new("TESTS-PASS").unwrap()],
@@ -256,6 +261,8 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
                 runtime: "codex".to_string(),
                 prompt: lionclaw::model::PayloadRef::inline("p"),
                 base_sha: BASE_SHA.to_string(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
             })],
             1,
         )

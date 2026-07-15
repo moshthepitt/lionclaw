@@ -22,6 +22,7 @@ fn completed_work(base_sha: &str) -> RoleRunOutcome {
             head_sha: HEAD_SHA.to_string(),
         }),
         runtime_configuration: Default::default(),
+        final_response: String::new(),
     }
 }
 
@@ -45,6 +46,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
+                final_response: String::new(),
             });
         }
         Ok(completed_work(&request.base_sha))
@@ -84,6 +86,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
             return Err(RoleRunFailure {
                 kind: RunErrorKind::Timeout,
                 detail: "provider temporarily unavailable".into(),
+                final_response: String::new(),
             });
         }
         assert!(request.prompt.contains("provider temporarily unavailable"));
@@ -111,6 +114,7 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
         Err(RoleRunFailure {
             kind: RunErrorKind::Launch,
             detail: "runtime profile is invalid".into(),
+            final_response: String::new(),
         })
     }));
     let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;

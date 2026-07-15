@@ -877,15 +877,15 @@ async fn cmd_apply(args: ApplyArgs) -> Result<()> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let state = store.require_state(&mission_id).await?;
-    let branch = apply_target(&mission_id, &state.base_sha, &state.current_sha)?;
-    workspace::create_branch(&repo, &branch, &state.current_sha, args.force)
+    let branch = apply_target(&mission_id, &state.base_sha, state.deliverable_head())?;
+    workspace::create_branch(&repo, &branch, state.deliverable_head(), args.force)
         .await
         .with_context(|| {
             format!("could not create branch '{branch}' (already exists? use --force)")
         })?;
     println!(
         "applied mission {mission_id} → branch {branch} ({})",
-        short_hex(&state.current_sha)
+        short_hex(state.deliverable_head())
     );
     Ok(())
 }
@@ -924,7 +924,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "exit_code": v.exit_code(),
                 "exit_signal": v.exit_signal(),
                 "judged_sha": v.judged_sha(),
-                "fresh": v.is_fresh_at(&state.current_sha),
+                "fresh": v.is_fresh_at(state.deliverable_head()),
                 "prepared_inputs": v.prepared_inputs(),
                 "evidence": crate::evidence::evidence_json(store.blobs(), &evidence)?,
             }))
@@ -965,7 +965,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             // verdict describes a superseded tree, so only a FRESH one is
             // serialized (the summary's verdict/fresh fields say why).
             let (gaps, report) = match &state.terminal_review.outcome {
-                Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(&state.current_sha) => (
+                Some(ReviewOutcome::Verdict(v)) if v.is_fresh_at(state.deliverable_head()) => (
                     serde_json::to_value(&v.gaps)?,
                     serde_json::Value::String(store.blobs().resolve(&v.report)?),
                 ),
@@ -979,7 +979,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                     serde_json::json!({
                         "kind": a.kind.slug(),
                         "judged_sha": a.judged_sha,
-                        "fresh": a.is_fresh_at(&state.current_sha),
+                        "fresh": a.is_fresh_at(state.deliverable_head()),
                         "justification": a.justification,
                     })
                 })
@@ -1000,11 +1000,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "finish": finish.map(|f| f.slug()),
                 "disposition": view.disposition.slug(),
                 "next_actions": view.next_actions(),
-                "tasks": state.tasks.iter().map(|(id, task)| serde_json::json!({
-                    "id": id.as_str(),
-                    "status": format!("{:?}", task.status).to_ascii_lowercase(),
-                    "runtime_configuration": task.last_runtime_configuration,
-                })).collect::<Vec<_>>(),
+                "tasks": state.tasks.iter().map(|(id, task)| {
+                    task_runtime_json(store.blobs(), id, task)
+                }).collect::<Result<Vec<_>>>()?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -1037,7 +1035,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     println!(
         "  commit:  {} → {}",
         short_hex(&state.base_sha),
-        short_hex(&state.current_sha)
+        short_hex(state.deliverable_head())
     );
     match finish {
         Some(FinishClass::Verified) => {
@@ -1072,6 +1070,12 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 configuration.applied_mode,
             );
         }
+        if let Some(response) = &task.final_response {
+            println!("  task {task_id} final response:");
+            for line in store.blobs().resolve(response)?.lines() {
+                println!("    {line}");
+            }
+        }
     }
     if let Some(failure) = &state.cleanup_failure {
         println!(
@@ -1087,7 +1091,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 a.kind.slug(),
                 short_hex(&a.judged_sha),
                 a.justification,
-                if a.is_fresh_at(&state.current_sha) {
+                if a.is_fresh_at(state.deliverable_head()) {
                     ""
                 } else {
                     " [STALE — superseded by later work]"
@@ -1095,7 +1099,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             );
         }
         if let Some(crate::model::ReviewOutcome::Verdict(v)) = &state.terminal_review.outcome {
-            if v.is_fresh_at(&state.current_sha) {
+            if v.is_fresh_at(state.deliverable_head()) {
                 for gap in &v.gaps {
                     println!(
                         "    [{}] {}{}",
@@ -1213,7 +1217,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         println!("\n  next: {}", view.next_actions().join(" | "));
     }
     if args.patch && state.current_sha != state.base_sha {
-        let diff = workspace::diff(&repo, &state.base_sha, &state.current_sha).await?;
+        let diff = workspace::diff(&repo, &state.base_sha, state.deliverable_head()).await?;
         println!(
             "\n--- diff {}..{} ---\n{diff}",
             state.base_sha, state.current_sha
@@ -1751,6 +1755,14 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
                 for item in state.open_attention.values() {
                     print_attention(blobs, item, "  ")?;
                 }
+                for (task_id, task) in &state.tasks {
+                    if let Some(response) = &task.final_response {
+                        println!("  task {task_id} final response:");
+                        for line in blobs.resolve(response)?.lines() {
+                            println!("    {line}");
+                        }
+                    }
+                }
             }
             MissionDisposition::Running => {
                 println!("mission {mission_id}: running under another driver")
@@ -1789,11 +1801,9 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
-        "tasks": state.tasks.iter().map(|(id, task)| serde_json::json!({
-            "id": id.as_str(),
-            "status": format!("{:?}", task.status).to_ascii_lowercase(),
-            "runtime_configuration": task.last_runtime_configuration,
-        })).collect::<Vec<_>>(),
+        "tasks": state.tasks.iter().map(|(id, task)| {
+            task_runtime_json(blobs, id, task)
+        }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
             serde_json::json!({
@@ -1810,6 +1820,23 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         }).collect::<Result<Vec<_>>>()?,
         "cleanup_failure": cleanup_failure_json(state),
         "terminal_review": review_summary(state),
+    }))
+}
+
+fn task_runtime_json(
+    blobs: &BlobStore,
+    id: &crate::model::TaskId,
+    task: &crate::model::TaskRuntimeState,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "id": id.as_str(),
+        "status": format!("{:?}", task.status).to_ascii_lowercase(),
+        "workspace_base_sha": task.workspace_base_sha,
+        "assignment_epoch": task.assignment_epoch,
+        "runtime_configuration": task.last_runtime_configuration,
+        "final_response": task.final_response.as_ref()
+            .map(|response| blobs.resolve(response))
+            .transpose()?,
     }))
 }
 
@@ -1973,11 +2000,11 @@ fn review_summary(state: &crate::model::MissionState) -> serde_json::Value {
             AttentionKind::OracleFailed | AttentionKind::OracleVerdictFailed
         )
     });
-    let waived = tr.waived_at(&state.current_sha);
+    let waived = tr.waived_at(state.deliverable_head());
     let (verdict, judged_sha, fresh, counts, acknowledged) = match &tr.outcome {
         Some(ReviewOutcome::Verdict(v)) => {
             let count = |s: GapSeverity| v.gaps.iter().filter(|g| g.severity == s).count();
-            let is_fresh = v.is_fresh_at(&state.current_sha);
+            let is_fresh = v.is_fresh_at(state.deliverable_head());
             let kind = if !is_fresh && done {
                 "skipped"
             } else if v.blocking() {
@@ -2427,6 +2454,7 @@ mod tests {
                     base_sha: "base".into(),
                     head_sha: "h1".into(),
                 }),
+                final_response: PayloadRef::inline("done"),
             },
         ];
         events.extend(tail);
