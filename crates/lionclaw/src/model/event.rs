@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
-/// Bumped for unified typed effect outcomes and removal of legacy failed
-/// event variants and envelope-level runtime configuration evidence.
-pub const SCHEMA_VERSION: u32 = 7;
+/// Bumped for immutable absolute effect deadlines and durable exact-generation
+/// controls.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +85,8 @@ pub struct MissionConfig {
     pub planning: PlanningDag,
     #[serde(default)]
     pub recovery: RecoveryConfig,
+    #[serde(default)]
+    pub execution: ExecutionPolicy,
     /// The mission type's closing review (a fresh-context judge of the final
     /// tree against the objective). `None` ⇒ feature off: every derivation
     /// short-circuits, so pre-feature event logs re-derive identically.
@@ -99,8 +101,45 @@ impl Default for MissionConfig {
             stop: StopBar::Verified,
             planning: PlanningDag::default(),
             recovery: RecoveryConfig::default(),
+            execution: ExecutionPolicy::default(),
             terminal_review: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub default_timeout_secs: u64,
+    pub max_task_time_secs: u64,
+    pub extension_step_secs: u64,
+    #[serde(default)]
+    pub auto_continue_candidate: bool,
+    #[serde(default)]
+    pub auto_continue_proof: bool,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 30 * 60,
+            max_task_time_secs: 30 * 60,
+            extension_step_secs: 5 * 60,
+            auto_continue_candidate: false,
+            auto_continue_proof: false,
+        }
+    }
+}
+
+impl ExecutionPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.default_timeout_secs == 0 || self.extension_step_secs == 0 {
+            return Err("execution durations must be greater than zero".into());
+        }
+        if self.max_task_time_secs < self.default_timeout_secs {
+            return Err("max-task-time-secs must be at least default-timeout-secs".into());
+        }
+        Ok(())
     }
 }
 
@@ -338,6 +377,9 @@ pub enum MissionEvent {
         assignment_epoch: u32,
         /// True only when a fresh assignment moved the required base.
         recreate_workspace: bool,
+        requested_at_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
     },
     RoleRunCompleted {
         task_id: TaskId,
@@ -351,6 +393,8 @@ pub enum MissionEvent {
         judged_sha: String,
         attempt_no: u32,
         effect_id: super::EffectId,
+        requested_at_ms: i64,
+        deadline_ms: i64,
     },
     OracleRunCompleted {
         assertion_ids: Vec<AssertionId>,
@@ -379,6 +423,9 @@ pub enum MissionEvent {
         /// its handoff. Rides the event so the runner's forgery check
         /// survives crash/resume (the inflight effect rebuilds from here).
         nonce: String,
+        requested_at_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
     },
     /// The reviewer's verdict — advisory by construction: the fold stores it
     /// in `terminal_review`, never in any assertion's `last_authoritative`,
@@ -390,6 +437,12 @@ pub enum MissionEvent {
         /// The reviewer's own summary bit. A blocking gap dominates it
         /// (fail-closed) — see `TerminalReviewVerdict::blocking`.
         outcome: Result<TerminalReviewSuccess, TypedFailure>,
+    },
+    /// A durable control for one exact effect generation.
+    ControlRequested {
+        effect_id: super::EffectId,
+        action: ControlAction,
+        reason: String,
     },
     /// Cleanup failed without settling the original request. The next driver
     /// retries the same exact resource operation before any new dispatch.
@@ -409,6 +462,22 @@ pub enum MissionEvent {
         attention_id: String,
         action: DecisionAction,
         justification: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ControlAction {
+    Stop,
+    ExtendDeadline {
+        old_deadline_ms: i64,
+        new_deadline_ms: i64,
+        #[serde(default)]
+        automatic: bool,
+    },
+    Continue {
+        #[serde(default)]
+        automatic: bool,
     },
 }
 
@@ -462,6 +531,7 @@ impl MissionEvent {
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
+            Self::ControlRequested { .. } => "control_requested",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
@@ -486,6 +556,7 @@ impl MissionEvent {
             // effect-style event must decide its class here.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
+            | Self::ControlRequested { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
             | Self::EffectCleanupFailed { .. } => None,

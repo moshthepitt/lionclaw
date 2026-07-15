@@ -117,6 +117,11 @@ async fn advisory_only_mission_type_never_verifies() {
                 stop: StopBar::Reviewed,
                 planning: Default::default(),
                 recovery: Default::default(),
+                execution: lionclaw::model::ExecutionPolicy {
+                    auto_continue_candidate: true,
+                    auto_continue_proof: true,
+                    ..Default::default()
+                },
                 terminal_review,
             },
         )

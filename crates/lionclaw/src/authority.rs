@@ -14,7 +14,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use lionclaw_confinement::{
     parse_runtime_tmpfs_entry, ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset,
@@ -209,7 +208,6 @@ pub struct RolePlanRequest<'a> {
     /// Canonical roots of the tree(s) any verdict from this node is about.
     pub judged_roots: &'a [PathBuf],
     pub environment: Vec<(String, String)>,
-    pub hard_timeout: Duration,
 }
 
 /// A moat-vetted execution plan. Private field, no other constructor: the
@@ -343,7 +341,6 @@ pub fn compile_role_plan(request: RolePlanRequest<'_>) -> Result<CompiledRolePla
         working_dir: Some(working_dir),
         environment: request.environment,
         mcp_servers: Vec::new(),
-        hard_timeout: request.hard_timeout,
         mounts,
         mount_runtime_secrets: authority.preset.mount_runtime_secrets,
         escape_classes: authority.preset.escape_classes.clone(),
@@ -377,6 +374,7 @@ mod tests {
             name: RoleName::new("probe").expect("role name"),
             output,
             runtime: None,
+            timeout_secs: None,
             network: true,
             secrets,
             skills: Vec::new(),
@@ -407,7 +405,6 @@ mod tests {
             mounts: m,
             judged_roots: judged,
             environment: Vec::new(),
-            hard_timeout: Duration::from_secs(120),
         }
     }
 

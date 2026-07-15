@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RolePlanRequest};
 use crate::config::MissionRuntimeProfile;
-use crate::ports::{OracleOutcome, OracleRunRequest, OracleRunner};
+use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
 use crate::runner::{
     prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
 };
@@ -94,6 +94,7 @@ impl OracleRunner for OciOracleRunner {
                     &checkout,
                     &request.prepared_inputs,
                     &request.effect_id,
+                    request.deadline_ms,
                 )
                 .await
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
@@ -126,7 +127,6 @@ impl OracleRunner for OciOracleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
-                hard_timeout: self.profile.oracle_timeout,
             })
             .map_err(|e| fail(format!("oracle plan refused to compile (moat): {e}")))?;
 
@@ -146,21 +146,46 @@ impl OracleRunner for OciOracleRunner {
             // it here is a runner concern that never threatens fold purity.
             #[expect(clippy::disallowed_methods)]
             let started = Instant::now();
-            let run = tokio::time::timeout(
-                self.profile.oracle_timeout,
-                executor.execute_captured(program),
-            )
-            .await;
+            let mut run = Box::pin(executor.execute_captured(program));
+            let mut control = request.control.clone();
+            let run = loop {
+                let current_control = control.borrow().clone();
+                let deadline_ms = match current_control {
+                    ExecutionControl::RunUntil(deadline_ms) => deadline_ms,
+                    ExecutionControl::Stop(reason) => {
+                        let mut evidence = TypedFailureEvidence::new(
+                            Some("oracle.stopped".into()),
+                            "oracle stopped by operator",
+                        );
+                        evidence.stop_reason = Some(reason);
+                        break Err(TypedFailure::OperatorStopped {
+                            evidence: Box::new(evidence),
+                        });
+                    }
+                };
+                tokio::select! {
+                    completed = &mut run => break completed.map_err(|error| {
+                        fail(format!("oracle failed to run: {error}"))
+                    }),
+                    changed = control.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                    }
+                    () = tokio::time::sleep(crate::ports::remaining_until(deadline_ms)) => {
+                        break Err(TypedFailure::DeadlineExhausted {
+                            evidence: Box::new(TypedFailureEvidence::new(
+                                Some("oracle.deadline".to_string()),
+                                "oracle exceeded its recorded effect deadline",
+                            )),
+                        });
+                    }
+                }
+            };
             let duration_ms = started.elapsed().as_millis() as u64;
             match run {
-                Err(_) => Err(TypedFailure::DeadlineExhausted {
-                    evidence: Box::new(TypedFailureEvidence::new(
-                        Some("oracle.deadline".to_string()),
-                        format!("oracle exceeded {:?}", self.profile.oracle_timeout),
-                    )),
-                }),
-                Ok(Err(err)) => Err(fail(format!("oracle failed to run: {err}"))),
-                Ok(Ok(output)) => Ok(OracleOutcome {
+                Err(failure) => Err(failure),
+                Ok(output) => Ok(OracleOutcome {
                     exit_code: output.exit_code.unwrap_or(-1),
                     exit_signal: output.exit_signal,
                     stdout: output.stdout,

@@ -6,9 +6,9 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
+use common::{default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{DecisionAction, FinishClass, MissionConfig, MissionEvent, MissionPhase};
+use lionclaw::model::{DecisionAction, FinishClass, MissionEvent, MissionPhase};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -37,7 +37,7 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
             dir.path().to_str().unwrap(),
             "gated mission",
             BASE_SHA,
-            MissionConfig::default(),
+            default_config(),
         )
         .await
         .expect("create");
@@ -110,7 +110,7 @@ async fn abort_decision_terminates_the_mission() {
             dir.path().to_str().unwrap(),
             "gated",
             BASE_SHA,
-            MissionConfig::default(),
+            default_config(),
         )
         .await
         .expect("create");

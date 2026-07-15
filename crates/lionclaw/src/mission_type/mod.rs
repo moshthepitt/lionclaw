@@ -48,6 +48,7 @@ pub struct RoleDefinition {
     pub output: OutputSemantics,
     /// Runtime profile name; `None` uses the mission default.
     pub runtime: Option<String>,
+    pub timeout_secs: Option<u64>,
     pub network: bool,
     pub secrets: bool,
     /// Mission-owned skills projected for this role. Empty is valid.
@@ -90,6 +91,7 @@ pub struct MissionType {
     pub planning: PlanningDag,
     /// Mission-level role recovery budget.
     pub recovery: crate::model::RecoveryConfig,
+    pub execution: crate::model::ExecutionPolicy,
     /// The closing review (the pure-core config type, threaded verbatim into
     /// `MissionConfig` at mission start). Required when `stop = "reviewed"`.
     pub terminal_review: Option<TerminalReviewConfig>,

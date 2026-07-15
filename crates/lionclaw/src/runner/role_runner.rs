@@ -24,7 +24,7 @@ use crate::authority::{
 };
 use crate::config::{MissionRuntimeProfile, RuntimeAuthConfig, RuntimeProfiles};
 use crate::model::{ArtifactOutcome, OutputSemantics};
-use crate::ports::{RoleRunOutcome, RoleRunRequest, RoleRunner};
+use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
@@ -224,7 +224,6 @@ impl RoleRunner for OciRoleRunner {
                 },
                 judged_roots: &judged_roots,
                 environment,
-                hard_timeout: profile.hard_timeout,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
 
@@ -350,7 +349,7 @@ impl OciRoleRunner {
             (last_error, final_response.trim_end().to_string())
         });
 
-        let turn = adapter.program_backed_turn(
+        let mut turn = Box::pin(adapter.program_backed_turn(
             RuntimeProgramTurnExecution {
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
@@ -365,26 +364,63 @@ impl OciRoleRunner {
                 )),
             },
             journal_tx,
-        );
-
-        let result = tokio::time::timeout(profile.hard_timeout, turn).await;
+        ));
+        let mut control = request.control.clone();
+        let result = loop {
+            let current_control = control.borrow().clone();
+            let deadline_ms = match current_control {
+                ExecutionControl::RunUntil(deadline_ms) => deadline_ms,
+                ExecutionControl::Stop(reason) => {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        adapter.cancel(&handle, Some(reason.clone())),
+                    )
+                    .await;
+                    let mut evidence = turn_failure_evidence(
+                        profile,
+                        "agent turn stopped by operator".into(),
+                        String::new(),
+                        String::new(),
+                    );
+                    evidence.stop_reason = Some(reason);
+                    break Err(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    });
+                }
+            };
+            tokio::select! {
+                completed = &mut turn => break completed.map_err(|err| {
+                    err.downcast_ref::<TypedFailure>()
+                        .cloned()
+                        .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
+                }),
+                changed = control.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                }
+                () = tokio::time::sleep(crate::ports::remaining_until(deadline_ms)) => {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        adapter.cancel(&handle, Some("effect deadline exhausted".into())),
+                    ).await;
+                    break Err(TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(turn_failure_evidence(
+                            profile,
+                            "agent turn exceeded its recorded effect deadline".into(),
+                            String::new(),
+                            String::new(),
+                        )),
+                    });
+                }
+            }
+        };
+        drop(turn);
         let _ = adapter.close(&handle).await;
         let (last_error, final_response) = drain.await.unwrap_or_default();
 
         match result {
-            Err(_) => Err(TypedFailure::DeadlineExhausted {
-                evidence: Box::new(turn_failure_evidence(
-                    profile,
-                    format!("agent turn exceeded {:?}", profile.hard_timeout),
-                    last_error.unwrap_or_default(),
-                    final_response,
-                )),
-            }),
-            Ok(Err(err)) => {
-                let mut failure = err
-                    .downcast_ref::<TypedFailure>()
-                    .cloned()
-                    .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()));
+            Err(mut failure) => {
                 let evidence = failure.evidence_mut();
                 evidence.stderr =
                     lionclaw_runtime_api::bounded_text(last_error.as_deref().unwrap_or_default());
@@ -393,7 +429,7 @@ impl OciRoleRunner {
                 evidence.configuration.requested_mode = profile.mode.clone();
                 Err(failure.projected())
             }
-            Ok(Ok(result)) => {
+            Ok(result) => {
                 let configuration = result.configuration;
                 if configuration.requested_model != profile.model
                     || configuration.requested_mode != profile.mode

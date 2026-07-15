@@ -49,6 +49,7 @@ fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
         name: rn(name),
         output,
         runtime: None,
+        timeout_secs: None,
         network: false,
         secrets: false,
         skills: Vec::new(),
@@ -79,6 +80,7 @@ fn planning_mission_type() -> MissionType {
         image: "img".to_string(),
         planning: planning_dag(),
         recovery: Default::default(),
+        execution: Default::default(),
         terminal_review: None,
         playbook: Some("plan carefully".to_string()),
         roles,
@@ -256,6 +258,19 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
     planning_engine_with_runner(workspace, planning_runner()).await
 }
 
+async fn advance_through_checkpoints(
+    engine: &Engine,
+    id: &lionclaw::model::MissionId,
+) -> lionclaw::engine::MissionView {
+    for _ in 0..32 {
+        let view = engine.advance(id).await.unwrap();
+        if view.disposition != lionclaw::engine::MissionDisposition::Ready {
+            return view;
+        }
+    }
+    panic!("planning test exceeded checkpoint bound")
+}
+
 #[tokio::test]
 async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     let dir = tempfile::tempdir().unwrap();
@@ -269,6 +284,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -277,7 +293,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
 
     // Drive the planning DAG: strategist → red-team → author → park on the
     // proposal. No contract exists yet — the proposal is gradeless.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     assert!(state.plan.is_none(), "planning must not seed a plan");
@@ -290,7 +306,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
         .expect("parked on PlanProposal");
 
     // A malformed advance can't launder past approval: still no contract.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     assert!(engine.load_state(&id).await.unwrap().plan.is_none());
 
     // Approve: derive_promotion seeds the contract for the first time.
@@ -304,7 +320,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
     assert_eq!(state.revision, 1);
 
     // Execute: implementer commits, cargo-test passes at the new head → Verified.
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(
         state.phase,
@@ -332,12 +348,13 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
         .await
         .unwrap();
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     let approve = state
         .open_attention
@@ -375,7 +392,7 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         assert!(runtime.feedback.is_empty());
     }
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
     let second_strategist_prompt = events
         .iter()
@@ -416,6 +433,7 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -444,7 +462,7 @@ async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_gui
         .await
         .unwrap();
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let events = engine.store().load(&id).await.unwrap();
     let prompt_ref = events
         .iter()
@@ -482,6 +500,7 @@ async fn ratification_can_revise_a_to_b_to_c_and_then_approve() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -586,6 +605,7 @@ async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -659,6 +679,7 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: RecoveryConfig { max_attempts: 3 },
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -666,7 +687,7 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
         .unwrap();
 
     for cycle in 0..3 {
-        engine.advance(&id).await.unwrap();
+        advance_through_checkpoints(&engine, &id).await;
         engine
             .decide(
                 &id,
@@ -678,7 +699,7 @@ async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
             .unwrap();
     }
 
-    let view = engine.advance(&id).await.unwrap();
+    let view = advance_through_checkpoints(&engine, &id).await;
     assert_eq!(view.state.phase, MissionPhase::AttentionNeeded);
     assert!(view.state.proposal.is_some());
     assert_eq!(*strategist_calls.lock().unwrap(), 5);
@@ -702,6 +723,7 @@ async fn revise_guidance_preserves_whitespace_verbatim() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -742,6 +764,7 @@ async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -832,13 +855,14 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
         .await
         .unwrap();
 
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     let state = engine.load_state(&id).await.unwrap();
     assert_eq!(state.phase, MissionPhase::AttentionNeeded);
     let node_failed = state
@@ -907,12 +931,13 @@ async fn park_after_author(
                 stop: StopBar::Verified,
                 planning: planning_dag(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
         .await
         .unwrap();
-    engine.advance(&id).await.unwrap();
+    advance_through_checkpoints(&engine, &id).await;
     engine.load_state(&id).await.unwrap()
 }
 

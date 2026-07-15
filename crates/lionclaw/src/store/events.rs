@@ -305,6 +305,7 @@ mod sink_tests {
                 stop: StopBar::Verified,
                 planning: Default::default(),
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         })

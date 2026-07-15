@@ -984,7 +984,6 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
-    use std::time::Duration;
 
     use super::{
         build_oci_attached_process_invocation, build_oci_process_invocation,
@@ -1842,7 +1841,6 @@ esac
             working_dir: Some("/host/workspace/src".to_string()),
             environment: vec![("FOO".to_string(), "from-plan".to_string())],
             mcp_servers: Vec::new(),
-            hard_timeout: Duration::from_secs(90),
             mounts: vec![
                 MountSpec {
                     source: "/host/workspace".into(),

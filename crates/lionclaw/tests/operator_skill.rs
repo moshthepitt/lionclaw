@@ -25,10 +25,14 @@ fn delegated_ratification_uses_the_same_unbounded_revision_loop() {
 }
 
 #[test]
-fn the_skill_keeps_one_blocking_advance_status_loop() {
+fn the_skill_uses_wait_as_the_one_blocking_surface_and_documents_controls() {
     assert!(SKILL.contains(
-        "Repeat this advance/status loop until the mission is terminal or needs a\n   decision."
+        "Run `lionclaw mission advance --wait` as the lead's blocking orchestration\n   primitive."
+    ));
+    assert!(SKILL.contains(
+        "Plain `mission advance` starts or observes the detached driver\n   and returns after its startup handshake."
     ));
     assert!(SKILL
-        .contains("If the advance caller itself is\n   interrupted, run `mission advance` again"));
+        .contains("`mission extend`, `mission stop`, or, after it\n   parks, `mission continue`"));
+    assert!(SKILL.contains("Ctrl-C detaches an observer; it does not stop\n   the driver."));
 }

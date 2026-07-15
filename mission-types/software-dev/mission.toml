@@ -15,6 +15,13 @@ role = "gap-reviewer"
 [recovery]
 max-attempts = 3
 
+[execution]
+default-timeout-secs = 1800
+max-task-time-secs = 3600
+extension-step-secs = 600
+auto-continue-candidate = false
+auto-continue-proof = false
+
 [[inputs]]
 name = "cargo-home"
 network = true

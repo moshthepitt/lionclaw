@@ -73,9 +73,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
             dir.path().to_str().unwrap(),
             "advisory-only mission",
             BASE_SHA,
-            lionclaw::model::MissionConfig {
-                ..Default::default()
-            },
+            common::default_config(),
         )
         .await
         .expect("create");

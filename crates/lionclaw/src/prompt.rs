@@ -470,6 +470,7 @@ mod tests {
             name: RoleName::new(name).unwrap(),
             output,
             runtime: None,
+            timeout_secs: None,
             network: false,
             secrets: false,
             skills: Vec::new(),

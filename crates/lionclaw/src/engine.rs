@@ -24,8 +24,8 @@ use crate::model::{
     TerminalReviewDispatchIntent, TerminalReviewSuccess,
 };
 use crate::ports::{
-    Clock, EffectCleaner, EffectCleanupRequest, OracleRunRequest, OracleRunner, RoleRunRequest,
-    RoleRunner,
+    Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl, OracleRunRequest, OracleRunner,
+    RoleRunRequest, RoleRunner,
 };
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
@@ -351,11 +351,32 @@ impl Engine {
 
     /// Drive the mission until it parks, terminates, or awaits input.
     pub async fn advance(&self, mission_id: &MissionId) -> Result<MissionView> {
+        self.advance_with_handshake(mission_id, None).await
+    }
+
+    pub async fn advance_with_handshake(
+        &self,
+        mission_id: &MissionId,
+        handshake: Option<&std::path::Path>,
+    ) -> Result<MissionView> {
         let Some(_guard) = DriverGuard::try_acquire(&self.store.driver_lock_path(mission_id))?
         else {
             let state = self.store.require_state(mission_id).await?;
             return Ok(MissionView::from_state(state, true));
         };
+        let initial_state = self.store.require_state(mission_id).await?;
+        crate::activity::publish(
+            &self.store.mission_dir(mission_id),
+            &initial_state,
+            self.clock.now_ms(),
+        )?;
+        if let Some(path) = handshake {
+            let temporary = path.with_extension("tmp");
+            std::fs::write(&temporary, b"ready\n")
+                .with_context(|| format!("writing driver handshake '{}'", temporary.display()))?;
+            std::fs::rename(&temporary, path)
+                .with_context(|| format!("publishing driver handshake '{}'", path.display()))?;
+        }
         if !self.recover_interrupted(mission_id).await? {
             return Ok(MissionView::from_state(
                 self.load_state(mission_id).await?,
@@ -366,6 +387,11 @@ impl Engine {
         // Persist a fold snapshot before parking or exiting so the next
         // invocation resumes without re-folding the whole log.
         let state = self.load_state(mission_id).await?;
+        crate::activity::publish(
+            &self.store.mission_dir(mission_id),
+            &state,
+            self.clock.now_ms(),
+        )?;
         self.store
             .save_snapshot(&state, self.clock.now_ms())
             .await?;
@@ -431,19 +457,76 @@ impl Engine {
         let Some((effect_id, effect)) = state.inflight.iter().next() else {
             return Ok(false);
         };
-        let outcome = match effect {
-            InflightEffect::RoleRun { .. } => {
-                self.execute_role_run(state, effect_id, effect).await?
+        let (control_tx, control_rx) =
+            tokio::sync::watch::channel(ExecutionControl::RunUntil(effect.deadline_ms()));
+        let execution = async {
+            match effect {
+                InflightEffect::RoleRun { .. } => {
+                    self.execute_role_run(state, effect_id, effect, control_rx)
+                        .await
+                }
+                InflightEffect::OracleRun { .. } => {
+                    self.execute_oracle_run(state, effect_id, effect, control_rx)
+                        .await
+                }
+                InflightEffect::TerminalReview { .. } => {
+                    self.execute_terminal_review(state, effect_id, effect, control_rx)
+                        .await
+                }
             }
-            InflightEffect::OracleRun { .. } => {
-                self.execute_oracle_run(state, effect_id, effect).await?
-            }
-            InflightEffect::TerminalReview { .. } => {
-                self.execute_terminal_review(state, effect_id, effect)
-                    .await?
+        };
+        tokio::pin!(execution);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut execution => break outcome?,
+                () = tokio::time::sleep(Duration::from_millis(100)) => {
+                    let current = self.load_state(&state.mission_id).await?;
+                    crate::activity::publish(
+                        &self.store.mission_dir(&state.mission_id),
+                        &current,
+                        self.clock.now_ms(),
+                    )?;
+                    let Some(active) = current.inflight.get(effect_id) else {
+                        bail!("active effect '{effect_id}' disappeared without an outcome");
+                    };
+                    if let Some(reason) = current.stop_requests.get(effect_id) {
+                        control_tx.send_replace(ExecutionControl::Stop(reason.clone()));
+                        continue;
+                    }
+                    let mut deadline_ms = active.deadline_ms();
+                    if self.clock.now_ms().saturating_add(200) >= deadline_ms {
+                        if let Some(budget_deadline_ms) = active.budget_deadline_ms() {
+                            if deadline_ms < budget_deadline_ms {
+                                let step_ms = i64::try_from(
+                                    current.config.execution.extension_step_secs.saturating_mul(1_000),
+                                )
+                                .unwrap_or(i64::MAX);
+                                let new_deadline_ms = deadline_ms
+                                    .saturating_add(step_ms)
+                                    .min(budget_deadline_ms);
+                                self.append_fact(
+                                    &current.mission_id,
+                                    current.head,
+                                    NewEvent::new(MissionEvent::ControlRequested {
+                                        effect_id: effect_id.clone(),
+                                        action: crate::model::ControlAction::ExtendDeadline {
+                                            old_deadline_ms: deadline_ms,
+                                            new_deadline_ms,
+                                            automatic: true,
+                                        },
+                                        reason: "mission execution policy time budget".into(),
+                                    }),
+                                ).await?;
+                                deadline_ms = new_deadline_ms;
+                            }
+                        }
+                    }
+                    control_tx.send_replace(ExecutionControl::RunUntil(deadline_ms));
+                }
             }
         };
         let discard_artifact = !matches!(outcome.event, MissionEvent::RoleRunCompleted { .. });
+        let checkpoint = checkpoint_after(&outcome.event, &state.config.execution);
         if !self
             .cleanup_effect(state, effect_id, discard_artifact)
             .await?
@@ -452,6 +535,23 @@ impl Engine {
         }
         self.append_outcome(&state.mission_id, state.head, outcome)
             .await?;
+        let Some((automatic, reason)) = checkpoint else {
+            return Ok(true);
+        };
+        if !automatic {
+            return Ok(false);
+        }
+        let current = self.load_state(&state.mission_id).await?;
+        self.append_fact(
+            &current.mission_id,
+            current.head,
+            NewEvent::new(MissionEvent::ControlRequested {
+                effect_id: effect_id.clone(),
+                action: crate::model::ControlAction::Continue { automatic: true },
+                reason: reason.into(),
+            }),
+        )
+        .await?;
         Ok(true)
     }
 
@@ -563,6 +663,7 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         effect: &InflightEffect,
+        control: tokio::sync::watch::Receiver<ExecutionControl>,
     ) -> Result<NewEvent> {
         let InflightEffect::RoleRun {
             task_id,
@@ -615,6 +716,8 @@ impl Engine {
             base_sha: base_sha.to_string(),
             assignment_epoch: *assignment_epoch,
             recreate_workspace: *recreate_workspace,
+            deadline_ms: effect.deadline_ms(),
+            control,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -713,6 +816,7 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         effect: &InflightEffect,
+        control: tokio::sync::watch::Receiver<ExecutionControl>,
     ) -> Result<NewEvent> {
         let InflightEffect::OracleRun {
             assertion_ids,
@@ -750,6 +854,8 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
             prepared_inputs: self.mission_type.inputs.values().cloned().collect(),
+            deadline_ms: effect.deadline_ms(),
+            control,
         };
         match self.oracle_runner.run(request).await {
             Ok(outcome) => Ok(completed(Ok(OracleRunSuccess {
@@ -776,6 +882,7 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         effect: &InflightEffect,
+        control: tokio::sync::watch::Receiver<ExecutionControl>,
     ) -> Result<NewEvent> {
         let InflightEffect::TerminalReview {
             attempt_no,
@@ -828,6 +935,8 @@ impl Engine {
             base_sha: judged_sha.clone(),
             assignment_epoch: attempt_no,
             recreate_workspace: true,
+            deadline_ms: effect.deadline_ms(),
+            control,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -1058,6 +1167,15 @@ impl Engine {
             &assignment_epoch.to_string(),
             &prompt_hash,
         ]);
+        let requested_at_ms = self.clock.now_ms();
+        let initial_secs = role
+            .timeout_secs
+            .unwrap_or(state.config.execution.default_timeout_secs);
+        let deadline_ms = resolved_deadline(requested_at_ms, initial_secs)?;
+        let budget_deadline_ms = resolved_deadline(
+            requested_at_ms,
+            initial_secs.max(state.config.execution.max_task_time_secs),
+        )?;
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
             task_id: intent.task_id,
             attempt_no: intent.attempt_no,
@@ -1071,6 +1189,9 @@ impl Engine {
             base_sha,
             assignment_epoch,
             recreate_workspace,
+            requested_at_ms,
+            deadline_ms,
+            budget_deadline_ms,
         })
         .with_prompt_hash(prompt_hash);
         self.append_idempotent(&state.mission_id, state.head, &[event])
@@ -1136,6 +1257,10 @@ impl Engine {
             .store
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
+        let requested_at_ms = self.clock.now_ms();
+        let initial_secs = role
+            .timeout_secs
+            .unwrap_or(state.config.execution.default_timeout_secs);
         let event = NewEvent::new(MissionEvent::TerminalReviewRequested {
             attempt_no: intent.attempt_no,
             effect_id,
@@ -1147,6 +1272,12 @@ impl Engine {
             prompt,
             judged_sha: intent.judged_sha,
             nonce,
+            requested_at_ms,
+            deadline_ms: resolved_deadline(requested_at_ms, initial_secs)?,
+            budget_deadline_ms: resolved_deadline(
+                requested_at_ms,
+                initial_secs.max(state.config.execution.max_task_time_secs),
+            )?,
         })
         .with_prompt_hash(prompt_hash);
         self.append_idempotent(&state.mission_id, state.head, &[event])
@@ -1168,15 +1299,21 @@ impl Engine {
                     &intent.judged_sha,
                     &intent.attempt_no.to_string(),
                 ]);
-                NewEvent::new(MissionEvent::OracleRunRequested {
+                let requested_at_ms = self.clock.now_ms();
+                Ok(NewEvent::new(MissionEvent::OracleRunRequested {
                     assertion_ids: intent.assertion_ids,
                     oracle: intent.oracle,
                     judged_sha: intent.judged_sha,
                     attempt_no: intent.attempt_no,
                     effect_id,
-                })
+                    requested_at_ms,
+                    deadline_ms: resolved_deadline(
+                        requested_at_ms,
+                        state.config.execution.default_timeout_secs,
+                    )?,
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         self.append_idempotent(&state.mission_id, state.head, &events)
             .await
     }
@@ -1345,12 +1482,119 @@ pub async fn record_decision(
     Ok(())
 }
 
+/// Validate and append a control against the exact replayed effect generation.
+/// A concurrent outcome makes the optimistic append conflict, so stale races
+/// fail instead of leaking onto a successor.
+pub async fn record_control(
+    store: &MissionStore,
+    now_ms: i64,
+    mission_id: &MissionId,
+    effect_id: &EffectId,
+    action: crate::model::ControlAction,
+    reason: &str,
+) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("control reason must not be empty");
+    }
+    let state = store.require_state(mission_id).await?;
+    match &action {
+        crate::model::ControlAction::Stop => {
+            if !state.inflight.contains_key(effect_id) {
+                bail!("effect '{effect_id}' is not active; control is stale");
+            }
+        }
+        crate::model::ControlAction::ExtendDeadline {
+            old_deadline_ms,
+            new_deadline_ms,
+            ..
+        } => {
+            let Some(effect) = state.inflight.get(effect_id) else {
+                bail!("effect '{effect_id}' is not active; control is stale");
+            };
+            if effect.deadline_ms() != *old_deadline_ms {
+                bail!("effect '{effect_id}' deadline changed; control is stale");
+            }
+            if *new_deadline_ms < *old_deadline_ms || *new_deadline_ms <= now_ms {
+                bail!("extended deadline must be finite, nondecreasing, and in the future");
+            }
+        }
+        crate::model::ControlAction::Continue { automatic } => {
+            if *automatic {
+                bail!("automatic controls are engine-owned");
+            }
+            if !state.parked_effects.contains_key(effect_id) {
+                bail!("effect '{effect_id}' is not parked; control is stale");
+            }
+        }
+    }
+    store
+        .append(
+            mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::ControlRequested {
+                effect_id: effect_id.clone(),
+                action,
+                reason: reason.trim().to_string(),
+            })],
+            now_ms,
+        )
+        .await?;
+    Ok(())
+}
+
 fn transient_backoff_ms(consecutive_failures: u32, adapter_retry_after_ms: Option<u64>) -> u64 {
     const MAX_BACKOFF_MS: u64 = 30_000;
     let policy_ms = 1_000_u64 << consecutive_failures.min(4);
     policy_ms
         .max(adapter_retry_after_ms.unwrap_or_default())
         .min(MAX_BACKOFF_MS)
+}
+
+/// Checkpoint selection is pure: recorded state policy plus the just-produced
+/// outcome. The driver only performs the returned action.
+fn checkpoint_after(
+    event: &MissionEvent,
+    policy: &crate::model::ExecutionPolicy,
+) -> Option<(bool, &'static str)> {
+    match event {
+        MissionEvent::RoleRunCompleted {
+            outcome: Ok(success),
+            ..
+        } if success.artifact.is_some() => Some((
+            policy.auto_continue_candidate,
+            "mission policy auto-continued captured candidate",
+        )),
+        MissionEvent::RoleRunCompleted {
+            outcome:
+                Ok(crate::model::RoleRunSuccess {
+                    handoff: Handoff::Validate { .. },
+                    ..
+                }),
+            ..
+        } => Some((
+            policy.auto_continue_proof,
+            "mission policy auto-continued advisory proof completion",
+        )),
+        MissionEvent::RoleRunCompleted { outcome: Ok(_), .. } => {
+            Some((false, "agent response checkpoint"))
+        }
+        MissionEvent::OracleRunCompleted { outcome: Ok(_), .. }
+        | MissionEvent::TerminalReviewCompleted { outcome: Ok(_), .. } => Some((
+            policy.auto_continue_proof,
+            "mission policy auto-continued proof completion",
+        )),
+        _ => None,
+    }
+}
+
+fn resolved_deadline(requested_at_ms: i64, duration_secs: u64) -> Result<i64> {
+    let duration_ms = duration_secs
+        .checked_mul(1_000)
+        .context("execution duration overflows milliseconds")?;
+    let duration_ms = i64::try_from(duration_ms).context("execution duration is too large")?;
+    requested_at_ms
+        .checked_add(duration_ms)
+        .context("execution deadline overflows epoch milliseconds")
 }
 
 fn runtime_configuration_evidence(

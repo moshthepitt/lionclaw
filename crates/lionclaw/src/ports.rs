@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use lionclaw_runtime_api::TypedFailure;
+use tokio::sync::watch;
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
@@ -42,6 +43,8 @@ pub struct RoleRunRequest {
     pub base_sha: String,
     pub assignment_epoch: u32,
     pub recreate_workspace: bool,
+    pub deadline_ms: i64,
+    pub control: watch::Receiver<ExecutionControl>,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
@@ -78,6 +81,23 @@ pub struct OracleRunRequest {
     pub workspace_dir: PathBuf,
     pub state_dir: PathBuf,
     pub prepared_inputs: Vec<PreparedInput>,
+    pub deadline_ms: i64,
+    pub control: watch::Receiver<ExecutionControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionControl {
+    RunUntil(i64),
+    Stop(String),
+}
+
+pub fn remaining_until(deadline_ms: i64) -> std::time::Duration {
+    #[expect(clippy::disallowed_methods)]
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    std::time::Duration::from_millis(deadline_ms.saturating_sub(now_ms).max(0) as u64)
 }
 
 #[derive(Debug, Clone)]

@@ -432,6 +432,9 @@ async fn a_crashed_review_is_interrupted_without_rerunning_the_llm() {
         prompt: PayloadRef::inline("prompt"),
         judged_sha: BASE_SHA.to_string(),
         nonce: "n0".to_string(),
+        requested_at_ms: 0,
+        deadline_ms: 100_000,
+        budget_deadline_ms: 100_000,
     });
     h.engine
         .store()
@@ -506,6 +509,9 @@ async fn rebuild_cursors_does_not_relaunch_a_crashed_review() {
         prompt: PayloadRef::inline("p"),
         judged_sha: BASE_SHA.to_string(),
         nonce: "n0".to_string(),
+        requested_at_ms: 0,
+        deadline_ms: 100_000,
+        budget_deadline_ms: 100_000,
     });
     h.engine
         .store()

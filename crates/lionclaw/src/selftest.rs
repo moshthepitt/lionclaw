@@ -13,7 +13,6 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -570,7 +569,6 @@ async fn run_confined_sh(
         },
         judged_roots,
         environment: vec![("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
-        hard_timeout: Duration::from_secs(120),
     })
     .map_err(|e| anyhow::anyhow!("plan refused to compile: {e}"))?;
     let mut executor = MissionProgramExecutor::new(
@@ -1103,7 +1101,6 @@ async fn check_runtime_skill_mount() -> Result<()> {
             "HOME".to_string(),
             lionclaw_confinement::RUNTIME_HOME_MOUNT_TARGET.to_string(),
         )],
-        hard_timeout: Duration::from_secs(120),
     })
     .map_err(|err| anyhow::anyhow!("plan refused to compile: {err}"))?;
     let mut executor = MissionProgramExecutor::new(

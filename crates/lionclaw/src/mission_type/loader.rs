@@ -83,6 +83,10 @@ pub fn load_mission_type(
             "[recovery] max-attempts must be at least 1".to_string(),
         ));
     }
+    manifest
+        .execution
+        .validate()
+        .map_err(|error| MissionTypeError::Manifest(format!("[execution] {error}")))?;
 
     let skills = load_skills(root)?;
     let inputs = load_inputs(root, manifest.inputs)?;
@@ -140,6 +144,7 @@ pub fn load_mission_type(
         image: manifest.mission_type.image,
         planning: manifest.planning,
         recovery: manifest.recovery,
+        execution: manifest.execution,
         terminal_review,
         playbook: Some(playbook),
         roles,
@@ -303,6 +308,7 @@ fn load_roles(
             network,
             secrets,
             runtime,
+            timeout_secs,
             skills,
             prompt_body,
         } = parse_role_file(&text).map_err(|e| MissionTypeError::Role {
@@ -334,6 +340,7 @@ fn load_roles(
             name: name.clone(),
             output,
             runtime,
+            timeout_secs,
             network,
             secrets,
             skills,

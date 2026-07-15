@@ -30,6 +30,7 @@ pub(crate) async fn prepare_inputs(
     checkout: &Path,
     inputs: &[PreparedInput],
     effect_id: &crate::model::EffectId,
+    deadline_ms: i64,
 ) -> Result<PreparedInputs> {
     let mut prepared = PreparedInputs {
         mounts: Vec::new(),
@@ -45,7 +46,10 @@ pub(crate) async fn prepare_inputs(
             checkout,
             input,
             &digest,
-            effect_id,
+            PreparationExecution {
+                effect_id,
+                deadline_ms,
+            },
         )
         .await?;
         prepared.mounts.push(MountSpec {
@@ -60,6 +64,12 @@ pub(crate) async fn prepare_inputs(
         });
     }
     Ok(prepared)
+}
+
+#[derive(Clone, Copy)]
+struct PreparationExecution<'a> {
+    effect_id: &'a crate::model::EffectId,
+    deadline_ms: i64,
 }
 
 fn input_cache_key(
@@ -146,7 +156,7 @@ async fn prepare_one(
     checkout: &Path,
     input: &PreparedInput,
     digest: &str,
-    effect_id: &crate::model::EffectId,
+    execution: PreparationExecution<'_>,
 ) -> Result<PathBuf> {
     let parent = state_dir
         .join("inputs")
@@ -204,7 +214,6 @@ async fn prepare_one(
         },
         judged_roots: &judged_roots,
         environment: preparation_environment(),
-        hard_timeout: profile.oracle_timeout,
     })
     .map_err(|error| anyhow::anyhow!("prepared-input plan refused to compile: {error}"))?;
     let program = RuntimeProgramSpec {
@@ -217,14 +226,15 @@ async fn prepare_one(
     let mut executor = MissionProgramExecutor::new(
         compiled.plan().clone(),
         RuntimeAuthRegistry::empty(),
-        effect_id,
+        execution.effect_id,
     );
-    let run = tokio::time::timeout(profile.oracle_timeout, executor.execute_captured(program))
+    let remaining = crate::ports::remaining_until(execution.deadline_ms);
+    let run = tokio::time::timeout(remaining, executor.execute_captured(program))
         .await
         .with_context(|| {
             format!(
-                "prepared input '{}' exceeded {:?}",
-                input.name, profile.oracle_timeout
+                "prepared input '{}' exceeded its effect deadline",
+                input.name
             )
         })??;
     if run.exit_code != Some(0) || run.exit_signal.is_some() {

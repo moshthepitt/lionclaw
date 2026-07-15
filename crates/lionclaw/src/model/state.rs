@@ -251,6 +251,15 @@ pub enum ReviewOutcome {
     },
 }
 
+/// Exact failed effect generation that may be reopened by `continue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParkedEffect {
+    RoleRun { task_id: TaskId },
+    OracleRun { oracle: OracleName },
+    TerminalReview,
+}
+
 /// How a human accepted closure despite the review: `accept` on a gap park
 /// acknowledges the blocking verdict, while `accept` on a failure park waives
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
@@ -402,6 +411,9 @@ pub enum InflightEffect {
         base_sha: String,
         assignment_epoch: u32,
         recreate_workspace: bool,
+        requested_at_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
         requested_seq: u64,
     },
     OracleRun {
@@ -409,6 +421,8 @@ pub enum InflightEffect {
         oracle: OracleName,
         judged_sha: String,
         attempt_no: u32,
+        requested_at_ms: i64,
+        deadline_ms: i64,
         requested_seq: u64,
     },
     TerminalReview {
@@ -420,11 +434,42 @@ pub enum InflightEffect {
         /// Carried from the event so the runner's handoff-forgery check
         /// still has its expected token after a crash/resume.
         nonce: String,
+        requested_at_ms: i64,
+        deadline_ms: i64,
+        budget_deadline_ms: i64,
         requested_seq: u64,
     },
 }
 
 impl InflightEffect {
+    pub fn set_deadline_ms(&mut self, new_deadline_ms: i64) {
+        match self {
+            Self::RoleRun { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms = new_deadline_ms,
+        }
+    }
+
+    pub fn deadline_ms(&self) -> i64 {
+        match self {
+            Self::RoleRun { deadline_ms, .. }
+            | Self::OracleRun { deadline_ms, .. }
+            | Self::TerminalReview { deadline_ms, .. } => *deadline_ms,
+        }
+    }
+
+    pub fn budget_deadline_ms(&self) -> Option<i64> {
+        match self {
+            Self::RoleRun {
+                budget_deadline_ms, ..
+            }
+            | Self::TerminalReview {
+                budget_deadline_ms, ..
+            } => Some(*budget_deadline_ms),
+            Self::OracleRun { .. } => None,
+        }
+    }
+
     /// Build the inflight entry for a `…Requested` event.
     pub fn from_request(
         event: &super::event::MissionEvent,
@@ -442,6 +487,9 @@ impl InflightEffect {
                 base_sha,
                 assignment_epoch,
                 recreate_workspace,
+                requested_at_ms,
+                deadline_ms,
+                budget_deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::RoleRun {
@@ -453,6 +501,9 @@ impl InflightEffect {
                     base_sha: base_sha.clone(),
                     assignment_epoch: *assignment_epoch,
                     recreate_workspace: *recreate_workspace,
+                    requested_at_ms: *requested_at_ms,
+                    deadline_ms: *deadline_ms,
+                    budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
                 },
             )),
@@ -462,6 +513,8 @@ impl InflightEffect {
                 judged_sha,
                 attempt_no,
                 effect_id,
+                requested_at_ms,
+                deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::OracleRun {
@@ -469,6 +522,8 @@ impl InflightEffect {
                     oracle: oracle.clone(),
                     judged_sha: judged_sha.clone(),
                     attempt_no: *attempt_no,
+                    requested_at_ms: *requested_at_ms,
+                    deadline_ms: *deadline_ms,
                     requested_seq,
                 },
             )),
@@ -480,6 +535,9 @@ impl InflightEffect {
                 prompt,
                 judged_sha,
                 nonce,
+                requested_at_ms,
+                deadline_ms,
+                budget_deadline_ms,
             } => Some((
                 effect_id.clone(),
                 Self::TerminalReview {
@@ -489,6 +547,9 @@ impl InflightEffect {
                     prompt: prompt.clone(),
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),
+                    requested_at_ms: *requested_at_ms,
+                    deadline_ms: *deadline_ms,
+                    budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
                 },
             )),
@@ -501,6 +562,7 @@ impl InflightEffect {
             | MissionEvent::TerminalReviewCompleted { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
+            | MissionEvent::ControlRequested { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
         }
     }
@@ -542,6 +604,10 @@ pub struct MissionState {
     /// Per-oracle dispatch counter (attempt numbering).
     pub oracle_attempts: BTreeMap<OracleName, u32>,
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
+    #[serde(default)]
+    pub stop_requests: BTreeMap<super::EffectId, String>,
+    #[serde(default)]
+    pub parked_effects: BTreeMap<super::EffectId, ParkedEffect>,
     /// Latest cleanup failure for an unfinished effect. Cleared only when that
     /// effect's outcome is durably recorded.
     #[serde(default)]

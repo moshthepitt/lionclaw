@@ -33,7 +33,7 @@ rustix = { workspace = true, features = ["fs"] }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "process", "io-util", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

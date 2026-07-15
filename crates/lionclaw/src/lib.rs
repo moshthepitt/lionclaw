@@ -24,5 +24,6 @@ pub mod selftest;
 pub mod store;
 pub mod workspace;
 
+pub mod activity;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

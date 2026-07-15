@@ -4,20 +4,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 
 use crate::authority::AuthorityCeiling;
 use crate::config::{MissionRuntimeProfile, RuntimeProfiles};
-use crate::engine::{load_mission_view, Engine, EngineServices, MissionDisposition, MissionView};
+use crate::engine::{
+    load_mission_view, record_control, Engine, EngineServices, MissionDisposition, MissionView,
+};
 use crate::mission_type::{
     add_skill, install_mission_type, load_mission_type, materialize_mission_type, remove_skill,
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, DecisionAction, EventEnvelope, FinishClass, MissionConfig, MissionId,
-    MissionPhase,
+    fold, short_hex, ControlAction, DecisionAction, EffectId, EventEnvelope, FinishClass,
+    MissionConfig, MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EventSink, SystemClock};
@@ -113,6 +116,8 @@ pub enum MissionCommand {
     Start(StartArgs),
     /// Drive a mission until it parks, finishes, or awaits input.
     Advance(AdvanceArgs),
+    #[command(hide = true)]
+    Driver(DriverArgs),
     /// Show a mission's state (contract, phase, finish grade).
     Status(StatusArgs),
     /// The verifiable receipt: what was proven, by what, and what was NOT.
@@ -128,6 +133,12 @@ pub enum MissionCommand {
     Plan(PlanCommand),
     /// Resolve an open attention item.
     Decide(DecideArgs),
+    /// Request cancellation of one exact active effect.
+    Stop(ControlArgs),
+    /// Extend one exact active effect's deadline.
+    Extend(ExtendArgs),
+    /// Resume one exact parked effect in its preserved workspace.
+    Continue(ControlArgs),
     /// Inspect mission types.
     #[command(subcommand)]
     Type(TypeCommand),
@@ -259,6 +270,41 @@ pub struct AdvanceArgs {
     pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Wait for the detached driver to reach its next checkpoint.
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Args)]
+pub struct DriverArgs {
+    pub mission_id: String,
+    #[arg(long)]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub handshake: PathBuf,
+}
+
+#[derive(Args)]
+pub struct ControlArgs {
+    pub mission_id: String,
+    pub effect_id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args)]
+pub struct ExtendArgs {
+    pub mission_id: String,
+    pub effect_id: String,
+    #[arg(long)]
+    pub repo: Option<PathBuf>,
+    /// Additional seconds from the effect's current effective deadline.
+    #[arg(long)]
+    pub seconds: u64,
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Args)]
@@ -270,6 +316,9 @@ pub struct StatusArgs {
     pub repo: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Follow the bounded activity projection until the driver exits.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 #[derive(Args)]
@@ -361,9 +410,15 @@ impl MissionCommand {
             Self::Plan(a) => a.is_json(),
             Self::Inbox(a) => a.json,
             Self::Advance(a) => a.json,
+            Self::Driver(_) => false,
             Self::SelfTest(a) => a.json,
             Self::Type(t) => t.is_json(),
-            Self::Apply(_) | Self::Log(_) | Self::Decide(_) => false,
+            Self::Apply(_)
+            | Self::Log(_)
+            | Self::Decide(_)
+            | Self::Stop(_)
+            | Self::Extend(_)
+            | Self::Continue(_) => false,
         }
     }
 }
@@ -392,6 +447,7 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
     match cmd {
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Advance(args) => cmd_advance(args).await,
+        MissionCommand::Driver(args) => cmd_driver(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
@@ -399,6 +455,9 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
         MissionCommand::Inbox(args) => cmd_inbox(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Plan(cmd) => cmd_plan(cmd).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Decide(args) => cmd_decide(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Stop(args) => cmd_control(args, false).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Extend(args) => cmd_extend(args).await.map(|()| ExitCode::SUCCESS),
+        MissionCommand::Continue(args) => cmd_control(args, true).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Type(cmd) => cmd_type(cmd).await,
         MissionCommand::SelfTest(args) => crate::selftest::run(args.json).await,
     }
@@ -673,6 +732,7 @@ async fn cmd_start(args: StartArgs) -> Result<()> {
                     // manually proposed plan).
                     planning: engine.mission_type().planning.clone(),
                     recovery: engine.mission_type().recovery.clone(),
+                    execution: engine.mission_type().execution.clone(),
                     // The closing review the mission type ships (None ⇒ off).
                     terminal_review: engine.mission_type().terminal_review.clone(),
                 },
@@ -1254,6 +1314,70 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_control(args: ControlArgs, resume: bool) -> Result<()> {
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let effect_id = EffectId::parse(&args.effect_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let action = if resume {
+        ControlAction::Continue { automatic: false }
+    } else {
+        ControlAction::Stop
+    };
+    record_control(
+        &store,
+        SystemClock.now_ms(),
+        &mission_id,
+        &effect_id,
+        action,
+        &args.reason,
+    )
+    .await?;
+    println!(
+        "recorded {} for effect {effect_id}",
+        if resume { "continue" } else { "stop" }
+    );
+    Ok(())
+}
+
+async fn cmd_extend(args: ExtendArgs) -> Result<()> {
+    if args.seconds == 0 {
+        bail!("--seconds must be greater than zero");
+    }
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let effect_id = EffectId::parse(&args.effect_id)?;
+    let (_repo, store) = open_store(args.repo).await?;
+    let state = store.require_state(&mission_id).await?;
+    let effect = state
+        .inflight
+        .get(&effect_id)
+        .with_context(|| format!("effect '{effect_id}' is not active; control is stale"))?;
+    let old_deadline_ms = effect.deadline_ms();
+    let extension_ms = i64::try_from(
+        args.seconds
+            .checked_mul(1_000)
+            .context("deadline extension overflows milliseconds")?,
+    )
+    .context("deadline extension is too large")?;
+    let new_deadline_ms = old_deadline_ms
+        .checked_add(extension_ms)
+        .context("extended deadline overflows epoch milliseconds")?;
+    record_control(
+        &store,
+        SystemClock.now_ms(),
+        &mission_id,
+        &effect_id,
+        ControlAction::ExtendDeadline {
+            old_deadline_ms,
+            new_deadline_ms,
+            automatic: false,
+        },
+        &args.reason,
+    )
+    .await?;
+    println!("extended effect {effect_id} deadline to {new_deadline_ms}");
+    Ok(())
+}
+
 fn parse_decision_action(action: &str) -> Result<DecisionAction> {
     Ok(match action {
         "approve" => DecisionAction::Approve,
@@ -1316,11 +1440,68 @@ fn decode_feedback(bytes: Vec<u8>, source: &str) -> Result<String> {
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
-    // Stream committed events to stderr so a run that blocks minutes per agent
-    // turn is not silent (stdout stays clean for `--json`).
-    let store = store.with_sink(Arc::new(StderrEventSink));
+    let initial = load_mission_view(&store, &mission_id).await?;
+    let mut child = None;
+    if matches!(
+        initial.disposition,
+        MissionDisposition::Ready | MissionDisposition::CleanupBlocked
+    ) {
+        let handshake = store.mission_dir(&mission_id).join(format!(
+            "driver-{}-{}.ready",
+            std::process::id(),
+            SystemClock.now_ms()
+        ));
+        let spawned = std::process::Command::new(std::env::current_exe()?)
+            .arg("mission")
+            .arg("driver")
+            .arg(mission_id.as_str())
+            .arg("--repo")
+            .arg(&repo)
+            .arg("--handshake")
+            .arg(&handshake)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawning detached mission driver")?;
+        child = Some(spawned);
+        let startup = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handshake.is_file() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                if child
+                    .as_mut()
+                    .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+                {
+                    bail!("mission driver exited before publishing its startup handshake");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(&handshake);
+        startup.context("mission driver startup handshake timed out")??;
+    }
+    if args.wait {
+        if let Some(mut child) = child {
+            let status = tokio::task::spawn_blocking(move || child.wait())
+                .await
+                .context("joining mission driver waiter")??;
+            if !status.success() {
+                bail!("mission driver exited unsuccessfully: {status}");
+            }
+        } else if matches!(initial.disposition, MissionDisposition::Running) {
+            let lock_path = store.driver_lock_path(&mission_id);
+            tokio::task::spawn_blocking(move || {
+                crate::driver_lock::DriverGuard::acquire(&lock_path)
+            })
+            .await
+            .context("joining driver-lock waiter")??;
+        }
+    }
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
-    let view = engine.advance(&mission_id).await?;
+    let view = load_mission_view(engine.store(), &mission_id).await?;
     let state = &view.state;
     print_mission_view(&view, engine.store().blobs(), args.json)?;
     // Closing over acknowledged review gaps (or a waived review) was an
@@ -1368,13 +1549,34 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     })
 }
 
+async fn cmd_driver(args: DriverArgs) -> Result<std::process::ExitCode> {
+    let mission_id = MissionId::parse(&args.mission_id)?;
+    let store = MissionStore::open(&args.repo)
+        .await?
+        .with_sink(Arc::new(StderrEventSink));
+    let engine = build_engine_for_mission(store, &args.repo, &mission_id).await?;
+    engine
+        .advance_with_handshake(&mission_id, Some(&args.handshake))
+        .await?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
 async fn cmd_status(args: StatusArgs) -> Result<()> {
     let (_repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
+    if args.watch {
+        return watch_status(&store, &mission_id, args.json).await;
+    }
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
     if args.json {
-        println!("{}", mission_view_json(&view, store.blobs())?);
+        let mut value = mission_view_json(&view, store.blobs())?;
+        let activity = std::fs::read(crate::activity::path(&store.mission_dir(&mission_id)))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
+        value["activity"] = activity;
+        println!("{value}");
     } else {
         println!(
             "mission {mission_id}: {} (revision {}, {})",
@@ -1402,11 +1604,68 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
         }
+        print_activity(&store, &mission_id)?;
         print_planning_input(store.blobs(), state, "")?;
         for item in state.open_attention.values() {
             print_attention(store.blobs(), item, "  ")?;
         }
         println!("next: {}", view.next_actions().join(" | "));
+    }
+    Ok(())
+}
+
+async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) -> Result<()> {
+    let activity_path = crate::activity::path(&store.mission_dir(mission_id));
+    let mut previous = Vec::new();
+    loop {
+        let bytes = std::fs::read(&activity_path).unwrap_or_default();
+        if !bytes.is_empty() && bytes != previous {
+            if json {
+                println!("{}", String::from_utf8_lossy(&bytes));
+            } else if let Ok(activity) =
+                serde_json::from_slice::<crate::activity::ActivityProjection>(&bytes)
+            {
+                for effect in activity.effects {
+                    println!(
+                        "{} {} elapsed={}ms deadline={} dirty={}",
+                        short_hex(&effect.effect_id),
+                        effect.last_activity,
+                        effect.elapsed_ms,
+                        effect.deadline_ms,
+                        effect.dirty_diffstat.as_deref().unwrap_or("clean")
+                    );
+                }
+            }
+            previous = bytes;
+        }
+        if !matches!(
+            load_mission_view(store, mission_id).await?.disposition,
+            MissionDisposition::Running
+        ) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+}
+
+fn print_activity(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
+    let path = crate::activity::path(&store.mission_dir(mission_id));
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    let activity: crate::activity::ActivityProjection = serde_json::from_slice(&bytes)?;
+    for effect in activity.effects {
+        println!(
+            "activity {}: {} elapsed={}ms deadline={} controls={}",
+            short_hex(&effect.effect_id),
+            effect.last_activity,
+            effect.elapsed_ms,
+            effect.deadline_ms,
+            effect.legal_controls.join("|")
+        );
     }
     Ok(())
 }
@@ -2345,6 +2604,7 @@ mod tests {
             image: "image".to_string(),
             planning: Default::default(),
             recovery: Default::default(),
+            execution: Default::default(),
             terminal_review: None,
             playbook: None,
             roles: BTreeMap::from([(
@@ -2353,6 +2613,7 @@ mod tests {
                     name,
                     output: OutputSemantics::ProducesArtifact,
                     runtime: runtime.map(str::to_string),
+                    timeout_secs: None,
                     network: true,
                     secrets: false,
                     skills: Vec::new(),
@@ -2473,6 +2734,7 @@ mod tests {
                 base_sha: "base".into(),
                 config: MissionConfig {
                     recovery: RecoveryConfig { max_attempts: 1 },
+                    execution: Default::default(),
                     terminal_review: Some(TerminalReviewConfig {
                         role: RoleName::new("gap-reviewer").unwrap(),
                     }),

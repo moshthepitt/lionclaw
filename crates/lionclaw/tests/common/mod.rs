@@ -55,6 +55,7 @@ pub fn test_mission_type() -> MissionType {
         image: "localhost/lionclaw-runtime-dev:v1".to_string(),
         planning: Default::default(),
         recovery: Default::default(),
+        execution: Default::default(),
         terminal_review: Some(lionclaw::model::TerminalReviewConfig {
             role: RoleName::new("reviewer").expect("role name"),
         }),
@@ -66,6 +67,7 @@ pub fn test_mission_type() -> MissionType {
                     name: implementer,
                     output: OutputSemantics::ProducesArtifact,
                     runtime: None,
+                    timeout_secs: None,
                     network: false,
                     secrets: false,
                     skills: Vec::new(),
@@ -78,6 +80,7 @@ pub fn test_mission_type() -> MissionType {
                     name: RoleName::new("reviewer").expect("role name"),
                     output: OutputSemantics::EmitsVerdict,
                     runtime: None,
+                    timeout_secs: None,
                     network: false,
                     secrets: false,
                     skills: Vec::new(),
@@ -105,6 +108,7 @@ pub fn review_mission_type() -> MissionType {
             name: gap_reviewer.clone(),
             output: OutputSemantics::EmitsGapVerdict,
             runtime: Some("opencode".to_string()),
+            timeout_secs: None,
             network: false,
             secrets: false,
             skills: Vec::new(),
@@ -240,7 +244,14 @@ pub async fn harness_with_type(
 }
 
 pub fn default_config() -> MissionConfig {
-    MissionConfig::default()
+    MissionConfig {
+        execution: lionclaw::model::ExecutionPolicy {
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// `default_config` plus the closing review (matches `review_mission_type`).
@@ -249,7 +260,7 @@ pub fn review_config() -> MissionConfig {
         terminal_review: Some(lionclaw::model::TerminalReviewConfig {
             role: RoleName::new("gap-reviewer").expect("role name"),
         }),
-        ..Default::default()
+        ..default_config()
     }
 }
 

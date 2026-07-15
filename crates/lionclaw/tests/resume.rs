@@ -100,6 +100,9 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
                 base_sha: BASE_SHA.to_string(),
                 assignment_epoch: 1,
                 recreate_workspace: true,
+                requested_at_ms: 0,
+                deadline_ms: 100_000,
+                budget_deadline_ms: 100_000,
             })],
             1,
         )
@@ -176,6 +179,9 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     base_sha: BASE_SHA.to_string(),
                     assignment_epoch: 1,
                     recreate_workspace: true,
+                    requested_at_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
                 }),
                 NewEvent::new(MissionEvent::RoleRunCompleted {
                     task_id,
@@ -201,6 +207,8 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     judged_sha: HEAD_SHA.to_string(),
                     attempt_no: 1,
                     effect_id: oracle_effect.clone(),
+                    requested_at_ms: 0,
+                    deadline_ms: 100_000,
                 }),
             ],
             1,
@@ -266,6 +274,9 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
                 base_sha: BASE_SHA.to_string(),
                 assignment_epoch: 1,
                 recreate_workspace: true,
+                requested_at_ms: 0,
+                deadline_ms: 100_000,
+                budget_deadline_ms: 100_000,
             })],
             1,
         )

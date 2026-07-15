@@ -215,6 +215,9 @@ mod tests {
                     base_sha: "s0".into(),
                     assignment_epoch: 1,
                     recreate_workspace: true,
+                    requested_at_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
                 },
             ));
             seq += 1;

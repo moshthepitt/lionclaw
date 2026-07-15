@@ -22,6 +22,7 @@ pub struct RoleFrontmatter {
     pub network: bool,
     pub secrets: bool,
     pub runtime: Option<String>,
+    pub timeout_secs: Option<u64>,
     pub skills: Vec<String>,
     pub prompt_body: String,
 }
@@ -34,6 +35,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
     let mut network = true;
     let mut secrets = false;
     let mut runtime: Option<String> = None;
+    let mut timeout_secs: Option<u64> = None;
     let mut skills: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
@@ -55,6 +57,15 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
             "network" => network = parse_bool(key, value)?,
             "secrets" => secrets = parse_bool(key, value)?,
             "runtime" => runtime = Some(parse_scalar(key, value)?),
+            "timeout-secs" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|_| "timeout-secs must be a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("timeout-secs must be a positive integer".to_string());
+                }
+                timeout_secs = Some(parsed);
+            }
             "skills" => skills = parse_string_list(value)?,
             other => return Err(format!("unknown key '{other}'")),
         }
@@ -70,6 +81,7 @@ pub fn parse_role_file(text: &str) -> Result<RoleFrontmatter, String> {
         network,
         secrets,
         runtime,
+        timeout_secs,
         skills,
         prompt_body: prompt_body.to_string(),
     })

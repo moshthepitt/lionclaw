@@ -24,6 +24,8 @@ pub(crate) struct ManifestFile {
     pub planning: crate::model::PlanningDag,
     #[serde(default)]
     pub recovery: crate::model::RecoveryConfig,
+    #[serde(default)]
+    pub execution: crate::model::ExecutionPolicy,
     /// The optional engine-owned closing review. Required for the reviewed
     /// stop bar and resolved against the loaded role inventory.
     #[serde(default, rename = "terminal-review")]

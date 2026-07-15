@@ -179,6 +179,7 @@ fn execution_mission_type(
                 name,
                 output: OutputSemantics::ProducesArtifact,
                 runtime: None,
+                timeout_secs: None,
                 network: false,
                 secrets: false,
                 // Declaration order: zebra BEFORE alpha (reversed from BTreeMap sort).
@@ -195,6 +196,7 @@ fn execution_mission_type(
                 name,
                 output: OutputSemantics::EmitsVerdict,
                 runtime: None,
+                timeout_secs: None,
                 network: false,
                 secrets: false,
                 skills: Vec::new(),
@@ -209,6 +211,7 @@ fn execution_mission_type(
         image: "img".to_string(),
         planning: PlanningDag::default(),
         recovery: Default::default(),
+        execution: Default::default(),
         terminal_review: None,
         playbook: None,
         roles,
@@ -387,6 +390,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
                 name: role_name,
                 output,
                 runtime: None,
+                timeout_secs: None,
                 network: false,
                 secrets: false,
                 skills: Vec::new(),
@@ -420,6 +424,7 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
             ],
         },
         recovery: Default::default(),
+        execution: Default::default(),
         terminal_review: None,
         playbook: None,
         roles,
@@ -524,6 +529,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
                     ],
                 },
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
@@ -602,11 +608,13 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
                     ],
                 },
                 recovery: Default::default(),
+                execution: Default::default(),
                 terminal_review: None,
             },
         )
         .await
         .unwrap();
+    engine.advance(&mission_id).await.unwrap();
     engine.advance(&mission_id).await.unwrap();
 
     let prompt = persisted_prompt(&engine, &mission_id, "author").await;

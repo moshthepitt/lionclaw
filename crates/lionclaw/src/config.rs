@@ -4,16 +4,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use lionclaw_confinement::{ConfinementConfig, ExecutionLimits, OciConfinementConfig};
 use serde::Deserialize;
 
 use crate::mission_type::Home;
-
-const DEFAULT_HARD_TIMEOUT_SECS: u64 = 30 * 60;
-const DEFAULT_ORACLE_TIMEOUT_SECS: u64 = 15 * 60;
 
 const DEFAULT_RUNTIMES_TOML: &str = r#"
 [runtimes.codex]
@@ -56,8 +52,6 @@ pub struct MissionRuntimeProfile {
     pub auth: Option<RuntimeAuthConfig>,
     pub skills_dir: Option<RuntimeSkillsDir>,
     pub confinement: ConfinementConfig,
-    pub hard_timeout: Duration,
-    pub oracle_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,10 +183,6 @@ struct RuntimeProfileFile {
     skills_dir: Option<PathBuf>,
     #[serde(default = "default_confinement")]
     confinement: ConfinementConfig,
-    #[serde(default = "default_hard_timeout_secs")]
-    hard_timeout_secs: u64,
-    #[serde(default = "default_oracle_timeout_secs")]
-    oracle_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,9 +217,6 @@ impl RuntimeProfileFile {
             .auth
             .map(|config| config.apply(user_home))
             .transpose()?;
-        if self.hard_timeout_secs == 0 || self.oracle_timeout_secs == 0 {
-            return Err(anyhow!("runtime timeouts must be greater than zero"));
-        }
         let skills_dir = self.skills_dir.map(RuntimeSkillsDir::new).transpose()?;
         self.confinement.oci_mut().tmpfs = self
             .confinement
@@ -258,8 +245,6 @@ impl RuntimeProfileFile {
             auth,
             skills_dir,
             confinement: self.confinement,
-            hard_timeout: Duration::from_secs(self.hard_timeout_secs),
-            oracle_timeout: Duration::from_secs(self.oracle_timeout_secs),
         })
     }
 }
@@ -376,14 +361,6 @@ fn default_confinement() -> ConfinementConfig {
         limits: ExecutionLimits::default(),
         ..OciConfinementConfig::default()
     })
-}
-
-const fn default_hard_timeout_secs() -> u64 {
-    DEFAULT_HARD_TIMEOUT_SECS
-}
-
-const fn default_oracle_timeout_secs() -> u64 {
-    DEFAULT_ORACLE_TIMEOUT_SECS
 }
 
 #[cfg(test)]

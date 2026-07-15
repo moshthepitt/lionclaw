@@ -11,20 +11,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::event::{
-    EventEnvelope, GapSeverity, Handoff, MissionEvent, PayloadRef, RuntimeConfigurationEvidence,
+    ControlAction, EventEnvelope, GapSeverity, Handoff, MissionEvent, PayloadRef,
+    RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, TaskId};
 use super::plan::Assertion;
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
-    MissionState, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
+    MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
     ReviewAcceptanceKind, ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 9;
+pub const REDUCER_VERSION: u32 = 10;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -83,6 +84,8 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         current_sha: base_sha.clone(),
         oracle_attempts: Default::default(),
         inflight: Default::default(),
+        stop_requests: Default::default(),
+        parked_effects: Default::default(),
         cleanup_failure: None,
         open_attention: Default::default(),
         proposal_approved: false,
@@ -117,6 +120,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             assignment_epoch,
             ..
         } => {
+            state.parked_effects.retain(|_, parked| {
+                !matches!(parked, ParkedEffect::RoleRun { task_id: parked_task } if parked_task == task_id)
+            });
             let tasks = state.active_tasks_mut();
             let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
@@ -132,6 +138,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             outcome,
         } => {
             state.inflight.remove(effect_id);
+            state.stop_requests.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
@@ -169,6 +176,16 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             applied_mode: evidence.configuration.applied_mode.clone(),
                         });
                         task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+                        if !failure.automatically_retryable()
+                            || task.consecutive_failures >= state.config.recovery.max_attempts
+                        {
+                            state.parked_effects.insert(
+                                effect_id.clone(),
+                                ParkedEffect::RoleRun {
+                                    task_id: task_id.clone(),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -176,6 +193,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::OracleRunRequested {
             oracle, attempt_no, ..
         } => {
+            state.parked_effects.retain(|_, parked| {
+                !matches!(parked, ParkedEffect::OracleRun { oracle: parked_oracle } if parked_oracle == oracle)
+            });
             state.oracle_attempts.insert(oracle.clone(), *attempt_no);
             track_inflight(state, &envelope.event, seq);
         }
@@ -188,6 +208,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ..
         } => {
             state.inflight.remove(effect_id);
+            state.stop_requests.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
@@ -208,6 +229,12 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
                 Err(failure) => {
+                    state.parked_effects.insert(
+                        effect_id.clone(),
+                        ParkedEffect::OracleRun {
+                            oracle: oracle.clone(),
+                        },
+                    );
                     state
                         .oracle_failures
                         .insert(oracle.clone(), failure.clone());
@@ -220,6 +247,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         // dispatch under a fresh attempt (and a fresh effect ID), never
         // spin the drive loop re-appending a duplicate.
         MissionEvent::TerminalReviewRequested { attempt_no, .. } => {
+            state
+                .parked_effects
+                .retain(|_, parked| !matches!(parked, ParkedEffect::TerminalReview));
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             track_inflight(state, &envelope.event, seq);
         }
@@ -230,6 +260,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             outcome,
         } => {
             state.inflight.remove(effect_id);
+            state.stop_requests.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             match outcome {
@@ -244,6 +275,9 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         }));
                 }
                 Err(failure) => {
+                    state
+                        .parked_effects
+                        .insert(effect_id.clone(), ParkedEffect::TerminalReview);
                     state.terminal_review.consecutive_failures =
                         state.terminal_review.consecutive_failures.saturating_add(1);
                     state.terminal_review.outcome = Some(ReviewOutcome::Failed {
@@ -252,6 +286,51 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
             }
         }
+        MissionEvent::ControlRequested {
+            effect_id,
+            action,
+            reason,
+        } => match action {
+            ControlAction::Stop => {
+                if state.inflight.contains_key(effect_id) {
+                    state
+                        .stop_requests
+                        .insert(effect_id.clone(), reason.clone());
+                }
+            }
+            ControlAction::ExtendDeadline {
+                old_deadline_ms,
+                new_deadline_ms,
+                ..
+            } => {
+                if let Some(effect) = state.inflight.get_mut(effect_id) {
+                    if effect.deadline_ms() == *old_deadline_ms
+                        && new_deadline_ms >= old_deadline_ms
+                    {
+                        effect.set_deadline_ms(*new_deadline_ms);
+                    }
+                }
+            }
+            ControlAction::Continue { .. } => {
+                if let Some(parked) = state.parked_effects.remove(effect_id) {
+                    match parked {
+                        ParkedEffect::RoleRun { task_id } => {
+                            if let Some(task) = state.active_tasks_mut().get_mut(&task_id) {
+                                task.status = TaskStatus::Pending;
+                                task.consecutive_failures = 0;
+                            }
+                        }
+                        ParkedEffect::OracleRun { oracle } => {
+                            state.oracle_failures.remove(&oracle);
+                        }
+                        ParkedEffect::TerminalReview => {
+                            state.terminal_review.outcome = None;
+                            state.terminal_review.consecutive_failures = 0;
+                        }
+                    }
+                }
+            }
+        },
         MissionEvent::MissionAborted { reason, .. } => {
             state.phase = MissionPhase::Aborted {
                 reason: reason.clone(),
@@ -263,6 +342,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             justification,
         } => {
             apply_decision(state, attention_id, action, justification);
+            prune_reopened_parked_effects(state);
         }
         MissionEvent::EffectCleanupFailed {
             effect_id,
@@ -284,6 +364,24 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+fn prune_reopened_parked_effects(state: &mut MissionState) {
+    let parked = std::mem::take(&mut state.parked_effects);
+    state.parked_effects = parked
+        .into_iter()
+        .filter(|(_, effect)| match effect {
+            ParkedEffect::RoleRun { task_id } => state
+                .active_tasks()
+                .get(task_id)
+                .is_some_and(|task| task.status == TaskStatus::Failed),
+            ParkedEffect::OracleRun { oracle } => state.oracle_failures.contains_key(oracle),
+            ParkedEffect::TerminalReview => matches!(
+                state.terminal_review.outcome,
+                Some(ReviewOutcome::Failed { .. })
+            ),
+        })
+        .collect();
 }
 
 fn clear_cleanup_failure(state: &mut MissionState, effect_id: &super::EffectId) {
@@ -1278,6 +1376,9 @@ mod tests {
             base_sha: "base".into(),
             assignment_epoch: 1,
             recreate_workspace: true,
+            requested_at_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
         }
     }
 
@@ -1307,6 +1408,8 @@ mod tests {
             judged_sha: judged.into(),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
+            requested_at_ms: 0,
+            deadline_ms: 100_000,
         }
     }
 
@@ -2296,6 +2399,9 @@ mod tests {
             prompt: PayloadRef::inline("review prompt"),
             judged_sha: judged.into(),
             nonce: "n0".into(),
+            requested_at_ms: 0,
+            deadline_ms: 100_000,
+            budget_deadline_ms: 100_000,
         }
     }
 

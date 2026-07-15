@@ -22,6 +22,24 @@ impl Drop for DriverGuard {
 }
 
 impl DriverGuard {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let Some(parent) = path.parent() else {
+            anyhow::bail!("mission driver lock has no parent directory");
+        };
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating mission lock directory '{}'", parent.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("opening mission driver lock '{}'", path.display()))?;
+        flock(&file, FlockOperation::LockExclusive)
+            .with_context(|| format!("locking mission driver lock '{}'", path.display()))?;
+        Ok(Self { _file: file })
+    }
+
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
