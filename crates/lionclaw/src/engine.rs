@@ -611,14 +611,16 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
-        let previous_failure = state
-            .planning
-            .tasks
-            .get(task_id)
-            .or_else(|| state.tasks.get(task_id))
-            .and_then(|task| task.last_failure.as_ref());
-        if attempt_no > 1 && previous_failure.is_some_and(crate::model::RunFailure::transient) {
-            let seconds = 1_u64 << (attempt_no.saturating_sub(2)).min(2);
+        let previous_task = state.active_tasks().get(task_id);
+        if previous_task
+            .and_then(|task| task.last_failure.as_ref())
+            .is_some_and(crate::model::RunFailure::transient)
+        {
+            let exponent = previous_task
+                .map(|task| task.consecutive_failures.saturating_sub(1))
+                .unwrap_or(0)
+                .min(2);
+            let seconds = 1_u64 << exponent;
             tokio::time::sleep(Duration::from_secs(seconds)).await;
         }
         match self.role_runner.run(request).await {

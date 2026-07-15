@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
@@ -15,9 +15,10 @@ use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
     MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningRefinement, PlanningTask, RoleName, StopBar, Task, TaskKind, TaskStatus,
+    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, RunErrorKind, StopBar,
+    Task, TaskKind, TaskStatus,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -177,58 +178,63 @@ fn expanded_candidate(base_revision: u32) -> PlanProposal {
 
 /// A role runner that answers per output semantics: reports for the planners,
 /// a plan proposal for the author, a committed artifact for the implementer.
-fn planning_runner() -> MockRoleRunner {
-    MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
-        if req.role.name.as_str() == "strategist" {
-            assert_eq!(req.runtime, "opencode");
-            assert_eq!(req.skills.len(), 1);
-            assert_eq!(req.skills[0].name, "planning-method");
-        } else {
-            assert_eq!(req.runtime, "codex");
-            assert!(req.skills.is_empty());
+fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
+    if req.role.name.as_str() == "strategist" {
+        assert_eq!(req.runtime, "opencode");
+        assert_eq!(req.skills.len(), 1);
+        assert_eq!(req.skills[0].name, "planning-method");
+    } else {
+        assert_eq!(req.runtime, "codex");
+        assert!(req.skills.is_empty());
+    }
+    let handoff = match req.role.output {
+        OutputSemantics::ProposesPlan => Handoff::Plan {
+            done: true,
+            report: PayloadRef::inline("proposed contract"),
+            proposal: Some(proposed_plan()),
+            request_attention: false,
+        },
+        OutputSemantics::ProducesReport => Handoff::Work {
+            done: true,
+            report: PayloadRef::inline("planning report"),
+            request_attention: false,
+        },
+        OutputSemantics::ProducesArtifact => Handoff::Work {
+            done: true,
+            report: PayloadRef::inline("fixed it"),
+            request_attention: false,
+        },
+        OutputSemantics::EmitsVerdict => Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("looks good"),
+            items: vec![],
+            passed: true,
+            request_attention: false,
+        },
+        OutputSemantics::EmitsGapVerdict => {
+            panic!("terminal-review roles are never plan tasks")
         }
-        let handoff = match req.role.output {
-            OutputSemantics::ProposesPlan => Handoff::Plan {
-                done: true,
-                report: PayloadRef::inline("proposed contract"),
-                proposal: Some(proposed_plan()),
-                request_attention: false,
-            },
-            OutputSemantics::ProducesReport => Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("planning report"),
-                request_attention: false,
-            },
-            OutputSemantics::ProducesArtifact => Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("fixed it"),
-                request_attention: false,
-            },
-            OutputSemantics::EmitsVerdict => Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("looks good"),
-                items: vec![],
-                passed: true,
-                request_attention: false,
-            },
-            OutputSemantics::EmitsGapVerdict => {
-                panic!("terminal-review roles are never plan tasks")
-            }
-        };
-        let artifact =
-            (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
-                base_sha: req.base_sha.clone(),
-                head_sha: "head-1".to_string(),
-            });
-        Ok(RoleRunOutcome {
-            handoff,
-            artifact,
-            model_id: None,
-        })
-    }))
+    };
+    let artifact =
+        (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
+            base_sha: req.base_sha.clone(),
+            head_sha: "head-1".to_string(),
+        });
+    RoleRunOutcome {
+        handoff,
+        artifact,
+        model_id: None,
+    }
 }
 
-async fn planning_engine(workspace: &std::path::Path) -> Engine {
+fn planning_runner() -> MockRoleRunner {
+    MockRoleRunner::new(Box::new(|req| Ok(successful_role_outcome(req))))
+}
+
+async fn planning_engine_with_runner(
+    workspace: &std::path::Path,
+    runner: MockRoleRunner,
+) -> Engine {
     let store = MissionStore::open(workspace).await.expect("store");
     Engine::new(
         store,
@@ -236,12 +242,16 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
         "codex".to_string(),
         "img".to_string(),
         EngineServices::new(
-            Arc::new(planning_runner()),
+            Arc::new(runner),
             Arc::new(MockOracleRunner::exiting(0)),
             Arc::new(NoopEffectCleaner),
             Arc::new(MockClock::default()),
         ),
     )
+}
+
+async fn planning_engine(workspace: &std::path::Path) -> Engine {
+    planning_engine_with_runner(workspace, planning_runner()).await
 }
 
 #[tokio::test]
@@ -616,6 +626,64 @@ async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
             MissionEvent::DecisionRecorded { justification, .. } if justification == &format!("feedback-{i}")
         )));
     }
+}
+
+#[tokio::test]
+async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let strategist_calls = Arc::new(Mutex::new(0_u32));
+    let seen = strategist_calls.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.role.name.as_str() == "strategist" {
+            let mut calls = seen.lock().unwrap();
+            *calls += 1;
+            if *calls == 4 {
+                return Err(RoleRunFailure {
+                    kind: RunErrorKind::Timeout,
+                    detail: "temporary provider timeout".to_string(),
+                });
+            }
+        }
+        Ok(successful_role_outcome(request))
+    }));
+    let engine = planning_engine_with_runner(dir.path(), runner).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "refine without spending recovery",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: RecoveryConfig { max_attempts: 3 },
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for cycle in 0..3 {
+        engine.advance(&id).await.unwrap();
+        engine
+            .decide(
+                &id,
+                "plan_proposal:mission",
+                DecisionAction::Revise,
+                &format!("refine cycle {cycle}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let view = engine.advance(&id).await.unwrap();
+    assert_eq!(view.state.phase, MissionPhase::AttentionNeeded);
+    assert!(view.state.proposal.is_some());
+    assert_eq!(*strategist_calls.lock().unwrap(), 5);
+    assert_eq!(view.state.planning.tasks[&tid("strategist")].attempts, 5);
+    assert_eq!(
+        view.state.planning.tasks[&tid("strategist")].consecutive_failures,
+        0
+    );
 }
 
 #[tokio::test]

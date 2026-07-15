@@ -238,7 +238,8 @@ fn step_running(state: &MissionState) -> StepDecision {
         &state.terminal_review.outcome,
         Some(ReviewOutcome::Failed { failure })
             if failure.automatically_retryable()
-                && state.terminal_review.attempts < state.config.recovery.max_attempts
+                && state.terminal_review.consecutive_failures
+                    < state.config.recovery.max_attempts
     );
     if terminal_review_outstanding(state)
         && (!matches!(

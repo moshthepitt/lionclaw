@@ -75,7 +75,11 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
+    /// Monotonic dispatch identity. Successful reruns never reset it.
     pub attempts: u32,
+    /// Failures since the last successful outcome or explicit recovery
+    /// decision. This, not the dispatch identity, bounds automatic recovery.
+    pub consecutive_failures: u32,
     /// The latest handoff report, for threading into downstream prompts.
     #[serde(default)]
     pub last_report: Option<PayloadRef>,
@@ -89,7 +93,7 @@ pub struct TaskRuntimeState {
 impl TaskRuntimeState {
     pub fn automatic_retry_remaining(&self, max_attempts: u32) -> bool {
         self.status == TaskStatus::Failed
-            && self.attempts < max_attempts
+            && self.consecutive_failures < max_attempts
             && self
                 .last_failure
                 .as_ref()
@@ -209,6 +213,9 @@ pub struct TerminalReviewState {
     /// effect ID ride on it, so a retry re-rolls under a fresh identity.
     #[serde(default)]
     pub attempts: u32,
+    /// Failures since the last completed review or explicit recovery decision.
+    #[serde(default)]
+    pub consecutive_failures: u32,
     /// The last attempt's result. A fresh verdict and a pending failure
     /// cannot coexist: a failure only follows a dispatch, and dispatch only
     /// happens without a fresh verdict (history lives in the event log).
@@ -528,8 +535,8 @@ pub struct MissionState {
     pub contract: BTreeMap<AssertionId, AssertionState>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
     /// The contract-free planning phase: the runtime status of the mission
-    /// type's planning DAG. Disjoint from `tasks` (execution) — planning and
-    /// execution ids never coexist, since `plan` goes monotonically `None → Some`.
+    /// type's planning DAG. Disjoint from `tasks` (execution); the active era
+    /// decides which map receives role events and operator decisions.
     pub planning: PlanningState,
     /// Revision the active planning DAG is authoring against. `None` means the
     /// planning DAG is idle; this is independent of whether an accepted plan
@@ -580,6 +587,25 @@ pub struct MissionState {
     pub terminal_review: TerminalReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
+}
+
+impl MissionState {
+    /// Runtime state for the task era currently allowed to dispatch roles.
+    pub(crate) fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
+        if self.planning_base_revision.is_some() {
+            &self.planning.tasks
+        } else {
+            &self.tasks
+        }
+    }
+
+    pub(crate) fn active_tasks_mut(&mut self) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
+        if self.planning_base_revision.is_some() {
+            &mut self.planning.tasks
+        } else {
+            &mut self.tasks
+        }
+    }
 }
 
 #[cfg(test)]

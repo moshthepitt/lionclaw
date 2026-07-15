@@ -23,7 +23,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 5;
+pub const REDUCER_VERSION: u32 = 6;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -114,7 +114,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             attempt_no,
             ..
         } => {
-            let tasks = era_tasks_mut(state);
+            let tasks = state.active_tasks_mut();
             let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
@@ -133,10 +133,17 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             if let Some(artifact) = artifact {
                 state.current_sha = artifact.head_sha.clone();
             }
-            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                 task.attempts = task.attempts.max(*attempt_no);
             }
             apply_handoff(state, task_id, handoff);
+            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                if task.status == TaskStatus::Failed {
+                    task.consecutive_failures = task.consecutive_failures.saturating_add(1);
+                } else {
+                    task.consecutive_failures = 0;
+                }
+            }
         }
         MissionEvent::RoleRunFailed {
             task_id,
@@ -147,10 +154,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
-            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                 task.attempts = task.attempts.max(*attempt_no);
                 task.status = TaskStatus::Failed;
                 task.last_failure = Some(failure.clone());
+                task.consecutive_failures = task.consecutive_failures.saturating_add(1);
             }
         }
         MissionEvent::OracleRunRequested {
@@ -221,6 +229,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
+            state.terminal_review.consecutive_failures = 0;
             state.terminal_review.outcome = Some(ReviewOutcome::Verdict(TerminalReviewVerdict {
                 judged_sha: judged_sha.clone(),
                 passed: *passed,
@@ -237,6 +246,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             state.inflight.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
+            state.terminal_review.consecutive_failures =
+                state.terminal_review.consecutive_failures.saturating_add(1);
             state.terminal_review.outcome = Some(ReviewOutcome::Failed {
                 failure: failure.clone(),
             });
@@ -354,6 +365,7 @@ fn pending_task() -> TaskRuntimeState {
     TaskRuntimeState {
         status: TaskStatus::Pending,
         attempts: 0,
+        consecutive_failures: 0,
         last_report: None,
         last_failure: None,
         feedback: Vec::new(),
@@ -425,13 +437,10 @@ fn apply_decision(
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return; // unknown or already-resolved item
     };
-    // Planning and execution ids live in separate maps. Prefer the active
-    // planning run, then fall back to execution so decisions do not infer an
-    // era from whether an accepted plan exists.
+    // Planning and execution ids live in separate maps. The active era owns
+    // every node decision, even when both maps contain the same id.
     let node_status = |state: &mut MissionState, task_id, status| {
-        if let Some(task) = state.planning.tasks.get_mut(task_id) {
-            task.status = status;
-        } else if let Some(task) = state.tasks.get_mut(task_id) {
+        if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
             task.status = status;
         }
     };
@@ -450,12 +459,18 @@ fn apply_decision(
         (DecisionAction::Retry, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
                 node_status(state, task_id, TaskStatus::Pending);
+                if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    task.consecutive_failures = 0;
+                }
                 state.flagged_nodes.remove(task_id);
             }
         }
         (DecisionAction::Accept, AttentionKind::NodeFailed) => {
             if let Some(task_id) = &item.task_id {
                 node_status(state, task_id, TaskStatus::Cleared); // accept the failure
+                if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    task.consecutive_failures = 0;
+                }
             }
         }
         (DecisionAction::Accept, AttentionKind::NodeAttention) => {
@@ -510,12 +525,14 @@ fn apply_decision(
                 }) {
                     if let Some(runtime) = state.tasks.get_mut(&task.id) {
                         runtime.status = TaskStatus::Pending;
+                        runtime.consecutive_failures = 0;
                         runtime.feedback.push(feedback.clone());
                     }
                 }
             }
             state.terminal_review.outcome = None;
             state.terminal_review.accepted = None;
+            state.terminal_review.consecutive_failures = 0;
         }
         (DecisionAction::Accept, AttentionKind::OracleFailed) => {
             // Accept the infra failure: waive the obligation so the mission
@@ -561,6 +578,7 @@ fn apply_decision(
             // waiver and re-opens the review — the instrument may have
             // recovered, and the human never saw the new tree.
             state.terminal_review.outcome = None;
+            state.terminal_review.consecutive_failures = 0;
             state.terminal_review.accepted = Some(ReviewAcceptance {
                 kind: ReviewAcceptanceKind::Waived,
                 judged_sha: state.current_sha.clone(),
@@ -601,6 +619,7 @@ fn start_replanning(state: &mut MissionState) {
         task.status = TaskStatus::Pending;
         task.last_report = None;
         task.last_failure = None;
+        task.consecutive_failures = 0;
         task.feedback.clear();
         state.flagged_nodes.remove(id);
     }
@@ -828,7 +847,8 @@ fn derive_attention(state: &mut MissionState) {
             // OracleFailed mirror; raised until a decision retries or waives).
             Some(ReviewOutcome::Failed { failure })
                 if !failure.automatically_retryable()
-                    || state.terminal_review.attempts >= state.config.recovery.max_attempts =>
+                    || state.terminal_review.consecutive_failures
+                        >= state.config.recovery.max_attempts =>
             {
                 raise(
                     AttentionKind::TerminalReviewFailed,
@@ -906,15 +926,6 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
     }
 }
 
-/// The task map for the currently dispatched role run.
-fn era_tasks_mut(state: &mut MissionState) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
-    if state.planning_base_revision.is_some() {
-        &mut state.planning.tasks
-    } else {
-        &mut state.tasks
-    }
-}
-
 fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
     match handoff {
         Handoff::Work {
@@ -930,7 +941,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             // Work runs in either era (a planning report role or an execution
             // artifact role), so route by era; Plan is planning-only and Validate
             // execution-only, and address their maps directly below.
-            if let Some(task) = era_tasks_mut(state).get_mut(task_id) {
+            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
                 task.last_failure = (!done).then(|| RunFailure {
@@ -1105,7 +1116,7 @@ mod tests {
         ArtifactOutcome, MissionConfig, PayloadRef, RunErrorKind, ValidationItem,
     };
     use super::super::ids::{AssertionId, EffectId, MissionId, OracleName, RoleName, TaskId};
-    use super::super::plan::{Assertion, Plan, PlanProposal, Task, TaskKind};
+    use super::super::plan::{Assertion, Plan, PlanProposal, PlanningTask, Task, TaskKind};
     use super::super::state::RunFailure;
     use super::super::verdict::FinishClass;
     use super::*;
@@ -1784,6 +1795,49 @@ mod tests {
     }
 
     #[test]
+    fn node_decisions_target_the_active_task_era_when_ids_overlap() {
+        let mut created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("same-id"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "plan".into(),
+            depends_on: vec![],
+        });
+        let state = fold_log(vec![
+            created,
+            role_requested("same-id", "planning"),
+            role_completed("same-id", "planning", work_handoff(true, false), None),
+            plan_proposed(vec![], vec![work_task("same-id")]),
+            role_requested("same-id", "execution"),
+            MissionEvent::RoleRunFailed {
+                task_id: tid("same-id"),
+                attempt_no: 1,
+                effect_id: EffectId::for_parts(&["test", "execution"]),
+                failure: RunFailure {
+                    kind: RunErrorKind::Timeout,
+                    detail: "took too long".into(),
+                },
+            },
+            decision(
+                "node_failed:same-id",
+                super::super::event::DecisionAction::Retry,
+            ),
+        ])
+        .expect("state");
+
+        assert_eq!(
+            state.planning.tasks[&tid("same-id")].status,
+            TaskStatus::Cleared
+        );
+        assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Pending);
+        assert_eq!(state.tasks[&tid("same-id")].consecutive_failures, 0);
+        assert!(state.open_attention.is_empty());
+    }
+
+    #[test]
     fn artifact_outcome_moves_current_sha() {
         let state = fold_log(vec![
             created(),
@@ -2089,9 +2143,15 @@ mod tests {
         }
     }
 
-    fn review_completed(key: &str, judged: &str, passed: bool, gaps: Vec<Gap>) -> MissionEvent {
+    fn review_completed_at(
+        attempt_no: u32,
+        key: &str,
+        judged: &str,
+        passed: bool,
+        gaps: Vec<Gap>,
+    ) -> MissionEvent {
         MissionEvent::TerminalReviewCompleted {
-            attempt_no: 1,
+            attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
             passed,
@@ -2100,9 +2160,13 @@ mod tests {
         }
     }
 
-    fn review_failed(key: &str, judged: &str, detail: &str) -> MissionEvent {
+    fn review_completed(key: &str, judged: &str, passed: bool, gaps: Vec<Gap>) -> MissionEvent {
+        review_completed_at(1, key, judged, passed, gaps)
+    }
+
+    fn review_failed_at(attempt_no: u32, key: &str, judged: &str, detail: &str) -> MissionEvent {
         MissionEvent::TerminalReviewFailed {
-            attempt_no: 1,
+            attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             judged_sha: judged.into(),
             failure: RunFailure {
@@ -2110,6 +2174,10 @@ mod tests {
                 detail: detail.into(),
             },
         }
+    }
+
+    fn review_failed(key: &str, judged: &str, detail: &str) -> MissionEvent {
+        review_failed_at(1, key, judged, detail)
     }
 
     /// A review-configured mission driven to the brink of closure: work
@@ -2362,6 +2430,41 @@ mod tests {
         assert_eq!(state.terminal_review.outcome, None);
         assert!(terminal_review_outstanding(&state));
         assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
+    fn prior_successful_reviews_do_not_consume_the_recovery_budget() {
+        use super::super::step::{step, StepDecision};
+
+        let mut events = events_to_the_brink();
+        let MissionEvent::MissionCreated { config, .. } = &mut events[0] else {
+            unreachable!("events_to_the_brink starts with MissionCreated");
+        };
+        config.recovery.max_attempts = 3;
+        events.push(review_requested(4, "kr4", "h1"));
+        events.push(review_completed_at(4, "kr4", "h1", true, vec![]));
+        events.push(role_completed(
+            "fix",
+            "k2",
+            work_handoff(true, false),
+            Some(ArtifactOutcome {
+                base_sha: "h1".into(),
+                head_sha: "h2".into(),
+            }),
+        ));
+        events.push(oracle_completed("TESTS-PASS", "h2", "ko2", 0));
+        events.push(review_requested(5, "kr5", "h2"));
+        events.push(review_failed_at(5, "kr5", "h2", "temporary timeout"));
+
+        let state = fold_log(events).expect("state");
+        assert_eq!(state.terminal_review.attempts, 5);
+        assert_eq!(state.terminal_review.consecutive_failures, 1);
+        assert!(state.open_attention.is_empty());
+        assert_eq!(state.phase, MissionPhase::Running);
+        assert!(matches!(
+            step(&state),
+            StepDecision::ReviewTerminal(intent) if intent.attempt_no == 6
+        ));
     }
 
     #[test]
