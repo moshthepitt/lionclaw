@@ -800,7 +800,7 @@ fn derive_attention(state: &mut MissionState) {
     // state as durable prompt evidence, but they cannot compete with the
     // planning DAG or its replacement proposal for dispatch. This also keeps a
     // failed-gate `revise` from requiring an administrative accept on the
-    // rejected plan before the strategist can run.
+    // rejected plan before the replacement planning DAG can run.
     if state.planning_base_revision.is_some() {
         for (task_id, rt) in &state.planning.tasks {
             if rt.status == TaskStatus::Failed
