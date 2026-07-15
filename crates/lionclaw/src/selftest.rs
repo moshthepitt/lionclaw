@@ -25,9 +25,9 @@ use crate::config::RuntimeProfiles;
 use crate::engine::{Engine, EngineServices, MissionDisposition, ProposeError};
 use crate::mission_type::{load_mission_type, MissionTypeError};
 use crate::model::{
-    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, FinishClass, Gap,
-    GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase, OracleName,
-    PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
+    ArtifactOutcome, Assertion, AssertionId, DecisionAction, EffectId, ExecutionPolicy,
+    FinishClass, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionId, MissionPhase,
+    OracleName, PayloadRef, Plan, PlanProposal, ProposalError, Requirement, RequirementDisposition,
     RequirementId, RequirementKind, ReviewAcceptanceKind, RoleName, Task, TaskId, TaskKind,
     TaskStatus,
 };
@@ -45,6 +45,17 @@ use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{ExecutionOutput, RuntimeAuthRegistry, RuntimeProgramExecutor};
 
 const RUNTIME_IMAGE: &str = "localhost/lionclaw-runtime-dev:v1";
+
+fn self_test_config() -> MissionConfig {
+    MissionConfig {
+        execution: ExecutionPolicy {
+            auto_continue_candidate: true,
+            auto_continue_proof: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 /// A no-op producer: clears its work task without changing the tree, so the
 /// real oracle judges the base fixture as-is. Used by the oracle-honesty
@@ -646,9 +657,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
                 &repo.path().to_string_lossy(),
                 "self-test writable worker",
                 &base,
-                MissionConfig {
-                    ..Default::default()
-                },
+                self_test_config(),
             )
             .await?;
         engine
@@ -704,9 +713,7 @@ async fn check_prepared_input() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test prepared input",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
+            self_test_config(),
         )
         .await?;
     engine
@@ -746,7 +753,7 @@ async fn check_prepared_input() -> Result<()> {
 }
 
 async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
-    let outcome = engine.advance(id).await?;
+    let outcome = advance_through_ready_checkpoints(engine, id).await?;
     let state = engine.load_state(id).await?;
     match state.phase {
         MissionPhase::Done {
@@ -754,6 +761,19 @@ async fn assert_verified(engine: &Engine, id: &MissionId) -> Result<()> {
         } => Ok(()),
         other => anyhow::bail!("expected verified finish, got {other:?} (outcome {outcome:?})"),
     }
+}
+
+async fn advance_through_ready_checkpoints(
+    engine: &Engine,
+    id: &MissionId,
+) -> Result<crate::engine::MissionView> {
+    for _ in 0..16 {
+        let outcome = engine.advance(id).await?;
+        if outcome.disposition != MissionDisposition::Ready {
+            return Ok(outcome);
+        }
+    }
+    anyhow::bail!("self-test exceeded 16 explicit ready checkpoints")
 }
 
 /// (2) The real cargo-test oracle on a genuinely-broken tree records a valid
@@ -777,9 +797,7 @@ async fn check_oracle_honesty() -> Result<()> {
             &repo.path().to_string_lossy(),
             "self-test oracle honesty",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
+            self_test_config(),
         )
         .await?;
     engine
@@ -787,7 +805,7 @@ async fn check_oracle_honesty() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &id).await?;
-    let outcome = engine.advance(&id).await?;
+    let outcome = advance_through_ready_checkpoints(&engine, &id).await?;
     let state = engine.load_state(&id).await?;
     let verdict = state
         .contract
@@ -841,9 +859,7 @@ async fn check_replanning() -> Result<()> {
             repo.path().to_str().context("utf8 repo path")?,
             "re-planning self-test",
             &base,
-            MissionConfig {
-                ..Default::default()
-            },
+            self_test_config(),
         )
         .await?;
     engine
@@ -937,7 +953,7 @@ async fn check_terminal_review() -> Result<()> {
     let base = materialize_repo(repo.path(), ADD_CARGO, FIXED_ADD_LIB).await?;
     let config = MissionConfig {
         terminal_review: mission_type.terminal_review.clone(),
-        ..Default::default()
+        ..self_test_config()
     };
     let engine = Engine::new(
         MissionStore::open(repo.path()).await?,
