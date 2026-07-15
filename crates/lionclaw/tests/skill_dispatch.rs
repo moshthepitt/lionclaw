@@ -70,12 +70,7 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
         .unwrap();
     harness
         .engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&harness.engine, &mission_id).await;
@@ -131,12 +126,7 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
         .unwrap();
     harness
         .engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&harness.engine, &mission_id).await;

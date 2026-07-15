@@ -34,12 +34,7 @@ async fn rerun_after_finish_appends_nothing_and_invokes_nothing() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -84,12 +79,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -158,12 +148,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -315,12 +300,7 @@ async fn one_outcome_per_effect_id_is_a_store_invariant() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::{proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{DecisionAction, FinishClass, MissionConfig, MissionPhase};
+use lionclaw::model::{DecisionAction, FinishClass, MissionConfig, MissionEvent, MissionPhase};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -42,12 +42,7 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
         .await
         .expect("create");
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
 
@@ -65,8 +60,7 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
             &mission_id,
             "plan_proposal:mission",
             DecisionAction::Approve,
-            "  ",
-            "test"
+            "",
         )
         .await
         .is_err());
@@ -78,19 +72,12 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
             "plan_proposal:mission",
             DecisionAction::Retry,
             "",
-            "test"
         )
         .await
         .is_err());
     // A decision on a nonexistent item is refused.
     assert!(engine
-        .decide(
-            &mission_id,
-            "node_failed:ghost",
-            DecisionAction::Accept,
-            "",
-            "test"
-        )
+        .decide(&mission_id, "node_failed:ghost", DecisionAction::Accept, "",)
         .await
         .is_err());
 
@@ -101,7 +88,6 @@ async fn every_plan_parks_until_approved_then_proceeds_to_verified() {
             "plan_proposal:mission",
             DecisionAction::Approve,
             "ok",
-            "test",
         )
         .await
         .expect("approve");
@@ -129,12 +115,7 @@ async fn abort_decision_terminates_the_mission() {
         .await
         .expect("create");
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     engine.advance(&mission_id).await.expect("advance");
@@ -145,10 +126,27 @@ async fn abort_decision_terminates_the_mission() {
             "plan_proposal:mission",
             DecisionAction::Abort,
             "stop",
-            "test",
         )
         .await
         .expect("abort");
     let state = engine.load_state(&mission_id).await.expect("state");
-    assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
+    assert!(matches!(
+        state.phase,
+        MissionPhase::Aborted { ref reason } if reason == "stop"
+    ));
+    let events = engine.store().load(&mission_id).await.expect("events");
+    assert!(matches!(
+        &events[events.len() - 2].event,
+        MissionEvent::DecisionRecorded {
+            attention_id,
+            action,
+            justification,
+        } if attention_id == "plan_proposal:mission"
+            && action == &DecisionAction::Abort
+            && justification == "stop"
+    ));
+    assert!(matches!(
+        &events[events.len() - 1].event,
+        MissionEvent::MissionAborted { reason } if reason == "stop"
+    ));
 }

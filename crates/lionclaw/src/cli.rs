@@ -16,7 +16,8 @@ use crate::mission_type::{
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, EventEnvelope, FinishClass, MissionConfig, MissionId, MissionPhase,
+    fold, short_hex, DecisionAction, EventEnvelope, FinishClass, MissionConfig, MissionId,
+    MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
 use crate::ports::{Clock, EventSink, SystemClock};
@@ -226,9 +227,15 @@ pub struct DecideArgs {
     /// Target repo (default: the enclosing git worktree root).
     #[arg(long)]
     pub repo: Option<PathBuf>,
-    /// Why this decision is appropriate. Required and recorded in the log.
-    #[arg(long)]
-    pub justification: String,
+    /// Why a non-revise decision is appropriate. Recorded in the log.
+    #[arg(long, conflicts_with_all = ["feedback_file", "feedback_stdin"])]
+    pub justification: Option<String>,
+    /// Read exact revise feedback from this UTF-8 file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["justification", "feedback_stdin"])]
+    pub feedback_file: Option<PathBuf>,
+    /// Read exact revise feedback from stdin.
+    #[arg(long, conflicts_with_all = ["justification", "feedback_file"])]
+    pub feedback_stdin: bool,
 }
 
 #[derive(Args)]
@@ -241,10 +248,6 @@ pub struct PlanProposeArgs {
     /// Proposal JSON ({ "base_revision": N, "plan": {...} }); `-` reads stdin.
     #[arg(long = "file")]
     pub file: PathBuf,
-    #[arg(long, default_value = "orchestrator")]
-    pub actor: String,
-    #[arg(long, default_value = "")]
-    pub justification: String,
 }
 
 #[derive(Args)]
@@ -854,7 +857,7 @@ async fn cmd_plan_propose(args: PlanProposeArgs) -> Result<()> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let proposal = read_json_arg(&args.file)?;
     engine
-        .propose_plan(&mission_id, proposal, &args.actor, &args.justification)
+        .propose_plan(&mission_id, proposal)
         .await
         .context("plan proposal rejected")?;
     println!("plan proposed for mission {mission_id}");
@@ -951,7 +954,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         // review, whatever a hostile log writer recorded — the three review
         // fields must never contradict each other.
         let review = review_summary(state);
-        let (review_gaps, review_report, review_accepted_by) = if review.is_null() {
+        let (review_gaps, review_report, review_acceptance) = if review.is_null() {
             (
                 serde_json::Value::Null,
                 serde_json::Value::Null,
@@ -977,7 +980,6 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                         "kind": a.kind.slug(),
                         "judged_sha": a.judged_sha,
                         "fresh": a.is_fresh_at(&state.current_sha),
-                        "actor": a.actor,
                         "justification": a.justification,
                     })
                 })
@@ -1010,7 +1012,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "terminal_review": review,
                 "terminal_review_gaps": review_gaps,
                 "terminal_review_report": review_report,
-                "terminal_review_accepted_by": review_accepted_by,
+                "terminal_review_acceptance": review_acceptance,
                 "attention": state.open_attention.values().map(|item| {
                     attention_json(store.blobs(), item)
                 }).collect::<Result<Vec<_>>>()?,
@@ -1065,10 +1067,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         println!("  {line}");
         if let Some(a) = &state.terminal_review.accepted {
             println!(
-                "           {} at {} by {}: \"{}\"{}",
+                "           {} at {}: \"{}\"{}",
                 a.kind.slug(),
                 short_hex(&a.judged_sha),
-                a.actor,
                 a.justification,
                 if a.is_fresh_at(&state.current_sha) {
                     ""
@@ -1206,25 +1207,17 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
 }
 
 async fn cmd_decide(args: DecideArgs) -> Result<()> {
-    let (_repo, store) = open_store(args.repo).await?;
+    let action = parse_decision_action(&args.action)?;
     let mission_id = MissionId::parse(&args.mission_id)?;
-    let action = match args.action.as_str() {
-        "approve" => crate::model::DecisionAction::Approve,
-        "retry" => crate::model::DecisionAction::Retry,
-        "repair" => crate::model::DecisionAction::Repair,
-        "revise" => crate::model::DecisionAction::Revise,
-        "accept" => crate::model::DecisionAction::Accept,
-        "abort" => crate::model::DecisionAction::Abort,
-        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
-    };
+    let justification = decision_text(&args, &action)?;
+    let (_repo, store) = open_store(args.repo).await?;
     crate::engine::record_decision(
         &store,
         SystemClock.now_ms(),
         &mission_id,
         &args.item,
         action,
-        &args.justification,
-        "cli",
+        &justification,
     )
     .await?;
     println!(
@@ -1232,6 +1225,65 @@ async fn cmd_decide(args: DecideArgs) -> Result<()> {
         args.item
     );
     Ok(())
+}
+
+fn parse_decision_action(action: &str) -> Result<DecisionAction> {
+    Ok(match action {
+        "approve" => DecisionAction::Approve,
+        "retry" => DecisionAction::Retry,
+        "repair" => DecisionAction::Repair,
+        "revise" => DecisionAction::Revise,
+        "accept" => DecisionAction::Accept,
+        "abort" => DecisionAction::Abort,
+        other => bail!("unknown action '{other}' (approve|retry|repair|revise|accept|abort)"),
+    })
+}
+
+fn decision_text(args: &DecideArgs, action: &DecisionAction) -> Result<String> {
+    if action == &DecisionAction::Revise {
+        if args.justification.is_some() {
+            bail!(
+                "revise does not accept --justification; use --feedback-file or --feedback-stdin"
+            );
+        }
+        return match (&args.feedback_file, args.feedback_stdin) {
+            (Some(path), false) => read_feedback_file(path),
+            (None, true) => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut bytes)
+                    .context("failed to read revise feedback from stdin")?;
+                decode_feedback(bytes, "stdin")
+            }
+            _ => bail!("revise requires exactly one of --feedback-file PATH or --feedback-stdin"),
+        };
+    }
+
+    if args.feedback_file.is_some() || args.feedback_stdin {
+        bail!("--feedback-file and --feedback-stdin are only valid with revise");
+    }
+    let justification = args
+        .justification
+        .as_deref()
+        .context("non-revise decisions require --justification")?;
+    if justification.trim().is_empty() {
+        bail!("non-revise decisions require a non-empty --justification");
+    }
+    Ok(justification.to_string())
+}
+
+fn read_feedback_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read revise feedback from '{}'", path.display()))?;
+    decode_feedback(bytes, &format!("'{}'", path.display()))
+}
+
+fn decode_feedback(bytes: Vec<u8>, source: &str) -> Result<String> {
+    if bytes.is_empty() {
+        bail!("revise feedback from {source} is empty");
+    }
+    String::from_utf8(bytes).with_context(|| format!("revise feedback from {source} is not UTF-8"))
 }
 
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
@@ -1321,6 +1373,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
         }
+        print_planning_input(store.blobs(), state, "")?;
         for item in state.open_attention.values() {
             print_attention(store.blobs(), item, "  ")?;
         }
@@ -1670,7 +1723,10 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
         println!("{}", mission_view_json(view, blobs)?);
     } else {
         match view.disposition {
-            MissionDisposition::AwaitingPlan => println!("mission {mission_id}: awaiting a plan"),
+            MissionDisposition::AwaitingPlan => {
+                println!("mission {mission_id}: awaiting a plan");
+                print_planning_input(blobs, state, "  ")?;
+            }
             MissionDisposition::Parked => {
                 println!(
                     "mission {mission_id}: parked ({} attention item(s))",
@@ -1717,6 +1773,7 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
+        "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
             serde_json::json!({
                 "id": id.as_str(),
@@ -1733,6 +1790,74 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "cleanup_failure": cleanup_failure_json(state),
         "terminal_review": review_summary(state),
     }))
+}
+
+fn planning_input_json(
+    state: &crate::model::MissionState,
+    blobs: &BlobStore,
+) -> Result<serde_json::Value> {
+    if state.planning_input.latest_rejected_proposal.is_none()
+        && state.planning_input.refinement.is_none()
+    {
+        return Ok(serde_json::Value::Null);
+    }
+    let refinement = match state.planning_input.refinement.as_ref() {
+        Some(crate::model::PlanningRefinement::Guidance(guidance)) => serde_json::json!({
+            "kind": "guidance",
+            "text": guidance,
+        }),
+        Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => serde_json::json!({
+            "kind": "failure_evidence",
+            "summary": feedback.summary,
+            "justification": feedback.justification,
+            "evidence": feedback.evidence.as_ref()
+                .map(|evidence| crate::evidence::evidence_json(blobs, evidence))
+                .transpose()?,
+            "details": feedback.details.as_ref()
+                .map(|details| blobs.resolve(details).map(|text| crate::evidence::excerpt(&text)))
+                .transpose()?,
+        }),
+        None => serde_json::Value::Null,
+    };
+    Ok(serde_json::json!({
+        "base_revision": state.planning_base_revision.unwrap_or(state.revision),
+        "latest_rejected_proposal": state.planning_input.latest_rejected_proposal,
+        "refinement": refinement,
+    }))
+}
+
+fn print_planning_input(
+    blobs: &BlobStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) -> Result<()> {
+    let input = &state.planning_input;
+    if input.latest_rejected_proposal.is_none() && input.refinement.is_none() {
+        return Ok(());
+    }
+    println!("{indent}active planning input:");
+    if let Some(proposal) = &input.latest_rejected_proposal {
+        println!(
+            "{indent}  latest rejected complete proposal targeted revision {}",
+            proposal.base_revision
+        );
+    }
+    match input.refinement.as_ref() {
+        Some(crate::model::PlanningRefinement::Guidance(guidance)) => {
+            println!("{indent}  human guidance:");
+            for line in guidance.lines() {
+                println!("{indent}    {line}");
+            }
+        }
+        Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
+            println!("{indent}  failure evidence:");
+            for line in crate::evidence::render_feedback(blobs, feedback)?.lines() {
+                println!("{indent}    {line}");
+            }
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn cleanup_failure_json(state: &crate::model::MissionState) -> serde_json::Value {
@@ -1928,7 +2053,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn cli_has_no_plan_approval_bypass_and_requires_decision_justification() {
+    fn cli_has_no_plan_approval_bypass_and_exposes_only_explicit_decision_inputs() {
         assert!(Cli::try_parse_from([
             "lionclaw",
             "mission",
@@ -1947,6 +2072,41 @@ mod tests {
             "mabc123def456",
             "plan_proposal:mission",
             "approve",
+            "--justification",
+            "reviewed the proposed contract",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-file",
+            "feedback.md",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-stdin",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "mission",
+            "decide",
+            "mabc123def456",
+            "plan_proposal:mission",
+            "revise",
+            "--feedback-file",
+            "feedback.md",
+            "--feedback-stdin",
         ])
         .is_err());
         assert!(Cli::try_parse_from([
@@ -1958,8 +2118,106 @@ mod tests {
             "approve",
             "--justification",
             "reviewed the proposed contract",
+            "--actor",
+            "caller-supplied",
         ])
-        .is_ok());
+        .is_err());
+        for removed in ["--actor", "--justification"] {
+            assert!(Cli::try_parse_from([
+                "lionclaw",
+                "mission",
+                "plan",
+                "propose",
+                "mabc123def456",
+                "--file",
+                "proposal.json",
+                removed,
+                "caller-supplied",
+            ])
+            .is_err());
+        }
+    }
+
+    fn decision_args(action: &str) -> DecideArgs {
+        DecideArgs {
+            mission_id: "mabc123def456".to_string(),
+            item: "plan_proposal:mission".to_string(),
+            action: action.to_string(),
+            repo: None,
+            justification: None,
+            feedback_file: None,
+            feedback_stdin: false,
+        }
+    }
+
+    #[test]
+    fn decision_inputs_are_action_specific() {
+        let mut approve = decision_args("approve");
+        assert!(decision_text(&approve, &DecisionAction::Approve)
+            .unwrap_err()
+            .to_string()
+            .contains("require --justification"));
+        approve.justification = Some(" \n\t".to_string());
+        assert!(decision_text(&approve, &DecisionAction::Approve)
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty"));
+        approve.justification = Some("contract checked".to_string());
+        assert_eq!(
+            decision_text(&approve, &DecisionAction::Approve).unwrap(),
+            "contract checked"
+        );
+
+        let revise = decision_args("revise");
+        assert!(decision_text(&revise, &DecisionAction::Revise)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+        let mut revise_with_justification = decision_args("revise");
+        revise_with_justification.justification = Some("inline".to_string());
+        assert!(
+            decision_text(&revise_with_justification, &DecisionAction::Revise)
+                .unwrap_err()
+                .to_string()
+                .contains("does not accept --justification")
+        );
+        let mut retry = decision_args("retry");
+        retry.feedback_file = Some(PathBuf::from("feedback.md"));
+        assert!(decision_text(&retry, &DecisionAction::Retry)
+            .unwrap_err()
+            .to_string()
+            .contains("only valid with revise"));
+    }
+
+    #[test]
+    fn revise_feedback_file_preserves_large_utf8_input_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feedback.md");
+        let feedback = format!("  first\0line\n{}\t", "x".repeat(140 * 1024));
+        std::fs::write(&path, feedback.as_bytes()).unwrap();
+        let mut args = decision_args("revise");
+        args.feedback_file = Some(path);
+
+        assert_eq!(
+            decision_text(&args, &DecisionAction::Revise).unwrap(),
+            feedback
+        );
+    }
+
+    #[test]
+    fn revise_feedback_rejects_empty_or_invalid_utf8_input() {
+        assert!(decode_feedback(Vec::new(), "stdin")
+            .unwrap_err()
+            .to_string()
+            .contains("is empty"));
+        assert!(decode_feedback(vec![0xff], "stdin")
+            .unwrap_err()
+            .to_string()
+            .contains("is not UTF-8"));
+        assert_eq!(
+            decode_feedback(b" \n\t".to_vec(), "stdin").unwrap(),
+            " \n\t"
+        );
     }
 
     fn mission_type_with_runtime(runtime: Option<&str>) -> MissionType {
@@ -2129,14 +2387,11 @@ mod tests {
                     },
                 },
                 plan_hash: "h".into(),
-                actor: "test".into(),
-                justification: "initial".into(),
             },
             MissionEvent::DecisionRecorded {
                 attention_id: "plan_proposal:mission".into(),
                 action: DecisionAction::Approve,
                 justification: "test fixture approves the plan".into(),
-                actor: "test".into(),
             },
             MissionEvent::RoleRunCompleted {
                 task_id: TaskId::new("fix").unwrap(),
@@ -2244,8 +2499,66 @@ mod tests {
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
         assert_eq!(json["next_actions"], serde_json::json!(["mission decide"]));
+        assert_eq!(json["planning_input"], serde_json::Value::Null);
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
+    }
+
+    #[test]
+    fn mission_view_json_projects_complete_manual_replanning_input() {
+        use crate::model::{FailureEvidence, FailureFeedback, PlanningRefinement};
+
+        let mut state = review_state(vec![]);
+        state.planning_base_revision = Some(1);
+        state.planning_input.latest_rejected_proposal = Some(crate::model::PlanProposal {
+            base_revision: 1,
+            plan: state.plan.clone().expect("accepted plan"),
+        });
+        state.planning_input.refinement = Some(PlanningRefinement::Guidance(
+            "  preserve this exactly\n\t".to_string(),
+        ));
+        let view = MissionView {
+            state,
+            disposition: MissionDisposition::AwaitingPlan,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path().join("blobs"));
+        let json = mission_view_json(&view, &blobs).unwrap();
+
+        assert_eq!(json["planning_input"]["base_revision"], 1);
+        assert_eq!(
+            json["planning_input"]["latest_rejected_proposal"]["base_revision"],
+            1
+        );
+        assert_eq!(json["planning_input"]["refinement"]["kind"], "guidance");
+        assert_eq!(
+            json["planning_input"]["refinement"]["text"],
+            "  preserve this exactly\n\t"
+        );
+
+        let mut state = view.state;
+        state.planning_input.refinement = Some(PlanningRefinement::FailureEvidence(Box::new(
+            FailureFeedback {
+                summary: "oracle failed".to_string(),
+                evidence: Some(FailureEvidence {
+                    exit_code: 1,
+                    exit_signal: None,
+                    stdout: crate::model::PayloadRef::inline("ordinary output"),
+                    stderr: crate::model::PayloadRef::inline("actual diagnostic"),
+                }),
+                details: Some(crate::model::PayloadRef::inline("review detail")),
+                justification: "repair this".to_string(),
+            },
+        )));
+        let json = planning_input_json(&state, &blobs).unwrap();
+        assert_eq!(json["refinement"]["kind"], "failure_evidence");
+        assert_eq!(json["refinement"]["evidence"]["stdout"], "ordinary output");
+        assert_eq!(
+            json["refinement"]["evidence"]["stderr"],
+            "actual diagnostic"
+        );
+        assert_eq!(json["refinement"]["details"], "review detail");
+        assert_eq!(json["refinement"]["justification"], "repair this");
     }
 
     #[test]
@@ -2300,7 +2613,6 @@ mod tests {
                 attention_id: "terminal_review_failed:mission".into(),
                 action: crate::model::DecisionAction::Abort,
                 justification: "give up".into(),
-                actor: "test".into(),
             },
         ]);
         assert!(matches!(state.phase, MissionPhase::Aborted { .. }));
@@ -2311,7 +2623,6 @@ mod tests {
         // Aborted before any review dispatch: "none", not "owed" forever.
         let state = review_state(vec![MissionEvent::MissionAborted {
             reason: "operator stop".into(),
-            actor: "test".into(),
         }]);
         let line = review_line(&state).expect("line");
         assert!(line.contains("the mission was aborted"), "got: {line}");

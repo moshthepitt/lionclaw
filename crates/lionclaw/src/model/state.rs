@@ -75,7 +75,11 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
+    /// Monotonic dispatch identity. Successful reruns never reset it.
     pub attempts: u32,
+    /// Failures since the last successful outcome or explicit recovery
+    /// decision. This, not the dispatch identity, bounds automatic recovery.
+    pub consecutive_failures: u32,
     /// The latest handoff report, for threading into downstream prompts.
     #[serde(default)]
     pub last_report: Option<PayloadRef>,
@@ -89,7 +93,7 @@ pub struct TaskRuntimeState {
 impl TaskRuntimeState {
     pub fn automatic_retry_remaining(&self, max_attempts: u32) -> bool {
         self.status == TaskStatus::Failed
-            && self.attempts < max_attempts
+            && self.consecutive_failures < max_attempts
             && self
                 .last_failure
                 .as_ref()
@@ -136,6 +140,22 @@ pub struct FailureFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<PayloadRef>,
     pub justification: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningRefinement {
+    Guidance(String),
+    FailureEvidence(Box<FailureFeedback>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningInput {
+    /// Latest complete candidate rejected during plan ratification. Kept as
+    /// planning input until a candidate is approved.
+    pub latest_rejected_proposal: Option<PlanProposal>,
+    /// The single active refinement input for the next planning pass.
+    pub refinement: Option<PlanningRefinement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +213,9 @@ pub struct TerminalReviewState {
     /// effect ID ride on it, so a retry re-rolls under a fresh identity.
     #[serde(default)]
     pub attempts: u32,
+    /// Failures since the last completed review or explicit recovery decision.
+    #[serde(default)]
+    pub consecutive_failures: u32,
     /// The last attempt's result. A fresh verdict and a pending failure
     /// cannot coexist: a failure only follows a dispatch, and dispatch only
     /// happens without a fresh verdict (history lives in the event log).
@@ -244,7 +267,7 @@ pub enum ReviewOutcome {
 /// How a human accepted closure despite the review: `accept` on a gap park
 /// acknowledges the blocking verdict, while `accept` on a failure park waives
 /// the review outright. One value, so waived-and-acknowledged is unrepresentable;
-/// the receipt distinguishes the kinds and cites who accepted and why.
+/// the receipt distinguishes the kinds and cites why it was accepted.
 ///
 /// Both kinds are keyed to the head they were granted at: a later artifact
 /// commit stales the acceptance and re-opens the review, so neither an
@@ -255,9 +278,6 @@ pub struct ReviewAcceptance {
     /// `current_sha` at the moment of acceptance (for an acknowledgment this
     /// is also the verdict's `judged_sha` — the gap item only raises fresh).
     pub judged_sha: String,
-    /// Provenance from the `DecisionRecorded` event, folded into state so
-    /// the receipt can never cite a decision a later retry discarded.
-    pub actor: String,
     pub justification: String,
 }
 
@@ -515,16 +535,15 @@ pub struct MissionState {
     pub contract: BTreeMap<AssertionId, AssertionState>,
     pub tasks: BTreeMap<TaskId, TaskRuntimeState>,
     /// The contract-free planning phase: the runtime status of the mission
-    /// type's planning DAG. Disjoint from `tasks` (execution) — planning and
-    /// execution ids never coexist, since `plan` goes monotonically `None → Some`.
+    /// type's planning DAG. Disjoint from `tasks` (execution); the active era
+    /// decides which map receives role events and operator decisions.
     pub planning: PlanningState,
     /// Revision the active planning DAG is authoring against. `None` means the
     /// planning DAG is idle; this is independent of whether an accepted plan
     /// already exists, so the same DAG can author repairs.
     pub planning_base_revision: Option<u32>,
-    /// Evidence and human guidance projected into the active planning run.
-    #[serde(default)]
-    pub planning_feedback: Vec<FailureFeedback>,
+    /// Active candidate/guidance/evidence input for the next planning pass.
+    pub planning_input: PlanningInput,
     /// Complete plan proposal awaiting approval or automatic promotion.
     pub proposal: Option<PlanProposal>,
     /// Latest recorded artifact head (starts at `base_sha`). Oracle verdicts
@@ -568,6 +587,25 @@ pub struct MissionState {
     pub terminal_review: TerminalReviewState,
     /// Sequence number of the last folded event (optimistic-concurrency head).
     pub head: u64,
+}
+
+impl MissionState {
+    /// Runtime state for the task era currently allowed to dispatch roles.
+    pub(crate) fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
+        if self.planning_base_revision.is_some() {
+            &self.planning.tasks
+        } else {
+            &self.tasks
+        }
+    }
+
+    pub(crate) fn active_tasks_mut(&mut self) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
+        if self.planning_base_revision.is_some() {
+            &mut self.planning.tasks
+        } else {
+            &mut self.tasks
+        }
+    }
 }
 
 #[cfg(test)]

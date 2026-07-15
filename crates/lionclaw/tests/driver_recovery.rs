@@ -96,12 +96,7 @@ async fn create_approved_mission(
         .await
         .unwrap();
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(engine, &mission_id).await;

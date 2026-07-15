@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::{covered_requirement, BASE_SHA};
 use lionclaw::engine::{Engine, EngineServices};
@@ -15,9 +15,10 @@ use lionclaw::mission_type::{MissionType, RoleDefinition, SkillPackage};
 use lionclaw::model::{
     ArtifactOutcome, Assertion, AssertionId, AttentionKind, DecisionAction, Handoff, MissionConfig,
     MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef, Plan, PlanProposal,
-    PlanningDag, PlanningTask, RoleName, StopBar, Task, TaskKind,
+    PlanningDag, PlanningRefinement, PlanningTask, RecoveryConfig, RoleName, RunErrorKind, StopBar,
+    Task, TaskKind, TaskStatus,
 };
-use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
+use lionclaw::ports::{RoleRunFailure, RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 
@@ -29,6 +30,17 @@ fn tid(n: &str) -> lionclaw::model::TaskId {
 }
 fn aid(n: &str) -> AssertionId {
     AssertionId::new(n).unwrap()
+}
+
+fn markdown_section<'a>(prompt: &'a str, heading: &str) -> &'a str {
+    let marker = format!("## {heading}\n\n");
+    prompt
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("missing prompt section '{heading}'"))
+        .1
+        .split("\n\n## ")
+        .next()
+        .expect("section body")
 }
 
 fn role(name: &str, output: OutputSemantics) -> RoleDefinition {
@@ -134,60 +146,95 @@ fn proposed_plan() -> PlanProposal {
     }
 }
 
-/// A role runner that answers per output semantics: reports for the planners,
-/// a plan proposal for the author, a committed artifact for the implementer.
-fn planning_runner() -> MockRoleRunner {
-    MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
-        if req.role.name.as_str() == "strategist" {
-            assert_eq!(req.runtime, "opencode");
-            assert_eq!(req.skills.len(), 1);
-            assert_eq!(req.skills[0].name, "planning-method");
-        } else {
-            assert_eq!(req.runtime, "codex");
-            assert!(req.skills.is_empty());
-        }
-        let handoff = match req.role.output {
-            OutputSemantics::ProposesPlan => Handoff::Plan {
-                done: true,
-                report: PayloadRef::inline("proposed contract"),
-                proposal: Some(proposed_plan()),
-                request_attention: false,
-            },
-            OutputSemantics::ProducesReport => Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("planning report"),
-                request_attention: false,
-            },
-            OutputSemantics::ProducesArtifact => Handoff::Work {
-                done: true,
-                report: PayloadRef::inline("fixed it"),
-                request_attention: false,
-            },
-            OutputSemantics::EmitsVerdict => Handoff::Validate {
-                done: true,
-                report: PayloadRef::inline("looks good"),
-                items: vec![],
-                passed: true,
-                request_attention: false,
-            },
-            OutputSemantics::EmitsGapVerdict => {
-                panic!("terminal-review roles are never plan tasks")
-            }
-        };
-        let artifact =
-            (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
-                base_sha: req.base_sha.clone(),
-                head_sha: "head-1".to_string(),
-            });
-        Ok(RoleRunOutcome {
-            handoff,
-            artifact,
-            model_id: None,
-        })
-    }))
+fn candidate(task_id: &str) -> PlanProposal {
+    let mut proposal = proposed_plan();
+    proposal.plan.tasks[0].id = tid(task_id);
+    proposal.plan.tasks[0].body = format!("make {task_id} pass");
+    proposal
 }
 
-async fn planning_engine(workspace: &std::path::Path) -> Engine {
+fn expanded_candidate(base_revision: u32) -> PlanProposal {
+    let mut proposal = proposed_plan();
+    proposal.base_revision = base_revision;
+    proposal
+        .plan
+        .requirements
+        .push(covered_requirement("EXTRA-WORK", "EXTRA-HOLDS"));
+    proposal.plan.assertions.push(Assertion {
+        id: aid("EXTRA-HOLDS"),
+        prose: "the additional behavior works".to_string(),
+        oracle: Some(OracleName::new("cargo-test").unwrap()),
+    });
+    proposal.plan.tasks.push(Task {
+        id: tid("extra"),
+        kind: TaskKind::Work,
+        body: "implement the additional behavior".to_string(),
+        targets: vec![aid("EXTRA-HOLDS")],
+        role: Some(rn("implementer")),
+        depends_on: vec![],
+    });
+    proposal
+}
+
+/// A role runner that answers per output semantics: reports for the planners,
+/// a plan proposal for the author, a committed artifact for the implementer.
+fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
+    if req.role.name.as_str() == "strategist" {
+        assert_eq!(req.runtime, "opencode");
+        assert_eq!(req.skills.len(), 1);
+        assert_eq!(req.skills[0].name, "planning-method");
+    } else {
+        assert_eq!(req.runtime, "codex");
+        assert!(req.skills.is_empty());
+    }
+    let handoff = match req.role.output {
+        OutputSemantics::ProposesPlan => Handoff::Plan {
+            done: true,
+            report: PayloadRef::inline("proposed contract"),
+            proposal: Some(proposed_plan()),
+            request_attention: false,
+        },
+        OutputSemantics::ProducesReport => Handoff::Work {
+            done: true,
+            report: PayloadRef::inline("planning report"),
+            request_attention: false,
+        },
+        OutputSemantics::ProducesArtifact => Handoff::Work {
+            done: true,
+            report: PayloadRef::inline("fixed it"),
+            request_attention: false,
+        },
+        OutputSemantics::EmitsVerdict => Handoff::Validate {
+            done: true,
+            report: PayloadRef::inline("looks good"),
+            items: vec![],
+            passed: true,
+            request_attention: false,
+        },
+        OutputSemantics::EmitsGapVerdict => {
+            panic!("terminal-review roles are never plan tasks")
+        }
+    };
+    let artifact =
+        (req.role.output == OutputSemantics::ProducesArtifact).then(|| ArtifactOutcome {
+            base_sha: req.base_sha.clone(),
+            head_sha: "head-1".to_string(),
+        });
+    RoleRunOutcome {
+        handoff,
+        artifact,
+        model_id: None,
+    }
+}
+
+fn planning_runner() -> MockRoleRunner {
+    MockRoleRunner::new(Box::new(|req| Ok(successful_role_outcome(req))))
+}
+
+async fn planning_engine_with_runner(
+    workspace: &std::path::Path,
+    runner: MockRoleRunner,
+) -> Engine {
     let store = MissionStore::open(workspace).await.expect("store");
     Engine::new(
         store,
@@ -195,12 +242,16 @@ async fn planning_engine(workspace: &std::path::Path) -> Engine {
         "codex".to_string(),
         "img".to_string(),
         EngineServices::new(
-            Arc::new(planning_runner()),
+            Arc::new(runner),
             Arc::new(MockOracleRunner::exiting(0)),
             Arc::new(NoopEffectCleaner),
             Arc::new(MockClock::default()),
         ),
     )
+}
+
+async fn planning_engine(workspace: &std::path::Path) -> Engine {
+    planning_engine_with_runner(workspace, planning_runner()).await
 }
 
 #[tokio::test]
@@ -242,13 +293,7 @@ async fn planning_proposes_then_approve_seeds_the_contract_and_verifies() {
 
     // Approve: derive_promotion seeds the contract for the first time.
     engine
-        .decide(
-            &id,
-            &approve.id,
-            DecisionAction::Approve,
-            "looks good",
-            "human",
-        )
+        .decide(&id, &approve.id, DecisionAction::Approve, "looks good")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
@@ -298,22 +343,21 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         .find(|a| a.kind == AttentionKind::PlanProposal)
         .expect("parked on PlanProposal");
 
-    // Retry: the proposal is discarded and the planning DAG is re-runnable.
-    // Nothing was seeded, so nothing is weakened.
+    // Revise: the proposal is kept as the latest rejected candidate and the
+    // planning DAG is re-runnable. Nothing was seeded, so nothing is weakened.
     engine
-        .decide(
-            &id,
-            &approve.id,
-            DecisionAction::Revise,
-            "not good enough",
-            "human",
-        )
+        .decide(&id, &approve.id, DecisionAction::Revise, "not good enough")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();
-    assert!(
-        state.proposal.is_none(),
-        "the rejected proposal is discarded"
+    assert!(state.proposal.is_none());
+    assert_eq!(
+        state.planning_input.latest_rejected_proposal.as_ref(),
+        Some(&proposed_plan())
+    );
+    assert_eq!(
+        state.planning_input.refinement.as_ref(),
+        Some(&PlanningRefinement::Guidance("not good enough".to_string()))
     );
     assert!(state.plan.is_none(), "still no contract after a rejection");
     assert!(state.contract.is_empty());
@@ -322,8 +366,12 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         MissionPhase::Planning,
         "planning is re-runnable"
     );
-    assert_eq!(state.planning_feedback.len(), 1);
-    assert_eq!(state.planning_feedback[0].justification, "not good enough");
+    for runtime in state.planning.tasks.values() {
+        assert_eq!(runtime.status, TaskStatus::Pending);
+        assert!(runtime.last_report.is_none());
+        assert!(runtime.last_failure.is_none());
+        assert!(runtime.feedback.is_empty());
+    }
 
     engine.advance(&id).await.unwrap();
     let events = engine.store().load(&id).await.unwrap();
@@ -344,8 +392,394 @@ async fn revising_a_proposal_rejects_it_and_re_runs_planning() {
         .blobs()
         .resolve(second_strategist_prompt)
         .unwrap();
-    assert!(prompt.contains("Required rework"));
-    assert!(prompt.contains("not good enough"));
+    assert_eq!(
+        markdown_section(&prompt, "Active planning input"),
+        "### Human guidance\n\nnot good enough"
+    );
+    let rejected = markdown_section(&prompt, "Latest rejected plan candidate");
+    assert!(rejected.contains("\"base_revision\": 0"));
+    assert!(rejected.contains("make it pass"));
+}
+
+#[tokio::test]
+async fn replanning_prompt_combines_the_accepted_plan_rejected_candidate_and_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine.propose_plan(&id, proposed_plan()).await.unwrap();
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "initial plan is sound",
+        )
+        .await
+        .unwrap();
+    let rejected = expanded_candidate(1);
+    engine.propose_plan(&id, rejected.clone()).await.unwrap();
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Revise,
+            "keep the new requirement but use one coherent task",
+        )
+        .await
+        .unwrap();
+
+    engine.advance(&id).await.unwrap();
+    let events = engine.store().load(&id).await.unwrap();
+    let prompt_ref = events
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            MissionEvent::RoleRunRequested {
+                task_id, prompt, ..
+            } if task_id == &tid("strategist") => Some(prompt),
+            _ => None,
+        })
+        .expect("strategist prompt");
+    let prompt = engine.store().blobs().resolve(prompt_ref).unwrap();
+
+    let accepted = markdown_section(&prompt, "Current accepted plan");
+    assert!(accepted.contains("TESTS-PASS"));
+    assert!(!accepted.contains("EXTRA-HOLDS"));
+    let rejected_section = markdown_section(&prompt, "Latest rejected plan candidate");
+    assert!(rejected_section.contains("\"base_revision\": 1"));
+    assert!(rejected_section.contains("EXTRA-HOLDS"));
+    assert_eq!(
+        markdown_section(&prompt, "Active planning input"),
+        "### Human guidance\n\nkeep the new requirement but use one coherent task"
+    );
+}
+
+#[tokio::test]
+async fn ratification_can_revise_a_to_b_to_c_and_then_approve() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    engine.propose_plan(&id, candidate("fix-a")).await.unwrap();
+    engine.propose_plan(&id, candidate("fix-a2")).await.unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(state.proposal.as_ref(), Some(&candidate("fix-a2")));
+    assert!(state.planning_input.latest_rejected_proposal.is_none());
+    assert!(state.planning_input.refinement.is_none());
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Revise,
+            "A needs narrower tasks",
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(
+        state.planning_input.latest_rejected_proposal.as_ref(),
+        Some(&candidate("fix-a2"))
+    );
+    assert_eq!(
+        state.planning_input.refinement.as_ref(),
+        Some(&PlanningRefinement::Guidance(
+            "A needs narrower tasks".to_string()
+        ))
+    );
+    assert!(state.proposal.is_none());
+    assert!(state.plan.is_none());
+    assert_eq!(state.planning_base_revision, Some(0));
+
+    engine.propose_plan(&id, candidate("fix-b")).await.unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(state.proposal.as_ref(), Some(&candidate("fix-b")));
+    assert_eq!(
+        state.planning_input.latest_rejected_proposal.as_ref(),
+        Some(&candidate("fix-a2"))
+    );
+    assert_eq!(
+        state.planning_input.refinement.as_ref(),
+        Some(&PlanningRefinement::Guidance(
+            "A needs narrower tasks".to_string()
+        ))
+    );
+
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Revise,
+            "B missed the oracle",
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(
+        state.planning_input.latest_rejected_proposal.as_ref(),
+        Some(&candidate("fix-b"))
+    );
+    assert_eq!(
+        state.planning_input.refinement.as_ref(),
+        Some(&PlanningRefinement::Guidance(
+            "B missed the oracle".to_string()
+        ))
+    );
+    assert!(state.proposal.is_none());
+    assert_eq!(state.planning_base_revision, Some(0));
+
+    engine.propose_plan(&id, candidate("fix-c")).await.unwrap();
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "C is acceptable",
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.plan.as_ref(), Some(&candidate("fix-c").plan));
+    assert!(state.proposal.is_none());
+    assert!(state.planning_input.latest_rejected_proposal.is_none());
+    assert!(state.planning_input.refinement.is_none());
+}
+
+#[tokio::test]
+async fn ratification_revisions_are_unbounded_and_keep_only_the_newest_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for i in 0..6 {
+        let proposal = candidate(&format!("fix-{i}"));
+        engine.propose_plan(&id, proposal.clone()).await.unwrap();
+        let guidance = format!("feedback-{i}");
+        engine
+            .decide(
+                &id,
+                "plan_proposal:mission",
+                DecisionAction::Revise,
+                &guidance,
+            )
+            .await
+            .unwrap();
+        let state = engine.load_state(&id).await.unwrap();
+        assert_eq!(
+            state.planning_input.latest_rejected_proposal.as_ref(),
+            Some(&proposal)
+        );
+        assert_eq!(
+            state.planning_input.refinement.as_ref(),
+            Some(&PlanningRefinement::Guidance(guidance))
+        );
+        assert!(state.proposal.is_none());
+        assert_eq!(state.planning_base_revision, Some(0));
+        assert!(state.planning.tasks.values().all(|runtime| {
+            runtime.status == TaskStatus::Pending && runtime.last_report.is_none()
+        }));
+    }
+
+    let events = engine.store().load(&id).await.unwrap();
+    for i in 0..6 {
+        assert!(events.iter().any(|envelope| matches!(
+            &envelope.event,
+            MissionEvent::DecisionRecorded { justification, .. } if justification == &format!("feedback-{i}")
+        )));
+    }
+}
+
+#[tokio::test]
+async fn successful_refinement_cycles_do_not_consume_the_recovery_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let strategist_calls = Arc::new(Mutex::new(0_u32));
+    let seen = strategist_calls.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.role.name.as_str() == "strategist" {
+            let mut calls = seen.lock().unwrap();
+            *calls += 1;
+            if *calls == 4 {
+                return Err(RoleRunFailure {
+                    kind: RunErrorKind::Timeout,
+                    detail: "temporary provider timeout".to_string(),
+                });
+            }
+        }
+        Ok(successful_role_outcome(request))
+    }));
+    let engine = planning_engine_with_runner(dir.path(), runner).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "refine without spending recovery",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: RecoveryConfig { max_attempts: 3 },
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for cycle in 0..3 {
+        engine.advance(&id).await.unwrap();
+        engine
+            .decide(
+                &id,
+                "plan_proposal:mission",
+                DecisionAction::Revise,
+                &format!("refine cycle {cycle}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let view = engine.advance(&id).await.unwrap();
+    assert_eq!(view.state.phase, MissionPhase::AttentionNeeded);
+    assert!(view.state.proposal.is_some());
+    assert_eq!(*strategist_calls.lock().unwrap(), 5);
+    assert_eq!(view.state.planning.tasks[&tid("strategist")].attempts, 5);
+    assert_eq!(
+        view.state.planning.tasks[&tid("strategist")].consecutive_failures,
+        0
+    );
+}
+
+#[tokio::test]
+async fn revise_guidance_preserves_whitespace_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&id, candidate("fix-space"))
+        .await
+        .unwrap();
+
+    let guidance = "  keep these exact bytes\n\t";
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Revise,
+            guidance,
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert_eq!(
+        state.planning_input.refinement.as_ref(),
+        Some(&PlanningRefinement::Guidance(guidance.to_string()))
+    );
+}
+
+#[tokio::test]
+async fn aborting_a_plan_proposal_records_the_generic_decision_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let id = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning: planning_dag(),
+                recovery: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&id, candidate("fix-abort"))
+        .await
+        .unwrap();
+
+    engine
+        .decide(
+            &id,
+            "plan_proposal:mission",
+            DecisionAction::Abort,
+            "stop exactly here",
+        )
+        .await
+        .unwrap();
+    let state = engine.load_state(&id).await.unwrap();
+    assert!(matches!(
+        state.phase,
+        MissionPhase::Aborted { ref reason } if reason == "stop exactly here"
+    ));
+    assert!(state.open_attention.is_empty());
+
+    let events = engine.store().load(&id).await.unwrap();
+    let tail: Vec<_> = events.iter().rev().take(2).collect();
+    assert!(matches!(
+        &tail[1].event,
+        MissionEvent::DecisionRecorded {
+            action: DecisionAction::Abort,
+            justification,
+            ..
+        } if justification == "stop exactly here"
+    ));
+    assert!(matches!(
+        &tail[0].event,
+        MissionEvent::MissionAborted { reason } if reason == "stop exactly here"
+    ));
+    assert_eq!(tail[0].sequence_no, tail[1].sequence_no + 1);
 }
 
 /// A failed planning node must raise a *retryable* NodeFailed, never wedge the
@@ -411,13 +845,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
 
     // Retry re-pends the planning node (a fresh attempt would re-dispatch it).
     engine
-        .decide(
-            &id,
-            &node_failed.id,
-            DecisionAction::Retry,
-            "try again",
-            "human",
-        )
+        .decide(&id, &node_failed.id, DecisionAction::Retry, "try again")
         .await
         .unwrap();
     let state = engine.load_state(&id).await.unwrap();

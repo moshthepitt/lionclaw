@@ -188,8 +188,6 @@ mod tests {
                         plan: plan.clone(),
                     },
                     plan_hash: "h".into(),
-                    actor: "test".into(),
-                    justification: "initial".into(),
                 },
             ),
             env(
@@ -199,7 +197,6 @@ mod tests {
                     attention_id: "plan_proposal:mission".into(),
                     action: crate::model::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
-                    actor: "test".into(),
                 },
             ),
         ];

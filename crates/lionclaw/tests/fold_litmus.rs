@@ -51,6 +51,30 @@ async fn assert_fold_litmus(h: &TestHarness, mission_id: &MissionId) {
     assert_eq!(rebuilt, once, "state diverged after cursor rebuild");
 }
 
+fn assert_every_prefix_is_deterministic(events: &[lionclaw::model::EventEnvelope]) {
+    for end in 1..=events.len() {
+        let prefix = &events[..end];
+        let expected = fold(prefix.to_vec()).expect("prefix fold");
+        assert_eq!(fold(prefix.to_vec()).expect("repeat fold"), expected);
+        let json = serde_json::to_string(&expected).expect("encode prefix state");
+        assert_eq!(
+            serde_json::from_str::<lionclaw::model::MissionState>(&json)
+                .expect("decode prefix state"),
+            expected
+        );
+        for split in 1..end {
+            let mut incremental = fold(prefix[..split].to_vec()).expect("incremental prefix");
+            for event in &prefix[split..] {
+                apply(&mut incremental, event);
+            }
+            assert_eq!(
+                incremental, expected,
+                "prefix ending at {end} diverged at split {split}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn fold_is_deterministic_incremental_and_serde_stable() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -71,12 +95,7 @@ async fn fold_is_deterministic_incremental_and_serde_stable() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -109,12 +128,7 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -128,7 +142,6 @@ async fn a_review_mission_satisfies_the_litmus_through_park_and_acknowledge() {
             "terminal_review_gaps:mission",
             DecisionAction::Accept,
             "acceptable",
-            "test",
         )
         .await
         .expect("decide");
@@ -160,12 +173,7 @@ async fn snapshot_resume_matches_full_refold() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -196,4 +204,187 @@ async fn snapshot_resume_matches_full_refold() {
         .expect("state");
     let via_full = fold(events).expect("fold");
     assert_eq!(via_snapshot, via_full);
+}
+
+#[tokio::test]
+async fn iterative_ratification_and_abort_survive_every_prefix_and_snapshot_generation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "ratify repeatedly",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+
+    for (name, feedback) in [("A", "refine A"), ("B", "refine B")] {
+        let mut plan = simple_plan();
+        plan.tasks[0].body = format!("candidate {name}");
+        h.engine
+            .propose_plan(&mission_id, proposal(0, plan))
+            .await
+            .expect("propose candidate");
+        h.engine
+            .decide(
+                &mission_id,
+                "plan_proposal:mission",
+                DecisionAction::Revise,
+                feedback,
+            )
+            .await
+            .expect("revise candidate");
+    }
+    let mut plan_c = simple_plan();
+    plan_c.tasks[0].body = "candidate C".to_string();
+    h.engine
+        .propose_plan(&mission_id, proposal(0, plan_c))
+        .await
+        .expect("propose C");
+    h.engine
+        .decide(
+            &mission_id,
+            "plan_proposal:mission",
+            DecisionAction::Approve,
+            "C is ready",
+        )
+        .await
+        .expect("approve C");
+
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    assert_every_prefix_is_deterministic(&events);
+    let expected = fold(events).expect("full fold");
+    let rebuilt = h
+        .engine
+        .store()
+        .rebuild_cursors(&mission_id, 10)
+        .await
+        .expect("snapshot rebuild");
+    assert_eq!(rebuilt, expected);
+
+    let database = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join(".lionclaw/mission.db").display()
+    ))
+    .await
+    .expect("open database");
+    sqlx::query(
+        "UPDATE mission_snapshots SET reducer_version = ?1, state_json = 'not-json' \
+         WHERE mission_id = ?2",
+    )
+    .bind((lionclaw::model::REDUCER_VERSION - 1) as i64)
+    .bind(mission_id.as_str())
+    .execute(&database)
+    .await
+    .expect("age snapshot");
+    let from_old_snapshot = h
+        .engine
+        .store()
+        .load_state_snapshotted(&mission_id)
+        .await
+        .expect("fallback load")
+        .expect("state");
+    assert_eq!(from_old_snapshot, expected);
+    h.engine
+        .store()
+        .save_snapshot(&from_old_snapshot, 11)
+        .await
+        .expect("replace stale snapshot");
+    assert_eq!(
+        h.engine
+            .store()
+            .snapshot_meta(&mission_id)
+            .await
+            .expect("snapshot meta")
+            .expect("snapshot")
+            .1,
+        lionclaw::model::REDUCER_VERSION
+    );
+
+    let aborted_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "abort during ratification",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create aborted mission");
+    h.engine
+        .propose_plan(&aborted_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose abort candidate");
+    h.engine
+        .decide(
+            &aborted_id,
+            "plan_proposal:mission",
+            DecisionAction::Abort,
+            "stop here",
+        )
+        .await
+        .expect("abort");
+    let aborted_events = h
+        .engine
+        .store()
+        .load(&aborted_id)
+        .await
+        .expect("aborted events");
+    assert_every_prefix_is_deterministic(&aborted_events);
+}
+
+#[tokio::test]
+async fn failure_driven_replanning_survives_every_prefix_and_snapshot_rebuild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness_with_type(
+        dir.path(),
+        review_mission_type(),
+        review_runner(vec![(false, vec![blocking_gap()])]),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "repair the reviewed behavior",
+            BASE_SHA,
+            review_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    h.engine.advance(&mission_id).await.expect("advance to gap");
+    h.engine
+        .decide(
+            &mission_id,
+            "terminal_review_gaps:mission",
+            DecisionAction::Revise,
+            "repair what the reviewer observed",
+        )
+        .await
+        .expect("replan");
+
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    assert_every_prefix_is_deterministic(&events);
+    let expected = fold(events).expect("full fold");
+    let rebuilt = h
+        .engine
+        .store()
+        .rebuild_cursors(&mission_id, 20)
+        .await
+        .expect("snapshot rebuild");
+    assert_eq!(rebuilt, expected);
 }

@@ -47,7 +47,7 @@ async fn started() -> (
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -59,10 +59,7 @@ async fn complete_revision_retires_omitted_tasks_and_seeds_new_tasks() {
     let (_dir, h, id) = started().await;
     let mut next = simple_plan();
     next.tasks = vec![new_task("fix2")];
-    h.engine
-        .propose_plan(&id, proposal(1, next), "test", "new approach")
-        .await
-        .unwrap();
+    h.engine.propose_plan(&id, proposal(1, next)).await.unwrap();
     approve_plan(&h.engine, &id).await;
 
     let state = h.engine.load_state(&id).await.unwrap();
@@ -85,7 +82,7 @@ async fn stale_and_immaterial_proposals_append_nothing() {
 
     let stale = h
         .engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "stale")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -95,7 +92,7 @@ async fn stale_and_immaterial_proposals_append_nothing() {
 
     let same = h
         .engine
-        .propose_plan(&id, proposal(1, simple_plan()), "test", "same")
+        .propose_plan(&id, proposal(1, simple_plan()))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -118,9 +115,7 @@ async fn requirements_cannot_disappear_or_weaken() {
         },
     }];
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(1, removed), "test", "drop requirement")
-            .await,
+        h.engine.propose_plan(&id, proposal(1, removed)).await,
         Err(ProposeError::Rejected(
             ProposalError::RequirementWeakened { .. }
         ))
@@ -131,9 +126,7 @@ async fn requirements_cannot_disappear_or_weaken() {
         rationale: "too hard".into(),
     };
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(1, limited), "test", "weaken")
-            .await,
+        h.engine.propose_plan(&id, proposal(1, limited)).await,
         Err(ProposeError::Rejected(
             ProposalError::RequirementWeakened { .. }
         ))
@@ -158,7 +151,7 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
         },
     });
     h.engine
-        .propose_plan(&id, proposal(0, initial.clone()), "test", "initial")
+        .propose_plan(&id, proposal(0, initial.clone()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -168,7 +161,7 @@ async fn a_limitation_may_become_covered_but_not_the_reverse() {
     };
     initial.tasks = vec![new_task("fix2")];
     h.engine
-        .propose_plan(&id, proposal(1, initial), "test", "cover limitation")
+        .propose_plan(&id, proposal(1, initial))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
@@ -180,9 +173,7 @@ async fn assertions_are_preserved_and_oracle_binding_only_strengthens() {
     let mut changed = simple_plan();
     changed.assertions[0].prose = "different claim".into();
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(1, changed), "test", "rewrite")
-            .await,
+        h.engine.propose_plan(&id, proposal(1, changed)).await,
         Err(ProposeError::Rejected(
             ProposalError::AssertionWeakened { .. }
         ))
@@ -191,9 +182,7 @@ async fn assertions_are_preserved_and_oracle_binding_only_strengthens() {
     let mut rebound = simple_plan();
     rebound.assertions[0].oracle = Some(OracleName::new("other-oracle").unwrap());
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(1, rebound), "test", "rebind")
-            .await,
+        h.engine.propose_plan(&id, proposal(1, rebound)).await,
         Err(ProposeError::Rejected(
             ProposalError::AssertionWeakened { .. }
         ))
@@ -206,24 +195,20 @@ async fn retained_task_ids_are_immutable_and_retired_ids_never_revive() {
     let mut changed = simple_plan();
     changed.tasks[0].body = "quietly different".into();
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(1, changed), "test", "mutate task")
-            .await,
+        h.engine.propose_plan(&id, proposal(1, changed)).await,
         Err(ProposeError::Rejected(ProposalError::TaskChanged { .. }))
     ));
 
     let mut revision = simple_plan();
     revision.tasks = vec![new_task("fix2")];
     h.engine
-        .propose_plan(&id, proposal(1, revision.clone()), "test", "retire fix")
+        .propose_plan(&id, proposal(1, revision.clone()))
         .await
         .unwrap();
     approve_plan(&h.engine, &id).await;
     revision.tasks.push(new_task("fix"));
     assert!(matches!(
-        h.engine
-            .propose_plan(&id, proposal(2, revision), "test", "revive fix")
-            .await,
+        h.engine.propose_plan(&id, proposal(2, revision)).await,
         Err(ProposeError::Rejected(ProposalError::TaskIdReused { .. }))
     ));
 }
@@ -238,7 +223,7 @@ async fn approval_policy_applies_to_every_revision() {
         .await
         .unwrap();
     h.engine
-        .propose_plan(&id, proposal(0, simple_plan()), "test", "initial")
+        .propose_plan(&id, proposal(0, simple_plan()))
         .await
         .unwrap();
     let state = h.engine.load_state(&id).await.unwrap();
@@ -250,7 +235,6 @@ async fn approval_policy_applies_to_every_revision() {
             "plan_proposal:mission",
             DecisionAction::Approve,
             "approved",
-            "human",
         )
         .await
         .unwrap();
@@ -258,10 +242,7 @@ async fn approval_policy_applies_to_every_revision() {
 
     let mut next = simple_plan();
     next.tasks = vec![new_task("fix2")];
-    h.engine
-        .propose_plan(&id, proposal(1, next), "test", "revision")
-        .await
-        .unwrap();
+    h.engine.propose_plan(&id, proposal(1, next)).await.unwrap();
     let state = h.engine.load_state(&id).await.unwrap();
     assert_eq!(state.revision, 1);
     assert!(state.proposal.is_some());
@@ -283,8 +264,6 @@ async fn initial_proposal_must_target_revision_zero() {
                 base_revision: 1,
                 plan: simple_plan(),
             },
-            "test",
-            "wrong base",
         )
         .await
         .unwrap_err();

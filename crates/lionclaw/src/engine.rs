@@ -28,7 +28,8 @@ use crate::ports::{
 };
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
-    PlanningPromptContext, PromptContext, TerminalReviewPromptContext,
+    PlanningPromptContext, PlanningPromptInput, PlanningPromptRefinement, PromptContext,
+    TerminalReviewPromptContext,
 };
 use crate::store::{AppendError, MissionStore, NewEvent};
 
@@ -287,8 +288,6 @@ impl Engine {
         &self,
         mission_id: &MissionId,
         proposal: PlanProposal,
-        actor: &str,
-        justification: &str,
     ) -> Result<(), ProposeError> {
         let state = self.load_state(mission_id).await?;
         if !state.inflight.is_empty() {
@@ -300,8 +299,6 @@ impl Engine {
         let event = NewEvent::new(MissionEvent::PlanProposed {
             proposal,
             plan_hash,
-            actor: actor.to_string(),
-            justification: justification.to_string(),
         });
         self.store
             .append(mission_id, state.head, &[event], self.clock.now_ms())
@@ -318,7 +315,6 @@ impl Engine {
         attention_id: &str,
         action: crate::model::DecisionAction,
         justification: &str,
-        actor: &str,
     ) -> Result<()> {
         record_decision(
             &self.store,
@@ -327,7 +323,6 @@ impl Engine {
             attention_id,
             action,
             justification,
-            actor,
         )
         .await
     }
@@ -616,14 +611,16 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
-        let previous_failure = state
-            .planning
-            .tasks
-            .get(task_id)
-            .or_else(|| state.tasks.get(task_id))
-            .and_then(|task| task.last_failure.as_ref());
-        if attempt_no > 1 && previous_failure.is_some_and(crate::model::RunFailure::transient) {
-            let seconds = 1_u64 << (attempt_no.saturating_sub(2)).min(2);
+        let previous_task = state.active_tasks().get(task_id);
+        if previous_task
+            .and_then(|task| task.last_failure.as_ref())
+            .is_some_and(crate::model::RunFailure::transient)
+        {
+            let exponent = previous_task
+                .map(|task| task.consecutive_failures.saturating_sub(1))
+                .unwrap_or(0)
+                .min(2);
+            let seconds = 1_u64 << exponent;
             tokio::time::sleep(Duration::from_secs(seconds)).await;
         }
         match self.role_runner.run(request).await {
@@ -921,16 +918,14 @@ impl Engine {
             .context("dispatched planning task not in the DAG")?;
         let upstream_reports =
             self.resolve_upstream_reports(&state.planning.tasks, &task.depends_on)?;
-        let mut feedback = state
+        let task_feedback = state
             .planning
             .tasks
             .get(&task.id)
             .map(|runtime| self.resolve_task_feedback(runtime))
             .transpose()?
             .unwrap_or_default();
-        for item in &state.planning_feedback {
-            feedback.push(crate::evidence::render_feedback(self.store.blobs(), item)?);
-        }
+        let planning_input = self.resolve_planning_prompt_input(state)?;
         let oracle_inventory: Vec<String> = self
             .mission_type
             .oracles
@@ -943,17 +938,39 @@ impl Engine {
             &PlanningPromptContext {
                 objective: &state.objective,
                 base_revision: state.planning_base_revision.unwrap_or(state.revision),
-                current_plan: state.plan.as_ref(),
+                input: planning_input,
                 playbook: self.mission_type.playbook.as_deref(),
                 roles: &self.mission_type.roles,
                 oracle_inventory: &oracle_inventory,
                 task_body: &intent.body,
                 upstream_reports: &upstream_reports,
                 skills: &skills,
-                feedback: &feedback,
+                task_feedback: &task_feedback,
             },
         );
         Ok((prompt, "plan-role"))
+    }
+
+    fn resolve_planning_prompt_input<'a>(
+        &self,
+        state: &'a MissionState,
+    ) -> Result<PlanningPromptInput<'a>> {
+        let refinement = match state.planning_input.refinement.as_ref() {
+            Some(crate::model::PlanningRefinement::Guidance(guidance)) => {
+                Some(PlanningPromptRefinement::HumanGuidance(guidance))
+            }
+            Some(crate::model::PlanningRefinement::FailureEvidence(feedback)) => {
+                Some(PlanningPromptRefinement::FailureEvidence(
+                    crate::evidence::render_feedback(self.store.blobs(), feedback)?,
+                ))
+            }
+            None => None,
+        };
+        Ok(PlanningPromptInput {
+            accepted_plan: state.plan.as_ref(),
+            latest_rejected_candidate: state.planning_input.latest_rejected_proposal.as_ref(),
+            refinement,
+        })
     }
 
     /// Turn a role-dispatch intent into a recorded request: assemble the
@@ -1222,7 +1239,6 @@ pub async fn record_decision(
     attention_id: &str,
     action: crate::model::DecisionAction,
     justification: &str,
-    actor: &str,
 ) -> Result<()> {
     let state = store.require_state(mission_id).await?;
     // Preserve the typed `DecisionError` as the error source (its `Display` is
@@ -1231,12 +1247,17 @@ pub async fn record_decision(
     crate::model::validate_decision(&state, attention_id, &action, justification)?;
     let event = NewEvent::new(MissionEvent::DecisionRecorded {
         attention_id: attention_id.to_string(),
-        action,
+        action: action.clone(),
         justification: justification.to_string(),
-        actor: actor.to_string(),
     });
+    let mut events = vec![event];
+    if action == crate::model::DecisionAction::Abort {
+        events.push(NewEvent::new(MissionEvent::MissionAborted {
+            reason: justification.to_string(),
+        }));
+    }
     store
-        .append(mission_id, state.head, &[event], now_ms)
+        .append(mission_id, state.head, &events, now_ms)
         .await?;
     Ok(())
 }

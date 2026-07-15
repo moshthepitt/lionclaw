@@ -93,7 +93,12 @@ pub fn validate_decision(
             kind: item.kind,
         });
     }
-    if justification.trim().is_empty() {
+    let justification_missing = if action == &DecisionAction::Revise {
+        justification.is_empty()
+    } else {
+        justification.trim().is_empty()
+    };
+    if justification_missing {
         return Err(DecisionError::JustificationRequired);
     }
     Ok(())

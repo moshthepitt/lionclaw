@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
-pub const SCHEMA_VERSION: u32 = 3;
+/// Bumped for the strict decision/proposal/abort wire break that removes
+/// caller-supplied provenance from authoritative events.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,7 +269,7 @@ pub enum EffectResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum MissionEvent {
     MissionCreated {
@@ -289,8 +291,6 @@ pub enum MissionEvent {
         proposal: PlanProposal,
         /// sha256 of the canonical plan JSON.
         plan_hash: String,
-        actor: String,
-        justification: String,
     },
     RoleRunRequested {
         task_id: TaskId,
@@ -400,7 +400,6 @@ pub enum MissionEvent {
     },
     MissionAborted {
         reason: String,
-        actor: String,
     },
     /// A human/orchestrator decision resolving an open attention item (a
     /// durable interrupt). The fold applies the action and marks the item
@@ -410,13 +409,12 @@ pub enum MissionEvent {
         attention_id: String,
         action: DecisionAction,
         justification: String,
-        actor: String,
     },
 }
 
 /// The actions a decision can take on an open attention item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionAction {
     /// Approve a proposed plan or a cleared gate checkpoint.
     Approve,
@@ -567,11 +565,139 @@ mod compat_tests {
                 },
             },
             plan_hash: "hash".into(),
-            actor: "author".into(),
-            justification: "initial proposal".into(),
         };
 
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<MissionEvent>(&json).unwrap(), event);
+    }
+
+    fn empty_plan_proposal() -> PlanProposal {
+        PlanProposal {
+            base_revision: 0,
+            plan: crate::model::Plan {
+                requirements: vec![],
+                assertions: vec![],
+                tasks: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn plan_proposed_serializes_with_only_proposal_and_engine_hash() {
+        let event = MissionEvent::PlanProposed {
+            proposal: empty_plan_proposal(),
+            plan_hash: "engine-hash".into(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "plan_proposed",
+                "proposal": {
+                    "base_revision": 0,
+                    "plan": {
+                        "requirements": [],
+                        "assertions": [],
+                        "tasks": []
+                    }
+                },
+                "plan_hash": "engine-hash"
+            })
+        );
+        assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn mission_aborted_serializes_with_only_reason() {
+        let event = MissionEvent::MissionAborted {
+            reason: "not worth continuing".into(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "mission_aborted",
+                "reason": "not worth continuing"
+            })
+        );
+        assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn every_decision_action_uses_the_same_strict_wire_shape() {
+        let cases = [
+            DecisionAction::Approve,
+            DecisionAction::Revise,
+            DecisionAction::Retry,
+            DecisionAction::Repair,
+            DecisionAction::Accept,
+            DecisionAction::Abort,
+        ];
+
+        for action in cases {
+            let event = MissionEvent::DecisionRecorded {
+                attention_id: format!("attn-{}", action.slug()),
+                action: action.clone(),
+                justification: format!("because {}", action.slug()),
+            };
+
+            let json = serde_json::to_value(&event).unwrap();
+
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "type": "decision_recorded",
+                    "attention_id": format!("attn-{}", action.slug()),
+                    "action": action.slug(),
+                    "justification": format!("because {}", action.slug())
+                })
+            );
+            assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn removed_event_fields_and_unknown_nested_fields_are_rejected() {
+        let rejected = [
+            r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]}},"plan_hash":"hash","actor":"caller"}"#,
+            r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]}},"plan_hash":"hash","justification":"dead prose"}"#,
+            r#"{"type":"plan_proposed","proposal":{"base_revision":0,"plan":{"requirements":[],"assertions":[],"tasks":[]},"unexpected":"nested"}},"plan_hash":"hash"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"approve","justification":"ok","actor":"caller"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"approve","justification":"ok","unexpected":"field"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":{"action":"approve"},"justification":"ok"}"#,
+            r#"{"type":"decision_recorded","attention_id":"a","action":"unknown","justification":"ok"}"#,
+            r#"{"type":"mission_aborted","reason":"stop","actor":"caller"}"#,
+            r#"{"type":"mission_aborted","reason":"stop","unexpected":"field"}"#,
+        ];
+
+        for raw in rejected {
+            assert!(
+                serde_json::from_str::<MissionEvent>(raw).is_err(),
+                "unexpectedly accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_specific_decision_event_types_are_not_in_the_wire_vocabulary() {
+        for event_type in [
+            "plan_approved",
+            "plan_revised",
+            "retry_recorded",
+            "repair_recorded",
+            "accept_recorded",
+            "abort_recorded",
+        ] {
+            let raw = serde_json::json!({
+                "type": event_type,
+                "attention_id": "attn",
+                "justification": "because"
+            });
+            assert!(serde_json::from_value::<MissionEvent>(raw).is_err());
+        }
     }
 }

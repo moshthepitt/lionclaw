@@ -34,7 +34,6 @@ pub async fn approve_plan(engine: &Engine, mission_id: &lionclaw::model::Mission
             "plan_proposal:mission",
             lionclaw::model::DecisionAction::Approve,
             "test approval",
-            "test",
         )
         .await
         .expect("approve plan");

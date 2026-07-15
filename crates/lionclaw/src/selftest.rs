@@ -476,7 +476,6 @@ async fn approve_plan(engine: &Engine, mission_id: &MissionId) -> Result<()> {
             "plan_proposal:mission",
             DecisionAction::Approve,
             "self-test approves the plan",
-            "self-test",
         )
         .await?;
     Ok(())
@@ -651,7 +650,7 @@ async fn check_happy_writer_and_resume() -> Result<()> {
             )
             .await?;
         engine
-            .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
+            .propose_plan(&id, proposal(0, oracle_plan()))
             .await
             .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
         approve_plan(&engine, &id).await?;
@@ -709,7 +708,7 @@ async fn check_prepared_input() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
+        .propose_plan(&id, proposal(0, oracle_plan()))
         .await
         .map_err(|error| anyhow::anyhow!("plan proposal rejected: {error}"))?;
     approve_plan(&engine, &id).await?;
@@ -782,7 +781,7 @@ async fn check_oracle_honesty() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(&id, proposal(0, oracle_plan()), "self-test", "initial plan")
+        .propose_plan(&id, proposal(0, oracle_plan()))
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &id).await?;
@@ -846,12 +845,7 @@ async fn check_replanning() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, oracle_plan()),
-            "self-test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, oracle_plan()))
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -867,12 +861,7 @@ async fn check_replanning() -> Result<()> {
         depends_on: Vec::new(),
     }];
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(1, next),
-            "self-test",
-            "swap the coverer",
-        )
+        .propose_plan(&mission_id, proposal(1, next))
         .await
         .map_err(|e| anyhow::anyhow!("revision rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -896,10 +885,7 @@ async fn check_replanning() -> Result<()> {
     // existing assertion to a different oracle.
     let mut weaken = state.plan.clone().expect("accepted plan");
     weaken.assertions[0].oracle = Some(OracleName::new("cargo-clippy").expect("oracle name"));
-    match engine
-        .propose_plan(&mission_id, proposal(2, weaken), "self-test", "weaken")
-        .await
-    {
+    match engine.propose_plan(&mission_id, proposal(2, weaken)).await {
         Err(ProposeError::Rejected(ProposalError::AssertionWeakened { .. })) => Ok(()),
         Ok(()) => anyhow::bail!("contract-weakening revision was accepted"),
         Err(other) => anyhow::bail!("weakening refused for the wrong reason: {other}"),
@@ -974,12 +960,7 @@ async fn check_terminal_review() -> Result<()> {
         )
         .await?;
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, oracle_plan()),
-            "self-test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, oracle_plan()))
         .await
         .map_err(|e| anyhow::anyhow!("plan proposal rejected: {e}"))?;
     approve_plan(&engine, &mission_id).await?;
@@ -1005,7 +986,6 @@ async fn check_terminal_review() -> Result<()> {
             "terminal_review_gaps:mission",
             DecisionAction::Accept,
             "self-test acknowledges the gap",
-            "self-test",
         )
         .await?;
     engine.advance(&mission_id).await?;

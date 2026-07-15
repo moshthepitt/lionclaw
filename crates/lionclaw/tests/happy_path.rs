@@ -28,12 +28,7 @@ async fn passing_oracle_yields_verified_finish() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -84,12 +79,7 @@ async fn already_satisfied_work_verifies_without_advancing_head() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -130,12 +120,7 @@ async fn failing_oracle_never_reports_verified() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
@@ -189,12 +174,7 @@ async fn worker_reporting_not_done_parks_with_attention() {
         .await
         .expect("create");
     h.engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, simple_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;

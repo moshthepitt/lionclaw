@@ -79,12 +79,7 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
         .await
         .expect("create");
     engine
-        .propose_plan(
-            &mission_id,
-            proposal(0, advisory_plan()),
-            "test",
-            "initial plan",
-        )
+        .propose_plan(&mission_id, proposal(0, advisory_plan()))
         .await
         .expect("propose");
     approve_plan(&engine, &mission_id).await;
