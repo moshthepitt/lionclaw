@@ -162,6 +162,8 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     )
     .unwrap();
     assert_eq!(activity.effects.len(), 1);
+    assert_eq!(activity.effects[0].applied_model, None);
+    assert_eq!(activity.effects[0].applied_mode, None);
     assert_eq!(
         activity.effects[0].legal_controls,
         ["stop", "extend_deadline"]

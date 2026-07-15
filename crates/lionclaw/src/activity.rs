@@ -86,11 +86,6 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
                     *requested_at_ms,
                 ),
             };
-            let configuration = task
-                .as_ref()
-                .and_then(|task| crate::model::TaskId::new(task).ok())
-                .and_then(|task| state.active_tasks().get(&task))
-                .and_then(|task| task.last_runtime_configuration.as_ref());
             let dirty_diffstat = task.as_ref().and_then(|task| {
                 workspace_diffstat(&mission_dir.join("tasks").join(task).join("work"))
             });
@@ -99,8 +94,10 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
                 role,
                 task,
                 runtime,
-                applied_model: configuration.and_then(|c| c.applied_model.clone()),
-                applied_mode: configuration.and_then(|c| c.applied_mode.clone()),
+                // Adapter configuration is authoritative only after the effect
+                // reports its outcome. Never project a prior attempt as current.
+                applied_model: None,
+                applied_mode: None,
                 environment: format!(
                     "confinement-image:{}",
                     crate::model::short_hex(&state.image_id)

@@ -1063,6 +1063,9 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "tasks": state.tasks.iter().map(|(id, task)| {
                     task_runtime_json(store.blobs(), id, task)
                 }).collect::<Result<Vec<_>>>()?,
+                "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
+                    task_runtime_json(store.blobs(), id, task)
+                }).collect::<Result<Vec<_>>>()?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -1136,6 +1139,26 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         }
         if let Some(response) = &task.final_response {
             println!("  task {task_id} final response:");
+            for line in store.blobs().resolve(response)?.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    for (task_id, task) in &state.planning.tasks {
+        if let Some(failure) = &task.last_failure {
+            print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
+        }
+        if let Some(configuration) = &task.last_runtime_configuration {
+            println!(
+                "  planning task {task_id}: model {:?} -> {:?}, mode {:?} -> {:?}",
+                configuration.requested_model,
+                configuration.applied_model,
+                configuration.requested_mode,
+                configuration.applied_mode,
+            );
+        }
+        if let Some(response) = &task.final_response {
+            println!("  planning task {task_id} final response:");
             for line in store.blobs().resolve(response)?.lines() {
                 println!("    {line}");
             }
@@ -1603,6 +1626,17 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 .map(|v| if v.passed() { "pass" } else { "fail" })
                 .unwrap_or("—");
             println!("  {id}: authoritative={auth}");
+        }
+        for (id, task) in &state.planning.tasks {
+            if task.status != crate::model::TaskStatus::Pending {
+                println!(
+                    "  planning {id}: status={:?} runtime={:?}",
+                    task.status, task.last_runtime_configuration
+                );
+                if let Some(response) = &task.final_response {
+                    println!("    final response: {}", store.blobs().resolve(response)?);
+                }
+            }
         }
         print_activity(&store, &mission_id)?;
         for (effect_id, parked) in &state.parked_effects {
@@ -2081,6 +2115,9 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "current_sha": state.current_sha,
         "objective": state.objective,
         "tasks": state.tasks.iter().map(|(id, task)| {
+            task_runtime_json(blobs, id, task)
+        }).collect::<Result<Vec<_>>>()?,
+        "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
             task_runtime_json(blobs, id, task)
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
@@ -2884,7 +2921,31 @@ mod tests {
 
     #[test]
     fn mission_view_json_carries_one_disposition_and_action_projection() {
-        let state = review_state(vec![oracle_completed(1)]);
+        use crate::model::{
+            PayloadRef, RuntimeConfigurationEvidence, TaskId, TaskRuntimeState, TaskStatus,
+        };
+
+        let mut state = review_state(vec![oracle_completed(1)]);
+        state.planning.tasks.insert(
+            TaskId::new("planner").unwrap(),
+            TaskRuntimeState {
+                status: TaskStatus::Failed,
+                attempts: 1,
+                consecutive_failures: 1,
+                last_report: None,
+                last_failure: None,
+                feedback: Vec::new(),
+                last_runtime_configuration: Some(RuntimeConfigurationEvidence {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("applied".into()),
+                    requested_mode: Some("plan".into()),
+                    applied_mode: Some("plan".into()),
+                }),
+                workspace_base_sha: Some("base".into()),
+                assignment_epoch: 1,
+                final_response: Some(PayloadRef::inline("planning stopped here")),
+            },
+        );
         let view = MissionView {
             state,
             disposition: MissionDisposition::Parked,
@@ -2899,6 +2960,15 @@ mod tests {
         assert_eq!(json["planning_input"], serde_json::Value::Null);
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
+        assert_eq!(json["planning_tasks"][0]["id"], "planner");
+        assert_eq!(
+            json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
+            "applied"
+        );
+        assert_eq!(
+            json["planning_tasks"][0]["final_response"],
+            "planning stopped here"
+        );
     }
 
     #[test]
