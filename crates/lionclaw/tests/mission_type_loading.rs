@@ -37,6 +37,13 @@ fn software_dev_mission_type_loads() {
     assert!(mission_type
         .oracles
         .contains_key(&lionclaw::model::OracleName::new("cargo-test").expect("name")));
+    assert_eq!(mission_type.planning.tasks.len(), 1);
+    let planner = &mission_type.planning.tasks[0];
+    assert_eq!(planner.id.as_str(), "strategist");
+    assert_eq!(
+        mission_type.roles[&planner.role].output,
+        lionclaw::model::OutputSemantics::ProposesPlan
+    );
 }
 
 #[test]

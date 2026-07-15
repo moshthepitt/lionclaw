@@ -19,7 +19,7 @@ use super::plan::{PlanProposal, PlanningDag};
 
 /// Bumped for the strict decision/proposal/abort wire break that removes
 /// caller-supplied provenance from authoritative events.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,9 +130,17 @@ pub struct VersionStamps {
     pub schema_version: u32,
     pub engine_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
+    pub runtime_configuration: Option<RuntimeConfigurationEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfigurationEvidence {
+    pub requested_model: Option<String>,
+    pub applied_model: Option<String>,
+    pub requested_mode: Option<String>,
+    pub applied_mode: Option<String>,
 }
 
 /// What a role's agent handed back. Written by the agent as

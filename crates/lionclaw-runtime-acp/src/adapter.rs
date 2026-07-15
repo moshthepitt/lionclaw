@@ -219,8 +219,12 @@ impl AcpTurnRunner {
                     mcp_servers: &self.mcp_servers,
                 })
                 .await?;
-            client
-                .configure_session(&self.config, &opened_session.session_id)
+            let configuration = client
+                .configure_session(
+                    &self.config,
+                    &opened_session.session_id,
+                    &opened_session.selections,
+                )
                 .await?;
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
@@ -238,7 +242,10 @@ impl AcpTurnRunner {
                 .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
                 .await;
             prompt_result?;
-            Ok(RuntimeTurnResult::default())
+            Ok(RuntimeTurnResult {
+                configuration,
+                ..Default::default()
+            })
         }
         .await;
 

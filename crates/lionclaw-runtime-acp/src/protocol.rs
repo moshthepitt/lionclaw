@@ -5,6 +5,105 @@ use serde_json::Value;
 pub(crate) struct AcpOpenedSession {
     pub(crate) session_id: String,
     pub(crate) resumed_existing: bool,
+    pub(crate) selections: AcpSessionSelections,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AcpSessionSelections {
+    pub(crate) models: Option<AcpSelectionSet>,
+    pub(crate) modes: Option<AcpSelectionSet>,
+    pub(crate) config_options: Vec<AcpConfigOption>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AcpSelectionSet {
+    pub(crate) current: Option<String>,
+    pub(crate) values: Vec<AcpSelectionValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcpSelectionValue {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcpConfigOption {
+    pub(crate) id: String,
+    pub(crate) current: Option<String>,
+    pub(crate) values: Vec<String>,
+}
+
+impl AcpSessionSelections {
+    pub(crate) fn from_session_result(result: &Value) -> Self {
+        Self {
+            models: selection_set(
+                result.get("models"),
+                "currentModelId",
+                "availableModels",
+                "modelId",
+            ),
+            modes: selection_set(result.get("modes"), "currentModeId", "availableModes", "id"),
+            config_options: result
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    Some(AcpConfigOption {
+                        id: option.get("id")?.as_str()?.to_string(),
+                        current: option
+                            .get("currentValue")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        values: option
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|value| {
+                                value
+                                    .get("value")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .collect(),
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+fn selection_set(
+    value: Option<&Value>,
+    current_key: &str,
+    available_key: &str,
+    id_key: &str,
+) -> Option<AcpSelectionSet> {
+    let value = value?;
+    let values = value
+        .get(available_key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(AcpSelectionValue {
+                id: entry.get(id_key)?.as_str()?.to_string(),
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    Some(AcpSelectionSet {
+        current: value
+            .get(current_key)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        values,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -740,6 +740,20 @@ fn model_list_description_uses_codex_app_server_display_fields() {
 }
 
 #[test]
+fn applied_model_is_read_from_structured_turn_response() {
+    assert_eq!(
+        crate::app_server::extract_app_server_model(&json!({
+            "turn": {"id": "turn_1", "model": "gpt-5.5"}
+        })),
+        Some("gpt-5.5".to_string())
+    );
+    assert_eq!(
+        crate::app_server::extract_app_server_model(&json!({"turn": {"id": "turn_1"}})),
+        None
+    );
+}
+
+#[test]
 fn completed_turn_error_text_only_flags_failed_turns() {
     assert_eq!(
         super::completed_turn_error_text(&json!({

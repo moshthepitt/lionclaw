@@ -46,7 +46,11 @@ fn work_outcome(request: &RoleRunRequest) -> RoleRunOutcome {
             base_sha: request.base_sha.clone(),
             head_sha: HEAD_SHA.to_string(),
         }),
-        model_id: Some("mock".to_string()),
+        runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+            requested_model: Some("mock".to_string()),
+            applied_model: Some("mock".to_string()),
+            ..Default::default()
+        },
     }
 }
 
@@ -286,7 +290,11 @@ async fn execution_prompt_for_unassigned_role_has_no_skill_section() {
                 base_sha: request.base_sha.clone(),
                 head_sha: HEAD_SHA.to_string(),
             }),
-            model_id: Some("mock".to_string()),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("mock".to_string()),
+                applied_model: Some("mock".to_string()),
+                ..Default::default()
+            },
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -473,7 +481,7 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
         Ok(RoleRunOutcome {
             handoff,
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -550,7 +558,7 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
         Ok(RoleRunOutcome {
             handoff,
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }));
     let store = MissionStore::open(dir.path()).await.expect("store");
@@ -638,7 +646,7 @@ async fn terminal_review_prompt_lists_assigned_skills() {
                     base_sha: request.base_sha.clone(),
                     head_sha: HEAD_SHA.to_string(),
                 }),
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         }
     }));
@@ -692,7 +700,7 @@ async fn terminal_review_prompt_for_unassigned_role_has_no_skill_section() {
                     base_sha: request.base_sha.clone(),
                     head_sha: HEAD_SHA.to_string(),
                 }),
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         }
     }));

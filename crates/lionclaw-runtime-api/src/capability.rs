@@ -61,7 +61,16 @@ pub struct RuntimeCapabilityResult {
     pub output: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppliedRuntimeConfiguration {
+    pub requested_model: Option<String>,
+    pub applied_model: Option<String>,
+    pub requested_mode: Option<String>,
+    pub applied_mode: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
+    pub configuration: AppliedRuntimeConfiguration,
 }

@@ -23,7 +23,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 6;
+pub const REDUCER_VERSION: u32 = 7;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -138,6 +138,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
             apply_handoff(state, task_id, handoff);
             if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                task.last_runtime_configuration = envelope.stamps.runtime_configuration.clone();
                 if task.status == TaskStatus::Failed {
                     task.consecutive_failures = task.consecutive_failures.saturating_add(1);
                 } else {
@@ -369,6 +370,7 @@ fn pending_task() -> TaskRuntimeState {
         last_report: None,
         last_failure: None,
         feedback: Vec::new(),
+        last_runtime_configuration: None,
     }
 }
 
@@ -693,6 +695,43 @@ fn derive_attention(state: &mut MissionState) {
         );
     }
 
+    // Replanning is its own attention era. Rejected execution facts remain in
+    // state as durable prompt evidence, but they cannot compete with the
+    // planning DAG or its replacement proposal for dispatch. This also keeps a
+    // failed-gate `revise` from requiring an administrative accept on the
+    // rejected plan before the strategist can run.
+    if state.planning_base_revision.is_some() {
+        for (task_id, rt) in &state.planning.tasks {
+            if rt.status == TaskStatus::Failed
+                && !rt.automatic_retry_remaining(state.config.recovery.max_attempts)
+            {
+                raise(
+                    AttentionKind::NodeFailed,
+                    Some(task_id.clone()),
+                    None,
+                    Vec::new(),
+                    None,
+                    failure_report("planning task", task_id, rt),
+                );
+            } else if state.flagged_nodes.contains(task_id) {
+                raise(
+                    AttentionKind::NodeAttention,
+                    Some(task_id.clone()),
+                    None,
+                    Vec::new(),
+                    None,
+                    format!("planning task '{task_id}' asks for a look"),
+                );
+            }
+        }
+        state.open_attention = attention;
+        return;
+    }
+    if state.proposal.is_some() && !state.proposal_approved {
+        state.open_attention = attention;
+        return;
+    }
+
     // Oracle infrastructure failures: park rather than re-request forever.
     for (oracle, failure) in &state.oracle_failures {
         raise(
@@ -755,33 +794,6 @@ fn derive_attention(state: &mut MissionState) {
                 evidence.exit_code
             ),
         );
-    }
-
-    // The planning DAG can author both the initial plan and later revisions.
-    if state.planning_base_revision.is_some() {
-        for (task_id, rt) in &state.planning.tasks {
-            if rt.status == TaskStatus::Failed
-                && !rt.automatic_retry_remaining(state.config.recovery.max_attempts)
-            {
-                raise(
-                    AttentionKind::NodeFailed,
-                    Some(task_id.clone()),
-                    None,
-                    Vec::new(),
-                    None,
-                    failure_report("planning task", task_id, rt),
-                );
-            } else if state.flagged_nodes.contains(task_id) {
-                raise(
-                    AttentionKind::NodeAttention,
-                    Some(task_id.clone()),
-                    None,
-                    Vec::new(),
-                    None,
-                    format!("planning task '{task_id}' asks for a look"),
-                );
-            }
-        }
     }
 
     let Some(plan) = state.plan.clone() else {
@@ -1408,6 +1420,62 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn revise_failed_gate_suppresses_rejected_execution_attention() {
+        let mut created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut created else {
+            unreachable!();
+        };
+        config.planning.tasks = vec![super::super::plan::PlanningTask {
+            id: tid("strategist"),
+            role: RoleName::new("strategist").unwrap(),
+            body: "replace the rejected plan".into(),
+            depends_on: vec![],
+        }];
+        let base = vec![
+            created,
+            plan_proposed(
+                vec![assertion("AA", None)],
+                vec![
+                    work_task("w"),
+                    validate_task("v"),
+                    gate_task("g", &["AA"], &["v"]),
+                ],
+            ),
+            role_completed("w", "kw", work_handoff(true, false), None),
+            role_completed("v", "kv", validate_handoff(&[("AA", false)]), None),
+        ];
+        let parked = fold_log(base.clone()).expect("state");
+        let gate = parked
+            .open_attention
+            .get("gate_failed:g")
+            .expect("failed gate attention");
+        let exact_failure = gate.report.clone();
+
+        let mut replanning = base;
+        replanning.push(decision(
+            "gate_failed:g",
+            super::super::event::DecisionAction::Revise,
+        ));
+        let state = fold_log(replanning).expect("state");
+
+        assert_eq!(state.phase, MissionPhase::Planning);
+        assert!(state.open_attention.is_empty());
+        assert_eq!(state.tasks[&tid("g")].status, TaskStatus::Failed);
+        let Some(PlanningRefinement::FailureEvidence(feedback)) =
+            state.planning_input.refinement.as_ref()
+        else {
+            panic!("failed gate evidence must feed replanning");
+        };
+        assert_eq!(feedback.summary, exact_failure);
+        assert_eq!(feedback.justification, "j");
+        assert!(matches!(
+            super::super::step::step(&state),
+            super::super::step::StepDecision::DispatchRole(intent)
+                if intent.task_id == tid("strategist")
+        ));
     }
 
     // Regression (review): accepting an OracleFailed waives the obligation

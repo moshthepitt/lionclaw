@@ -41,7 +41,11 @@ impl RoleRunner for BlockingRunner {
                 base_sha: request.base_sha,
                 head_sha: HEAD_SHA.to_string(),
             }),
-            model_id: Some("blocking-test".to_string()),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("blocking-test".to_string()),
+                applied_model: Some("blocking-test".to_string()),
+                ..Default::default()
+            },
         })
     }
 }

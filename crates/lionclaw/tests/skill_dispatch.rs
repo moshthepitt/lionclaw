@@ -48,7 +48,11 @@ async fn engine_resolves_declared_packages_before_role_dispatch() {
                 base_sha: request.base_sha.clone(),
                 head_sha: HEAD_SHA.to_string(),
             }),
-            model_id: Some("mock".to_string()),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("mock".to_string()),
+                applied_model: Some("mock".to_string()),
+                ..Default::default()
+            },
         })
     }));
     let harness = harness_with_type(
@@ -104,7 +108,11 @@ async fn role_without_skills_dispatches_an_empty_package_set() {
                 base_sha: request.base_sha.clone(),
                 head_sha: HEAD_SHA.to_string(),
             }),
-            model_id: Some("mock".to_string()),
+            runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                requested_model: Some("mock".to_string()),
+                applied_model: Some("mock".to_string()),
+                ..Default::default()
+            },
         })
     }));
     let harness = harness_with_type(

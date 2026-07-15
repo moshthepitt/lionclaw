@@ -89,7 +89,7 @@ async fn advisory_only_mission_type_never_verifies() {
         Ok(RoleRunOutcome {
             handoff,
             artifact,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }));
     // The reviewed bar requires the closing review (create_mission refuses

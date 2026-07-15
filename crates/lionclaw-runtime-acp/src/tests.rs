@@ -23,6 +23,8 @@ use super::{
     acp_permission_denial, acp_turn_events, AcpMessage, AcpRuntimeAdapter, AcpRuntimeConfig,
     ACP_SESSION_ID_STATE_FILE,
 };
+use crate::client::AcpClient;
+use crate::protocol::AcpSessionSelections;
 
 fn opencode_acp_config(model: Option<String>, mode: Option<String>) -> AcpRuntimeConfig {
     AcpRuntimeConfig {
@@ -481,6 +483,96 @@ fn opencode_acp_config_options_fixture_pins_model_and_mode_protocol() {
     );
 }
 
+#[tokio::test]
+async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let session = FakeAcpProgramSession {
+        inbound: VecDeque::from([
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{}}"#.to_string(),
+        ]),
+        output: ExecutionOutput::default(),
+        state: Arc::clone(&state),
+    };
+    let mut client = AcpClient::new(Box::new(session));
+    let selections = AcpSessionSelections::from_session_result(&json!({
+        "models": {
+            "currentModelId": "openrouter:old",
+            "availableModels": [
+                {"modelId": "openrouter:gpt-5.5", "name": "gpt-5.5"}
+            ]
+        },
+        "modes": {
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "dont_ask", "name": "Don't Ask"}
+            ]
+        },
+        "configOptions": []
+    }));
+    let applied = client
+        .configure_session(
+            &opencode_acp_config(Some("gpt-5.5".into()), Some("dont_ask".into())),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect("typed selections apply");
+
+    assert_eq!(applied.requested_model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(applied.applied_model.as_deref(), Some("openrouter:gpt-5.5"));
+    assert_eq!(applied.applied_mode.as_deref(), Some("dont_ask"));
+    let sent = state.lock().unwrap().sent.clone();
+    assert_eq!(sent[0]["method"], "session/set_model");
+    assert_eq!(sent[0]["params"]["modelId"], "openrouter:gpt-5.5");
+    assert_eq!(sent[1]["method"], "session/set_mode");
+    assert_eq!(sent[1]["params"]["modeId"], "dont_ask");
+}
+
+#[tokio::test]
+async fn unadvertised_or_unconfirmed_configuration_is_rejected() {
+    let selections = AcpSessionSelections::from_session_result(&json!({
+        "configOptions": [{
+            "id": "model",
+            "currentValue": "old",
+            "options": [{"value": "advertised"}]
+        }]
+    }));
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let mut client = AcpClient::new(Box::new(FakeAcpProgramSession {
+        inbound: VecDeque::new(),
+        output: ExecutionOutput::default(),
+        state,
+    }));
+    let error = client
+        .configure_session(
+            &opencode_acp_config(Some("missing".into()), None),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect_err("unadvertised model must fail before an RPC");
+    assert!(error
+        .to_string()
+        .contains("does not advertise requested model"));
+
+    let state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
+    let mut client = AcpClient::new(Box::new(FakeAcpProgramSession {
+        inbound: VecDeque::from([r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string()]),
+        output: ExecutionOutput::default(),
+        state,
+    }));
+    let error = client
+        .configure_session(
+            &opencode_acp_config(Some("advertised".into()), None),
+            "session-1",
+            &selections,
+        )
+        .await
+        .expect_err("an ack without applied evidence must fail");
+    assert!(error.to_string().contains("did not confirm applied model"));
+}
+
 fn acp_response_by_id(messages: &[Value], id: u64) -> Option<&Value> {
     messages
         .iter()
@@ -522,9 +614,9 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     let executor = FakeAcpProgramExecutor {
         inbound: VecDeque::from([
             opencode_initialize_response(1),
-            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[]}}"#.to_string(),
-            r#"{"jsonrpc":"2.0","id":3,"result":{}}"#.to_string(),
-            r#"{"jsonrpc":"2.0","id":4,"result":{}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_program","configOptions":[{"id":"model","currentValue":"old","options":[{"value":"gpt-5"}]},{"id":"mode","currentValue":"build","options":[{"value":"plan"}]}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"model","currentValue":"gpt-5"}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"mode","currentValue":"plan"}]}}"#.to_string(),
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_thought_chunk","messageId":"msg_1","content":{"type":"text","text":"thinking"}}}}"#.to_string(),
             r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_program","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"answer"}}}}"#.to_string(),
             r#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","_meta":{}}}"#.to_string(),
@@ -536,7 +628,7 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     let mut context = acp_driver_context(runtime_state_root.clone());
     context.working_dir = Some("/workspace/crates/example".to_string());
 
-    adapter
+    let result = adapter
         .program_backed_turn(
             RuntimeProgramTurnExecution {
                 input: RuntimeTurnInput {
@@ -551,6 +643,15 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         )
         .await
         .expect("ACP turn");
+    assert_eq!(
+        result.configuration,
+        lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_model: Some("gpt-5".to_string()),
+            applied_model: Some("gpt-5".to_string()),
+            requested_mode: Some("plan".to_string()),
+            applied_mode: Some("plan".to_string()),
+        }
+    );
 
     let mut journal = Vec::new();
     while let Some(record) = journal_rx.recv().await {

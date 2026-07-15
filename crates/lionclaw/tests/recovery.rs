@@ -21,7 +21,7 @@ fn completed_work(base_sha: &str) -> RoleRunOutcome {
             base_sha: base_sha.to_string(),
             head_sha: HEAD_SHA.to_string(),
         }),
-        model_id: None,
+        runtime_configuration: Default::default(),
     }
 }
 
@@ -44,7 +44,7 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
                     request_attention: false,
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
             });
         }
         Ok(completed_work(&request.base_sha))

@@ -43,7 +43,7 @@ fn work_outcome(request: &RoleRunRequest, head_sha: &str) -> RoleRunOutcome {
             base_sha: request.base_sha.clone(),
             head_sha: head_sha.to_string(),
         }),
-        model_id: None,
+        runtime_configuration: Default::default(),
     }
 }
 
@@ -395,7 +395,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
                     nonce: "forged".to_string(),
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))
@@ -691,7 +691,7 @@ async fn a_done_false_review_handoff_parks_as_incomplete_not_as_a_verdict() {
                         .to_string(),
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))
@@ -720,7 +720,7 @@ async fn an_ordinary_validator_handoff_cannot_seal_the_terminal_review() {
                     request_attention: false,
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))

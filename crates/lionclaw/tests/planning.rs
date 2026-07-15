@@ -223,7 +223,7 @@ fn successful_role_outcome(req: &RoleRunRequest) -> RoleRunOutcome {
     RoleRunOutcome {
         handoff,
         artifact,
-        model_id: None,
+        runtime_configuration: Default::default(),
     }
 }
 
@@ -803,7 +803,7 @@ async fn a_failed_planning_node_is_retryable_not_a_wedge() {
                 request_attention: false,
             },
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }));
     let engine = Engine::new(
@@ -877,7 +877,7 @@ async fn park_after_author(
         Ok(RoleRunOutcome {
             handoff,
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }));
     let engine = Engine::new(

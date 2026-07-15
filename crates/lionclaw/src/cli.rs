@@ -1000,6 +1000,11 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "finish": finish.map(|f| f.slug()),
                 "disposition": view.disposition.slug(),
                 "next_actions": view.next_actions(),
+                "tasks": state.tasks.iter().map(|(id, task)| serde_json::json!({
+                    "id": id.as_str(),
+                    "status": format!("{:?}", task.status).to_ascii_lowercase(),
+                    "runtime_configuration": task.last_runtime_configuration,
+                })).collect::<Vec<_>>(),
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
                     "oracle": row.oracle,
@@ -1057,6 +1062,17 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
         phase_slug(&state.phase),
         view.disposition.slug()
     );
+    for (task_id, task) in &state.tasks {
+        if let Some(configuration) = &task.last_runtime_configuration {
+            println!(
+                "  task {task_id}: model {:?} -> {:?}, mode {:?} -> {:?}",
+                configuration.requested_model,
+                configuration.applied_model,
+                configuration.requested_mode,
+                configuration.applied_mode,
+            );
+        }
+    }
     if let Some(failure) = &state.cleanup_failure {
         println!(
             "  cleanup: blocked for effect {} ({:?}): {}",
@@ -1773,6 +1789,11 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "revision": state.revision,
         "current_sha": state.current_sha,
         "objective": state.objective,
+        "tasks": state.tasks.iter().map(|(id, task)| serde_json::json!({
+            "id": id.as_str(),
+            "status": format!("{:?}", task.status).to_ascii_lowercase(),
+            "runtime_configuration": task.last_runtime_configuration,
+        })).collect::<Vec<_>>(),
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
             serde_json::json!({

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::event::{
     EffectResource, Gap, GapSeverity, MissionConfig, MissionTypeRef, PayloadRef, RunErrorKind,
+    RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
@@ -88,6 +89,8 @@ pub struct TaskRuntimeState {
     /// Engine-routed repair feedback for this task's next attempt.
     #[serde(default)]
     pub feedback: Vec<FailureFeedback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_runtime_configuration: Option<RuntimeConfigurationEvidence>,
 }
 
 impl TaskRuntimeState {

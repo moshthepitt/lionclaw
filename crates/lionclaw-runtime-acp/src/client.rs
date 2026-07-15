@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use lionclaw_runtime_api::{
-    ExecutionOutput, RawTurnPayload, RuntimeEvent, RuntimeMcpServerSpec, RuntimeProgramSession,
-    RuntimeTurnJournalSender, TurnEvent,
+    AppliedRuntimeConfiguration, ExecutionOutput, RawTurnPayload, RuntimeEvent,
+    RuntimeMcpServerSpec, RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent,
 };
 
 use crate::driver::{AcpRuntimeConfig, ACP_PROTOCOL_NAME};
@@ -17,7 +17,7 @@ use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
 use crate::protocol::{
     acp_is_server_request, acp_response_id, parse_acp_response, AcpMessage, AcpOpenedSession,
-    AcpResponse, AcpSessionCapabilities,
+    AcpResponse, AcpSelectionSet, AcpSessionCapabilities, AcpSessionSelections,
 };
 use crate::state::{
     forget_acp_session_id, normalize_acp_session_id, remember_acp_session_id, AcpCancelRequest,
@@ -81,19 +81,21 @@ impl AcpClient {
         let mcp_servers = acp_mcp_servers(input.mcp_servers);
         if let Some(session_id) = input.session_state.session_id.as_deref() {
             if let Some(reopen_method) = input.session_capabilities.reopen_method() {
-                self.request(
-                    reopen_method,
-                    json!({
-                        "sessionId": session_id,
-                        "cwd": input.working_dir,
-                        "mcpServers": mcp_servers.clone(),
-                    }),
-                    None,
-                )
-                .await?;
+                let response = self
+                    .request(
+                        reopen_method,
+                        json!({
+                            "sessionId": session_id,
+                            "cwd": input.working_dir,
+                            "mcpServers": mcp_servers.clone(),
+                        }),
+                        None,
+                    )
+                    .await?;
                 return Ok(AcpOpenedSession {
                     session_id: session_id.to_string(),
                     resumed_existing: true,
+                    selections: AcpSessionSelections::from_session_result(&response.result),
                 });
             } else {
                 forget_acp_session_id(input.config, input.sessions, input.runtime_session_id)?;
@@ -130,6 +132,7 @@ impl AcpClient {
         Ok(AcpOpenedSession {
             session_id,
             resumed_existing: false,
+            selections: AcpSessionSelections::from_session_result(&response.result),
         })
     }
 
@@ -137,34 +140,108 @@ impl AcpClient {
         &mut self,
         config: &AcpRuntimeConfig,
         session_id: &str,
-    ) -> Result<()> {
+        selections: &AcpSessionSelections,
+    ) -> Result<AppliedRuntimeConfiguration> {
+        let mut applied = AppliedRuntimeConfiguration {
+            requested_model: config.model.clone(),
+            requested_mode: config.mode.clone(),
+            ..Default::default()
+        };
         if let Some(model) = config.model.as_deref() {
-            self.request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": "model",
-                    "value": model,
-                }),
-                None,
-            )
-            .await?;
+            applied.applied_model = Some(
+                self.apply_selection(
+                    session_id,
+                    "model",
+                    model,
+                    selections.models.as_ref(),
+                    selections,
+                )
+                .await?,
+            );
         }
 
         if let Some(mode) = config.mode.as_deref() {
+            applied.applied_mode = Some(
+                self.apply_selection(
+                    session_id,
+                    "mode",
+                    mode,
+                    selections.modes.as_ref(),
+                    selections,
+                )
+                .await?,
+            );
+        }
+
+        Ok(applied)
+    }
+
+    async fn apply_selection(
+        &mut self,
+        session_id: &str,
+        kind: &str,
+        requested: &str,
+        first_class: Option<&AcpSelectionSet>,
+        selections: &AcpSessionSelections,
+    ) -> Result<String> {
+        if let Some(first_class) = first_class {
+            let matches = first_class
+                .values
+                .iter()
+                .filter(|value| value.id == requested || value.name.as_deref() == Some(requested))
+                .collect::<Vec<_>>();
+            let selected = match matches.as_slice() {
+                [selected] => selected.id.clone(),
+                [] => {
+                    return Err(anyhow!(
+                        "ACP runtime does not advertise requested {kind} '{requested}'"
+                    ))
+                }
+                _ => return Err(anyhow!("ACP requested {kind} '{requested}' is ambiguous")),
+            };
+            let (method, id_key) = match kind {
+                "model" => ("session/set_model", "modelId"),
+                "mode" => ("session/set_mode", "modeId"),
+                _ => return Err(anyhow!("unsupported ACP selection kind '{kind}'")),
+            };
             self.request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": "mode",
-                    "value": mode,
-                }),
+                method,
+                json!({"sessionId": session_id, (id_key): selected}),
                 None,
             )
             .await?;
+            return Ok(selected);
         }
 
-        Ok(())
+        let option = selections
+            .config_options
+            .iter()
+            .find(|option| option.id == kind)
+            .ok_or_else(|| anyhow!("ACP runtime cannot apply requested {kind} '{requested}'"))?;
+        if !option.values.is_empty() && !option.values.iter().any(|value| value == requested) {
+            return Err(anyhow!(
+                "ACP runtime does not advertise requested {kind} '{requested}'"
+            ));
+        }
+        let response = self
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": kind, "value": requested}),
+                None,
+            )
+            .await?;
+        let observed = AcpSessionSelections::from_session_result(&response.result)
+            .config_options
+            .into_iter()
+            .find(|candidate| candidate.id == kind)
+            .and_then(|candidate| candidate.current)
+            .ok_or_else(|| anyhow!("ACP runtime did not confirm applied {kind} '{requested}'"))?;
+        if observed != requested {
+            return Err(anyhow!(
+                "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
+            ));
+        }
+        Ok(observed)
     }
 
     pub(crate) async fn prompt(

@@ -35,8 +35,11 @@ impl NewEvent {
         }
     }
 
-    pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
-        self.stamps.model_id = model_id;
+    pub fn with_runtime_configuration(
+        mut self,
+        configuration: crate::model::RuntimeConfigurationEvidence,
+    ) -> Self {
+        self.stamps.runtime_configuration = Some(configuration);
         self
     }
 

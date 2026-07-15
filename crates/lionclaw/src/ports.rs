@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
     ArtifactOutcome, EffectId, EffectResource, Handoff, MissionId, OracleName, PreparedInputRef,
-    RunErrorKind, TaskId,
+    RunErrorKind, RuntimeConfigurationEvidence, TaskId,
 };
 
 /// One full autonomous agent run — the engine never micromanages how a role
@@ -53,7 +53,7 @@ pub struct RoleRunOutcome {
     /// `head_sha == base_sha`. Readers/judges/planners are never captured, so
     /// this is `None` for them.
     pub artifact: Option<ArtifactOutcome>,
-    pub model_id: Option<String>,
+    pub runtime_configuration: RuntimeConfigurationEvidence,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

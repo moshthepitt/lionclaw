@@ -20,8 +20,8 @@ pub use decision::{validate_decision, DecisionError};
 pub use event::{
     ArtifactOutcome, BlobRef, DecisionAction, EffectEventClass, EffectResource, EventEnvelope, Gap,
     GapSeverity, Handoff, MissionConfig, MissionEvent, MissionTypeRef, PayloadRef,
-    PreparedInputRef, RecoveryConfig, RunErrorKind, StopBar, TerminalReviewConfig, ValidationItem,
-    VersionStamps, SCHEMA_VERSION,
+    PreparedInputRef, RecoveryConfig, RunErrorKind, RuntimeConfigurationEvidence, StopBar,
+    TerminalReviewConfig, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};

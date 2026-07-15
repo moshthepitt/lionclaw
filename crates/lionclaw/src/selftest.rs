@@ -61,7 +61,7 @@ impl RoleRunner for NoopRoleRunner {
                 request_attention: false,
             },
             artifact: None,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }
 }
@@ -93,7 +93,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                         .to_string(),
                 },
                 artifact: None,
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         } else {
             Ok(RoleRunOutcome {
@@ -106,7 +106,7 @@ impl RoleRunner for ReviewParkRoleRunner {
                     base_sha: request.base_sha.clone(),
                     head_sha: request.base_sha,
                 }),
-                model_id: None,
+                runtime_configuration: Default::default(),
             })
         }
     }
@@ -540,7 +540,7 @@ impl ScriptedRoleRunner {
                 base_sha: request.base_sha.clone(),
                 head_sha: head,
             }),
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }
 }

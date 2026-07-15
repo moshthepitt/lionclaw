@@ -281,5 +281,6 @@ where
 
     Ok(RuntimeTurnResult {
         capability_requests: Vec::new(),
+        configuration: Default::default(),
     })
 }

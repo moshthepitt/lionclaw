@@ -19,9 +19,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::app_server::{
-    extract_app_server_thread_id, extract_app_server_turn_id, finish_app_server_session,
-    thread_resume_params, thread_start_params, turn_start_params, AppServerTransport,
-    CodexAppServerClient, CodexAppServerEventSink, ExecutionSessionTransport,
+    extract_app_server_model, extract_app_server_thread_id, extract_app_server_turn_id,
+    finish_app_server_session, thread_resume_params, thread_start_params, turn_start_params,
+    AppServerTransport, CodexAppServerClient, CodexAppServerEventSink, ExecutionSessionTransport,
     CODEX_GENERATED_IMAGES_NATIVE_HOME_DIR,
 };
 use crate::driver::CodexRuntimeConfig;
@@ -83,6 +83,12 @@ impl CodexAppServerTurnRunner<'_> {
                 )
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
+            let applied_model = extract_app_server_model(&response);
+            if self.adapter.config.model.is_some() && applied_model.is_none() {
+                return Err(anyhow!(
+                    "codex app-server did not report the applied model in turn/start"
+                ));
+            }
             let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
             client
                 .wait_for_turn_completed(
@@ -94,7 +100,15 @@ impl CodexAppServerTurnRunner<'_> {
                     Some(&mut interrupt_rx),
                 )
                 .await?;
-            Ok(RuntimeTurnResult::default())
+            Ok(RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: self.adapter.config.model.clone(),
+                    applied_model,
+                    requested_mode: None,
+                    applied_mode: None,
+                },
+                ..Default::default()
+            })
         }
         .await;
 

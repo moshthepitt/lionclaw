@@ -47,7 +47,7 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
         Ok(RoleRunOutcome {
             handoff,
             artifact,
-            model_id: None,
+            runtime_configuration: Default::default(),
         })
     }))
 }

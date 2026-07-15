@@ -149,6 +149,17 @@ pub(crate) fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .map(|turn_id| turn_id.trim().to_string())
 }
 
+pub(crate) fn extract_app_server_model(value: &Value) -> Option<String> {
+    value
+        .pointer("/turn/model")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/thread/model").and_then(Value::as_str))
+        .or_else(|| value.get("model").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
 pub(crate) fn extract_app_server_item_id(value: &Value) -> Option<String> {
     value
         .pointer("/item/id")

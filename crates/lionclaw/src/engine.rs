@@ -657,7 +657,7 @@ impl Engine {
                     handoff,
                     artifact: outcome.artifact,
                 })
-                .with_model_id(outcome.model_id))
+                .with_runtime_configuration(outcome.runtime_configuration))
             }
             Err(failure) => Ok(failed(failure.kind, failure.detail)),
         }
@@ -824,7 +824,7 @@ impl Engine {
             gaps,
             report: self.store.blobs().externalize(report)?,
         })
-        .with_model_id(outcome.model_id))
+        .with_runtime_configuration(outcome.runtime_configuration))
     }
 
     /// Resolve the `last_report` blobs of a task's dependencies (in either era's

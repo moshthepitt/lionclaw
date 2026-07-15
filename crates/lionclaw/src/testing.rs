@@ -39,7 +39,11 @@ pub fn review_verdict(request: &RoleRunRequest, passed: bool, gaps: Vec<Gap>) ->
                 .to_string(),
         },
         artifact: None,
-        model_id: Some("mock-model".to_string()),
+        runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+            requested_model: Some("mock-model".to_string()),
+            applied_model: Some("mock-model".to_string()),
+            ..Default::default()
+        },
     }
 }
 
@@ -87,7 +91,11 @@ impl MockRoleRunner {
                     base_sha: request.base_sha.clone(),
                     head_sha: head_sha.clone(),
                 }),
-                model_id: Some("mock-model".to_string()),
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    requested_model: Some("mock-model".to_string()),
+                    applied_model: Some("mock-model".to_string()),
+                    ..Default::default()
+                },
             })
         }))
     }

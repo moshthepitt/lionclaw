@@ -191,7 +191,7 @@ impl RoleRunner for OciRoleRunner {
 
             // Run the agent turn under confinement, then capture the artifact
             // (writer only) before the workspace is torn down.
-            let model_id = self
+            let applied = self
                 .run_turn(&profile, &request, compiled.plan().clone())
                 .await?;
             let handoff = read_handoff(&dirs.handoff, request.role.output)?;
@@ -223,7 +223,12 @@ impl RoleRunner for OciRoleRunner {
             Ok(RoleRunOutcome {
                 handoff,
                 artifact,
-                model_id,
+                runtime_configuration: crate::model::RuntimeConfigurationEvidence {
+                    requested_model: applied.requested_model,
+                    applied_model: applied.applied_model,
+                    requested_mode: applied.requested_mode,
+                    applied_mode: applied.applied_mode,
+                },
             })
         }
         .await;
@@ -238,7 +243,7 @@ impl OciRoleRunner {
         profile: &MissionRuntimeProfile,
         request: &RoleRunRequest,
         plan: lionclaw_confinement::EffectiveExecutionPlan,
-    ) -> Result<Option<String>, RoleRunFailure> {
+    ) -> Result<lionclaw_runtime_api::AppliedRuntimeConfiguration, RoleRunFailure> {
         let driver = Self::driver(profile)
             .map_err(|err| launch(format!("runtime profile invalid: {err:#}")))?;
         let config = Self::driver_config(profile)
@@ -316,7 +321,20 @@ impl OciRoleRunner {
                     None => err.to_string(),
                 },
             }),
-            Ok(Ok(_)) => Ok(profile.model.clone()),
+            Ok(Ok(result)) => {
+                let configuration = result.configuration;
+                if configuration.requested_model != profile.model
+                    || configuration.requested_mode != profile.mode
+                    || profile.model.is_some() && configuration.applied_model.is_none()
+                    || profile.mode.is_some() && configuration.applied_mode.is_none()
+                {
+                    return Err(launch(format!(
+                        "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
+                        profile.model, profile.mode
+                    )));
+                }
+                Ok(configuration)
+            }
         }
     }
 }
