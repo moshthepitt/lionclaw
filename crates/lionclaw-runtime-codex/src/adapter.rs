@@ -27,7 +27,8 @@ use crate::app_server::{
 use crate::driver::CodexRuntimeConfig;
 use crate::program::{build_codex_app_server_program, build_codex_terminal_program};
 use crate::state::{
-    load_ready_saved_thread_id, CodexInterruptRequest, CodexSessionState, CodexThreadState,
+    load_ready_saved_thread_id, validate_protocol_id, CodexInterruptRequest, CodexSessionState,
+    CodexThreadState,
 };
 
 #[derive(Debug)]
@@ -97,6 +98,9 @@ impl CodexAppServerTurnRunner<'_> {
                 )
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
+            if let Some(turn_id) = turn_id.as_deref() {
+                validate_protocol_id(turn_id)?;
+            }
             let applied_model = extract_app_server_model(&response);
             let configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
                 requested_model: self.adapter.config.model.clone(),

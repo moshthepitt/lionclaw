@@ -15,8 +15,9 @@ use lionclaw_runtime_api::{
     RuntimeControlOrigin, RuntimeControlOutcome, RuntimeDriverConfig, RuntimeDriverProvider,
     RuntimeEvent, RuntimeExecutionContext, RuntimeFileChangeStatus, RuntimeMcpServerSpec,
     RuntimeMessageLane, RuntimePathProjection, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeSessionHandle, RuntimeSessionReady,
-    RuntimeSessionStartInput, RuntimeTerminalProgramInput, TurnEvent, TypedFailure,
+    RuntimeProgramSpec, RuntimeProgramStdoutSender, RuntimeProgramTurnExecution,
+    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTurnInput, TurnEvent, TypedFailure,
     RUNTIME_SESSION_READY_MARKER,
 };
 
@@ -106,6 +107,56 @@ impl RuntimeProgramExecutor for UnusedRuntimeProgramExecutor {
         _program: RuntimeProgramSpec,
     ) -> Result<Box<dyn RuntimeProgramSession>> {
         anyhow::bail!("test did not expect interactive runtime execution")
+    }
+}
+
+struct ScriptedRuntimeProgramSession {
+    incoming: VecDeque<String>,
+}
+
+#[async_trait]
+impl RuntimeProgramSession for ScriptedRuntimeProgramSession {
+    async fn write_line(&mut self, _line: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn read_line(&mut self) -> Result<Option<String>> {
+        Ok(self.incoming.pop_front())
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<ExecutionOutput> {
+        Ok(ExecutionOutput {
+            exit_code: Some(0),
+            ..ExecutionOutput::default()
+        })
+    }
+}
+
+struct ScriptedRuntimeProgramExecutor {
+    incoming: Option<VecDeque<String>>,
+}
+
+#[async_trait]
+impl RuntimeProgramExecutor for ScriptedRuntimeProgramExecutor {
+    async fn execute_streaming(
+        &mut self,
+        _program: RuntimeProgramSpec,
+        _stdout: RuntimeProgramStdoutSender,
+    ) -> Result<ExecutionOutput> {
+        anyhow::bail!("test expected interactive runtime execution")
+    }
+
+    async fn execute_captured(&mut self, _program: RuntimeProgramSpec) -> Result<ExecutionOutput> {
+        anyhow::bail!("test expected interactive runtime execution")
+    }
+
+    async fn spawn(
+        &mut self,
+        _program: RuntimeProgramSpec,
+    ) -> Result<Box<dyn RuntimeProgramSession>> {
+        Ok(Box::new(ScriptedRuntimeProgramSession {
+            incoming: self.incoming.take().expect("runtime spawned once"),
+        }))
     }
 }
 
@@ -599,6 +650,115 @@ async fn app_server_protocol_state_is_bounded_against_unmatched_provider_ids() {
 
     let error = limit_error.expect("provider-selected protocol IDs must have a finite state bound");
     assert!(error.to_string().contains("protocol state limit"));
+}
+
+#[tokio::test]
+async fn app_server_rejects_oversized_thread_id_from_start_response() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    let (adapter, handle, thread_state) =
+        start_codex_test_session(Some(runtime_state_root.clone())).await;
+    let transport = FakeAppServerTransport::new(vec![json!({
+        "id": 1,
+        "result": {"thread": {"id": "x".repeat(2_048)}}
+    })]);
+    let mut client = CodexAppServerClient::new(transport);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = adapter
+        .ensure_app_server_thread(
+            &mut client,
+            &handle.runtime_session_id,
+            &event_tx,
+            &thread_state,
+        )
+        .await
+        .expect_err("oversized response thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+    assert!(!runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE).exists());
+}
+
+#[tokio::test]
+async fn app_server_rejects_oversized_turn_id_from_start_response() {
+    let (adapter, handle, _thread_state) = start_codex_test_session(None).await;
+    let messages = [
+        json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}}}),
+        json!({"id": 2, "result": {"thread": {"id": "thr_1"}}}),
+        json!({"id": 3, "result": {"turn": {"id": "x".repeat(2_048)}}}),
+    ]
+    .into_iter()
+    .map(|message| serde_json::to_string(&message).unwrap())
+    .collect();
+    let executor = ScriptedRuntimeProgramExecutor {
+        incoming: Some(messages),
+    };
+    let (journal, _journal_rx) = tokio::sync::mpsc::channel(4);
+
+    let error = adapter
+        .program_backed_turn(
+            RuntimeProgramTurnExecution {
+                input: RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: "test".into(),
+                    fresh_prompt: None,
+                },
+                context: RuntimeExecutionContext {
+                    network_mode: NetworkMode::None,
+                    working_dir: None,
+                    environment: Vec::new(),
+                    runtime_state_root: None,
+                    runtime_path_projections: Vec::new(),
+                    mcp_servers: Vec::new(),
+                },
+                executor: Box::new(executor),
+            },
+            journal,
+        )
+        .await
+        .expect_err("oversized response turn id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
+async fn codex_session_rejects_oversized_restored_thread_id() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let runtime_state_root = temp_dir.path().join("runtime-state");
+    std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+    std::fs::write(
+        runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+        format!("{}\n", "x".repeat(2_048)),
+    )
+    .expect("write oversized thread state");
+    let ready = mark_runtime_ready(&runtime_state_root);
+    let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+
+    let error = adapter
+        .session_start(RuntimeSessionStartInput {
+            session_id: Uuid::new_v4(),
+            working_dir: None,
+            environment: Vec::new(),
+            runtime_state_root: Some(runtime_state_root),
+            runtime_session_ready: ready,
+        })
+        .await
+        .expect_err("oversized restored thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
+async fn codex_active_turn_rejects_oversized_protocol_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn("thr_1", &"x".repeat(2_048), interrupt_tx)
+        .expect_err("oversized active turn id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
 }
 
 #[tokio::test]

@@ -945,8 +945,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
-    let workspace_diffstats =
-        crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
+    let workspace_observations =
+        crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
 
     let finish = state.phase.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
@@ -1057,7 +1057,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                         &store,
                         id,
                         task,
-                        workspace_diffstats.get(id).map(String::as_str),
+                        workspace_observations.get(id),
                     )
                 }).collect::<Result<Vec<_>>>()?,
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
@@ -1141,7 +1141,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             }
         }
     }
-    print_retained_task_work(state, "  ", &workspace_diffstats);
+    print_task_workspace_observations(state, "  ", &workspace_observations);
     for (task_id, task) in &state.planning.tasks {
         if let Some(failure) = &task.last_failure {
             print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
@@ -1653,8 +1653,8 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             .map_or(serde_json::Value::Null, serde_json::Value::String);
         println!("{value}");
     } else {
-        let workspace_diffstats =
-            crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
+        let workspace_observations =
+            crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
         println!(
             "mission {mission_id}: {} (revision {}, {})",
             phase_slug(&state.phase),
@@ -1692,7 +1692,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 }
             }
         }
-        print_retained_task_work(state, "  ", &workspace_diffstats);
+        print_task_workspace_observations(state, "  ", &workspace_observations);
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, &mission_id)?;
         }
@@ -1729,12 +1729,12 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
             {
                 for effect in activity.effects {
                     println!(
-                        "{} {} elapsed={}ms deadline={} dirty={}",
+                        "{} {} elapsed={}ms deadline={} workspace={}",
                         effect.effect_id,
                         effect.last_activity,
                         effect.elapsed_ms,
                         effect.deadline_ms,
-                        effect.dirty_diffstat.as_deref().unwrap_or("clean")
+                        workspace_observation_summary(&effect.workspace)
                     );
                 }
             }
@@ -2123,8 +2123,8 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                 print_planning_input(blobs, state, "  ")?;
             }
             MissionDisposition::Parked => {
-                let workspace_diffstats =
-                    crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
+                let workspace_observations =
+                    crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
                 println!(
                     "mission {mission_id}: parked ({} attention item(s))",
                     state.open_attention.len()
@@ -2143,7 +2143,7 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
                         }
                     }
                 }
-                print_retained_task_work(state, "  ", &workspace_diffstats);
+                print_task_workspace_observations(state, "  ", &workspace_observations);
                 print_non_task_failures(state);
             }
             MissionDisposition::Running => {
@@ -2172,17 +2172,41 @@ async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool
     Ok(())
 }
 
-fn print_retained_task_work(
+fn print_task_workspace_observations(
     state: &crate::model::MissionState,
     indent: &str,
-    workspace_diffstats: &std::collections::BTreeMap<crate::model::TaskId, String>,
+    workspace_observations: &std::collections::BTreeMap<
+        crate::model::TaskId,
+        crate::activity::WorkspaceObservation,
+    >,
 ) {
     for task_id in state.tasks.keys() {
-        if let Some(diffstat) = workspace_diffstats.get(task_id) {
-            println!("{indent}task {task_id} retained work:");
-            for line in diffstat.lines() {
-                println!("{indent}  {line}");
+        match workspace_observations.get(task_id) {
+            Some(crate::activity::WorkspaceObservation::Changed { diffstat }) => {
+                println!("{indent}task {task_id} retained work:");
+                for line in diffstat.lines() {
+                    println!("{indent}  {line}");
+                }
             }
+            Some(crate::activity::WorkspaceObservation::Unavailable { reason }) => {
+                println!("{indent}task {task_id} workspace observation unavailable: {reason}");
+            }
+            Some(crate::activity::WorkspaceObservation::NotApplicable)
+            | Some(crate::activity::WorkspaceObservation::NotCreated)
+            | Some(crate::activity::WorkspaceObservation::Clean)
+            | None => {}
+        }
+    }
+}
+
+fn workspace_observation_summary(observation: &crate::activity::WorkspaceObservation) -> String {
+    match observation {
+        crate::activity::WorkspaceObservation::NotApplicable => "n/a".into(),
+        crate::activity::WorkspaceObservation::NotCreated => "not-created".into(),
+        crate::activity::WorkspaceObservation::Clean => "clean".into(),
+        crate::activity::WorkspaceObservation::Changed { diffstat } => diffstat.clone(),
+        crate::activity::WorkspaceObservation::Unavailable { reason } => {
+            format!("unavailable ({reason})")
         }
     }
 }
@@ -2190,8 +2214,8 @@ fn print_retained_task_work(
 async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
     let state = &view.state;
     let blobs = store.blobs();
-    let workspace_diffstats =
-        crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
+    let workspace_observations =
+        crate::activity::task_workspace_observations(store.lionclaw_dir(), state).await;
     Ok(serde_json::json!({
         "mission_id": state.mission_id.as_str(),
         "phase": phase_slug(&state.phase),
@@ -2206,7 +2230,7 @@ async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<s
                 store,
                 id,
                 task,
-                workspace_diffstats.get(id).map(String::as_str),
+                workspace_observations.get(id),
             )
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
@@ -2243,14 +2267,14 @@ fn task_runtime_json(
     store: &MissionStore,
     id: &crate::model::TaskId,
     task: &crate::model::TaskRuntimeState,
-    dirty_diffstat: Option<&str>,
+    workspace_observation: Option<&crate::activity::WorkspaceObservation>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "id": id.as_str(),
         "status": format!("{:?}", task.status).to_ascii_lowercase(),
         "workspace_base_sha": task.workspace_base_sha,
         "assignment_epoch": task.assignment_epoch,
-        "dirty_diffstat": dirty_diffstat,
+        "workspace_observation": workspace_observation,
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
         "final_response": task.final_response.as_ref()
@@ -3088,8 +3112,23 @@ mod tests {
                 final_response: None,
             },
         );
+        state.tasks.insert(
+            TaskId::new("unobservable").unwrap(),
+            TaskRuntimeState {
+                status: TaskStatus::Failed,
+                attempts: 1,
+                consecutive_failures: 1,
+                last_report: None,
+                last_failure: None,
+                feedback: Vec::new(),
+                last_runtime_configuration: None,
+                workspace_base_sha: Some("base".into()),
+                assignment_epoch: 1,
+                final_response: None,
+            },
+        );
         let mission_id = state.mission_id.clone();
-        let view = MissionView {
+        let mut view = MissionView {
             state,
             disposition: MissionDisposition::Parked,
         };
@@ -3106,7 +3145,49 @@ mod tests {
             .current_dir(&retained)
             .status()
             .unwrap();
+        for args in [
+            ["config", "user.name", "test"],
+            ["config", "user.email", "test@local"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&retained)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(retained.join("base.txt"), "base\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "base.txt"])
+            .current_dir(&retained)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "base"])
+            .current_dir(&retained)
+            .status()
+            .unwrap()
+            .success());
+        let base = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&retained)
+            .output()
+            .unwrap();
+        view.state
+            .tasks
+            .get_mut(&TaskId::new("retained").unwrap())
+            .unwrap()
+            .workspace_base_sha = Some(String::from_utf8(base.stdout).unwrap().trim().into());
         std::fs::write(retained.join("partial.txt"), "preserved\n").unwrap();
+        let unobservable = store
+            .lionclaw_dir()
+            .join("missions")
+            .join(mission_id.as_str())
+            .join("tasks/unobservable/work");
+        std::fs::create_dir_all(&unobservable).unwrap();
+        std::fs::write(unobservable.join("partial.txt"), "unknown\n").unwrap();
         std::fs::write(
             crate::activity::path(&store.mission_dir(&mission_id)),
             b"stale",
@@ -3133,7 +3214,7 @@ mod tests {
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
         assert_eq!(json["planning_tasks"][0]["id"], "planner");
         assert_eq!(
-            json["planning_tasks"][0]["dirty_diffstat"],
+            json["planning_tasks"][0]["workspace_observation"],
             serde_json::Value::Null
         );
         let retained = json["tasks"]
@@ -3142,10 +3223,25 @@ mod tests {
             .iter()
             .find(|task| task["id"] == "retained")
             .unwrap();
-        assert!(retained["dirty_diffstat"]
+        assert!(retained["workspace_observation"]["diffstat"]
             .as_str()
             .unwrap()
             .contains("partial.txt"));
+        assert_eq!(retained["workspace_observation"]["status"], "changed");
+        let unobservable = json["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "unobservable")
+            .unwrap();
+        assert_eq!(
+            unobservable["workspace_observation"]["status"],
+            "unavailable"
+        );
+        assert!(unobservable["workspace_observation"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Git observation failed"));
         assert_eq!(
             json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
             "applied"

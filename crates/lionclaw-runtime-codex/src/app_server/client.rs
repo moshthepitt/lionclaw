@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::state::{CodexInterruptRequest, CodexThreadState};
+use crate::state::{validate_protocol_id, CodexInterruptRequest, CodexThreadState};
 
 use super::event_mapping::{
     agent_message_phase_lane, app_server_error_text, app_server_item_events, app_server_item_type,
@@ -28,7 +28,6 @@ use super::sink::CodexAppServerEventSink;
 use super::transport::{AppServerMessage, AppServerTransport};
 
 const MAX_TRACKED_PROTOCOL_ENTRIES: usize = 256;
-const MAX_PROTOCOL_ID_BYTES: usize = 1_024;
 
 pub(crate) struct CodexAppServerClient<T> {
     transport: T,
@@ -488,7 +487,7 @@ where
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
-                    ensure_protocol_id_bounded(&thread_id)?;
+                    validate_protocol_id(&thread_id)?;
                     thread_state.persist_thread_id(&thread_id)?;
                     events.push(RuntimeEvent::Status {
                         code: None,
@@ -604,7 +603,7 @@ where
             .chain(self.active_agent_message_item_id.iter())
             .chain(self.last_answer_item_id.iter())
         {
-            ensure_protocol_id_bounded(id)?;
+            validate_protocol_id(id)?;
         }
         Ok(())
     }
@@ -820,16 +819,6 @@ where
         let response = app_server_error_response(id, -32601, message);
         self.transport.send(&response).await
     }
-}
-
-fn ensure_protocol_id_bounded(id: &str) -> Result<()> {
-    if id.len() > MAX_PROTOCOL_ID_BYTES {
-        bail!(
-            "codex app-server protocol state limit exceeded: identifier is {} bytes (maximum {MAX_PROTOCOL_ID_BYTES})",
-            id.len()
-        );
-    }
-    Ok(())
 }
 
 fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {

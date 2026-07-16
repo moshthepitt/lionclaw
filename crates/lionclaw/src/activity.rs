@@ -10,6 +10,18 @@ use crate::model::{InflightEffect, MissionState};
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
+const MAX_CONCURRENT_OBSERVERS: usize = 4;
+const TOTAL_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkspaceObservation {
+    NotApplicable,
+    NotCreated,
+    Clean,
+    Changed { diffstat: String },
+    Unavailable { reason: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityProjection {
@@ -35,7 +47,7 @@ pub struct EffectActivity {
     pub deadline_ms: i64,
     pub last_activity: String,
     pub tool_activity: Option<String>,
-    pub dirty_diffstat: Option<String>,
+    pub workspace: WorkspaceObservation,
     pub queued_controls: Vec<String>,
     pub queued_messages: usize,
     pub legal_controls: Vec<String>,
@@ -123,26 +135,26 @@ pub async fn publish_observed(
         .await
         .with_context(|| format!("creating mission directory '{}'", mission_dir.display()))?;
     let previous = read(mission_dir).await.ok();
-    let mut dirty_diffstats = std::collections::BTreeMap::new();
-    for (effect_id, effect) in state.inflight.iter().take(MAX_EFFECTS) {
-        if let InflightEffect::RoleRun { task_id, .. } = effect {
-            let base_sha = state
-                .tasks
-                .get(task_id)
-                .and_then(|task| task.workspace_base_sha.as_deref());
-            dirty_diffstats.insert(
+    let workspace_requests = state
+        .inflight
+        .iter()
+        .take(MAX_EFFECTS)
+        .filter_map(|(effect_id, effect)| match effect {
+            InflightEffect::RoleRun { task_id, .. } => Some((
                 effect_id.clone(),
-                workspace_diffstat(
-                    &mission_dir
-                        .join("tasks")
-                        .join(task_id.as_str())
-                        .join("work"),
-                    base_sha,
-                )
-                .await,
-            );
-        }
-    }
+                mission_dir
+                    .join("tasks")
+                    .join(task_id.as_str())
+                    .join("work"),
+                state
+                    .tasks
+                    .get(task_id)
+                    .and_then(|task| task.workspace_base_sha.clone()),
+            )),
+            InflightEffect::OracleRun { .. } | InflightEffect::TerminalReview { .. } => None,
+        })
+        .collect();
+    let workspace_observations = observe_workspaces(workspace_requests).await;
     let effects = state
         .inflight
         .iter()
@@ -183,7 +195,10 @@ pub async fn publish_observed(
                     *requested_at_ms,
                 ),
             };
-            let dirty_diffstat = dirty_diffstats.get(effect_id).cloned().flatten();
+            let workspace = workspace_observations
+                .get(effect_id)
+                .cloned()
+                .unwrap_or(WorkspaceObservation::NotApplicable);
             let prior = previous.as_ref().and_then(|projection| {
                 projection
                     .effects
@@ -248,7 +263,7 @@ pub async fn publish_observed(
                     )
                 },
                 tool_activity: prior.and_then(|prior| prior.tool_activity.clone()),
-                dirty_diffstat,
+                workspace,
                 queued_controls,
                 queued_messages: prior.map_or(0, |prior| prior.queued_messages),
                 legal_controls: if deadline_reached {
@@ -260,7 +275,7 @@ pub async fn publish_observed(
         })
         .collect();
     let mut projection = ActivityProjection {
-        version: 1,
+        version: 2,
         mission_id: state.mission_id.as_str().to_string(),
         event_head: state.head,
         generated_at_ms: now_ms,
@@ -351,119 +366,154 @@ async fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()
 async fn git_output(
     workspace: &Path,
     args: &[&str],
-) -> Option<lionclaw_runtime_api::ExecutionOutput> {
+) -> Result<lionclaw_runtime_api::ExecutionOutput> {
     crate::workspace::observed_git_output(workspace, args)
         .await
-        .ok()
+        .with_context(|| format!("Git observation failed for {}", args.join(" ")))
 }
 
-async fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String> {
+async fn workspace_observation(workspace: &Path, base_sha: Option<&str>) -> WorkspaceObservation {
     if !workspace.is_dir() {
-        return None;
+        return WorkspaceObservation::NotCreated;
     }
+    match observe_existing_workspace(workspace, base_sha).await {
+        Ok(summary) if summary.is_empty() => WorkspaceObservation::Clean,
+        Ok(diffstat) => WorkspaceObservation::Changed {
+            diffstat: bounded(&diffstat),
+        },
+        Err(error) => WorkspaceObservation::Unavailable {
+            reason: bounded(&format!("{error:#}")),
+        },
+    }
+}
+
+async fn observe_existing_workspace(workspace: &Path, base_sha: Option<&str>) -> Result<String> {
     let mut summary = String::new();
     if let Some(base_sha) = base_sha {
-        let head = git_output(workspace, &["rev-parse", "HEAD"]).await?;
-        if head.success() {
-            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-            if head != base_sha {
-                let ancestry =
-                    git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head])
-                        .await?;
-                let relation = if ancestry.success() {
-                    "committed work"
-                } else {
-                    "diverged work"
-                };
-                summary.push_str(&format!(
-                    "{relation}: {} (recorded base {})\n",
-                    crate::model::short_hex(&head),
-                    crate::model::short_hex(base_sha),
-                ));
-                if ancestry.success() {
-                    if let Some(diffstat) = git_output(
-                        workspace,
-                        &[
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            "--stat",
-                            &format!("{base_sha}..{head}"),
-                        ],
-                    )
-                    .await
-                    {
-                        if diffstat.success() {
-                            summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
-                        }
-                    }
-                }
+        let head_output = git_output(workspace, &["rev-parse", "HEAD"]).await?;
+        ensure_git_success(&head_output, "resolve workspace HEAD")?;
+        let head = String::from_utf8_lossy(&head_output.stdout)
+            .trim()
+            .to_string();
+        if head != base_sha {
+            let ancestry =
+                git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head]).await?;
+            let is_ancestor = if ancestry.success() {
+                true
+            } else if ancestry.exit_code == Some(1) && ancestry.exit_signal.is_none() {
+                false
+            } else {
+                ensure_git_success(&ancestry, "compare workspace ancestry")?;
+                unreachable!("successful ancestry check returned above")
+            };
+            let relation = if is_ancestor {
+                "committed work"
+            } else {
+                "diverged work"
+            };
+            summary.push_str(&format!(
+                "{relation}: {} (recorded base {})\n",
+                crate::model::short_hex(&head),
+                crate::model::short_hex(base_sha),
+            ));
+            if is_ancestor {
+                let diffstat = git_output(
+                    workspace,
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--stat",
+                        &format!("{base_sha}..{head}"),
+                    ],
+                )
+                .await?;
+                ensure_git_success(&diffstat, "read committed workspace diffstat")?;
+                summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
             }
         }
     }
     let status = git_output(workspace, &["status", "--short"]).await?;
-    if status.success() {
-        summary.push_str(&String::from_utf8_lossy(&status.stdout));
+    ensure_git_success(&status, "read workspace status")?;
+    summary.push_str(&String::from_utf8_lossy(&status.stdout));
+    Ok(summary)
+}
+
+fn ensure_git_success(
+    output: &lionclaw_runtime_api::ExecutionOutput,
+    operation: &str,
+) -> Result<()> {
+    if !output.success() {
+        anyhow::bail!(
+            "{operation} failed ({}): {}",
+            output.status_description(),
+            bounded(&String::from_utf8_lossy(&output.stderr))
+        );
     }
-    (!summary.is_empty()).then(|| bounded(&summary))
+    Ok(())
 }
 
-pub async fn task_workspace_diffstat(
-    lionclaw_dir: &Path,
-    mission_id: &crate::model::MissionId,
-    task_id: &crate::model::TaskId,
-    base_sha: Option<&str>,
-) -> Option<String> {
-    workspace_diffstat(
-        &lionclaw_dir
-            .join("missions")
-            .join(mission_id.as_str())
-            .join("tasks")
-            .join(task_id.as_str())
-            .join("work"),
-        base_sha,
-    )
-    .await
-}
-
-pub async fn task_workspace_diffstats(
+pub async fn task_workspace_observations(
     lionclaw_dir: &Path,
     state: &MissionState,
-) -> std::collections::BTreeMap<crate::model::TaskId, String> {
-    const MAX_CONCURRENT_OBSERVERS: usize = 4;
-    const TOTAL_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+) -> std::collections::BTreeMap<crate::model::TaskId, WorkspaceObservation> {
+    let requests = state
+        .tasks
+        .iter()
+        .map(|(task_id, task)| {
+            (
+                task_id.clone(),
+                lionclaw_dir
+                    .join("missions")
+                    .join(state.mission_id.as_str())
+                    .join("tasks")
+                    .join(task_id.as_str())
+                    .join("work"),
+                task.workspace_base_sha.clone(),
+            )
+        })
+        .collect();
+    observe_workspaces(requests).await
+}
+
+async fn observe_workspaces<K>(
+    requests: Vec<(K, PathBuf, Option<String>)>,
+) -> std::collections::BTreeMap<K, WorkspaceObservation>
+where
+    K: Clone + Ord + Send + 'static,
+{
+    let mut observed: std::collections::BTreeMap<K, WorkspaceObservation> = requests
+        .iter()
+        .map(|(key, _, _)| {
+            (
+                key.clone(),
+                WorkspaceObservation::Unavailable {
+                    reason: "observation budget exhausted".into(),
+                },
+            )
+        })
+        .collect();
     let mut tasks = tokio::task::JoinSet::new();
-    let mut pending = state.tasks.iter();
+    let mut pending = requests.into_iter();
     let deadline = tokio::time::Instant::now() + TOTAL_OBSERVATION_BUDGET;
-    let mut observed = std::collections::BTreeMap::new();
     loop {
         while tasks.len() < MAX_CONCURRENT_OBSERVERS {
-            let Some((task_id, task)) = pending.next() else {
+            let Some((key, workspace, base_sha)) = pending.next() else {
                 break;
             };
-            let lionclaw_dir = lionclaw_dir.to_path_buf();
-            let mission_id = state.mission_id.clone();
-            let task_id = task_id.clone();
-            let base_sha = task.workspace_base_sha.clone();
             tasks.spawn(async move {
-                let diffstat = task_workspace_diffstat(
-                    &lionclaw_dir,
-                    &mission_id,
-                    &task_id,
-                    base_sha.as_deref(),
-                )
-                .await;
-                (task_id, diffstat)
+                let observation = workspace_observation(&workspace, base_sha.as_deref()).await;
+                (key, observation)
             });
         }
         if tasks.is_empty() {
             break;
         }
         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(Ok((task_id, Some(diffstat))))) => {
-                observed.insert(task_id, diffstat);
+            Ok(Some(Ok((key, observation)))) => {
+                observed.insert(key, observation);
             }
-            Ok(Some(Ok((_, None)))) | Ok(Some(Err(_))) => {}
+            Ok(Some(Err(_))) => {}
             Ok(None) => break,
             Err(_) => {
                 tasks.abort_all();
@@ -520,9 +570,11 @@ mod tests {
         run(&["add", "work.txt"]);
         run(&["commit", "-q", "-m", "worker progress"]);
 
-        let summary = workspace_diffstat(temp.path(), Some(base.trim()))
-            .await
-            .unwrap();
+        let WorkspaceObservation::Changed { diffstat: summary } =
+            workspace_observation(temp.path(), Some(base.trim())).await
+        else {
+            panic!("committed work must be observed as changed");
+        };
         assert!(summary.contains("committed work:"));
         assert!(summary.contains("work.txt"));
         assert!(!summary.contains(" M work.txt"));
@@ -556,7 +608,7 @@ mod tests {
         run(&["commit", "-q", "-m", "base"]);
         run(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
 
-        let _ = workspace_diffstat(temp.path(), None).await;
+        let _ = workspace_observation(temp.path(), None).await;
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled local config"
@@ -577,11 +629,24 @@ mod tests {
         run(&["config", "filter.hostile.clean", filter.to_str().unwrap()]);
         std::fs::write(temp.path().join("tracked"), "worker change\n").unwrap();
 
-        let _ = workspace_diffstat(temp.path(), None).await;
+        let _ = workspace_observation(temp.path(), None).await;
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled filter drivers"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_observation_does_not_look_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("not-a-repository"), "retained work\n").unwrap();
+
+        let observation = workspace_observation(temp.path(), None).await;
+
+        assert!(matches!(
+            observation,
+            WorkspaceObservation::Unavailable { .. }
+        ));
     }
 
     #[test]
@@ -612,7 +677,7 @@ mod tests {
         write(
             temp.path(),
             &ActivityProjection {
-                version: 1,
+                version: 2,
                 mission_id: "mission".into(),
                 event_head: 4,
                 generated_at_ms: 10,
@@ -630,7 +695,7 @@ mod tests {
                     deadline_ms: 100,
                     last_activity: "effect running".into(),
                     tool_activity: None,
-                    dirty_diffstat: None,
+                    workspace: WorkspaceObservation::Clean,
                     queued_controls: Vec::new(),
                     queued_messages: 0,
                     legal_controls: vec!["stop".into()],

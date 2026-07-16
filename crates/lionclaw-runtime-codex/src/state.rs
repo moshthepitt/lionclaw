@@ -2,11 +2,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use lionclaw_runtime_api::{load_ready_state_value, save_state_value, RuntimeSessionReady};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const CODEX_THREAD_ID_STATE_FILE: &str = ".lionclaw-codex-thread-id";
+pub(crate) const MAX_CODEX_PROTOCOL_ID_BYTES: usize = 1_024;
+
+pub(crate) fn validate_protocol_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("codex app-server protocol identifier must not be empty");
+    }
+    if id.len() > MAX_CODEX_PROTOCOL_ID_BYTES {
+        bail!(
+            "codex app-server protocol identifier is {} bytes (maximum {MAX_CODEX_PROTOCOL_ID_BYTES})",
+            id.len()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CodexSessionState {
@@ -37,15 +51,20 @@ pub(crate) fn load_ready_saved_thread_id(
     root: &Path,
     runtime_session_ready: RuntimeSessionReady,
 ) -> Result<Option<String>> {
-    load_ready_state_value(
+    let thread_id = load_ready_state_value(
         root,
         CODEX_THREAD_ID_STATE_FILE,
         "codex thread",
         runtime_session_ready,
-    )
+    )?;
+    if let Some(thread_id) = thread_id.as_deref() {
+        validate_protocol_id(thread_id)?;
+    }
+    Ok(thread_id)
 }
 
 pub(crate) fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
+    validate_protocol_id(thread_id)?;
     save_state_value(root, CODEX_THREAD_ID_STATE_FILE, thread_id, "codex thread")
 }
 
@@ -56,6 +75,8 @@ impl CodexThreadState {
         turn_id: &str,
         interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
     ) -> Result<()> {
+        validate_protocol_id(thread_id)?;
+        validate_protocol_id(turn_id)?;
         let mut sessions = self
             .sessions
             .write()
@@ -114,6 +135,7 @@ impl CodexThreadState {
     }
 
     pub(crate) fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
+        validate_protocol_id(thread_id)?;
         let root = self
             .sessions
             .read()
