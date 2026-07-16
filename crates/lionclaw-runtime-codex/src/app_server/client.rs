@@ -27,6 +27,9 @@ use super::protocol::{
 use super::sink::CodexAppServerEventSink;
 use super::transport::{AppServerMessage, AppServerTransport};
 
+const MAX_TRACKED_PROTOCOL_ENTRIES: usize = 256;
+const MAX_PROTOCOL_ID_BYTES: usize = 1_024;
+
 pub(crate) struct CodexAppServerClient<T> {
     transport: T,
     runtime_context: Option<RuntimeExecutionContext>,
@@ -473,6 +476,7 @@ where
             {
                 events.push(RuntimeEvent::Artifact { artifact });
             }
+            self.ensure_protocol_state_bounded()?;
             return Ok(events);
         };
         let params = message.get("params").unwrap_or(&Value::Null);
@@ -484,6 +488,7 @@ where
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
+                    ensure_protocol_id_bounded(&thread_id)?;
                     thread_state.persist_thread_id(&thread_id)?;
                     events.push(RuntimeEvent::Status {
                         code: None,
@@ -565,7 +570,43 @@ where
             }
             _ => {}
         }
+        self.ensure_protocol_state_bounded()?;
         Ok(events)
+    }
+
+    fn ensure_protocol_state_bounded(&self) -> Result<()> {
+        let entry_count = self.completed_turns.len()
+            + self.completed_turn_threads.len()
+            + self.failed_turns.len()
+            + self.started_thread_turns.len()
+            + self.agent_message_lanes.len()
+            + self.active_answer_item_ids.len()
+            + self.completed_context_compaction_threads.len()
+            + self.emitted_artifact_ids.len()
+            + usize::from(self.active_agent_message_item_id.is_some())
+            + usize::from(self.last_answer_item_id.is_some());
+        if entry_count > MAX_TRACKED_PROTOCOL_ENTRIES {
+            bail!(
+                "codex app-server protocol state limit exceeded ({entry_count} > {MAX_TRACKED_PROTOCOL_ENTRIES})"
+            );
+        }
+        for id in self
+            .completed_turns
+            .iter()
+            .chain(self.completed_turn_threads.iter())
+            .chain(self.failed_turns.keys())
+            .chain(self.started_thread_turns.keys())
+            .chain(self.started_thread_turns.values())
+            .chain(self.agent_message_lanes.keys())
+            .chain(self.active_answer_item_ids.iter())
+            .chain(self.completed_context_compaction_threads.iter())
+            .chain(self.emitted_artifact_ids.iter())
+            .chain(self.active_agent_message_item_id.iter())
+            .chain(self.last_answer_item_id.iter())
+        {
+            ensure_protocol_id_bounded(id)?;
+        }
+        Ok(())
     }
 
     /// Translate one app-server message and forward its canonical events to the
@@ -779,6 +820,16 @@ where
         let response = app_server_error_response(id, -32601, message);
         self.transport.send(&response).await
     }
+}
+
+fn ensure_protocol_id_bounded(id: &str) -> Result<()> {
+    if id.len() > MAX_PROTOCOL_ID_BYTES {
+        bail!(
+            "codex app-server protocol state limit exceeded: identifier is {} bytes (maximum {MAX_PROTOCOL_ID_BYTES})",
+            id.len()
+        );
+    }
+    Ok(())
 }
 
 fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {

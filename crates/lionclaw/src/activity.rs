@@ -113,15 +113,36 @@ pub fn driver_error(mission_dir: &Path) -> Option<String> {
         })
 }
 
-pub fn publish_observed(
+pub async fn publish_observed(
     mission_dir: &Path,
     state: &MissionState,
     now_ms: i64,
     observation: Option<&(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
 ) -> Result<()> {
-    std::fs::create_dir_all(mission_dir)
+    tokio::fs::create_dir_all(mission_dir)
+        .await
         .with_context(|| format!("creating mission directory '{}'", mission_dir.display()))?;
-    let previous = read(mission_dir).ok();
+    let previous = read(mission_dir).await.ok();
+    let mut dirty_diffstats = std::collections::BTreeMap::new();
+    for (effect_id, effect) in state.inflight.iter().take(MAX_EFFECTS) {
+        if let InflightEffect::RoleRun { task_id, .. } = effect {
+            let base_sha = state
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.workspace_base_sha.as_deref());
+            dirty_diffstats.insert(
+                effect_id.clone(),
+                workspace_diffstat(
+                    &mission_dir
+                        .join("tasks")
+                        .join(task_id.as_str())
+                        .join("work"),
+                    base_sha,
+                )
+                .await,
+            );
+        }
+    }
     let effects = state
         .inflight
         .iter()
@@ -162,16 +183,7 @@ pub fn publish_observed(
                     *requested_at_ms,
                 ),
             };
-            let dirty_diffstat = task.as_ref().and_then(|task| {
-                let base_sha = match effect {
-                    InflightEffect::RoleRun { task_id, .. } => state
-                        .tasks
-                        .get(task_id)
-                        .and_then(|task| task.workspace_base_sha.as_deref()),
-                    _ => None,
-                };
-                workspace_diffstat(&mission_dir.join("tasks").join(task).join("work"), base_sha)
-            });
+            let dirty_diffstat = dirty_diffstats.get(effect_id).cloned().flatten();
             let prior = previous.as_ref().and_then(|projection| {
                 projection
                     .effects
@@ -257,7 +269,7 @@ pub fn publish_observed(
     if let Some((effect_id, event)) = observation {
         apply_runtime_event(&mut projection, effect_id, event, now_ms);
     }
-    write(mission_dir, &projection)
+    write(mission_dir, &projection).await
 }
 
 fn apply_runtime_event(
@@ -318,39 +330,47 @@ fn apply_runtime_event(
     projection.generated_at_ms = now_ms;
 }
 
-fn read(mission_dir: &Path) -> Result<ActivityProjection> {
-    let bytes = std::fs::read(path(mission_dir))?;
+async fn read(mission_dir: &Path) -> Result<ActivityProjection> {
+    let bytes = tokio::fs::read(path(mission_dir)).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()> {
+async fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(projection)?;
     let target = path(mission_dir);
     let temporary = target.with_extension("tmp");
-    std::fs::write(&temporary, bytes)
+    tokio::fs::write(&temporary, bytes)
+        .await
         .with_context(|| format!("writing activity projection '{}'", temporary.display()))?;
-    std::fs::rename(&temporary, &target)
+    tokio::fs::rename(&temporary, &target)
+        .await
         .with_context(|| format!("publishing activity projection '{}'", target.display()))?;
     Ok(())
 }
 
-fn git_output(workspace: &Path, args: &[&str]) -> Option<std::process::Output> {
-    crate::workspace::observed_git_output(workspace, args).ok()
+async fn git_output(
+    workspace: &Path,
+    args: &[&str],
+) -> Option<lionclaw_runtime_api::ExecutionOutput> {
+    crate::workspace::observed_git_output(workspace, args)
+        .await
+        .ok()
 }
 
-fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String> {
+async fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String> {
     if !workspace.is_dir() {
         return None;
     }
     let mut summary = String::new();
     if let Some(base_sha) = base_sha {
-        let head = git_output(workspace, &["rev-parse", "HEAD"])?;
-        if head.status.success() {
+        let head = git_output(workspace, &["rev-parse", "HEAD"]).await?;
+        if head.success() {
             let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
             if head != base_sha {
                 let ancestry =
-                    git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head])?;
-                let relation = if ancestry.status.success() {
+                    git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head])
+                        .await?;
+                let relation = if ancestry.success() {
                     "committed work"
                 } else {
                     "diverged work"
@@ -360,7 +380,7 @@ fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String
                     crate::model::short_hex(&head),
                     crate::model::short_hex(base_sha),
                 ));
-                if ancestry.status.success() {
+                if ancestry.success() {
                     if let Some(diffstat) = git_output(
                         workspace,
                         &[
@@ -370,8 +390,10 @@ fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String
                             "--stat",
                             &format!("{base_sha}..{head}"),
                         ],
-                    ) {
-                        if diffstat.status.success() {
+                    )
+                    .await
+                    {
+                        if diffstat.success() {
                             summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
                         }
                     }
@@ -379,14 +401,14 @@ fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String
             }
         }
     }
-    let status = git_output(workspace, &["status", "--short"])?;
-    if status.status.success() {
+    let status = git_output(workspace, &["status", "--short"]).await?;
+    if status.success() {
         summary.push_str(&String::from_utf8_lossy(&status.stdout));
     }
     (!summary.is_empty()).then(|| bounded(&summary))
 }
 
-pub fn task_workspace_diffstat(
+pub async fn task_workspace_diffstat(
     lionclaw_dir: &Path,
     mission_id: &crate::model::MissionId,
     task_id: &crate::model::TaskId,
@@ -401,6 +423,55 @@ pub fn task_workspace_diffstat(
             .join("work"),
         base_sha,
     )
+    .await
+}
+
+pub async fn task_workspace_diffstats(
+    lionclaw_dir: &Path,
+    state: &MissionState,
+) -> std::collections::BTreeMap<crate::model::TaskId, String> {
+    const MAX_CONCURRENT_OBSERVERS: usize = 4;
+    const TOTAL_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending = state.tasks.iter();
+    let deadline = tokio::time::Instant::now() + TOTAL_OBSERVATION_BUDGET;
+    let mut observed = std::collections::BTreeMap::new();
+    loop {
+        while tasks.len() < MAX_CONCURRENT_OBSERVERS {
+            let Some((task_id, task)) = pending.next() else {
+                break;
+            };
+            let lionclaw_dir = lionclaw_dir.to_path_buf();
+            let mission_id = state.mission_id.clone();
+            let task_id = task_id.clone();
+            let base_sha = task.workspace_base_sha.clone();
+            tasks.spawn(async move {
+                let diffstat = task_workspace_diffstat(
+                    &lionclaw_dir,
+                    &mission_id,
+                    &task_id,
+                    base_sha.as_deref(),
+                )
+                .await;
+                (task_id, diffstat)
+            });
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(Ok((task_id, Some(diffstat))))) => {
+                observed.insert(task_id, diffstat);
+            }
+            Ok(Some(Ok((_, None)))) | Ok(Some(Err(_))) => {}
+            Ok(None) => break,
+            Err(_) => {
+                tasks.abort_all();
+                break;
+            }
+        }
+    }
+    observed
 }
 
 fn bounded(text: &str) -> String {
@@ -420,8 +491,8 @@ mod tests {
         assert_eq!(bounded(&"x".repeat(MAX_TEXT + 10)).len(), MAX_TEXT);
     }
 
-    #[test]
-    fn clean_committed_work_is_visible_relative_to_the_recorded_base() {
+    #[tokio::test]
+    async fn clean_committed_work_is_visible_relative_to_the_recorded_base() {
         let temp = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             let status = std::process::Command::new("git")
@@ -440,6 +511,7 @@ mod tests {
         run(&["commit", "-q", "-m", "base"]);
         let base = String::from_utf8(
             git_output(temp.path(), &["rev-parse", "HEAD"])
+                .await
                 .unwrap()
                 .stdout,
         )
@@ -448,14 +520,16 @@ mod tests {
         run(&["add", "work.txt"]);
         run(&["commit", "-q", "-m", "worker progress"]);
 
-        let summary = workspace_diffstat(temp.path(), Some(base.trim())).unwrap();
+        let summary = workspace_diffstat(temp.path(), Some(base.trim()))
+            .await
+            .unwrap();
         assert!(summary.contains("committed work:"));
         assert!(summary.contains("work.txt"));
         assert!(!summary.contains(" M work.txt"));
     }
 
-    #[test]
-    fn workspace_observation_never_executes_worker_git_configuration() {
+    #[tokio::test]
+    async fn workspace_observation_never_executes_worker_git_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("host-command-ran");
         let monitor = temp.path().join("hostile-monitor");
@@ -482,7 +556,7 @@ mod tests {
         run(&["commit", "-q", "-m", "base"]);
         run(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
 
-        let _ = workspace_diffstat(temp.path(), None);
+        let _ = workspace_diffstat(temp.path(), None).await;
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled local config"
@@ -503,7 +577,7 @@ mod tests {
         run(&["config", "filter.hostile.clean", filter.to_str().unwrap()]);
         std::fs::write(temp.path().join("tracked"), "worker change\n").unwrap();
 
-        let _ = workspace_diffstat(temp.path(), None);
+        let _ = workspace_diffstat(temp.path(), None).await;
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled filter drivers"
@@ -531,8 +605,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn runtime_journal_updates_configuration_and_activity_without_message_content() {
+    #[tokio::test]
+    async fn runtime_journal_updates_configuration_and_activity_without_message_content() {
         let temp = tempfile::tempdir().unwrap();
         let effect_id = crate::model::EffectId::for_parts(&["activity", "effect"]);
         write(
@@ -563,9 +637,10 @@ mod tests {
                 }],
             },
         )
+        .await
         .unwrap();
 
-        let mut projection = read(temp.path()).unwrap();
+        let mut projection = read(temp.path()).await.unwrap();
         apply_runtime_event(
             &mut projection,
             &effect_id,
@@ -590,9 +665,9 @@ mod tests {
             }),
             21,
         );
-        write(temp.path(), &projection).unwrap();
+        write(temp.path(), &projection).await.unwrap();
 
-        let projection = read(temp.path()).unwrap();
+        let projection = read(temp.path()).await.unwrap();
         let effect = &projection.effects[0];
         assert_eq!(effect.applied_model.as_deref(), Some("canonical-id"));
         assert_eq!(

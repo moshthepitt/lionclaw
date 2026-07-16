@@ -573,6 +573,35 @@ async fn app_server_agent_message_phases_choose_transcript_lane() {
 }
 
 #[tokio::test]
+async fn app_server_protocol_state_is_bounded_against_unmatched_provider_ids() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    let mut limit_error = None;
+
+    for index in 0..1_024 {
+        let result = client
+            .handle_message(
+                json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": format!("unmatched-thread-{index}"),
+                        "turn": {"id": format!("unmatched-turn-{index}")},
+                    }
+                }),
+                &thread_state,
+            )
+            .await;
+        if let Err(error) = result {
+            limit_error = Some(error);
+            break;
+        }
+    }
+
+    let error = limit_error.expect("provider-selected protocol IDs must have a finite state bound");
+    assert!(error.to_string().contains("protocol state limit"));
+}
+
+#[tokio::test]
 async fn app_server_agent_message_items_emit_answer_boundaries() {
     let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
     let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));

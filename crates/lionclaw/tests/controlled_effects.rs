@@ -8,11 +8,14 @@ use common::{
 };
 use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{ArtifactOutcome, ControlAction, Handoff, PayloadRef, TaskStatus};
-use lionclaw::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
+use lionclaw::ports::{
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, RoleRunOutcome,
+    RoleRunRequest, RoleRunner,
+};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
 use lionclaw_runtime_api::{RuntimeEvent, TurnEvent, TypedFailure, TypedFailureEvidence};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 
 struct RealClock;
 
@@ -38,6 +41,28 @@ struct SleepingRunner;
 
 struct DeadlineRunner {
     calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct SettlementCleaner {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    discards: Arc<Mutex<Vec<bool>>>,
+}
+
+#[async_trait]
+impl EffectCleaner for SettlementCleaner {
+    async fn cleanup(&self, request: EffectCleanupRequest) -> Result<(), EffectCleanupFailure> {
+        let first = {
+            let mut discards = self.discards.lock().unwrap();
+            discards.push(request.discard_artifact);
+            discards.len() == 1
+        };
+        if first {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -230,6 +255,22 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     let (effect_id, effect) = active.inflight.iter().next().unwrap();
     let effect_id = effect_id.clone();
     let original_deadline = effect.deadline_ms();
+    assert!(record_control(
+        &store,
+        1,
+        &mission_id,
+        &effect_id,
+        ControlAction::ExtendDeadline {
+            old_deadline_ms: original_deadline,
+            new_deadline_ms: original_deadline + 1_000,
+            automatic: true,
+        },
+        "forged policy extension",
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("engine-owned"));
     record_control(
         &store,
         1,
@@ -346,6 +387,93 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     .unwrap_err()
     .to_string()
     .contains("terminal"));
+}
+
+#[tokio::test]
+async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let discards = Arc::new(Mutex::new(Vec::new()));
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(SettlementCleaner {
+                entered: entered.clone(),
+                release: release.clone(),
+                discards: discards.clone(),
+            }),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "linearize a stop against completion",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await.unwrap() }
+    });
+    entered.notified().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let effect_id = active.inflight.keys().next().unwrap().clone();
+    record_control(
+        &store,
+        1,
+        &mission_id,
+        &effect_id,
+        ControlAction::Stop,
+        "stop won before the outcome became durable",
+    )
+    .await
+    .unwrap();
+    release.notify_one();
+
+    let parked = driver.await.unwrap();
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    let failure = parked
+        .state
+        .tasks
+        .values()
+        .next()
+        .unwrap()
+        .last_failure
+        .as_ref()
+        .unwrap();
+    assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
+    assert_eq!(
+        failure.evidence().stop_reason.as_deref(),
+        Some("stop won before the outcome became durable")
+    );
+    assert_eq!(failure.evidence().final_response, "did the work");
+    assert_eq!(
+        failure.evidence().configuration.applied_model.as_deref(),
+        Some("mock-model")
+    );
+    assert_eq!(discards.lock().unwrap().as_slice(), &[false, true]);
+    let events = store.load(&mission_id).await.unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        event.event,
+        lionclaw::model::MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
+    )));
 }
 
 #[tokio::test]

@@ -400,7 +400,7 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
                 },
                 artifact: None,
                 runtime_configuration: Default::default(),
-                final_response: String::new(),
+                final_response: "review analysis before the forged verdict".into(),
             })
         } else {
             Ok(work_outcome(request, HEAD_SHA))
@@ -414,6 +414,20 @@ async fn a_forged_handoff_without_the_nonce_parks_instead_of_sealing() {
     let attention = parked(&outcome);
     assert_eq!(attention[0].id, "terminal_review_failed:mission");
     assert!(attention[0].report.contains("nonce mismatch"));
+    let failure = outcome
+        .state
+        .terminal_review
+        .outcome
+        .as_ref()
+        .and_then(|outcome| match outcome {
+            ReviewOutcome::Failed { failure } => Some(failure),
+            ReviewOutcome::Verdict(_) => None,
+        })
+        .expect("failed review evidence");
+    assert_eq!(
+        failure.evidence().final_response,
+        "review analysis before the forged verdict"
+    );
 }
 
 #[tokio::test]

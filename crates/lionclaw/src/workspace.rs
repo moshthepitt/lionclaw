@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -320,13 +321,23 @@ async fn observed_git(repo: &Path, args: &[&str]) -> Result<String> {
     observer.output(args).await
 }
 
-pub fn observed_git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+pub async fn observed_git_output(
+    repo: &Path,
+    args: &[&str],
+) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+    observed_git_output_with_timeout(repo, args, Path::new("git"), Duration::from_millis(500)).await
+}
+
+async fn observed_git_output_with_timeout(
+    repo: &Path,
+    args: &[&str],
+    executable: &Path,
+    timeout: Duration,
+) -> Result<lionclaw_runtime_api::ExecutionOutput> {
     let observer = GitObserver::open(repo)?;
-    observer
-        .std_command()
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to spawn isolated git {args:?}"))
+    tokio::time::timeout(timeout, observer.raw_output_with(executable, args))
+        .await
+        .with_context(|| format!("isolated git {args:?} exceeded observation deadline"))?
 }
 
 async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -431,19 +442,18 @@ impl GitObserver {
     }
 
     fn tokio_command(&self) -> Command {
-        let mut command = Command::new("git");
+        self.tokio_command_with(Path::new("git"))
+    }
+
+    fn tokio_command_with(&self, executable: &Path) -> Command {
+        let mut command = Command::new(executable);
         self.configure_tokio(&mut command);
         command
     }
 
     async fn output(&self, args: &[&str]) -> Result<String> {
-        let output = self
-            .tokio_command()
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn isolated git {args:?}"))?;
-        if !output.status.success() {
+        let output = self.raw_output(args).await?;
+        if !output.success() {
             bail!(
                 "isolated git {:?} failed in '{}': {}",
                 args,
@@ -452,6 +462,22 @@ impl GitObserver {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn raw_output(&self, args: &[&str]) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+        self.raw_output_with(Path::new("git"), args).await
+    }
+
+    async fn raw_output_with(
+        &self,
+        executable: &Path,
+        args: &[&str],
+    ) -> Result<lionclaw_runtime_api::ExecutionOutput> {
+        let mut command = self.tokio_command_with(executable);
+        command.args(args);
+        lionclaw_confinement::process::run_command_bounded(&mut command)
+            .await
+            .with_context(|| format!("failed to run isolated git {args:?}"))
     }
 
     fn local_fetch_source(&self) -> Result<&Path> {
@@ -464,23 +490,6 @@ impl GitObserver {
         }
         std::fs::write(info.join("alternates"), format!("{object_path}\n"))?;
         Ok(&self.metadata)
-    }
-
-    fn std_command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new("git");
-        command
-            .arg("--no-optional-locks")
-            .env("GIT_DIR", &self.metadata)
-            .env("GIT_WORK_TREE", &self.worktree)
-            .env("GIT_INDEX_FILE", &self.index)
-            .env("GIT_OBJECT_DIRECTORY", &self.objects)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG", "/dev/null")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_EXTERNAL_DIFF");
-        command
     }
 
     fn configure_tokio(&self, command: &mut Command) {
@@ -658,6 +667,29 @@ mod tests {
         git(dir, &["add", "-A"]).await.unwrap();
         git(dir, &["commit", "-q", "-m", "base"]).await.unwrap();
         head_sha(dir).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disposable_git_observation_has_a_hard_deadline() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let fake_git = repo.path().join("stalling-git");
+        std::fs::write(&fake_git, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        make_executable(&fake_git).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = observed_git_output_with_timeout(
+            repo.path(),
+            &["status", "--short"],
+            &fake_git,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("disposable observation must time out");
+
+        assert!(error.to_string().contains("observation deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

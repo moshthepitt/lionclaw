@@ -814,16 +814,16 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
         }
     }
     if args.json {
-        let missions: Vec<_> = pending
-            .iter()
-            .map(|view| mission_view_json(view, &store))
-            .collect::<Result<Vec<_>>>()?;
+        let mut missions = Vec::with_capacity(pending.len());
+        for view in &pending {
+            missions.push(mission_view_json(view, &store).await?);
+        }
         println!("{}", serde_json::json!({ "missions": missions }));
     } else if pending.is_empty() {
         println!("inbox empty: no missions awaiting input or cleanup");
     } else {
         for view in &pending {
-            print_mission_view(view, &store, false)?;
+            print_mission_view(view, &store, false).await?;
             println!("  objective: {}", view.state.objective);
             println!("  next: {}", view.next_actions().join(" | "));
         }
@@ -945,6 +945,8 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
+    let workspace_diffstats =
+        crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
 
     let finish = state.phase.finish();
     // Per-assertion evidence: the oracle that judged it, its exit code, the
@@ -1051,10 +1053,15 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "disposition": view.disposition.slug(),
                 "next_actions": view.next_actions(),
                 "tasks": state.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(&store, state, id, task, true)
+                    task_runtime_json(
+                        &store,
+                        id,
+                        task,
+                        workspace_diffstats.get(id).map(String::as_str),
+                    )
                 }).collect::<Result<Vec<_>>>()?,
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(&store, state, id, task, false)
+                    task_runtime_json(&store, id, task, None)
                 }).collect::<Result<Vec<_>>>()?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
@@ -1134,7 +1141,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             }
         }
     }
-    print_retained_task_work(&store, state, "  ");
+    print_retained_task_work(state, "  ", &workspace_diffstats);
     for (task_id, task) in &state.planning.tasks {
         if let Some(failure) = &task.last_failure {
             print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
@@ -1563,7 +1570,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let view = load_mission_view(engine.store(), &mission_id).await?;
     let state = &view.state;
-    print_mission_view(&view, engine.store(), args.json)?;
+    print_mission_view(&view, engine.store(), args.json).await?;
     // Closing over acknowledged review gaps (or a waived review) was an
     // explicit, justified human decision — exit SUCCESS, but say so. The
     // summary already applies the freshness law, so a stale verdict from a
@@ -1637,7 +1644,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
     if args.json {
-        let mut value = mission_view_json(&view, &store)?;
+        let mut value = mission_view_json(&view, &store).await?;
         let activity = running_activity_bytes(&store, &mission_id, view.disposition)
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
@@ -1646,6 +1653,8 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
             .map_or(serde_json::Value::Null, serde_json::Value::String);
         println!("{value}");
     } else {
+        let workspace_diffstats =
+            crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
         println!(
             "mission {mission_id}: {} (revision {}, {})",
             phase_slug(&state.phase),
@@ -1683,7 +1692,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 }
             }
         }
-        print_retained_task_work(&store, state, "  ");
+        print_retained_task_work(state, "  ", &workspace_diffstats);
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, &mission_id)?;
         }
@@ -2101,12 +2110,12 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
     }
 }
 
-fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> Result<()> {
+async fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> Result<()> {
     let state = &view.state;
     let blobs = store.blobs();
     let mission_id = state.mission_id.as_str();
     if json {
-        println!("{}", mission_view_json(view, store)?);
+        println!("{}", mission_view_json(view, store).await?);
     } else {
         match view.disposition {
             MissionDisposition::AwaitingPlan => {
@@ -2114,6 +2123,8 @@ fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> R
                 print_planning_input(blobs, state, "  ")?;
             }
             MissionDisposition::Parked => {
+                let workspace_diffstats =
+                    crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
                 println!(
                     "mission {mission_id}: parked ({} attention item(s))",
                     state.open_attention.len()
@@ -2132,7 +2143,7 @@ fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> R
                         }
                     }
                 }
-                print_retained_task_work(store, state, "  ");
+                print_retained_task_work(state, "  ", &workspace_diffstats);
                 print_non_task_failures(state);
             }
             MissionDisposition::Running => {
@@ -2162,21 +2173,12 @@ fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> R
 }
 
 fn print_retained_task_work(
-    store: &MissionStore,
     state: &crate::model::MissionState,
     indent: &str,
+    workspace_diffstats: &std::collections::BTreeMap<crate::model::TaskId, String>,
 ) {
     for task_id in state.tasks.keys() {
-        let base_sha = state
-            .tasks
-            .get(task_id)
-            .and_then(|task| task.workspace_base_sha.as_deref());
-        if let Some(diffstat) = crate::activity::task_workspace_diffstat(
-            store.lionclaw_dir(),
-            &state.mission_id,
-            task_id,
-            base_sha,
-        ) {
+        if let Some(diffstat) = workspace_diffstats.get(task_id) {
             println!("{indent}task {task_id} retained work:");
             for line in diffstat.lines() {
                 println!("{indent}  {line}");
@@ -2185,9 +2187,11 @@ fn print_retained_task_work(
     }
 }
 
-fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
+async fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
     let state = &view.state;
     let blobs = store.blobs();
+    let workspace_diffstats =
+        crate::activity::task_workspace_diffstats(store.lionclaw_dir(), state).await;
     Ok(serde_json::json!({
         "mission_id": state.mission_id.as_str(),
         "phase": phase_slug(&state.phase),
@@ -2198,10 +2202,15 @@ fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_j
         "current_sha": state.current_sha,
         "objective": state.objective,
         "tasks": state.tasks.iter().map(|(id, task)| {
-            task_runtime_json(store, state, id, task, true)
+            task_runtime_json(
+                store,
+                id,
+                task,
+                workspace_diffstats.get(id).map(String::as_str),
+            )
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-            task_runtime_json(store, state, id, task, false)
+            task_runtime_json(store, id, task, None)
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
@@ -2232,24 +2241,16 @@ fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_j
 
 fn task_runtime_json(
     store: &MissionStore,
-    state: &crate::model::MissionState,
     id: &crate::model::TaskId,
     task: &crate::model::TaskRuntimeState,
-    include_workspace: bool,
+    dirty_diffstat: Option<&str>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "id": id.as_str(),
         "status": format!("{:?}", task.status).to_ascii_lowercase(),
         "workspace_base_sha": task.workspace_base_sha,
         "assignment_epoch": task.assignment_epoch,
-        "dirty_diffstat": include_workspace.then(|| {
-            crate::activity::task_workspace_diffstat(
-                store.lionclaw_dir(),
-                &state.mission_id,
-                id,
-                task.workspace_base_sha.as_deref(),
-            )
-        }).flatten(),
+        "dirty_diffstat": dirty_diffstat,
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
         "final_response": task.final_response.as_ref()
@@ -3122,7 +3123,7 @@ mod tests {
             Some(Vec::new()),
             "a running watch waits through the pre-projection startup window"
         );
-        let json = mission_view_json(&view, &store).unwrap();
+        let json = mission_view_json(&view, &store).await.unwrap();
 
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
@@ -3217,7 +3218,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let store = MissionStore::open(temp.path()).await.unwrap();
-        let json = mission_view_json(&view, &store).unwrap();
+        let json = mission_view_json(&view, &store).await.unwrap();
 
         assert_eq!(json["planning_input"]["base_revision"], 1);
         assert_eq!(

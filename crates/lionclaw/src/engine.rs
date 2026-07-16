@@ -79,22 +79,17 @@ impl ActivityReporter {
                 };
                 let mission_dir = store.mission_dir(&mission_id);
                 let observation = activity.borrow().clone();
-                let published = tokio::task::spawn_blocking(move || {
-                    crate::activity::publish_observed(
-                        &mission_dir,
-                        &state,
-                        crate::activity::now_ms(),
-                        observation.as_ref(),
-                    )
-                })
-                .await;
-                match published {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(%mission_id, %error, "failed to update non-authoritative activity projection")
-                    }
+                match crate::activity::publish_observed(
+                    &mission_dir,
+                    &state,
+                    crate::activity::now_ms(),
+                    observation.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => {}
                     Err(error) => {
-                        tracing::warn!(%mission_id, %error, "activity projection task failed")
+                        tracing::warn!(%mission_id, %error, "failed to update non-authoritative activity projection")
                     }
                 }
             }
@@ -110,6 +105,7 @@ impl ActivityReporter {
             let _ = stop.send(());
         }
         if let Some(task) = self.task.take() {
+            task.abort();
             let _ = task.await;
         }
     }
@@ -534,12 +530,18 @@ impl Engine {
             if !self.cleanup_effect(&state, effect_id, true).await? {
                 return Ok(false);
             }
-            self.append_outcome(
-                &state.mission_id,
-                state.head,
-                interrupted_outcome(effect_id, effect),
-            )
-            .await?;
+            if self
+                .append_outcome(
+                    &state.mission_id,
+                    effect_id,
+                    interrupted_outcome(effect_id, effect),
+                    true,
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
         }
     }
 
@@ -570,12 +572,18 @@ impl Engine {
                 if !self.cleanup_effect(&current, effect_id, true).await? {
                     return Ok(false);
                 }
-                self.append_outcome(
-                    &current.mission_id,
-                    current.head,
-                    stopped_before_start_outcome(effect_id, active, reason),
-                )
-                .await?;
+                if self
+                    .append_outcome(
+                        &current.mission_id,
+                        effect_id,
+                        stopped_before_start_outcome(effect_id, active, reason),
+                        true,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
                 return Ok(has_owned_oracle_sibling(&current, effect_id, active));
             }
             let now = tokio::time::Instant::now();
@@ -678,15 +686,19 @@ impl Engine {
             outcome.event,
             MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
         );
-        let checkpoint = checkpoint_after(&outcome.event, &state.config.execution);
         if !self
             .cleanup_effect(state, effect_id, discard_artifact)
             .await?
         {
             return Ok(false);
         }
-        self.append_outcome(&state.mission_id, state.head, outcome)
-            .await?;
+        let Some(outcome) = self
+            .append_outcome(&state.mission_id, effect_id, outcome, discard_artifact)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let checkpoint = checkpoint_after(&outcome.event, &state.config.execution);
         let Some((automatic, reason)) = checkpoint else {
             return Ok(true);
         };
@@ -744,25 +756,37 @@ impl Engine {
     async fn append_outcome(
         &self,
         mission_id: &MissionId,
-        initial_head: u64,
-        outcome: NewEvent,
-    ) -> Result<()> {
-        let mut head = initial_head;
+        effect_id: &EffectId,
+        mut outcome: NewEvent,
+        mut artifact_discarded: bool,
+    ) -> Result<Option<NewEvent>> {
         for _ in 0..MAX_LOOP_ITERATIONS {
+            let state = self.load_state(mission_id).await?;
+            let Some(effect) = state.inflight.get(effect_id) else {
+                bail!("effect '{effect_id}' settled before this driver could append its outcome");
+            };
+            if let Some(failure) = settlement_failure(&state, effect_id, &outcome.event) {
+                outcome = failed_outcome(effect_id, effect, failure);
+                if !artifact_discarded {
+                    if !self.cleanup_effect(&state, effect_id, true).await? {
+                        return Ok(None);
+                    }
+                    artifact_discarded = true;
+                    continue;
+                }
+            }
             match self
                 .store
                 .append(
                     mission_id,
-                    head,
+                    state.head,
                     std::slice::from_ref(&outcome),
                     self.clock.now_ms(),
                 )
                 .await
             {
-                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(()),
-                Err(AppendError::Conflict { .. }) => {
-                    head = self.load_state(mission_id).await?.head;
-                }
+                Ok(_) | Err(AppendError::Duplicate { .. }) => return Ok(Some(outcome)),
+                Err(AppendError::Conflict { .. }) => continue,
                 Err(err) => return Err(err.into()),
             }
         }
@@ -974,11 +998,11 @@ impl Engine {
                     _ => None,
                 };
                 if let Some(detail) = incomplete {
-                    let mut failure = TypedFailure::invalid("handoff.incomplete", detail);
-                    failure.evidence_mut().final_response = outcome.final_response.clone();
-                    failure.evidence_mut().configuration =
-                        runtime_configuration_evidence(&outcome.runtime_configuration);
-                    return Ok(completed(Err(failure)));
+                    return Ok(completed(Err(invalid_role_outcome(
+                        "handoff.incomplete",
+                        detail,
+                        &outcome,
+                    ))));
                 }
                 // A planning author's proposal is validated fail-closed before
                 // it is recorded, exactly like a manually proposed plan — an
@@ -990,26 +1014,20 @@ impl Engine {
                 } = &outcome.handoff
                 {
                     let Some(proposal) = proposal else {
-                        let mut failure = TypedFailure::invalid(
+                        return Ok(completed(Err(invalid_role_outcome(
                             "plan.missing",
                             "planning author reported done but proposed no plan",
-                        );
-                        failure.evidence_mut().final_response = outcome.final_response.clone();
-                        failure.evidence_mut().configuration =
-                            runtime_configuration_evidence(&outcome.runtime_configuration);
-                        return Ok(completed(Err(failure)));
+                            &outcome,
+                        ))));
                     };
                     if let Err(error) =
                         validate_plan_proposal(state, proposal, &self.mission_type.inventory())
                     {
-                        let mut failure = TypedFailure::invalid(
+                        return Ok(completed(Err(invalid_role_outcome(
                             "plan.invalid",
                             format!("proposed plan is invalid: {error}"),
-                        );
-                        failure.evidence_mut().final_response = outcome.final_response.clone();
-                        failure.evidence_mut().configuration =
-                            runtime_configuration_evidence(&outcome.runtime_configuration);
-                        return Ok(completed(Err(failure)));
+                            &outcome,
+                        ))));
                     }
                 }
                 let handoff = self.externalize_handoff(outcome.handoff)?;
@@ -1203,30 +1221,33 @@ impl Engine {
             passed,
             gaps,
             nonce: echoed,
-        } = outcome.handoff
+        } = &outcome.handoff
         else {
             // Unreachable via the runner's schema check; fail closed anyway.
-            return Ok(completed(Err(TypedFailure::invalid(
+            return Ok(completed(Err(invalid_role_outcome(
                 "handoff.review_shape",
                 "terminal reviewer handed back a non-review handoff".to_string(),
+                &outcome,
             ))));
         };
-        if echoed != *nonce {
-            return Ok(completed(Err(TypedFailure::invalid(
+        if echoed != nonce {
+            return Ok(completed(Err(invalid_role_outcome(
                 "handoff.nonce",
                 "handoff nonce mismatch: the handoff was not written by the reviewer".to_string(),
+                &outcome,
             ))));
         }
         if !done {
-            return Ok(completed(Err(TypedFailure::invalid(
+            return Ok(completed(Err(invalid_role_outcome(
                 "handoff.incomplete",
                 "reviewer handed off done=false: the review itself did not complete".to_string(),
+                &outcome,
             ))));
         }
         Ok(completed(Ok(TerminalReviewSuccess {
-            passed,
-            gaps,
-            report: self.store.blobs().externalize(report)?,
+            passed: *passed,
+            gaps: gaps.clone(),
+            report: self.store.blobs().externalize(report.clone())?,
             final_response: self
                 .store
                 .blobs()
@@ -1697,6 +1718,14 @@ fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEven
     let failure = TypedFailure::Interrupted {
         evidence: Box::new(evidence),
     };
+    failed_outcome(effect_id, effect, failure)
+}
+
+fn failed_outcome(
+    effect_id: &EffectId,
+    effect: &InflightEffect,
+    failure: TypedFailure,
+) -> NewEvent {
     NewEvent::new(match effect {
         InflightEffect::RoleRun {
             task_id,
@@ -1748,42 +1777,102 @@ fn stopped_before_start_outcome(
     let failure = TypedFailure::OperatorStopped {
         evidence: Box::new(evidence),
     };
-    NewEvent::new(match effect {
-        InflightEffect::RoleRun {
-            task_id,
-            attempt_no,
-            ..
-        } => MissionEvent::RoleRunCompleted {
-            task_id: task_id.clone(),
-            attempt_no: *attempt_no,
-            effect_id: effect_id.clone(),
-            outcome: Err(failure),
+    failed_outcome(effect_id, effect, failure)
+}
+
+enum SettlementKind {
+    Abort,
+    Stop,
+    Deadline,
+}
+
+fn settlement_failure(
+    state: &MissionState,
+    effect_id: &EffectId,
+    outcome: &MissionEvent,
+) -> Option<TypedFailure> {
+    let (code, detail, reason, category) = match &state.phase {
+        MissionPhase::Aborted { reason } => (
+            "control.aborted_before_settlement",
+            "mission abort became durable before the effect outcome",
+            reason.clone(),
+            SettlementKind::Abort,
+        ),
+        _ => {
+            if let Some(reason) = state.stop_requests.get(effect_id) {
+                (
+                    "control.stopped_before_settlement",
+                    "operator stop became durable before the effect outcome",
+                    reason.clone(),
+                    SettlementKind::Stop,
+                )
+            } else if let Some(deadline_ms) = state.reached_deadlines.get(effect_id) {
+                (
+                    "control.deadline_before_settlement",
+                    "the recorded effect deadline became durable before the effect outcome",
+                    format!("deadline reached at {deadline_ms}"),
+                    SettlementKind::Deadline,
+                )
+            } else {
+                return None;
+            }
+        }
+    };
+    let mut evidence = outcome_failure_evidence(outcome);
+    evidence.code = Some(code.into());
+    evidence.detail = detail.into();
+    evidence.stop_reason = Some(reason);
+    Some(
+        match category {
+            SettlementKind::Abort => TypedFailure::OperatorAborted {
+                evidence: Box::new(evidence),
+            },
+            SettlementKind::Stop => TypedFailure::OperatorStopped {
+                evidence: Box::new(evidence),
+            },
+            SettlementKind::Deadline => TypedFailure::DeadlineExhausted {
+                evidence: Box::new(evidence),
+            },
+        }
+        .projected(),
+    )
+}
+
+fn outcome_failure_evidence(outcome: &MissionEvent) -> lionclaw_runtime_api::TypedFailureEvidence {
+    match outcome {
+        MissionEvent::RoleRunCompleted { outcome, .. } => match outcome {
+            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
+                final_response: inline_payload(&success.final_response),
+                configuration: runtime_configuration_evidence(&success.runtime_configuration),
+                ..Default::default()
+            },
+            Err(failure) => failure.evidence().clone(),
         },
-        InflightEffect::OracleRun {
-            assertion_ids,
-            oracle,
-            judged_sha,
-            attempt_no,
-            ..
-        } => MissionEvent::OracleRunCompleted {
-            assertion_ids: assertion_ids.clone(),
-            oracle: oracle.clone(),
-            judged_sha: judged_sha.clone(),
-            attempt_no: *attempt_no,
-            effect_id: effect_id.clone(),
-            outcome: Err(failure),
+        MissionEvent::OracleRunCompleted { outcome, .. } => match outcome {
+            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
+                exit_code: Some(success.exit_code),
+                stderr: inline_payload(&success.stderr),
+                ..Default::default()
+            },
+            Err(failure) => failure.evidence().clone(),
         },
-        InflightEffect::TerminalReview {
-            attempt_no,
-            judged_sha,
-            ..
-        } => MissionEvent::TerminalReviewCompleted {
-            attempt_no: *attempt_no,
-            effect_id: effect_id.clone(),
-            judged_sha: judged_sha.clone(),
-            outcome: Err(failure),
+        MissionEvent::TerminalReviewCompleted { outcome, .. } => match outcome {
+            Ok(success) => lionclaw_runtime_api::TypedFailureEvidence {
+                final_response: inline_payload(&success.final_response),
+                configuration: runtime_configuration_evidence(&success.runtime_configuration),
+                ..Default::default()
+            },
+            Err(failure) => failure.evidence().clone(),
         },
-    })
+        _ => lionclaw_runtime_api::TypedFailureEvidence::default(),
+    }
+}
+
+fn inline_payload(payload: &PayloadRef) -> String {
+    match payload {
+        PayloadRef::Inline { text } => text.clone(),
+        PayloadRef::Blob(_) => String::new(),
+    }
 }
 
 /// Record a decision without a full engine (the CLI's `decide` needs
@@ -1848,8 +1937,11 @@ pub async fn record_control(
         crate::model::ControlAction::ExtendDeadline {
             old_deadline_ms,
             new_deadline_ms,
-            ..
+            automatic,
         } => {
+            if *automatic {
+                bail!("automatic controls are engine-owned");
+            }
             let Some(effect) = state.inflight.get(effect_id) else {
                 bail!("effect '{effect_id}' is not active; control is stale");
             };
@@ -1972,6 +2064,18 @@ fn runtime_configuration_evidence(
         applied_mode: evidence.applied_mode.clone(),
         mode_confirmation: evidence.mode_confirmation,
     }
+}
+
+fn invalid_role_outcome(
+    code: impl Into<String>,
+    detail: impl Into<String>,
+    outcome: &crate::ports::RoleRunOutcome,
+) -> TypedFailure {
+    let mut failure = TypedFailure::invalid(code, detail);
+    failure.evidence_mut().final_response = outcome.final_response.clone();
+    failure.evidence_mut().configuration =
+        runtime_configuration_evidence(&outcome.runtime_configuration);
+    failure.projected()
 }
 
 #[cfg(test)]
