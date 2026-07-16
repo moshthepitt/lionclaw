@@ -127,8 +127,7 @@ pub type RuntimeTurnJournalSender = mpsc::Sender<TurnEvent>;
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
 fn bounded_runtime_event(event: RuntimeEvent) -> RuntimeEvent {
-    let bounded_optional =
-        |value: Option<String>| value.map(|value| crate::failure::bounded_text(&value));
+    let bounded_optional = |value: Option<String>| value.map(|value| crate::bounded_text(&value));
     match event {
         RuntimeEvent::Configuration { mut configuration } => {
             configuration.requested_model = bounded_optional(configuration.requested_model);
@@ -139,41 +138,39 @@ fn bounded_runtime_event(event: RuntimeEvent) -> RuntimeEvent {
         }
         RuntimeEvent::MessageDelta { lane, text } => RuntimeEvent::MessageDelta {
             lane,
-            text: crate::failure::bounded_text(&text),
+            text: crate::bounded_text(&text),
         },
         RuntimeEvent::MessageBoundary { lane } => RuntimeEvent::MessageBoundary { lane },
         RuntimeEvent::Status { code, text } => RuntimeEvent::Status {
             code: bounded_optional(code),
-            text: crate::failure::bounded_text(&text),
+            text: crate::bounded_text(&text),
         },
         RuntimeEvent::Artifact { mut artifact } => {
-            artifact.artifact_id = crate::failure::bounded_text(&artifact.artifact_id);
-            artifact.path = PathBuf::from(crate::failure::bounded_text(
-                &artifact.path.to_string_lossy(),
-            ));
+            artifact.artifact_id = crate::bounded_text(&artifact.artifact_id);
+            artifact.path = PathBuf::from(crate::bounded_text(&artifact.path.to_string_lossy()));
             artifact.filename = bounded_optional(artifact.filename);
             artifact.mime_type = bounded_optional(artifact.mime_type);
             RuntimeEvent::Artifact { artifact }
         }
         RuntimeEvent::FileChange { mut change } => {
-            change.runtime = crate::failure::bounded_text(&change.runtime);
+            change.runtime = crate::bounded_text(&change.runtime);
             change.operation_id = bounded_optional(change.operation_id);
             change.paths.truncate(RUNTIME_EVENT_ITEM_LIMIT);
             for path in &mut change.paths {
-                *path = crate::failure::bounded_text(path);
+                *path = crate::bounded_text(path);
             }
             RuntimeEvent::FileChange { change }
         }
         RuntimeEvent::Done => RuntimeEvent::Done,
         RuntimeEvent::Error { code, text } => RuntimeEvent::Error {
             code: bounded_optional(code),
-            text: crate::failure::bounded_text(&text),
+            text: crate::bounded_text(&text),
         },
     }
 }
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
-    let remaining = crate::failure::FAILURE_TEXT_LIMIT.saturating_sub(existing.len());
+    let remaining = crate::FAILURE_TEXT_LIMIT.saturating_sub(existing.len());
     let mut end = remaining.min(delta.len());
     while !delta.is_char_boundary(end) {
         end = end.saturating_sub(1);
@@ -247,12 +244,9 @@ mod tests {
     #[test]
     fn final_response_assembly_never_exceeds_its_utf8_byte_bound() {
         let mut response = String::new();
-        append_streamed_text_delta(
-            &mut response,
-            &"é".repeat(crate::failure::FAILURE_TEXT_LIMIT),
-        );
+        append_streamed_text_delta(&mut response, &"é".repeat(crate::FAILURE_TEXT_LIMIT));
         append_streamed_text_boundary(&mut response);
-        assert!(response.len() <= crate::failure::FAILURE_TEXT_LIMIT);
+        assert!(response.len() <= crate::FAILURE_TEXT_LIMIT);
         assert!(response.is_char_boundary(response.len()));
     }
 
@@ -260,11 +254,11 @@ mod tests {
     fn canonical_journal_records_bound_provider_controlled_content() {
         let event = TurnEvent::canonical(RuntimeEvent::FileChange {
             change: RuntimeFileChange {
-                runtime: "r".repeat(crate::failure::FAILURE_TEXT_LIMIT * 2),
-                operation_id: Some("o".repeat(crate::failure::FAILURE_TEXT_LIMIT * 2)),
+                runtime: "r".repeat(crate::FAILURE_TEXT_LIMIT * 2),
+                operation_id: Some("o".repeat(crate::FAILURE_TEXT_LIMIT * 2)),
                 status: RuntimeFileChangeStatus::Editing,
                 paths: (0..RUNTIME_EVENT_ITEM_LIMIT * 2)
-                    .map(|_| "p".repeat(crate::failure::FAILURE_TEXT_LIMIT * 2))
+                    .map(|_| "p".repeat(crate::FAILURE_TEXT_LIMIT * 2))
                     .collect(),
                 total_count: RUNTIME_EVENT_ITEM_LIMIT * 2,
             },
@@ -272,13 +266,13 @@ mod tests {
         let RuntimeEvent::FileChange { change } = event.event else {
             panic!("expected file-change event");
         };
-        assert!(change.runtime.len() <= crate::failure::FAILURE_TEXT_LIMIT);
-        assert!(change.operation_id.unwrap().len() <= crate::failure::FAILURE_TEXT_LIMIT);
+        assert!(change.runtime.len() <= crate::FAILURE_TEXT_LIMIT);
+        assert!(change.operation_id.unwrap().len() <= crate::FAILURE_TEXT_LIMIT);
         assert_eq!(change.paths.len(), RUNTIME_EVENT_ITEM_LIMIT);
         assert!(change
             .paths
             .iter()
-            .all(|path| path.len() <= crate::failure::FAILURE_TEXT_LIMIT));
+            .all(|path| path.len() <= crate::FAILURE_TEXT_LIMIT));
         assert_eq!(change.total_count, RUNTIME_EVENT_ITEM_LIMIT * 2);
     }
 }

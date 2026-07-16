@@ -270,16 +270,16 @@ fn step_running(state: &MissionState) -> StepDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::event::{
+    use crate::event::{
         ArtifactOutcome, EventEnvelope, Handoff, MissionConfig, MissionEvent, OracleRunSuccess,
         PayloadRef, RoleRunSuccess, RuntimeConfigurationEvidence, TerminalReviewSuccess,
         VersionStamps,
     };
-    use crate::model::fold::fold;
-    use crate::model::ids::{EffectId, MissionId};
-    use crate::model::plan::{Assertion, Plan, Task};
-    use crate::model::verdict::FinishClass;
-    use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
+    use crate::fold::fold;
+    use crate::ids::{EffectId, MissionId};
+    use crate::plan::{Assertion, Plan, Task};
+    use crate::verdict::FinishClass;
+    use crate::{TypedFailure, TypedFailureEvidence};
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
@@ -362,7 +362,7 @@ mod tests {
     fn created(base_sha: &str) -> MissionEvent {
         MissionEvent::MissionCreated {
             objective: "ship it".to_string(),
-            mission_type: crate::model::MissionTypeRef {
+            mission_type: crate::MissionTypeRef {
                 name: "software-dev".into(),
                 digest: "d".into(),
             },
@@ -371,7 +371,7 @@ mod tests {
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {
-                recovery: crate::model::RecoveryConfig { max_attempts: 1 },
+                recovery: crate::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
@@ -379,7 +379,7 @@ mod tests {
 
     fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
         MissionEvent::PlanProposed {
-            proposal: crate::model::PlanProposal {
+            proposal: crate::PlanProposal {
                 base_revision: 0,
                 plan: Plan {
                     requirements: vec![],
@@ -492,7 +492,7 @@ mod tests {
             let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
                 MissionEvent::DecisionRecorded {
                     attention_id: "plan_proposal:mission".into(),
-                    action: crate::model::DecisionAction::Approve,
+                    action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
                 }
             });
@@ -830,7 +830,7 @@ mod tests {
                 oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
                 oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", exit_code),
             ]);
-            assert_eq!(crate::model::classify_finish(&state), finish);
+            assert_eq!(crate::classify_finish(&state), finish);
             let expected = if exit_code == 0 {
                 MissionPhase::Done { finish }
             } else {
@@ -856,7 +856,7 @@ mod tests {
         let MissionEvent::MissionCreated { config, .. } = &mut event else {
             unreachable!("created() builds MissionCreated");
         };
-        config.terminal_review = Some(crate::model::event::TerminalReviewConfig {
+        config.terminal_review = Some(crate::event::TerminalReviewConfig {
             role: rname("gap-reviewer"),
         });
         event
@@ -884,7 +884,7 @@ mod tests {
         passed: bool,
         blocking_gaps: usize,
     ) -> MissionEvent {
-        use crate::model::event::{Gap, GapSeverity};
+        use crate::event::{Gap, GapSeverity};
         MissionEvent::TerminalReviewCompleted {
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn a_gap_park_steps_park_and_retry_redispatches_fresh() {
-        use crate::model::event::DecisionAction;
+        use crate::event::DecisionAction;
         let mut events = review_brink();
         events.push(review_requested(1, "k-tr-1", "sha-1"));
         events.push(review_completed("k-tr-1", "sha-1", false, 1));

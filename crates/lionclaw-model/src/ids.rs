@@ -147,7 +147,9 @@ impl EffectId {
     pub fn for_parts(parts: &[&str]) -> Self {
         use sha2::{Digest, Sha256};
 
-        Self(hex::encode(Sha256::digest(parts.join("\u{1f}").as_bytes())))
+        Self(lowercase_hex(&Sha256::digest(
+            parts.join("\u{1f}").as_bytes(),
+        )))
     }
 
     pub fn as_str(&self) -> &str {
@@ -215,10 +217,10 @@ impl MissionId {
         Self(format!("m{}", &digest_hex[..12]))
     }
 
-    pub(crate) fn for_creation(workspace: &str, objective: &str, now_ms: i64) -> Self {
+    pub fn for_creation(workspace: &str, objective: &str, now_ms: i64) -> Self {
         use sha2::{Digest, Sha256};
 
-        Self::from_digest_prefix(&hex::encode(Sha256::digest(
+        Self::from_digest_prefix(&lowercase_hex(&Sha256::digest(
             format!("{workspace}\u{1f}{objective}\u{1f}{now_ms}").as_bytes(),
         )))
     }
@@ -235,6 +237,16 @@ impl fmt::Display for MissionId {
 }
 
 /// The first 12 chars of a sha/digest, for compact human display.
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 pub fn short_hex(hex: &str) -> String {
     hex.chars().take(12).collect()
 }

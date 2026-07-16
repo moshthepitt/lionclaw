@@ -22,6 +22,7 @@ use super::state::{
     ReviewAcceptanceKind, ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
+use crate::TypedFailure;
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
@@ -485,9 +486,9 @@ fn merge_runtime_configuration(
 }
 
 fn merge_failure_configuration(
-    failure: &lionclaw_runtime_api::TypedFailure,
+    failure: &TypedFailure,
     observed: Option<&RuntimeConfigurationEvidence>,
-) -> lionclaw_runtime_api::TypedFailure {
+) -> TypedFailure {
     let mut failure = failure.clone();
     let evidence = failure.evidence_mut();
     let reported = RuntimeConfigurationEvidence {
@@ -499,7 +500,7 @@ fn merge_failure_configuration(
         mode_confirmation: evidence.configuration.mode_confirmation,
     };
     let merged = merge_runtime_configuration(observed, &reported);
-    evidence.configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+    evidence.configuration = crate::AppliedRuntimeConfiguration {
         requested_model: merged.requested_model,
         applied_model: merged.applied_model,
         model_confirmation: merged.model_confirmation,
@@ -1205,10 +1206,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 task.status = status;
                 task.last_report = Some(report.clone());
                 task.last_failure = (!done).then(|| {
-                    lionclaw_runtime_api::TypedFailure::invalid(
-                        "handoff.incomplete",
-                        "role reported done=false",
-                    )
+                    TypedFailure::invalid("handoff.incomplete", "role reported done=false")
                 });
             }
             // A done task that asks for a look is flagged (derived into a
@@ -1236,7 +1234,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
                 task.status = status;
                 task.last_report = Some(report.clone());
                 task.last_failure = (!done).then(|| {
-                    lionclaw_runtime_api::TypedFailure::invalid(
+                    TypedFailure::invalid(
                         "handoff.incomplete",
                         "planning author reported done=false",
                     )
@@ -1384,7 +1382,7 @@ mod tests {
     use super::super::plan::{Assertion, Plan, PlanProposal, PlanningTask, Task, TaskKind};
     use super::super::verdict::FinishClass;
     use super::*;
-    use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
+    use crate::TypedFailureEvidence;
 
     fn tid(raw: &str) -> TaskId {
         TaskId::new(raw).expect("task id")
@@ -1429,7 +1427,7 @@ mod tests {
     fn created() -> MissionEvent {
         MissionEvent::MissionCreated {
             objective: "objective".into(),
-            mission_type: crate::model::MissionTypeRef {
+            mission_type: crate::MissionTypeRef {
                 name: "mt".into(),
                 digest: "d".into(),
             },
@@ -1501,14 +1499,10 @@ mod tests {
         let observed = RuntimeConfigurationEvidence {
             requested_model: Some("requested".into()),
             applied_model: Some("applied".into()),
-            model_confirmation: Some(
-                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-            ),
+            model_confirmation: Some(crate::RuntimeConfigurationConfirmation::Observed),
             requested_mode: Some("build".into()),
             applied_mode: Some("build".into()),
-            mode_confirmation: Some(
-                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-            ),
+            mode_confirmation: Some(crate::RuntimeConfigurationConfirmation::Observed),
         };
 
         assert_eq!(
@@ -3022,14 +3016,10 @@ mod tests {
             configuration: RuntimeConfigurationEvidence {
                 requested_model: Some("requested".into()),
                 applied_model: Some("applied".into()),
-                model_confirmation: Some(
-                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-                ),
+                model_confirmation: Some(crate::RuntimeConfigurationConfirmation::Observed),
                 requested_mode: Some("build".into()),
                 applied_mode: Some("build".into()),
-                mode_confirmation: Some(
-                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
-                ),
+                mode_confirmation: Some(crate::RuntimeConfigurationConfirmation::Observed),
             },
         });
         events.push(review_failed("kr", "h1", "forced cancellation"));

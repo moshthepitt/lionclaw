@@ -1,12 +1,12 @@
 //! The pure deterministic core: identifiers, plan vocabulary, events, state,
 //! the fold, validation, and the step decision function.
 //!
-//! Dependency wall: everything in this module imports only `std`, `serde`,
-//! and `thiserror` (error derives). No I/O, no clock, no RNG, no async — the
-//! fold-litmus test depends on it.
+//! Dependency wall: this crate has only deterministic value/hash dependencies.
+//! No I/O, clock, RNG, or async dependencies may enter the kernel model.
 
 pub mod decision;
 pub mod event;
+pub mod failure;
 pub mod fold;
 pub mod gate;
 pub mod ids;
@@ -23,6 +23,10 @@ pub use event::{
     MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess,
     RuntimeConfigurationEvidence, StopBar, TerminalReviewConfig, TerminalReviewSuccess,
     ValidationItem, VersionStamps, SCHEMA_VERSION,
+};
+pub use failure::{
+    bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
+    RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
 };
 pub use fold::{apply, fold, REDUCER_VERSION};
 pub use gate::{evaluate_gate, GateResult};

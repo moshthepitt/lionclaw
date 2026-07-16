@@ -102,13 +102,13 @@ fn blocked(reason: String) -> GateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::event::{
+    use crate::event::{
         EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps,
     };
-    use crate::model::fold::fold;
-    use crate::model::ids::{AssertionId, EffectId, MissionId, RoleName};
-    use crate::model::plan::{Assertion, Task};
-    use crate::model::MissionConfig;
+    use crate::fold::fold;
+    use crate::ids::{AssertionId, EffectId, MissionId, RoleName};
+    use crate::plan::{Assertion, Task};
+    use crate::MissionConfig;
 
     fn aid(s: &str) -> AssertionId {
         AssertionId::new(s).unwrap()
@@ -166,7 +166,7 @@ mod tests {
                 1,
                 MissionEvent::MissionCreated {
                     objective: "o".into(),
-                    mission_type: crate::model::MissionTypeRef {
+                    mission_type: crate::MissionTypeRef {
                         name: "p".into(),
                         digest: "d".into(),
                     },
@@ -183,7 +183,7 @@ mod tests {
                 &mission_id,
                 2,
                 MissionEvent::PlanProposed {
-                    proposal: crate::model::PlanProposal {
+                    proposal: crate::PlanProposal {
                         base_revision: 0,
                         plan: plan.clone(),
                     },
@@ -195,7 +195,7 @@ mod tests {
                 3,
                 MissionEvent::DecisionRecorded {
                     attention_id: "plan_proposal:mission".into(),
-                    action: crate::model::DecisionAction::Approve,
+                    action: crate::DecisionAction::Approve,
                     justification: "test fixture approves the plan".into(),
                 },
             ),
@@ -229,7 +229,7 @@ mod tests {
                     task_id: tid(validator),
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", validator]),
-                    outcome: Ok(crate::model::RoleRunSuccess {
+                    outcome: Ok(crate::RoleRunSuccess {
                         handoff: Handoff::Validate {
                             done: true,
                             report: PayloadRef::inline("r"),
@@ -245,8 +245,7 @@ mod tests {
                         },
                         artifact: None,
                         final_response: PayloadRef::inline("reviewed"),
-                        runtime_configuration: crate::model::RuntimeConfigurationEvidence::default(
-                        ),
+                        runtime_configuration: crate::RuntimeConfigurationEvidence::default(),
                     }),
                 },
             ));

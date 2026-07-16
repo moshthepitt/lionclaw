@@ -22,6 +22,7 @@ clap_mangen = "0.2"
 hex.workspace = true
 lionclaw-confinement.workspace = true
 lionclaw-durable-fs.workspace = true
+lionclaw-model.workspace = true
 lionclaw-runtime-api.workspace = true
 lionclaw-runtime-acp.workspace = true
 lionclaw-runtime-codex.workspace = true

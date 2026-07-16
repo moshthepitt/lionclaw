@@ -13,11 +13,11 @@
 //!
 //! Events are additive-only and version-stamped; never rewrite history.
 
-use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
+use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
 /// Bumped for durable, effect-scoped runtime configuration evidence.
 pub const SCHEMA_VERSION: u32 = 11;
@@ -173,15 +173,7 @@ pub struct VersionStamps {
     pub prompt_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeConfigurationEvidence {
-    pub requested_model: Option<String>,
-    pub applied_model: Option<String>,
-    pub model_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
-    pub requested_mode: Option<String>,
-    pub applied_mode: Option<String>,
-    pub mode_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
-}
+pub type RuntimeConfigurationEvidence = AppliedRuntimeConfiguration;
 
 /// What a role's agent handed back. Written by the agent as
 /// `/mission/handoff/handoff.json`, parsed strictly by the runner.
@@ -638,7 +630,7 @@ mod compat_tests {
 
     #[test]
     fn plan_proposal_round_trips_strict_requirement_dispositions() {
-        use crate::model::{
+        use crate::{
             Assertion, Plan, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         };
 
@@ -672,7 +664,7 @@ mod compat_tests {
     fn empty_plan_proposal() -> PlanProposal {
         PlanProposal {
             base_revision: 0,
-            plan: crate::model::Plan {
+            plan: crate::Plan {
                 requirements: vec![],
                 assertions: vec![],
                 tasks: vec![],

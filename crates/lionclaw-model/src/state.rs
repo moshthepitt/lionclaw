@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use lionclaw_runtime_api::TypedFailure;
 use serde::{Deserialize, Serialize};
 
 use super::event::{
@@ -14,6 +13,7 @@ use super::event::{
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
+use crate::TypedFailure;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
@@ -679,7 +679,7 @@ impl MissionState {
     }
 
     /// Runtime state for the task era currently allowed to dispatch roles.
-    pub(crate) fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
+    pub fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
         if self.planning_base_revision.is_some() {
             &self.planning.tasks
         } else {
@@ -711,7 +711,7 @@ impl MissionState {
 #[cfg(test)]
 mod slug_tests {
     use super::*;
-    use crate::model::{FinishClass, OutputSemantics, StopBar};
+    use crate::{FinishClass, OutputSemantics, StopBar};
 
     /// Every `slug()` must equal the enum's serde repr — the single source that
     /// keeps the CLI, the fold's attention ids, and the wire format from

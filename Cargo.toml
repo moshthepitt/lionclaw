@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lionclaw",
+    "crates/lionclaw-model",
     "crates/lionclaw-confinement",
     "crates/lionclaw-durable-fs",
     "crates/lionclaw-runtime-api",
@@ -25,6 +26,7 @@ clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 lionclaw-confinement = { path = "crates/lionclaw-confinement" }
 lionclaw-durable-fs = { path = "crates/lionclaw-durable-fs" }
+lionclaw-model = { path = "crates/lionclaw-model" }
 lionclaw-runtime-api = { path = "crates/lionclaw-runtime-api" }
 lionclaw-runtime-acp = { path = "crates/lionclaw-runtime-acp" }
 lionclaw-runtime-codex = { path = "crates/lionclaw-runtime-codex" }

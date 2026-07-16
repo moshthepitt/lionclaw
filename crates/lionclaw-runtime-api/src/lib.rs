@@ -36,7 +36,6 @@ mod capability;
 mod context;
 mod driver;
 mod event;
-mod failure;
 mod program;
 mod program_backed;
 mod registry;
@@ -53,8 +52,7 @@ pub use auth::{
     RuntimeAuthRegistry,
 };
 pub use capability::{
-    AppliedRuntimeConfiguration, Capability, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-    RuntimeConfigurationConfirmation, RuntimeTurnResult,
+    Capability, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeTurnResult,
 };
 pub use context::{
     safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec,
@@ -67,7 +65,10 @@ pub use event::{
     RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeTurnJournalSender,
     TurnEvent, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
-pub use failure::{bounded_text, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT};
+pub use lionclaw_model::{
+    bounded_failure_text as bounded_text, AppliedRuntimeConfiguration,
+    RuntimeConfigurationConfirmation, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT,
+};
 pub use program::{
     ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
     RuntimeProgramSpec, RuntimeProgramStdoutSender,

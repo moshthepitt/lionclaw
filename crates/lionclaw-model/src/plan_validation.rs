@@ -716,8 +716,8 @@ fn check_coverage(plan: &Plan) -> Vec<PlanValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ids::{AssertionId, RequirementId};
-    use crate::model::plan::{Assertion, PlanningTask, Requirement, RequirementKind, Task};
+    use crate::ids::{AssertionId, RequirementId};
+    use crate::plan::{Assertion, PlanningTask, Requirement, RequirementKind, Task};
 
     fn aid(raw: &str) -> AssertionId {
         AssertionId::new(raw).expect("valid assertion id")
