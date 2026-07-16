@@ -54,7 +54,7 @@ pub use auth::{
 };
 pub use capability::{
     AppliedRuntimeConfiguration, Capability, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-    RuntimeTurnResult,
+    RuntimeConfigurationConfirmation, RuntimeTurnResult,
 };
 pub use context::{
     safe_relative_path, RuntimeExecutionContext, RuntimeMcpServerSpec,

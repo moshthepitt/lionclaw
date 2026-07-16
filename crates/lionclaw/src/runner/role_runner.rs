@@ -120,23 +120,71 @@ fn launch(detail: String) -> TypedFailure {
     TypedFailure::permanent("kernel.launch", detail)
 }
 
+async fn cancellation_acknowledged<A, T, O>(
+    acknowledgement: A,
+    mut turn: std::pin::Pin<&mut T>,
+    timeout: std::time::Duration,
+) -> bool
+where
+    A: std::future::Future<Output = anyhow::Result<()>>,
+    T: std::future::Future<Output = O>,
+{
+    tokio::pin!(acknowledgement);
+    let mut acknowledgement_done = false;
+    let mut acknowledgement_ok = false;
+    let mut turn_done = false;
+    tokio::time::timeout(timeout, async {
+        while !acknowledgement_done || !turn_done {
+            tokio::select! {
+                result = &mut acknowledgement, if !acknowledgement_done => {
+                    acknowledgement_ok = result.is_ok();
+                    acknowledgement_done = true;
+                }
+                _ = turn.as_mut(), if !turn_done => turn_done = true,
+            }
+        }
+    })
+    .await
+    .is_ok()
+        && acknowledgement_ok
+        && turn_done
+}
+
 async fn prepare_writer_checkout(
     repo: &std::path::Path,
     workspace: &std::path::Path,
     base_sha: &str,
     recreate_workspace: bool,
 ) -> Result<(), TypedFailure> {
-    if workspace.exists() && !recreate_workspace {
-        return Ok(());
-    }
-    if workspace.exists()
-        && workspace::is_dirty(workspace)
+    if workspace.exists() {
+        let head = workspace::head_sha(workspace)
+            .await
+            .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
+        if head == base_sha {
+            return Ok(());
+        }
+        if !recreate_workspace {
+            return Err(launch(format!(
+                "retained task workspace HEAD {head} does not match its recorded base {base_sha}"
+            )));
+        }
+        if workspace::is_dirty(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
-    {
-        return Err(launch(
-            "refusing to recreate a dirty task workspace on a moved base".to_string(),
-        ));
+        {
+            return Err(launch(
+                "refusing to recreate a dirty task workspace on a moved base".to_string(),
+            ));
+        }
+        if !workspace::commit_exists(repo, &head).await
+            || !workspace::is_ancestor(repo, &head, base_sha)
+                .await
+                .map_err(|e| launch(format!("failed to compare retained checkout ancestry: {e}")))?
+        {
+            return Err(launch(format!(
+                "refusing to recreate task workspace with uncaptured commits at {head}"
+            )));
+        }
     }
     workspace::create_checkout(repo, workspace, base_sha)
         .await
@@ -197,6 +245,13 @@ impl RoleRunner for OciRoleRunner {
                         request.recreate_workspace,
                     )
                     .await?;
+                    request
+                        .updates
+                        .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+                            base_sha: request.base_sha.clone(),
+                            assignment_epoch: request.assignment_epoch,
+                        })
+                        .map_err(|_| launch("kernel role update receiver closed".into()))?;
                 } else {
                     workspace::create_checkout(
                         &request.workspace_dir,
@@ -273,8 +328,10 @@ impl RoleRunner for OciRoleRunner {
                 runtime_configuration: crate::model::RuntimeConfigurationEvidence {
                     requested_model: applied.requested_model,
                     applied_model: applied.applied_model,
+                    model_confirmation: applied.model_confirmation,
                     requested_mode: applied.requested_mode,
                     applied_mode: applied.applied_mode,
+                    mode_confirmation: applied.mode_confirmation,
                 },
                 final_response,
             })
@@ -326,10 +383,12 @@ impl OciRoleRunner {
 
         let (journal_tx, mut journal_rx) =
             tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
+        let updates = request.updates.clone();
         let drain = tokio::spawn(async move {
             let mut last_error = None;
             let mut final_response = String::new();
             while let Some(event) = journal_rx.recv().await {
+                let _ = updates.send(crate::ports::RoleRunUpdate::Runtime(event.clone()));
                 match &event.event {
                     lionclaw_runtime_api::RuntimeEvent::Error { text, .. } => {
                         last_error = Some(text.clone());
@@ -366,52 +425,78 @@ impl OciRoleRunner {
             journal_tx,
         ));
         let mut control = request.control.clone();
-        let result = loop {
+        enum TurnEnd {
+            Completed(anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>),
+            Cancel { reason: String, deadline: bool },
+        }
+        let end = loop {
             let current_control = control.borrow().clone();
-            let deadline_ms = match current_control {
-                ExecutionControl::RunUntil(deadline_ms) => deadline_ms,
-                ExecutionControl::Stop(reason) => {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        adapter.cancel(&handle, Some(reason.clone())),
-                    )
-                    .await;
-                    let mut evidence = turn_failure_evidence(
-                        profile,
-                        "agent turn stopped by operator".into(),
-                        String::new(),
-                        String::new(),
-                    );
-                    evidence.stop_reason = Some(reason);
-                    break Err(TypedFailure::OperatorStopped {
-                        evidence: Box::new(evidence),
-                    });
+            match current_control {
+                ExecutionControl::RunUntil(_) => {}
+                ExecutionControl::DeadlineExhausted => {
+                    break TurnEnd::Cancel {
+                        reason: "effect deadline exhausted".into(),
+                        deadline: true,
+                    };
                 }
-            };
+                ExecutionControl::Stop(reason) => {
+                    break TurnEnd::Cancel {
+                        reason,
+                        deadline: false,
+                    };
+                }
+            }
             tokio::select! {
-                completed = &mut turn => break completed.map_err(|err| {
-                    err.downcast_ref::<TypedFailure>()
-                        .cloned()
-                        .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
-                }),
+                biased;
                 changed = control.changed() => {
                     if changed.is_err() {
                         continue;
                     }
                 }
-                () = tokio::time::sleep(crate::ports::remaining_until(deadline_ms)) => {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        adapter.cancel(&handle, Some("effect deadline exhausted".into())),
-                    ).await;
-                    break Err(TypedFailure::DeadlineExhausted {
-                        evidence: Box::new(turn_failure_evidence(
-                            profile,
-                            "agent turn exceeded its recorded effect deadline".into(),
-                            String::new(),
-                            String::new(),
-                        )),
-                    });
+                completed = &mut turn => break TurnEnd::Completed(completed),
+            }
+        };
+        let result = match end {
+            TurnEnd::Completed(completed) => completed.map_err(|err| {
+                err.downcast_ref::<TypedFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
+            }),
+            TurnEnd::Cancel { reason, deadline } => {
+                let acknowledged = cancellation_acknowledged(
+                    adapter.cancel(&handle, Some(reason.clone())),
+                    turn.as_mut(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+                let mut evidence = turn_failure_evidence(
+                    profile,
+                    if deadline {
+                        "agent turn exceeded its recorded effect deadline"
+                    } else {
+                        "agent turn stopped by operator"
+                    }
+                    .into(),
+                    String::new(),
+                    String::new(),
+                );
+                evidence.code = Some(
+                    if acknowledged {
+                        "runtime.cancel_acknowledged"
+                    } else {
+                        "runtime.cancel_forced"
+                    }
+                    .into(),
+                );
+                evidence.stop_reason = Some(reason);
+                if deadline {
+                    Err(TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(evidence),
+                    })
+                } else {
+                    Err(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    })
                 }
             }
         };
@@ -602,6 +687,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_polls_the_turn_that_must_deliver_its_acknowledgement() {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let mut turn = std::future::poll_fn(move |_| {
+            if let Some(sent) = sent.take() {
+                let _ = sent.send(());
+            }
+            std::task::Poll::Ready(())
+        });
+        let acknowledgement = async move {
+            received.await.map_err(anyhow::Error::from)?;
+            Ok(())
+        };
+
+        assert!(
+            cancellation_acknowledged(
+                acknowledgement,
+                std::pin::Pin::new(&mut turn),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn writer_workspace_reuse_preserves_dirty_work_and_clean_rebase_moves_head() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -658,7 +768,12 @@ mod tests {
             .unwrap();
         std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
 
-        let error = prepare_writer_checkout(&repo, &task_work, &base, true)
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+
+        let error = prepare_writer_checkout(&repo, &task_work, &moved, true)
             .await
             .unwrap_err();
         assert!(error.detail().contains("refusing to recreate"));
@@ -666,5 +781,72 @@ mod tests {
             std::fs::read_to_string(task_work.join("substantial-uncommitted")).unwrap(),
             "preserve me\n"
         );
+    }
+
+    #[tokio::test]
+    async fn moved_base_never_discards_clean_uncaptured_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("worker-only"), "committed work\n").unwrap();
+        git(&task_work, &["add", "worker-only"]).await;
+        git(&task_work, &["commit", "-q", "-m", "uncaptured"]).await;
+        let uncaptured = git(&task_work, &["rev-parse", "HEAD"]).await;
+
+        std::fs::write(repo.join("tracked"), "other task\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "other-task"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        let error = prepare_writer_checkout(&repo, &task_work, &moved, true)
+            .await
+            .unwrap_err();
+        assert!(error.detail().contains("uncaptured commits"));
+        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), uncaptured);
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("worker-only")).unwrap(),
+            "committed work\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reuse_intent_fails_closed_instead_of_replacing_disk_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("tracked"), "moved\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "moved"]).await;
+        let moved = git(&repo, &["rev-parse", "HEAD"]).await;
+        let error = prepare_writer_checkout(&repo, &task_work, &moved, false)
+            .await
+            .unwrap_err();
+        assert!(error.detail().contains("does not match its recorded base"));
+        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), base);
     }
 }

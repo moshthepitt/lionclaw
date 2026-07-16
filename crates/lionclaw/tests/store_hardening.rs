@@ -45,6 +45,7 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
                 assignment_epoch: 1,
                 recreate_workspace: true,
                 requested_at_ms: 0,
+                not_before_ms: 0,
                 deadline_ms: 100_000,
                 budget_deadline_ms: 100_000,
             })],

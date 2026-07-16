@@ -231,4 +231,17 @@ mod failure_tests {
             }
         ));
     }
+
+    #[test]
+    fn provider_metadata_without_a_retry_bit_remains_permanent() {
+        let error = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"service": "session", "errorName": "APIError"}
+        });
+        assert!(matches!(
+            acp_typed_failure("session/prompt", &error),
+            TypedFailure::PermanentRuntime { .. }
+        ));
+    }
 }

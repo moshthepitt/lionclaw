@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use lionclaw_runtime_api::TypedFailure;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::mission_type::{PreparedInput, RoleDefinition, SkillPackage};
 use crate::model::{
@@ -45,10 +45,20 @@ pub struct RoleRunRequest {
     pub recreate_workspace: bool,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
+    pub updates: mpsc::UnboundedSender<RoleRunUpdate>,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
     pub state_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum RoleRunUpdate {
+    WorkspacePrepared {
+        base_sha: String,
+        assignment_epoch: u32,
+    },
+    Runtime(lionclaw_runtime_api::TurnEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +98,7 @@ pub struct OracleRunRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionControl {
     RunUntil(i64),
+    DeadlineExhausted,
     Stop(String),
 }
 

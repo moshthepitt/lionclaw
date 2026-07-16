@@ -3,9 +3,12 @@
 
 mod common;
 
-use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
+use common::{
+    approve_plan, covered_requirement, default_config, harness, proposal, simple_plan,
+    test_mission_type, BASE_SHA, HEAD_SHA,
+};
 use lionclaw::engine::MissionDisposition;
-use lionclaw::model::{FinishClass, MissionPhase, TaskStatus};
+use lionclaw::model::{Assertion, AssertionId, FinishClass, MissionPhase, OracleName, TaskStatus};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
 #[tokio::test]
@@ -57,6 +60,74 @@ async fn passing_oracle_yields_verified_finish() {
         h.oracle_runner.calls.lock().expect("lock").as_slice(),
         &[("cargo-test".to_string(), HEAD_SHA.to_string())]
     );
+}
+
+#[tokio::test]
+async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mission_type = test_mission_type();
+    mission_type.oracles.insert(
+        OracleName::new("lint").unwrap(),
+        "/nonexistent-mission-type/oracles/lint".into(),
+    );
+    let h = common::harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mut plan = simple_plan();
+    plan.requirements
+        .push(covered_requirement("LINT-GREEN", "LINT-PASS"));
+    plan.assertions.push(Assertion {
+        id: AssertionId::new("LINT-PASS").unwrap(),
+        prose: "lint exits 0".into(),
+        oracle: Some(OracleName::new("lint").unwrap()),
+    });
+    plan.tasks[0]
+        .targets
+        .push(AssertionId::new("LINT-PASS").unwrap());
+    let mut config = default_config();
+    config.execution.auto_continue_proof = false;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "run the complete proof batch",
+            BASE_SHA,
+            config,
+        )
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission_id, proposal(0, plan))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
+
+    let checkpoint = h.engine.advance(&mission_id).await.unwrap();
+    assert_eq!(checkpoint.disposition, MissionDisposition::Terminal);
+    assert!(checkpoint.state.inflight.is_empty());
+    assert_eq!(
+        checkpoint
+            .state
+            .contract
+            .values()
+            .filter(|assertion| assertion.last_authoritative.is_some())
+            .count(),
+        2
+    );
+    let events = h.engine.store().load(&mission_id).await.unwrap();
+    assert!(!events.iter().any(|event| {
+        matches!(
+            &event.event,
+            lionclaw::model::MissionEvent::OracleRunCompleted {
+                outcome: Err(lionclaw_runtime_api::TypedFailure::Interrupted { .. }),
+                ..
+            }
+        )
+    }));
 }
 
 #[tokio::test]

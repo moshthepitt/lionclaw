@@ -201,7 +201,10 @@ fn step_running(state: &MissionState) -> StepDecision {
             let Some(oracle) = &assertion.oracle else {
                 continue;
             };
-            if state.oracle_failures.contains_key(oracle) || state.waived_oracles.contains(oracle) {
+            if (state.oracle_failures.contains_key(oracle)
+                && !state.oracle_automatic_retry_remaining(oracle))
+                || state.waived_oracles.contains(oracle)
+            {
                 continue;
             }
             let fresh = assertion
@@ -400,6 +403,7 @@ mod tests {
             assignment_epoch: 1,
             recreate_workspace: true,
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
         }
@@ -451,6 +455,7 @@ mod tests {
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
         }
     }
@@ -867,6 +872,7 @@ mod tests {
             judged_sha: judged_sha.to_string(),
             nonce: "n0".to_string(),
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
         }

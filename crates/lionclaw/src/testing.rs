@@ -117,6 +117,14 @@ impl MockRoleRunner {
 #[async_trait]
 impl RoleRunner for MockRoleRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        if request.role.output == crate::model::OutputSemantics::ProducesArtifact {
+            let _ = request
+                .updates
+                .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
+                    base_sha: request.base_sha.clone(),
+                    assignment_epoch: request.assignment_epoch,
+                });
+        }
         self.calls.lock().expect("lock").push((
             request.task_id.clone(),
             request.attempt_no,

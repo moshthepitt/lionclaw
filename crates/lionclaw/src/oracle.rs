@@ -150,8 +150,16 @@ impl OracleRunner for OciOracleRunner {
             let mut control = request.control.clone();
             let run = loop {
                 let current_control = control.borrow().clone();
-                let deadline_ms = match current_control {
-                    ExecutionControl::RunUntil(deadline_ms) => deadline_ms,
+                match current_control {
+                    ExecutionControl::RunUntil(_) => {}
+                    ExecutionControl::DeadlineExhausted => {
+                        break Err(TypedFailure::DeadlineExhausted {
+                            evidence: Box::new(TypedFailureEvidence::new(
+                                Some("oracle.deadline".to_string()),
+                                "oracle exceeded its recorded effect deadline",
+                            )),
+                        });
+                    }
                     ExecutionControl::Stop(reason) => {
                         let mut evidence = TypedFailureEvidence::new(
                             Some("oracle.stopped".into()),
@@ -162,24 +170,17 @@ impl OracleRunner for OciOracleRunner {
                             evidence: Box::new(evidence),
                         });
                     }
-                };
+                }
                 tokio::select! {
-                    completed = &mut run => break completed.map_err(|error| {
-                        fail(format!("oracle failed to run: {error}"))
-                    }),
+                    biased;
                     changed = control.changed() => {
                         if changed.is_err() {
                             continue;
                         }
                     }
-                    () = tokio::time::sleep(crate::ports::remaining_until(deadline_ms)) => {
-                        break Err(TypedFailure::DeadlineExhausted {
-                            evidence: Box::new(TypedFailureEvidence::new(
-                                Some("oracle.deadline".to_string()),
-                                "oracle exceeded its recorded effect deadline",
-                            )),
-                        });
-                    }
+                    completed = &mut run => break completed.map_err(|error| {
+                        fail(format!("oracle failed to run: {error}"))
+                    }),
                 }
             };
             let duration_ms = started.elapsed().as_millis() as u64;

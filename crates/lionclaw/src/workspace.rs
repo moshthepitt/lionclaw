@@ -31,6 +31,24 @@ pub async fn is_dirty(repo: &Path) -> Result<bool> {
         .is_empty())
 }
 
+pub async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .await
+        .context("failed to spawn git merge-base --is-ancestor")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "git merge-base --is-ancestor failed in '{}'",
+            repo.display()
+        ),
+    }
+}
+
 /// Keep mission state out of the user's `git status` without touching tracked
 /// files. Resolves the exclude file via git rather than assuming
 /// `.git/info/exclude`: in a linked worktree `.git` is a file and the exclude
@@ -236,6 +254,7 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
 async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .await

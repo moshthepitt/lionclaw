@@ -412,6 +412,7 @@ pub enum InflightEffect {
         assignment_epoch: u32,
         recreate_workspace: bool,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
         budget_deadline_ms: i64,
         requested_seq: u64,
@@ -422,6 +423,7 @@ pub enum InflightEffect {
         judged_sha: String,
         attempt_no: u32,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
         requested_seq: u64,
     },
@@ -435,6 +437,7 @@ pub enum InflightEffect {
         /// still has its expected token after a crash/resume.
         nonce: String,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
         budget_deadline_ms: i64,
         requested_seq: u64,
@@ -455,6 +458,14 @@ impl InflightEffect {
             Self::RoleRun { deadline_ms, .. }
             | Self::OracleRun { deadline_ms, .. }
             | Self::TerminalReview { deadline_ms, .. } => *deadline_ms,
+        }
+    }
+
+    pub fn not_before_ms(&self) -> i64 {
+        match self {
+            Self::RoleRun { not_before_ms, .. }
+            | Self::OracleRun { not_before_ms, .. }
+            | Self::TerminalReview { not_before_ms, .. } => *not_before_ms,
         }
     }
 
@@ -488,6 +499,7 @@ impl InflightEffect {
                 assignment_epoch,
                 recreate_workspace,
                 requested_at_ms,
+                not_before_ms,
                 deadline_ms,
                 budget_deadline_ms,
             } => Some((
@@ -502,6 +514,7 @@ impl InflightEffect {
                     assignment_epoch: *assignment_epoch,
                     recreate_workspace: *recreate_workspace,
                     requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
                     budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
@@ -514,6 +527,7 @@ impl InflightEffect {
                 attempt_no,
                 effect_id,
                 requested_at_ms,
+                not_before_ms,
                 deadline_ms,
             } => Some((
                 effect_id.clone(),
@@ -523,6 +537,7 @@ impl InflightEffect {
                     judged_sha: judged_sha.clone(),
                     attempt_no: *attempt_no,
                     requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
                     requested_seq,
                 },
@@ -536,6 +551,7 @@ impl InflightEffect {
                 judged_sha,
                 nonce,
                 requested_at_ms,
+                not_before_ms,
                 deadline_ms,
                 budget_deadline_ms,
             } => Some((
@@ -548,6 +564,7 @@ impl InflightEffect {
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),
                     requested_at_ms: *requested_at_ms,
+                    not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
                     budget_deadline_ms: *budget_deadline_ms,
                     requested_seq,
@@ -557,12 +574,14 @@ impl InflightEffect {
             // its inflight entry here.
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
+            | MissionEvent::TaskWorkspacePrepared { .. }
             | MissionEvent::RoleRunCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
             | MissionEvent::TerminalReviewCompleted { .. }
             | MissionEvent::MissionAborted { .. }
             | MissionEvent::DecisionRecorded { .. }
             | MissionEvent::ControlRequested { .. }
+            | MissionEvent::EffectDeadlineReached { .. }
             | MissionEvent::EffectCleanupFailed { .. } => None,
         }
     }
@@ -606,6 +625,8 @@ pub struct MissionState {
     pub inflight: BTreeMap<super::EffectId, InflightEffect>,
     #[serde(default)]
     pub stop_requests: BTreeMap<super::EffectId, String>,
+    #[serde(default)]
+    pub reached_deadlines: BTreeMap<super::EffectId, i64>,
     #[serde(default)]
     pub parked_effects: BTreeMap<super::EffectId, ParkedEffect>,
     /// Latest cleanup failure for an unfinished effect. Cleared only when that
@@ -667,6 +688,18 @@ impl MissionState {
         } else {
             &mut self.tasks
         }
+    }
+
+    pub(crate) fn oracle_automatic_retry_remaining(&self, oracle: &OracleName) -> bool {
+        self.oracle_failures
+            .get(oracle)
+            .is_some_and(TypedFailure::is_transient)
+            && self
+                .oracle_attempts
+                .get(oracle)
+                .copied()
+                .unwrap_or_default()
+                < self.config.recovery.max_attempts
     }
 }
 

@@ -46,6 +46,9 @@ pub struct RuntimeFileChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeEvent {
+    Configuration {
+        configuration: crate::AppliedRuntimeConfiguration,
+    },
     MessageDelta {
         lane: RuntimeMessageLane,
         text: String,

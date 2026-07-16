@@ -153,6 +153,62 @@ async fn concurrent_advance_reports_running_and_never_double_dispatches() {
 }
 
 #[tokio::test]
+async fn detached_startup_waits_out_a_short_observer_lock_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(
+        MissionStore::open(dir.path()).await.unwrap(),
+        test_mission_type(),
+        "codex".to_string(),
+        "test-image".to_string(),
+        EngineServices::new(
+            Arc::new(MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = create_approved_mission(&engine, dir.path()).await;
+    let lock_path = engine
+        .store()
+        .lionclaw_dir()
+        .join("missions")
+        .join(mission_id.as_str())
+        .join("driver.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let observer_probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    rustix::fs::flock(&observer_probe, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let handshake = dir.path().join("detached.ready");
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        let handshake = handshake.clone();
+        async move {
+            engine
+                .advance_with_handshake(&mission_id, Some(&handshake))
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(
+        !handshake.exists(),
+        "handshake requires actual lock ownership"
+    );
+    rustix::fs::flock(&observer_probe, rustix::fs::FlockOperation::Unlock).unwrap();
+    drop(observer_probe);
+
+    let finished = driver.await.unwrap();
+    assert!(handshake.exists());
+    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+}
+
+#[tokio::test]
 async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() {
     let dir = tempfile::tempdir().unwrap();
     let runner = Arc::new(MockRoleRunner::happy(HEAD_SHA));

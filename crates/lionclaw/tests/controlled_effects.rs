@@ -36,6 +36,39 @@ struct ControlledRunner {
 
 struct SleepingRunner;
 
+struct DeadlineRunner {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl RoleRunner for DeadlineRunner {
+    async fn run(&self, mut request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            match request.control.borrow().clone() {
+                ExecutionControl::DeadlineExhausted => {
+                    return Err(TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(TypedFailureEvidence::new(
+                            Some("test.deadline".into()),
+                            "engine delivered the durable deadline control",
+                        )),
+                    });
+                }
+                ExecutionControl::Stop(reason) => {
+                    let mut evidence =
+                        TypedFailureEvidence::new(Some("test.stop".into()), "unexpected stop");
+                    evidence.stop_reason = Some(reason);
+                    return Err(TypedFailure::OperatorStopped {
+                        evidence: Box::new(evidence),
+                    });
+                }
+                ExecutionControl::RunUntil(_) => {}
+            }
+            request.control.changed().await.unwrap();
+        }
+    }
+}
+
 #[async_trait]
 impl RoleRunner for SleepingRunner {
     async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
@@ -288,6 +321,72 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
     .unwrap_err()
     .to_string()
     .contains("terminal"));
+}
+
+#[tokio::test]
+async fn deadline_is_durably_linearized_before_one_adapter_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine = Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(DeadlineRunner {
+                calls: calls.clone(),
+            }),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(RealClock),
+        ),
+    );
+    let mut config = default_config();
+    config.execution.default_timeout_secs = 1;
+    config.execution.max_task_time_secs = 1;
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "linearize deadline",
+            BASE_SHA,
+            config,
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let parked = engine.advance(&mission_id).await.unwrap();
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(parked.state.reached_deadlines.is_empty());
+    let events = store.load(&mission_id).await.unwrap();
+    let reached = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::EffectDeadlineReached { .. }
+            )
+        })
+        .unwrap();
+    let completed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                lionclaw::model::MissionEvent::RoleRunCompleted {
+                    outcome: Err(TypedFailure::DeadlineExhausted { .. }),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(reached < completed);
 }
 
 #[tokio::test]

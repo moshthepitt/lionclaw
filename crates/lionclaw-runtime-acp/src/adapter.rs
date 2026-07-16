@@ -228,6 +228,13 @@ impl AcpTurnRunner {
                 )
                 .await?;
             applied_configuration = Some(configuration.clone());
+            if configuration.requested_model.is_some() || configuration.requested_mode.is_some() {
+                drop(journal.send(lionclaw_runtime_api::TurnEvent::canonical(
+                    lionclaw_runtime_api::RuntimeEvent::Configuration {
+                        configuration: configuration.clone(),
+                    },
+                )));
+            }
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
                 &self.sessions,

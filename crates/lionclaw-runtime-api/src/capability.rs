@@ -67,8 +67,20 @@ pub struct RuntimeCapabilityResult {
 pub struct AppliedRuntimeConfiguration {
     pub requested_model: Option<String>,
     pub applied_model: Option<String>,
+    pub model_confirmation: Option<RuntimeConfigurationConfirmation>,
     pub requested_mode: Option<String>,
     pub applied_mode: Option<String>,
+    pub mode_confirmation: Option<RuntimeConfigurationConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConfigurationConfirmation {
+    /// A first-class protocol setter completed successfully, but the protocol
+    /// provides no generic read-current-selection operation.
+    Acknowledged,
+    /// The runtime returned the selected value as its current configuration.
+    Observed,
 }
 
 #[derive(Debug, Clone, Default)]

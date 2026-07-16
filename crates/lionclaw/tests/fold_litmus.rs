@@ -10,8 +10,13 @@ use common::{
     review_config, review_mission_type, review_runner, simple_plan, TestHarness, BASE_SHA,
     HEAD_SHA,
 };
-use lionclaw::model::{apply, fold, DecisionAction, MissionId};
+use lionclaw::model::{
+    apply, fold, ControlAction, DecisionAction, EffectId, MissionEvent, MissionId, PayloadRef,
+    RoleName, TaskId,
+};
+use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
+use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
 
 /// The four laws, over whatever log the mission produced: determinism,
 /// incremental consistency, serde roundtrip, and cursor agreement/rebuild.
@@ -204,6 +209,108 @@ async fn snapshot_resume_matches_full_refold() {
         .expect("state");
     let via_full = fold(events).expect("fold");
     assert_eq!(via_snapshot, via_full);
+}
+
+#[tokio::test]
+async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::happy(HEAD_SHA),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "controlled replay",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &mission_id).await;
+
+    let task_id = TaskId::new("fix").unwrap();
+    let effect_id = EffectId::for_parts(&["litmus", "controlled"]);
+    let mut failure_evidence = TypedFailureEvidence::new(
+        Some("runtime.cancel_acknowledged".into()),
+        "effect reached its recorded deadline",
+    );
+    failure_evidence.stop_reason = Some("effect deadline exhausted".into());
+    let state = h.engine.load_state(&mission_id).await.unwrap();
+    h.engine
+        .store()
+        .append(
+            &mission_id,
+            state.head,
+            &[
+                NewEvent::new(MissionEvent::RoleRunRequested {
+                    task_id: task_id.clone(),
+                    attempt_no: 1,
+                    effect_id: effect_id.clone(),
+                    role: RoleName::new("implementer").unwrap(),
+                    runtime: "codex".into(),
+                    prompt: PayloadRef::inline("prompt"),
+                    base_sha: BASE_SHA.into(),
+                    assignment_epoch: 1,
+                    recreate_workspace: true,
+                    requested_at_ms: 1_000,
+                    not_before_ms: 1_000,
+                    deadline_ms: 2_000,
+                    budget_deadline_ms: 3_000,
+                }),
+                NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+                    task_id: task_id.clone(),
+                    effect_id: effect_id.clone(),
+                    base_sha: BASE_SHA.into(),
+                    assignment_epoch: 1,
+                }),
+                NewEvent::new(MissionEvent::ControlRequested {
+                    effect_id: effect_id.clone(),
+                    action: ControlAction::ExtendDeadline {
+                        old_deadline_ms: 2_000,
+                        new_deadline_ms: 3_000,
+                        automatic: false,
+                    },
+                    reason: "observed progress".into(),
+                }),
+                NewEvent::new(MissionEvent::EffectDeadlineReached {
+                    effect_id: effect_id.clone(),
+                    deadline_ms: 3_000,
+                }),
+                NewEvent::new(MissionEvent::RoleRunCompleted {
+                    task_id,
+                    attempt_no: 1,
+                    effect_id,
+                    outcome: Err(TypedFailure::DeadlineExhausted {
+                        evidence: Box::new(failure_evidence),
+                    }),
+                }),
+            ],
+            3_001,
+        )
+        .await
+        .unwrap();
+
+    let events = h.engine.store().load(&mission_id).await.unwrap();
+    assert_every_prefix_is_deterministic(&events);
+    let expected = fold(events).unwrap();
+    assert!(expected.inflight.is_empty());
+    assert!(expected.reached_deadlines.is_empty());
+    assert_eq!(
+        h.engine
+            .store()
+            .rebuild_cursors(&mission_id, 4_000)
+            .await
+            .unwrap(),
+        expected
+    );
 }
 
 #[tokio::test]

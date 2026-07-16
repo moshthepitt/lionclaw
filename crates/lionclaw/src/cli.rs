@@ -19,24 +19,14 @@ use crate::mission_type::{
     BundledMissionTypes, Home, MissionType, MissionTypeLocator, SkillSource,
 };
 use crate::model::{
-    fold, short_hex, ControlAction, DecisionAction, EffectId, EventEnvelope, FinishClass,
-    MissionConfig, MissionId, MissionPhase,
+    fold, short_hex, ControlAction, DecisionAction, EffectId, FinishClass, MissionConfig,
+    MissionId, MissionPhase,
 };
 use crate::oracle::OciOracleRunner;
-use crate::ports::{Clock, EventSink, SystemClock};
+use crate::ports::{Clock, SystemClock};
 use crate::runner::OciRoleRunner;
 use crate::store::{BlobStore, MissionStore};
 use crate::workspace;
-
-/// Streams committed events to stderr so a long `advance` is not silent. Stderr,
-/// not stdout, so `--json` consumers reading stdout are unaffected.
-struct StderrEventSink;
-
-impl EventSink for StderrEventSink {
-    fn emit(&self, event: &EventEnvelope) {
-        eprintln!("  · {:>4}  {}", event.sequence_no, event.event.event_type());
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "lionclaw", about = "LionClaw mission engine")]
@@ -1460,6 +1450,15 @@ fn decode_feedback(bytes: Vec<u8>, source: &str) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("revise feedback from {source} is not UTF-8"))
 }
 
+#[cfg(unix)]
+fn isolate_driver_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_driver_process_group(_command: &mut std::process::Command) {}
+
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
@@ -1474,7 +1473,9 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             std::process::id(),
             SystemClock.now_ms()
         ));
-        let spawned = std::process::Command::new(std::env::current_exe()?)
+        crate::activity::clear_driver_run_evidence(&store.mission_dir(&mission_id))?;
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
             .arg("mission")
             .arg("driver")
             .arg(mission_id.as_str())
@@ -1484,7 +1485,11 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             .arg(&handshake)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(
+                crate::activity::open_driver_stderr(&store.mission_dir(&mission_id))?,
+            ));
+        isolate_driver_process_group(&mut command);
+        let spawned = command
             .spawn()
             .context("spawning detached mission driver")?;
         child = Some(spawned);
@@ -1497,7 +1502,9 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
                     .as_mut()
                     .is_some_and(|child| child.try_wait().ok().flatten().is_some())
                 {
-                    bail!("mission driver exited before publishing its startup handshake");
+                    let detail = crate::activity::driver_error(&store.mission_dir(&mission_id))
+                        .unwrap_or_else(|| "driver lost the startup ownership race".into());
+                    bail!("mission driver exited before startup: {detail}");
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1512,7 +1519,9 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
                 .await
                 .context("joining mission driver waiter")??;
             if !status.success() {
-                bail!("mission driver exited unsuccessfully: {status}");
+                let detail = crate::activity::driver_error(&store.mission_dir(&mission_id))
+                    .unwrap_or_else(|| "no driver error evidence was recorded".into());
+                bail!("mission driver exited unsuccessfully ({status}): {detail}");
             }
         } else if matches!(initial.disposition, MissionDisposition::Running) {
             let lock_path = store.driver_lock_path(&mission_id);
@@ -1574,14 +1583,21 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
 
 async fn cmd_driver(args: DriverArgs) -> Result<std::process::ExitCode> {
     let mission_id = MissionId::parse(&args.mission_id)?;
-    let store = MissionStore::open(&args.repo)
-        .await?
-        .with_sink(Arc::new(StderrEventSink));
-    let engine = build_engine_for_mission(store, &args.repo, &mission_id).await?;
-    engine
-        .advance_with_handshake(&mission_id, Some(&args.handshake))
-        .await?;
-    Ok(std::process::ExitCode::SUCCESS)
+    let store = MissionStore::open(&args.repo).await?;
+    let mission_dir = store.mission_dir(&mission_id);
+    crate::activity::clear_driver_error(&mission_dir)?;
+    let result = async {
+        let engine = build_engine_for_mission(store, &args.repo, &mission_id).await?;
+        engine
+            .advance_with_handshake(&mission_id, Some(&args.handshake))
+            .await?;
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+    .await;
+    if let Err(error) = &result {
+        let _ = crate::activity::record_driver_error(&mission_dir, error);
+    }
+    result
 }
 
 async fn cmd_status(args: StatusArgs) -> Result<()> {
@@ -1594,11 +1610,17 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let state = &view.state;
     if args.json {
         let mut value = mission_view_json(&view, store.blobs())?;
-        let activity = std::fs::read(crate::activity::path(&store.mission_dir(&mission_id)))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let activity = if view.disposition == MissionDisposition::Running {
+            std::fs::read(crate::activity::path(&store.mission_dir(&mission_id)))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
         value["activity"] = activity;
+        value["driver_error"] = crate::activity::driver_error(&store.mission_dir(&mission_id))
+            .map_or(serde_json::Value::Null, serde_json::Value::String);
         println!("{value}");
     } else {
         println!(
@@ -1638,12 +1660,16 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 }
             }
         }
-        print_activity(&store, &mission_id)?;
+        if view.disposition == MissionDisposition::Running {
+            print_activity(&store, &mission_id)?;
+        }
+        if let Some(error) = crate::activity::driver_error(&store.mission_dir(&mission_id)) {
+            println!("driver error: {error}");
+        }
         for (effect_id, parked) in &state.parked_effects {
             println!(
                 "parked effect {}: {:?}; legal control=continue",
-                short_hex(effect_id.as_str()),
-                parked
+                effect_id, parked
             );
         }
         print_planning_input(store.blobs(), state, "")?;
@@ -2475,6 +2501,33 @@ mod tests {
     use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
     use std::collections::BTreeMap;
 
+    #[cfg(unix)]
+    #[test]
+    fn detached_driver_uses_a_process_group_isolated_from_the_invoker() {
+        fn process_group(pid: u32) -> String {
+            String::from_utf8(
+                std::process::Command::new("ps")
+                    .args(["-o", "pgid=", "-p", &pid.to_string()])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        }
+
+        let parent_group = process_group(std::process::id());
+        let mut child = std::process::Command::new("sh");
+        child.args(["-c", "ps -o pgid= -p $$"]);
+        isolate_driver_process_group(&mut child);
+        let child_group = String::from_utf8(child.output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(child_group, parent_group);
+    }
+
     #[test]
     fn cli_has_no_plan_approval_bypass_and_exposes_only_explicit_decision_inputs() {
         assert!(Cli::try_parse_from([
@@ -2938,8 +2991,14 @@ mod tests {
                 last_runtime_configuration: Some(RuntimeConfigurationEvidence {
                     requested_model: Some("requested".into()),
                     applied_model: Some("applied".into()),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                    ),
                     requested_mode: Some("plan".into()),
                     applied_mode: Some("plan".into()),
+                    mode_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                    ),
                 }),
                 workspace_base_sha: Some("base".into()),
                 assignment_epoch: 1,

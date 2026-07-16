@@ -4,8 +4,10 @@ use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
 use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
-use lionclaw::engine::MissionDisposition;
-use lionclaw::model::{ArtifactOutcome, DecisionAction, Handoff, MissionPhase, PayloadRef};
+use lionclaw::engine::{record_control, MissionDisposition};
+use lionclaw::model::{
+    ArtifactOutcome, ControlAction, DecisionAction, Handoff, MissionPhase, PayloadRef,
+};
 use lionclaw::ports::{OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -131,6 +133,140 @@ async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately(
     let attention: Vec<_> = view.state.open_attention.values().collect();
     assert_eq!(attention[0].id, "node_failed:fix");
     assert_eq!(h.role_runner.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts = Arc::new(Mutex::new(0_u32));
+    let seen = attempts.clone();
+    let runner = MockRoleRunner::new(Box::new(move |_| {
+        let mut count = seen.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            Err(TypedFailure::transient(
+                "runtime.fixture",
+                "retry after a bounded delay",
+                None,
+            ))
+        } else {
+            panic!("stopped scheduled retry must never launch")
+        }
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let id = h
+        .engine
+        .create_mission("/repo", "stop scheduled retry", BASE_SHA, default_config())
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &id).await;
+    let store = h.engine.store().clone();
+    let engine = Arc::new(h.engine);
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let id = id.clone();
+        async move { engine.advance(&id).await.unwrap() }
+    });
+
+    let (effect_id, not_before_ms, deadline_ms) = loop {
+        let state = store.require_state(&id).await.unwrap();
+        if let Some((effect_id, effect)) = state.inflight.iter().find(|(_, effect)| {
+            matches!(
+                effect,
+                lionclaw::model::InflightEffect::RoleRun { attempt_no: 2, .. }
+            )
+        }) {
+            break (
+                effect_id.clone(),
+                effect.not_before_ms(),
+                effect.deadline_ms(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert!(
+        deadline_ms > not_before_ms,
+        "the execution budget starts after backoff"
+    );
+    record_control(
+        &store,
+        1,
+        &id,
+        &effect_id,
+        ControlAction::Stop,
+        "operator stopped the scheduled retry",
+    )
+    .await
+    .unwrap();
+
+    let parked = driver.await.unwrap();
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    assert_eq!(*attempts.lock().unwrap(), 1);
+    assert_eq!(
+        parked
+            .state
+            .tasks
+            .values()
+            .next()
+            .unwrap()
+            .last_failure
+            .as_ref()
+            .unwrap()
+            .category(),
+        "operator_stopped"
+    );
+}
+
+#[tokio::test]
+async fn structured_transient_oracle_failure_uses_the_shared_retry_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts = Arc::new(Mutex::new(0_u32));
+    let seen = attempts.clone();
+    let oracle = MockOracleRunner::new(Box::new(move |_| {
+        let mut count = seen.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            return Err(TypedFailure::transient(
+                "oracle.fixture",
+                "oracle runtime temporarily unavailable",
+                Some(1),
+            ));
+        }
+        Ok(OracleOutcome {
+            exit_code: 0,
+            exit_signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 1,
+        })
+    }));
+    let h = harness(dir.path(), MockRoleRunner::happy(HEAD_SHA), oracle).await;
+    let id = h
+        .engine
+        .create_mission(
+            "/repo",
+            "retry transient oracle",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &id).await;
+
+    let view = h.engine.advance(&id).await.unwrap();
+    assert_eq!(view.disposition, MissionDisposition::Terminal);
+    assert_eq!(*attempts.lock().unwrap(), 2);
+    assert!(view.state.oracle_failures.is_empty());
+    assert!(view.state.parked_effects.is_empty());
 }
 
 #[tokio::test]

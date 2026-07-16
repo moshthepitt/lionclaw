@@ -25,7 +25,7 @@ use crate::model::{
 };
 use crate::ports::{
     Clock, EffectCleaner, EffectCleanupRequest, ExecutionControl, OracleRunRequest, OracleRunner,
-    RoleRunRequest, RoleRunner,
+    RoleRunRequest, RoleRunUpdate, RoleRunner,
 };
 use crate::prompt::{
     assemble_planning_prompt, assemble_role_prompt, assemble_terminal_review_prompt,
@@ -146,6 +146,7 @@ pub async fn load_mission_view(
 ) -> Result<MissionView> {
     let guard = DriverGuard::try_acquire(&store.driver_lock_path(mission_id))?;
     let driver_running = guard.is_none();
+    drop(guard);
     let state = store.require_state(mission_id).await?;
     Ok(MissionView::from_state(state, driver_running))
 }
@@ -204,6 +205,20 @@ impl Engine {
 
     pub fn mission_type(&self) -> &MissionType {
         &self.mission_type
+    }
+
+    fn publish_activity(&self, state: &MissionState) {
+        if let Err(error) = crate::activity::publish(
+            &self.store.mission_dir(&state.mission_id),
+            state,
+            self.clock.now_ms(),
+        ) {
+            tracing::warn!(
+                mission_id = %state.mission_id,
+                %error,
+                "failed to update non-authoritative activity projection"
+            );
+        }
     }
 
     /// The mission type this engine runs, pinned by name + content digest.
@@ -362,17 +377,18 @@ impl Engine {
         mission_id: &MissionId,
         handshake: Option<&std::path::Path>,
     ) -> Result<MissionView> {
-        let Some(_guard) = DriverGuard::try_acquire(&self.store.driver_lock_path(mission_id))?
-        else {
-            let state = self.store.require_state(mission_id).await?;
-            return Ok(MissionView::from_state(state, true));
+        let lock_path = self.store.driver_lock_path(mission_id);
+        let started = tokio::time::Instant::now();
+        let _guard = loop {
+            if let Some(guard) = DriverGuard::try_acquire(&lock_path)? {
+                break guard;
+            }
+            if handshake.is_none() || started.elapsed() >= Duration::from_secs(2) {
+                let state = self.store.require_state(mission_id).await?;
+                return Ok(MissionView::from_state(state, true));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let initial_state = self.store.require_state(mission_id).await?;
-        crate::activity::publish(
-            &self.store.mission_dir(mission_id),
-            &initial_state,
-            self.clock.now_ms(),
-        )?;
         if let Some(path) = handshake {
             let temporary = path.with_extension("tmp");
             std::fs::write(&temporary, b"ready\n")
@@ -380,6 +396,8 @@ impl Engine {
             std::fs::rename(&temporary, path)
                 .with_context(|| format!("publishing driver handshake '{}'", path.display()))?;
         }
+        let initial_state = self.store.require_state(mission_id).await?;
+        self.publish_activity(&initial_state);
         if !self.recover_interrupted(mission_id).await? {
             return Ok(MissionView::from_state(
                 self.load_state(mission_id).await?,
@@ -390,11 +408,7 @@ impl Engine {
         // Persist a fold snapshot before parking or exiting so the next
         // invocation resumes without re-folding the whole log.
         let state = self.load_state(mission_id).await?;
-        crate::activity::publish(
-            &self.store.mission_dir(mission_id),
-            &state,
-            self.clock.now_ms(),
-        )?;
+        self.publish_activity(&state);
         self.store
             .save_snapshot(&state, self.clock.now_ms())
             .await?;
@@ -457,23 +471,55 @@ impl Engine {
     /// Execute one request materialized by this driver, clean its transient
     /// resources, then durably record the outcome.
     async fn drive_one(&self, state: &MissionState) -> Result<bool> {
-        let Some((effect_id, effect)) = state.inflight.iter().next() else {
+        let Some(effect_id) = state.inflight.keys().next() else {
             return Ok(false);
+        };
+        let wait_ms = state
+            .inflight
+            .get(effect_id)
+            .expect("effect id came from the same map")
+            .not_before_ms()
+            .saturating_sub(self.clock.now_ms())
+            .max(0) as u64;
+        let start_at = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        let effect = loop {
+            let current = self.load_state(&state.mission_id).await?;
+            let Some(active) = current.inflight.get(effect_id) else {
+                return Ok(true);
+            };
+            if let Some(reason) = current.stop_requests.get(effect_id) {
+                if !self.cleanup_effect(&current, effect_id, true).await? {
+                    return Ok(false);
+                }
+                self.append_outcome(
+                    &current.mission_id,
+                    current.head,
+                    stopped_before_start_outcome(effect_id, active, reason),
+                )
+                .await?;
+                return Ok(false);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= start_at {
+                break active.clone();
+            }
+            self.publish_activity(&current);
+            tokio::time::sleep((start_at - now).min(Duration::from_millis(100))).await;
         };
         let (control_tx, control_rx) =
             tokio::sync::watch::channel(ExecutionControl::RunUntil(effect.deadline_ms()));
         let execution = async {
-            match effect {
+            match &effect {
                 InflightEffect::RoleRun { .. } => {
-                    self.execute_role_run(state, effect_id, effect, control_rx)
+                    self.execute_role_run(state, effect_id, &effect, control_rx)
                         .await
                 }
                 InflightEffect::OracleRun { .. } => {
-                    self.execute_oracle_run(state, effect_id, effect, control_rx)
+                    self.execute_oracle_run(state, effect_id, &effect, control_rx)
                         .await
                 }
                 InflightEffect::TerminalReview { .. } => {
-                    self.execute_terminal_review(state, effect_id, effect, control_rx)
+                    self.execute_terminal_review(state, effect_id, &effect, control_rx)
                         .await
                 }
             }
@@ -484,28 +530,29 @@ impl Engine {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
                     let current = self.load_state(&state.mission_id).await?;
-                    crate::activity::publish(
-                        &self.store.mission_dir(&state.mission_id),
-                        &current,
-                        self.clock.now_ms(),
-                    )?;
+                    self.publish_activity(&current);
                     let Some(active) = current.inflight.get(effect_id) else {
                         bail!("active effect '{effect_id}' disappeared without an outcome");
                     };
+                    if current.reached_deadlines.contains_key(effect_id) {
+                        control_tx.send_replace(ExecutionControl::DeadlineExhausted);
+                        continue;
+                    }
                     if let Some(reason) = current.stop_requests.get(effect_id) {
                         control_tx.send_replace(ExecutionControl::Stop(reason.clone()));
                         continue;
                     }
                     let mut deadline_ms = active.deadline_ms();
-                    if self.clock.now_ms().saturating_add(200) >= deadline_ms {
+                    let now_ms = self.clock.now_ms();
+                    let extension_step_ms = i64::try_from(
+                        current.config.execution.extension_step_secs.saturating_mul(1_000),
+                    )
+                    .unwrap_or(i64::MAX);
+                    if now_ms.saturating_add(extension_step_ms) >= deadline_ms {
                         if let Some(budget_deadline_ms) = active.budget_deadline_ms() {
                             if deadline_ms < budget_deadline_ms {
-                                let step_ms = i64::try_from(
-                                    current.config.execution.extension_step_secs.saturating_mul(1_000),
-                                )
-                                .unwrap_or(i64::MAX);
                                 let new_deadline_ms = deadline_ms
-                                    .saturating_add(step_ms)
+                                    .saturating_add(extension_step_ms)
                                     .min(budget_deadline_ms);
                                 self.append_fact(
                                     &current.mission_id,
@@ -524,11 +571,30 @@ impl Engine {
                             }
                         }
                     }
-                    control_tx.send_replace(ExecutionControl::RunUntil(deadline_ms));
+                    if now_ms >= deadline_ms {
+                        self.append_fact(
+                            &current.mission_id,
+                            current.head,
+                            NewEvent::new(MissionEvent::EffectDeadlineReached {
+                                effect_id: effect_id.clone(),
+                                deadline_ms,
+                            }),
+                        )
+                        .await?;
+                        let latest = self.load_state(&current.mission_id).await?;
+                        if latest.reached_deadlines.get(effect_id) == Some(&deadline_ms) {
+                            control_tx.send_replace(ExecutionControl::DeadlineExhausted);
+                        }
+                    } else {
+                        control_tx.send_replace(ExecutionControl::RunUntil(deadline_ms));
+                    }
                 }
             }
         };
-        let discard_artifact = !matches!(outcome.event, MissionEvent::RoleRunCompleted { .. });
+        let discard_artifact = !matches!(
+            outcome.event,
+            MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
+        );
         let checkpoint = checkpoint_after(&outcome.event, &state.config.execution);
         if !self
             .cleanup_effect(state, effect_id, discard_artifact)
@@ -542,6 +608,16 @@ impl Engine {
             return Ok(true);
         };
         if !automatic {
+            // Oracle requests are materialized as one owned batch. Yield only
+            // after every sibling has run; otherwise recovery would falsely
+            // classify an unstarted sibling as a crashed effect.
+            let has_oracle_batch_sibling = matches!(effect, InflightEffect::OracleRun { .. })
+                && state.inflight.iter().any(|(sibling_id, sibling)| {
+                    sibling_id != effect_id && matches!(sibling, InflightEffect::OracleRun { .. })
+                });
+            if has_oracle_batch_sibling {
+                return Ok(true);
+            }
             return Ok(false);
         }
         let current = self.load_state(&state.mission_id).await?;
@@ -640,6 +716,81 @@ impl Engine {
         bail!("event append kept conflicting after {MAX_LOOP_ITERATIONS} retries")
     }
 
+    async fn run_role_observed(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+        request: RoleRunRequest,
+        mut updates: tokio::sync::mpsc::UnboundedReceiver<RoleRunUpdate>,
+        record_workspace: bool,
+    ) -> Result<std::result::Result<crate::ports::RoleRunOutcome, TypedFailure>> {
+        let run = self.role_runner.run(request);
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                result = &mut run => {
+                    while let Ok(update) = updates.try_recv() {
+                        self.record_role_update(state, effect_id, update, record_workspace).await?;
+                    }
+                    return Ok(result);
+                }
+                update = updates.recv() => {
+                    if let Some(update) = update {
+                        self.record_role_update(state, effect_id, update, record_workspace).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn record_role_update(
+        &self,
+        state: &MissionState,
+        effect_id: &EffectId,
+        update: RoleRunUpdate,
+        record_workspace: bool,
+    ) -> Result<()> {
+        match update {
+            RoleRunUpdate::WorkspacePrepared {
+                base_sha,
+                assignment_epoch,
+            } if record_workspace => {
+                let task_id = match state.inflight.get(effect_id) {
+                    Some(InflightEffect::RoleRun { task_id, .. }) => task_id.clone(),
+                    _ => return Ok(()),
+                };
+                self.append_fact(
+                    &state.mission_id,
+                    state.head,
+                    NewEvent::new(MissionEvent::TaskWorkspacePrepared {
+                        task_id,
+                        effect_id: effect_id.clone(),
+                        base_sha,
+                        assignment_epoch,
+                    }),
+                )
+                .await
+            }
+            RoleRunUpdate::WorkspacePrepared { .. } => Ok(()),
+            RoleRunUpdate::Runtime(event) => {
+                if let Err(error) = crate::activity::record_runtime_event(
+                    &self.store.mission_dir(&state.mission_id),
+                    effect_id,
+                    &event,
+                    self.clock.now_ms(),
+                ) {
+                    tracing::warn!(
+                        mission_id = %state.mission_id,
+                        %effect_id,
+                        %error,
+                        "failed to update non-authoritative runtime activity"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Append events, treating a `Conflict`/`Duplicate` as an idempotent no-op.
     /// Safe only for request appends: a Conflict means a non-driver decision
     /// moved the head, and the next fold re-derives the same dispatch.
@@ -707,6 +858,7 @@ impl Engine {
                 ))))
             }
         };
+        let (updates, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
@@ -721,26 +873,15 @@ impl Engine {
             recreate_workspace: *recreate_workspace,
             deadline_ms: effect.deadline_ms(),
             control,
+            updates,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
         let previous_task = state.active_tasks().get(task_id);
-        if let Some(failure) = previous_task
-            .and_then(|task| task.last_failure.as_ref())
-            .filter(|failure| failure.is_transient())
+        match self
+            .run_role_observed(state, effect_id, request, update_rx, true)
+            .await?
         {
-            let remaining_ms = failure
-                .next_eligible_at_ms()
-                .map(|eligible| eligible.saturating_sub(self.clock.now_ms()).max(0) as u64)
-                .unwrap_or_else(|| {
-                    transient_backoff_ms(
-                        previous_task.map_or(0, |task| task.consecutive_failures),
-                        failure.retry_after_ms(),
-                    )
-                });
-            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
-        }
-        match self.role_runner.run(request).await {
             Ok(outcome) => {
                 let incomplete = match &outcome.handoff {
                     Handoff::Work { done: false, .. } => Some("role reported done=false"),
@@ -869,7 +1010,15 @@ impl Engine {
                 prepared_inputs: outcome.prepared_inputs,
                 duration_ms: outcome.duration_ms,
             }))),
-            Err(failure) => Ok(completed(Err(failure.projected()))),
+            Err(mut failure) => {
+                if failure.is_transient() {
+                    let delay_ms = transient_backoff_ms(attempt_no, failure.retry_after_ms());
+                    failure.set_next_eligible_at_ms(
+                        self.clock.now_ms().saturating_add(delay_ms as i64),
+                    );
+                }
+                Ok(completed(Err(failure.projected())))
+            }
         }
     }
 
@@ -926,6 +1075,7 @@ impl Engine {
             }
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
+        let (updates, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
@@ -940,12 +1090,27 @@ impl Engine {
             recreate_workspace: true,
             deadline_ms: effect.deadline_ms(),
             control,
+            updates,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
-        let outcome = match self.role_runner.run(request).await {
+        let outcome = match self
+            .run_role_observed(state, effect_id, request, update_rx, false)
+            .await?
+        {
             Ok(outcome) => outcome,
-            Err(failure) => return Ok(completed(Err(failure.projected()))),
+            Err(mut failure) => {
+                if failure.is_transient() {
+                    let delay_ms = transient_backoff_ms(
+                        state.terminal_review.consecutive_failures,
+                        failure.retry_after_ms(),
+                    );
+                    failure.set_next_eligible_at_ms(
+                        self.clock.now_ms().saturating_add(delay_ms as i64),
+                    );
+                }
+                return Ok(completed(Err(failure.projected())));
+            }
         };
         let Handoff::Review {
             done,
@@ -1171,14 +1336,16 @@ impl Engine {
             &prompt_hash,
         ]);
         let requested_at_ms = self.clock.now_ms();
+        let not_before_ms = retry_not_before(
+            requested_at_ms,
+            state
+                .active_tasks()
+                .get(&intent.task_id)
+                .and_then(|task| task.last_failure.as_ref()),
+        );
         let initial_secs = role
             .timeout_secs
             .unwrap_or(state.config.execution.default_timeout_secs);
-        let deadline_ms = resolved_deadline(requested_at_ms, initial_secs)?;
-        let budget_deadline_ms = resolved_deadline(
-            requested_at_ms,
-            initial_secs.max(state.config.execution.max_task_time_secs),
-        )?;
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
             task_id: intent.task_id,
             attempt_no: intent.attempt_no,
@@ -1193,8 +1360,12 @@ impl Engine {
             assignment_epoch,
             recreate_workspace,
             requested_at_ms,
-            deadline_ms,
-            budget_deadline_ms,
+            not_before_ms,
+            deadline_ms: resolved_deadline(not_before_ms, initial_secs)?,
+            budget_deadline_ms: resolved_deadline(
+                not_before_ms,
+                initial_secs.max(state.config.execution.max_task_time_secs),
+            )?,
         })
         .with_prompt_hash(prompt_hash);
         self.append_idempotent(&state.mission_id, state.head, &[event])
@@ -1261,6 +1432,11 @@ impl Engine {
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
         let requested_at_ms = self.clock.now_ms();
+        let previous_failure = match state.terminal_review.outcome.as_ref() {
+            Some(crate::model::ReviewOutcome::Failed { failure }) => Some(failure),
+            _ => None,
+        };
+        let not_before_ms = retry_not_before(requested_at_ms, previous_failure);
         let initial_secs = role
             .timeout_secs
             .unwrap_or(state.config.execution.default_timeout_secs);
@@ -1276,9 +1452,10 @@ impl Engine {
             judged_sha: intent.judged_sha,
             nonce,
             requested_at_ms,
-            deadline_ms: resolved_deadline(requested_at_ms, initial_secs)?,
+            not_before_ms,
+            deadline_ms: resolved_deadline(not_before_ms, initial_secs)?,
             budget_deadline_ms: resolved_deadline(
-                requested_at_ms,
+                not_before_ms,
                 initial_secs.max(state.config.execution.max_task_time_secs),
             )?,
         })
@@ -1303,6 +1480,8 @@ impl Engine {
                     &intent.attempt_no.to_string(),
                 ]);
                 let requested_at_ms = self.clock.now_ms();
+                let not_before_ms =
+                    retry_not_before(requested_at_ms, state.oracle_failures.get(&intent.oracle));
                 Ok(NewEvent::new(MissionEvent::OracleRunRequested {
                     assertion_ids: intent.assertion_ids,
                     oracle: intent.oracle,
@@ -1310,8 +1489,9 @@ impl Engine {
                     attempt_no: intent.attempt_no,
                     effect_id,
                     requested_at_ms,
+                    not_before_ms,
                     deadline_ms: resolved_deadline(
-                        requested_at_ms,
+                        not_before_ms,
                         state.config.execution.default_timeout_secs,
                     )?,
                 }))
@@ -1409,11 +1589,64 @@ fn effect_id_for(parts: &[&str]) -> EffectId {
 }
 
 fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEvent {
+    let mut evidence = lionclaw_runtime_api::TypedFailureEvidence::new(
+        Some("driver.interrupted".to_string()),
+        "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed",
+    );
+    evidence.stop_reason = Some("mission driver exited".into());
     let failure = TypedFailure::Interrupted {
-        evidence: Box::new(lionclaw_runtime_api::TypedFailureEvidence::new(
-            Some("driver.interrupted".to_string()),
-            "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed",
-        )),
+        evidence: Box::new(evidence),
+    };
+    NewEvent::new(match effect {
+        InflightEffect::RoleRun {
+            task_id,
+            attempt_no,
+            ..
+        } => MissionEvent::RoleRunCompleted {
+            task_id: task_id.clone(),
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            outcome: Err(failure),
+        },
+        InflightEffect::OracleRun {
+            assertion_ids,
+            oracle,
+            judged_sha,
+            attempt_no,
+            ..
+        } => MissionEvent::OracleRunCompleted {
+            assertion_ids: assertion_ids.clone(),
+            oracle: oracle.clone(),
+            judged_sha: judged_sha.clone(),
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            outcome: Err(failure),
+        },
+        InflightEffect::TerminalReview {
+            attempt_no,
+            judged_sha,
+            ..
+        } => MissionEvent::TerminalReviewCompleted {
+            attempt_no: *attempt_no,
+            effect_id: effect_id.clone(),
+            judged_sha: judged_sha.clone(),
+            outcome: Err(failure),
+        },
+    })
+}
+
+fn stopped_before_start_outcome(
+    effect_id: &EffectId,
+    effect: &InflightEffect,
+    reason: &str,
+) -> NewEvent {
+    let mut evidence = lionclaw_runtime_api::TypedFailureEvidence::new(
+        Some("control.stopped_before_start".into()),
+        "operator stopped the effect during its recorded retry backoff",
+    );
+    evidence.stop_reason = Some(reason.to_string());
+    let failure = TypedFailure::OperatorStopped {
+        evidence: Box::new(evidence),
     };
     NewEvent::new(match effect {
         InflightEffect::RoleRun {
@@ -1508,6 +1741,9 @@ pub async fn record_control(
             if !state.inflight.contains_key(effect_id) {
                 bail!("effect '{effect_id}' is not active; control is stale");
             }
+            if state.reached_deadlines.contains_key(effect_id) {
+                bail!("effect '{effect_id}' cancellation already began; control is stale");
+            }
         }
         crate::model::ControlAction::ExtendDeadline {
             old_deadline_ms,
@@ -1517,6 +1753,9 @@ pub async fn record_control(
             let Some(effect) = state.inflight.get(effect_id) else {
                 bail!("effect '{effect_id}' is not active; control is stale");
             };
+            if state.reached_deadlines.contains_key(effect_id) {
+                bail!("effect '{effect_id}' cancellation already began; control is stale");
+            }
             if effect.deadline_ms() != *old_deadline_ms {
                 bail!("effect '{effect_id}' deadline changed; control is stale");
             }
@@ -1554,6 +1793,14 @@ fn transient_backoff_ms(consecutive_failures: u32, adapter_retry_after_ms: Optio
     policy_ms
         .max(adapter_retry_after_ms.unwrap_or_default())
         .min(MAX_BACKOFF_MS)
+}
+
+fn retry_not_before(now_ms: i64, failure: Option<&TypedFailure>) -> i64 {
+    failure
+        .filter(|failure| failure.is_transient())
+        .and_then(TypedFailure::next_eligible_at_ms)
+        .unwrap_or(now_ms)
+        .max(now_ms)
 }
 
 /// Checkpoint selection is pure: recorded state policy plus the just-produced
@@ -1609,8 +1856,10 @@ fn runtime_configuration_evidence(
     lionclaw_runtime_api::AppliedRuntimeConfiguration {
         requested_model: evidence.requested_model.clone(),
         applied_model: evidence.applied_model.clone(),
+        model_confirmation: evidence.model_confirmation,
         requested_mode: evidence.requested_mode.clone(),
         applied_mode: evidence.applied_mode.clone(),
+        mode_confirmation: evidence.mode_confirmation,
     }
 }
 

@@ -148,29 +148,31 @@ impl AcpClient {
             ..Default::default()
         };
         if let Some(model) = config.model.as_deref() {
-            applied.applied_model = Some(
-                self.apply_selection(
+            let (selected, confirmation) = self
+                .apply_selection(
                     session_id,
                     "model",
                     model,
                     selections.models.as_ref(),
                     selections,
                 )
-                .await?,
-            );
+                .await?;
+            applied.applied_model = Some(selected);
+            applied.model_confirmation = Some(confirmation);
         }
 
         if let Some(mode) = config.mode.as_deref() {
-            applied.applied_mode = Some(
-                self.apply_selection(
+            let (selected, confirmation) = self
+                .apply_selection(
                     session_id,
                     "mode",
                     mode,
                     selections.modes.as_ref(),
                     selections,
                 )
-                .await?,
-            );
+                .await?;
+            applied.applied_mode = Some(selected);
+            applied.mode_confirmation = Some(confirmation);
         }
 
         Ok(applied)
@@ -183,7 +185,10 @@ impl AcpClient {
         requested: &str,
         first_class: Option<&AcpSelectionSet>,
         selections: &AcpSessionSelections,
-    ) -> Result<String> {
+    ) -> Result<(
+        String,
+        lionclaw_runtime_api::RuntimeConfigurationConfirmation,
+    )> {
         if let Some(first_class) = first_class {
             let matches = first_class
                 .values
@@ -210,7 +215,10 @@ impl AcpClient {
                 None,
             )
             .await?;
-            return Ok(selected);
+            return Ok((
+                selected,
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+            ));
         }
 
         let option = selections
@@ -241,7 +249,10 @@ impl AcpClient {
                 "ACP runtime applied {kind} '{observed}' instead of requested '{requested}'"
             ));
         }
-        Ok(observed)
+        Ok((
+            observed,
+            lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+        ))
     }
 
     pub(crate) async fn prompt(

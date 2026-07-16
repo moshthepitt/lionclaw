@@ -521,7 +521,15 @@ async fn advertised_first_class_model_and_mode_are_applied_by_typed_methods() {
 
     assert_eq!(applied.requested_model.as_deref(), Some("gpt-5.5"));
     assert_eq!(applied.applied_model.as_deref(), Some("openrouter:gpt-5.5"));
+    assert_eq!(
+        applied.model_confirmation,
+        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+    );
     assert_eq!(applied.applied_mode.as_deref(), Some("dont_ask"));
+    assert_eq!(
+        applied.mode_confirmation,
+        Some(lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged)
+    );
     let sent = state.lock().unwrap().sent.clone();
     assert_eq!(sent[0]["method"], "session/set_model");
     assert_eq!(sent[0]["params"]["modelId"], "openrouter:gpt-5.5");
@@ -648,8 +656,14 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         lionclaw_runtime_api::AppliedRuntimeConfiguration {
             requested_model: Some("gpt-5".to_string()),
             applied_model: Some("gpt-5".to_string()),
+            model_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
             requested_mode: Some("plan".to_string()),
             applied_mode: Some("plan".to_string()),
+            mode_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
         }
     );
 
@@ -660,6 +674,9 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
     assert_eq!(
         canonical_events(&journal).cloned().collect::<Vec<_>>(),
         vec![
+            RuntimeEvent::Configuration {
+                configuration: result.configuration.clone(),
+            },
             RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Reasoning,
                 text: "thinking".to_string(),
@@ -671,7 +688,8 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             RuntimeEvent::Done,
         ]
     );
-    assert!(journal.iter().all(|record| record.raw.is_some()));
+    assert!(journal[0].raw.is_none());
+    assert!(journal[1..].iter().all(|record| record.raw.is_some()));
     assert_eq!(
         std::fs::read_to_string(runtime_state_root.join(ACP_SESSION_ID_STATE_FILE))
             .expect("saved session id"),

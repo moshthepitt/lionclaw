@@ -85,17 +85,25 @@ impl CodexAppServerTurnRunner<'_> {
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
             let applied_model = extract_app_server_model(&response);
-            applied_configuration = Some(lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            let configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
                 requested_model: self.adapter.config.model.clone(),
                 applied_model: applied_model.clone(),
+                model_confirmation: applied_model
+                    .as_ref()
+                    .map(|_| lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed),
                 requested_mode: None,
                 applied_mode: None,
-            });
+                mode_confirmation: None,
+            };
+            applied_configuration = Some(configuration.clone());
             if self.adapter.config.model.is_some() && applied_model.is_none() {
                 return Err(anyhow!(
                     "codex app-server did not report the applied model in turn/start"
                 ));
             }
+            drop(journal.send(lionclaw_runtime_api::TurnEvent::canonical(
+                lionclaw_runtime_api::RuntimeEvent::Configuration { configuration },
+            )));
             let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
             client
                 .wait_for_turn_completed(
@@ -110,9 +118,13 @@ impl CodexAppServerTurnRunner<'_> {
             Ok(RuntimeTurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: self.adapter.config.model.clone(),
+                    model_confirmation: applied_model
+                        .as_ref()
+                        .map(|_| lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed),
                     applied_model,
                     requested_mode: None,
                     applied_mode: None,
+                    mode_confirmation: None,
                 },
                 ..Default::default()
             })

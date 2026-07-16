@@ -25,7 +25,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 10;
+pub const REDUCER_VERSION: u32 = 12;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -85,6 +85,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         oracle_attempts: Default::default(),
         inflight: Default::default(),
         stop_requests: Default::default(),
+        reached_deadlines: Default::default(),
         parked_effects: Default::default(),
         cleanup_failure: None,
         open_attention: Default::default(),
@@ -116,8 +117,6 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         MissionEvent::RoleRunRequested {
             task_id,
             attempt_no,
-            base_sha,
-            assignment_epoch,
             ..
         } => {
             state.parked_effects.retain(|_, parked| {
@@ -127,9 +126,31 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
-            task.workspace_base_sha = Some(base_sha.clone());
-            task.assignment_epoch = *assignment_epoch;
             track_inflight(state, &envelope.event, seq);
+        }
+        MissionEvent::TaskWorkspacePrepared {
+            task_id,
+            effect_id,
+            base_sha,
+            assignment_epoch,
+        } => {
+            let matches_request = matches!(
+                state.inflight.get(effect_id),
+                Some(InflightEffect::RoleRun {
+                    task_id: active_task,
+                    base_sha: active_base,
+                    assignment_epoch: active_epoch,
+                    ..
+                }) if active_task == task_id
+                    && active_base == base_sha
+                    && active_epoch == assignment_epoch
+            );
+            if matches_request {
+                if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    task.workspace_base_sha = Some(base_sha.clone());
+                    task.assignment_epoch = *assignment_epoch;
+                }
+            }
         }
         MissionEvent::RoleRunCompleted {
             task_id,
@@ -139,6 +160,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
+            state.reached_deadlines.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
@@ -172,8 +194,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         task.last_runtime_configuration = Some(RuntimeConfigurationEvidence {
                             requested_model: evidence.configuration.requested_model.clone(),
                             applied_model: evidence.configuration.applied_model.clone(),
+                            model_confirmation: evidence.configuration.model_confirmation,
                             requested_mode: evidence.configuration.requested_mode.clone(),
                             applied_mode: evidence.configuration.applied_mode.clone(),
+                            mode_confirmation: evidence.configuration.mode_confirmation,
                         });
                         task.consecutive_failures = task.consecutive_failures.saturating_add(1);
                         if !failure.automatically_retryable()
@@ -209,6 +233,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
+            state.reached_deadlines.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
@@ -229,15 +254,17 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
                 Err(failure) => {
-                    state.parked_effects.insert(
-                        effect_id.clone(),
-                        ParkedEffect::OracleRun {
-                            oracle: oracle.clone(),
-                        },
-                    );
                     state
                         .oracle_failures
                         .insert(oracle.clone(), failure.clone());
+                    if !state.oracle_automatic_retry_remaining(oracle) {
+                        state.parked_effects.insert(
+                            effect_id.clone(),
+                            ParkedEffect::OracleRun {
+                                oracle: oracle.clone(),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -261,6 +288,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
         } => {
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
+            state.reached_deadlines.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             state.terminal_review.attempts = (*attempt_no).max(state.terminal_review.attempts);
             match outcome {
@@ -303,11 +331,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 new_deadline_ms,
                 ..
             } => {
-                if let Some(effect) = state.inflight.get_mut(effect_id) {
-                    if effect.deadline_ms() == *old_deadline_ms
-                        && new_deadline_ms >= old_deadline_ms
-                    {
-                        effect.set_deadline_ms(*new_deadline_ms);
+                if !state.reached_deadlines.contains_key(effect_id) {
+                    if let Some(effect) = state.inflight.get_mut(effect_id) {
+                        if effect.deadline_ms() == *old_deadline_ms
+                            && new_deadline_ms >= old_deadline_ms
+                        {
+                            effect.set_deadline_ms(*new_deadline_ms);
+                        }
                     }
                 }
             }
@@ -331,6 +361,20 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 }
             }
         },
+        MissionEvent::EffectDeadlineReached {
+            effect_id,
+            deadline_ms,
+        } => {
+            if state
+                .inflight
+                .get(effect_id)
+                .is_some_and(|effect| effect.deadline_ms() == *deadline_ms)
+            {
+                state
+                    .reached_deadlines
+                    .insert(effect_id.clone(), *deadline_ms);
+            }
+        }
         MissionEvent::MissionAborted { reason, .. } => {
             state.phase = MissionPhase::Aborted {
                 reason: reason.clone(),
@@ -835,6 +879,9 @@ fn derive_attention(state: &mut MissionState) {
 
     // Oracle infrastructure failures: park rather than re-request forever.
     for (oracle, failure) in &state.oracle_failures {
+        if state.oracle_automatic_retry_remaining(oracle) {
+            continue;
+        }
         raise(
             AttentionKind::OracleFailed,
             None,
@@ -1377,6 +1424,7 @@ mod tests {
             assignment_epoch: 1,
             recreate_workspace: true,
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
         }
@@ -1409,6 +1457,7 @@ mod tests {
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
         }
     }
@@ -1453,6 +1502,137 @@ mod tests {
             role: None,
             depends_on: deps.iter().map(|d| tid(d)).collect(),
         }
+    }
+
+    #[test]
+    fn workspace_provenance_advances_only_after_the_exact_runner_confirmation() {
+        let effect_id = EffectId::for_parts(&["test", "workspace"]);
+        let requested = role_requested("w", "workspace");
+        let requested_state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            requested.clone(),
+        ])
+        .expect("requested state");
+        let task = requested_state.tasks.get(&tid("w")).unwrap();
+        assert_eq!(task.workspace_base_sha, None);
+        assert_eq!(task.assignment_epoch, 0);
+
+        let stale_state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            requested.clone(),
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("w"),
+                effect_id: EffectId::for_parts(&["test", "stale"]),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+        ])
+        .expect("stale state");
+        assert_eq!(
+            stale_state.tasks.get(&tid("w")).unwrap().workspace_base_sha,
+            None
+        );
+
+        let confirmed_state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            requested,
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("w"),
+                effect_id,
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+        ])
+        .expect("confirmed state");
+        let task = confirmed_state.tasks.get(&tid("w")).unwrap();
+        assert_eq!(task.workspace_base_sha.as_deref(), Some("base"));
+        assert_eq!(task.assignment_epoch, 1);
+    }
+
+    #[test]
+    fn pre_checkout_failure_preserves_the_last_confirmed_workspace_base() {
+        let first_effect = EffectId::for_parts(&["test", "workspace-first"]);
+        let second_effect = EffectId::for_parts(&["test", "workspace-second"]);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "workspace-first"),
+            MissionEvent::TaskWorkspacePrepared {
+                task_id: tid("w"),
+                effect_id: first_effect,
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+            },
+            role_completed("w", "workspace-first", work_handoff(true, false), None),
+            MissionEvent::RoleRunRequested {
+                task_id: tid("w"),
+                attempt_no: 2,
+                effect_id: second_effect.clone(),
+                role: RoleName::new("implementer").unwrap(),
+                runtime: "codex".into(),
+                prompt: PayloadRef::inline("moved-base prompt"),
+                base_sha: "moved".into(),
+                assignment_epoch: 2,
+                recreate_workspace: true,
+                requested_at_ms: 1,
+                not_before_ms: 1,
+                deadline_ms: 100_001,
+                budget_deadline_ms: 100_001,
+            },
+            MissionEvent::RoleRunCompleted {
+                task_id: tid("w"),
+                attempt_no: 2,
+                effect_id: second_effect,
+                outcome: Err(TypedFailure::permanent(
+                    "kernel.launch",
+                    "checkout failed before preparation",
+                )),
+            },
+        ])
+        .unwrap();
+        let task = state.tasks.get(&tid("w")).unwrap();
+        assert_eq!(task.workspace_base_sha.as_deref(), Some("base"));
+        assert_eq!(task.assignment_epoch, 1);
+    }
+
+    #[test]
+    fn deadline_and_extension_linearize_by_event_order_without_replay() {
+        let effect_id = EffectId::for_parts(&["test", "deadline-race"]);
+        let base = vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            role_requested("w", "deadline-race"),
+        ];
+        let extend = MissionEvent::ControlRequested {
+            effect_id: effect_id.clone(),
+            action: ControlAction::ExtendDeadline {
+                old_deadline_ms: 100_000,
+                new_deadline_ms: 110_000,
+                automatic: false,
+            },
+            reason: "more time".into(),
+        };
+        let reached = MissionEvent::EffectDeadlineReached {
+            effect_id: effect_id.clone(),
+            deadline_ms: 100_000,
+        };
+
+        let extension_first = fold_log(
+            base.iter()
+                .cloned()
+                .chain([extend.clone(), reached.clone()])
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(extension_first.inflight[&effect_id].deadline_ms(), 110_000);
+        assert!(!extension_first.reached_deadlines.contains_key(&effect_id));
+
+        let deadline_first = fold_log(base.into_iter().chain([reached, extend]).collect()).unwrap();
+        assert_eq!(deadline_first.inflight[&effect_id].deadline_ms(), 100_000);
+        assert_eq!(deadline_first.reached_deadlines[&effect_id], 100_000);
     }
 
     // Regression (review): a fresh authoritative FAIL must dominate a green
@@ -2400,6 +2580,7 @@ mod tests {
             judged_sha: judged.into(),
             nonce: "n0".into(),
             requested_at_ms: 0,
+            not_before_ms: 0,
             deadline_ms: 100_000,
             budget_deadline_ms: 100_000,
         }

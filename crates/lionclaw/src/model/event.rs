@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
-/// Bumped for immutable absolute effect deadlines and durable exact-generation
-/// controls.
-pub const SCHEMA_VERSION: u32 = 8;
+/// Bumped for runner-confirmed workspace provenance, scheduled effect starts,
+/// and durable deadline/cancellation linearization.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,8 +178,10 @@ pub struct VersionStamps {
 pub struct RuntimeConfigurationEvidence {
     pub requested_model: Option<String>,
     pub applied_model: Option<String>,
+    pub model_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
     pub requested_mode: Option<String>,
     pub applied_mode: Option<String>,
+    pub mode_confirmation: Option<lionclaw_runtime_api::RuntimeConfigurationConfirmation>,
 }
 
 /// What a role's agent handed back. Written by the agent as
@@ -378,8 +380,18 @@ pub enum MissionEvent {
         /// True only when a fresh assignment moved the required base.
         recreate_workspace: bool,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
         budget_deadline_ms: i64,
+    },
+    /// Kernel-observed confirmation that the task-owned writable checkout
+    /// exists at the assignment base. Request intent never updates workspace
+    /// provenance; only this post-materialization fact does.
+    TaskWorkspacePrepared {
+        task_id: TaskId,
+        effect_id: super::EffectId,
+        base_sha: String,
+        assignment_epoch: u32,
     },
     RoleRunCompleted {
         task_id: TaskId,
@@ -394,6 +406,7 @@ pub enum MissionEvent {
         attempt_no: u32,
         effect_id: super::EffectId,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
     },
     OracleRunCompleted {
@@ -424,6 +437,7 @@ pub enum MissionEvent {
         /// survives crash/resume (the inflight effect rebuilds from here).
         nonce: String,
         requested_at_ms: i64,
+        not_before_ms: i64,
         deadline_ms: i64,
         budget_deadline_ms: i64,
     },
@@ -443,6 +457,13 @@ pub enum MissionEvent {
         effect_id: super::EffectId,
         action: ControlAction,
         reason: String,
+    },
+    /// The driver durably won the exact deadline race and may now cancel this
+    /// generation. Later extensions are stale; an earlier extension changes
+    /// the deadline and makes this fact inapplicable in the fold.
+    EffectDeadlineReached {
+        effect_id: super::EffectId,
+        deadline_ms: i64,
     },
     /// Cleanup failed without settling the original request. The next driver
     /// retries the same exact resource operation before any new dispatch.
@@ -466,7 +487,7 @@ pub enum MissionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlAction {
     Stop,
     ExtendDeadline {
@@ -526,12 +547,14 @@ impl MissionEvent {
             Self::MissionCreated { .. } => "mission_created",
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
+            Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
             Self::RoleRunCompleted { .. } => "role_run_completed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
             Self::TerminalReviewRequested { .. } => "terminal_review_requested",
             Self::TerminalReviewCompleted { .. } => "terminal_review_completed",
             Self::ControlRequested { .. } => "control_requested",
+            Self::EffectDeadlineReached { .. } => "effect_deadline_reached",
             Self::EffectCleanupFailed { .. } => "effect_cleanup_failed",
             Self::MissionAborted { .. } => "mission_aborted",
             Self::DecisionRecorded { .. } => "decision_recorded",
@@ -556,7 +579,9 @@ impl MissionEvent {
             // effect-style event must decide its class here.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
+            | Self::TaskWorkspacePrepared { .. }
             | Self::ControlRequested { .. }
+            | Self::EffectDeadlineReached { .. }
             | Self::MissionAborted { .. }
             | Self::DecisionRecorded { .. }
             | Self::EffectCleanupFailed { .. } => None,
