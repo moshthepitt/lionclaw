@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use lionclaw_confinement::{MountAccess, MountSpec, RuntimeProgramSpec};
 use lionclaw_runtime_api::{RuntimeAuthRegistry, RuntimeProgramExecutor};
+use tokio::io::AsyncReadExt;
 
 use crate::authority::{
     compile_role_plan, prepared_input_authority, MissionMounts, RolePlanRequest,
@@ -16,6 +17,48 @@ use super::{MissionProgramExecutor, SCRATCH_MOUNT_TARGET};
 const INPUT_PROGRAM_TARGET: &str = "/mission/input/prepare";
 const INPUT_OUTPUT_TARGET: &str = "/output";
 pub(crate) const INPUTS_MOUNT_TARGET: &str = "/inputs";
+const MAX_KEY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_KEY_ENTRIES: usize = 8 * 1024;
+const MAX_KEY_DEPTH: usize = 64;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct KeyHashBudget {
+    bytes: u64,
+    entries: usize,
+}
+
+impl KeyHashBudget {
+    fn account(&mut self, declared: &Path, relative: &Path, depth: usize, len: u64) -> Result<()> {
+        if depth > MAX_KEY_DEPTH {
+            bail!(
+                "prepared-input key '{}' exceeds the depth limit at '{}'",
+                declared.display(),
+                relative.display()
+            );
+        }
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > MAX_KEY_ENTRIES {
+            bail!(
+                "prepared-input key '{}' exceeds the {} entry limit",
+                declared.display(),
+                MAX_KEY_ENTRIES
+            );
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(len)
+            .context("prepared-input key byte count overflowed while applying the hashing limit")?;
+        if self.bytes > MAX_KEY_BYTES {
+            bail!(
+                "prepared-input key '{}' exceeds the {} byte limit",
+                declared.display(),
+                MAX_KEY_BYTES
+            );
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct PreparedInputs {
     pub mounts: Vec<MountSpec>,
@@ -86,8 +129,9 @@ async fn input_cache_key(
     for (name, value) in &input.environment {
         digest.feed(&format!("environment/{name}"), value.as_bytes(), false);
     }
+    let mut budget = KeyHashBudget::default();
     for key in &input.key_files {
-        feed_key_path(&mut digest, checkout, key, key).await?;
+        feed_key_path(&mut digest, checkout, key, key, 0, &mut budget).await?;
     }
     Ok(digest.finish())
 }
@@ -97,6 +141,8 @@ fn feed_key_path<'a>(
     checkout: &'a Path,
     declared: &'a Path,
     relative: &'a Path,
+    depth: usize,
+    budget: &'a mut KeyHashBudget,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let path = checkout.join(relative);
@@ -113,11 +159,53 @@ fn feed_key_path<'a>(
         let logical = format!("key/{}", relative.to_string_lossy());
         if metadata.is_file() {
             use std::os::unix::fs::PermissionsExt;
-            digest.feed(
+            budget.account(declared, relative, depth, metadata.len())?;
+            let descriptor = rustix::fs::open(
+                &path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .with_context(|| format!("opening prepared-input key '{}'", relative.display()))?;
+            let file = std::fs::File::from(descriptor);
+            let opened = file.metadata()?;
+            if !opened.is_file() || opened.len() != metadata.len() {
+                bail!(
+                    "prepared-input key '{}' changed while it was being hashed",
+                    relative.display()
+                );
+            }
+            digest.feed_header(
                 &logical,
-                &tokio::fs::read(&path).await?,
+                opened.len(),
                 metadata.permissions().mode() & 0o111 != 0,
             );
+            let mut file = tokio::fs::File::from_std(file);
+            let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+            let mut read = 0_u64;
+            loop {
+                let count = file.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                read = read.saturating_add(count as u64);
+                if read > opened.len() {
+                    bail!(
+                        "prepared-input key '{}' grew while it was being hashed",
+                        relative.display()
+                    );
+                }
+                digest.feed_chunk(&buffer[..count]);
+                tokio::task::yield_now().await;
+            }
+            if read != opened.len() {
+                bail!(
+                    "prepared-input key '{}' shrank while it was being hashed",
+                    relative.display()
+                );
+            }
             return Ok(());
         }
         if !metadata.is_dir() {
@@ -127,16 +215,24 @@ fn feed_key_path<'a>(
                 relative.display()
             );
         }
+        budget.account(declared, relative, depth, 0)?;
         digest.feed(&format!("{logical}/"), b"directory", false);
         let mut directory = tokio::fs::read_dir(&path).await?;
         let mut entries = Vec::new();
         while let Some(entry) = directory.next_entry().await? {
+            if entries.len() >= MAX_KEY_ENTRIES {
+                bail!(
+                    "prepared-input key '{}' exceeds the {} entry limit",
+                    declared.display(),
+                    MAX_KEY_ENTRIES
+                );
+            }
             entries.push(entry.file_name());
         }
         entries.sort();
         for entry in entries {
             let child = relative.join(entry);
-            feed_key_path(digest, checkout, declared, &child).await?;
+            feed_key_path(digest, checkout, declared, &child, depth + 1, budget).await?;
         }
         Ok(())
     })
@@ -271,6 +367,26 @@ mod tests {
     use crate::config::RuntimeProfiles;
     use crate::model::InputName;
 
+    fn profile() -> MissionRuntimeProfile {
+        RuntimeProfiles::from_toml(
+            "[runtimes.test]\ndriver = \"acp\"\ncommand = \"test\"\n",
+            Path::new("/home/test"),
+        )
+        .unwrap()
+        .get("test")
+        .unwrap()
+    }
+
+    fn input(program: PathBuf, key: &str) -> PreparedInput {
+        PreparedInput {
+            name: InputName::new("deps").unwrap(),
+            program,
+            network: true,
+            key_files: vec![PathBuf::from(key)],
+            environment: BTreeMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn cache_key_changes_with_declared_content_and_rejects_symlinks() {
         let checkout = tempfile::tempdir().unwrap();
@@ -278,20 +394,8 @@ mod tests {
         let program = program_dir.path().join("prepare");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
         std::fs::write(checkout.path().join("lock"), "one").unwrap();
-        let profile = RuntimeProfiles::from_toml(
-            "[runtimes.test]\ndriver = \"acp\"\ncommand = \"test\"\n",
-            Path::new("/home/test"),
-        )
-        .unwrap()
-        .get("test")
-        .unwrap();
-        let input = PreparedInput {
-            name: InputName::new("deps").unwrap(),
-            program,
-            network: true,
-            key_files: vec![PathBuf::from("lock")],
-            environment: BTreeMap::new(),
-        };
+        let profile = profile();
+        let input = input(program, "lock");
 
         let first = input_cache_key(&profile, checkout.path(), &input)
             .await
@@ -309,5 +413,45 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("symlink"));
+    }
+
+    #[tokio::test]
+    async fn cache_key_rejects_oversized_declared_content_without_reading_it_whole() {
+        let checkout = tempfile::tempdir().unwrap();
+        let program_dir = tempfile::tempdir().unwrap();
+        let program = program_dir.path().join("prepare");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        let oversized = checkout.path().join("oversized");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_KEY_BYTES + 1)
+            .unwrap();
+
+        let error = input_cache_key(&profile(), checkout.path(), &input(program, "oversized"))
+            .await
+            .expect_err("prepared-input content has one aggregate byte ceiling");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn key_hash_budget_enforces_entry_and_depth_limits() {
+        let declared = Path::new("tree");
+        let mut entries = KeyHashBudget::default();
+        for index in 0..MAX_KEY_ENTRIES {
+            entries
+                .account(declared, Path::new("entry"), 0, u64::from(index == 0))
+                .unwrap();
+        }
+        assert!(entries
+            .account(declared, Path::new("extra"), 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("entry limit"));
+
+        assert!(KeyHashBudget::default()
+            .account(declared, Path::new("deep"), MAX_KEY_DEPTH + 1, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("depth limit"));
     }
 }

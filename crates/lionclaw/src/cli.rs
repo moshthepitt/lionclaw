@@ -1485,9 +1485,29 @@ enum DriverStartup {
 struct DetachedDriver {
     process: std::process::Child,
     stderr_spool: std::process::Child,
+    cleanup_on_drop: bool,
 }
 
 impl DetachedDriver {
+    async fn terminate_and_reap(&mut self) -> Result<()> {
+        let mut group_error = None;
+        #[cfg(unix)]
+        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
+            match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => group_error = Some(error),
+            }
+        }
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        self.settle_stderr().await;
+        self.cleanup_on_drop = false;
+        match group_error {
+            Some(error) => Err(error).context("killing detached driver process group"),
+            None => Ok(()),
+        }
+    }
+
     async fn settle_stderr(&mut self) {
         let settled = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -1513,6 +1533,22 @@ impl DetachedDriver {
         };
         self.settle_stderr().await;
         Ok(status)
+    }
+}
+
+impl Drop for DetachedDriver {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        let _ = self.stderr_spool.kill();
+        let _ = self.stderr_spool.wait();
     }
 }
 
@@ -1554,6 +1590,7 @@ fn spawn_detached_driver(
     Ok(DetachedDriver {
         process,
         stderr_spool,
+        cleanup_on_drop: true,
     })
 }
 
@@ -1562,7 +1599,16 @@ async fn await_driver_startup(
     handshake: &Path,
     mission_dir: &Path,
 ) -> Result<DriverStartup> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    await_driver_startup_with_timeout(child, handshake, mission_dir, Duration::from_secs(5)).await
+}
+
+async fn await_driver_startup_with_timeout(
+    child: &mut DetachedDriver,
+    handshake: &Path,
+    mission_dir: &Path,
+    timeout: Duration,
+) -> Result<DriverStartup> {
+    let startup = tokio::time::timeout(timeout, async {
         loop {
             if handshake.is_file() {
                 return Ok(DriverStartup::Acquired);
@@ -1580,7 +1626,20 @@ async fn await_driver_startup(
         }
     })
     .await
-    .context("mission driver startup handshake timed out")?
+    .context("mission driver startup handshake timed out")
+    .and_then(|result| result);
+    match startup {
+        Ok(startup) => {
+            child.cleanup_on_drop = false;
+            Ok(startup)
+        }
+        Err(startup_error) => match child.terminate_and_reap().await {
+            Ok(()) => Err(startup_error),
+            Err(cleanup_error) => Err(startup_error.context(format!(
+                "failed to clean up detached driver startup: {cleanup_error:#}"
+            ))),
+        },
+    }
 }
 
 async fn wait_for_existing_driver(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
@@ -3222,52 +3281,60 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let store = MissionStore::open(temp.path()).await.unwrap();
-        let retained = store
-            .lionclaw_dir()
-            .join("missions")
-            .join(mission_id.as_str())
-            .join("tasks/retained/work");
-        std::fs::create_dir_all(&retained).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&retained)
-            .status()
-            .unwrap();
         for args in [
-            ["config", "user.name", "test"],
-            ["config", "user.email", "test@local"],
-            ["config", "commit.gpgsign", "false"],
+            &["init", "-q"][..],
+            &["config", "user.name", "test"][..],
+            &["config", "user.email", "test@local"][..],
+            &["config", "commit.gpgsign", "false"][..],
         ] {
             assert!(std::process::Command::new("git")
                 .args(args)
-                .current_dir(&retained)
+                .current_dir(temp.path())
                 .status()
                 .unwrap()
                 .success());
         }
-        std::fs::write(retained.join("base.txt"), "base\n").unwrap();
+        std::fs::write(temp.path().join("base.txt"), "base\n").unwrap();
         assert!(std::process::Command::new("git")
             .args(["add", "base.txt"])
-            .current_dir(&retained)
+            .current_dir(temp.path())
             .status()
             .unwrap()
             .success());
         assert!(std::process::Command::new("git")
             .args(["commit", "-q", "-m", "base"])
-            .current_dir(&retained)
+            .current_dir(temp.path())
             .status()
             .unwrap()
             .success());
         let base = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
-            .current_dir(&retained)
+            .current_dir(temp.path())
             .output()
+            .unwrap();
+        let base = String::from_utf8(base.stdout).unwrap().trim().to_string();
+        let retained = store
+            .lionclaw_dir()
+            .join("missions")
+            .join(mission_id.as_str())
+            .join("tasks/retained/work");
+        crate::workspace::create_checkout(temp.path(), &retained, &base)
+            .await
+            .unwrap();
+        let observer_index = retained.parent().unwrap().join("observer.index");
+        crate::workspace::prepare_task_observer_index(temp.path(), &observer_index, &base, true)
+            .await
             .unwrap();
         view.state
             .tasks
             .get_mut(&TaskId::new("retained").unwrap())
             .unwrap()
-            .workspace_base_sha = Some(String::from_utf8(base.stdout).unwrap().trim().into());
+            .workspace_base_sha = Some(base.clone());
+        view.state
+            .tasks
+            .get_mut(&TaskId::new("unobservable").unwrap())
+            .unwrap()
+            .workspace_base_sha = Some(base);
         std::fs::write(retained.join("partial.txt"), "preserved\n").unwrap();
         let unobservable = store
             .lionclaw_dir()
@@ -3329,7 +3396,7 @@ mod tests {
         assert!(unobservable["workspace_observation"]["reason"]
             .as_str()
             .unwrap()
-            .contains("Git observation failed"));
+            .contains("observer index"));
         assert_eq!(
             json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
             "applied"
@@ -3355,6 +3422,7 @@ mod tests {
         let mut child = DetachedDriver {
             process,
             stderr_spool,
+            cleanup_on_drop: true,
         };
 
         assert_eq!(
@@ -3363,6 +3431,63 @@ mod tests {
                 .unwrap(),
             DriverStartup::LostRace
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_timeout_terminates_and_reaps_driver_and_spool() {
+        let temp = tempfile::tempdir().unwrap();
+        let handshake = temp.path().join("never-published.ready");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 60"]);
+        isolate_driver_process_group(&mut command);
+        let process = command.spawn().unwrap();
+        let stderr_spool = std::process::Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+        let mut child = DetachedDriver {
+            process,
+            stderr_spool,
+            cleanup_on_drop: true,
+        };
+
+        let error = await_driver_startup_with_timeout(
+            &mut child,
+            &handshake,
+            temp.path(),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a missing startup handshake has one bounded failure path");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        assert!(child.process.try_wait().unwrap().is_some());
+        assert!(child.stderr_spool.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_an_unresolved_startup_reaps_both_children() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 60"]);
+        isolate_driver_process_group(&mut command);
+        let process = command.spawn().unwrap();
+        let stderr_spool = std::process::Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .unwrap();
+        let driver_pid = process.id();
+        let spool_pid = stderr_spool.id();
+
+        drop(DetachedDriver {
+            process,
+            stderr_spool,
+            cleanup_on_drop: true,
+        });
+
+        assert!(!Path::new(&format!("/proc/{driver_pid}")).exists());
+        assert!(!Path::new(&format!("/proc/{spool_pid}")).exists());
     }
 
     #[tokio::test]

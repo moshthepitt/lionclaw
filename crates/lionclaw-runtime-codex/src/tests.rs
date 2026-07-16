@@ -1945,6 +1945,13 @@ async fn codex_app_server_turn_interrupt_uses_contract_fixture() {
 #[tokio::test]
 async fn codex_cancel_interrupts_active_app_server_turn() {
     let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+    assert_eq!(
+        adapter
+            .cancel(&handle, Some("pre-start".into()))
+            .await
+            .unwrap(),
+        lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn
+    );
     let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
     thread_state
         .set_active_turn("thr_1", "turn_1", interrupt_tx)
@@ -1955,10 +1962,14 @@ async fn codex_cancel_interrupts_active_app_server_turn() {
         request.ack_tx.send(Ok(())).expect("ack interrupt");
     });
 
-    adapter
+    let cancellation = adapter
         .cancel(&handle, Some("test timeout".to_string()))
         .await
         .expect("cancel sends native Codex interrupt");
+    assert_eq!(
+        cancellation,
+        lionclaw_runtime_api::RuntimeCancellation::Acknowledged
+    );
     wait_task.await.expect("wait task joins");
 
     adapter.close(&handle).await.expect("close");

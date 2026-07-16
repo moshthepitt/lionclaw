@@ -166,19 +166,24 @@ async fn cancellation_acknowledged<A, T, O>(
     timeout: std::time::Duration,
 ) -> (bool, Option<O>)
 where
-    A: std::future::Future<Output = anyhow::Result<()>>,
+    A: std::future::Future<Output = anyhow::Result<lionclaw_runtime_api::RuntimeCancellation>>,
     T: std::future::Future<Output = O>,
 {
     tokio::pin!(acknowledgement);
-    let mut acknowledgement_done = false;
-    let mut acknowledgement_ok = false;
+    let mut cancellation_acknowledged = false;
     let mut turn_result = None;
     let completed_in_time = tokio::time::timeout(timeout, async {
-        while !acknowledgement_done || turn_result.is_none() {
+        while !cancellation_acknowledged || turn_result.is_none() {
             tokio::select! {
-                result = &mut acknowledgement, if !acknowledgement_done => {
-                    acknowledgement_ok = result.is_ok();
-                    acknowledgement_done = true;
+                result = &mut acknowledgement, if !cancellation_acknowledged => {
+                    match result {
+                        Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged) => {
+                            cancellation_acknowledged = true;
+                        }
+                        Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn) | Err(_) => {
+                            return;
+                        }
+                    }
                 }
                 result = turn.as_mut(), if turn_result.is_none() => turn_result = Some(result),
             }
@@ -187,7 +192,7 @@ where
     .await
     .is_ok();
     (
-        completed_in_time && acknowledgement_ok && turn_result.is_some(),
+        completed_in_time && cancellation_acknowledged && turn_result.is_some(),
         turn_result,
     )
 }
@@ -209,9 +214,11 @@ fn completed_turn_evidence(
 async fn prepare_writer_checkout(
     repo: &std::path::Path,
     workspace: &std::path::Path,
+    observer_index: &std::path::Path,
     base_sha: &str,
     recreate_workspace: bool,
 ) -> Result<(), TypedFailure> {
+    let mut replace = !workspace.exists();
     if workspace.exists() {
         let head = workspace::task_head_sha(workspace)
             .await
@@ -224,6 +231,9 @@ async fn prepare_writer_checkout(
                         launch(format!("failed to compare retained checkout ancestry: {e}"))
                     })?
             {
+                workspace::prepare_task_observer_index(repo, observer_index, base_sha, false)
+                    .await
+                    .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))?;
                 return Ok(());
             }
             return Err(launch(format!(
@@ -231,29 +241,43 @@ async fn prepare_writer_checkout(
             )));
         }
         if head == base_sha {
-            return Ok(());
-        }
-        if workspace::task_is_dirty(workspace)
-            .await
-            .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
-        {
-            return Err(launch(
-                "refusing to recreate a dirty task workspace on a moved base".to_string(),
-            ));
-        }
-        if !workspace::commit_exists(repo, &head).await
-            || !workspace::is_ancestor(repo, &head, base_sha)
+            replace = false;
+        } else {
+            if workspace::task_is_dirty(workspace)
                 .await
-                .map_err(|e| launch(format!("failed to compare retained checkout ancestry: {e}")))?
-        {
-            return Err(launch(format!(
-                "refusing to recreate task workspace with uncaptured commits at {head}"
-            )));
+                .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
+            {
+                return Err(launch(
+                    "refusing to recreate a dirty task workspace on a moved base".to_string(),
+                ));
+            }
+            if !workspace::commit_exists(repo, &head).await
+                || !workspace::is_ancestor(repo, &head, base_sha)
+                    .await
+                    .map_err(|e| {
+                        launch(format!("failed to compare retained checkout ancestry: {e}"))
+                    })?
+            {
+                return Err(launch(format!(
+                    "refusing to recreate task workspace with uncaptured commits at {head}"
+                )));
+            }
+            replace = true;
         }
     }
-    workspace::replace_checkout(repo, workspace, base_sha)
-        .await
-        .map_err(|e| launch(format!("failed to create checkout: {e}")))
+    if replace {
+        workspace::replace_checkout(repo, workspace, base_sha)
+            .await
+            .map_err(|e| launch(format!("failed to create checkout: {e}")))?;
+    }
+    workspace::prepare_task_observer_index(
+        repo,
+        observer_index,
+        base_sha,
+        recreate_workspace || replace,
+    )
+    .await
+    .map_err(|e| launch(format!("failed to prepare workspace observer: {e}")))
 }
 
 #[async_trait]
@@ -286,16 +310,20 @@ impl RoleRunner for OciRoleRunner {
             let authority = compile_authority(&request.role, &self.ceiling)
                 .map_err(|e| launch(format!("authority refused to compile: {e}")))?;
             let is_writer = authority.output() == OutputSemantics::ProducesArtifact;
-            let (workspace_source, scratch_source) = if is_writer {
+            let (workspace_source, scratch_source, observer_index) = if is_writer {
                 let task_dirs = TaskDirs::prepare(
                     &request.state_dir,
                     request.mission_id.as_str(),
                     &request.task_id,
                 )
                 .map_err(|e| launch(format!("failed to prepare task dirs: {e}")))?;
-                (task_dirs.work.clone(), task_dirs.scratch.clone())
+                (
+                    task_dirs.work.clone(),
+                    task_dirs.scratch.clone(),
+                    Some(task_dirs.observer_index.clone()),
+                )
             } else {
-                (dirs.root.join("work"), dirs.read_scratch.clone())
+                (dirs.root.join("work"), dirs.read_scratch.clone(), None)
             };
             {
                 let _guard = self.repo_lock.lock().await;
@@ -303,6 +331,7 @@ impl RoleRunner for OciRoleRunner {
                     prepare_writer_checkout(
                         &request.workspace_dir,
                         &workspace_source,
+                        observer_index.as_deref().expect("writer observer index"),
                         &request.base_sha,
                         request.recreate_workspace,
                     )
@@ -807,6 +836,19 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    async fn prepare_test_writer(
+        repo: &Path,
+        task_work: &Path,
+        base: &str,
+        recreate: bool,
+    ) -> Result<(), TypedFailure> {
+        let observer_index = task_work
+            .parent()
+            .expect("test task work has a parent")
+            .join("observer.index");
+        prepare_writer_checkout(repo, task_work, &observer_index, base, recreate).await
+    }
+
     #[tokio::test]
     async fn cancellation_polls_the_turn_that_must_deliver_its_acknowledgement() {
         let (sent, received) = tokio::sync::oneshot::channel();
@@ -819,7 +861,7 @@ mod tests {
         });
         let acknowledgement = async move {
             received.await.map_err(anyhow::Error::from)?;
-            Ok(())
+            Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged)
         };
 
         let (acknowledged, turn_result) = cancellation_acknowledged(
@@ -830,6 +872,25 @@ mod tests {
         .await;
         assert!(acknowledged);
         assert_eq!(turn_result, Some(()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_an_active_turn_drops_setup_immediately() {
+        let mut turn = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            "provider turn started"
+        });
+        let started = tokio::time::Instant::now();
+        let (acknowledged, turn_result) = cancellation_acknowledged(
+            std::future::ready(Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn)),
+            turn.as_mut(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(!acknowledged);
+        assert_eq!(turn_result, None);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
     #[test]
@@ -1004,12 +1065,12 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "base"]).await;
         let base = git(&repo, &["rev-parse", "HEAD"]).await;
         let task_work = temp.path().join("task/work");
-        prepare_writer_checkout(&repo, &task_work, &base, true)
+        prepare_test_writer(&repo, &task_work, &base, true)
             .await
             .unwrap();
 
         std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
-        prepare_writer_checkout(&repo, &task_work, &base, false)
+        prepare_test_writer(&repo, &task_work, &base, false)
             .await
             .unwrap();
         assert_eq!(
@@ -1022,7 +1083,7 @@ mod tests {
         git(&repo, &["add", "tracked"]).await;
         git(&repo, &["commit", "-q", "-m", "moved"]).await;
         let moved = git(&repo, &["rev-parse", "HEAD"]).await;
-        prepare_writer_checkout(&repo, &task_work, &moved, true)
+        prepare_test_writer(&repo, &task_work, &moved, true)
             .await
             .unwrap();
         assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), moved);
@@ -1042,7 +1103,7 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "base"]).await;
         let base = git(&repo, &["rev-parse", "HEAD"]).await;
         let task_work = temp.path().join("task/work");
-        prepare_writer_checkout(&repo, &task_work, &base, true)
+        prepare_test_writer(&repo, &task_work, &base, true)
             .await
             .unwrap();
 
@@ -1051,7 +1112,7 @@ mod tests {
         git(&task_work, &["commit", "-q", "-m", "partial rework"]).await;
         let partial = git(&task_work, &["rev-parse", "HEAD"]).await;
 
-        prepare_writer_checkout(&repo, &task_work, &base, false)
+        prepare_test_writer(&repo, &task_work, &base, false)
             .await
             .unwrap();
         assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), partial);
@@ -1075,7 +1136,7 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "base"]).await;
         let base = git(&repo, &["rev-parse", "HEAD"]).await;
         let task_work = temp.path().join("task/work");
-        prepare_writer_checkout(&repo, &task_work, &base, true)
+        prepare_test_writer(&repo, &task_work, &base, true)
             .await
             .unwrap();
         std::fs::write(task_work.join("substantial-uncommitted"), "preserve me\n").unwrap();
@@ -1085,7 +1146,7 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "moved"]).await;
         let moved = git(&repo, &["rev-parse", "HEAD"]).await;
 
-        let error = prepare_writer_checkout(&repo, &task_work, &moved, true)
+        let error = prepare_test_writer(&repo, &task_work, &moved, true)
             .await
             .unwrap_err();
         assert!(error.detail().contains("refusing to recreate"));
@@ -1109,7 +1170,7 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "base"]).await;
         let base = git(&repo, &["rev-parse", "HEAD"]).await;
         let task_work = temp.path().join("task/work");
-        prepare_writer_checkout(&repo, &task_work, &base, true)
+        prepare_test_writer(&repo, &task_work, &base, true)
             .await
             .unwrap();
 
@@ -1122,7 +1183,7 @@ mod tests {
         git(&repo, &["add", "tracked"]).await;
         git(&repo, &["commit", "-q", "-m", "other-task"]).await;
         let moved = git(&repo, &["rev-parse", "HEAD"]).await;
-        let error = prepare_writer_checkout(&repo, &task_work, &moved, true)
+        let error = prepare_test_writer(&repo, &task_work, &moved, true)
             .await
             .unwrap_err();
         assert!(error.detail().contains("uncaptured commits"));
@@ -1150,7 +1211,7 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "base"]).await;
         let base = git(&repo, &["rev-parse", "HEAD"]).await;
         let task_work = temp.path().join("task/work");
-        prepare_writer_checkout(&repo, &task_work, &base, true)
+        prepare_test_writer(&repo, &task_work, &base, true)
             .await
             .unwrap();
 
@@ -1158,7 +1219,7 @@ mod tests {
         git(&repo, &["add", "tracked"]).await;
         git(&repo, &["commit", "-q", "-m", "moved"]).await;
         let moved = git(&repo, &["rev-parse", "HEAD"]).await;
-        let error = prepare_writer_checkout(&repo, &task_work, &moved, false)
+        let error = prepare_test_writer(&repo, &task_work, &moved, false)
             .await
             .unwrap_err();
         assert!(error

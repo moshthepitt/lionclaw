@@ -127,7 +127,11 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+    async fn cancel(
+        &self,
+        handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<lionclaw_runtime_api::RuntimeCancellation> {
         let active_turn = self
             .sessions
             .read()
@@ -135,7 +139,7 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
             .get(&handle.runtime_session_id)
             .and_then(|state| state.active_turn.clone());
         let Some(active_turn) = active_turn else {
-            return Ok(());
+            return Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn);
         };
 
         let completion = Arc::clone(&active_turn.completion);
@@ -160,18 +164,24 @@ impl RuntimeAdapter for AcpRuntimeAdapter {
                     session_id = active_turn.session_id,
                     "timed out waiting for ACP session/cancel send acknowledgement"
                 );
-                return Ok(());
+                return Err(anyhow!(
+                    "timed out waiting for ACP session/cancel send acknowledgement for '{}'",
+                    active_turn.session_id
+                ));
             }
         }?;
 
         match timeout(ACP_CANCEL_ACK_TIMEOUT, completion.wait()).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged),
             Err(_) => {
                 warn!(
                     session_id = active_turn.session_id,
                     "timed out waiting for ACP cancelled turn to finish"
                 );
-                Ok(())
+                Err(anyhow!(
+                    "timed out waiting for ACP cancelled turn to finish for '{}'",
+                    active_turn.session_id
+                ))
             }
         }
     }

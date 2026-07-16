@@ -203,6 +203,7 @@ fn read_driver_diagnostic(path: &Path) -> Option<String> {
 }
 
 pub async fn publish_observed(
+    workspace_root: &Path,
     mission_dir: &Path,
     state: &MissionState,
     now_ms: i64,
@@ -219,10 +220,15 @@ pub async fn publish_observed(
         .filter_map(|(effect_id, effect)| match effect {
             InflightEffect::RoleRun { task_id, .. } => Some((
                 effect_id.clone(),
+                workspace_root.to_path_buf(),
                 mission_dir
                     .join("tasks")
                     .join(task_id.as_str())
                     .join("work"),
+                mission_dir
+                    .join("tasks")
+                    .join(task_id.as_str())
+                    .join("observer.index"),
                 state
                     .tasks
                     .get(task_id)
@@ -440,22 +446,24 @@ async fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()
     Ok(())
 }
 
-async fn git_output(
+async fn workspace_observation(
+    repo: &Path,
     workspace: &Path,
-    args: &[&str],
-) -> Result<lionclaw_runtime_api::ExecutionOutput> {
-    crate::workspace::observed_git_output(workspace, args)
-        .await
-        .with_context(|| format!("Git observation failed for {}", args.join(" ")))
-}
-
-async fn workspace_observation(workspace: &Path, base_sha: Option<&str>) -> WorkspaceObservation {
+    observer_index: &Path,
+    base_sha: Option<&str>,
+) -> WorkspaceObservation {
     if let Err(observation) =
         classify_workspace_metadata(tokio::fs::symlink_metadata(workspace).await)
     {
         return observation;
     }
-    match observe_existing_workspace(workspace, base_sha).await {
+    let Some(base_sha) = base_sha else {
+        return WorkspaceObservation::Unavailable {
+            reason: "workspace exists before its base was recorded".into(),
+        };
+    };
+    match crate::workspace::observe_task_workspace(repo, workspace, observer_index, base_sha).await
+    {
         Ok(summary) if summary.is_empty() => WorkspaceObservation::Clean,
         Ok(diffstat) => WorkspaceObservation::Changed {
             diffstat: bounded(&diffstat),
@@ -483,72 +491,6 @@ fn classify_workspace_metadata(
     }
 }
 
-async fn observe_existing_workspace(workspace: &Path, base_sha: Option<&str>) -> Result<String> {
-    let mut summary = String::new();
-    if let Some(base_sha) = base_sha {
-        let head_output = git_output(workspace, &["rev-parse", "HEAD"]).await?;
-        ensure_git_success(&head_output, "resolve workspace HEAD")?;
-        let head = String::from_utf8_lossy(&head_output.stdout)
-            .trim()
-            .to_string();
-        if head != base_sha {
-            let ancestry =
-                git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head]).await?;
-            let is_ancestor = if ancestry.success() {
-                true
-            } else if ancestry.exit_code == Some(1) && ancestry.exit_signal.is_none() {
-                false
-            } else {
-                ensure_git_success(&ancestry, "compare workspace ancestry")?;
-                unreachable!("successful ancestry check returned above")
-            };
-            let relation = if is_ancestor {
-                "committed work"
-            } else {
-                "diverged work"
-            };
-            summary.push_str(&format!(
-                "{relation}: {} (recorded base {})\n",
-                crate::model::short_hex(&head),
-                crate::model::short_hex(base_sha),
-            ));
-            if is_ancestor {
-                let diffstat = git_output(
-                    workspace,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--stat",
-                        &format!("{base_sha}..{head}"),
-                    ],
-                )
-                .await?;
-                ensure_git_success(&diffstat, "read committed workspace diffstat")?;
-                summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
-            }
-        }
-    }
-    let status = git_output(workspace, &["status", "--short"]).await?;
-    ensure_git_success(&status, "read workspace status")?;
-    summary.push_str(&String::from_utf8_lossy(&status.stdout));
-    Ok(summary)
-}
-
-fn ensure_git_success(
-    output: &lionclaw_runtime_api::ExecutionOutput,
-    operation: &str,
-) -> Result<()> {
-    if !output.success() {
-        anyhow::bail!(
-            "{operation} failed ({}): {}",
-            output.status_description(),
-            bounded(&String::from_utf8_lossy(&output.stderr))
-        );
-    }
-    Ok(())
-}
-
 pub async fn task_workspace_observations(
     lionclaw_dir: &Path,
     state: &MissionState,
@@ -560,11 +502,21 @@ pub async fn task_workspace_observations(
             (
                 task_id.clone(),
                 lionclaw_dir
+                    .parent()
+                    .expect(".lionclaw directory has a workspace parent")
+                    .to_path_buf(),
+                lionclaw_dir
                     .join("missions")
                     .join(state.mission_id.as_str())
                     .join("tasks")
                     .join(task_id.as_str())
                     .join("work"),
+                lionclaw_dir
+                    .join("missions")
+                    .join(state.mission_id.as_str())
+                    .join("tasks")
+                    .join(task_id.as_str())
+                    .join("observer.index"),
                 task.workspace_base_sha.clone(),
             )
         })
@@ -573,14 +525,14 @@ pub async fn task_workspace_observations(
 }
 
 async fn observe_workspaces<K>(
-    requests: Vec<(K, PathBuf, Option<String>)>,
+    requests: Vec<(K, PathBuf, PathBuf, PathBuf, Option<String>)>,
 ) -> std::collections::BTreeMap<K, WorkspaceObservation>
 where
     K: Clone + Ord + Send + 'static,
 {
     let mut observed: std::collections::BTreeMap<K, WorkspaceObservation> = requests
         .iter()
-        .map(|(key, _, _)| {
+        .map(|(key, _, _, _, _)| {
             (
                 key.clone(),
                 WorkspaceObservation::Unavailable {
@@ -594,11 +546,13 @@ where
     let deadline = tokio::time::Instant::now() + TOTAL_OBSERVATION_BUDGET;
     loop {
         while tasks.len() < MAX_CONCURRENT_OBSERVERS {
-            let Some((key, workspace, base_sha)) = pending.next() else {
+            let Some((key, repo, workspace, observer_index, base_sha)) = pending.next() else {
                 break;
             };
             tasks.spawn(async move {
-                let observation = workspace_observation(&workspace, base_sha.as_deref()).await;
+                let observation =
+                    workspace_observation(&repo, &workspace, &observer_index, base_sha.as_deref())
+                        .await;
                 (key, observation)
             });
         }
@@ -638,48 +592,68 @@ mod tests {
         assert_eq!(bounded(&"x".repeat(MAX_TEXT + 10)).len(), MAX_TEXT);
     }
 
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_repo(repo: &Path) -> String {
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.name", "test"]);
+        git(repo, &["config", "user.email", "test@local"]);
+        git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(repo, &["add", "tracked"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
     #[tokio::test]
     async fn clean_committed_work_is_visible_relative_to_the_recorded_base() {
         let temp = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(temp.path())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.name", "test"]);
-        run(&["config", "user.email", "test@local"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
-        run(&["add", "work.txt"]);
-        run(&["commit", "-q", "-m", "base"]);
-        let base = String::from_utf8(
-            git_output(temp.path(), &["rev-parse", "HEAD"])
-                .await
-                .unwrap()
-                .stdout,
-        )
-        .unwrap();
-        std::fs::write(temp.path().join("work.txt"), "committed result\n").unwrap();
-        run(&["add", "work.txt"]);
-        run(&["commit", "-q", "-m", "worker progress"]);
+        let source = temp.path().join("source");
+        let work = temp.path().join("work");
+        let index = temp.path().join("observer.index");
+        std::fs::create_dir(&source).unwrap();
+        let base = init_repo(&source);
+        workspace::create_checkout(&source, &work, &base)
+            .await
+            .unwrap();
+        workspace::prepare_task_observer_index(&source, &index, &base, true)
+            .await
+            .unwrap();
+        std::fs::write(work.join("tracked"), "committed result\n").unwrap();
+        git(&work, &["add", "tracked"]);
+        git(&work, &["commit", "-q", "-m", "worker progress"]);
 
         let WorkspaceObservation::Changed { diffstat: summary } =
-            workspace_observation(temp.path(), Some(base.trim())).await
+            workspace_observation(&source, &work, &index, Some(&base)).await
         else {
             panic!("committed work must be observed as changed");
         };
-        assert!(summary.contains("committed work:"));
-        assert!(summary.contains("work.txt"));
-        assert!(!summary.contains(" M work.txt"));
+        assert!(summary.contains("tracked"));
+        assert!(summary.contains(" M tracked"));
     }
 
     #[tokio::test]
     async fn workspace_observation_never_executes_worker_git_configuration() {
         let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let work = temp.path().join("work");
+        let index = temp.path().join("observer.index");
+        std::fs::create_dir(&source).unwrap();
+        let base = init_repo(&source);
+        workspace::create_checkout(&source, &work, &base)
+            .await
+            .unwrap();
+        workspace::prepare_task_observer_index(&source, &index, &base, true)
+            .await
+            .unwrap();
         let marker = temp.path().join("host-command-ran");
         let monitor = temp.path().join("hostile-monitor");
         std::fs::write(
@@ -688,24 +662,13 @@ mod tests {
         )
         .unwrap();
         workspace::make_executable(&monitor).unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(temp.path())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.name", "test"]);
-        run(&["config", "user.email", "test@local"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(temp.path().join("tracked"), "base\n").unwrap();
-        run(&["add", "tracked"]);
-        run(&["commit", "-q", "-m", "base"]);
-        run(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
+        git(
+            &work,
+            &["config", "core.fsmonitor", monitor.to_str().unwrap()],
+        );
 
-        let _ = workspace_observation(temp.path(), None).await;
+        let clean = workspace_observation(&source, &work, &index, Some(&base)).await;
+        assert_eq!(clean, WorkspaceObservation::Clean);
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled local config"
@@ -718,15 +681,20 @@ mod tests {
         )
         .unwrap();
         workspace::make_executable(&filter).unwrap();
+        std::fs::write(work.join(".gitattributes"), "tracked filter=hostile\n").unwrap();
+        git(
+            &work,
+            &["config", "filter.hostile.clean", filter.to_str().unwrap()],
+        );
+        std::fs::write(work.join("tracked"), "worker change\n").unwrap();
         std::fs::write(
-            temp.path().join(".gitattributes"),
-            "tracked filter=hostile\n",
+            work.join(".git/HEAD"),
+            "worker metadata must not be opened\n",
         )
         .unwrap();
-        run(&["config", "filter.hostile.clean", filter.to_str().unwrap()]);
-        std::fs::write(temp.path().join("tracked"), "worker change\n").unwrap();
 
-        let _ = workspace_observation(temp.path(), None).await;
+        let changed = workspace_observation(&source, &work, &index, Some(&base)).await;
+        assert!(matches!(changed, WorkspaceObservation::Changed { .. }));
         assert!(
             !marker.exists(),
             "observer Git must not execute worker-controlled filter drivers"
@@ -738,7 +706,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("not-a-repository"), "retained work\n").unwrap();
 
-        let observation = workspace_observation(temp.path(), None).await;
+        let observation =
+            workspace_observation(temp.path(), temp.path(), &temp.path().join("index"), None).await;
 
         assert!(matches!(
             observation,
@@ -752,7 +721,8 @@ mod tests {
         let workspace = temp.path().join("work");
         std::fs::write(&workspace, "retained work\n").unwrap();
 
-        let observation = workspace_observation(&workspace, None).await;
+        let observation =
+            workspace_observation(temp.path(), &workspace, &temp.path().join("index"), None).await;
 
         assert!(matches!(
             observation,

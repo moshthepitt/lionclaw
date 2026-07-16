@@ -140,6 +140,14 @@ pub enum RuntimeTurnMode {
     ProgramBacked,
 }
 
+/// Outcome of a cancellation request at the adapter's structured protocol
+/// boundary. Absence of an active turn is not an acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCancellation {
+    NoActiveTurn,
+    Acknowledged,
+}
+
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
@@ -241,6 +249,10 @@ pub trait RuntimeAdapter: Send + Sync {
         results: Vec<RuntimeCapabilityResult>,
         events: RuntimeEventSender,
     ) -> Result<()>;
-    async fn cancel(&self, handle: &RuntimeSessionHandle, reason: Option<String>) -> Result<()>;
+    async fn cancel(
+        &self,
+        handle: &RuntimeSessionHandle,
+        reason: Option<String>,
+    ) -> Result<RuntimeCancellation>;
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()>;
 }

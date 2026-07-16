@@ -8,12 +8,12 @@ use std::{
 use super::{
     canonical_events, clear_state_value, execute_program_backed_turn, load_ready_state_value,
     safe_relative_path, ExecutionOutput, NetworkMode, RawTurnPayload, RuntimeAdapter,
-    RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlInput, RuntimeControlOrigin,
-    RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
-    RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
+    RuntimeAdapterInfo, RuntimeCancellation, RuntimeCapabilityResult, RuntimeControlInput,
+    RuntimeControlOrigin, RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext,
+    RuntimeMessageLane, RuntimeNativeHomeArtifactDir, RuntimePathProjection,
+    RuntimeProgramExecutor, RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution,
+    RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput,
+    RuntimeTerminalConfig, RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
     RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 use anyhow::{anyhow, Result};
@@ -165,8 +165,12 @@ impl RuntimeAdapter for TestProgramAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
-        Ok(())
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<RuntimeCancellation> {
+        Ok(RuntimeCancellation::NoActiveTurn)
     }
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {

@@ -152,8 +152,12 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
     }
 
-    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
-        Ok(())
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<lionclaw_runtime_api::RuntimeCancellation> {
+        Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn)
     }
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {

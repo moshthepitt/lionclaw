@@ -193,6 +193,90 @@ pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()>
     Ok(())
 }
 
+/// Materialize the immutable index used by live workspace observation. The
+/// index lives beside the task checkout, outside the runtime mount, and is
+/// built from the trusted target repository rather than worker Git metadata.
+pub async fn prepare_task_observer_index(
+    repo: &Path,
+    index: &Path,
+    base_sha: &str,
+    reset: bool,
+) -> Result<()> {
+    match std::fs::symlink_metadata(index) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            if !reset {
+                return Ok(());
+            }
+        }
+        Ok(_) => bail!(
+            "task observer index '{}' is not a regular file",
+            index.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading task observer index '{}'", index.display()))
+        }
+    }
+    std::fs::create_dir_all(index.parent().context("observer index has no parent")?)?;
+    let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = index.with_extension(format!("prepare-{}-{sequence}", std::process::id()));
+    let mut command = managed_git_command();
+    command
+        .current_dir(repo)
+        .env("GIT_INDEX_FILE", &temporary)
+        .args(["read-tree", "--reset", base_sha]);
+    let result = async {
+        run(&mut command, "git read-tree for task observer").await?;
+        let metadata = std::fs::symlink_metadata(&temporary)
+            .context("Git did not create the task observer index")?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            bail!("Git created an invalid task observer index");
+        }
+        std::fs::rename(&temporary, index).context("publishing task observer index")?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Observe a live task worktree relative to its assignment base without
+/// opening any worker-controlled `.git` path.
+pub async fn observe_task_workspace(
+    repo: &Path,
+    worktree: &Path,
+    index: &Path,
+    base_sha: &str,
+) -> Result<String> {
+    let observer = TaskGitObserver::from_engine_baseline(repo, worktree, index, base_sha).await?;
+    let diff = observer
+        .raw_output(&["diff", "--no-ext-diff", "--no-textconv", "--stat"])
+        .await?;
+    ensure_observer_success(&diff, "read task workspace diffstat")?;
+    let status = observer.raw_output(&["status", "--short"]).await?;
+    ensure_observer_success(&status, "read task workspace status")?;
+    let mut summary = String::from_utf8_lossy(&diff.stdout).into_owned();
+    summary.push_str(&String::from_utf8_lossy(&status.stdout));
+    Ok(summary)
+}
+
+fn ensure_observer_success(
+    output: &lionclaw_runtime_api::ExecutionOutput,
+    operation: &str,
+) -> Result<()> {
+    if !output.success() {
+        bail!(
+            "{operation} failed ({}): {}",
+            output.status_description(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Why post-run artifact capture failed. Correctable dirty output, permanent
 /// history divergence, and Git infrastructure failures have different retry
 /// semantics at the runner boundary.
@@ -473,8 +557,45 @@ impl TaskGitObserver {
             "Git HTTP object alternate",
         )?;
         let head = resolve_task_head(&git_dir)?;
-        let index = optional_regular_file(&git_dir.join("index"), "Git index")?;
+        let index = regular_file(&git_dir.join("index"), "Git index")?;
         let objects = directory(&git_dir.join("objects"), "Git object database")?;
+        validate_worker_object_database(&objects)?;
+        Self::create(worktree, index, objects, &head)
+    }
+
+    async fn from_engine_baseline(
+        repo: &Path,
+        worktree: &Path,
+        index: &Path,
+        head: &str,
+    ) -> Result<Self> {
+        if !valid_object_id(head) {
+            bail!("recorded task base is not a full Git object ID");
+        }
+        let objects = git(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
+        )
+        .await?;
+        let objects = std::fs::canonicalize(objects.trim())
+            .context("resolving trusted target Git object database")?;
+        let worktree = worktree.to_path_buf();
+        let index = index.to_path_buf();
+        let head = head.to_string();
+        tokio::task::spawn_blocking(move || Self::create(&worktree, index, objects, &head))
+            .await
+            .context("joining trusted task workspace observer")?
+    }
+
+    fn create(worktree: &Path, index: PathBuf, objects: PathBuf, head: &str) -> Result<Self> {
+        directory(worktree, "task worktree")?;
+        let index = regular_file(&index, "task observer index")?;
+        directory(&objects, "Git object database")?;
         let metadata = loop {
             let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let candidate = std::env::temp_dir().join(format!(
@@ -503,7 +624,7 @@ impl TaskGitObserver {
         std::fs::write(observer.metadata.join("HEAD"), format!("{head}\n"))?;
         std::fs::write(
             observer.metadata.join("config"),
-            synthetic_repository_config(&head),
+            synthetic_repository_config(head),
         )?;
         Ok(observer)
     }
@@ -585,6 +706,42 @@ impl TaskGitObserver {
     }
 }
 
+const MAX_WORKER_OBJECT_ENTRIES: usize = 1_000_000;
+const MAX_WORKER_OBJECT_DEPTH: usize = 16;
+
+/// Capture runs only after the runtime is gone. Before passing the worker's
+/// object database to host Git, reject every indirection and special file so
+/// Git cannot escape into another host path.
+fn validate_worker_object_database(root: &Path) -> Result<()> {
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let mut entries = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_WORKER_OBJECT_DEPTH {
+            bail!("worker Git object database exceeds the depth limit");
+        }
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("reading Git object directory '{}'", directory.display()))?
+        {
+            let entry = entry?;
+            entries = entries.saturating_add(1);
+            if entries > MAX_WORKER_OBJECT_ENTRIES {
+                bail!("worker Git object database exceeds the entry limit");
+            }
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("Git object path '{}' is a symlink", path.display());
+            }
+            if kind.is_dir() {
+                pending.push((path, depth + 1));
+            } else if !kind.is_file() {
+                bail!("Git object path '{}' is not a regular file", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Drop for TaskGitObserver {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.metadata);
@@ -602,13 +759,15 @@ fn reject_git_indirection(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn optional_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
+fn regular_file(path: &Path, label: &str) -> Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             Ok(path.to_path_buf())
         }
         Ok(_) => bail!("{label} '{}' is not a regular file", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{label} '{}' does not exist", path.display())
+        }
         Err(error) => Err(error).with_context(|| format!("reading {label} '{}'", path.display())),
     }
 }
@@ -946,6 +1105,30 @@ mod tests {
             capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id).await,
             Err(CaptureError::DirtyWorktree(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_rejects_symlinked_object_database_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let pack = checkout.join(".git/objects/pack");
+        std::fs::remove_dir(&pack).unwrap();
+        symlink(repo.path().join(".git/objects/pack"), &pack).unwrap();
+
+        let effect_id = EffectId::for_parts(&["test", "object-pack-symlink"]);
+        let error =
+            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
+                .await
+                .expect_err("capture must not pass descendant object symlinks to host Git");
+        assert!(error.to_string().contains("symlink"));
     }
 
     #[tokio::test]

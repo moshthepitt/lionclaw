@@ -20,6 +20,7 @@ use super::MissionStore;
 pub struct NewEvent {
     pub stamps: VersionStamps,
     pub event: MissionEvent,
+    pub(crate) settlement_evidence: Option<lionclaw_runtime_api::TypedFailureEvidence>,
 }
 
 impl NewEvent {
@@ -32,7 +33,16 @@ impl NewEvent {
                 ..Default::default()
             },
             event,
+            settlement_evidence: None,
         }
+    }
+
+    pub(crate) fn with_settlement_evidence(
+        mut self,
+        evidence: lionclaw_runtime_api::TypedFailureEvidence,
+    ) -> Self {
+        self.settlement_evidence = Some(evidence.project());
+        self
     }
 
     pub fn with_prompt_hash(mut self, prompt_hash: impl Into<String>) -> Self {

@@ -9,8 +9,8 @@ use common::{
 use lionclaw::engine::{record_control, Engine, EngineServices, MissionDisposition};
 use lionclaw::model::{ArtifactOutcome, ControlAction, Handoff, PayloadRef, TaskStatus};
 use lionclaw::ports::{
-    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, RoleRunOutcome,
-    RoleRunRequest, RoleRunner,
+    EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, ExecutionControl, OracleOutcome,
+    RoleRunOutcome, RoleRunRequest, RoleRunner,
 };
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
@@ -47,6 +47,7 @@ struct SettlementCleaner {
     entered: Arc<Notify>,
     release: Arc<Notify>,
     discards: Arc<Mutex<Vec<bool>>>,
+    pause_on: usize,
 }
 
 #[async_trait]
@@ -55,7 +56,7 @@ impl EffectCleaner for SettlementCleaner {
         let first = {
             let mut discards = self.discards.lock().unwrap();
             discards.push(request.discard_artifact);
-            discards.len() == 1
+            discards.len() == self.pause_on
         };
         if first {
             self.entered.notify_one();
@@ -408,6 +409,7 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
                 entered: entered.clone(),
                 release: release.clone(),
                 discards: discards.clone(),
+                pause_on: 1,
             }),
             Arc::new(MockClock::default()),
         ),
@@ -474,6 +476,89 @@ async fn durable_stop_wins_the_outcome_append_race_and_discards_the_candidate() 
         event.event,
         lionclaw::model::MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }
     )));
+}
+
+#[tokio::test]
+async fn settlement_retains_bounded_blob_backed_oracle_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let discards = Arc::new(Mutex::new(Vec::new()));
+    let oracle = MockOracleRunner::new(Box::new(|_| {
+        Ok(OracleOutcome {
+            exit_code: 1,
+            exit_signal: None,
+            stdout: Vec::new(),
+            stderr: vec![b'E'; 128 * 1024],
+            prepared_inputs: Vec::new(),
+            duration_ms: 42,
+        })
+    }));
+    let engine = Arc::new(Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(oracle),
+            Arc::new(SettlementCleaner {
+                entered: entered.clone(),
+                release: release.clone(),
+                discards: discards.clone(),
+                pause_on: 2,
+            }),
+            Arc::new(MockClock::default()),
+        ),
+    ));
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "preserve large oracle evidence across settlement",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let mission_id = mission_id.clone();
+        async move { engine.advance(&mission_id).await.unwrap() }
+    });
+    entered.notified().await;
+    let active = store.require_state(&mission_id).await.unwrap();
+    let effect_id = active.inflight.keys().next().unwrap().clone();
+    assert!(matches!(
+        active.inflight.get(&effect_id),
+        Some(lionclaw::model::InflightEffect::OracleRun { .. })
+    ));
+    record_control(
+        &store,
+        1,
+        &mission_id,
+        &effect_id,
+        ControlAction::Stop,
+        "stop won after large oracle output",
+    )
+    .await
+    .unwrap();
+    release.notify_one();
+
+    let parked = driver.await.unwrap();
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    let failure = parked.state.oracle_failures.values().next().unwrap();
+    assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
+    assert!(!failure.evidence().stderr.is_empty());
+    assert!(failure.evidence().stderr.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+    assert!(failure.evidence().stderr.starts_with('E'));
+    assert_eq!(discards.lock().unwrap().as_slice(), &[false, true]);
 }
 
 #[tokio::test]

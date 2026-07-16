@@ -9,10 +9,18 @@ impl ContentDigest {
     }
 
     pub(crate) fn feed(&mut self, logical_path: &str, bytes: &[u8], executable: bool) {
+        self.feed_header(logical_path, bytes.len() as u64, executable);
+        self.feed_chunk(bytes);
+    }
+
+    pub(crate) fn feed_header(&mut self, logical_path: &str, len: u64, executable: bool) {
         self.0.update((logical_path.len() as u64).to_le_bytes());
         self.0.update(logical_path.as_bytes());
         self.0.update([executable as u8]);
-        self.0.update((bytes.len() as u64).to_le_bytes());
+        self.0.update(len.to_le_bytes());
+    }
+
+    pub(crate) fn feed_chunk(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
     }
 

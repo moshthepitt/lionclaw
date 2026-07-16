@@ -42,10 +42,10 @@ mod registry;
 mod state;
 
 pub use adapter::{
-    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeControlExecution,
-    RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeProgramTurnExecution,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTerminalProgramInput, RuntimeTurnInput,
-    RuntimeTurnMode,
+    HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCancellation,
+    RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+    RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
+    RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
 };
 pub use auth::{
     RuntimeAuthContext, RuntimeAuthKind, RuntimeAuthPreparation, RuntimeAuthProvider,

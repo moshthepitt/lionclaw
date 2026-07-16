@@ -618,6 +618,13 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         })
         .await
         .expect("start");
+    assert_eq!(
+        adapter
+            .cancel(&handle, Some("pre-start".into()))
+            .await
+            .unwrap(),
+        lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn
+    );
     let fake_state = Arc::new(Mutex::new(FakeAcpProgramState::default()));
     let executor = FakeAcpProgramExecutor {
         inbound: VecDeque::from([
@@ -873,10 +880,14 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
         "ACP prompt request was not sent"
     );
 
-    adapter
+    let cancellation = adapter
         .cancel(&handle, Some("operator cancelled".to_string()))
         .await
         .expect("cancel active ACP prompt");
+    assert_eq!(
+        cancellation,
+        lionclaw_runtime_api::RuntimeCancellation::Acknowledged
+    );
     assert!(
         state.is_shutdown(),
         "ACP cancel should wait until the prompt response path has shut down the session"

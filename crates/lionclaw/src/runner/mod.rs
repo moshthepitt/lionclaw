@@ -111,6 +111,7 @@ pub struct TaskDirs {
     pub root: PathBuf,
     pub work: PathBuf,
     pub scratch: PathBuf,
+    pub observer_index: PathBuf,
 }
 
 impl TaskDirs {
@@ -123,6 +124,7 @@ impl TaskDirs {
         let dirs = Self {
             work: root.join("work"),
             scratch: root.join("scratch"),
+            observer_index: root.join("observer.index"),
             root,
         };
         std::fs::create_dir_all(&dirs.scratch)?;

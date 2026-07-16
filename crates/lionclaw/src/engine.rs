@@ -80,6 +80,10 @@ impl ActivityReporter {
                 let mission_dir = store.mission_dir(&mission_id);
                 let observation = activity.borrow().clone();
                 match crate::activity::publish_observed(
+                    store
+                        .lionclaw_dir()
+                        .parent()
+                        .expect(".lionclaw directory has a workspace parent"),
                     &mission_dir,
                     &state,
                     crate::activity::now_ms(),
@@ -765,7 +769,7 @@ impl Engine {
             let Some(effect) = state.inflight.get(effect_id) else {
                 bail!("effect '{effect_id}' settled before this driver could append its outcome");
             };
-            if let Some(failure) = settlement_failure(&state, effect_id, &outcome.event) {
+            if let Some(failure) = settlement_failure(&state, effect_id, &outcome) {
                 outcome = failed_outcome(effect_id, effect, failure);
                 if !artifact_discarded {
                     if !self.cleanup_effect(&state, effect_id, true).await? {
@@ -1031,6 +1035,11 @@ impl Engine {
                     }
                 }
                 let handoff = self.externalize_handoff(outcome.handoff)?;
+                let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
+                    final_response: outcome.final_response.clone(),
+                    configuration: runtime_configuration_evidence(&outcome.runtime_configuration),
+                    ..Default::default()
+                };
                 Ok(completed(Ok(RoleRunSuccess {
                     handoff,
                     artifact: outcome.artifact,
@@ -1039,7 +1048,8 @@ impl Engine {
                         .blobs()
                         .externalize(PayloadRef::inline(outcome.final_response))?,
                     runtime_configuration: outcome.runtime_configuration,
-                })))
+                }))
+                .with_settlement_evidence(settlement_evidence))
             }
             Err(mut failure) => {
                 if failure.is_transient() {
@@ -1103,14 +1113,22 @@ impl Engine {
             control,
         };
         match self.oracle_runner.run(request).await {
-            Ok(outcome) => Ok(completed(Ok(OracleRunSuccess {
-                exit_code: outcome.exit_code,
-                exit_signal: outcome.exit_signal,
-                stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
-                stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
-                prepared_inputs: outcome.prepared_inputs,
-                duration_ms: outcome.duration_ms,
-            }))),
+            Ok(outcome) => {
+                let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
+                    exit_code: Some(outcome.exit_code),
+                    stderr: String::from_utf8_lossy(&outcome.stderr).into_owned(),
+                    ..Default::default()
+                };
+                Ok(completed(Ok(OracleRunSuccess {
+                    exit_code: outcome.exit_code,
+                    exit_signal: outcome.exit_signal,
+                    stdout: self.store.blobs().payload_from_bytes(&outcome.stdout)?,
+                    stderr: self.store.blobs().payload_from_bytes(&outcome.stderr)?,
+                    prepared_inputs: outcome.prepared_inputs,
+                    duration_ms: outcome.duration_ms,
+                }))
+                .with_settlement_evidence(settlement_evidence))
+            }
             Err(mut failure) => {
                 if failure.is_transient() {
                     let delay_ms = transient_backoff_ms(attempt_no, failure.retry_after_ms());
@@ -1244,6 +1262,11 @@ impl Engine {
                 &outcome,
             ))));
         }
+        let settlement_evidence = lionclaw_runtime_api::TypedFailureEvidence {
+            final_response: outcome.final_response.clone(),
+            configuration: runtime_configuration_evidence(&outcome.runtime_configuration),
+            ..Default::default()
+        };
         Ok(completed(Ok(TerminalReviewSuccess {
             passed: *passed,
             gaps: gaps.clone(),
@@ -1253,7 +1276,8 @@ impl Engine {
                 .blobs()
                 .externalize(PayloadRef::inline(outcome.final_response))?,
             runtime_configuration: outcome.runtime_configuration,
-        })))
+        }))
+        .with_settlement_evidence(settlement_evidence))
     }
 
     /// Resolve the `last_report` blobs of a task's dependencies (in either era's
@@ -1789,7 +1813,7 @@ enum SettlementKind {
 fn settlement_failure(
     state: &MissionState,
     effect_id: &EffectId,
-    outcome: &MissionEvent,
+    outcome: &NewEvent,
 ) -> Option<TypedFailure> {
     let (code, detail, reason, category) = match &state.phase {
         MissionPhase::Aborted { reason } => (
@@ -1818,7 +1842,10 @@ fn settlement_failure(
             }
         }
     };
-    let mut evidence = outcome_failure_evidence(outcome);
+    let mut evidence = outcome
+        .settlement_evidence
+        .clone()
+        .unwrap_or_else(|| outcome_failure_evidence(&outcome.event));
     evidence.code = Some(code.into());
     evidence.detail = detail.into();
     evidence.stop_reason = Some(reason);

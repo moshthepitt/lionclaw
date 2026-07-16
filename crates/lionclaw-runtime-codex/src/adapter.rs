@@ -375,13 +375,17 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+    async fn cancel(
+        &self,
+        handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<lionclaw_runtime_api::RuntimeCancellation> {
         let active_turn = self
             .session_state(&handle.runtime_session_id)
             .ok()
             .and_then(|state| state.active_turn);
         let Some(active_turn) = active_turn else {
-            return Ok(());
+            return Ok(lionclaw_runtime_api::RuntimeCancellation::NoActiveTurn);
         };
 
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -395,7 +399,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 )
             })?;
 
-        timeout(Duration::from_secs(5), ack_rx)
+        let result = timeout(Duration::from_secs(5), ack_rx)
             .await
             .map_err(|_| {
                 anyhow!(
@@ -410,7 +414,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                     active_turn.thread_id,
                     active_turn.turn_id
                 )
-            })?
+            })?;
+        result?;
+        Ok(lionclaw_runtime_api::RuntimeCancellation::Acknowledged)
     }
 
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
