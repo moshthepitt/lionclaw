@@ -1611,14 +1611,9 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let state = &view.state;
     if args.json {
         let mut value = mission_view_json(&view, &store)?;
-        let activity = if view.disposition == MissionDisposition::Running {
-            std::fs::read(crate::activity::path(&store.mission_dir(&mission_id)))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        };
+        let activity = running_activity_bytes(&store, &mission_id, view.disposition)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
         value["activity"] = activity;
         value["driver_error"] = crate::activity::driver_error(&store.mission_dir(&mission_id))
             .map_or(serde_json::Value::Null, serde_json::Value::String);
@@ -1684,10 +1679,12 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
 }
 
 async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) -> Result<()> {
-    let activity_path = crate::activity::path(&store.mission_dir(mission_id));
     let mut previous = Vec::new();
     loop {
-        let bytes = std::fs::read(&activity_path).unwrap_or_default();
+        let disposition = load_mission_view(store, mission_id).await?.disposition;
+        let Some(bytes) = running_activity_bytes(store, mission_id, disposition) else {
+            return Ok(());
+        };
         if !bytes.is_empty() && bytes != previous {
             if json {
                 println!("{}", String::from_utf8_lossy(&bytes));
@@ -1707,17 +1704,21 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
             }
             previous = bytes;
         }
-        if !matches!(
-            load_mission_view(store, mission_id).await?.disposition,
-            MissionDisposition::Running
-        ) {
-            return Ok(());
-        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
             () = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
     }
+}
+
+fn running_activity_bytes(
+    store: &MissionStore,
+    mission_id: &MissionId,
+    disposition: MissionDisposition,
+) -> Option<Vec<u8>> {
+    (disposition == MissionDisposition::Running)
+        .then(|| std::fs::read(crate::activity::path(&store.mission_dir(mission_id))).ok())
+        .flatten()
 }
 
 fn print_activity(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
@@ -3072,6 +3073,16 @@ mod tests {
             .status()
             .unwrap();
         std::fs::write(retained.join("partial.txt"), "preserved\n").unwrap();
+        std::fs::write(
+            crate::activity::path(&store.mission_dir(&mission_id)),
+            b"stale",
+        )
+        .unwrap();
+        assert!(running_activity_bytes(&store, &mission_id, MissionDisposition::Parked).is_none());
+        assert_eq!(
+            running_activity_bytes(&store, &mission_id, MissionDisposition::Running).as_deref(),
+            Some(b"stale".as_slice())
+        );
         let json = mission_view_json(&view, &store).unwrap();
 
         assert_eq!(json["phase"], "attention_needed");
