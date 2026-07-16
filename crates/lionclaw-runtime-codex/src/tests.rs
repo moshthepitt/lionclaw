@@ -762,6 +762,30 @@ async fn codex_active_turn_rejects_oversized_protocol_id() {
 }
 
 #[tokio::test]
+async fn codex_active_turn_rejects_empty_protocol_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn("thr_1", "", interrupt_tx)
+        .expect_err("empty active turn id must fail closed");
+
+    assert!(error.to_string().contains("must not be empty"));
+}
+
+#[tokio::test]
+async fn codex_active_turn_rejects_oversized_thread_id() {
+    let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+    let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = thread_state
+        .set_active_turn(&"x".repeat(2_048), "turn_1", interrupt_tx)
+        .expect_err("oversized active thread id must fail closed");
+
+    assert!(error.to_string().contains("identifier"));
+}
+
+#[tokio::test]
 async fn app_server_agent_message_items_emit_answer_boundaries() {
     let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
     let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));

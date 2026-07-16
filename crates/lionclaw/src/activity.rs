@@ -373,8 +373,21 @@ async fn git_output(
 }
 
 async fn workspace_observation(workspace: &Path, base_sha: Option<&str>) -> WorkspaceObservation {
-    if !workspace.is_dir() {
-        return WorkspaceObservation::NotCreated;
+    match tokio::fs::symlink_metadata(workspace).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return WorkspaceObservation::Unavailable {
+                reason: "workspace path is not a directory".into(),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorkspaceObservation::NotCreated;
+        }
+        Err(error) => {
+            return WorkspaceObservation::Unavailable {
+                reason: bounded(&format!("workspace metadata unavailable: {error}")),
+            };
+        }
     }
     match observe_existing_workspace(workspace, base_sha).await {
         Ok(summary) if summary.is_empty() => WorkspaceObservation::Clean,
@@ -642,6 +655,20 @@ mod tests {
         std::fs::write(temp.path().join("not-a-repository"), "retained work\n").unwrap();
 
         let observation = workspace_observation(temp.path(), None).await;
+
+        assert!(matches!(
+            observation,
+            WorkspaceObservation::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_directory_workspace_is_unavailable_not_uncreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("work");
+        std::fs::write(&workspace, "retained work\n").unwrap();
+
+        let observation = workspace_observation(&workspace, None).await;
 
         assert!(matches!(
             observation,
