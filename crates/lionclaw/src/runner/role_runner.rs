@@ -173,13 +173,22 @@ async fn prepare_writer_checkout(
         let head = workspace::head_sha(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
+        if !recreate_workspace {
+            if workspace::commit_exists(workspace, base_sha).await
+                && workspace::is_ancestor(workspace, base_sha, &head)
+                    .await
+                    .map_err(|e| {
+                        launch(format!("failed to compare retained checkout ancestry: {e}"))
+                    })?
+            {
+                return Ok(());
+            }
+            return Err(launch(format!(
+                "retained task workspace HEAD {head} does not descend from its recorded base {base_sha}"
+            )));
+        }
         if head == base_sha {
             return Ok(());
-        }
-        if !recreate_workspace {
-            return Err(launch(format!(
-                "retained task workspace HEAD {head} does not match its recorded base {base_sha}"
-            )));
         }
         if workspace::is_dirty(workspace)
             .await
@@ -264,6 +273,7 @@ impl RoleRunner for OciRoleRunner {
                             base_sha: request.base_sha.clone(),
                             assignment_epoch: request.assignment_epoch,
                         })
+                        .await
                         .map_err(|_| launch("kernel role update receiver closed".into()))?;
                 } else {
                     workspace::create_checkout(
@@ -397,11 +407,22 @@ impl OciRoleRunner {
         let (journal_tx, mut journal_rx) =
             tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
         let updates = request.updates.clone();
+        let activity = request.activity.clone();
+        let activity_effect_id = request.effect_id.clone();
         let drain = tokio::spawn(async move {
             let mut last_error = None;
             let mut final_response = String::new();
             while let Some(event) = journal_rx.recv().await {
-                let _ = updates.send(crate::ports::RoleRunUpdate::Runtime(event.clone()));
+                if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
+                    &event.event
+                {
+                    let _ = updates
+                        .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
+                            configuration.clone(),
+                        ))
+                        .await;
+                }
+                activity.send_replace(Some((activity_effect_id.clone(), event.clone())));
                 match &event.event {
                     lionclaw_runtime_api::RuntimeEvent::Error { text, .. } => {
                         last_error = Some(text.clone());
@@ -784,6 +805,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_reuses_a_clean_committed_descendant_of_the_recorded_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).await;
+        git(&repo, &["config", "user.name", "test"]).await;
+        git(&repo, &["config", "user.email", "test@local"]).await;
+        git(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        git(&repo, &["add", "tracked"]).await;
+        git(&repo, &["commit", "-q", "-m", "base"]).await;
+        let base = git(&repo, &["rev-parse", "HEAD"]).await;
+        let task_work = temp.path().join("task/work");
+        prepare_writer_checkout(&repo, &task_work, &base, true)
+            .await
+            .unwrap();
+
+        std::fs::write(task_work.join("committed-rework"), "preserve this commit\n").unwrap();
+        git(&task_work, &["add", "committed-rework"]).await;
+        git(&task_work, &["commit", "-q", "-m", "partial rework"]).await;
+        let partial = git(&task_work, &["rev-parse", "HEAD"]).await;
+
+        prepare_writer_checkout(&repo, &task_work, &base, false)
+            .await
+            .unwrap();
+        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), partial);
+        assert_eq!(
+            std::fs::read_to_string(task_work.join("committed-rework")).unwrap(),
+            "preserve this commit\n"
+        );
+    }
+
+    #[tokio::test]
     async fn moved_base_never_recreates_a_dirty_writer_workspace() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -880,7 +934,9 @@ mod tests {
         let error = prepare_writer_checkout(&repo, &task_work, &moved, false)
             .await
             .unwrap_err();
-        assert!(error.detail().contains("does not match its recorded base"));
+        assert!(error
+            .detail()
+            .contains("does not descend from its recorded base"));
         assert_eq!(workspace::head_sha(&task_work).await.unwrap(), base);
     }
 }

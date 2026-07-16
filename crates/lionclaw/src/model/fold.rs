@@ -222,14 +222,18 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         let evidence = failure.evidence();
                         task.final_response = (!evidence.final_response.is_empty())
                             .then(|| PayloadRef::inline(evidence.final_response.clone()));
-                        task.last_runtime_configuration = Some(RuntimeConfigurationEvidence {
+                        let failure_configuration = RuntimeConfigurationEvidence {
                             requested_model: evidence.configuration.requested_model.clone(),
                             applied_model: evidence.configuration.applied_model.clone(),
                             model_confirmation: evidence.configuration.model_confirmation,
                             requested_mode: evidence.configuration.requested_mode.clone(),
                             applied_mode: evidence.configuration.applied_mode.clone(),
                             mode_confirmation: evidence.configuration.mode_confirmation,
-                        });
+                        };
+                        task.last_runtime_configuration = Some(merge_runtime_configuration(
+                            task.last_runtime_configuration.as_ref(),
+                            &failure_configuration,
+                        ));
                         task.consecutive_failures = task.consecutive_failures.saturating_add(1);
                         if !failure.automatically_retryable()
                             || task.consecutive_failures >= state.config.recovery.max_attempts
@@ -439,6 +443,21 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+fn merge_runtime_configuration(
+    previous: Option<&RuntimeConfigurationEvidence>,
+    current: &RuntimeConfigurationEvidence,
+) -> RuntimeConfigurationEvidence {
+    let previous = previous.cloned().unwrap_or_default();
+    RuntimeConfigurationEvidence {
+        requested_model: current.requested_model.clone().or(previous.requested_model),
+        applied_model: current.applied_model.clone().or(previous.applied_model),
+        model_confirmation: current.model_confirmation.or(previous.model_confirmation),
+        requested_mode: current.requested_mode.clone().or(previous.requested_mode),
+        applied_mode: current.applied_mode.clone().or(previous.applied_mode),
+        mode_confirmation: current.mode_confirmation.or(previous.mode_confirmation),
+    }
 }
 
 fn prune_reopened_parked_effects(state: &mut MissionState) {
@@ -1425,6 +1444,27 @@ mod tests {
             report: PayloadRef::inline("report"),
             request_attention,
         }
+    }
+
+    #[test]
+    fn configuration_less_failure_does_not_clobber_observed_runtime_evidence() {
+        let observed = RuntimeConfigurationEvidence {
+            requested_model: Some("requested".into()),
+            applied_model: Some("applied".into()),
+            model_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+            requested_mode: Some("build".into()),
+            applied_mode: Some("build".into()),
+            mode_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+        };
+
+        assert_eq!(
+            merge_runtime_configuration(Some(&observed), &RuntimeConfigurationEvidence::default()),
+            observed
+        );
     }
 
     fn validate_handoff(items: &[(&str, bool)]) -> Handoff {

@@ -1460,6 +1460,37 @@ fn isolate_driver_process_group(command: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn isolate_driver_process_group(_command: &mut std::process::Command) {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverStartup {
+    Acquired,
+    LostRace,
+}
+
+async fn await_driver_startup(
+    child: &mut std::process::Child,
+    handshake: &Path,
+    mission_dir: &Path,
+) -> Result<DriverStartup> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if handshake.is_file() {
+                return Ok(DriverStartup::Acquired);
+            }
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(DriverStartup::LostRace);
+                }
+                let detail = crate::activity::driver_error(mission_dir)
+                    .unwrap_or_else(|| "no driver error evidence was recorded".into());
+                bail!("mission driver exited before startup ({status}): {detail}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("mission driver startup handshake timed out")?
+}
+
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
@@ -1494,25 +1525,14 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             .spawn()
             .context("spawning detached mission driver")?;
         child = Some(spawned);
-        let startup = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if handshake.is_file() {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                if child
-                    .as_mut()
-                    .is_some_and(|child| child.try_wait().ok().flatten().is_some())
-                {
-                    let detail = crate::activity::driver_error(&store.mission_dir(&mission_id))
-                        .unwrap_or_else(|| "driver lost the startup ownership race".into());
-                    bail!("mission driver exited before startup: {detail}");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+        let startup = await_driver_startup(
+            child.as_mut().expect("driver was just spawned"),
+            &handshake,
+            &store.mission_dir(&mission_id),
+        )
         .await;
         let _ = std::fs::remove_file(&handshake);
-        startup.context("mission driver startup handshake timed out")??;
+        startup?;
     }
     if args.wait {
         if let Some(mut child) = child {
@@ -1694,7 +1714,7 @@ async fn watch_status(store: &MissionStore, mission_id: &MissionId, json: bool) 
                 for effect in activity.effects {
                     println!(
                         "{} {} elapsed={}ms deadline={} dirty={}",
-                        short_hex(&effect.effect_id),
+                        effect.effect_id,
                         effect.last_activity,
                         effect.elapsed_ms,
                         effect.deadline_ms,
@@ -1716,9 +1736,9 @@ fn running_activity_bytes(
     mission_id: &MissionId,
     disposition: MissionDisposition,
 ) -> Option<Vec<u8>> {
-    (disposition == MissionDisposition::Running)
-        .then(|| std::fs::read(crate::activity::path(&store.mission_dir(mission_id))).ok())
-        .flatten()
+    (disposition == MissionDisposition::Running).then(|| {
+        std::fs::read(crate::activity::path(&store.mission_dir(mission_id))).unwrap_or_default()
+    })
 }
 
 fn print_activity(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
@@ -1730,7 +1750,7 @@ fn print_activity(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
     for effect in activity.effects {
         println!(
             "activity {}: {} elapsed={}ms deadline={} controls={}",
-            short_hex(&effect.effect_id),
+            effect.effect_id,
             effect.last_activity,
             effect.elapsed_ms,
             effect.deadline_ms,
@@ -2140,10 +2160,15 @@ fn print_retained_task_work(
     indent: &str,
 ) {
     for task_id in state.tasks.keys() {
+        let base_sha = state
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.workspace_base_sha.as_deref());
         if let Some(diffstat) = crate::activity::task_workspace_diffstat(
             store.lionclaw_dir(),
             &state.mission_id,
             task_id,
+            base_sha,
         ) {
             println!("{indent}task {task_id} retained work:");
             for line in diffstat.lines() {
@@ -2215,6 +2240,7 @@ fn task_runtime_json(
                 store.lionclaw_dir(),
                 &state.mission_id,
                 id,
+                task.workspace_base_sha.as_deref(),
             )
         }).flatten(),
         "runtime_configuration": task.last_runtime_configuration,
@@ -3083,6 +3109,12 @@ mod tests {
             running_activity_bytes(&store, &mission_id, MissionDisposition::Running).as_deref(),
             Some(b"stale".as_slice())
         );
+        std::fs::remove_file(crate::activity::path(&store.mission_dir(&mission_id))).unwrap();
+        assert_eq!(
+            running_activity_bytes(&store, &mission_id, MissionDisposition::Running),
+            Some(Vec::new()),
+            "a running watch waits through the pre-projection startup window"
+        );
         let json = mission_view_json(&view, &store).unwrap();
 
         assert_eq!(json["phase"], "attention_needed");
@@ -3113,6 +3145,23 @@ mod tests {
         assert_eq!(
             json["planning_tasks"][0]["final_response"],
             "planning stopped here"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_driver_exit_before_handshake_is_a_benign_ownership_race() {
+        let temp = tempfile::tempdir().unwrap();
+        let handshake = temp.path().join("never-published.ready");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+
+        assert_eq!(
+            await_driver_startup(&mut child, &handshake, temp.path())
+                .await
+                .unwrap(),
+            DriverStartup::LostRace
         );
     }
 

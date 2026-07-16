@@ -45,7 +45,11 @@ pub struct RoleRunRequest {
     pub recreate_workspace: bool,
     pub deadline_ms: i64,
     pub control: watch::Receiver<ExecutionControl>,
-    pub updates: mpsc::UnboundedSender<RoleRunUpdate>,
+    /// Lossless, low-volume facts that may affect durable mission evidence.
+    pub updates: mpsc::Sender<RoleRunUpdate>,
+    /// Coalesced, non-authoritative runtime telemetry. Slow observers retain
+    /// only the latest event and can never backpressure runtime execution.
+    pub activity: watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     /// The target repository the mission operates on.
     pub workspace_dir: PathBuf,
     /// Mission state root (attempt dirs, worktrees) — `<workspace>/.lionclaw`.
@@ -58,7 +62,7 @@ pub enum RoleRunUpdate {
         base_sha: String,
         assignment_epoch: u32,
     },
-    Runtime(lionclaw_runtime_api::TurnEvent),
+    RuntimeConfigured(lionclaw_runtime_api::AppliedRuntimeConfiguration),
 }
 
 #[derive(Debug, Clone)]

@@ -420,7 +420,11 @@ where
             .pointer("/error/code")
             .or_else(|| params.pointer("/turn/error/code"))
             .or_else(|| params.get("code"))
-            .map(Value::to_string)
+            .and_then(|code| {
+                code.as_str()
+                    .map(str::to_string)
+                    .or_else(|| code.as_i64().map(|code| code.to_string()))
+            })
             .unwrap_or_else(|| "codex.turn".to_string());
         let will_retry = params
             .get("willRetry")

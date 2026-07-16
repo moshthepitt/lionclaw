@@ -54,6 +54,75 @@ pub struct EngineServices {
     clock: Arc<dyn Clock>,
 }
 
+struct ActivityReporter {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ActivityReporter {
+    fn start(
+        store: MissionStore,
+        mission_id: MissionId,
+        activity: tokio::sync::watch::Receiver<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
+    ) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => return,
+                    _ = interval.tick() => {}
+                }
+                let Ok(state) = store.require_state(&mission_id).await else {
+                    continue;
+                };
+                let mission_dir = store.mission_dir(&mission_id);
+                let observation = activity.borrow().clone();
+                let published = tokio::task::spawn_blocking(move || {
+                    crate::activity::publish_observed(
+                        &mission_dir,
+                        &state,
+                        crate::activity::now_ms(),
+                        observation.as_ref(),
+                    )
+                })
+                .await;
+                match published {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%mission_id, %error, "failed to update non-authoritative activity projection")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%mission_id, %error, "activity projection task failed")
+                    }
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            task: Some(task),
+        }
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ActivityReporter {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 impl EngineServices {
     pub fn new(
         role_runner: Arc<dyn RoleRunner>,
@@ -205,20 +274,6 @@ impl Engine {
 
     pub fn mission_type(&self) -> &MissionType {
         &self.mission_type
-    }
-
-    fn publish_activity(&self, state: &MissionState) {
-        if let Err(error) = crate::activity::publish(
-            &self.store.mission_dir(&state.mission_id),
-            state,
-            self.clock.now_ms(),
-        ) {
-            tracing::warn!(
-                mission_id = %state.mission_id,
-                %error,
-                "failed to update non-authoritative activity projection"
-            );
-        }
     }
 
     /// The mission type this engine runs, pinned by name + content digest.
@@ -396,30 +451,46 @@ impl Engine {
             std::fs::rename(&temporary, path)
                 .with_context(|| format!("publishing driver handshake '{}'", path.display()))?;
         }
-        let initial_state = self.store.require_state(mission_id).await?;
-        self.publish_activity(&initial_state);
         if !self.recover_interrupted(mission_id).await? {
             return Ok(MissionView::from_state(
                 self.load_state(mission_id).await?,
                 false,
             ));
         }
-        self.drive(mission_id).await?;
+        let (activity, observed_activity) = tokio::sync::watch::channel(None);
+        let reporter =
+            ActivityReporter::start(self.store.clone(), mission_id.clone(), observed_activity);
+        let drive_result = self.drive(mission_id, activity).await;
         // Persist a fold snapshot before parking or exiting so the next
         // invocation resumes without re-folding the whole log.
-        let state = self.load_state(mission_id).await?;
-        self.publish_activity(&state);
-        self.store
-            .save_snapshot(&state, self.clock.now_ms())
-            .await?;
+        let state = match drive_result {
+            Ok(()) => {
+                let state = self.load_state(mission_id).await?;
+                self.store
+                    .save_snapshot(&state, self.clock.now_ms())
+                    .await?;
+                state
+            }
+            Err(error) => {
+                reporter.shutdown().await;
+                return Err(error);
+            }
+        };
+        // Projection latency is deliberately outside all authoritative state
+        // transitions, deadline decisions, and cleanup.
+        reporter.shutdown().await;
         Ok(MissionView::from_state(state, false))
     }
 
-    async fn drive(&self, mission_id: &MissionId) -> Result<()> {
+    async fn drive(
+        &self,
+        mission_id: &MissionId,
+        activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
+    ) -> Result<()> {
         for _ in 0..MAX_LOOP_ITERATIONS {
             let state = self.load_state(mission_id).await?;
             if !state.inflight.is_empty() {
-                if self.drive_one(&state).await? {
+                if self.drive_one(&state, activity.clone()).await? {
                     continue;
                 }
                 return Ok(());
@@ -470,7 +541,11 @@ impl Engine {
 
     /// Execute one request materialized by this driver, clean its transient
     /// resources, then durably record the outcome.
-    async fn drive_one(&self, state: &MissionState) -> Result<bool> {
+    async fn drive_one(
+        &self,
+        state: &MissionState,
+        activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
+    ) -> Result<bool> {
         let Some(effect_id) = state.inflight.keys().next() else {
             return Ok(false);
         };
@@ -497,13 +572,12 @@ impl Engine {
                     stopped_before_start_outcome(effect_id, active, reason),
                 )
                 .await?;
-                return Ok(false);
+                return Ok(has_owned_oracle_sibling(&current, effect_id, active));
             }
             let now = tokio::time::Instant::now();
             if now >= start_at {
                 break active.clone();
             }
-            self.publish_activity(&current);
             tokio::time::sleep((start_at - now).min(Duration::from_millis(100))).await;
         };
         let (control_tx, control_rx) =
@@ -511,7 +585,7 @@ impl Engine {
         let execution = async {
             match &effect {
                 InflightEffect::RoleRun { .. } => {
-                    self.execute_role_run(state, effect_id, &effect, control_rx)
+                    self.execute_role_run(state, effect_id, &effect, control_rx, activity.clone())
                         .await
                 }
                 InflightEffect::OracleRun { .. } => {
@@ -519,8 +593,14 @@ impl Engine {
                         .await
                 }
                 InflightEffect::TerminalReview { .. } => {
-                    self.execute_terminal_review(state, effect_id, &effect, control_rx)
-                        .await
+                    self.execute_terminal_review(
+                        state,
+                        effect_id,
+                        &effect,
+                        control_rx,
+                        activity.clone(),
+                    )
+                    .await
                 }
             }
         };
@@ -530,7 +610,6 @@ impl Engine {
                 outcome = &mut execution => break outcome?,
                 () = tokio::time::sleep(Duration::from_millis(100)) => {
                     let current = self.load_state(&state.mission_id).await?;
-                    self.publish_activity(&current);
                     let Some(active) = current.inflight.get(effect_id) else {
                         bail!("active effect '{effect_id}' disappeared without an outcome");
                     };
@@ -611,11 +690,7 @@ impl Engine {
             // Oracle requests are materialized as one owned batch. Yield only
             // after every sibling has run; otherwise recovery would falsely
             // classify an unstarted sibling as a crashed effect.
-            let has_oracle_batch_sibling = matches!(effect, InflightEffect::OracleRun { .. })
-                && state.inflight.iter().any(|(sibling_id, sibling)| {
-                    sibling_id != effect_id && matches!(sibling, InflightEffect::OracleRun { .. })
-                });
-            if has_oracle_batch_sibling {
+            if has_owned_oracle_sibling(state, effect_id, &effect) {
                 return Ok(true);
             }
             return Ok(false);
@@ -721,7 +796,7 @@ impl Engine {
         state: &MissionState,
         effect_id: &EffectId,
         request: RoleRunRequest,
-        mut updates: tokio::sync::mpsc::UnboundedReceiver<RoleRunUpdate>,
+        mut updates: tokio::sync::mpsc::Receiver<RoleRunUpdate>,
         record_workspace: bool,
     ) -> Result<std::result::Result<crate::ports::RoleRunOutcome, TypedFailure>> {
         let run = self.role_runner.run(request);
@@ -772,41 +847,23 @@ impl Engine {
                 .await
             }
             RoleRunUpdate::WorkspacePrepared { .. } => Ok(()),
-            RoleRunUpdate::Runtime(event) => {
-                if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
-                    &event.event
-                {
-                    self.append_fact(
-                        &state.mission_id,
-                        state.head,
-                        NewEvent::new(MissionEvent::EffectRuntimeConfigured {
-                            effect_id: effect_id.clone(),
-                            configuration: crate::model::RuntimeConfigurationEvidence {
-                                requested_model: configuration.requested_model.clone(),
-                                applied_model: configuration.applied_model.clone(),
-                                model_confirmation: configuration.model_confirmation,
-                                requested_mode: configuration.requested_mode.clone(),
-                                applied_mode: configuration.applied_mode.clone(),
-                                mode_confirmation: configuration.mode_confirmation,
-                            },
-                        }),
-                    )
-                    .await?;
-                }
-                if let Err(error) = crate::activity::record_runtime_event(
-                    &self.store.mission_dir(&state.mission_id),
-                    effect_id,
-                    &event,
-                    self.clock.now_ms(),
-                ) {
-                    tracing::warn!(
-                        mission_id = %state.mission_id,
-                        %effect_id,
-                        %error,
-                        "failed to update non-authoritative runtime activity"
-                    );
-                }
-                Ok(())
+            RoleRunUpdate::RuntimeConfigured(configuration) => {
+                self.append_fact(
+                    &state.mission_id,
+                    state.head,
+                    NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+                        effect_id: effect_id.clone(),
+                        configuration: crate::model::RuntimeConfigurationEvidence {
+                            requested_model: configuration.requested_model,
+                            applied_model: configuration.applied_model,
+                            model_confirmation: configuration.model_confirmation,
+                            requested_mode: configuration.requested_mode,
+                            applied_mode: configuration.applied_mode,
+                            mode_confirmation: configuration.mode_confirmation,
+                        },
+                    }),
+                )
+                .await
             }
         }
     }
@@ -838,6 +895,7 @@ impl Engine {
         effect_id: &EffectId,
         effect: &InflightEffect,
         control: tokio::sync::watch::Receiver<ExecutionControl>,
+        activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<NewEvent> {
         let InflightEffect::RoleRun {
             task_id,
@@ -878,7 +936,7 @@ impl Engine {
                 ))))
             }
         };
-        let (updates, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: task_id.clone(),
@@ -894,6 +952,7 @@ impl Engine {
             deadline_ms: effect.deadline_ms(),
             control,
             updates,
+            activity,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -1055,6 +1114,7 @@ impl Engine {
         effect_id: &EffectId,
         effect: &InflightEffect,
         control: tokio::sync::watch::Receiver<ExecutionControl>,
+        activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<NewEvent> {
         let InflightEffect::TerminalReview {
             attempt_no,
@@ -1095,7 +1155,7 @@ impl Engine {
             }
         };
         let prompt_text = self.store.blobs().resolve(prompt)?;
-        let (updates, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, update_rx) = tokio::sync::mpsc::channel(8);
         let request = RoleRunRequest {
             mission_id: state.mission_id.clone(),
             task_id: TaskId::new(TERMINAL_REVIEW_TASK_TAG).expect("valid literal task id"),
@@ -1111,6 +1171,7 @@ impl Engine {
             deadline_ms: effect.deadline_ms(),
             control,
             updates,
+            activity,
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
@@ -1873,6 +1934,17 @@ fn checkpoint_after(
         )),
         _ => None,
     }
+}
+
+fn has_owned_oracle_sibling(
+    state: &MissionState,
+    effect_id: &EffectId,
+    effect: &InflightEffect,
+) -> bool {
+    matches!(effect, InflightEffect::OracleRun { .. })
+        && state.inflight.iter().any(|(sibling_id, sibling)| {
+            sibling_id != effect_id && matches!(sibling, InflightEffect::OracleRun { .. })
+        })
 }
 
 fn resolved_deadline(requested_at_ms: i64, duration_secs: u64) -> Result<i64> {

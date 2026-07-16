@@ -45,6 +45,19 @@ pub fn path(mission_dir: &Path) -> PathBuf {
     mission_dir.join("activity.json")
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "timestamps a disposable observer projection, never mission policy or event facts"
+)]
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
 fn driver_error_path(mission_dir: &Path) -> PathBuf {
     mission_dir.join("driver-error.txt")
 }
@@ -100,7 +113,12 @@ pub fn driver_error(mission_dir: &Path) -> Option<String> {
         })
 }
 
-pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<()> {
+pub fn publish_observed(
+    mission_dir: &Path,
+    state: &MissionState,
+    now_ms: i64,
+    observation: Option<&(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
+) -> Result<()> {
     std::fs::create_dir_all(mission_dir)
         .with_context(|| format!("creating mission directory '{}'", mission_dir.display()))?;
     let previous = read(mission_dir).ok();
@@ -145,7 +163,14 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
                 ),
             };
             let dirty_diffstat = task.as_ref().and_then(|task| {
-                workspace_diffstat(&mission_dir.join("tasks").join(task).join("work"))
+                let base_sha = match effect {
+                    InflightEffect::RoleRun { task_id, .. } => state
+                        .tasks
+                        .get(task_id)
+                        .and_then(|task| task.workspace_base_sha.as_deref()),
+                    _ => None,
+                };
+                workspace_diffstat(&mission_dir.join("tasks").join(task).join("work"), base_sha)
             });
             let prior = previous.as_ref().and_then(|projection| {
                 projection
@@ -222,31 +247,33 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
             }
         })
         .collect();
-    let projection = ActivityProjection {
+    let mut projection = ActivityProjection {
         version: 1,
         mission_id: state.mission_id.as_str().to_string(),
         event_head: state.head,
         generated_at_ms: now_ms,
         effects,
     };
+    if let Some((effect_id, event)) = observation {
+        apply_runtime_event(&mut projection, effect_id, event, now_ms);
+    }
     write(mission_dir, &projection)
 }
 
-pub fn record_runtime_event(
-    mission_dir: &Path,
+fn apply_runtime_event(
+    projection: &mut ActivityProjection,
     effect_id: &crate::model::EffectId,
     event: &lionclaw_runtime_api::TurnEvent,
     now_ms: i64,
-) -> Result<()> {
+) {
     use lionclaw_runtime_api::{RuntimeEvent, RuntimeMessageLane};
 
-    let mut projection = read(mission_dir)?;
     let Some(effect) = projection
         .effects
         .iter_mut()
         .find(|effect| effect.effect_id == effect_id.as_str())
     else {
-        return Ok(());
+        return;
     };
     match &event.event {
         RuntimeEvent::Configuration { configuration } => {
@@ -289,7 +316,6 @@ pub fn record_runtime_event(
         }
     }
     projection.generated_at_ms = now_ms;
-    write(mission_dir, &projection)
 }
 
 fn read(mission_dir: &Path) -> Result<ActivityProjection> {
@@ -308,26 +334,63 @@ fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()> {
     Ok(())
 }
 
-fn workspace_diffstat(workspace: &Path) -> Option<String> {
+fn git_output(workspace: &Path, args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .ok()
+}
+
+fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String> {
     if !workspace.is_dir() {
         return None;
     }
-    let output = std::process::Command::new("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-C", workspace.to_str()?, "status", "--short"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| bounded(&String::from_utf8_lossy(&output.stdout)))
-        .filter(|text| !text.is_empty())
+    let mut summary = String::new();
+    if let Some(base_sha) = base_sha {
+        let head = git_output(workspace, &["rev-parse", "HEAD"])?;
+        if head.status.success() {
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            if head != base_sha {
+                let ancestry =
+                    git_output(workspace, &["merge-base", "--is-ancestor", base_sha, &head])?;
+                let relation = if ancestry.status.success() {
+                    "committed work"
+                } else {
+                    "diverged work"
+                };
+                summary.push_str(&format!(
+                    "{relation}: {} (recorded base {})\n",
+                    crate::model::short_hex(&head),
+                    crate::model::short_hex(base_sha),
+                ));
+                if ancestry.status.success() {
+                    if let Some(diffstat) = git_output(
+                        workspace,
+                        &["diff", "--stat", &format!("{base_sha}..{head}")],
+                    ) {
+                        if diffstat.status.success() {
+                            summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let status = git_output(workspace, &["status", "--short"])?;
+    if status.status.success() {
+        summary.push_str(&String::from_utf8_lossy(&status.stdout));
+    }
+    (!summary.is_empty()).then(|| bounded(&summary))
 }
 
 pub fn task_workspace_diffstat(
     lionclaw_dir: &Path,
     mission_id: &crate::model::MissionId,
     task_id: &crate::model::TaskId,
+    base_sha: Option<&str>,
 ) -> Option<String> {
     workspace_diffstat(
         &lionclaw_dir
@@ -336,6 +399,7 @@ pub fn task_workspace_diffstat(
             .join("tasks")
             .join(task_id.as_str())
             .join("work"),
+        base_sha,
     )
 }
 
@@ -353,6 +417,61 @@ mod tests {
     #[test]
     fn bounded_projection_text_is_capped() {
         assert_eq!(bounded(&"x".repeat(MAX_TEXT + 10)).len(), MAX_TEXT);
+    }
+
+    #[test]
+    fn clean_committed_work_is_visible_relative_to_the_recorded_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@local"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+        run(&["add", "work.txt"]);
+        run(&["commit", "-q", "-m", "base"]);
+        let base = String::from_utf8(
+            git_output(temp.path(), &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("work.txt"), "committed result\n").unwrap();
+        run(&["add", "work.txt"]);
+        run(&["commit", "-q", "-m", "worker progress"]);
+
+        let summary = workspace_diffstat(temp.path(), Some(base.trim())).unwrap();
+        assert!(summary.contains("committed work:"));
+        assert!(summary.contains("work.txt"));
+        assert!(!summary.contains(" M work.txt"));
+    }
+
+    #[test]
+    fn runtime_activity_channel_coalesces_without_a_queue() {
+        let effect_id = crate::model::EffectId::for_parts(&["activity", "coalesced"]);
+        let (activity, observed) = tokio::sync::watch::channel(None);
+        for index in 0..10_000 {
+            activity.send_replace(Some((
+                effect_id.clone(),
+                lionclaw_runtime_api::TurnEvent::canonical(RuntimeEvent::Status {
+                    code: Some("progress".into()),
+                    text: format!("event {index}"),
+                }),
+            )));
+        }
+        let latest = observed.borrow().clone().unwrap();
+        assert_eq!(latest.0, effect_id);
+        assert!(matches!(
+            latest.1.event,
+            RuntimeEvent::Status { ref text, .. } if text == "event 9999"
+        ));
     }
 
     #[test]
@@ -389,8 +508,9 @@ mod tests {
         )
         .unwrap();
 
-        record_runtime_event(
-            temp.path(),
+        let mut projection = read(temp.path()).unwrap();
+        apply_runtime_event(
+            &mut projection,
             &effect_id,
             &TurnEvent::canonical(RuntimeEvent::Configuration {
                 configuration: AppliedRuntimeConfiguration {
@@ -403,18 +523,17 @@ mod tests {
                 },
             }),
             20,
-        )
-        .unwrap();
-        record_runtime_event(
-            temp.path(),
+        );
+        apply_runtime_event(
+            &mut projection,
             &effect_id,
             &TurnEvent::canonical(RuntimeEvent::MessageDelta {
                 lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
                 text: "secret response text".into(),
             }),
             21,
-        )
-        .unwrap();
+        );
+        write(temp.path(), &projection).unwrap();
 
         let projection = read(temp.path()).unwrap();
         let effect = &projection.effects[0];

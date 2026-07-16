@@ -123,7 +123,8 @@ impl RoleRunner for MockRoleRunner {
                 .send(crate::ports::RoleRunUpdate::WorkspacePrepared {
                     base_sha: request.base_sha.clone(),
                     assignment_epoch: request.assignment_epoch,
-                });
+                })
+                .await;
         }
         self.calls.lock().expect("lock").push((
             request.task_id.clone(),

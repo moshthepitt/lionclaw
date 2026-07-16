@@ -3,10 +3,14 @@ mod common;
 use lionclaw_runtime_api::TypedFailure;
 use std::sync::{Arc, Mutex};
 
-use common::{approve_plan, default_config, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA};
+use common::{
+    approve_plan, covered_requirement, default_config, harness, harness_with_type, proposal,
+    simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
+};
 use lionclaw::engine::{record_control, MissionDisposition};
 use lionclaw::model::{
-    ArtifactOutcome, ControlAction, DecisionAction, Handoff, MissionPhase, PayloadRef,
+    ArtifactOutcome, Assertion, AssertionId, ControlAction, DecisionAction, Handoff, MissionPhase,
+    OracleName, PayloadRef,
 };
 use lionclaw::ports::{OracleOutcome, RoleRunOutcome};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -219,6 +223,125 @@ async fn a_scheduled_transient_retry_can_be_stopped_before_runtime_launch() {
             .category(),
         "operator_stopped"
     );
+}
+
+#[tokio::test]
+async fn stopping_one_scheduled_oracle_retry_does_not_interrupt_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mission_type = test_mission_type();
+    let lint = OracleName::new("lint").unwrap();
+    mission_type
+        .oracles
+        .insert(lint.clone(), "/nonexistent/oracles/lint".into());
+    let attempts = Arc::new(Mutex::new(std::collections::BTreeMap::<String, u32>::new()));
+    let seen = attempts.clone();
+    let oracle = MockOracleRunner::new(Box::new(move |request| {
+        let mut attempts = seen.lock().unwrap();
+        let attempt = attempts.entry(request.oracle.to_string()).or_default();
+        *attempt += 1;
+        if *attempt == 1 {
+            return Err(TypedFailure::transient(
+                "oracle.fixture",
+                "schedule both oracle retries",
+                None,
+            ));
+        }
+        Ok(OracleOutcome {
+            exit_code: 0,
+            exit_signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            prepared_inputs: Vec::new(),
+            duration_ms: 1,
+        })
+    }));
+    let h = harness_with_type(
+        dir.path(),
+        mission_type,
+        MockRoleRunner::happy(HEAD_SHA),
+        oracle,
+    )
+    .await;
+    let mut plan = simple_plan();
+    plan.requirements
+        .push(covered_requirement("LINT-GREEN", "LINT-PASS"));
+    plan.assertions.push(Assertion {
+        id: AssertionId::new("LINT-PASS").unwrap(),
+        prose: "lint exits successfully".into(),
+        oracle: Some(lint),
+    });
+    plan.tasks[0]
+        .targets
+        .push(AssertionId::new("LINT-PASS").unwrap());
+    let id = h
+        .engine
+        .create_mission(
+            "/repo",
+            "stop one scheduled oracle",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .unwrap();
+    h.engine.propose_plan(&id, proposal(0, plan)).await.unwrap();
+    approve_plan(&h.engine, &id).await;
+    let store = h.engine.store().clone();
+    let engine = Arc::new(h.engine);
+    let driver = tokio::spawn({
+        let engine = engine.clone();
+        let id = id.clone();
+        async move { engine.advance(&id).await.unwrap() }
+    });
+
+    let (stopped_effect, stopped_oracle) = loop {
+        let state = store.require_state(&id).await.unwrap();
+        let retries = state
+            .inflight
+            .iter()
+            .filter_map(|(effect_id, effect)| match effect {
+                lionclaw::model::InflightEffect::OracleRun {
+                    oracle,
+                    attempt_no: 2,
+                    ..
+                } => Some((effect_id.clone(), oracle.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if retries.len() == 2 {
+            break retries[0].clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    record_control(
+        &store,
+        1,
+        &id,
+        &stopped_effect,
+        ControlAction::Stop,
+        "stop one scheduled oracle retry",
+    )
+    .await
+    .unwrap();
+
+    let parked = driver.await.unwrap();
+    assert_eq!(parked.disposition, MissionDisposition::Parked);
+    let attempts = attempts.lock().unwrap();
+    for (oracle, count) in attempts.iter() {
+        assert_eq!(
+            *count,
+            if oracle == stopped_oracle.as_str() {
+                1
+            } else {
+                2
+            },
+            "the stopped oracle must not launch again and its sibling must drain"
+        );
+    }
+    assert!(parked
+        .state
+        .oracle_failures
+        .values()
+        .all(|failure| failure.category() != "interrupted"));
 }
 
 #[tokio::test]

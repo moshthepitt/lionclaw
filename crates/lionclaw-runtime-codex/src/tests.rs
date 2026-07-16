@@ -1891,7 +1891,7 @@ async fn codex_app_server_unmatched_terminal_error_returns_error() {
 fn codex_turn_failure_classification_uses_only_will_retry() {
     let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
     client.remember_turn_failure(
-        &json!({"turnId": "transient", "willRetry": true, "message": "overloaded"}),
+        &json!({"turnId": "transient", "willRetry": true, "code": "capacity", "message": "overloaded"}),
         "overloaded".into(),
     );
     client.remember_turn_failure(
@@ -1903,6 +1903,15 @@ fn codex_turn_failure_classification_uses_only_will_retry() {
         client.turn_failure(Some("transient")),
         Some(TypedFailure::TransientRuntime { .. })
     ));
+    assert_eq!(
+        client
+            .turn_failure(Some("transient"))
+            .unwrap()
+            .evidence()
+            .code
+            .as_deref(),
+        Some("capacity")
+    );
     assert!(matches!(
         client.turn_failure(Some("unknown")),
         Some(TypedFailure::PermanentRuntime { .. })

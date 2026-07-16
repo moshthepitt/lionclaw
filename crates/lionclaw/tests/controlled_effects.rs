@@ -11,7 +11,7 @@ use lionclaw::model::{ArtifactOutcome, ControlAction, Handoff, PayloadRef, TaskS
 use lionclaw::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner};
 use lionclaw::store::MissionStore;
 use lionclaw::testing::{MockClock, MockOracleRunner, NoopEffectCleaner};
-use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
+use lionclaw_runtime_api::{RuntimeEvent, TurnEvent, TypedFailure, TypedFailureEvidence};
 use tokio::sync::Barrier;
 
 struct RealClock;
@@ -98,6 +98,15 @@ impl RoleRunner for ControlledRunner {
             requests.len()
         };
         if invocation == 1 {
+            for index in 0..10_000 {
+                request.activity.send_replace(Some((
+                    request.effect_id.clone(),
+                    TurnEvent::canonical(RuntimeEvent::Status {
+                        code: Some("progress".into()),
+                        text: format!("event {index}"),
+                    }),
+                )));
+            }
             self.started.wait().await;
             loop {
                 let control = request.control.borrow().clone();
@@ -183,20 +192,36 @@ async fn stop_parks_exact_generation_and_continue_preserves_assignment() {
         handshake.is_file(),
         "lock-owned startup handshake is published"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    let activity: lionclaw::activity::ActivityProjection = serde_json::from_slice(
-        &std::fs::read(lionclaw::activity::path(
-            &store
-                .lionclaw_dir()
-                .join("missions")
-                .join(mission_id.as_str()),
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    let activity_path = lionclaw::activity::path(
+        &store
+            .lionclaw_dir()
+            .join("missions")
+            .join(mission_id.as_str()),
+    );
+    let activity = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&activity_path) {
+                if let Ok(projection) =
+                    serde_json::from_slice::<lionclaw::activity::ActivityProjection>(&bytes)
+                {
+                    if projection
+                        .effects
+                        .first()
+                        .is_some_and(|effect| effect.last_activity == "event 9999")
+                    {
+                        break projection;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background activity reporter publishes the coalesced observation");
     assert_eq!(activity.effects.len(), 1);
     assert_eq!(activity.effects[0].applied_model, None);
     assert_eq!(activity.effects[0].applied_mode, None);
+    assert_eq!(activity.effects[0].last_activity, "event 9999");
     assert_eq!(
         activity.effects[0].legal_controls,
         ["stop", "extend_deadline"]
