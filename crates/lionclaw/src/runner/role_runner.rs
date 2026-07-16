@@ -213,12 +213,12 @@ async fn prepare_writer_checkout(
     recreate_workspace: bool,
 ) -> Result<(), TypedFailure> {
     if workspace.exists() {
-        let head = workspace::head_sha(workspace)
+        let head = workspace::task_head_sha(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout HEAD: {e}")))?;
         if !recreate_workspace {
-            if workspace::commit_exists(workspace, base_sha).await
-                && workspace::is_ancestor(workspace, base_sha, &head)
+            if workspace::task_commit_exists(workspace, base_sha).await
+                && workspace::task_is_ancestor(workspace, base_sha, &head)
                     .await
                     .map_err(|e| {
                         launch(format!("failed to compare retained checkout ancestry: {e}"))
@@ -233,7 +233,7 @@ async fn prepare_writer_checkout(
         if head == base_sha {
             return Ok(());
         }
-        if workspace::is_dirty(workspace)
+        if workspace::task_is_dirty(workspace)
             .await
             .map_err(|e| launch(format!("failed to inspect retained checkout: {e}")))?
         {
@@ -370,6 +370,7 @@ impl RoleRunner for OciRoleRunner {
                 let head_sha = workspace::capture_worker_result(
                     &request.workspace_dir,
                     &workspace_source,
+                    &request.base_sha,
                     request.mission_id.as_str(),
                     &request.effect_id,
                 )
@@ -378,6 +379,9 @@ impl RoleRunner for OciRoleRunner {
                     let mut failure = match e {
                         workspace::CaptureError::DirtyWorktree(_) => {
                             TypedFailure::invalid("workspace.dirty", e.to_string())
+                        }
+                        workspace::CaptureError::HistoryDiverged { .. } => {
+                            TypedFailure::permanent("workspace.history", e.to_string())
                         }
                         workspace::CaptureError::Infra(_) => {
                             TypedFailure::permanent("workspace.capture", e.to_string())
@@ -1021,7 +1025,7 @@ mod tests {
         prepare_writer_checkout(&repo, &task_work, &moved, true)
             .await
             .unwrap();
-        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), moved);
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), moved);
     }
 
     #[tokio::test]
@@ -1050,7 +1054,7 @@ mod tests {
         prepare_writer_checkout(&repo, &task_work, &base, false)
             .await
             .unwrap();
-        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), partial);
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), partial);
         assert_eq!(
             std::fs::read_to_string(task_work.join("committed-rework")).unwrap(),
             "preserve this commit\n"
@@ -1122,7 +1126,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.detail().contains("uncaptured commits"));
-        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), uncaptured);
+        assert_eq!(
+            workspace::task_head_sha(&task_work).await.unwrap(),
+            uncaptured
+        );
         assert_eq!(
             std::fs::read_to_string(task_work.join("worker-only")).unwrap(),
             "committed work\n"
@@ -1157,6 +1164,6 @@ mod tests {
         assert!(error
             .detail()
             .contains("does not descend from its recorded base"));
-        assert_eq!(workspace::head_sha(&task_work).await.unwrap(), base);
+        assert_eq!(workspace::task_head_sha(&task_work).await.unwrap(), base);
     }
 }

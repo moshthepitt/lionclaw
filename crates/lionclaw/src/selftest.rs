@@ -538,6 +538,7 @@ impl ScriptedRoleRunner {
         let head = workspace::capture_worker_result(
             &request.workspace_dir,
             &dest,
+            &request.base_sha,
             request.mission_id.as_str(),
             &request.effect_id,
         )

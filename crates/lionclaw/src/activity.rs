@@ -1,15 +1,19 @@
 //! Bounded, disposable activity projection. Mission authority remains the
 //! append-only event log; this file exists only for cheap live observation.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{InflightEffect, MissionState};
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
+const MAX_DRIVER_STDERR_BYTES: u64 = 64 * 1024;
+const MAX_DRIVER_DIAGNOSTIC_BYTES: u64 = (MAX_TEXT * 4) as u64;
 const MAX_CONCURRENT_OBSERVERS: usize = 4;
 const TOTAL_OBSERVATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -78,6 +82,21 @@ fn driver_stderr_path(mission_dir: &Path) -> PathBuf {
     mission_dir.join("driver-stderr.txt")
 }
 
+fn create_private_diagnostic(path: &Path) -> Result<std::fs::File> {
+    let descriptor = open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let file = std::fs::File::from(descriptor);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 pub fn clear_driver_run_evidence(mission_dir: &Path) -> Result<()> {
     for path in [
         driver_error_path(mission_dir),
@@ -100,29 +119,78 @@ pub fn clear_driver_error(mission_dir: &Path) -> Result<()> {
     }
 }
 
-pub fn open_driver_stderr(mission_dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(mission_dir)?;
-    Ok(std::fs::File::create(driver_stderr_path(mission_dir))?)
+pub fn spool_driver_stderr(mut input: impl Read, mission_dir: &Path) -> Result<()> {
+    let mut failure = None;
+    let mut output = match std::fs::create_dir_all(mission_dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| create_private_diagnostic(&driver_stderr_path(mission_dir)))
+    {
+        Ok(output) => Some(output),
+        Err(error) => {
+            failure = Some(error);
+            None
+        }
+    };
+    let mut retained = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let available = MAX_DRIVER_STDERR_BYTES.saturating_sub(retained) as usize;
+        let keep = read.min(available);
+        if keep > 0 {
+            if let Some(writer) = output.as_mut() {
+                match writer.write_all(&buffer[..keep]) {
+                    Ok(()) => retained += keep as u64,
+                    Err(error) => {
+                        failure = Some(error.into());
+                        output = None;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(writer) = output.as_mut() {
+        if let Err(error) = writer.flush() {
+            failure = Some(error.into());
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub fn record_driver_error(mission_dir: &Path, error: &anyhow::Error) -> Result<()> {
     let target = driver_error_path(mission_dir);
     let temporary = target.with_extension("tmp");
-    std::fs::write(&temporary, bounded(&format!("{error:#}")))?;
+    let mut output = create_private_diagnostic(&temporary)?;
+    output.write_all(bounded(&format!("{error:#}")).as_bytes())?;
+    output.flush()?;
+    drop(output);
     std::fs::rename(temporary, target)?;
     Ok(())
 }
 
 pub fn driver_error(mission_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(driver_error_path(mission_dir))
-        .ok()
+    read_driver_diagnostic(&driver_error_path(mission_dir))
         .filter(|text| !text.trim().is_empty())
         .or_else(|| {
-            std::fs::read_to_string(driver_stderr_path(mission_dir))
-                .ok()
+            read_driver_diagnostic(&driver_stderr_path(mission_dir))
                 .map(|text| bounded(&text))
                 .filter(|text| !text.trim().is_empty())
         })
+}
+
+fn read_driver_diagnostic(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(MAX_DRIVER_DIAGNOSTIC_BYTES as usize);
+    file.take(MAX_DRIVER_DIAGNOSTIC_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub async fn publish_observed(
@@ -554,6 +622,7 @@ mod tests {
     use lionclaw_runtime_api::{
         AppliedRuntimeConfiguration, RuntimeConfigurationConfirmation, RuntimeEvent, TurnEvent,
     };
+    use std::io::Cursor;
 
     #[test]
     fn bounded_projection_text_is_capped() {
@@ -829,5 +898,52 @@ mod tests {
         );
         clear_driver_run_evidence(temp.path()).unwrap();
         assert_eq!(driver_error(temp.path()), None);
+    }
+
+    #[test]
+    fn detached_driver_stderr_retention_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = vec![b'x'; 128 * 1024];
+        let mut stderr = Cursor::new(source);
+        spool_driver_stderr(&mut stderr, temp.path()).unwrap();
+
+        assert_eq!(stderr.position(), 128 * 1024, "the spool keeps draining");
+        assert_eq!(
+            std::fs::metadata(driver_stderr_path(temp.path()))
+                .unwrap()
+                .len(),
+            MAX_DRIVER_STDERR_BYTES,
+            "retained diagnostics have a fixed disk bound"
+        );
+        assert_eq!(driver_error(temp.path()).unwrap().len(), MAX_TEXT);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(driver_stderr_path(temp.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn detached_driver_stderr_keeps_draining_when_retention_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_mission_dir = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_mission_dir, "occupied").unwrap();
+        let source = vec![b'x'; 128 * 1024];
+        let mut stderr = Cursor::new(source);
+
+        spool_driver_stderr(&mut stderr, &invalid_mission_dir)
+            .expect_err("invalid retention path must be reported");
+        assert_eq!(
+            stderr.position(),
+            128 * 1024,
+            "diagnostic failure must not backpressure mission execution"
+        );
     }
 }

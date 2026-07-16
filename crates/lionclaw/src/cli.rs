@@ -108,6 +108,8 @@ pub enum MissionCommand {
     Advance(AdvanceArgs),
     #[command(hide = true)]
     Driver(DriverArgs),
+    #[command(hide = true)]
+    DriverStderr(DriverStderrArgs),
     /// Show a mission's state (contract, phase, finish grade).
     Status(StatusArgs),
     /// The verifiable receipt: what was proven, by what, and what was NOT.
@@ -275,6 +277,12 @@ pub struct DriverArgs {
 }
 
 #[derive(Args)]
+pub struct DriverStderrArgs {
+    #[arg(long)]
+    pub mission_dir: PathBuf,
+}
+
+#[derive(Args)]
 pub struct ControlArgs {
     pub mission_id: String,
     pub effect_id: String,
@@ -400,7 +408,7 @@ impl MissionCommand {
             Self::Plan(a) => a.is_json(),
             Self::Inbox(a) => a.json,
             Self::Advance(a) => a.json,
-            Self::Driver(_) => false,
+            Self::Driver(_) | Self::DriverStderr(_) => false,
             Self::SelfTest(a) => a.json,
             Self::Type(t) => t.is_json(),
             Self::Apply(_)
@@ -438,6 +446,7 @@ async fn dispatch_mission(cmd: MissionCommand) -> Result<std::process::ExitCode>
         MissionCommand::Start(args) => cmd_start(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Advance(args) => cmd_advance(args).await,
         MissionCommand::Driver(args) => cmd_driver(args).await,
+        MissionCommand::DriverStderr(args) => cmd_driver_stderr(args).await,
         MissionCommand::Status(args) => cmd_status(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Report(args) => cmd_report(args).await.map(|()| ExitCode::SUCCESS),
         MissionCommand::Apply(args) => cmd_apply(args).await.map(|()| ExitCode::SUCCESS),
@@ -1473,8 +1482,83 @@ enum DriverStartup {
     LostRace,
 }
 
+struct DetachedDriver {
+    process: std::process::Child,
+    stderr_spool: std::process::Child,
+}
+
+impl DetachedDriver {
+    async fn settle_stderr(&mut self) {
+        let settled = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if self.stderr_spool.try_wait()?.is_some() {
+                    return std::io::Result::Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if !matches!(settled, Ok(Ok(()))) {
+            let _ = self.stderr_spool.kill();
+            let _ = self.stderr_spool.wait();
+        }
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus> {
+        let status = loop {
+            if let Some(status) = self.process.try_wait()? {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        self.settle_stderr().await;
+        Ok(status)
+    }
+}
+
+fn spawn_detached_driver(
+    command: &mut std::process::Command,
+    mission_dir: &Path,
+) -> Result<DetachedDriver> {
+    let executable = std::env::current_exe()?;
+    command.stderr(std::process::Stdio::piped());
+    let mut process = command
+        .spawn()
+        .context("spawning detached mission driver")?;
+    let stderr = match process.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = process.kill();
+            let _ = process.wait();
+            bail!("detached mission driver did not expose stderr");
+        }
+    };
+    let mut spool = std::process::Command::new(executable);
+    spool
+        .arg("mission")
+        .arg("driver-stderr")
+        .arg("--mission-dir")
+        .arg(mission_dir)
+        .stdin(std::process::Stdio::from(stderr))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    isolate_driver_process_group(&mut spool);
+    let stderr_spool = match spool.spawn() {
+        Ok(spool) => spool,
+        Err(error) => {
+            let _ = process.kill();
+            let _ = process.wait();
+            return Err(error).context("spawning bounded driver stderr spool");
+        }
+    };
+    Ok(DetachedDriver {
+        process,
+        stderr_spool,
+    })
+}
+
 async fn await_driver_startup(
-    child: &mut std::process::Child,
+    child: &mut DetachedDriver,
     handshake: &Path,
     mission_dir: &Path,
 ) -> Result<DriverStartup> {
@@ -1483,7 +1567,8 @@ async fn await_driver_startup(
             if handshake.is_file() {
                 return Ok(DriverStartup::Acquired);
             }
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = child.process.try_wait()? {
+                child.settle_stderr().await;
                 if status.success() {
                     return Ok(DriverStartup::LostRace);
                 }
@@ -1532,14 +1617,9 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             .arg("--handshake")
             .arg(&handshake)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::from(
-                crate::activity::open_driver_stderr(&store.mission_dir(&mission_id))?,
-            ));
+            .stdout(std::process::Stdio::null());
         isolate_driver_process_group(&mut command);
-        let spawned = command
-            .spawn()
-            .context("spawning detached mission driver")?;
+        let spawned = spawn_detached_driver(&mut command, &store.mission_dir(&mission_id))?;
         child = Some(spawned);
         let startup_result = await_driver_startup(
             child.as_mut().expect("driver was just spawned"),
@@ -1552,9 +1632,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     }
     if args.wait {
         if let Some(mut child) = child {
-            let status = tokio::task::spawn_blocking(move || child.wait())
-                .await
-                .context("joining mission driver waiter")??;
+            let status = child.wait().await?;
             if !status.success() {
                 let detail = crate::activity::driver_error(&store.mission_dir(&mission_id))
                     .unwrap_or_else(|| "no driver error evidence was recorded".into());
@@ -1633,6 +1711,16 @@ async fn cmd_driver(args: DriverArgs) -> Result<std::process::ExitCode> {
         let _ = crate::activity::record_driver_error(&mission_dir, error);
     }
     result
+}
+
+async fn cmd_driver_stderr(args: DriverStderrArgs) -> Result<std::process::ExitCode> {
+    tokio::task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        crate::activity::spool_driver_stderr(stdin.lock(), &args.mission_dir)
+    })
+    .await
+    .context("joining driver stderr spool")??;
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 async fn cmd_status(args: StatusArgs) -> Result<()> {
@@ -3256,10 +3344,18 @@ mod tests {
     async fn successful_driver_exit_before_handshake_is_a_benign_ownership_race() {
         let temp = tempfile::tempdir().unwrap();
         let handshake = temp.path().join("never-published.ready");
-        let mut child = std::process::Command::new("sh")
+        let process = std::process::Command::new("sh")
             .args(["-c", "exit 0"])
             .spawn()
             .unwrap();
+        let stderr_spool = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let mut child = DetachedDriver {
+            process,
+            stderr_spool,
+        };
 
         assert_eq!(
             await_driver_startup(&mut child, &handshake, temp.path())
