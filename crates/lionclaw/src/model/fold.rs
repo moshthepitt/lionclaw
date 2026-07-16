@@ -189,6 +189,17 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             outcome,
         } => {
+            let observed_configuration = state.inflight.get(effect_id).and_then(|effect| {
+                if let InflightEffect::RoleRun {
+                    runtime_configuration,
+                    ..
+                } = effect
+                {
+                    runtime_configuration.clone()
+                } else {
+                    None
+                }
+            });
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
             state.reached_deadlines.remove(effect_id);
@@ -215,6 +226,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                 }
                 Err(failure) => {
+                    let failure =
+                        merge_failure_configuration(failure, observed_configuration.as_ref());
                     if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                         task.attempts = task.attempts.max(*attempt_no);
                         task.status = TaskStatus::Failed;
@@ -321,6 +334,17 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             judged_sha,
             outcome,
         } => {
+            let observed_configuration = state.inflight.get(effect_id).and_then(|effect| {
+                if let InflightEffect::TerminalReview {
+                    runtime_configuration,
+                    ..
+                } = effect
+                {
+                    runtime_configuration.clone()
+                } else {
+                    None
+                }
+            });
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
             state.reached_deadlines.remove(effect_id);
@@ -338,14 +362,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         }));
                 }
                 Err(failure) => {
+                    let failure =
+                        merge_failure_configuration(failure, observed_configuration.as_ref());
                     state
                         .parked_effects
                         .insert(effect_id.clone(), ParkedEffect::TerminalReview);
                     state.terminal_review.consecutive_failures =
                         state.terminal_review.consecutive_failures.saturating_add(1);
-                    state.terminal_review.outcome = Some(ReviewOutcome::Failed {
-                        failure: failure.clone(),
-                    });
+                    state.terminal_review.outcome = Some(ReviewOutcome::Failed { failure });
                 }
             }
         }
@@ -458,6 +482,32 @@ fn merge_runtime_configuration(
         applied_mode: current.applied_mode.clone().or(previous.applied_mode),
         mode_confirmation: current.mode_confirmation.or(previous.mode_confirmation),
     }
+}
+
+fn merge_failure_configuration(
+    failure: &lionclaw_runtime_api::TypedFailure,
+    observed: Option<&RuntimeConfigurationEvidence>,
+) -> lionclaw_runtime_api::TypedFailure {
+    let mut failure = failure.clone();
+    let evidence = failure.evidence_mut();
+    let reported = RuntimeConfigurationEvidence {
+        requested_model: evidence.configuration.requested_model.clone(),
+        applied_model: evidence.configuration.applied_model.clone(),
+        model_confirmation: evidence.configuration.model_confirmation,
+        requested_mode: evidence.configuration.requested_mode.clone(),
+        applied_mode: evidence.configuration.applied_mode.clone(),
+        mode_confirmation: evidence.configuration.mode_confirmation,
+    };
+    let merged = merge_runtime_configuration(observed, &reported);
+    evidence.configuration = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+        requested_model: merged.requested_model,
+        applied_model: merged.applied_model,
+        model_confirmation: merged.model_confirmation,
+        requested_mode: merged.requested_mode,
+        applied_mode: merged.applied_mode,
+        mode_confirmation: merged.mode_confirmation,
+    };
+    failure
 }
 
 fn prune_reopened_parked_effects(state: &mut MissionState) {
@@ -2961,6 +3011,41 @@ mod tests {
         assert_eq!(state.terminal_review.outcome, None);
         assert!(terminal_review_outstanding(&state));
         assert_eq!(state.phase, MissionPhase::Running);
+    }
+
+    #[test]
+    fn terminal_review_failure_retains_effect_scoped_runtime_configuration() {
+        let mut events = events_to_the_brink();
+        events.push(review_requested(1, "kr", "h1"));
+        events.push(MissionEvent::EffectRuntimeConfigured {
+            effect_id: EffectId::for_parts(&["test", "kr"]),
+            configuration: RuntimeConfigurationEvidence {
+                requested_model: Some("requested".into()),
+                applied_model: Some("applied".into()),
+                model_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+                requested_mode: Some("build".into()),
+                applied_mode: Some("build".into()),
+                mode_confirmation: Some(
+                    lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                ),
+            },
+        });
+        events.push(review_failed("kr", "h1", "forced cancellation"));
+
+        let state = fold_log(events).expect("state");
+        let Some(ReviewOutcome::Failed { failure }) = state.terminal_review.outcome else {
+            panic!("terminal review failure must be retained");
+        };
+        assert_eq!(
+            failure.evidence().configuration.applied_model.as_deref(),
+            Some("applied")
+        );
+        assert_eq!(
+            failure.evidence().configuration.applied_mode.as_deref(),
+            Some("build")
+        );
     }
 
     #[test]

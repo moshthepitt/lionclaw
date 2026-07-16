@@ -1491,11 +1491,20 @@ async fn await_driver_startup(
     .context("mission driver startup handshake timed out")?
 }
 
+async fn wait_for_existing_driver(store: &MissionStore, mission_id: &MissionId) -> Result<()> {
+    let lock_path = store.driver_lock_path(mission_id);
+    tokio::task::spawn_blocking(move || crate::driver_lock::DriverGuard::acquire(&lock_path))
+        .await
+        .context("joining driver-lock waiter")??;
+    Ok(())
+}
+
 async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let (repo, store) = open_store(args.repo).await?;
     let mission_id = resolve_mission_id(&store, args.mission_id.as_deref()).await?;
     let initial = load_mission_view(&store, &mission_id).await?;
     let mut child = None;
+    let mut startup = None;
     if matches!(
         initial.disposition,
         MissionDisposition::Ready | MissionDisposition::CleanupBlocked
@@ -1525,14 +1534,14 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
             .spawn()
             .context("spawning detached mission driver")?;
         child = Some(spawned);
-        let startup = await_driver_startup(
+        let startup_result = await_driver_startup(
             child.as_mut().expect("driver was just spawned"),
             &handshake,
             &store.mission_dir(&mission_id),
         )
         .await;
         let _ = std::fs::remove_file(&handshake);
-        startup?;
+        startup = Some(startup_result?);
     }
     if args.wait {
         if let Some(mut child) = child {
@@ -1544,13 +1553,11 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
                     .unwrap_or_else(|| "no driver error evidence was recorded".into());
                 bail!("mission driver exited unsuccessfully ({status}): {detail}");
             }
+            if startup == Some(DriverStartup::LostRace) {
+                wait_for_existing_driver(&store, &mission_id).await?;
+            }
         } else if matches!(initial.disposition, MissionDisposition::Running) {
-            let lock_path = store.driver_lock_path(&mission_id);
-            tokio::task::spawn_blocking(move || {
-                crate::driver_lock::DriverGuard::acquire(&lock_path)
-            })
-            .await
-            .context("joining driver-lock waiter")??;
+            wait_for_existing_driver(&store, &mission_id).await?;
         }
     }
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
@@ -3163,6 +3170,32 @@ mod tests {
                 .unwrap(),
             DriverStartup::LostRace
         );
+    }
+
+    #[tokio::test]
+    async fn lost_startup_race_waits_for_the_winning_driver_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MissionStore::open(temp.path()).await.unwrap();
+        let mission_id = MissionId::from_digest_prefix("1234567890abcdef");
+        let winner =
+            crate::driver_lock::DriverGuard::acquire(&store.driver_lock_path(&mission_id)).unwrap();
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            let mission_id = mission_id.clone();
+            async move { wait_for_existing_driver(&store, &mission_id).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "--wait must remain with the winning driver"
+        );
+        drop(winner);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter observes driver release")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
