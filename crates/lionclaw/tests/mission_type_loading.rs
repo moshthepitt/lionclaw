@@ -347,6 +347,23 @@ fn the_minimal_type_loads() {
     load_mission_type(dir.path(), &AuthorityCeiling::default()).expect("valid type loads");
 }
 
+#[test]
+fn an_invalid_execution_policy_refuses_to_load() {
+    let dir = tempfile::tempdir().unwrap();
+    write_valid_type(dir.path());
+    std::fs::write(
+        dir.path().join("mission.toml"),
+        "[mission-type]\nname = \"guarded\"\nstop = \"verified\"\nimage = \"img\"\n\
+         \n[execution]\ndefault-timeout-secs = 0\nmax-task-time-secs = 1\nextension-step-secs = 1\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        &load_err(dir.path()),
+        MissionTypeError::Manifest(detail) if detail.contains("[execution]")
+    ));
+}
+
 fn add_input_program(root: &std::path::Path, name: &str) {
     std::fs::create_dir_all(root.join("inputs")).unwrap();
     write_oracle(

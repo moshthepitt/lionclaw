@@ -526,3 +526,35 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
         .count();
     assert_eq!(automatic, 2);
 }
+
+#[tokio::test]
+async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store,
+        test_mission_type(),
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mut config = default_config();
+    config.execution.default_timeout_secs = 0;
+
+    let error = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject invalid policy",
+            BASE_SHA,
+            config,
+        )
+        .await
+        .expect_err("direct callers must not persist invalid execution policy");
+
+    assert!(error.to_string().contains("invalid execution policy"));
+}

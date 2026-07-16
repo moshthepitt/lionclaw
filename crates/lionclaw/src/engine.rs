@@ -316,6 +316,10 @@ impl Engine {
         base_sha: &str,
         config: crate::model::MissionConfig,
     ) -> Result<MissionId> {
+        config
+            .execution
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid execution policy: {error}"))?;
         // The loader enforces both rules for mission types; enforce them here
         // too so no direct caller can mint a config the closing gate cannot
         // honor (the fold is total and cannot refuse the config).

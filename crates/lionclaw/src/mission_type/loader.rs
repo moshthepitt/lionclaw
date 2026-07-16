@@ -69,6 +69,10 @@ pub fn load_mission_type(
             manifest.mission_type.name
         )));
     }
+    manifest
+        .execution
+        .validate()
+        .map_err(|error| MissionTypeError::Manifest(format!("[execution] {error}")))?;
     let stop = match manifest.mission_type.stop.as_str() {
         "verified" => StopBar::Verified,
         "reviewed" => StopBar::Reviewed,
