@@ -850,7 +850,8 @@ mod tests {
     #[test]
     fn completed_turn_accepts_only_confirmed_adapter_canonicalization() {
         let profiles = RuntimeProfiles::from_toml(
-            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n",
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n\
+             [runtimes.mode]\ndriver = \"acp\"\ncommand = \"example\"\nmode = \"build\"\n",
             Path::new("/home/alice"),
         )
         .unwrap();
@@ -917,6 +918,28 @@ mod tests {
                 .applied_model
                 .as_deref(),
             Some("unrelated-fallback")
+        );
+
+        let mode_profile = profiles.get("mode").unwrap();
+        let unconfirmed_mode = validate_completed_turn(
+            &mode_profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_mode: Some("build".into()),
+                    applied_mode: Some("build".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed_mode
+                .evidence()
+                .configuration
+                .applied_mode
+                .as_deref(),
+            Some("build")
         );
     }
 
