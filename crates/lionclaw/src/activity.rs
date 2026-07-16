@@ -185,7 +185,16 @@ pub fn driver_error(mission_dir: &Path) -> Option<String> {
 }
 
 fn read_driver_diagnostic(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .ok()?;
+    let file = std::fs::File::from(descriptor);
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(MAX_DRIVER_DIAGNOSTIC_BYTES as usize);
     file.take(MAX_DRIVER_DIAGNOSTIC_BYTES)
         .read_to_end(&mut bytes)
@@ -945,5 +954,28 @@ mod tests {
             128 * 1024,
             "diagnostic failure must not backpressure mission execution"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_diagnostic_reads_reject_indirection_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external.txt");
+        std::fs::write(&external, "must not be disclosed").unwrap();
+        symlink(&external, driver_error_path(temp.path())).unwrap();
+
+        assert_eq!(driver_error(temp.path()), None);
+        std::fs::remove_file(driver_error_path(temp.path())).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            driver_error_path(temp.path()),
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        assert_eq!(driver_error(temp.path()), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rustix::fs::{open, Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::model::EffectId;
 use tokio::process::Command;
@@ -192,9 +193,9 @@ pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()>
     Ok(())
 }
 
-/// Why post-run artifact capture failed. Distinguishes the one agent-behavior
-/// case (an uncommitted tree) from everything else (Git infrastructure),
-/// so the runner labels the persisted failure correctly.
+/// Why post-run artifact capture failed. Correctable dirty output, permanent
+/// history divergence, and Git infrastructure failures have different retry
+/// semantics at the runner boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("worker left uncommitted changes ({0} paths)")]
@@ -436,6 +437,7 @@ fn clear_git_authority_environment(command: &mut Command) {
 
 static OBSERVER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_GIT_METADATA_BYTES: u64 = 4 * 1024;
+const MAX_PACKED_REFS_BYTES: u64 = 8 * 1024 * 1024;
 
 struct TaskGitObserver {
     metadata: PathBuf,
@@ -611,13 +613,18 @@ fn optional_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
     }
 }
 
-fn read_bounded_regular_string(path: &Path, label: &str) -> Result<String> {
-    let descriptor = open(
+fn try_read_bounded_regular_bytes(path: &Path, label: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    let descriptor = match open(
         path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-    )
-    .with_context(|| format!("opening {label} '{}'", path.display()))?;
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {label} '{}'", path.display()))
+        }
+    };
     let mut file = File::from(descriptor);
     let metadata = file
         .metadata()
@@ -625,25 +632,31 @@ fn read_bounded_regular_string(path: &Path, label: &str) -> Result<String> {
     if !metadata.is_file() {
         bail!("{label} '{}' is not a regular file", path.display());
     }
-    if metadata.len() > MAX_GIT_METADATA_BYTES {
+    if metadata.len() > limit {
         bail!(
             "{label} '{}' exceeds the {} byte metadata limit",
             path.display(),
-            MAX_GIT_METADATA_BYTES
+            limit
         );
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.by_ref()
-        .take(MAX_GIT_METADATA_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {label} '{}'", path.display()))?;
-    if bytes.len() as u64 > MAX_GIT_METADATA_BYTES {
+    if bytes.len() as u64 > limit {
         bail!(
             "{label} '{}' exceeds the {} byte metadata limit",
             path.display(),
-            MAX_GIT_METADATA_BYTES
+            limit
         );
     }
+    Ok(Some(bytes))
+}
+
+fn read_bounded_regular_string(path: &Path, label: &str) -> Result<String> {
+    let bytes = try_read_bounded_regular_bytes(path, label, MAX_GIT_METADATA_BYTES)?
+        .with_context(|| format!("opening {label} '{}': file not found", path.display()))?;
     String::from_utf8(bytes).with_context(|| format!("{label} '{}' is not UTF-8", path.display()))
 }
 
@@ -674,12 +687,20 @@ fn resolve_task_head(git_dir: &Path) -> Result<String> {
         })
         .context("invalid symbolic Git HEAD")?;
     let reference_path = safe_reference_path(git_dir, reference)?;
-    let value = read_bounded_regular_string(&reference_path, "Git reference")?;
-    let value = value.trim();
-    if !valid_object_id(value) {
-        bail!("Git reference '{reference}' does not contain a full object ID");
+    if let Some(bytes) =
+        try_read_bounded_regular_bytes(&reference_path, "Git reference", MAX_GIT_METADATA_BYTES)?
+    {
+        let value = String::from_utf8(bytes)
+            .with_context(|| format!("Git reference '{reference}' is not UTF-8"))?;
+        let value = value.trim();
+        if !valid_object_id(value) {
+            bail!("Git reference '{reference}' does not contain a full object ID");
+        }
+        return Ok(value.to_string());
     }
-    Ok(value.to_string())
+    read_packed_reference(git_dir, reference)?.with_context(|| {
+        format!("symbolic Git HEAD reference '{reference}' does not resolve in the task clone")
+    })
 }
 
 fn safe_reference_path(git_dir: &Path, reference: &str) -> Result<PathBuf> {
@@ -694,18 +715,58 @@ fn safe_reference_path(git_dir: &Path, reference: &str) -> Result<PathBuf> {
         bail!("invalid symbolic Git HEAD reference '{reference}'");
     }
     let mut path = git_dir.to_path_buf();
+    let mut parent_missing = false;
     for component in &components[..components.len() - 1] {
         let Component::Normal(component) = component else {
             unreachable!("reference components were validated")
         };
         path.push(component);
-        directory(&path, "Git reference directory")?;
+        if !parent_missing {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => bail!(
+                    "Git reference directory '{}' is not a directory",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    parent_missing = true;
+                }
+                Err(error) => return Err(error).context("reading Git reference directory"),
+            }
+        }
     }
     let Component::Normal(file_name) = components.last().expect("reference is nonempty") else {
         unreachable!("reference components were validated")
     };
     path.push(file_name);
     Ok(path)
+}
+
+fn read_packed_reference(git_dir: &Path, reference: &str) -> Result<Option<String>> {
+    let path = git_dir.join("packed-refs");
+    let Some(bytes) =
+        try_read_bounded_regular_bytes(&path, "packed Git references", MAX_PACKED_REFS_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let packed = std::str::from_utf8(&bytes)
+        .with_context(|| format!("packed Git references '{}' are not UTF-8", path.display()))?;
+    for line in packed.lines() {
+        if line.starts_with(['#', '^']) {
+            continue;
+        }
+        let Some((object, name)) = line.split_once(' ') else {
+            continue;
+        };
+        if name == reference {
+            if !valid_object_id(object) {
+                bail!("packed Git reference '{reference}' has an invalid object ID");
+            }
+            return Ok(Some(object.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn valid_object_id(value: &str) -> bool {
@@ -840,6 +901,32 @@ mod tests {
         assert!(resolve_managed_commit(repo.path(), &mission_ref)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn capture_supports_a_symbolic_head_stored_in_packed_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        git(&checkout, &["checkout", "-q", "-b", "worker"])
+            .await
+            .unwrap();
+        let head = commit_change(&checkout, "packed worker change\n").await;
+        git(&checkout, &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        assert!(!checkout.join(".git/refs/heads/worker").exists());
+
+        let effect_id = EffectId::for_parts(&["test", "packed-head"]);
+        let captured =
+            capture_worker_result(repo.path(), &checkout, &base, "mabc123def456", &effect_id)
+                .await
+                .expect("a valid packed symbolic HEAD remains capturable");
+        assert_eq!(captured, head);
     }
 
     #[tokio::test]
@@ -986,6 +1073,47 @@ mod tests {
             .await
             .expect_err("special Git metadata files are never opened as streams");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn task_observation_rejects_oversized_packed_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        let packed = repo.path().join(".git/packed-refs");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&packed)
+            .unwrap()
+            .set_len(MAX_PACKED_REFS_BYTES + 1)
+            .unwrap();
+
+        let error = observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("packed reference parsing has a fixed total bound");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_observation_rejects_symlinked_packed_refs() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["pack-refs", "--all", "--prune"])
+            .await
+            .unwrap();
+        let packed = repo.path().join(".git/packed-refs");
+        let external = repo.path().join("external-packed-refs");
+        std::fs::rename(&packed, &external).unwrap();
+        symlink(&external, &packed).unwrap();
+
+        observed_git_output(repo.path(), &["status", "--short"])
+            .await
+            .expect_err("packed references must be a no-follow regular file");
     }
 
     async fn commit_change(repo: &Path, contents: &str) -> String {
