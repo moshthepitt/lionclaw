@@ -53,14 +53,16 @@ where
                 .await?;
 
         if attempt.output.success() {
-            flush_buffered_program_output_events(&journal, attempt.buffered_errors);
+            flush_buffered_program_output_events(&journal, attempt.buffered_errors).await;
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
                 attempt.last_error_text.as_deref(),
                 attempt.saw_done,
+                attempt.final_response,
                 &journal,
-            );
+            )
+            .await;
         }
 
         if !attempted_retry
@@ -78,14 +80,16 @@ where
             continue;
         }
 
-        flush_buffered_program_output_events(&journal, attempt.buffered_errors);
+        flush_buffered_program_output_events(&journal, attempt.buffered_errors).await;
         return finish_program_backed_turn(
             adapter,
             attempt.output,
             attempt.last_error_text.as_deref(),
             attempt.saw_done,
+            attempt.final_response,
             &journal,
-        );
+        )
+        .await;
     }
 }
 
@@ -94,6 +98,35 @@ struct ProgramBackedAttemptOutcome {
     output: ExecutionOutput,
     saw_done: bool,
     last_error_text: Option<String>,
+    final_response: String,
+}
+
+struct ProgramOutputObservation {
+    buffered_errors: Option<Vec<RuntimeEvent>>,
+    saw_done: bool,
+    last_error_text: Option<String>,
+    final_response: String,
+}
+
+impl ProgramOutputObservation {
+    fn new(buffer_errors: bool) -> Self {
+        Self {
+            buffered_errors: buffer_errors.then(Vec::new),
+            saw_done: false,
+            last_error_text: None,
+            final_response: String::new(),
+        }
+    }
+
+    fn finish(self, output: ExecutionOutput) -> ProgramBackedAttemptOutcome {
+        ProgramBackedAttemptOutcome {
+            buffered_errors: self.buffered_errors,
+            output,
+            saw_done: self.saw_done,
+            last_error_text: self.last_error_text,
+            final_response: self.final_response,
+        }
+    }
 }
 
 async fn run_program_backed_attempt<A>(
@@ -111,9 +144,7 @@ where
     let execution = executor.execute_streaming(program, stdout_tx);
     tokio::pin!(execution);
 
-    let mut buffered_errors = input.fresh_prompt.is_some().then(Vec::new);
-    let mut saw_done = false;
-    let mut last_error_text: Option<String> = None;
+    let mut observation = ProgramOutputObservation::new(input.fresh_prompt.is_some());
     let mut output_parser = adapter.program_output_parser(input);
 
     loop {
@@ -124,26 +155,17 @@ where
                         adapter,
                         &mut output_parser,
                         journal,
-                        &mut buffered_errors,
                         &line,
-                        &mut saw_done,
-                        &mut last_error_text,
-                    ),
+                        &mut observation,
+                    ).await,
                     None => {
                         finish_program_output_parser(
                             &mut output_parser,
                             journal,
-                            &mut buffered_errors,
-                            &mut saw_done,
-                            &mut last_error_text,
-                        );
+                            &mut observation,
+                        ).await;
                         let output = execution.await?;
-                        return Ok(ProgramBackedAttemptOutcome {
-                            buffered_errors,
-                            output,
-                            saw_done,
-                            last_error_text,
-                        });
+                        return Ok(observation.finish(output));
                     }
                 }
             }
@@ -154,38 +176,27 @@ where
                         adapter,
                         &mut output_parser,
                         journal,
-                        &mut buffered_errors,
                         &line,
-                        &mut saw_done,
-                        &mut last_error_text,
-                    );
+                        &mut observation,
+                    ).await;
                 }
                 finish_program_output_parser(
                     &mut output_parser,
                     journal,
-                    &mut buffered_errors,
-                    &mut saw_done,
-                    &mut last_error_text,
-                );
-                return Ok(ProgramBackedAttemptOutcome {
-                    buffered_errors,
-                    output,
-                    saw_done,
-                    last_error_text,
-                });
+                    &mut observation,
+                ).await;
+                return Ok(observation.finish(output));
             }
         }
     }
 }
 
-fn observe_program_output_line<A>(
+async fn observe_program_output_line<A>(
     adapter: &A,
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     journal: &RuntimeTurnJournalSender,
-    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
-    saw_done: &mut bool,
-    last_error_text: &mut Option<String>,
+    observation: &mut ProgramOutputObservation,
 ) where
     A: RuntimeAdapter + Send + Sync + ?Sized,
 {
@@ -195,75 +206,64 @@ fn observe_program_output_line<A>(
         adapter.parse_program_output_line(line)
     };
 
-    observe_program_output_events(
-        journal,
-        buffered_errors,
-        parsed_events,
-        saw_done,
-        last_error_text,
-    );
+    observe_program_output_events(journal, parsed_events, observation).await;
 }
 
-fn finish_program_output_parser(
+async fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     journal: &RuntimeTurnJournalSender,
-    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
-    saw_done: &mut bool,
-    last_error_text: &mut Option<String>,
+    observation: &mut ProgramOutputObservation,
 ) {
     if let Some(parser) = output_parser.as_mut() {
-        observe_program_output_events(
-            journal,
-            buffered_errors,
-            parser.finish(),
-            saw_done,
-            last_error_text,
-        );
+        observe_program_output_events(journal, parser.finish(), observation).await;
     }
 }
 
-fn observe_program_output_events(
+async fn observe_program_output_events(
     journal: &RuntimeTurnJournalSender,
-    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
-    saw_done: &mut bool,
-    last_error_text: &mut Option<String>,
+    observation: &mut ProgramOutputObservation,
 ) {
     for event in parsed_events {
+        crate::event::observe_final_response(&mut observation.final_response, &event);
         if matches!(event, RuntimeEvent::Done) {
-            *saw_done = true;
+            observation.saw_done = true;
         }
         if let RuntimeEvent::Error { text, .. } = &event {
-            *last_error_text = Some(text.clone());
+            observation.last_error_text = Some(text.clone());
         }
         if matches!(event, RuntimeEvent::Error { .. }) {
-            if let Some(buffer) = buffered_errors.as_mut() {
+            if let Some(buffer) = observation.buffered_errors.as_mut() {
+                if buffer.len() == crate::event::RUNTIME_TURN_JOURNAL_CAPACITY {
+                    buffer.remove(0);
+                }
                 buffer.push(event);
             } else {
-                drop(journal.send(TurnEvent::canonical(event)));
+                drop(journal.send(TurnEvent::canonical(event)).await);
             }
         } else {
-            drop(journal.send(TurnEvent::canonical(event)));
+            drop(journal.send(TurnEvent::canonical(event)).await);
         }
     }
 }
 
-fn flush_buffered_program_output_events(
+async fn flush_buffered_program_output_events(
     journal: &RuntimeTurnJournalSender,
     buffered_errors: Option<Vec<RuntimeEvent>>,
 ) {
     if let Some(buffered_errors) = buffered_errors {
         for event in buffered_errors {
-            drop(journal.send(TurnEvent::canonical(event)));
+            drop(journal.send(TurnEvent::canonical(event)).await);
         }
     }
 }
 
-fn finish_program_backed_turn<A>(
+async fn finish_program_backed_turn<A>(
     adapter: &A,
     output: ExecutionOutput,
     observed_error_text: Option<&str>,
     saw_done: bool,
+    final_response: String,
     journal: &RuntimeTurnJournalSender,
 ) -> Result<RuntimeTurnResult>
 where
@@ -276,12 +276,12 @@ where
     }
 
     if !saw_done {
-        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
     }
 
     Ok(RuntimeTurnResult {
         capability_requests: Vec::new(),
         configuration: Default::default(),
-        final_response: String::new(),
+        final_response: final_response.trim_end().to_string(),
     })
 }

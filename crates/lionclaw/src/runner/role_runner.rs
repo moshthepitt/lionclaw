@@ -1,8 +1,8 @@
 //! `OciRoleRunner`: the production [`RoleRunner`]. One dispatch =
 //! isolate the workspace, compile the plan through the moat, run one full
 //! agent turn under confinement, capture the handoff (and, for writers, the
-//! resulting commit). Timeouts are enforced here (`process.rs` does not);
-//! `kill_on_drop` reaps the container when a timed-out future is dropped.
+//! resulting commit). The engine owns deadlines; this boundary observes its
+//! control channel throughout setup, execution, and capture.
 
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use crate::ports::{ExecutionControl, RoleRunOutcome, RoleRunRequest, RoleRunner}
 use super::executor::{mission_execution_context, MissionProgramExecutor};
 use super::handoff::read_handoff;
 use super::native_home_auth::NativeHomeAuthProvider;
-use super::{prepare_skill_mounts, EffectDirs, TaskDirs, SCRATCH_MOUNT_TARGET};
+use super::{await_controlled, prepare_skill_mounts, EffectDirs, TaskDirs, SCRATCH_MOUNT_TARGET};
 use crate::workspace;
 
 pub struct OciRoleRunner {
@@ -120,6 +120,46 @@ fn launch(detail: String) -> TypedFailure {
     TypedFailure::permanent("kernel.launch", detail)
 }
 
+fn setup_control_failure(
+    profile: &MissionRuntimeProfile,
+    control: &ExecutionControl,
+) -> Option<TypedFailure> {
+    let (deadline, reason) = match control {
+        ExecutionControl::RunUntil(_) => return None,
+        ExecutionControl::DeadlineExhausted => (true, "effect deadline exhausted".to_string()),
+        ExecutionControl::Stop(reason) => (false, reason.clone()),
+    };
+    let mut evidence = turn_failure_evidence(
+        profile,
+        if deadline {
+            "effect deadline reached before or after the runtime turn"
+        } else {
+            "effect stopped before or after the runtime turn"
+        }
+        .into(),
+        String::new(),
+        String::new(),
+    );
+    evidence.code = Some(
+        if deadline {
+            "kernel.deadline"
+        } else {
+            "kernel.stopped"
+        }
+        .into(),
+    );
+    evidence.stop_reason = Some(reason);
+    Some(if deadline {
+        TypedFailure::DeadlineExhausted {
+            evidence: Box::new(evidence),
+        }
+    } else {
+        TypedFailure::OperatorStopped {
+            evidence: Box::new(evidence),
+        }
+    })
+}
+
 async fn cancellation_acknowledged<A, T, O>(
     acknowledgement: A,
     mut turn: std::pin::Pin<&mut T>,
@@ -152,14 +192,17 @@ where
     )
 }
 
-fn completed_turn_configuration(
+fn completed_turn_evidence(
     completed: Option<anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>>,
-) -> Option<lionclaw_runtime_api::AppliedRuntimeConfiguration> {
+) -> Option<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String)> {
     completed.and_then(|completed| match completed {
-        Ok(result) => Some(result.configuration),
-        Err(error) => error
-            .downcast_ref::<TypedFailure>()
-            .map(|failure| failure.evidence().configuration.clone()),
+        Ok(result) => Some((result.configuration, result.final_response)),
+        Err(error) => error.downcast_ref::<TypedFailure>().map(|failure| {
+            (
+                failure.evidence().configuration.clone(),
+                failure.evidence().final_response.clone(),
+            )
+        }),
     })
 }
 
@@ -208,7 +251,7 @@ async fn prepare_writer_checkout(
             )));
         }
     }
-    workspace::create_checkout(repo, workspace, base_sha)
+    workspace::replace_checkout(repo, workspace, base_sha)
         .await
         .map_err(|e| launch(format!("failed to create checkout: {e}")))
 }
@@ -233,10 +276,7 @@ impl RoleRunner for OciRoleRunner {
         )
         .map_err(|e| launch(format!("failed to prepare attempt dirs: {e}")))?;
 
-        // Keep every fallible stage in one result. The engine owns the one
-        // cleanup path after this runner returns, including failures before a
-        // turn starts and recovery after this process exits.
-        let result: Result<RoleRunOutcome, TypedFailure> = async {
+        let setup = async {
             let skill_mounts = prepare_skill_mounts(
                 &dirs.runtime_home,
                 &request.skills,
@@ -304,12 +344,21 @@ impl RoleRunner for OciRoleRunner {
                 environment,
             })
             .map_err(|e| launch(format!("plan refused to compile (moat): {e}")))?;
+            Ok((is_writer, workspace_source, compiled.plan().clone()))
+        };
+        let (is_writer, workspace_source, plan) =
+            await_controlled(setup, request.control.clone(), |control| {
+                setup_control_failure(&profile, control)
+            })
+            .await?;
 
-            // Run the agent turn under confinement, then capture the artifact
-            // (writer only) before the workspace is torn down.
-            let (applied, final_response) = self
-                .run_turn(&profile, &request, compiled.plan().clone())
-                .await?;
+        // The adapter owns cancellation acknowledgement while its turn is
+        // live. Setup and capture use the same engine control, but are simply
+        // dropped: their child processes are kill-on-drop and task work is not.
+        let (applied, final_response) = self.run_turn(&profile, &request, plan).await?;
+        let cancellation_configuration = applied.clone();
+        let cancellation_response = final_response.clone();
+        let finish = async {
             let handoff =
                 read_handoff(&dirs.handoff, request.role.output).map_err(|mut failure| {
                     failure.evidence_mut().final_response = final_response.clone();
@@ -358,10 +407,15 @@ impl RoleRunner for OciRoleRunner {
                 },
                 final_response,
             })
-        }
-        .await;
-
-        result
+        };
+        await_controlled(finish, request.control.clone(), |control| {
+            setup_control_failure(&profile, control).map(|mut failure| {
+                failure.evidence_mut().configuration = cancellation_configuration.clone();
+                failure.evidence_mut().final_response = cancellation_response.clone();
+                failure
+            })
+        })
+        .await
     }
 }
 
@@ -393,25 +447,32 @@ impl OciRoleRunner {
             .iter()
             .find(|m| m.target == lionclaw_confinement::RUNTIME_MOUNT_TARGET)
             .map(|m| m.source.clone());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: uuid_from_key(request.effect_id.as_str()),
-                working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
-                environment: plan.environment.clone(),
-                runtime_state_root: state_root,
-                runtime_session_ready: RuntimeSessionReady::not_ready(),
-            })
-            .await
-            .map_err(|e| launch(format!("session_start failed: {e}")))?;
+        let start = async {
+            adapter
+                .session_start(RuntimeSessionStartInput {
+                    session_id: uuid_from_key(request.effect_id.as_str()),
+                    working_dir: Some(WORKSPACE_MOUNT_TARGET.to_string()),
+                    environment: plan.environment.clone(),
+                    runtime_state_root: state_root,
+                    runtime_session_ready: RuntimeSessionReady::not_ready(),
+                })
+                .await
+                .map_err(|e| launch(format!("session_start failed: {e}")))
+        };
+        let handle = await_controlled(start, request.control.clone(), |control| {
+            setup_control_failure(profile, control)
+        })
+        .await?;
 
         let (journal_tx, mut journal_rx) =
-            tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
+            tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
+                lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
+            );
         let updates = request.updates.clone();
         let activity = request.activity.clone();
         let activity_effect_id = request.effect_id.clone();
         let drain = tokio::spawn(async move {
             let mut last_error = None;
-            let mut final_response = String::new();
             while let Some(event) = journal_rx.recv().await {
                 if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
                     &event.event
@@ -423,23 +484,11 @@ impl OciRoleRunner {
                         .await;
                 }
                 activity.send_replace(Some((activity_effect_id.clone(), event.clone())));
-                match &event.event {
-                    lionclaw_runtime_api::RuntimeEvent::Error { text, .. } => {
-                        last_error = Some(text.clone());
-                    }
-                    lionclaw_runtime_api::RuntimeEvent::MessageDelta {
-                        lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
-                        text,
-                    } => {
-                        lionclaw_runtime_api::append_streamed_text_delta(&mut final_response, text)
-                    }
-                    lionclaw_runtime_api::RuntimeEvent::MessageBoundary {
-                        lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
-                    } => lionclaw_runtime_api::append_streamed_text_boundary(&mut final_response),
-                    _ => {}
+                if let lionclaw_runtime_api::RuntimeEvent::Error { text, .. } = &event.event {
+                    last_error = Some(lionclaw_runtime_api::bounded_text(text));
                 }
             }
-            (last_error, final_response.trim_end().to_string())
+            last_error
         });
 
         let mut turn = Box::pin(adapter.program_backed_turn(
@@ -514,8 +563,9 @@ impl OciRoleRunner {
                     String::new(),
                     String::new(),
                 );
-                if let Some(configuration) = completed_turn_configuration(completed) {
+                if let Some((configuration, final_response)) = completed_turn_evidence(completed) {
                     evidence.configuration = configuration;
+                    evidence.final_response = final_response;
                 }
                 evidence.code = Some(
                     if acknowledged {
@@ -539,14 +589,13 @@ impl OciRoleRunner {
         };
         drop(turn);
         let _ = adapter.close(&handle).await;
-        let (last_error, final_response) = drain.await.unwrap_or_default();
+        let last_error = drain.await.unwrap_or_default();
 
         match result {
             Err(mut failure) => {
                 let evidence = failure.evidence_mut();
                 evidence.stderr =
                     lionclaw_runtime_api::bounded_text(last_error.as_deref().unwrap_or_default());
-                evidence.final_response = lionclaw_runtime_api::bounded_text(&final_response);
                 evidence.configuration.requested_model = profile.model.clone();
                 evidence.configuration.requested_mode = profile.mode.clone();
                 Err(failure.projected())
@@ -563,7 +612,10 @@ impl OciRoleRunner {
                         profile.model, profile.mode
                     )));
                 }
-                Ok((configuration, final_response))
+                Ok((
+                    configuration,
+                    lionclaw_runtime_api::bounded_text(&result.final_response),
+                ))
             }
         }
     }
@@ -749,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_reclassification_preserves_structured_runtime_configuration() {
+    fn cancellation_reclassification_preserves_runtime_evidence() {
         let expected = lionclaw_runtime_api::AppliedRuntimeConfiguration {
             requested_mode: Some("build".into()),
             applied_mode: Some("build".into()),
@@ -760,9 +812,10 @@ mod tests {
         };
         let mut failure = TypedFailure::permanent("runtime.cancelled", "cancelled");
         failure.evidence_mut().configuration = expected.clone();
+        failure.evidence_mut().final_response = "work before stop".into();
         assert_eq!(
-            completed_turn_configuration(Some(Err(anyhow::Error::new(failure)))),
-            Some(expected)
+            completed_turn_evidence(Some(Err(anyhow::Error::new(failure)))),
+            Some((expected, "work before stop".into()))
         );
     }
 

@@ -72,24 +72,31 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         input: RuntimeTurnInput,
         journal: RuntimeTurnJournalSender,
     ) -> Result<RuntimeTurnResult> {
-        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Status {
-            code: None,
-            text: "mock runtime started turn".to_string(),
-        })));
-
+        let final_response = format!("[mock] prompt: {}", input.prompt);
         drop(
-            journal.send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: format!("[mock] prompt: {}", input.prompt),
-            })),
+            journal
+                .send(TurnEvent::canonical(RuntimeEvent::Status {
+                    code: None,
+                    text: "mock runtime started turn".to_string(),
+                }))
+                .await,
         );
 
-        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)));
+        drop(
+            journal
+                .send(TurnEvent::canonical(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: final_response.clone(),
+                }))
+                .await,
+        );
+
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
 
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
             configuration: Default::default(),
-            final_response: String::new(),
+            final_response,
         })
     }
 
@@ -177,7 +184,9 @@ mod tests {
             .expect("session_start");
 
         let (journal_tx, mut journal_rx) =
-            tokio::sync::mpsc::unbounded_channel::<lionclaw_runtime_api::TurnEvent>();
+            tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
+                lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
+            );
         let result = adapter
             .turn(
                 RuntimeTurnInput {

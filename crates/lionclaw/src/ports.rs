@@ -106,15 +106,6 @@ pub enum ExecutionControl {
     Stop(String),
 }
 
-pub fn remaining_until(deadline_ms: i64) -> std::time::Duration {
-    #[expect(clippy::disallowed_methods)]
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or_default();
-    std::time::Duration::from_millis(deadline_ms.saturating_sub(now_ms).max(0) as u64)
-}
-
 #[derive(Debug, Clone)]
 pub struct EffectCleanupRequest {
     pub mission_id: MissionId,

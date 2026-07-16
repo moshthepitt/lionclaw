@@ -44,6 +44,7 @@ pub(crate) struct CodexAppServerClient<T> {
     completed_context_compaction_threads: HashSet<String>,
     unmatched_context_compaction_completed: bool,
     emitted_artifact_ids: HashSet<String>,
+    final_response: String,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -82,6 +83,7 @@ where
             completed_context_compaction_threads: HashSet::new(),
             unmatched_context_compaction_completed: false,
             emitted_artifact_ids: HashSet::new(),
+            final_response: String::new(),
         }
     }
 
@@ -581,9 +583,16 @@ where
         let message = message.into();
         let raw_payload = message.raw;
         for event in self.handle_message(message.value, thread_state).await? {
-            sink.send(event, &raw_payload);
+            lionclaw_runtime_api::observe_final_response(&mut self.final_response, &event);
+            sink.send(event, &raw_payload).await;
         }
         Ok(())
+    }
+
+    pub(crate) fn take_final_response(&mut self) -> String {
+        std::mem::take(&mut self.final_response)
+            .trim_end()
+            .to_string()
     }
 
     fn generated_artifact_for_message(

@@ -8,7 +8,8 @@
 //! under OCI relabeling. Artifact-producing output is a recorded commit fetched
 //! back under `refs/mission/…`, never auto-applied.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 
@@ -16,7 +17,7 @@ use crate::model::EffectId;
 use tokio::process::Command;
 
 pub async fn head_sha(repo: &Path) -> Result<String> {
-    let out = git(repo, &["rev-parse", "HEAD"]).await?;
+    let out = observed_git(repo, &["rev-parse", "HEAD"]).await?;
     Ok(out.trim().to_string())
 }
 
@@ -25,16 +26,16 @@ pub async fn commit_exists(repo: &Path, sha: &str) -> bool {
 }
 
 pub async fn is_dirty(repo: &Path) -> Result<bool> {
-    Ok(!git(repo, &["status", "--porcelain"])
+    Ok(!observed_git(repo, &["status", "--porcelain"])
         .await?
         .trim()
         .is_empty())
 }
 
 pub async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .current_dir(repo)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    let observer = GitObserver::open(repo)?;
+    let status = observer
+        .tokio_command()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .status()
         .await
@@ -96,7 +97,7 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
         .await
         .with_context(|| format!("resolving checkout commit '{sha}'"))?;
     let expected = expected.trim();
-    let mut clone = Command::new("git");
+    let mut clone = managed_git_command();
     clone.args([
         "clone",
         "--quiet",
@@ -129,6 +130,39 @@ pub async fn create_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> 
     Ok(())
 }
 
+/// Materialize a checkout completely before replacing a task's durable clone.
+/// The two fixed siblings also make an interrupted swap recoverable on the
+/// next invocation without storing another authority-bearing state machine.
+pub async fn replace_checkout(repo: &Path, dest: &Path, sha: &str) -> Result<()> {
+    let parent = dest.parent().context("checkout dest has no parent")?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("checkout dest has no UTF-8 file name")?;
+    let staging = parent.join(format!(".{name}.prepare"));
+    let previous = parent.join(format!(".{name}.previous"));
+
+    if !dest.exists() && previous.exists() {
+        std::fs::rename(&previous, dest).context("restoring interrupted task checkout swap")?;
+    } else if dest.exists() {
+        remove_dir(&previous).await?;
+    }
+    remove_dir(&staging).await?;
+    create_checkout(repo, &staging, sha).await?;
+
+    if dest.exists() {
+        std::fs::rename(dest, &previous).context("preserving previous task checkout")?;
+    }
+    if let Err(error) = std::fs::rename(&staging, dest) {
+        if previous.exists() && !dest.exists() {
+            let _ = std::fs::rename(&previous, dest);
+        }
+        return Err(error).context("publishing replacement task checkout");
+    }
+    remove_dir(&previous).await?;
+    Ok(())
+}
+
 /// Why post-run artifact capture failed. Distinguishes the one agent-behavior
 /// case (an uncommitted tree) from everything else (Git infrastructure),
 /// so the runner labels the persisted failure correctly.
@@ -149,16 +183,19 @@ pub async fn capture_worker_result(
     mission_id: &str,
     effect_id: &EffectId,
 ) -> Result<String, CaptureError> {
-    let status = git(checkout, &["status", "--porcelain"]).await?;
+    let observer = GitObserver::open(checkout)?;
+    let status = observer.output(&["status", "--porcelain"]).await?;
     if !status.trim().is_empty() {
         return Err(CaptureError::DirtyWorktree(status.lines().count()));
     }
-    let head = head_sha(checkout).await?;
+    let head = observer.output(&["rev-parse", "HEAD"]).await?;
+    let head = head.trim().to_string();
+    let fetch_source = observer.local_fetch_source()?;
     // Fetch the checkout's HEAD commit so the object we report is the object we
     // store, regardless of which refs the agent created or moved locally.
     let mission_ref = format!("refs/mission/{mission_id}/{effect_id}");
     let refspec = format!("+HEAD:{mission_ref}");
-    let mut fetch = Command::new("git");
+    let mut fetch = managed_git_command();
     fetch
         .current_dir(repo)
         .args([
@@ -167,12 +204,12 @@ pub async fn capture_worker_result(
             "--no-write-fetch-head",
             "--no-auto-maintenance",
         ])
-        .arg(checkout)
+        .arg(fetch_source)
         .arg(&refspec);
     run(&mut fetch, "git fetch from worker checkout").await?;
     // The engine observes the commit from Git, never trusts the agent: verify
     // that the exact durable ref landed at the reported head.
-    let stored = resolve_commit(repo, &mission_ref)
+    let stored = resolve_managed_commit(repo, &mission_ref)
         .await
         .map_err(CaptureError::Infra)?;
     if stored.trim() != head {
@@ -216,7 +253,16 @@ pub fn make_executable(path: &Path) -> std::io::Result<()> {
 /// The unified diff between two commits (`from..to`). Empty when the tree did
 /// not change (a writer that committed nothing yields `to == from`).
 pub async fn diff(repo: &Path, from: &str, to: &str) -> Result<String> {
-    git(repo, &["diff", &format!("{from}..{to}")]).await
+    observed_git(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            &format!("{from}..{to}"),
+        ],
+    )
+    .await
 }
 
 /// Create a branch `name` at `sha` without touching HEAD or the worktree. With
@@ -232,6 +278,24 @@ pub async fn create_branch(repo: &Path, name: &str, sha: &str, force: bool) -> R
 }
 
 async fn resolve_commit(repo: &Path, revision: &str) -> Result<String> {
+    let peeled = format!("{revision}^{{commit}}");
+    observed_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &peeled,
+        ],
+    )
+    .await
+}
+
+/// Resolve a ref that LionClaw itself just created in the source repository.
+/// Worker-controlled repositories must use `resolve_commit`, whose synthetic
+/// metadata prevents Git configuration from becoming executable authority.
+async fn resolve_managed_commit(repo: &Path, revision: &str) -> Result<String> {
     let peeled = format!("{revision}^{{commit}}");
     git(
         repo,
@@ -251,10 +315,23 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
+async fn observed_git(repo: &Path, args: &[&str]) -> Result<String> {
+    let observer = GitObserver::open(repo)?;
+    observer.output(args).await
+}
+
+pub fn observed_git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let observer = GitObserver::open(repo)?;
+    observer
+        .std_command()
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to spawn isolated git {args:?}"))
+}
+
 async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = managed_git_command()
         .current_dir(repo)
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .await
@@ -271,6 +348,7 @@ async fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 async fn run(command: &mut Command, label: &str) -> Result<()> {
+    command.kill_on_drop(true);
     let output = command
         .output()
         .await
@@ -282,6 +360,274 @@ async fn run(command: &mut Command, label: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Git mutations against the operator repository or a newly-created clone.
+/// Worker-owned repositories are read only through `GitObserver` below.
+fn managed_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .kill_on_drop(true)
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.pager=cat"])
+        .args(["-c", "diff.external="])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_EXTERNAL_DIFF");
+    command
+}
+
+static OBSERVER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct GitObserver {
+    metadata: PathBuf,
+    worktree: PathBuf,
+    index: PathBuf,
+    objects: PathBuf,
+}
+
+impl GitObserver {
+    fn open(worktree: &Path) -> Result<Self> {
+        let (git_dir, linked_worktree) = resolve_git_dir(worktree)?;
+        let common_dir = resolve_common_dir(&git_dir, linked_worktree)?;
+        let head = resolve_head(&git_dir, &common_dir)?;
+        let index = optional_regular_file(&git_dir.join("index"), "Git index")?;
+        let objects = directory(&common_dir.join("objects"), "Git object database")?;
+        let metadata = loop {
+            let sequence = OBSERVER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "lionclaw-git-observer-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("creating isolated Git metadata"),
+            }
+        };
+        let observer = Self {
+            metadata,
+            worktree: worktree.to_path_buf(),
+            index,
+            objects,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&observer.metadata, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::create_dir(observer.metadata.join("objects"))?;
+        std::fs::create_dir(observer.metadata.join("refs"))?;
+        std::fs::write(observer.metadata.join("HEAD"), format!("{head}\n"))?;
+        std::fs::write(observer.metadata.join("config"), b"")?;
+        Ok(observer)
+    }
+
+    fn tokio_command(&self) -> Command {
+        let mut command = Command::new("git");
+        self.configure_tokio(&mut command);
+        command
+    }
+
+    async fn output(&self, args: &[&str]) -> Result<String> {
+        let output = self
+            .tokio_command()
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn isolated git {args:?}"))?;
+        if !output.status.success() {
+            bail!(
+                "isolated git {:?} failed in '{}': {}",
+                args,
+                self.worktree.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn local_fetch_source(&self) -> Result<&Path> {
+        let objects = self.metadata.join("objects");
+        let info = objects.join("info");
+        std::fs::create_dir(&info)?;
+        let object_path = self.objects.to_string_lossy();
+        if object_path.contains(['\n', '\r']) {
+            bail!("Git object path cannot be represented safely for capture");
+        }
+        std::fs::write(info.join("alternates"), format!("{object_path}\n"))?;
+        Ok(&self.metadata)
+    }
+
+    fn std_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command
+            .arg("--no-optional-locks")
+            .env("GIT_DIR", &self.metadata)
+            .env("GIT_WORK_TREE", &self.worktree)
+            .env("GIT_INDEX_FILE", &self.index)
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_EXTERNAL_DIFF");
+        command
+    }
+
+    fn configure_tokio(&self, command: &mut Command) {
+        command
+            .kill_on_drop(true)
+            .arg("--no-optional-locks")
+            .env("GIT_DIR", &self.metadata)
+            .env("GIT_WORK_TREE", &self.worktree)
+            .env("GIT_INDEX_FILE", &self.index)
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_EXTERNAL_DIFF");
+    }
+}
+
+impl Drop for GitObserver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.metadata);
+    }
+}
+
+fn resolve_git_dir(worktree: &Path) -> Result<(PathBuf, bool)> {
+    let dot_git = worktree.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git)
+        .with_context(|| format!("reading Git entry '{}'", dot_git.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("Git entry '{}' must not be a symlink", dot_git.display());
+    }
+    if metadata.is_dir() {
+        return Ok((dot_git, false));
+    }
+    if !metadata.is_file() {
+        bail!(
+            "Git entry '{}' is not a file or directory",
+            dot_git.display()
+        );
+    }
+    let pointer = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("reading Git directory pointer '{}'", dot_git.display()))?;
+    let relative = pointer
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("invalid Git directory pointer")?;
+    let path = Path::new(relative);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree.join(path)
+    };
+    Ok((directory(&resolved, "Git directory")?, true))
+}
+
+fn resolve_common_dir(git_dir: &Path, linked_worktree: bool) -> Result<PathBuf> {
+    let path = git_dir.join("commondir");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let relative = read_regular_string(&path, "Git common-directory pointer")?;
+            if !linked_worktree {
+                bail!("unexpected Git common-directory pointer in a standalone checkout");
+            }
+            let relative = relative.trim();
+            if relative.is_empty() {
+                bail!("empty Git common-directory pointer");
+            }
+            let relative = Path::new(relative);
+            let resolved = if relative.is_absolute() {
+                relative.to_path_buf()
+            } else {
+                git_dir.join(relative)
+            };
+            directory(&resolved, "Git common directory")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn optional_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(path.to_path_buf())
+        }
+        Ok(_) => bail!("{label} '{}' is not a regular file", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error).with_context(|| format!("reading {label} '{}'", path.display())),
+    }
+}
+
+fn read_regular_string(path: &Path, label: &str) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading {label} '{}'", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("{label} '{}' is not a regular file", path.display());
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {label} '{}'", path.display()))
+}
+
+fn directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading {label} '{}'", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("{label} '{}' is not a directory", path.display());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_head(git_dir: &Path, common_dir: &Path) -> Result<String> {
+    let head = read_regular_string(&git_dir.join("HEAD"), "Git HEAD")?;
+    let head = head.trim();
+    if valid_object_id(head) {
+        return Ok(head.to_string());
+    }
+    let reference = head
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .filter(|reference| {
+            reference.starts_with("refs/")
+                && !reference.contains("..")
+                && reference.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.')
+                })
+        })
+        .context("invalid symbolic Git HEAD")?;
+    for root in [git_dir, common_dir] {
+        if let Ok(value) = read_regular_string(&root.join(reference), "Git reference") {
+            let value = value.trim();
+            if valid_object_id(value) {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    let packed = read_regular_string(&common_dir.join("packed-refs"), "packed Git references")
+        .unwrap_or_default();
+    Ok(packed
+        .lines()
+        .filter(|line| !line.starts_with(['#', '^']))
+        .find_map(|line| {
+            let (object, name) = line.split_once(' ')?;
+            (name == reference && valid_object_id(object)).then(|| object.to_string())
+        })
+        .unwrap_or_else(|| format!("ref: {reference}")))
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -368,6 +714,50 @@ mod tests {
             capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id).await,
             Err(CaptureError::DirtyWorktree(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn capture_never_executes_worker_git_configuration() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = init_repo(repo.path()).await;
+        let work = tempfile::tempdir().unwrap();
+        let checkout = work.path().join("checkout");
+        create_checkout(repo.path(), &checkout, &base)
+            .await
+            .unwrap();
+        let marker = work.path().join("worker-config-executed");
+        let hostile = work.path().join("hostile");
+        std::fs::write(
+            &hostile,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        make_executable(&hostile).unwrap();
+        git(
+            &checkout,
+            &["config", "core.fsmonitor", hostile.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git(
+            &checkout,
+            &[
+                "config",
+                "uploadpack.packObjectsHook",
+                hostile.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let effect_id = EffectId::for_parts(&["test", "hostile-config"]);
+        capture_worker_result(repo.path(), &checkout, "mabc123def456", &effect_id)
+            .await
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "capture must not execute worker status or upload-pack configuration"
+        );
     }
 
     async fn commit_change(repo: &Path, contents: &str) -> String {
@@ -575,5 +965,27 @@ mod tests {
         assert!(git(&checkout, &["fsck", "--full", "--no-dangling"])
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn replacement_recovers_an_interrupted_swap_before_publishing_the_new_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let base = init_repo(&repo).await;
+        let checkout = temp.path().join("work");
+        replace_checkout(&repo, &checkout, &base).await.unwrap();
+
+        let next = commit_change(&repo, "next\n").await;
+        let previous = temp.path().join(".work.previous");
+        let staging = temp.path().join(".work.prepare");
+        std::fs::rename(&checkout, &previous).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("partial"), "interrupted clone").unwrap();
+
+        replace_checkout(&repo, &checkout, &next).await.unwrap();
+        assert_eq!(head_sha(&checkout).await.unwrap(), next);
+        assert!(!previous.exists());
+        assert!(!staging.exists());
     }
 }

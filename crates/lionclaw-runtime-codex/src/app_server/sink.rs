@@ -1,8 +1,4 @@
-use lionclaw_runtime_api::{
-    RawTurnPayload, RuntimeEvent, RuntimeEventSender, RuntimeTurnJournalSender, TurnEvent,
-};
-
-const CODEX_APP_SERVER_DRIVER: &str = "codex-app-server";
+use lionclaw_runtime_api::{RuntimeEvent, RuntimeEventSender, RuntimeTurnJournalSender, TurnEvent};
 
 #[derive(Clone, Copy)]
 pub(crate) enum CodexAppServerEventSink<'a> {
@@ -19,19 +15,14 @@ impl<'a> CodexAppServerEventSink<'a> {
         Self::Journal(journal)
     }
 
-    pub(crate) fn send(self, event: RuntimeEvent, raw_payload: &str) {
+    pub(crate) async fn send(self, event: RuntimeEvent, raw_payload: &str) {
         match self {
             Self::Runtime(events) => {
                 drop(events.send(event));
             }
             Self::Journal(journal) => {
-                drop(journal.send(TurnEvent::with_raw(
-                    event,
-                    RawTurnPayload {
-                        driver: CODEX_APP_SERVER_DRIVER.to_string(),
-                        payload: raw_payload.to_string(),
-                    },
-                )));
+                let _ = raw_payload;
+                drop(journal.send(TurnEvent::canonical(event)).await);
             }
         }
     }
@@ -40,5 +31,37 @@ impl<'a> CodexAppServerEventSink<'a> {
 impl<'a> From<&'a RuntimeEventSender> for CodexAppServerEventSink<'a> {
     fn from(events: &'a RuntimeEventSender) -> Self {
         Self::runtime(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lionclaw_runtime_api::{RuntimeMessageLane, RUNTIME_TURN_JOURNAL_CAPACITY};
+
+    #[tokio::test]
+    async fn production_journal_sink_backpressures_a_provider_flood_without_loss() {
+        let (journal, mut receiver) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+        let expected = RUNTIME_TURN_JOURNAL_CAPACITY * 4;
+        let drain = tokio::spawn(async move {
+            let mut received = 0;
+            while receiver.recv().await.is_some() {
+                received += 1;
+            }
+            received
+        });
+        let sink = CodexAppServerEventSink::journal(&journal);
+        for sequence in 0..expected {
+            sink.send(
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: sequence.to_string(),
+                },
+                "discarded raw provider payload",
+            )
+            .await;
+        }
+        drop(journal);
+        assert_eq!(drain.await.unwrap(), expected);
     }
 }

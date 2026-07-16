@@ -16,7 +16,7 @@ use lionclaw_runtime_api::{
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutSender,
     RuntimeProgramTurnExecution, RuntimeSessionReady, RuntimeSessionStartInput,
     RuntimeTerminalConfig, RuntimeTerminalProgramInput, RuntimeTurnInput, RuntimeTurnMode,
-    RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 
 use super::{
@@ -632,7 +632,7 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
         expected_auth: Some(expected_auth),
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root.clone());
     context.working_dir = Some("/workspace/crates/example".to_string());
 
@@ -666,6 +666,7 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             ),
         }
     );
+    assert_eq!(result.final_response, "answer");
 
     let mut journal = Vec::new();
     while let Some(record) = journal_rx.recv().await {
@@ -688,8 +689,10 @@ async fn acp_program_backed_turn_uses_profile_driver_journal() {
             RuntimeEvent::Done,
         ]
     );
-    assert!(journal[0].raw.is_none());
-    assert!(journal[1..].iter().all(|record| record.raw.is_some()));
+    assert!(
+        journal.iter().all(|record| record.raw.is_none()),
+        "runtime evidence retains canonical events, never raw provider payloads"
+    );
     assert_eq!(
         std::fs::read_to_string(runtime_state_root.join(ACP_SESSION_ID_STATE_FILE))
             .expect("saved session id"),
@@ -742,7 +745,7 @@ async fn acp_program_backed_turn_projects_runtime_mcp_servers() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, _journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, _journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.mcp_servers = vec![RuntimeMcpServerSpec {
         name: "lionclaw".to_string(),
@@ -829,7 +832,7 @@ async fn acp_cancel_sends_session_cancel_for_active_prompt() {
         .await
         .expect("start");
     let state = CancelableAcpProgramState::new();
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let adapter_for_task = Arc::clone(&adapter);
     let handle_for_task = handle.clone();
     let state_for_task = Arc::clone(&state);
@@ -980,7 +983,7 @@ async fn acp_resume_uses_effective_working_directory() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
@@ -1053,7 +1056,7 @@ async fn acp_resume_uses_session_resume_when_load_is_unsupported() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
     let mut context = acp_driver_context(runtime_state_root);
     context.working_dir = Some("/workspace/packages/runtime".to_string());
 
@@ -1127,7 +1130,7 @@ async fn acp_new_session_without_reopen_capability_clears_stale_session_id() {
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
         .program_backed_turn(
@@ -1199,7 +1202,7 @@ async fn acp_ready_session_without_reopen_capability_falls_back_to_fresh_prompt(
         expected_auth: None,
         state: Arc::clone(&fake_state),
     };
-    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (journal_tx, mut journal_rx) = tokio::sync::mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     adapter
         .program_backed_turn(

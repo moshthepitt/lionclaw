@@ -17,7 +17,8 @@ use crate::authority::{compile_role_plan, oracle_authority, MissionMounts, RoleP
 use crate::config::MissionRuntimeProfile;
 use crate::ports::{ExecutionControl, OracleOutcome, OracleRunRequest, OracleRunner};
 use crate::runner::{
-    prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs, SCRATCH_MOUNT_TARGET,
+    await_controlled, prepare_inputs, EffectDirs, MissionProgramExecutor, PreparedInputs,
+    SCRATCH_MOUNT_TARGET,
 };
 use crate::workspace;
 
@@ -69,9 +70,12 @@ impl OracleRunner for OciOracleRunner {
 
             // Copy the oracle executable into its own read-only mount.
             let oracle_dir = dirs.root.join("oracle");
-            std::fs::create_dir_all(&oracle_dir).map_err(|e| fail(e.to_string()))?;
+            tokio::fs::create_dir_all(&oracle_dir)
+                .await
+                .map_err(|e| fail(e.to_string()))?;
             let oracle_dest = oracle_dir.join(request.oracle.as_str());
-            std::fs::copy(&request.oracle_path, &oracle_dest)
+            tokio::fs::copy(&request.oracle_path, &oracle_dest)
+                .await
                 .map_err(|e| fail(format!("failed to stage oracle executable: {e}")))?;
             workspace::make_executable(&oracle_dest).map_err(|e| fail(e.to_string()))?;
 
@@ -94,7 +98,6 @@ impl OracleRunner for OciOracleRunner {
                     &checkout,
                     &request.prepared_inputs,
                     &request.effect_id,
-                    request.deadline_ms,
                 )
                 .await
                 .map_err(|error| fail(format!("failed to prepare mission inputs: {error:#}")))?
@@ -146,43 +149,10 @@ impl OracleRunner for OciOracleRunner {
             // it here is a runner concern that never threatens fold purity.
             #[expect(clippy::disallowed_methods)]
             let started = Instant::now();
-            let mut run = Box::pin(executor.execute_captured(program));
-            let mut control = request.control.clone();
-            let run = loop {
-                let current_control = control.borrow().clone();
-                match current_control {
-                    ExecutionControl::RunUntil(_) => {}
-                    ExecutionControl::DeadlineExhausted => {
-                        break Err(TypedFailure::DeadlineExhausted {
-                            evidence: Box::new(TypedFailureEvidence::new(
-                                Some("oracle.deadline".to_string()),
-                                "oracle exceeded its recorded effect deadline",
-                            )),
-                        });
-                    }
-                    ExecutionControl::Stop(reason) => {
-                        let mut evidence = TypedFailureEvidence::new(
-                            Some("oracle.stopped".into()),
-                            "oracle stopped by operator",
-                        );
-                        evidence.stop_reason = Some(reason);
-                        break Err(TypedFailure::OperatorStopped {
-                            evidence: Box::new(evidence),
-                        });
-                    }
-                }
-                tokio::select! {
-                    biased;
-                    changed = control.changed() => {
-                        if changed.is_err() {
-                            continue;
-                        }
-                    }
-                    completed = &mut run => break completed.map_err(|error| {
-                        fail(format!("oracle failed to run: {error}"))
-                    }),
-                }
-            };
+            let run = executor
+                .execute_captured(program)
+                .await
+                .map_err(|error| fail(format!("oracle failed to run: {error}")));
             let duration_ms = started.elapsed().as_millis() as u64;
             match run {
                 Err(failure) => Err(failure),
@@ -195,10 +165,31 @@ impl OracleRunner for OciOracleRunner {
                     duration_ms,
                 }),
             }
-        }
-        .await;
-
-        result
+        };
+        await_controlled(result, request.control.clone(), |control| match control {
+            ExecutionControl::RunUntil(_) => None,
+            ExecutionControl::DeadlineExhausted => {
+                let mut evidence = TypedFailureEvidence::new(
+                    Some("oracle.deadline".to_string()),
+                    "oracle exceeded its recorded effect deadline",
+                );
+                evidence.stop_reason = Some("effect deadline exhausted".into());
+                Some(TypedFailure::DeadlineExhausted {
+                    evidence: Box::new(evidence),
+                })
+            }
+            ExecutionControl::Stop(reason) => {
+                let mut evidence = TypedFailureEvidence::new(
+                    Some("oracle.stopped".into()),
+                    "oracle stopped by operator",
+                );
+                evidence.stop_reason = Some(reason.clone());
+                Some(TypedFailure::OperatorStopped {
+                    evidence: Box::new(evidence),
+                })
+            }
+        })
+        .await
     }
 }
 
@@ -218,4 +209,47 @@ fn oracle_environment() -> Vec<(String, String)> {
             format!("{SCRATCH_MOUNT_TARGET}/target"),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RuntimeProfiles;
+    use crate::model::{EffectId, MissionId, OracleName};
+
+    #[tokio::test]
+    async fn production_oracle_observes_stop_before_checkout_or_runtime_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = RuntimeProfiles::from_toml(
+            "[runtimes.test]\ndriver = \"acp\"\ncommand = \"never-launched\"\n",
+            temp.path(),
+        )
+        .unwrap()
+        .get("test")
+        .unwrap();
+        let runner = OciOracleRunner::new(profile);
+        let (_control_tx, control) =
+            tokio::sync::watch::channel(ExecutionControl::Stop("operator stop".into()));
+        let result = runner
+            .run(OracleRunRequest {
+                mission_id: MissionId::parse("m123456789abc").unwrap(),
+                effect_id: EffectId::for_parts(&["oracle", "pre-start-stop"]),
+                oracle: OracleName::new("checks").unwrap(),
+                oracle_path: temp.path().join("must-not-be-read"),
+                judged_sha: "must-not-be-resolved".into(),
+                workspace_dir: temp.path().join("must-not-be-cloned"),
+                state_dir: temp.path().join("state"),
+                prepared_inputs: Vec::new(),
+                deadline_ms: 10,
+                control,
+            })
+            .await;
+
+        let failure = result.expect_err("pre-start stop wins before setup");
+        assert!(matches!(failure, TypedFailure::OperatorStopped { .. }));
+        assert_eq!(
+            failure.evidence().stop_reason.as_deref(),
+            Some("operator stop")
+        );
+    }
 }

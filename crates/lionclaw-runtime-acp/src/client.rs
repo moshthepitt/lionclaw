@@ -7,11 +7,11 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use lionclaw_runtime_api::{
-    AppliedRuntimeConfiguration, ExecutionOutput, RawTurnPayload, RuntimeEvent,
-    RuntimeMcpServerSpec, RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent, TypedFailure,
+    AppliedRuntimeConfiguration, ExecutionOutput, RuntimeEvent, RuntimeMcpServerSpec,
+    RuntimeProgramSession, RuntimeTurnJournalSender, TurnEvent, TypedFailure,
 };
 
-use crate::driver::{AcpRuntimeConfig, ACP_PROTOCOL_NAME};
+use crate::driver::AcpRuntimeConfig;
 use crate::event_mapping::acp_turn_events;
 use crate::policy::{acp_error_response, acp_permission_denial};
 use crate::program::acp_mcp_servers;
@@ -27,6 +27,7 @@ use crate::state::{
 pub(crate) struct AcpClient {
     session: Option<Box<dyn RuntimeProgramSession>>,
     next_id: u64,
+    final_response: String,
 }
 
 struct AcpCancelWait<'a> {
@@ -49,6 +50,7 @@ impl AcpClient {
         Self {
             session: Some(session),
             next_id: 1,
+            final_response: String::new(),
         }
     }
 
@@ -261,7 +263,8 @@ impl AcpClient {
         prompt: &str,
         journal: &RuntimeTurnJournalSender,
         cancel_rx: &mut mpsc::UnboundedReceiver<AcpCancelRequest>,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        self.final_response.clear();
         let response = self
             .request_with_cancel(
                 "session/prompt",
@@ -277,14 +280,9 @@ impl AcpClient {
                 cancel_rx,
             )
             .await?;
-        drop(journal.send(TurnEvent::with_raw(
-            RuntimeEvent::Done,
-            RawTurnPayload {
-                driver: ACP_PROTOCOL_NAME.to_string(),
-                payload: response.raw,
-            },
-        )));
-        Ok(())
+        let _ = response.raw;
+        drop(journal.send(TurnEvent::canonical(RuntimeEvent::Done)).await);
+        Ok(self.take_final_response())
     }
 
     async fn request_with_cancel(
@@ -406,10 +404,20 @@ impl AcpClient {
 
         if let Some(journal) = journal {
             for record in acp_turn_events(&message) {
-                drop(journal.send(record));
+                lionclaw_runtime_api::observe_final_response(
+                    &mut self.final_response,
+                    &record.event,
+                );
+                drop(journal.send(TurnEvent::canonical(record.event)).await);
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn take_final_response(&mut self) -> String {
+        std::mem::take(&mut self.final_response)
+            .trim_end()
+            .to_string()
     }
 
     async fn respond_to_server_request(&mut self, request: &Value) -> Result<()> {

@@ -335,13 +335,7 @@ fn write(mission_dir: &Path, projection: &ActivityProjection) -> Result<()> {
 }
 
 fn git_output(workspace: &Path, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .output()
-        .ok()
+    crate::workspace::observed_git_output(workspace, args).ok()
 }
 
 fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String> {
@@ -369,7 +363,13 @@ fn workspace_diffstat(workspace: &Path, base_sha: Option<&str>) -> Option<String
                 if ancestry.status.success() {
                     if let Some(diffstat) = git_output(
                         workspace,
-                        &["diff", "--stat", &format!("{base_sha}..{head}")],
+                        &[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--stat",
+                            &format!("{base_sha}..{head}"),
+                        ],
                     ) {
                         if diffstat.status.success() {
                             summary.push_str(&String::from_utf8_lossy(&diffstat.stdout));
@@ -410,6 +410,7 @@ fn bounded(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace;
     use lionclaw_runtime_api::{
         AppliedRuntimeConfiguration, RuntimeConfigurationConfirmation, RuntimeEvent, TurnEvent,
     };
@@ -451,6 +452,62 @@ mod tests {
         assert!(summary.contains("committed work:"));
         assert!(summary.contains("work.txt"));
         assert!(!summary.contains(" M work.txt"));
+    }
+
+    #[test]
+    fn workspace_observation_never_executes_worker_git_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("host-command-ran");
+        let monitor = temp.path().join("hostile-monitor");
+        std::fs::write(
+            &monitor,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        workspace::make_executable(&monitor).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@local"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(temp.path().join("tracked"), "base\n").unwrap();
+        run(&["add", "tracked"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
+
+        let _ = workspace_diffstat(temp.path(), None);
+        assert!(
+            !marker.exists(),
+            "observer Git must not execute worker-controlled local config"
+        );
+
+        let filter = temp.path().join("hostile-filter");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        workspace::make_executable(&filter).unwrap();
+        std::fs::write(
+            temp.path().join(".gitattributes"),
+            "tracked filter=hostile\n",
+        )
+        .unwrap();
+        run(&["config", "filter.hostile.clean", filter.to_str().unwrap()]);
+        std::fs::write(temp.path().join("tracked"), "worker change\n").unwrap();
+
+        let _ = workspace_diffstat(temp.path(), None);
+        assert!(
+            !marker.exists(),
+            "observer Git must not execute worker-controlled filter drivers"
+        );
     }
 
     #[test]

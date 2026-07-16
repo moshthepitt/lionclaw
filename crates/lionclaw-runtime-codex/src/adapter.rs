@@ -101,9 +101,13 @@ impl CodexAppServerTurnRunner<'_> {
                     "codex app-server did not report the applied model in turn/start"
                 ));
             }
-            drop(journal.send(lionclaw_runtime_api::TurnEvent::canonical(
-                lionclaw_runtime_api::RuntimeEvent::Configuration { configuration },
-            )));
+            drop(
+                journal
+                    .send(lionclaw_runtime_api::TurnEvent::canonical(
+                        lionclaw_runtime_api::RuntimeEvent::Configuration { configuration },
+                    ))
+                    .await,
+            );
             let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
             client
                 .wait_for_turn_completed(
@@ -115,6 +119,7 @@ impl CodexAppServerTurnRunner<'_> {
                     Some(&mut interrupt_rx),
                 )
                 .await?;
+            let final_response = client.take_final_response();
             Ok(RuntimeTurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: self.adapter.config.model.clone(),
@@ -126,11 +131,17 @@ impl CodexAppServerTurnRunner<'_> {
                     applied_mode: None,
                     mode_confirmation: None,
                 },
+                final_response,
                 ..Default::default()
             })
         }
         .await;
 
+        let failed_final_response = if let Ok(completed) = &result {
+            completed.final_response.clone()
+        } else {
+            client.take_final_response()
+        };
         finish_app_server_session(client, result)
             .await
             .map_err(|error| {
@@ -141,6 +152,7 @@ impl CodexAppServerTurnRunner<'_> {
                 if let Some(configuration) = applied_configuration {
                     failure.evidence_mut().configuration = configuration;
                 }
+                failure.evidence_mut().final_response = failed_final_response;
                 anyhow::Error::new(failure.projected())
             })
     }

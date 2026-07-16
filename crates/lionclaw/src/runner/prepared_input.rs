@@ -30,7 +30,6 @@ pub(crate) async fn prepare_inputs(
     checkout: &Path,
     inputs: &[PreparedInput],
     effect_id: &crate::model::EffectId,
-    deadline_ms: i64,
 ) -> Result<PreparedInputs> {
     let mut prepared = PreparedInputs {
         mounts: Vec::new(),
@@ -38,7 +37,7 @@ pub(crate) async fn prepare_inputs(
         refs: Vec::new(),
     };
     for input in inputs {
-        let digest = input_cache_key(profile, checkout, input)?;
+        let digest = input_cache_key(profile, checkout, input).await?;
         let directory = prepare_one(
             profile,
             state_dir,
@@ -46,10 +45,7 @@ pub(crate) async fn prepare_inputs(
             checkout,
             input,
             &digest,
-            PreparationExecution {
-                effect_id,
-                deadline_ms,
-            },
+            effect_id,
         )
         .await?;
         prepared.mounts.push(MountSpec {
@@ -66,13 +62,7 @@ pub(crate) async fn prepare_inputs(
     Ok(prepared)
 }
 
-#[derive(Clone, Copy)]
-struct PreparationExecution<'a> {
-    effect_id: &'a crate::model::EffectId,
-    deadline_ms: i64,
-}
-
-fn input_cache_key(
+async fn input_cache_key(
     profile: &MissionRuntimeProfile,
     checkout: &Path,
     input: &PreparedInput,
@@ -92,61 +82,64 @@ fn input_cache_key(
         false,
     );
     digest.feed("network", &[u8::from(input.network)], false);
-    digest.feed("program", &std::fs::read(&input.program)?, true);
+    digest.feed("program", &tokio::fs::read(&input.program).await?, true);
     for (name, value) in &input.environment {
         digest.feed(&format!("environment/{name}"), value.as_bytes(), false);
     }
     for key in &input.key_files {
-        feed_key_path(&mut digest, checkout, key, key)?;
+        feed_key_path(&mut digest, checkout, key, key).await?;
     }
     Ok(digest.finish())
 }
 
-fn feed_key_path(
-    digest: &mut ContentDigest,
-    checkout: &Path,
-    declared: &Path,
-    relative: &Path,
-) -> Result<()> {
-    let path = checkout.join(relative);
-    let metadata = std::fs::symlink_metadata(&path)
-        .with_context(|| format!("reading prepared-input key '{}'", declared.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "prepared-input key '{}' contains a symlink at '{}'",
-            declared.display(),
-            relative.display()
-        );
-    }
-    let logical = format!("key/{}", relative.to_string_lossy());
-    if metadata.is_file() {
-        use std::os::unix::fs::PermissionsExt;
-        digest.feed(
-            &logical,
-            &std::fs::read(&path)?,
-            metadata.permissions().mode() & 0o111 != 0,
-        );
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        bail!(
-            "prepared-input key '{}' contains a non-file entry at '{}'",
-            declared.display(),
-            relative.display()
-        );
-    }
-    digest.feed(&format!("{logical}/"), b"directory", false);
-    let mut entries = std::fs::read_dir(&path)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        feed_key_path(
-            digest,
-            checkout,
-            declared,
-            &relative.join(entry.file_name()),
-        )?;
-    }
-    Ok(())
+fn feed_key_path<'a>(
+    digest: &'a mut ContentDigest,
+    checkout: &'a Path,
+    declared: &'a Path,
+    relative: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let path = checkout.join(relative);
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .with_context(|| format!("reading prepared-input key '{}'", declared.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "prepared-input key '{}' contains a symlink at '{}'",
+                declared.display(),
+                relative.display()
+            );
+        }
+        let logical = format!("key/{}", relative.to_string_lossy());
+        if metadata.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            digest.feed(
+                &logical,
+                &tokio::fs::read(&path).await?,
+                metadata.permissions().mode() & 0o111 != 0,
+            );
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "prepared-input key '{}' contains a non-file entry at '{}'",
+                declared.display(),
+                relative.display()
+            );
+        }
+        digest.feed(&format!("{logical}/"), b"directory", false);
+        let mut directory = tokio::fs::read_dir(&path).await?;
+        let mut entries = Vec::new();
+        while let Some(entry) = directory.next_entry().await? {
+            entries.push(entry.file_name());
+        }
+        entries.sort();
+        for entry in entries {
+            let child = relative.join(entry);
+            feed_key_path(digest, checkout, declared, &child).await?;
+        }
+        Ok(())
+    })
 }
 
 async fn prepare_one(
@@ -156,7 +149,7 @@ async fn prepare_one(
     checkout: &Path,
     input: &PreparedInput,
     digest: &str,
-    execution: PreparationExecution<'_>,
+    effect_id: &crate::model::EffectId,
 ) -> Result<PathBuf> {
     let parent = state_dir
         .join("inputs")
@@ -173,17 +166,17 @@ async fn prepare_one(
             destination.display()
         );
     }
-    std::fs::create_dir_all(&parent)?;
+    tokio::fs::create_dir_all(&parent).await?;
     let staging = attempt_dir.join(format!("input-{}", input.name));
     crate::workspace::remove_dir(&staging).await?;
     let output = staging.join("output");
     let scratch = staging.join("scratch");
     let program_dir = staging.join("program");
     for directory in [&output, &scratch, &program_dir] {
-        std::fs::create_dir_all(directory)?;
+        tokio::fs::create_dir_all(directory).await?;
     }
     let program = program_dir.join("prepare");
-    std::fs::copy(&input.program, &program)?;
+    tokio::fs::copy(&input.program, &program).await?;
     crate::workspace::make_executable(&program)?;
 
     let authority = prepared_input_authority(input.name.as_str(), input.network);
@@ -226,17 +219,9 @@ async fn prepare_one(
     let mut executor = MissionProgramExecutor::new(
         compiled.plan().clone(),
         RuntimeAuthRegistry::empty(),
-        execution.effect_id,
+        effect_id,
     );
-    let remaining = crate::ports::remaining_until(execution.deadline_ms);
-    let run = tokio::time::timeout(remaining, executor.execute_captured(program))
-        .await
-        .with_context(|| {
-            format!(
-                "prepared input '{}' exceeded its effect deadline",
-                input.name
-            )
-        })??;
+    let run = executor.execute_captured(program).await?;
     if run.exit_code != Some(0) || run.exit_signal.is_some() {
         let stdout = crate::evidence::excerpt(&String::from_utf8_lossy(&run.stdout));
         let stderr = crate::evidence::excerpt(&String::from_utf8_lossy(&run.stderr));
@@ -286,8 +271,8 @@ mod tests {
     use crate::config::RuntimeProfiles;
     use crate::model::InputName;
 
-    #[test]
-    fn cache_key_changes_with_declared_content_and_rejects_symlinks() {
+    #[tokio::test]
+    async fn cache_key_changes_with_declared_content_and_rejects_symlinks() {
         let checkout = tempfile::tempdir().unwrap();
         let program_dir = tempfile::tempdir().unwrap();
         let program = program_dir.path().join("prepare");
@@ -308,14 +293,19 @@ mod tests {
             environment: BTreeMap::new(),
         };
 
-        let first = input_cache_key(&profile, checkout.path(), &input).unwrap();
+        let first = input_cache_key(&profile, checkout.path(), &input)
+            .await
+            .unwrap();
         std::fs::write(checkout.path().join("lock"), "two").unwrap();
-        let second = input_cache_key(&profile, checkout.path(), &input).unwrap();
+        let second = input_cache_key(&profile, checkout.path(), &input)
+            .await
+            .unwrap();
         assert_ne!(first, second);
 
         std::fs::remove_file(checkout.path().join("lock")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", checkout.path().join("lock")).unwrap();
         assert!(input_cache_key(&profile, checkout.path(), &input)
+            .await
             .unwrap_err()
             .to_string()
             .contains("symlink"));

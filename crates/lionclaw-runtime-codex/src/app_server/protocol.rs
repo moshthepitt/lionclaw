@@ -37,7 +37,11 @@ pub(crate) fn parse_app_server_response(message: Value, method: &str) -> Result<
     if let Some(error) = message.get("error") {
         let code = error
             .get("code")
-            .map(Value::to_string)
+            .and_then(|code| {
+                code.as_str()
+                    .map(str::to_string)
+                    .or_else(|| code.as_i64().map(|code| code.to_string()))
+            })
             .unwrap_or_else(|| "codex.app_server".to_string());
         return Err(TypedFailure::permanent(
             code,
@@ -149,4 +153,20 @@ pub(crate) fn extract_app_server_item_id(value: &Value) -> Option<String> {
         .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|item_id| !item_id.trim().is_empty())
         .map(|item_id| item_id.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_error_preserves_scalar_code_without_json_quoting() {
+        let error = parse_app_server_response(
+            json!({"error": {"code": "capacity", "message": "busy"}}),
+            "turn/start",
+        )
+        .unwrap_err();
+        let failure = error.downcast_ref::<TypedFailure>().unwrap();
+        assert_eq!(failure.evidence().code.as_deref(), Some("capacity"));
+    }
 }

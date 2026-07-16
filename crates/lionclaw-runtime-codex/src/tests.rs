@@ -569,6 +569,7 @@ async fn app_server_agent_message_phases_choose_transcript_lane() {
     assert!(!events
         .iter()
         .any(|event| matches!(event, RuntimeEvent::MessageBoundary { .. })));
+    assert_eq!(client.take_final_response(), "Final answer.");
 }
 
 #[tokio::test]
@@ -608,6 +609,8 @@ async fn app_server_agent_message_items_emit_answer_boundaries() {
             .await
             .expect("handle message");
     }
+
+    assert_eq!(client.take_final_response(), "Intro.\n\n**Project**");
 
     let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
     let message_events = events

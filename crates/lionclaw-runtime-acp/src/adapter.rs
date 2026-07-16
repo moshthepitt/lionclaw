@@ -229,11 +229,15 @@ impl AcpTurnRunner {
                 .await?;
             applied_configuration = Some(configuration.clone());
             if configuration.requested_model.is_some() || configuration.requested_mode.is_some() {
-                drop(journal.send(lionclaw_runtime_api::TurnEvent::canonical(
-                    lionclaw_runtime_api::RuntimeEvent::Configuration {
-                        configuration: configuration.clone(),
-                    },
-                )));
+                drop(
+                    journal
+                        .send(lionclaw_runtime_api::TurnEvent::canonical(
+                            lionclaw_runtime_api::RuntimeEvent::Configuration {
+                                configuration: configuration.clone(),
+                            },
+                        ))
+                        .await,
+                );
             }
             let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
             active_turn = Some(register_active_acp_turn(
@@ -250,16 +254,27 @@ impl AcpTurnRunner {
             let prompt_result = client
                 .prompt(&opened_session.session_id, prompt, &journal, &mut cancel_rx)
                 .await;
-            prompt_result?;
+            let final_response = prompt_result?;
             Ok(RuntimeTurnResult {
                 configuration,
+                final_response,
                 ..Default::default()
             })
         }
         .await;
 
+        let failed_final_response = if let Ok(completed) = &result {
+            completed.final_response.clone()
+        } else {
+            client.take_final_response()
+        };
         let result = finish_acp_session(client, result).await.map_err(|error| {
-            configured_failure(error, applied_configuration.as_ref(), "acp.runtime")
+            let mut error =
+                configured_failure(error, applied_configuration.as_ref(), "acp.runtime");
+            if let Some(failure) = error.downcast_mut::<TypedFailure>() {
+                failure.evidence_mut().final_response = failed_final_response;
+            }
+            error
         });
         drop(active_turn);
         result

@@ -14,7 +14,7 @@ use super::{
     RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
     RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
     RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
-    RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -479,7 +479,7 @@ async fn program_backed_turn_streams_output_and_finishes() {
         stdout_lines: vec!["answer:hello".to_string()],
         output: success_output(),
     }]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     let result = execute_program_backed_turn(
         &adapter,
@@ -520,7 +520,7 @@ async fn program_backed_turn_retries_with_fresh_prompt_before_emitting_error() {
             output: success_output(),
         },
     ]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     execute_program_backed_turn(
         &adapter,
@@ -564,7 +564,7 @@ async fn program_backed_turn_surfaces_failure_after_retry() {
             output: failed_output(),
         },
     ]);
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     let err = execute_program_backed_turn(
         &adapter,
@@ -596,7 +596,7 @@ async fn program_backed_turn_does_not_deadlock_when_process_finishes_before_stdo
         stdout_lines: Vec::new(),
         output: success_output(),
     }]);
-    let (events, _event_rx) = mpsc::unbounded_channel();
+    let (events, _event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     timeout(
         Duration::from_millis(100),
@@ -650,7 +650,7 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
 
     let adapter = TestProgramAdapter::default();
     let executor = SlowExecutor;
-    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (events, mut event_rx) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
 
     execute_program_backed_turn(
         &adapter,

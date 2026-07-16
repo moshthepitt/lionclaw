@@ -62,9 +62,10 @@ pub use context::{
 };
 pub use driver::{RuntimeDriverConfig, RuntimeDriverProvider, RuntimeTerminalConfig};
 pub use event::{
-    append_streamed_text_boundary, append_streamed_text_delta, canonical_events, RawTurnPayload,
-    RuntimeArtifact, RuntimeEvent, RuntimeEventSender, RuntimeFileChange, RuntimeFileChangeStatus,
-    RuntimeMessageLane, RuntimeTurnJournalSender, TurnEvent,
+    append_streamed_text_boundary, append_streamed_text_delta, canonical_events,
+    observe_final_response, RawTurnPayload, RuntimeArtifact, RuntimeEvent, RuntimeEventSender,
+    RuntimeFileChange, RuntimeFileChangeStatus, RuntimeMessageLane, RuntimeTurnJournalSender,
+    TurnEvent, RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 pub use failure::{bounded_text, TypedFailure, TypedFailureEvidence, FAILURE_TEXT_LIMIT};
 pub use program::{
