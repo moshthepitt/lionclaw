@@ -25,7 +25,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 13;
+pub const REDUCER_VERSION: u32 = 14;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
