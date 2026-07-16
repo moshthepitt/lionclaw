@@ -560,7 +560,10 @@ async fn program_backed_turn_surfaces_failure_after_retry() {
             output: failed_output(),
         },
         StubAttempt {
-            stdout_lines: vec!["error:second".to_string()],
+            stdout_lines: vec![
+                "answer:partial work".to_string(),
+                "error:second".to_string(),
+            ],
             output: failed_output(),
         },
     ]);
@@ -579,6 +582,16 @@ async fn program_backed_turn_surfaces_failure_after_retry() {
     .expect_err("turn should fail");
 
     assert!(err.to_string().contains("second"));
+    let failure = err
+        .downcast_ref::<super::TypedFailure>()
+        .expect("process exit is typed at the runtime boundary");
+    assert_eq!(failure.evidence().final_response, "partial work");
+    assert_eq!(failure.evidence().exit_code, Some(1));
+    assert_eq!(failure.evidence().stderr, "failed");
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(TurnEvent { event: RuntimeEvent::MessageDelta { text, .. }, raw: None }) if text == "partial work"
+    ));
     assert!(matches!(
         event_rx.recv().await,
         Some(TurnEvent { event: RuntimeEvent::Error { text, .. }, raw: None }) if text == "second"

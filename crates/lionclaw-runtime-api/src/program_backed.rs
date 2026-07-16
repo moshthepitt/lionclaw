@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -270,9 +270,17 @@ where
     A: RuntimeAdapter + Send + Sync + ?Sized,
 {
     if !output.success() {
-        return Err(anyhow!(
-            adapter.format_program_exit_error(&output, observed_error_text)
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut failure = crate::TypedFailure::permanent(
+            "runtime.process_exit",
+            adapter.format_program_exit_error(&output, observed_error_text),
+        );
+        failure.evidence_mut().exit_code = output.exit_code;
+        failure.evidence_mut().stop_reason =
+            output.exit_signal.map(|signal| format!("signal {signal}"));
+        failure.evidence_mut().stderr = stderr;
+        failure.evidence_mut().final_response = final_response.trim_end().to_string();
+        return Err(anyhow::Error::new(failure.projected()));
     }
 
     if !saw_done {

@@ -42,6 +42,19 @@ struct CodexAppServerTurnRunner<'a> {
     executor: Box<dyn RuntimeProgramExecutor>,
 }
 
+fn validate_app_server_model(requested: Option<&str>, applied: Option<&str>) -> Result<()> {
+    match (requested, applied) {
+        (None, _) => Ok(()),
+        (Some(requested), Some(applied)) if requested == applied => Ok(()),
+        (Some(requested), Some(applied)) => Err(anyhow!(
+            "codex app-server applied model '{applied}', expected '{requested}'"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "codex app-server did not report the applied model in turn/start"
+        )),
+    }
+}
+
 impl CodexAppServerTurnRunner<'_> {
     async fn run_turn(
         &mut self,
@@ -96,11 +109,10 @@ impl CodexAppServerTurnRunner<'_> {
                 mode_confirmation: None,
             };
             applied_configuration = Some(configuration.clone());
-            if self.adapter.config.model.is_some() && applied_model.is_none() {
-                return Err(anyhow!(
-                    "codex app-server did not report the applied model in turn/start"
-                ));
-            }
+            validate_app_server_model(
+                self.adapter.config.model.as_deref(),
+                applied_model.as_deref(),
+            )?;
             drop(
                 journal
                     .send(lionclaw_runtime_api::TurnEvent::canonical(
@@ -403,5 +415,18 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .remove(&handle.runtime_session_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn app_server_model_evidence_must_match_the_codex_request() {
+        validate_app_server_model(Some("gpt-5.5"), Some("gpt-5.5")).unwrap();
+        assert!(validate_app_server_model(Some("gpt-5.5"), Some("fallback")).is_err());
+        assert!(validate_app_server_model(Some("gpt-5.5"), None).is_err());
+        validate_app_server_model(None, Some("runtime-default")).unwrap();
     }
 }

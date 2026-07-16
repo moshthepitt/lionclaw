@@ -40,14 +40,14 @@ where
     loop {
         tokio::select! {
             biased;
-            result = &mut future => return result,
             changed = control.changed(), if control_open => {
                 if changed.is_err() {
                     control_open = false;
                 } else if let Some(failure) = map_control(&control.borrow().clone()) {
                     return Err(failure);
                 }
-            }
+            },
+            result = &mut future => return result,
         }
     }
 }
@@ -253,5 +253,34 @@ mod control_tests {
         .expect("closed control channel must not cause a busy loop")
         .unwrap();
         assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn pending_durable_control_wins_simultaneous_future_completion() {
+        let (control_tx, control_rx) = tokio::sync::watch::channel(ExecutionControl::RunUntil(10));
+        let mut first_poll = true;
+        let future = std::future::poll_fn(move |context| {
+            if first_poll {
+                first_poll = false;
+                control_tx.send_replace(ExecutionControl::Stop("already recorded".into()));
+                context.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        });
+
+        let failure = await_controlled(future, control_rx, stopped)
+            .await
+            .expect_err("durable stop must win when completion is also ready");
+
+        assert!(matches!(
+            failure,
+            lionclaw_runtime_api::TypedFailure::OperatorStopped { .. }
+        ));
+        assert_eq!(
+            failure.evidence().stop_reason.as_deref(),
+            Some("already recorded")
+        );
     }
 }

@@ -423,7 +423,10 @@ impl GitObserver {
         std::fs::create_dir(observer.metadata.join("objects"))?;
         std::fs::create_dir(observer.metadata.join("refs"))?;
         std::fs::write(observer.metadata.join("HEAD"), format!("{head}\n"))?;
-        std::fs::write(observer.metadata.join("config"), b"")?;
+        std::fs::write(
+            observer.metadata.join("config"),
+            synthetic_repository_config(&head),
+        )?;
         Ok(observer)
     }
 
@@ -628,6 +631,14 @@ fn resolve_head(git_dir: &Path, common_dir: &Path) -> Result<String> {
 
 fn valid_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn synthetic_repository_config(head: &str) -> &'static [u8] {
+    if head.len() == 64 && valid_object_id(head) {
+        b"[core]\n\trepositoryFormatVersion = 1\n[extensions]\n\tobjectFormat = sha256\n"
+    } else {
+        b""
+    }
 }
 
 #[cfg(test)]
@@ -987,5 +998,47 @@ mod tests {
         assert_eq!(head_sha(&checkout).await.unwrap(), next);
         assert!(!previous.exists());
         assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn isolated_observation_and_capture_support_sha256_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let mut init = managed_git_command();
+        init.args(["init", "--quiet", "--object-format=sha256"])
+            .arg(&repo);
+        run(&mut init, "initialize SHA-256 repository")
+            .await
+            .unwrap();
+        git(&repo, &["config", "user.name", "test"]).await.unwrap();
+        git(&repo, &["config", "user.email", "test@local"])
+            .await
+            .unwrap();
+        git(&repo, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+        git(&repo, &["add", "f.txt"]).await.unwrap();
+        git(&repo, &["commit", "--quiet", "-m", "base"])
+            .await
+            .unwrap();
+        let base = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        assert_eq!(base.trim().len(), 64);
+        assert_eq!(head_sha(&repo).await.unwrap(), base.trim());
+        assert!(!is_dirty(&repo).await.unwrap());
+        assert!(diff(&repo, base.trim(), base.trim())
+            .await
+            .unwrap()
+            .is_empty());
+
+        let checkout = temp.path().join("checkout");
+        create_checkout(&repo, &checkout, base.trim())
+            .await
+            .unwrap();
+        let effect_id = EffectId::for_parts(&["test", "sha256-capture"]);
+        let captured = capture_worker_result(&repo, &checkout, "mabc123def456", &effect_id)
+            .await
+            .unwrap();
+        assert_eq!(captured, base.trim());
     }
 }

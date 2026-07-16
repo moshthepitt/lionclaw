@@ -464,27 +464,18 @@ impl OciRoleRunner {
         })
         .await?;
 
-        let (journal_tx, mut journal_rx) =
-            tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
-                lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
-            );
+        let (journal_tx, journal_rx) = tokio::sync::mpsc::channel::<lionclaw_runtime_api::TurnEvent>(
+            lionclaw_runtime_api::RUNTIME_TURN_JOURNAL_CAPACITY,
+        );
         let updates = request.updates.clone();
         let activity = request.activity.clone();
         let activity_effect_id = request.effect_id.clone();
-        let drain = tokio::spawn(async move {
-            while let Some(event) = journal_rx.recv().await {
-                if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
-                    &event.event
-                {
-                    let _ = updates
-                        .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
-                            configuration.clone(),
-                        ))
-                        .await;
-                }
-                activity.send_replace(Some((activity_effect_id.clone(), event.clone())));
-            }
-        });
+        let drain = tokio::spawn(drain_runtime_journal(
+            journal_rx,
+            updates,
+            activity,
+            activity_effect_id,
+        ));
 
         let mut turn = Box::pin(adapter.program_backed_turn(
             RuntimeProgramTurnExecution {
@@ -584,21 +575,53 @@ impl OciRoleRunner {
         };
         drop(turn);
         let _ = adapter.close(&handle).await;
-        let _ = drain.await;
+        let fallback_final_response = drain.await.unwrap_or_default();
 
         match result {
-            Err(failure) => Err(project_turn_failure(profile, failure)),
+            Err(failure) => Err(project_turn_failure(
+                profile,
+                failure,
+                &fallback_final_response,
+            )),
             Ok(result) => validate_completed_turn(profile, result),
         }
     }
 }
 
+async fn drain_runtime_journal(
+    mut journal: tokio::sync::mpsc::Receiver<lionclaw_runtime_api::TurnEvent>,
+    updates: tokio::sync::mpsc::Sender<crate::ports::RoleRunUpdate>,
+    activity: tokio::sync::watch::Sender<
+        Option<(crate::model::EffectId, lionclaw_runtime_api::TurnEvent)>,
+    >,
+    effect_id: crate::model::EffectId,
+) -> String {
+    let mut final_response = String::new();
+    while let Some(event) = journal.recv().await {
+        lionclaw_runtime_api::observe_final_response(&mut final_response, &event.event);
+        if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } = &event.event {
+            let _ = updates
+                .send(crate::ports::RoleRunUpdate::RuntimeConfigured(
+                    configuration.clone(),
+                ))
+                .await;
+        }
+        activity.send_replace(Some((effect_id.clone(), event)));
+    }
+    final_response.trim_end().to_string()
+}
+
 fn project_turn_failure(
     profile: &MissionRuntimeProfile,
     mut failure: TypedFailure,
+    fallback_final_response: &str,
 ) -> TypedFailure {
-    failure.evidence_mut().configuration.requested_model = profile.model.clone();
-    failure.evidence_mut().configuration.requested_mode = profile.mode.clone();
+    let evidence = failure.evidence_mut();
+    evidence.configuration.requested_model = profile.model.clone();
+    evidence.configuration.requested_mode = profile.mode.clone();
+    if evidence.final_response.is_empty() {
+        evidence.final_response = fallback_final_response.to_string();
+    }
     failure.projected()
 }
 
@@ -608,18 +631,10 @@ fn validate_completed_turn(
 ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
     let configuration = result.configuration;
     let final_response = lionclaw_runtime_api::bounded_text(&result.final_response);
-    let model_applied = profile
-        .model
-        .as_ref()
-        .is_none_or(|requested| configuration.applied_model.as_ref() == Some(requested));
-    let mode_applied = profile
-        .mode
-        .as_ref()
-        .is_none_or(|requested| configuration.applied_mode.as_ref() == Some(requested));
     if configuration.requested_model != profile.model
         || configuration.requested_mode != profile.mode
-        || !model_applied
-        || !mode_applied
+        || profile.model.is_some() && configuration.applied_model.is_none()
+        || profile.mode.is_some() && configuration.applied_mode.is_none()
     {
         let mut failure = launch(format!(
             "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
@@ -627,7 +642,7 @@ fn validate_completed_turn(
         ));
         failure.evidence_mut().configuration = configuration;
         failure.evidence_mut().final_response = final_response;
-        return Err(project_turn_failure(profile, failure));
+        return Err(project_turn_failure(profile, failure, ""));
     }
     Ok((configuration, final_response))
 }
@@ -831,19 +846,36 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_requires_the_exact_requested_configuration_and_preserves_response() {
+    fn completed_turn_accepts_adapter_canonicalization_but_requires_applied_evidence() {
         let profiles = RuntimeProfiles::from_toml(
             "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n",
             Path::new("/home/alice"),
         )
         .unwrap();
         let profile = profiles.get("example").unwrap();
+        let canonical = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("provider:requested".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the adapter owns advertised name-to-ID equivalence");
+        assert_eq!(
+            canonical.0.applied_model.as_deref(),
+            Some("provider:requested")
+        );
+
         let failure = validate_completed_turn(
             &profile,
             lionclaw_runtime_api::RuntimeTurnResult {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
-                    applied_model: Some("fallback".into()),
+                    applied_model: None,
                     ..Default::default()
                 },
                 final_response: "useful work before configuration rejection".into(),
@@ -858,7 +890,7 @@ mod tests {
         );
         assert_eq!(
             failure.evidence().configuration.applied_model.as_deref(),
-            Some("fallback")
+            None
         );
     }
 
@@ -873,9 +905,36 @@ mod tests {
         let mut failure = TypedFailure::permanent("runtime.process", "process failed");
         failure.evidence_mut().stderr = "adapter-captured stderr".into();
 
-        let projected = project_turn_failure(&profile, failure);
+        let projected = project_turn_failure(&profile, failure, "");
 
         assert_eq!(projected.evidence().stderr, "adapter-captured stderr");
+    }
+
+    #[tokio::test]
+    async fn journal_drain_retains_a_bounded_response_for_forced_cancellation() {
+        let (journal_tx, journal_rx) = tokio::sync::mpsc::channel(1);
+        let (updates, _update_rx) = tokio::sync::mpsc::channel(1);
+        let (activity, _activity_rx) = tokio::sync::watch::channel(None);
+        journal_tx
+            .send(lionclaw_runtime_api::TurnEvent::canonical(
+                lionclaw_runtime_api::RuntimeEvent::MessageDelta {
+                    lane: lionclaw_runtime_api::RuntimeMessageLane::Answer,
+                    text: "partial response before forced stop".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        drop(journal_tx);
+
+        let response = drain_runtime_journal(
+            journal_rx,
+            updates,
+            activity,
+            crate::model::EffectId::for_parts(&["test", "forced-response"]),
+        )
+        .await;
+
+        assert_eq!(response, "partial response before forced stop");
     }
 
     #[tokio::test]
