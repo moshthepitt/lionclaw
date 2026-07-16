@@ -472,7 +472,6 @@ impl OciRoleRunner {
         let activity = request.activity.clone();
         let activity_effect_id = request.effect_id.clone();
         let drain = tokio::spawn(async move {
-            let mut last_error = None;
             while let Some(event) = journal_rx.recv().await {
                 if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
                     &event.event
@@ -484,11 +483,7 @@ impl OciRoleRunner {
                         .await;
                 }
                 activity.send_replace(Some((activity_effect_id.clone(), event.clone())));
-                if let lionclaw_runtime_api::RuntimeEvent::Error { text, .. } = &event.event {
-                    last_error = Some(lionclaw_runtime_api::bounded_text(text));
-                }
             }
-            last_error
         });
 
         let mut turn = Box::pin(adapter.program_backed_turn(
@@ -589,36 +584,52 @@ impl OciRoleRunner {
         };
         drop(turn);
         let _ = adapter.close(&handle).await;
-        let last_error = drain.await.unwrap_or_default();
+        let _ = drain.await;
 
         match result {
-            Err(mut failure) => {
-                let evidence = failure.evidence_mut();
-                evidence.stderr =
-                    lionclaw_runtime_api::bounded_text(last_error.as_deref().unwrap_or_default());
-                evidence.configuration.requested_model = profile.model.clone();
-                evidence.configuration.requested_mode = profile.mode.clone();
-                Err(failure.projected())
-            }
-            Ok(result) => {
-                let configuration = result.configuration;
-                if configuration.requested_model != profile.model
-                    || configuration.requested_mode != profile.mode
-                    || profile.model.is_some() && configuration.applied_model.is_none()
-                    || profile.mode.is_some() && configuration.applied_mode.is_none()
-                {
-                    return Err(launch(format!(
-                        "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
-                        profile.model, profile.mode
-                    )));
-                }
-                Ok((
-                    configuration,
-                    lionclaw_runtime_api::bounded_text(&result.final_response),
-                ))
-            }
+            Err(failure) => Err(project_turn_failure(profile, failure)),
+            Ok(result) => validate_completed_turn(profile, result),
         }
     }
+}
+
+fn project_turn_failure(
+    profile: &MissionRuntimeProfile,
+    mut failure: TypedFailure,
+) -> TypedFailure {
+    failure.evidence_mut().configuration.requested_model = profile.model.clone();
+    failure.evidence_mut().configuration.requested_mode = profile.mode.clone();
+    failure.projected()
+}
+
+fn validate_completed_turn(
+    profile: &MissionRuntimeProfile,
+    result: lionclaw_runtime_api::RuntimeTurnResult,
+) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+    let configuration = result.configuration;
+    let final_response = lionclaw_runtime_api::bounded_text(&result.final_response);
+    let model_applied = profile
+        .model
+        .as_ref()
+        .is_none_or(|requested| configuration.applied_model.as_ref() == Some(requested));
+    let mode_applied = profile
+        .mode
+        .as_ref()
+        .is_none_or(|requested| configuration.applied_mode.as_ref() == Some(requested));
+    if configuration.requested_model != profile.model
+        || configuration.requested_mode != profile.mode
+        || !model_applied
+        || !mode_applied
+    {
+        let mut failure = launch(format!(
+            "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
+            profile.model, profile.mode
+        ));
+        failure.evidence_mut().configuration = configuration;
+        failure.evidence_mut().final_response = final_response;
+        return Err(project_turn_failure(profile, failure));
+    }
+    Ok((configuration, final_response))
 }
 
 fn turn_failure_evidence(
@@ -817,6 +828,54 @@ mod tests {
             completed_turn_evidence(Some(Err(anyhow::Error::new(failure)))),
             Some((expected, "work before stop".into()))
         );
+    }
+
+    #[test]
+    fn completed_turn_requires_the_exact_requested_configuration_and_preserves_response() {
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n",
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let profile = profiles.get("example").unwrap();
+        let failure = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("fallback".into()),
+                    ..Default::default()
+                },
+                final_response: "useful work before configuration rejection".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            failure.evidence().final_response,
+            "useful work before configuration rejection"
+        );
+        assert_eq!(
+            failure.evidence().configuration.applied_model.as_deref(),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn runner_projection_preserves_adapter_process_stderr() {
+        let profiles = RuntimeProfiles::from_toml(
+            "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\n",
+            Path::new("/home/alice"),
+        )
+        .unwrap();
+        let profile = profiles.get("example").unwrap();
+        let mut failure = TypedFailure::permanent("runtime.process", "process failed");
+        failure.evidence_mut().stderr = "adapter-captured stderr".into();
+
+        let projected = project_turn_failure(&profile, failure);
+
+        assert_eq!(projected.evidence().stderr, "adapter-captured stderr");
     }
 
     #[tokio::test]
