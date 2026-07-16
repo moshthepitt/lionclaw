@@ -411,6 +411,7 @@ pub enum InflightEffect {
         base_sha: String,
         assignment_epoch: u32,
         recreate_workspace: bool,
+        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
         not_before_ms: i64,
         deadline_ms: i64,
@@ -436,6 +437,7 @@ pub enum InflightEffect {
         /// Carried from the event so the runner's handoff-forgery check
         /// still has its expected token after a crash/resume.
         nonce: String,
+        runtime_configuration: Option<super::RuntimeConfigurationEvidence>,
         requested_at_ms: i64,
         not_before_ms: i64,
         deadline_ms: i64,
@@ -513,6 +515,7 @@ impl InflightEffect {
                     base_sha: base_sha.clone(),
                     assignment_epoch: *assignment_epoch,
                     recreate_workspace: *recreate_workspace,
+                    runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
@@ -563,6 +566,7 @@ impl InflightEffect {
                     prompt: prompt.clone(),
                     judged_sha: judged_sha.clone(),
                     nonce: nonce.clone(),
+                    runtime_configuration: None,
                     requested_at_ms: *requested_at_ms,
                     not_before_ms: *not_before_ms,
                     deadline_ms: *deadline_ms,
@@ -575,6 +579,7 @@ impl InflightEffect {
             MissionEvent::MissionCreated { .. }
             | MissionEvent::PlanProposed { .. }
             | MissionEvent::TaskWorkspacePrepared { .. }
+            | MissionEvent::EffectRuntimeConfigured { .. }
             | MissionEvent::RoleRunCompleted { .. }
             | MissionEvent::OracleRunCompleted { .. }
             | MissionEvent::TerminalReviewCompleted { .. }

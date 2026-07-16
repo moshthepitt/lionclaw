@@ -773,6 +773,26 @@ impl Engine {
             }
             RoleRunUpdate::WorkspacePrepared { .. } => Ok(()),
             RoleRunUpdate::Runtime(event) => {
+                if let lionclaw_runtime_api::RuntimeEvent::Configuration { configuration } =
+                    &event.event
+                {
+                    self.append_fact(
+                        &state.mission_id,
+                        state.head,
+                        NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+                            effect_id: effect_id.clone(),
+                            configuration: crate::model::RuntimeConfigurationEvidence {
+                                requested_model: configuration.requested_model.clone(),
+                                applied_model: configuration.applied_model.clone(),
+                                model_confirmation: configuration.model_confirmation,
+                                requested_mode: configuration.requested_mode.clone(),
+                                applied_mode: configuration.applied_mode.clone(),
+                                mode_confirmation: configuration.mode_confirmation,
+                            },
+                        }),
+                    )
+                    .await?;
+                }
                 if let Err(error) = crate::activity::record_runtime_event(
                     &self.store.mission_dir(&state.mission_id),
                     effect_id,
@@ -1594,6 +1614,21 @@ fn interrupted_outcome(effect_id: &EffectId, effect: &InflightEffect) -> NewEven
         "the previous mission driver exited before recording an outcome; its resources were cleaned and the effect was not replayed",
     );
     evidence.stop_reason = Some("mission driver exited".into());
+    match effect {
+        InflightEffect::RoleRun {
+            runtime_configuration,
+            ..
+        }
+        | InflightEffect::TerminalReview {
+            runtime_configuration,
+            ..
+        } => {
+            if let Some(configuration) = runtime_configuration {
+                evidence.configuration = runtime_configuration_evidence(configuration);
+            }
+        }
+        InflightEffect::OracleRun { .. } => {}
+    }
     let failure = TypedFailure::Interrupted {
         evidence: Box::new(evidence),
     };

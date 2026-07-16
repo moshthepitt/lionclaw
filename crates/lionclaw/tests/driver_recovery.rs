@@ -10,12 +10,15 @@ use common::{
     approve_plan, default_config, proposal, simple_plan, test_mission_type, BASE_SHA, HEAD_SHA,
 };
 use lionclaw::engine::{Engine, EngineServices, MissionDisposition};
-use lionclaw::model::{ArtifactOutcome, EffectResource, Handoff, PayloadRef};
+use lionclaw::model::{
+    ArtifactOutcome, EffectResource, Handoff, MissionEvent, PayloadRef,
+    RuntimeConfigurationEvidence,
+};
 use lionclaw::ports::{
     EffectCleaner, EffectCleanupFailure, EffectCleanupRequest, RoleRunOutcome, RoleRunRequest,
     RoleRunner,
 };
-use lionclaw::store::MissionStore;
+use lionclaw::store::{MissionStore, NewEvent};
 use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectCleaner};
 use lionclaw_runtime_api::TypedFailure;
 use tokio::sync::Barrier;
@@ -241,6 +244,33 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
     );
     assert_eq!(runner.calls.lock().unwrap().len(), 1);
 
+    let state = engine.load_state(&mission_id).await.unwrap();
+    let effect_id = state.inflight.keys().next().unwrap().clone();
+    engine
+        .store()
+        .append(
+            &mission_id,
+            state.head,
+            &[NewEvent::new(MissionEvent::EffectRuntimeConfigured {
+                effect_id,
+                configuration: RuntimeConfigurationEvidence {
+                    requested_model: Some("requested-model".into()),
+                    applied_model: Some("applied-model".into()),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                    ),
+                    requested_mode: Some("build".into()),
+                    applied_mode: Some("build".into()),
+                    mode_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+                    ),
+                },
+            })],
+            1,
+        )
+        .await
+        .unwrap();
+
     let parked = engine.advance(&mission_id).await.unwrap();
     assert_eq!(parked.disposition, MissionDisposition::Parked);
     assert!(parked.state.cleanup_failure.is_none());
@@ -255,6 +285,17 @@ async fn cleanup_failure_is_truthful_and_retried_without_replaying_the_effect() 
         task.last_failure.as_ref().unwrap().category(),
         "interrupted"
     );
+    let configuration = &task.last_failure.as_ref().unwrap().evidence().configuration;
+    assert_eq!(
+        configuration.requested_model.as_deref(),
+        Some("requested-model")
+    );
+    assert_eq!(
+        configuration.applied_model.as_deref(),
+        Some("applied-model")
+    );
+    assert_eq!(configuration.requested_mode.as_deref(), Some("build"));
+    assert_eq!(configuration.applied_mode.as_deref(), Some("build"));
     let attention = parked.state.open_attention.values().next().unwrap();
     assert!(attention.report.contains("previous mission driver exited"));
     assert!(attention.report.contains("effect was not replayed"));

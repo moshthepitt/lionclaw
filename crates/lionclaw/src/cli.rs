@@ -816,14 +816,14 @@ async fn cmd_inbox(args: InboxArgs) -> Result<()> {
     if args.json {
         let missions: Vec<_> = pending
             .iter()
-            .map(|view| mission_view_json(view, store.blobs()))
+            .map(|view| mission_view_json(view, &store))
             .collect::<Result<Vec<_>>>()?;
         println!("{}", serde_json::json!({ "missions": missions }));
     } else if pending.is_empty() {
         println!("inbox empty: no missions awaiting input or cleanup");
     } else {
         for view in &pending {
-            print_mission_view(view, store.blobs(), false)?;
+            print_mission_view(view, &store, false)?;
             println!("  objective: {}", view.state.objective);
             println!("  next: {}", view.next_actions().join(" | "));
         }
@@ -1051,10 +1051,10 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
                 "disposition": view.disposition.slug(),
                 "next_actions": view.next_actions(),
                 "tasks": state.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(store.blobs(), id, task)
+                    task_runtime_json(&store, state, id, task, true)
                 }).collect::<Result<Vec<_>>>()?,
                 "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-                    task_runtime_json(store.blobs(), id, task)
+                    task_runtime_json(&store, state, id, task, false)
                 }).collect::<Result<Vec<_>>>()?,
                 "assertions": rows.iter().map(|row| serde_json::json!({
                     "id": row.id,
@@ -1134,6 +1134,7 @@ async fn cmd_report(args: ReportArgs) -> Result<()> {
             }
         }
     }
+    print_retained_task_work(&store, state, "  ");
     for (task_id, task) in &state.planning.tasks {
         if let Some(failure) = &task.last_failure {
             print_typed_failure(failure, &format!("  planning task {task_id} failure: "));
@@ -1535,7 +1536,7 @@ async fn cmd_advance(args: AdvanceArgs) -> Result<std::process::ExitCode> {
     let engine = build_engine_for_mission(store, &repo, &mission_id).await?;
     let view = load_mission_view(engine.store(), &mission_id).await?;
     let state = &view.state;
-    print_mission_view(&view, engine.store().blobs(), args.json)?;
+    print_mission_view(&view, engine.store(), args.json)?;
     // Closing over acknowledged review gaps (or a waived review) was an
     // explicit, justified human decision — exit SUCCESS, but say so. The
     // summary already applies the freshness law, so a stale verdict from a
@@ -1609,7 +1610,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
     let view = load_mission_view(&store, &mission_id).await?;
     let state = &view.state;
     if args.json {
-        let mut value = mission_view_json(&view, store.blobs())?;
+        let mut value = mission_view_json(&view, &store)?;
         let activity = if view.disposition == MissionDisposition::Running {
             std::fs::read(crate::activity::path(&store.mission_dir(&mission_id)))
                 .ok()
@@ -1660,6 +1661,7 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 }
             }
         }
+        print_retained_task_work(&store, state, "  ");
         if view.disposition == MissionDisposition::Running {
             print_activity(&store, &mission_id)?;
         }
@@ -2071,11 +2073,12 @@ fn show_loaded_mission_type(mt: &MissionType, json: bool) {
     }
 }
 
-fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Result<()> {
+fn print_mission_view(view: &MissionView, store: &MissionStore, json: bool) -> Result<()> {
     let state = &view.state;
+    let blobs = store.blobs();
     let mission_id = state.mission_id.as_str();
     if json {
-        println!("{}", mission_view_json(view, blobs)?);
+        println!("{}", mission_view_json(view, store)?);
     } else {
         match view.disposition {
             MissionDisposition::AwaitingPlan => {
@@ -2101,6 +2104,7 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
                         }
                     }
                 }
+                print_retained_task_work(store, state, "  ");
                 print_non_task_failures(state);
             }
             MissionDisposition::Running => {
@@ -2129,8 +2133,28 @@ fn print_mission_view(view: &MissionView, blobs: &BlobStore, json: bool) -> Resu
     Ok(())
 }
 
-fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json::Value> {
+fn print_retained_task_work(
+    store: &MissionStore,
+    state: &crate::model::MissionState,
+    indent: &str,
+) {
+    for task_id in state.tasks.keys() {
+        if let Some(diffstat) = crate::activity::task_workspace_diffstat(
+            store.lionclaw_dir(),
+            &state.mission_id,
+            task_id,
+        ) {
+            println!("{indent}task {task_id} retained work:");
+            for line in diffstat.lines() {
+                println!("{indent}  {line}");
+            }
+        }
+    }
+}
+
+fn mission_view_json(view: &MissionView, store: &MissionStore) -> Result<serde_json::Value> {
     let state = &view.state;
+    let blobs = store.blobs();
     Ok(serde_json::json!({
         "mission_id": state.mission_id.as_str(),
         "phase": phase_slug(&state.phase),
@@ -2141,10 +2165,10 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
         "current_sha": state.current_sha,
         "objective": state.objective,
         "tasks": state.tasks.iter().map(|(id, task)| {
-            task_runtime_json(blobs, id, task)
+            task_runtime_json(store, state, id, task, true)
         }).collect::<Result<Vec<_>>>()?,
         "planning_tasks": state.planning.tasks.iter().map(|(id, task)| {
-            task_runtime_json(blobs, id, task)
+            task_runtime_json(store, state, id, task, false)
         }).collect::<Result<Vec<_>>>()?,
         "planning_input": planning_input_json(state, blobs)?,
         "contract": state.contract.iter().map(|(id, assertion)| {
@@ -2174,19 +2198,28 @@ fn mission_view_json(view: &MissionView, blobs: &BlobStore) -> Result<serde_json
 }
 
 fn task_runtime_json(
-    blobs: &BlobStore,
+    store: &MissionStore,
+    state: &crate::model::MissionState,
     id: &crate::model::TaskId,
     task: &crate::model::TaskRuntimeState,
+    include_workspace: bool,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "id": id.as_str(),
         "status": format!("{:?}", task.status).to_ascii_lowercase(),
         "workspace_base_sha": task.workspace_base_sha,
         "assignment_epoch": task.assignment_epoch,
+        "dirty_diffstat": include_workspace.then(|| {
+            crate::activity::task_workspace_diffstat(
+                store.lionclaw_dir(),
+                &state.mission_id,
+                id,
+            )
+        }).flatten(),
         "runtime_configuration": task.last_runtime_configuration,
         "failure": task.last_failure,
         "final_response": task.final_response.as_ref()
-            .map(|response| blobs.resolve(response))
+            .map(|response| store.blobs().resolve(response))
             .transpose()?,
     }))
 }
@@ -2972,8 +3005,8 @@ mod tests {
         assert_eq!(json["actions"][1], "repair");
     }
 
-    #[test]
-    fn mission_view_json_carries_one_disposition_and_action_projection() {
+    #[tokio::test]
+    async fn mission_view_json_carries_one_disposition_and_action_projection() {
         use crate::model::{
             PayloadRef, RuntimeConfigurationEvidence, TaskId, TaskRuntimeState, TaskStatus,
         };
@@ -3005,13 +3038,41 @@ mod tests {
                 final_response: Some(PayloadRef::inline("planning stopped here")),
             },
         );
+        state.tasks.insert(
+            TaskId::new("retained").unwrap(),
+            TaskRuntimeState {
+                status: TaskStatus::Failed,
+                attempts: 1,
+                consecutive_failures: 1,
+                last_report: None,
+                last_failure: None,
+                feedback: Vec::new(),
+                last_runtime_configuration: None,
+                workspace_base_sha: Some("base".into()),
+                assignment_epoch: 1,
+                final_response: None,
+            },
+        );
+        let mission_id = state.mission_id.clone();
         let view = MissionView {
             state,
             disposition: MissionDisposition::Parked,
         };
         let temp = tempfile::tempdir().unwrap();
-        let blobs = BlobStore::new(temp.path().join("blobs"));
-        let json = mission_view_json(&view, &blobs).unwrap();
+        let store = MissionStore::open(temp.path()).await.unwrap();
+        let retained = store
+            .lionclaw_dir()
+            .join("missions")
+            .join(mission_id.as_str())
+            .join("tasks/retained/work");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&retained)
+            .status()
+            .unwrap();
+        std::fs::write(retained.join("partial.txt"), "preserved\n").unwrap();
+        let json = mission_view_json(&view, &store).unwrap();
 
         assert_eq!(json["phase"], "attention_needed");
         assert_eq!(json["disposition"], "parked");
@@ -3020,6 +3081,20 @@ mod tests {
         assert_eq!(json["cleanup_failure"], serde_json::Value::Null);
         assert_eq!(json["attention"][0]["kind"], "oracle_verdict_failed");
         assert_eq!(json["planning_tasks"][0]["id"], "planner");
+        assert_eq!(
+            json["planning_tasks"][0]["dirty_diffstat"],
+            serde_json::Value::Null
+        );
+        let retained = json["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "retained")
+            .unwrap();
+        assert!(retained["dirty_diffstat"]
+            .as_str()
+            .unwrap()
+            .contains("partial.txt"));
         assert_eq!(
             json["planning_tasks"][0]["runtime_configuration"]["applied_model"],
             "applied"
@@ -3030,8 +3105,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mission_view_json_projects_complete_manual_replanning_input() {
+    #[tokio::test]
+    async fn mission_view_json_projects_complete_manual_replanning_input() {
         use crate::model::{FailureEvidence, FailureFeedback, PlanningRefinement};
 
         let mut state = review_state(vec![]);
@@ -3048,8 +3123,8 @@ mod tests {
             disposition: MissionDisposition::AwaitingPlan,
         };
         let temp = tempfile::tempdir().unwrap();
-        let blobs = BlobStore::new(temp.path().join("blobs"));
-        let json = mission_view_json(&view, &blobs).unwrap();
+        let store = MissionStore::open(temp.path()).await.unwrap();
+        let json = mission_view_json(&view, &store).unwrap();
 
         assert_eq!(json["planning_input"]["base_revision"], 1);
         assert_eq!(
@@ -3076,7 +3151,7 @@ mod tests {
                 justification: "repair this".to_string(),
             },
         )));
-        let json = planning_input_json(&state, &blobs).unwrap();
+        let json = planning_input_json(&state, store.blobs()).unwrap();
         assert_eq!(json["refinement"]["kind"], "failure_evidence");
         assert_eq!(json["refinement"]["evidence"]["stdout"], "ordinary output");
         assert_eq!(

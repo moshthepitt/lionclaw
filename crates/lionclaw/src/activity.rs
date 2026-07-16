@@ -153,6 +153,17 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
                     .iter()
                     .find(|prior| prior.effect_id == effect_id.as_str())
             });
+            let configuration = match effect {
+                InflightEffect::RoleRun {
+                    runtime_configuration,
+                    ..
+                }
+                | InflightEffect::TerminalReview {
+                    runtime_configuration,
+                    ..
+                } => runtime_configuration.as_ref(),
+                InflightEffect::OracleRun { .. } => None,
+            };
             let not_before_ms = effect.not_before_ms();
             let scheduled = now_ms < not_before_ms;
             let deadline_reached = state.reached_deadlines.contains_key(effect_id);
@@ -169,12 +180,20 @@ pub fn publish(mission_dir: &Path, state: &MissionState, now_ms: i64) -> Result<
                 role,
                 task,
                 runtime,
-                // Adapter configuration is authoritative only after the effect
-                // reports its outcome. Never project a prior attempt as current.
-                applied_model: prior.and_then(|prior| prior.applied_model.clone()),
-                model_confirmation: prior.and_then(|prior| prior.model_confirmation),
-                applied_mode: prior.and_then(|prior| prior.applied_mode.clone()),
-                mode_confirmation: prior.and_then(|prior| prior.mode_confirmation),
+                // Prefer the adapter confirmation folded for this exact
+                // effect; the prior file supplies only same-effect live data.
+                applied_model: configuration
+                    .and_then(|configuration| configuration.applied_model.clone())
+                    .or_else(|| prior.and_then(|prior| prior.applied_model.clone())),
+                model_confirmation: configuration
+                    .and_then(|configuration| configuration.model_confirmation)
+                    .or_else(|| prior.and_then(|prior| prior.model_confirmation)),
+                applied_mode: configuration
+                    .and_then(|configuration| configuration.applied_mode.clone())
+                    .or_else(|| prior.and_then(|prior| prior.applied_mode.clone())),
+                mode_confirmation: configuration
+                    .and_then(|configuration| configuration.mode_confirmation)
+                    .or_else(|| prior.and_then(|prior| prior.mode_confirmation)),
                 environment: format!(
                     "confinement-image:{}",
                     crate::model::short_hex(&state.image_id)
@@ -303,6 +322,21 @@ fn workspace_diffstat(workspace: &Path) -> Option<String> {
         .success()
         .then(|| bounded(&String::from_utf8_lossy(&output.stdout)))
         .filter(|text| !text.is_empty())
+}
+
+pub fn task_workspace_diffstat(
+    lionclaw_dir: &Path,
+    mission_id: &crate::model::MissionId,
+    task_id: &crate::model::TaskId,
+) -> Option<String> {
+    workspace_diffstat(
+        &lionclaw_dir
+            .join("missions")
+            .join(mission_id.as_str())
+            .join("tasks")
+            .join(task_id.as_str())
+            .join("work"),
+    )
 }
 
 fn bounded(text: &str) -> String {

@@ -19,9 +19,8 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
 
-/// Bumped for runner-confirmed workspace provenance, scheduled effect starts,
-/// and durable deadline/cancellation linearization.
-pub const SCHEMA_VERSION: u32 = 10;
+/// Bumped for durable, effect-scoped runtime configuration evidence.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +392,13 @@ pub enum MissionEvent {
         base_sha: String,
         assignment_epoch: u32,
     },
+    /// Structured adapter evidence for the exact active effect. This is the
+    /// one runtime journal fact promoted into mission authority so crash
+    /// recovery can report configuration truth without trusting activity.json.
+    EffectRuntimeConfigured {
+        effect_id: super::EffectId,
+        configuration: RuntimeConfigurationEvidence,
+    },
     RoleRunCompleted {
         task_id: TaskId,
         attempt_no: u32,
@@ -548,6 +554,7 @@ impl MissionEvent {
             Self::PlanProposed { .. } => "plan_proposed",
             Self::RoleRunRequested { .. } => "role_run_requested",
             Self::TaskWorkspacePrepared { .. } => "task_workspace_prepared",
+            Self::EffectRuntimeConfigured { .. } => "effect_runtime_configured",
             Self::RoleRunCompleted { .. } => "role_run_completed",
             Self::OracleRunRequested { .. } => "oracle_run_requested",
             Self::OracleRunCompleted { .. } => "oracle_run_completed",
@@ -575,11 +582,12 @@ impl MissionEvent {
             | Self::TerminalReviewCompleted { effect_id, .. } => {
                 Some((EffectEventClass::Outcome, effect_id.as_str()))
             }
-            // Fact events carry no effect ID. Exhaustive on purpose: a new
-            // effect-style event must decide its class here.
+            // Facts are not members of the request/outcome pair, even when
+            // they identify the effect they describe. Exhaustive on purpose.
             Self::MissionCreated { .. }
             | Self::PlanProposed { .. }
             | Self::TaskWorkspacePrepared { .. }
+            | Self::EffectRuntimeConfigured { .. }
             | Self::ControlRequested { .. }
             | Self::EffectDeadlineReached { .. }
             | Self::MissionAborted { .. }

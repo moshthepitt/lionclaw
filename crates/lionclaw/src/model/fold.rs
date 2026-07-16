@@ -25,7 +25,7 @@ use super::verdict::{classify_finish, AuthoritativeVerdict};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 12;
+pub const REDUCER_VERSION: u32 = 13;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -149,6 +149,37 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                     task.workspace_base_sha = Some(base_sha.clone());
                     task.assignment_epoch = *assignment_epoch;
+                }
+            }
+        }
+        MissionEvent::EffectRuntimeConfigured {
+            effect_id,
+            configuration,
+        } => {
+            let role_task = state
+                .inflight
+                .get_mut(effect_id)
+                .and_then(|effect| match effect {
+                    InflightEffect::RoleRun {
+                        task_id,
+                        runtime_configuration,
+                        ..
+                    } => {
+                        *runtime_configuration = Some(configuration.clone());
+                        Some(task_id.clone())
+                    }
+                    InflightEffect::TerminalReview {
+                        runtime_configuration,
+                        ..
+                    } => {
+                        *runtime_configuration = Some(configuration.clone());
+                        None
+                    }
+                    InflightEffect::OracleRun { .. } => None,
+                });
+            if let Some(task_id) = role_task {
+                if let Some(task) = state.active_tasks_mut().get_mut(&task_id) {
+                    task.last_runtime_configuration = Some(configuration.clone());
                 }
             }
         }
