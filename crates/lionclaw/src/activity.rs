@@ -373,21 +373,10 @@ async fn git_output(
 }
 
 async fn workspace_observation(workspace: &Path, base_sha: Option<&str>) -> WorkspaceObservation {
-    match tokio::fs::symlink_metadata(workspace).await {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => {
-            return WorkspaceObservation::Unavailable {
-                reason: "workspace path is not a directory".into(),
-            };
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return WorkspaceObservation::NotCreated;
-        }
-        Err(error) => {
-            return WorkspaceObservation::Unavailable {
-                reason: bounded(&format!("workspace metadata unavailable: {error}")),
-            };
-        }
+    if let Err(observation) =
+        classify_workspace_metadata(tokio::fs::symlink_metadata(workspace).await)
+    {
+        return observation;
     }
     match observe_existing_workspace(workspace, base_sha).await {
         Ok(summary) if summary.is_empty() => WorkspaceObservation::Clean,
@@ -397,6 +386,23 @@ async fn workspace_observation(workspace: &Path, base_sha: Option<&str>) -> Work
         Err(error) => WorkspaceObservation::Unavailable {
             reason: bounded(&format!("{error:#}")),
         },
+    }
+}
+
+fn classify_workspace_metadata(
+    metadata: std::io::Result<std::fs::Metadata>,
+) -> std::result::Result<(), WorkspaceObservation> {
+    match metadata {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(WorkspaceObservation::Unavailable {
+            reason: "workspace path is not a directory".into(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(WorkspaceObservation::NotCreated)
+        }
+        Err(error) => Err(WorkspaceObservation::Unavailable {
+            reason: bounded(&format!("workspace metadata unavailable: {error}")),
+        }),
     }
 }
 
@@ -673,6 +679,31 @@ mod tests {
         assert!(matches!(
             observation,
             WorkspaceObservation::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_metadata_errors_distinguish_absence_from_unavailability() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a workspace\n").unwrap();
+        assert_eq!(
+            classify_workspace_metadata(std::fs::symlink_metadata(temp.path())),
+            Ok(())
+        );
+        assert!(matches!(
+            classify_workspace_metadata(std::fs::symlink_metadata(file)),
+            Err(WorkspaceObservation::Unavailable { .. })
+        ));
+        assert_eq!(
+            classify_workspace_metadata(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            Err(WorkspaceObservation::NotCreated)
+        );
+        assert!(matches!(
+            classify_workspace_metadata(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            Err(WorkspaceObservation::Unavailable { .. })
         ));
     }
 
