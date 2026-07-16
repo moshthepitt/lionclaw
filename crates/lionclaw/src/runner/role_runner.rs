@@ -124,7 +124,7 @@ async fn cancellation_acknowledged<A, T, O>(
     acknowledgement: A,
     mut turn: std::pin::Pin<&mut T>,
     timeout: std::time::Duration,
-) -> bool
+) -> (bool, Option<O>)
 where
     A: std::future::Future<Output = anyhow::Result<()>>,
     T: std::future::Future<Output = O>,
@@ -132,22 +132,35 @@ where
     tokio::pin!(acknowledgement);
     let mut acknowledgement_done = false;
     let mut acknowledgement_ok = false;
-    let mut turn_done = false;
-    tokio::time::timeout(timeout, async {
-        while !acknowledgement_done || !turn_done {
+    let mut turn_result = None;
+    let completed_in_time = tokio::time::timeout(timeout, async {
+        while !acknowledgement_done || turn_result.is_none() {
             tokio::select! {
                 result = &mut acknowledgement, if !acknowledgement_done => {
                     acknowledgement_ok = result.is_ok();
                     acknowledgement_done = true;
                 }
-                _ = turn.as_mut(), if !turn_done => turn_done = true,
+                result = turn.as_mut(), if turn_result.is_none() => turn_result = Some(result),
             }
         }
     })
     .await
-    .is_ok()
-        && acknowledgement_ok
-        && turn_done
+    .is_ok();
+    (
+        completed_in_time && acknowledgement_ok && turn_result.is_some(),
+        turn_result,
+    )
+}
+
+fn completed_turn_configuration(
+    completed: Option<anyhow::Result<lionclaw_runtime_api::RuntimeTurnResult>>,
+) -> Option<lionclaw_runtime_api::AppliedRuntimeConfiguration> {
+    completed.and_then(|completed| match completed {
+        Ok(result) => Some(result.configuration),
+        Err(error) => error
+            .downcast_ref::<TypedFailure>()
+            .map(|failure| failure.evidence().configuration.clone()),
+    })
 }
 
 async fn prepare_writer_checkout(
@@ -463,7 +476,7 @@ impl OciRoleRunner {
                     .unwrap_or_else(|| TypedFailure::permanent("runtime.unknown", err.to_string()))
             }),
             TurnEnd::Cancel { reason, deadline } => {
-                let acknowledged = cancellation_acknowledged(
+                let (acknowledged, completed) = cancellation_acknowledged(
                     adapter.cancel(&handle, Some(reason.clone())),
                     turn.as_mut(),
                     std::time::Duration::from_secs(5),
@@ -480,6 +493,9 @@ impl OciRoleRunner {
                     String::new(),
                     String::new(),
                 );
+                if let Some(configuration) = completed_turn_configuration(completed) {
+                    evidence.configuration = configuration;
+                }
                 evidence.code = Some(
                     if acknowledged {
                         "runtime.cancel_acknowledged"
@@ -701,13 +717,31 @@ mod tests {
             Ok(())
         };
 
-        assert!(
-            cancellation_acknowledged(
-                acknowledgement,
-                std::pin::Pin::new(&mut turn),
-                std::time::Duration::from_millis(100),
-            )
-            .await
+        let (acknowledged, turn_result) = cancellation_acknowledged(
+            acknowledgement,
+            std::pin::Pin::new(&mut turn),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(acknowledged);
+        assert_eq!(turn_result, Some(()));
+    }
+
+    #[test]
+    fn cancellation_reclassification_preserves_structured_runtime_configuration() {
+        let expected = lionclaw_runtime_api::AppliedRuntimeConfiguration {
+            requested_mode: Some("build".into()),
+            applied_mode: Some("build".into()),
+            mode_confirmation: Some(
+                lionclaw_runtime_api::RuntimeConfigurationConfirmation::Observed,
+            ),
+            ..Default::default()
+        };
+        let mut failure = TypedFailure::permanent("runtime.cancelled", "cancelled");
+        failure.evidence_mut().configuration = expected.clone();
+        assert_eq!(
+            completed_turn_configuration(Some(Err(anyhow::Error::new(failure)))),
+            Some(expected)
         );
     }
 
