@@ -634,7 +634,9 @@ fn validate_completed_turn(
     if configuration.requested_model != profile.model
         || configuration.requested_mode != profile.mode
         || profile.model.is_some() && configuration.applied_model.is_none()
+        || profile.model.is_some() && configuration.model_confirmation.is_none()
         || profile.mode.is_some() && configuration.applied_mode.is_none()
+        || profile.mode.is_some() && configuration.mode_confirmation.is_none()
     {
         let mut failure = launch(format!(
             "runtime did not prove requested configuration was applied: requested model={:?} mode={:?}, evidence={configuration:?}",
@@ -846,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_accepts_adapter_canonicalization_but_requires_applied_evidence() {
+    fn completed_turn_accepts_only_confirmed_adapter_canonicalization() {
         let profiles = RuntimeProfiles::from_toml(
             "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"requested\"\n",
             Path::new("/home/alice"),
@@ -859,6 +861,9 @@ mod tests {
                 configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
                     requested_model: Some("requested".into()),
                     applied_model: Some("provider:requested".into()),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+                    ),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -891,6 +896,27 @@ mod tests {
         assert_eq!(
             failure.evidence().configuration.applied_model.as_deref(),
             None
+        );
+
+        let unconfirmed = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some("unrelated-fallback".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed
+                .evidence()
+                .configuration
+                .applied_model
+                .as_deref(),
+            Some("unrelated-fallback")
         );
     }
 
