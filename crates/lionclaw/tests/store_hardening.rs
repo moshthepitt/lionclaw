@@ -35,6 +35,7 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
             &mission_id,
             state.head,
             &[NewEvent::new(MissionEvent::RoleRunRequested {
+                namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
                 effect_id: id.clone(),

@@ -25,7 +25,7 @@ use crate::TypedFailure;
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 14;
+pub const REDUCER_VERSION: u32 = 15;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -115,14 +115,15 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             }
         }
         MissionEvent::RoleRunRequested {
+            namespace,
             task_id,
             attempt_no,
             ..
         } => {
             state.parked_effects.retain(|_, parked| {
-                !matches!(parked, ParkedEffect::RoleRun { task_id: parked_task } if parked_task == task_id)
+                !matches!(parked, ParkedEffect::RoleRun { namespace: parked_namespace, task_id: parked_task } if parked_namespace == namespace && parked_task == task_id)
             });
-            let tasks = state.active_tasks_mut();
+            let tasks = state.tasks_in_mut(*namespace);
             let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
             task.status = TaskStatus::Running;
             task.attempts = *attempt_no;
@@ -134,19 +135,26 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             base_sha,
             assignment_epoch,
         } => {
-            let matches_request = matches!(
-                state.inflight.get(effect_id),
-                Some(InflightEffect::RoleRun {
-                    task_id: active_task,
-                    base_sha: active_base,
-                    assignment_epoch: active_epoch,
-                    ..
-                }) if active_task == task_id
-                    && active_base == base_sha
-                    && active_epoch == assignment_epoch
-            );
-            if matches_request {
-                if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+            let namespace = state
+                .inflight
+                .get(effect_id)
+                .and_then(|effect| match effect {
+                    InflightEffect::RoleRun {
+                        namespace,
+                        task_id: active_task,
+                        base_sha: active_base,
+                        assignment_epoch: active_epoch,
+                        ..
+                    } if active_task == task_id
+                        && active_base == base_sha
+                        && active_epoch == assignment_epoch =>
+                    {
+                        Some(*namespace)
+                    }
+                    _ => None,
+                });
+            if let Some(namespace) = namespace {
+                if let Some(task) = state.tasks_in_mut(namespace).get_mut(task_id) {
                     task.workspace_base_sha = Some(base_sha.clone());
                     task.assignment_epoch = *assignment_epoch;
                 }
@@ -161,12 +169,13 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 .get_mut(effect_id)
                 .and_then(|effect| match effect {
                     InflightEffect::RoleRun {
+                        namespace,
                         task_id,
                         runtime_configuration,
                         ..
                     } => {
                         *runtime_configuration = Some(configuration.clone());
-                        Some(task_id.clone())
+                        Some((*namespace, task_id.clone()))
                     }
                     InflightEffect::TerminalReview {
                         runtime_configuration,
@@ -177,13 +186,14 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     }
                     InflightEffect::OracleRun { .. } => None,
                 });
-            if let Some(task_id) = role_task {
-                if let Some(task) = state.active_tasks_mut().get_mut(&task_id) {
+            if let Some((namespace, task_id)) = role_task {
+                if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
                     task.last_runtime_configuration = Some(configuration.clone());
                 }
             }
         }
         MissionEvent::RoleRunCompleted {
+            namespace,
             task_id,
             attempt_no,
             effect_id,
@@ -209,11 +219,11 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                     if let Some(artifact) = &success.artifact {
                         state.current_sha = artifact.head_sha.clone();
                     }
-                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                         task.attempts = task.attempts.max(*attempt_no);
                     }
-                    apply_handoff(state, task_id, &success.handoff);
-                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    apply_handoff(state, *namespace, task_id, &success.handoff);
+                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                         task.last_runtime_configuration =
                             Some(success.runtime_configuration.clone());
                         task.final_response = Some(success.final_response.clone());
@@ -228,7 +238,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                 Err(failure) => {
                     let failure =
                         merge_failure_configuration(failure, observed_configuration.as_ref());
-                    if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
                         task.attempts = task.attempts.max(*attempt_no);
                         task.status = TaskStatus::Failed;
                         task.last_failure = Some(failure.clone());
@@ -254,6 +264,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                             state.parked_effects.insert(
                                 effect_id.clone(),
                                 ParkedEffect::RoleRun {
+                                    namespace: *namespace,
                                     task_id: task_id.clone(),
                                 },
                             );
@@ -403,8 +414,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             ControlAction::Continue { .. } => {
                 if let Some(parked) = state.parked_effects.remove(effect_id) {
                     match parked {
-                        ParkedEffect::RoleRun { task_id } => {
-                            if let Some(task) = state.active_tasks_mut().get_mut(&task_id) {
+                        ParkedEffect::RoleRun { namespace, task_id } => {
+                            if let Some(task) = state.tasks_in_mut(namespace).get_mut(&task_id) {
                                 task.status = TaskStatus::Pending;
                                 task.consecutive_failures = 0;
                             }
@@ -515,8 +526,8 @@ fn prune_reopened_parked_effects(state: &mut MissionState) {
     state.parked_effects = parked
         .into_iter()
         .filter(|(_, effect)| match effect {
-            ParkedEffect::RoleRun { task_id } => state
-                .active_tasks()
+            ParkedEffect::RoleRun { namespace, task_id } => state
+                .tasks_in(*namespace)
                 .get(task_id)
                 .is_some_and(|task| task.status == TaskStatus::Failed),
             ParkedEffect::OracleRun { oracle } => state.oracle_failures.contains_key(oracle),
@@ -1186,7 +1197,12 @@ fn track_inflight(state: &mut MissionState, event: &MissionEvent, seq: u64) {
     }
 }
 
-fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff: &Handoff) {
+fn apply_handoff(
+    state: &mut MissionState,
+    namespace: crate::TaskNamespace,
+    task_id: &super::ids::TaskId,
+    handoff: &Handoff,
+) {
     match handoff {
         Handoff::Work {
             done,
@@ -1201,7 +1217,7 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             // Work runs in either era (a planning report role or an execution
             // artifact role), so route by era; Plan is planning-only and Validate
             // execution-only, and address their maps directly below.
-            if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
+            if let Some(task) = state.tasks_in_mut(namespace).get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
                 task.last_failure = (!done).then(|| {
@@ -1229,6 +1245,9 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
             } else {
                 TaskStatus::Failed
             };
+            if namespace != crate::TaskNamespace::Planning {
+                return;
+            }
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
@@ -1262,6 +1281,9 @@ fn apply_handoff(state: &mut MissionState, task_id: &super::ids::TaskId, handoff
         } => {
             // Execution-only: validators always clear — they ran; their verdicts
             // are data folded into the contract.
+            if namespace != crate::TaskNamespace::Execution {
+                return;
+            }
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Cleared;
                 task.last_report = Some(report.clone());
@@ -1527,7 +1549,16 @@ mod tests {
     }
 
     fn role_requested(task: &str, key: &str) -> MissionEvent {
+        role_requested_in(crate::TaskNamespace::Execution, task, key)
+    }
+
+    fn planning_role_requested(task: &str, key: &str) -> MissionEvent {
+        role_requested_in(crate::TaskNamespace::Planning, task, key)
+    }
+
+    fn role_requested_in(namespace: crate::TaskNamespace, task: &str, key: &str) -> MissionEvent {
         MissionEvent::RoleRunRequested {
+            namespace,
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -1550,7 +1581,33 @@ mod tests {
         handoff: Handoff,
         artifact: Option<ArtifactOutcome>,
     ) -> MissionEvent {
+        role_completed_in(
+            crate::TaskNamespace::Execution,
+            task,
+            key,
+            handoff,
+            artifact,
+        )
+    }
+
+    fn planning_role_completed(
+        task: &str,
+        key: &str,
+        handoff: Handoff,
+        artifact: Option<ArtifactOutcome>,
+    ) -> MissionEvent {
+        role_completed_in(crate::TaskNamespace::Planning, task, key, handoff, artifact)
+    }
+
+    fn role_completed_in(
+        namespace: crate::TaskNamespace,
+        task: &str,
+        key: &str,
+        handoff: Handoff,
+        artifact: Option<ArtifactOutcome>,
+    ) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
+            namespace,
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -1682,6 +1739,7 @@ mod tests {
             },
             role_completed("w", "workspace-first", work_handoff(true, false), None),
             MissionEvent::RoleRunRequested {
+                namespace: crate::TaskNamespace::Execution,
                 task_id: tid("w"),
                 attempt_no: 2,
                 effect_id: second_effect.clone(),
@@ -1697,6 +1755,7 @@ mod tests {
                 budget_deadline_ms: 100_001,
             },
             MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
                 task_id: tid("w"),
                 attempt_no: 2,
                 effect_id: second_effect,
@@ -1824,6 +1883,7 @@ mod tests {
             super::super::step::step(&state),
             super::super::step::StepDecision::DispatchRole(
                 super::super::step::RoleDispatchIntent {
+                    namespace: crate::TaskNamespace::Execution,
                     task_id: tid("w2"),
                     role: RoleName::new("implementer").unwrap(),
                     attempt_no: 1,
@@ -2247,6 +2307,7 @@ mod tests {
             plan_proposed(vec![], vec![work_task("t1")]),
             role_requested("t1", "k1"),
             MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
                 task_id: tid("t1"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k1"]),
@@ -2325,6 +2386,7 @@ mod tests {
                 plan_proposed(vec![], vec![work_task("t1")]),
                 role_requested("t1", &format!("request-{index}")),
                 MissionEvent::RoleRunCompleted {
+                    namespace: crate::TaskNamespace::Execution,
                     task_id: tid("t1"),
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", &format!("request-{index}")]),
@@ -2366,11 +2428,12 @@ mod tests {
         });
         let state = fold_log(vec![
             created,
-            role_requested("same-id", "planning"),
-            role_completed("same-id", "planning", work_handoff(true, false), None),
+            planning_role_requested("same-id", "planning"),
+            planning_role_completed("same-id", "planning", work_handoff(true, false), None),
             plan_proposed(vec![], vec![work_task("same-id")]),
             role_requested("same-id", "execution"),
             MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
                 task_id: tid("same-id"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "execution"]),
@@ -2392,6 +2455,163 @@ mod tests {
         assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Pending);
         assert_eq!(state.tasks[&tid("same-id")].consecutive_failures, 0);
         assert!(state.open_attention.is_empty());
+    }
+
+    #[test]
+    fn plan_handoff_completion_stays_in_its_original_task_era() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("same-id"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "replace the rejected plan".into(),
+            depends_on: vec![],
+        });
+        let MissionEvent::PlanProposed {
+            proposal: mut replacement,
+            ..
+        } = plan_proposed(vec![assertion("AA", None)], vec![work_task("replacement")])
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+        replacement.base_revision = 1;
+        let state = fold_log(vec![
+            mission_created,
+            plan_proposed(
+                vec![assertion("AA", None)],
+                vec![
+                    work_task("same-id"),
+                    validate_task("v"),
+                    gate_task("g", &["AA"], &["v"]),
+                ],
+            ),
+            role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
+            decision("gate_failed:g", super::super::event::DecisionAction::Revise),
+            planning_role_requested("same-id", "planning"),
+            planning_role_completed(
+                "same-id",
+                "planning",
+                Handoff::Plan {
+                    done: true,
+                    report: PayloadRef::inline("replacement plan"),
+                    proposal: Some(replacement),
+                    request_attention: false,
+                },
+                None,
+            ),
+        ])
+        .expect("state");
+
+        assert_eq!(
+            state.planning.tasks[&tid("same-id")].final_response,
+            Some(PayloadRef::inline("final response"))
+        );
+        assert_eq!(state.tasks[&tid("same-id")].final_response, None);
+    }
+
+    #[test]
+    fn continue_targets_the_parked_effects_original_task_era() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("same-id"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "replace the rejected plan".into(),
+            depends_on: vec![],
+        });
+        let MissionEvent::PlanProposed {
+            proposal: mut replacement,
+            ..
+        } = plan_proposed(vec![assertion("AA", None)], vec![work_task("same-id")])
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+        replacement.base_revision = 1;
+        let parked_effect = EffectId::for_parts(&["test", "planning-failure"]);
+        let state = fold_log(vec![
+            mission_created,
+            plan_proposed(
+                vec![assertion("AA", None)],
+                vec![validate_task("v"), gate_task("g", &["AA"], &["v"])],
+            ),
+            role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
+            decision("gate_failed:g", super::super::event::DecisionAction::Revise),
+            planning_role_requested("same-id", "planning-failure"),
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Planning,
+                task_id: tid("same-id"),
+                attempt_no: 1,
+                effect_id: parked_effect.clone(),
+                outcome: Err(TypedFailure::permanent("runtime.failed", "failed")),
+            },
+            MissionEvent::PlanProposed {
+                proposal: replacement,
+                plan_hash: "replacement".into(),
+            },
+            role_completed("same-id", "execution", work_handoff(true, false), None),
+            MissionEvent::ControlRequested {
+                effect_id: parked_effect,
+                action: super::super::event::ControlAction::Continue { automatic: false },
+                reason: "resume the planning effect".into(),
+            },
+        ])
+        .expect("state");
+
+        assert_eq!(
+            state.planning.tasks[&tid("same-id")].status,
+            TaskStatus::Pending
+        );
+        assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Cleared);
+    }
+
+    #[test]
+    fn role_handoffs_cannot_cross_task_namespaces() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("author"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "plan".into(),
+            depends_on: vec![],
+        });
+        let MissionEvent::PlanProposed { proposal, .. } =
+            plan_proposed(vec![], vec![work_task("work")])
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+        let state = fold_log(vec![
+            mission_created,
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("author"),
+                attempt_no: 1,
+                effect_id: EffectId::for_parts(&["test", "wrong-namespace"]),
+                outcome: Ok(RoleRunSuccess {
+                    handoff: Handoff::Plan {
+                        done: true,
+                        report: PayloadRef::inline("plan"),
+                        proposal: Some(proposal),
+                        request_attention: false,
+                    },
+                    artifact: None,
+                    final_response: PayloadRef::inline("plan"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            },
+        ])
+        .expect("state");
+
+        assert_eq!(
+            state.planning.tasks[&tid("author")].status,
+            TaskStatus::Pending
+        );
+        assert!(state.proposal.is_none());
     }
 
     #[test]
@@ -2628,6 +2848,7 @@ mod tests {
                 None,
             ),
             MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
                 task_id: tid("specter"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k3"]),

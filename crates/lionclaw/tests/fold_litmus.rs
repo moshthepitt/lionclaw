@@ -251,6 +251,7 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
             state.head,
             &[
                 NewEvent::new(MissionEvent::RoleRunRequested {
+                    namespace: lionclaw::model::TaskNamespace::Execution,
                     task_id: task_id.clone(),
                     attempt_no: 1,
                     effect_id: effect_id.clone(),
@@ -285,6 +286,7 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                     deadline_ms: 3_000,
                 }),
                 NewEvent::new(MissionEvent::RoleRunCompleted {
+                    namespace: lionclaw::model::TaskNamespace::Execution,
                     task_id,
                     attempt_no: 1,
                     effect_id,

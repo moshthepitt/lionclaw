@@ -20,7 +20,7 @@ use crate::mission_type::MissionType;
 use crate::model::{
     step, validate_plan_proposal, EffectId, Handoff, InflightEffect, MissionEvent, MissionId,
     MissionPhase, MissionState, OracleDispatchIntent, OracleRunSuccess, PayloadRef, PlanProposal,
-    ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision, TaskId,
+    ProposalError, RoleDispatchIntent, RoleRunSuccess, StepDecision, TaskId, TaskNamespace,
     TerminalReviewDispatchIntent, TerminalReviewSuccess,
 };
 use crate::ports::{
@@ -931,6 +931,7 @@ impl Engine {
         activity: tokio::sync::watch::Sender<Option<(EffectId, lionclaw_runtime_api::TurnEvent)>>,
     ) -> Result<NewEvent> {
         let InflightEffect::RoleRun {
+            namespace,
             task_id,
             attempt_no,
             role: role_name,
@@ -947,6 +948,7 @@ impl Engine {
         let attempt_no = *attempt_no;
         let completed = |outcome| {
             NewEvent::new(MissionEvent::RoleRunCompleted {
+                namespace: *namespace,
                 task_id: task_id.clone(),
                 attempt_no,
                 effect_id: effect_id.clone(),
@@ -989,7 +991,7 @@ impl Engine {
             workspace_dir: state.workspace_dir.clone().into(),
             state_dir: self.store.lionclaw_dir().to_path_buf(),
         };
-        let previous_task = state.active_tasks().get(task_id);
+        let previous_task = state.tasks_in(*namespace).get(task_id);
         match self
             .run_role_observed(state, effect_id, request, update_rx, true)
             .await?
@@ -1315,13 +1317,13 @@ impl Engine {
         Ok(feedback)
     }
 
-    /// Assemble an execution role's prompt (`("role", …)` effect namespace).
+    /// Assemble an execution role's prompt.
     fn assemble_execution_request(
         &self,
         state: &MissionState,
         role: &crate::mission_type::RoleDefinition,
         intent: &RoleDispatchIntent,
-    ) -> Result<(String, &'static str)> {
+    ) -> Result<String> {
         let plan = state
             .plan
             .as_ref()
@@ -1355,18 +1357,17 @@ impl Engine {
                 feedback: &feedback,
             },
         );
-        Ok((prompt, "role"))
+        Ok(prompt)
     }
 
-    /// Assemble a planning role's prompt (`("plan-role", …)` namespace). Threads
-    /// the mission type's playbook + execution-role/oracle inventories +
-    /// upstream planning reports through a separate assembler.
+    /// Assemble a planning role's prompt. Threads the mission type's playbook
+    /// and execution-role/oracle inventories through a separate assembler.
     fn assemble_planning_request(
         &self,
         state: &MissionState,
         role: &crate::mission_type::RoleDefinition,
         intent: &RoleDispatchIntent,
-    ) -> Result<(String, &'static str)> {
+    ) -> Result<String> {
         let task = state
             .config
             .planning
@@ -1406,7 +1407,7 @@ impl Engine {
                 task_feedback: &task_feedback,
             },
         );
-        Ok((prompt, "plan-role"))
+        Ok(prompt)
     }
 
     fn resolve_planning_prompt_input<'a>(
@@ -1446,10 +1447,15 @@ impl Engine {
         // Planning and execution assemble prompts and namespace effect IDs
         // separately, so a planning report can never reach an execution judge and
         // a planning effect can never collide with an execution one.
-        let (prompt_text, effect_namespace) = if state.planning_base_revision.is_some() {
-            self.assemble_planning_request(state, role, &intent)?
-        } else {
-            self.assemble_execution_request(state, role, &intent)?
+        let (prompt_text, effect_namespace) = match intent.namespace {
+            TaskNamespace::Planning => (
+                self.assemble_planning_request(state, role, &intent)?,
+                TaskNamespace::Planning.slug(),
+            ),
+            TaskNamespace::Execution => (
+                self.assemble_execution_request(state, role, &intent)?,
+                TaskNamespace::Execution.slug(),
+            ),
         };
         let prompt_hash = hex::encode(Sha256::digest(prompt_text.as_bytes()));
         let prompt = self
@@ -1457,7 +1463,7 @@ impl Engine {
             .blobs()
             .externalize(PayloadRef::inline(prompt_text))?;
         let (base_sha, assignment_epoch, recreate_workspace) = resolve_task_assignment(
-            state.active_tasks().get(&intent.task_id),
+            state.tasks_in(intent.namespace).get(&intent.task_id),
             &intent.base_sha,
             state.config.recovery.max_attempts,
         );
@@ -1473,7 +1479,7 @@ impl Engine {
         let not_before_ms = retry_not_before(
             requested_at_ms,
             state
-                .active_tasks()
+                .tasks_in(intent.namespace)
                 .get(&intent.task_id)
                 .and_then(|task| task.last_failure.as_ref()),
         );
@@ -1481,6 +1487,7 @@ impl Engine {
             .timeout_secs
             .unwrap_or(state.config.execution.default_timeout_secs);
         let event = NewEvent::new(MissionEvent::RoleRunRequested {
+            namespace: intent.namespace,
             task_id: intent.task_id,
             attempt_no: intent.attempt_no,
             effect_id,
@@ -1756,10 +1763,12 @@ fn failed_outcome(
 ) -> NewEvent {
     NewEvent::new(match effect {
         InflightEffect::RoleRun {
+            namespace,
             task_id,
             attempt_no,
             ..
         } => MissionEvent::RoleRunCompleted {
+            namespace: *namespace,
             task_id: task_id.clone(),
             attempt_no: *attempt_no,
             effect_id: effect_id.clone(),

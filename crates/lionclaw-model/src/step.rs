@@ -20,6 +20,7 @@ use super::fold::{oracle_obligation_outstanding, terminal_review_outstanding};
 use super::ids::{AssertionId, OracleName, RoleName, TaskId};
 use super::plan::TaskKind;
 use super::state::{MissionPhase, MissionState, ReviewOutcome, TaskStatus};
+use super::TaskNamespace;
 use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub enum StepDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDispatchIntent {
+    pub namespace: TaskNamespace,
     pub task_id: TaskId,
     pub role: RoleName,
     pub attempt_no: u32,
@@ -129,6 +131,7 @@ fn step_planning(state: &MissionState) -> StepDecision {
     };
     let attempt_no = state.planning.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
     StepDecision::DispatchRole(RoleDispatchIntent {
+        namespace: TaskNamespace::Planning,
         task_id: task.id.clone(),
         role: task.role.clone(),
         attempt_no,
@@ -178,6 +181,7 @@ fn step_running(state: &MissionState) -> StepDecision {
     if let Some(task) = runnable(TaskKind::Work).or_else(|| runnable(TaskKind::Validate)) {
         let attempt_no = state.tasks.get(&task.id).map_or(0, |t| t.attempts) + 1;
         return StepDecision::DispatchRole(RoleDispatchIntent {
+            namespace: TaskNamespace::Execution,
             task_id: task.id.clone(),
             role: task
                 .role
@@ -392,6 +396,7 @@ mod tests {
 
     fn role_requested(task: &str, attempt_no: u32, key: &str) -> MissionEvent {
         MissionEvent::RoleRunRequested {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -410,6 +415,7 @@ mod tests {
 
     fn work_done(task: &str, key: &str, artifact: Option<(&str, &str)>) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -431,6 +437,7 @@ mod tests {
 
     fn role_failed(task: &str, key: &str) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
+            namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
@@ -718,6 +725,7 @@ mod tests {
         assert_eq!(
             step(&state),
             StepDecision::DispatchRole(RoleDispatchIntent {
+                namespace: TaskNamespace::Execution,
                 task_id: tid("w2"),
                 role: rname("implementer"),
                 attempt_no: 1,

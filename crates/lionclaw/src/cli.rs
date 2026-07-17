@@ -3134,6 +3134,7 @@ mod tests {
                 justification: "test fixture approves the plan".into(),
             },
             MissionEvent::RoleRunCompleted {
+                namespace: crate::model::TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "k1"]),

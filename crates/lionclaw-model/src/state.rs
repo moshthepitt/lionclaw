@@ -254,8 +254,13 @@ pub enum ReviewOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParkedEffect {
-    RoleRun { task_id: TaskId },
-    OracleRun { oracle: OracleName },
+    RoleRun {
+        namespace: super::TaskNamespace,
+        task_id: TaskId,
+    },
+    OracleRun {
+        oracle: OracleName,
+    },
     TerminalReview,
 }
 
@@ -402,6 +407,7 @@ pub struct AttentionItem {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InflightEffect {
     RoleRun {
+        namespace: super::TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         role: RoleName,
@@ -490,6 +496,7 @@ impl InflightEffect {
         use super::event::MissionEvent;
         match event {
             MissionEvent::RoleRunRequested {
+                namespace,
                 task_id,
                 attempt_no,
                 effect_id,
@@ -506,6 +513,7 @@ impl InflightEffect {
             } => Some((
                 effect_id.clone(),
                 Self::RoleRun {
+                    namespace: *namespace,
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
                     role: role.clone(),
@@ -686,11 +694,28 @@ impl MissionState {
         }
     }
 
+    pub fn tasks_in(&self, namespace: super::TaskNamespace) -> &BTreeMap<TaskId, TaskRuntimeState> {
+        match namespace {
+            super::TaskNamespace::Planning => &self.planning.tasks,
+            super::TaskNamespace::Execution => &self.tasks,
+        }
+    }
+
     pub(crate) fn active_tasks_mut(&mut self) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
         if self.planning_base_revision.is_some() {
             &mut self.planning.tasks
         } else {
             &mut self.tasks
+        }
+    }
+
+    pub(crate) fn tasks_in_mut(
+        &mut self,
+        namespace: super::TaskNamespace,
+    ) -> &mut BTreeMap<TaskId, TaskRuntimeState> {
+        match namespace {
+            super::TaskNamespace::Planning => &mut self.planning.tasks,
+            super::TaskNamespace::Execution => &mut self.tasks,
         }
     }
 
@@ -729,6 +754,12 @@ mod slug_tests {
 
     #[test]
     fn slugs_match_the_serde_repr() {
+        for namespace in [
+            crate::TaskNamespace::Planning,
+            crate::TaskNamespace::Execution,
+        ] {
+            assert_slug(&namespace, namespace.slug());
+        }
         for k in [
             AttentionKind::NodeFailed,
             AttentionKind::NodeAttention,

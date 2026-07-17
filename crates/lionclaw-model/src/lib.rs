@@ -39,8 +39,8 @@ pub use event::{
     ArtifactOutcome, BlobRef, ControlAction, DecisionAction, EffectEventClass, EffectResource,
     EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent,
     MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess,
-    RuntimeConfigurationEvidence, StopBar, TerminalReviewConfig, TerminalReviewSuccess,
-    ValidationItem, VersionStamps, SCHEMA_VERSION,
+    RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
+    TerminalReviewSuccess, ValidationItem, VersionStamps, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,

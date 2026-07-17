@@ -20,8 +20,24 @@ use super::plan::{PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
-/// Bumped for durable, effect-scoped runtime configuration evidence.
-pub const SCHEMA_VERSION: u32 = 11;
+/// Bumped for the durable planning/execution task namespace on role effects.
+pub const SCHEMA_VERSION: u32 = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNamespace {
+    Planning,
+    Execution,
+}
+
+impl TaskNamespace {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Execution => "execution",
+        }
+    }
+}
 
 /// Reference to a content-addressed blob on durable-fs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +371,7 @@ pub enum MissionEvent {
         plan_hash: String,
     },
     RoleRunRequested {
+        namespace: TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
@@ -393,6 +410,7 @@ pub enum MissionEvent {
         configuration: RuntimeConfigurationEvidence,
     },
     RoleRunCompleted {
+        namespace: TaskNamespace,
         task_id: TaskId,
         attempt_no: u32,
         effect_id: super::EffectId,
@@ -716,6 +734,35 @@ mod compat_tests {
             })
         );
         assert_eq!(serde_json::from_value::<MissionEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn role_effect_task_namespace_is_required_on_the_wire() {
+        let event = MissionEvent::RoleRunRequested {
+            namespace: TaskNamespace::Planning,
+            task_id: TaskId::new("author").unwrap(),
+            attempt_no: 1,
+            effect_id: crate::EffectId::for_parts(&["test", "author"]),
+            role: RoleName::new("planner").unwrap(),
+            runtime: "codex".into(),
+            prompt: PayloadRef::inline("prompt"),
+            base_sha: "base".into(),
+            assignment_epoch: 1,
+            recreate_workspace: true,
+            requested_at_ms: 1,
+            not_before_ms: 1,
+            deadline_ms: 2,
+            budget_deadline_ms: 3,
+        };
+
+        let mut json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["namespace"], "planning");
+        assert_eq!(
+            serde_json::from_value::<MissionEvent>(json.clone()).unwrap(),
+            event
+        );
+        json.as_object_mut().unwrap().remove("namespace");
+        assert!(serde_json::from_value::<MissionEvent>(json).is_err());
     }
 
     #[test]

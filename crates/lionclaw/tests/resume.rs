@@ -91,6 +91,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
             &mission_id,
             state.head,
             &[NewEvent::new(MissionEvent::RoleRunRequested {
+                namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id: lionclaw::model::TaskId::new("fix").expect("task id"),
                 attempt_no: 1,
                 effect_id: id.clone(),
@@ -171,6 +172,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
             state.head,
             &[
                 NewEvent::new(MissionEvent::RoleRunRequested {
+                    namespace: lionclaw::model::TaskNamespace::Execution,
                     task_id: task_id.clone(),
                     attempt_no: 1,
                     effect_id: role_effect.clone(),
@@ -186,6 +188,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     budget_deadline_ms: 100_000,
                 }),
                 NewEvent::new(MissionEvent::RoleRunCompleted {
+                    namespace: lionclaw::model::TaskNamespace::Execution,
                     task_id,
                     attempt_no: 1,
                     effect_id: role_effect,
@@ -268,6 +271,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
             &mission_id,
             state.head,
             &[NewEvent::new(MissionEvent::RoleRunRequested {
+                namespace: lionclaw::model::TaskNamespace::Execution,
                 task_id: lionclaw::model::TaskId::new("fix").unwrap(),
                 attempt_no: 1,
                 effect_id: id.clone(),

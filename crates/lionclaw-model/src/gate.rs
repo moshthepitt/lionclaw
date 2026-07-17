@@ -205,6 +205,7 @@ mod tests {
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunRequested {
+                    namespace: crate::TaskNamespace::Execution,
                     task_id: tid(validator),
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", validator]),
@@ -225,6 +226,7 @@ mod tests {
                 &mission_id,
                 seq,
                 MissionEvent::RoleRunCompleted {
+                    namespace: crate::TaskNamespace::Execution,
                     task_id: tid(validator),
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", validator]),
