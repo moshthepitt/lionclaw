@@ -1574,6 +1574,14 @@ fn spawn_detached_driver(
     command: &mut std::process::Command,
     mission_dir: &Path,
 ) -> Result<DetachedDriver> {
+    spawn_detached_driver_with(command, mission_dir, std::process::Command::spawn)
+}
+
+fn spawn_detached_driver_with(
+    command: &mut std::process::Command,
+    mission_dir: &Path,
+    spawn_stderr_spool: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Child>,
+) -> Result<DetachedDriver> {
     let executable = std::env::current_exe()?;
     command.stderr(std::process::Stdio::piped());
     let process = command
@@ -1599,11 +1607,8 @@ fn spawn_detached_driver(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     isolate_driver_process_group(&mut spool);
-    child.stderr_spool = Some(
-        spool
-            .spawn()
-            .context("spawning bounded driver stderr spool")?,
-    );
+    child.stderr_spool =
+        Some(spawn_stderr_spool(&mut spool).context("spawning bounded driver stderr spool")?);
     Ok(child)
 }
 
@@ -3491,32 +3496,51 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn incomplete_driver_cleanup_terminates_process_group_descendants() {
+    fn spool_spawn_failure_terminates_driver_process_group() {
         let temp = tempfile::tempdir().unwrap();
+        let driver_pid_path = temp.path().join("driver.pid");
         let descendant_pid_path = temp.path().join("descendant.pid");
         let mut command = std::process::Command::new("sh");
         command
             .arg("-c")
-            .arg("sleep 60 & echo $! > \"$DESCENDANT_PID_PATH\"; wait")
+            .arg(
+                "echo $$ > \"$DRIVER_PID_PATH\"; \
+                 sleep 60 & echo $! > \"$DESCENDANT_PID_PATH\"; wait",
+            )
+            .env("DRIVER_PID_PATH", &driver_pid_path)
             .env("DESCENDANT_PID_PATH", &descendant_pid_path);
         isolate_driver_process_group(&mut command);
-        let process = command.spawn().unwrap();
-        let driver_pid = process.id();
-        let mut descendant_pid = None;
-        for _ in 0..200 {
-            if let Ok(pid) = std::fs::read_to_string(&descendant_pid_path) {
-                descendant_pid = Some(pid.trim().parse::<i32>().unwrap());
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let descendant_pid = descendant_pid.expect("driver did not publish its descendant pid");
 
-        drop(DetachedDriver {
-            process,
-            stderr_spool: None,
-            cleanup_on_drop: true,
-        });
+        let mut published_pids = None;
+        let error = spawn_detached_driver_with(&mut command, temp.path(), |_| {
+            for _ in 0..200 {
+                let driver_pid = std::fs::read_to_string(&driver_pid_path)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<i32>().ok());
+                let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<i32>().ok());
+                if let (Some(driver_pid), Some(descendant_pid)) = (driver_pid, descendant_pid) {
+                    published_pids = Some((driver_pid, descendant_pid));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if published_pids.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "driver did not publish process ids",
+                ));
+            }
+            Err(std::io::Error::other("injected spool spawn failure"))
+        })
+        .err()
+        .expect("the injected spool failure must fail construction");
+        assert!(error
+            .to_string()
+            .contains("spawning bounded driver stderr spool"));
+        let (driver_pid, descendant_pid) =
+            published_pids.expect("driver did not publish process ids");
 
         assert!(!Path::new(&format!("/proc/{driver_pid}")).exists());
         let descendant_path = PathBuf::from(format!("/proc/{descendant_pid}"));
