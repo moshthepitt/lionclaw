@@ -395,12 +395,13 @@ mod tests {
     }
 
     fn role_requested(task: &str, attempt_no: u32, key: &str) -> MissionEvent {
-        role_requested_as(
+        role_requested_at_base(
             task,
             attempt_no,
             key,
             "implementer",
             crate::OutputSemantics::ProducesArtifact,
+            "sha-0",
         )
     }
 
@@ -411,6 +412,17 @@ mod tests {
         role: &str,
         output: crate::OutputSemantics,
     ) -> MissionEvent {
+        role_requested_at_base(task, attempt_no, key, role, output, "sha-0")
+    }
+
+    fn role_requested_at_base(
+        task: &str,
+        attempt_no: u32,
+        key: &str,
+        role: &str,
+        output: crate::OutputSemantics,
+        base_sha: &str,
+    ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
@@ -420,7 +432,7 @@ mod tests {
             output,
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
-            base_sha: "sha-0".to_string(),
+            base_sha: base_sha.to_string(),
             assignment_epoch: 1,
             recreate_workspace: true,
             requested_at_ms: 0,
@@ -836,7 +848,14 @@ mod tests {
             work_done("w1", "k-w1-1", Some(("sha-0", "sha-1"))),
             oracle_requested(&["A1"], "tests", "sha-1", 1, "k-tests-1"),
             oracle_completed(&["A1"], "tests", "sha-1", 1, "k-tests-1", 0),
-            role_requested("w2", 1, "k-w2-1"),
+            role_requested_at_base(
+                "w2",
+                1,
+                "k-w2-1",
+                "implementer",
+                crate::OutputSemantics::ProducesArtifact,
+                "sha-1",
+            ),
             work_done("w2", "k-w2-1", Some(("sha-1", "sha-2"))),
         ]);
         assert_eq!(state.phase, MissionPhase::Running);
@@ -1010,7 +1029,14 @@ mod tests {
         events.push(review_completed("k-tr-1", "sha-1", true, 0));
         // New work moves the head; the oracle re-judges; the clean sha-1
         // verdict is stale — a second review dispatches at the new head.
-        events.push(role_requested("w1", 2, "k-w1-2"));
+        events.push(role_requested_at_base(
+            "w1",
+            2,
+            "k-w1-2",
+            "implementer",
+            crate::OutputSemantics::ProducesArtifact,
+            "sha-1",
+        ));
         events.push(work_done_at("w1", 2, "k-w1-2", Some(("sha-1", "sha-2"))));
         events.push(oracle_requested(&["A1"], "tests", "sha-2", 2, "k-tests-2"));
         events.push(oracle_completed(

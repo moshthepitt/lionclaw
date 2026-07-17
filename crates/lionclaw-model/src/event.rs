@@ -20,9 +20,8 @@ use super::plan::{OutputSemantics, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
-/// Bumped for namespaced task attention, durable output contracts, and exact
-/// outcome correlation.
-pub const SCHEMA_VERSION: u32 = 13;
+/// Bumped for exact resolved planning-task output contracts.
+pub const SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -352,6 +351,29 @@ impl GapSeverity {
 pub struct ArtifactOutcome {
     pub base_sha: String,
     pub head_sha: String,
+}
+
+/// Validate the parts of a role success that are authoritative at the effect
+/// boundary. Writers may legitimately report no artifact when the requested
+/// work was already satisfied, but only writers may return one and its base
+/// must be the immutable assignment base.
+pub fn role_success_contract_error(
+    output: OutputSemantics,
+    handoff: &Handoff,
+    artifact: Option<&ArtifactOutcome>,
+    requested_base_sha: &str,
+) -> Option<&'static str> {
+    if !handoff.matches_output(output) {
+        return Some("role handoff does not match the effect output contract");
+    }
+    let artifact = artifact?;
+    if output != OutputSemantics::ProducesArtifact {
+        return Some("only a produces-artifact role may return an artifact");
+    }
+    if artifact.base_sha != requested_base_sha {
+        return Some("artifact base does not match the effect assignment base");
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

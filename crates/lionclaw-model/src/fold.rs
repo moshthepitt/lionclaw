@@ -26,7 +26,7 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 16;
+pub const REDUCER_VERSION: u32 = 17;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -106,17 +106,16 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
 /// wrote it.
 pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     let seq = envelope.sequence_no;
-    if let Some((effect_id, effect)) = envelope.event.outcome_effect_id().and_then(|effect_id| {
-        state
-            .inflight
-            .get(effect_id)
-            .filter(|effect| !effect.matches_outcome(&envelope.event))
-            .cloned()
-            .map(|effect| (effect_id.clone(), effect))
-    }) {
-        reject_mismatched_outcome(state, &effect_id, effect);
-        finish_apply(state, seq);
-        return;
+    if let Some(effect_id) = envelope.event.outcome_effect_id() {
+        let Some(effect) = state.inflight.get(effect_id).cloned() else {
+            finish_apply(state, seq);
+            return;
+        };
+        if !effect.matches_outcome(&envelope.event) {
+            reject_mismatched_outcome(state, effect_id, effect);
+            finish_apply(state, seq);
+            return;
+        }
     }
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
@@ -234,23 +233,24 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             outcome,
         } => {
-            let (observed_configuration, expected_output) = state
+            let (observed_configuration, expected_contract) = state
                 .inflight
                 .get(effect_id)
                 .and_then(|effect| {
                     if let InflightEffect::RoleRun {
                         output,
+                        base_sha,
                         runtime_configuration,
                         ..
                     } = effect
                     {
-                        Some((runtime_configuration.clone(), *output))
+                        Some((runtime_configuration.clone(), (*output, base_sha.clone())))
                     } else {
                         None
                     }
                 })
-                .map_or((None, None), |(configuration, output)| {
-                    (configuration, Some(output))
+                .map_or((None, None), |(configuration, contract)| {
+                    (configuration, Some(contract))
                 });
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
@@ -258,8 +258,18 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
-                    if expected_output.is_some_and(|output| success.handoff.matches_output(output))
-                    {
+                    let contract_error = expected_contract.as_ref().map_or(
+                        Some("role outcome has no active request"),
+                        |(output, base_sha)| {
+                            super::event::role_success_contract_error(
+                                *output,
+                                &success.handoff,
+                                success.artifact.as_ref(),
+                                base_sha,
+                            )
+                        },
+                    );
+                    if contract_error.is_none() {
                         if let Some(artifact) = &success.artifact {
                             state.current_sha = artifact.head_sha.clone();
                         }
@@ -281,8 +291,8 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
                         }
                     } else {
                         let mut failure = TypedFailure::invalid(
-                            "handoff.output_contract",
-                            "role handoff does not match the effect output contract",
+                            "role.success_contract",
+                            contract_error.unwrap_or("role success contract mismatch"),
                         );
                         failure.evidence_mut().configuration =
                             success.runtime_configuration.clone();
@@ -636,13 +646,7 @@ fn role_request_matches_task(
             .tasks
             .iter()
             .find(|task| &task.id == task_id)
-            .is_some_and(|task| {
-                &task.role == role
-                    && matches!(
-                        output,
-                        OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan
-                    )
-            }),
+            .is_some_and(|task| &task.role == role && task.output == output),
         super::TaskNamespace::Execution => state
             .plan
             .as_ref()
@@ -1634,8 +1638,13 @@ mod tests {
                 }
                 _ => {}
             }
-            if let MissionEvent::RoleRunRequested { effect_id, .. } = &event {
-                requested_effects.insert(effect_id.clone());
+            match &event {
+                MissionEvent::RoleRunRequested { effect_id, .. }
+                | MissionEvent::OracleRunRequested { effect_id, .. }
+                | MissionEvent::TerminalReviewRequested { effect_id, .. } => {
+                    requested_effects.insert(effect_id.clone());
+                }
+                _ => {}
             }
             if let MissionEvent::RoleRunCompleted {
                 namespace,
@@ -1679,9 +1688,57 @@ mod tests {
                         output,
                         runtime: "codex".into(),
                         prompt: PayloadRef::inline("prompt"),
-                        base_sha: "base".into(),
+                        base_sha: success
+                            .artifact
+                            .as_ref()
+                            .map_or_else(|| "base".into(), |artifact| artifact.base_sha.clone()),
                         assignment_epoch: 1,
                         recreate_workspace: true,
+                        requested_at_ms: 0,
+                        not_before_ms: 0,
+                        deadline_ms: 100_000,
+                        budget_deadline_ms: 100_000,
+                    });
+                }
+            }
+            if let MissionEvent::OracleRunCompleted {
+                assertion_ids,
+                oracle,
+                judged_sha,
+                attempt_no,
+                effect_id,
+                ..
+            } = &event
+            {
+                if requested_effects.insert(effect_id.clone()) {
+                    valid_log.push(MissionEvent::OracleRunRequested {
+                        assertion_ids: assertion_ids.clone(),
+                        oracle: oracle.clone(),
+                        judged_sha: judged_sha.clone(),
+                        attempt_no: *attempt_no,
+                        effect_id: effect_id.clone(),
+                        requested_at_ms: 0,
+                        not_before_ms: 0,
+                        deadline_ms: 100_000,
+                    });
+                }
+            }
+            if let MissionEvent::TerminalReviewCompleted {
+                attempt_no,
+                effect_id,
+                judged_sha,
+                ..
+            } = &event
+            {
+                if requested_effects.insert(effect_id.clone()) {
+                    valid_log.push(MissionEvent::TerminalReviewRequested {
+                        attempt_no: *attempt_no,
+                        effect_id: effect_id.clone(),
+                        role: RoleName::new("gap-reviewer").expect("role name"),
+                        runtime: "codex".into(),
+                        prompt: PayloadRef::inline("review prompt"),
+                        judged_sha: judged_sha.clone(),
+                        nonce: "n0".into(),
                         requested_at_ms: 0,
                         not_before_ms: 0,
                         deadline_ms: 100_000,
@@ -2186,6 +2243,7 @@ mod tests {
         config.planning.tasks = vec![super::super::plan::PlanningTask {
             id: tid("strategist"),
             role: RoleName::new("strategist").unwrap(),
+            output: OutputSemantics::ProposesPlan,
             body: "replace the rejected plan".into(),
             depends_on: vec![],
         }];
@@ -2705,6 +2763,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("same-id"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProducesReport,
             body: "plan".into(),
             depends_on: vec![],
         });
@@ -2748,6 +2807,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("same-id"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
             body: "replace the rejected plan".into(),
             depends_on: vec![],
         });
@@ -2802,6 +2862,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("same-id"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProducesReport,
             body: "replace the rejected plan".into(),
             depends_on: vec![],
         });
@@ -2863,6 +2924,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("author"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
             body: "plan".into(),
             depends_on: vec![],
         });
@@ -2913,6 +2975,42 @@ mod tests {
     }
 
     #[test]
+    fn planning_requests_must_match_the_resolved_role_output() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("research"),
+            role: RoleName::new("reporter").expect("role name"),
+            output: OutputSemantics::ProducesReport,
+            body: "research".into(),
+            depends_on: vec![],
+        });
+        let state = fold_log(vec![
+            mission_created,
+            role_requested_in(
+                crate::TaskNamespace::Planning,
+                "research",
+                "swapped-output",
+                RoleName::new("reporter").expect("role name"),
+                OutputSemantics::ProposesPlan,
+            ),
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(
+            state.planning.tasks[&tid("research")].status,
+            TaskStatus::Failed
+        );
+        assert!(matches!(
+            state.planning.tasks[&tid("research")].last_failure,
+            Some(TypedFailure::PermanentRuntime { .. })
+        ));
+    }
+
+    #[test]
     fn role_completion_must_match_the_exact_inflight_identity() {
         let mut mission_created = created();
         let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
@@ -2921,6 +3019,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("original"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProducesReport,
             body: "plan".into(),
             depends_on: vec![],
         });
@@ -2971,6 +3070,124 @@ mod tests {
                 }) if task_id == &tid("original")
             ));
         }
+    }
+
+    #[test]
+    fn orphan_outcomes_cannot_settle_tasks_or_mint_authority() {
+        let mut role_state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("work")]),
+        ])
+        .expect("role state");
+        let next = role_state.head + 1;
+        apply(
+            &mut role_state,
+            &envelope(
+                next,
+                role_completed(
+                    "work",
+                    "orphan-role",
+                    work_handoff(true, false),
+                    Some(ArtifactOutcome {
+                        base_sha: "base".into(),
+                        head_sha: "unrequested".into(),
+                    }),
+                ),
+            ),
+        );
+        assert_eq!(role_state.tasks[&tid("work")].status, TaskStatus::Pending);
+        assert_eq!(role_state.current_sha, "base");
+
+        let mut oracle_state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("work")],
+            ),
+        ])
+        .expect("oracle state");
+        let next = oracle_state.head + 1;
+        apply(
+            &mut oracle_state,
+            &envelope(
+                next,
+                oracle_completed("TESTS-PASS", "base", "orphan-oracle", 0),
+            ),
+        );
+        assert!(oracle_state.contract[&aid("TESTS-PASS")]
+            .last_authoritative
+            .is_none());
+
+        let mut review_state = fold_log(vec![created_with_review()]).expect("review state");
+        let next = review_state.head + 1;
+        apply(
+            &mut review_state,
+            &envelope(
+                next,
+                review_completed_at(1, "orphan-review", "base", true, vec![]),
+            ),
+        );
+        assert!(review_state.terminal_review.outcome.is_none());
+    }
+
+    #[test]
+    fn artifacts_are_bound_to_writer_output_and_the_request_base() {
+        let validator_effect = EffectId::for_parts(&["test", "validator-artifact"]);
+        let mut validator_request = role_requested_in(
+            crate::TaskNamespace::Execution,
+            "validator",
+            "validator-artifact",
+            RoleName::new("reviewer").expect("role name"),
+            OutputSemantics::EmitsVerdict,
+        );
+        let MissionEvent::RoleRunRequested { base_sha, .. } = &mut validator_request else {
+            unreachable!("role_requested_in builds a request");
+        };
+        *base_sha = "base".into();
+        let validator = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![validate_task("validator")]),
+            validator_request,
+            MissionEvent::RoleRunCompleted {
+                namespace: crate::TaskNamespace::Execution,
+                task_id: tid("validator"),
+                attempt_no: 1,
+                effect_id: validator_effect,
+                outcome: Ok(RoleRunSuccess {
+                    handoff: validate_handoff(&[]),
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: "base".into(),
+                        head_sha: "must-not-promote".into(),
+                    }),
+                    final_response: PayloadRef::inline("invalid artifact"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            },
+        ])
+        .expect("validator state");
+        assert_eq!(
+            validator.tasks[&tid("validator")].status,
+            TaskStatus::Failed
+        );
+        assert_eq!(validator.current_sha, "base");
+
+        let writer = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("writer")]),
+            role_requested("writer", "wrong-base"),
+            role_completed(
+                "writer",
+                "wrong-base",
+                work_handoff(true, false),
+                Some(ArtifactOutcome {
+                    base_sha: "different-base".into(),
+                    head_sha: "must-not-promote".into(),
+                }),
+            ),
+        ])
+        .expect("writer state");
+        assert_eq!(writer.tasks[&tid("writer")].status, TaskStatus::Failed);
+        assert_eq!(writer.current_sha, "base");
     }
 
     #[test]
@@ -3025,6 +3242,7 @@ mod tests {
         config.planning.tasks.push(PlanningTask {
             id: tid("same-id"),
             role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
             body: "plan".into(),
             depends_on: vec![],
         });

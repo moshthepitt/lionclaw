@@ -106,18 +106,21 @@ fn planning_dag() -> PlanningDag {
             PlanningTask {
                 id: tid("strategist"),
                 role: rn("strategist"),
+                output: OutputSemantics::ProducesReport,
                 body: "draft".to_string(),
                 depends_on: vec![],
             },
             PlanningTask {
                 id: tid("red-team"),
                 role: rn("red-team"),
+                output: OutputSemantics::ProducesReport,
                 body: "critique".to_string(),
                 depends_on: vec![tid("strategist")],
             },
             PlanningTask {
                 id: tid("author"),
                 role: rn("author"),
+                output: OutputSemantics::ProposesPlan,
                 body: "propose".to_string(),
                 depends_on: vec![tid("strategist"), tid("red-team")],
             },
@@ -269,6 +272,34 @@ async fn advance_through_checkpoints(
         }
     }
     panic!("planning test exceeded checkpoint bound")
+}
+
+#[tokio::test]
+async fn mission_creation_rejects_a_substituted_planning_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = planning_engine(dir.path()).await;
+    let mut planning = planning_dag();
+    planning.tasks[0].output = OutputSemantics::ProposesPlan;
+
+    let error = engine
+        .create_mission(
+            &dir.path().to_string_lossy(),
+            "make the tests pass",
+            BASE_SHA,
+            MissionConfig {
+                stop: StopBar::Verified,
+                planning,
+                recovery: Default::default(),
+                execution: Default::default(),
+                terminal_review: None,
+            },
+        )
+        .await
+        .expect_err("the pinned mission type owns the planning contract");
+
+    assert!(error
+        .to_string()
+        .contains("planning DAG must exactly match pinned mission type"));
 }
 
 #[tokio::test]

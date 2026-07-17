@@ -156,16 +156,32 @@ pub fn validate_planning_dag(
                 ));
             }
         }
-        match inventory.roles.get(&t.role) {
-            None => errors.push(err(
-                "unknown_role",
-                format!(
-                    "planning task '{}' names role '{}' which the mission type does not provide",
-                    t.id, t.role
-                ),
-            )),
+        let declared_output = match inventory.roles.get(&t.role) {
+            None => {
+                errors.push(err(
+                    "unknown_role",
+                    format!(
+                        "planning task '{}' names role '{}' which the mission type does not provide",
+                        t.id, t.role
+                    ),
+                ));
+                None
+            }
+            Some(declared) if *declared != t.output => {
+                errors.push(err(
+                    "role_output_mismatch",
+                    format!(
+                        "planning task '{}' records {:?}, but role '{}' declares {:?}",
+                        t.id, t.output, t.role, declared
+                    ),
+                ));
+                None
+            }
+            Some(declared) => Some(*declared),
+        };
+        match declared_output {
             Some(OutputSemantics::ProposesPlan) => proposers += 1,
-            Some(OutputSemantics::ProducesReport) => {}
+            Some(OutputSemantics::ProducesReport) | None => {}
             Some(other) => errors.push(err(
                 "role_output_mismatch",
                 format!(
@@ -845,9 +861,12 @@ mod tests {
     const CLEAN: Vec<&str> = Vec::new();
 
     fn ptask(id: &str, role: &str, deps: &[&str]) -> PlanningTask {
+        let role = RoleName::new(role).expect("valid role name");
+        let output = inventory().roles[&role];
         PlanningTask {
             id: tid(id),
-            role: RoleName::new(role).expect("valid role name"),
+            role,
+            output,
             body: format!("do {id}"),
             depends_on: deps.iter().map(|d| tid(d)).collect(),
         }
@@ -872,6 +891,13 @@ mod tests {
                 ptask("author", "author", &["research"]),
             ]),
             CLEAN
+        );
+
+        let mut swapped = ptask("research", "reporter", &[]);
+        swapped.output = OutputSemantics::ProposesPlan;
+        assert!(
+            planning_codes(vec![swapped, ptask("author", "author", &["research"]),])
+                .contains(&"role_output_mismatch")
         );
         // Empty is valid (no in-engine planning).
         assert_eq!(planning_codes(vec![]), CLEAN);

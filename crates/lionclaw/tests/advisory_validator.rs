@@ -9,7 +9,8 @@ use std::sync::Arc;
 use common::{advisory_plan, approve_plan, proposal, test_mission_type, BASE_SHA, HEAD_SHA};
 use lionclaw::engine::{Engine, EngineServices};
 use lionclaw::model::{
-    AdvisoryStatus, FinishClass, Handoff, MissionPhase, PayloadRef, ValidationItem,
+    AdvisoryStatus, FinishClass, Handoff, MissionEvent, MissionPhase, MissionState,
+    OutputSemantics, PayloadRef, ValidationItem,
 };
 use lionclaw::ports::{RoleRunOutcome, RoleRunRequest};
 use lionclaw::store::MissionStore;
@@ -19,7 +20,6 @@ use lionclaw::testing::{MockClock, MockOracleRunner, MockRoleRunner, NoopEffectC
 /// handoff that "commits" HEAD_SHA.
 fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     MockRoleRunner::new(Box::new(move |req: &RoleRunRequest| {
-        use lionclaw::model::OutputSemantics;
         let handoff = if req.role.output == OutputSemantics::EmitsVerdict {
             Handoff::Validate {
                 done: true,
@@ -53,16 +53,16 @@ fn role_aware_runner(reviewer_passes: bool) -> MockRoleRunner {
     }))
 }
 
-async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
+async fn drive(role_runner: MockRoleRunner) -> (MissionState, Vec<lionclaw::model::EventEnvelope>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = MissionStore::open(dir.path()).await.expect("store");
     let engine = Engine::new(
-        store,
+        store.clone(),
         test_mission_type(),
         "codex".to_string(),
         "test-image".to_string(),
         EngineServices::new(
-            Arc::new(role_aware_runner(reviewer_passes)),
+            Arc::new(role_runner),
             Arc::new(MockOracleRunner::exiting(0)),
             Arc::new(NoopEffectCleaner),
             Arc::new(MockClock::default()),
@@ -84,6 +84,12 @@ async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
     approve_plan(&engine, &mission_id).await;
     engine.advance(&mission_id).await.expect("advance");
     let state = engine.load_state(&mission_id).await.expect("state");
+    let events = store.load(&mission_id).await.expect("events");
+    (state, events)
+}
+
+async fn run(reviewer_passes: bool) -> (MissionPhase, AdvisoryStatus) {
+    let (state, _) = drive(role_aware_runner(reviewer_passes)).await;
     let advisory = state
         .contract
         .get(&lionclaw::model::AssertionId::new("STYLE-OK").unwrap())
@@ -116,4 +122,58 @@ async fn advisory_fail_is_unverified() {
             finish: FinishClass::Unverified
         }
     );
+}
+
+#[tokio::test]
+async fn read_only_validator_artifacts_are_rejected_before_the_fold() {
+    let runner = MockRoleRunner::new(Box::new(|req: &RoleRunRequest| {
+        let (handoff, artifact) = match req.role.output {
+            OutputSemantics::ProducesArtifact => (
+                Handoff::Work {
+                    done: true,
+                    report: PayloadRef::inline("wrote it"),
+                    request_attention: false,
+                },
+                Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: req.base_sha.clone(),
+                    head_sha: HEAD_SHA.to_string(),
+                }),
+            ),
+            OutputSemantics::EmitsVerdict => (
+                Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("reviewed"),
+                    items: vec![ValidationItem {
+                        item_id: lionclaw::model::AssertionId::new("STYLE-OK").unwrap(),
+                        passed: true,
+                    }],
+                    passed: true,
+                    request_attention: false,
+                },
+                Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: req.base_sha.clone(),
+                    head_sha: "forged-validator-head".to_string(),
+                }),
+            ),
+            output => panic!("unexpected output contract {output:?}"),
+        };
+        Ok(RoleRunOutcome {
+            handoff,
+            artifact,
+            runtime_configuration: Default::default(),
+            final_response: String::new(),
+        })
+    }));
+
+    let (state, events) = drive(runner).await;
+
+    assert_eq!(state.current_sha, HEAD_SHA);
+    assert_eq!(state.phase, MissionPhase::AttentionNeeded);
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.event,
+            MissionEvent::RoleRunCompleted { outcome: Err(failure), .. }
+                if failure.evidence().code.as_deref() == Some("role.success_contract")
+        )
+    }));
 }

@@ -36,12 +36,13 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    resolve_execution_deadline_ms, ArtifactOutcome, BlobRef, ControlAction, DecisionAction,
-    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
-    MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef,
-    RecoveryConfig, RoleRunSuccess, RuntimeConfigurationEvidence, StopBar, TaskNamespace,
-    TerminalReviewConfig, TerminalReviewSuccess, ValidationItem, VersionStamps,
-    MAX_EXECUTION_DURATION_SECS, SCHEMA_VERSION,
+    resolve_execution_deadline_ms, role_success_contract_error, ArtifactOutcome, BlobRef,
+    ControlAction, DecisionAction, EffectEventClass, EffectResource, EventEnvelope,
+    ExecutionPolicy, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent, MissionTypeRef,
+    OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess,
+    RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
+    TerminalReviewSuccess, ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS,
+    SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,

@@ -7,13 +7,16 @@ use std::path::{Path, PathBuf};
 
 use crate::authority::{compile_authority, AuthorityCeiling, MoatViolation};
 use crate::model::{
-    InputName, OracleName, OutputSemantics, RoleName, StopBar, TerminalReviewConfig,
+    InputName, OracleName, OutputSemantics, PlanningDag, PlanningTask, RoleName, StopBar,
+    TerminalReviewConfig,
 };
 
 use super::digest::ContentDigest;
 use super::frontmatter::{parse_role_file, RoleFrontmatter};
 use super::install::validate_closed_tree;
-use super::manifest::{is_path_safe_name, ManifestFile, ManifestInput, MISSION_LOCK_FILE};
+use super::manifest::{
+    is_path_safe_name, ManifestFile, ManifestInput, ManifestPlanningDag, MISSION_LOCK_FILE,
+};
 use super::skills::{load_skills, package_files};
 use super::{MissionType, PreparedInput, RoleDefinition, SkillPackage};
 
@@ -95,6 +98,7 @@ pub fn load_mission_type(
     if roles.is_empty() {
         return Err(MissionTypeError::NoRoles(root.to_path_buf()));
     }
+    let planning = resolve_planning_dag(manifest.planning, &roles)?;
 
     // The closing review, fail-closed like the planning DAG: the named role
     // must exist and be a judge. An agent-graded bar without an independent
@@ -142,7 +146,7 @@ pub fn load_mission_type(
         digest,
         stop,
         image: manifest.mission_type.image,
-        planning: manifest.planning,
+        planning,
         recovery: manifest.recovery,
         execution: manifest.execution,
         terminal_review,
@@ -167,6 +171,35 @@ pub fn load_mission_type(
         )));
     }
     Ok(mission_type)
+}
+
+fn resolve_planning_dag(
+    dag: ManifestPlanningDag,
+    roles: &BTreeMap<RoleName, RoleDefinition>,
+) -> Result<PlanningDag, MissionTypeError> {
+    let tasks = dag
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let output = roles
+                .get(&task.role)
+                .map(|role| role.output)
+                .ok_or_else(|| {
+                    MissionTypeError::Manifest(format!(
+                    "[planning] task '{}' names role '{}' which the mission type does not provide",
+                    task.id, task.role
+                ))
+                })?;
+            Ok(PlanningTask {
+                id: task.id,
+                role: task.role,
+                output,
+                body: task.body,
+                depends_on: task.depends_on,
+            })
+        })
+        .collect::<Result<Vec<_>, MissionTypeError>>()?;
+    Ok(PlanningDag { tasks })
 }
 
 fn load_inputs(

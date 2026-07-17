@@ -173,6 +173,10 @@ pub struct PlanProposal {
 pub struct PlanningTask {
     pub id: TaskId,
     pub role: RoleName,
+    /// Resolved from the pinned mission type when the mission is created.
+    /// Persisted so the pure fold can enforce the exact role contract without
+    /// loading mission-type files during replay.
+    pub output: OutputSemantics,
     #[serde(default)]
     pub body: String,
     #[serde(default)]

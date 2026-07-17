@@ -327,6 +327,12 @@ impl Engine {
                 })?;
             }
         }
+        if config.planning != self.mission_type.planning {
+            bail!(
+                "mission planning DAG must exactly match pinned mission type '{}'",
+                self.mission_type.name
+            );
+        }
         // The loader enforces both rules for mission types; enforce them here
         // too so no direct caller can mint a config the closing gate cannot
         // honor (the fold is total and cannot refuse the config).
@@ -1012,10 +1018,15 @@ impl Engine {
         {
             Ok(outcome) => {
                 let outcome = outcome.projected();
-                if !outcome.handoff.matches_output(*output) {
+                if let Some(detail) = crate::model::role_success_contract_error(
+                    *output,
+                    &outcome.handoff,
+                    outcome.artifact.as_ref(),
+                    base_sha,
+                ) {
                     return Ok(completed(Err(invalid_role_outcome(
-                        "handoff.output_contract",
-                        "role handoff does not match the effect output contract",
+                        "role.success_contract",
+                        detail,
                         &outcome,
                     ))));
                 }

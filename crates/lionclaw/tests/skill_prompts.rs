@@ -412,12 +412,14 @@ fn planning_mission_type(skill_dir: &std::path::Path) -> MissionType {
                 PlanningTask {
                     id: tid("strategist"),
                     role: rn("strategist"),
+                    output: OutputSemantics::ProducesReport,
                     body: "draft".to_string(),
                     depends_on: vec![],
                 },
                 PlanningTask {
                     id: tid("author"),
                     role: rn("author"),
+                    output: OutputSemantics::ProposesPlan,
                     body: "propose".to_string(),
                     depends_on: vec![tid("strategist")],
                 },
@@ -517,12 +519,14 @@ async fn planning_prompt_lists_assigned_skills_for_skilled_role() {
                         PlanningTask {
                             id: tid("strategist"),
                             role: rn("strategist"),
+                            output: OutputSemantics::ProducesReport,
                             body: "draft".to_string(),
                             depends_on: vec![],
                         },
                         PlanningTask {
                             id: tid("author"),
                             role: rn("author"),
+                            output: OutputSemantics::ProposesPlan,
                             body: "propose".to_string(),
                             depends_on: vec![tid("strategist")],
                         },
@@ -596,12 +600,14 @@ async fn planning_prompt_for_unassigned_role_has_no_skill_section() {
                         PlanningTask {
                             id: tid("strategist"),
                             role: rn("strategist"),
+                            output: OutputSemantics::ProducesReport,
                             body: "draft".to_string(),
                             depends_on: vec![],
                         },
                         PlanningTask {
                             id: tid("author"),
                             role: rn("author"),
+                            output: OutputSemantics::ProposesPlan,
                             body: "propose".to_string(),
                             depends_on: vec![tid("strategist")],
                         },

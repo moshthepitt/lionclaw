@@ -41,9 +41,10 @@ fn software_dev_mission_type_loads() {
     let planner = &mission_type.planning.tasks[0];
     assert_eq!(planner.id.as_str(), "strategist");
     assert_eq!(
-        mission_type.roles[&planner.role].output,
+        planner.output,
         lionclaw::model::OutputSemantics::ProposesPlan
     );
+    assert_eq!(mission_type.roles[&planner.role].output, planner.output);
 }
 
 #[test]
