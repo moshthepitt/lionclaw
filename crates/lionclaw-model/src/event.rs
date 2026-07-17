@@ -30,6 +30,10 @@ pub enum TaskNamespace {
     Execution,
 }
 
+/// Largest whole-second duration that has an exact positive `i64`
+/// millisecond representation for an immutable effect request.
+pub const MAX_EXECUTION_DURATION_SECS: u64 = i64::MAX as u64 / 1_000;
+
 impl TaskNamespace {
     pub const fn slug(self) -> &'static str {
         match self {
@@ -154,6 +158,18 @@ impl ExecutionPolicy {
         }
         if self.max_task_time_secs < self.default_timeout_secs {
             return Err("max-task-time-secs must be at least default-timeout-secs".into());
+        }
+        if [
+            self.default_timeout_secs,
+            self.max_task_time_secs,
+            self.extension_step_secs,
+        ]
+        .into_iter()
+        .any(|duration| duration > MAX_EXECUTION_DURATION_SECS)
+        {
+            return Err(format!(
+                "execution durations must not exceed {MAX_EXECUTION_DURATION_SECS} seconds"
+            ));
         }
         Ok(())
     }
@@ -763,6 +779,16 @@ mod compat_tests {
         );
         json.as_object_mut().unwrap().remove("namespace");
         assert!(serde_json::from_value::<MissionEvent>(json).is_err());
+    }
+
+    #[test]
+    fn execution_policy_rejects_the_first_unrepresentable_duration() {
+        let mut policy = ExecutionPolicy::default();
+        policy.max_task_time_secs = super::MAX_EXECUTION_DURATION_SECS + 1;
+        assert!(policy.validate().is_err());
+
+        policy.max_task_time_secs = super::MAX_EXECUTION_DURATION_SECS;
+        assert!(policy.validate().is_ok());
     }
 
     #[test]

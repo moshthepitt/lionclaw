@@ -2176,4 +2176,12 @@ mod assignment_tests {
         assert_eq!(transient_backoff_ms(1, Some(2_500)), 2_500);
         assert_eq!(transient_backoff_ms(99, Some(90_000)), 30_000);
     }
+
+    #[test]
+    fn largest_representable_duration_materializes_at_the_zero_epoch() {
+        assert_eq!(
+            resolved_deadline(0, crate::model::MAX_EXECUTION_DURATION_SECS).unwrap(),
+            (crate::model::MAX_EXECUTION_DURATION_SECS * 1_000) as i64
+        );
+    }
 }

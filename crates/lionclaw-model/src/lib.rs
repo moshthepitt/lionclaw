@@ -40,7 +40,8 @@ pub use event::{
     EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent,
     MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess,
     RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
-    TerminalReviewSuccess, ValidationItem, VersionStamps, SCHEMA_VERSION,
+    TerminalReviewSuccess, ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS,
+    SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
