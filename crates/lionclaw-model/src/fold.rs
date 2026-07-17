@@ -685,6 +685,7 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         effect_id,
         role,
         output,
+        prompt,
         base_sha,
         assignment_epoch,
         recreate_workspace,
@@ -717,16 +718,19 @@ fn role_request_matches_dispatch(state: &MissionState, envelope: &EventEnvelope)
         &intent.base_sha,
         state.config.recovery.max_attempts,
     );
-    let Some(prompt_hash) = envelope.stamps.prompt_hash.as_deref() else {
+    let Some(prompt_hash) = prompt.content_sha256() else {
         return false;
     };
+    if envelope.stamps.prompt_hash.as_deref() != Some(prompt_hash.as_str()) {
+        return false;
+    }
     let expected_effect = super::EffectId::for_role_request(
         *namespace,
         &state.mission_id,
         task_id,
         *attempt_no,
         *assignment_epoch,
-        prompt_hash,
+        &prompt_hash,
     );
     output_matches
         && intent.namespace == *namespace
@@ -1729,7 +1733,8 @@ mod tests {
     use super::*;
     use crate::TypedFailureEvidence;
 
-    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+    const TEST_PROMPT_HASH: &str =
+        "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
 
     fn mission_id() -> MissionId {
         MissionId::from_digest_prefix("abcdef0123456789")
@@ -2149,6 +2154,25 @@ mod tests {
             }
             envelope
         }))
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert_eq!(state.tasks[&tid("w")].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn a_role_request_with_a_prompt_that_does_not_match_its_stamp_is_inert() {
+        let mut request = role_requested("w", "mismatched-prompt");
+        let MissionEvent::RoleRunRequested { prompt, .. } = &mut request else {
+            unreachable!("role_requested returns a role request")
+        };
+        *prompt = PayloadRef::inline("different prompt");
+
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(vec![], vec![work_task("w")]),
+            request,
+        ])
         .expect("state");
 
         assert!(state.inflight.is_empty());

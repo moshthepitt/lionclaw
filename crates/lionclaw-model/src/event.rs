@@ -81,6 +81,29 @@ impl PayloadRef {
     pub fn inline(text: impl Into<String>) -> Self {
         Self::Inline { text: text.into() }
     }
+
+    /// SHA-256 identity of the bytes the runner will resolve. Blob contents
+    /// are verified against their reference by the durable blob store.
+    pub fn content_sha256(&self) -> Option<String> {
+        match self {
+            Self::Inline { text } => {
+                use sha2::{Digest, Sha256};
+
+                Some(super::ids::lowercase_hex(&Sha256::digest(text.as_bytes())))
+            }
+            Self::Blob(blob)
+                if blob.algo == "sha256"
+                    && blob.hex.len() == 64
+                    && blob
+                        .hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Some(blob.hex.clone())
+            }
+            Self::Blob(_) => None,
+        }
+    }
 }
 
 /// The honesty bar a mission type declares: what "finished" must mean.

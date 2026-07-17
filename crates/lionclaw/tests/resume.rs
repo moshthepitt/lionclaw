@@ -14,7 +14,8 @@ use lionclaw::model::{
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
-const CRASHED_PROMPT_HASH: &str = "crash-injection-prompt-hash";
+const CRASHED_PROMPT_HASH: &str =
+    "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
 
 fn role_effect(
     mission_id: &lionclaw::model::MissionId,
@@ -281,7 +282,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
             role: lionclaw::model::RoleName::new("implementer").unwrap(),
             output: OutputSemantics::ProducesArtifact,
             runtime: "codex".to_string(),
-            prompt: lionclaw::model::PayloadRef::inline("p"),
+            prompt: lionclaw::model::PayloadRef::inline("prompt"),
             base_sha: BASE_SHA.to_string(),
             assignment_epoch: 1,
             recreate_workspace: true,

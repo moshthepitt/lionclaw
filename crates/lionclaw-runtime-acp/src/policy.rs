@@ -16,18 +16,8 @@ pub(crate) fn acp_permission_denial(params: Option<&Value>) -> Value {
         .and_then(|params| params.get("options"))
         .and_then(Value::as_array)
         .and_then(|options| {
-            let mut denials = options.iter().filter_map(|option| {
-                match option.get("kind").and_then(Value::as_str) {
-                    Some("reject_once" | "reject_always") => option
-                        .get("optionId")
-                        .or_else(|| option.get("id"))
-                        .and_then(Value::as_str)
-                        .filter(|option_id| !option_id.is_empty()),
-                    _ => None,
-                }
-            });
-            let denial = denials.next()?;
-            denials.next().is_none().then_some(denial)
+            denial_option_id(options, "reject_once")
+                .or_else(|| denial_option_id(options, "reject_always"))
         });
 
     match reject_option {
@@ -43,4 +33,17 @@ pub(crate) fn acp_permission_denial(params: Option<&Value>) -> Value {
             },
         }),
     }
+}
+
+fn denial_option_id<'a>(options: &'a [Value], kind: &str) -> Option<&'a str> {
+    options.iter().find_map(|option| {
+        if option.get("kind").and_then(Value::as_str) != Some(kind) {
+            return None;
+        }
+        option
+            .get("optionId")
+            .or_else(|| option.get("id"))
+            .and_then(Value::as_str)
+            .filter(|option_id| !option_id.is_empty())
+    })
 }

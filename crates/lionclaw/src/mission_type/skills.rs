@@ -156,6 +156,11 @@ fn load_lock_with_budget(
     text_budget: &mut ControlTextBudget,
 ) -> Result<MissionLockFile, MissionTypeError> {
     let path = Path::new(MISSION_LOCK_FILE);
+    if tree.contains(path, TreeEntryKind::Directory) {
+        return Err(MissionTypeError::Manifest(format!(
+            "{MISSION_LOCK_FILE} must be a regular file"
+        )));
+    }
     if !tree.contains(path, TreeEntryKind::File) {
         return Ok(MissionLockFile {
             version: 1,

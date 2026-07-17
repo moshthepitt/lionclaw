@@ -3077,7 +3077,8 @@ mod tests {
 
     /// Fold a hand-built review mission to a state, for summary rendering
     /// tests (sequence numbers assigned by position).
-    const REVIEW_PROMPT_HASH: &str = "review-fixture-prompt-hash";
+    const REVIEW_PROMPT_HASH: &str =
+        "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
 
     fn review_mission_id() -> crate::model::MissionId {
         crate::model::MissionId::parse("mabc123def456").unwrap()

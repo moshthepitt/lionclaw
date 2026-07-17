@@ -285,7 +285,7 @@ impl fmt::Display for MissionId {
 }
 
 /// Encode bytes as lowercase hexadecimal without another model dependency.
-fn lowercase_hex(bytes: &[u8]) -> String {
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

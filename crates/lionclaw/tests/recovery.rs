@@ -48,7 +48,7 @@ async fn an_inert_duplicate_outcome_fails_loudly_without_recovery_replay() {
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
 
-    let prompt_hash = "fault-injected-prompt-hash";
+    let prompt_hash = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
     let task_id = lionclaw::model::TaskId::new("fix").expect("task id");
     let effect_id = lionclaw::model::EffectId::for_role_request(
         TaskNamespace::Execution,

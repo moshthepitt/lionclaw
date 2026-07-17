@@ -945,12 +945,17 @@ fn acp_permission_requests_are_denied_by_default() {
     assert_eq!(
         acp_permission_denial(Some(&json!({
             "options": [
-                { "optionId": "one", "kind": "reject_once" },
-                { "optionId": "always", "kind": "reject_always" }
+                { "optionId": "always", "kind": "reject_always" },
+                { "optionId": "one", "kind": "reject_once" }
             ]
         }))),
-        json!({ "outcome": { "outcome": "cancelled" } }),
-        "multiple structured denial choices are ambiguous"
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "one"
+            }
+        }),
+        "reject_once is the least-persistent structured denial"
     );
 }
 

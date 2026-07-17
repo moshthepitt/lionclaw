@@ -13,6 +13,7 @@ use super::digest::ContentDigest;
 
 pub(crate) const MAX_BUNDLE_ENTRIES: usize = 4_096;
 pub(crate) const MAX_BUNDLE_DEPTH: usize = 32;
+pub(crate) const MAX_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_CONTROL_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CONTROL_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -292,6 +293,7 @@ fn inventory(
         root_identity,
     )];
     let mut result = Vec::new();
+    let mut admitted_bytes = 0_u64;
     while let Some((directory_fd, relative_dir, depth, directory_identity)) = pending.pop() {
         let mut names = Vec::new();
         for entry in Dir::read_from(&directory_fd)? {
@@ -337,7 +339,24 @@ fn inventory(
                     ));
                     TreeEntryKind::Directory
                 }
-                FileType::RegularFile => TreeEntryKind::File,
+                FileType::RegularFile => {
+                    let length = u64::try_from(stat.st_size).map_err(|_| {
+                        anyhow::anyhow!(
+                            "bundle entry '{}' reports a negative length",
+                            root.join(&relative).display()
+                        )
+                    })?;
+                    admitted_bytes = admitted_bytes.checked_add(length).ok_or_else(|| {
+                        anyhow::anyhow!("bundle byte total overflowed at '{}'", relative.display())
+                    })?;
+                    if admitted_bytes > MAX_BUNDLE_BYTES {
+                        bail!(
+                            "bundle byte limit of {MAX_BUNDLE_BYTES} exceeded by '{}'",
+                            root.join(&relative).display()
+                        );
+                    }
+                    TreeEntryKind::File
+                }
                 _ => bail!(
                     "bundle entry '{}' must be a regular file or directory",
                     root.join(&relative).display()

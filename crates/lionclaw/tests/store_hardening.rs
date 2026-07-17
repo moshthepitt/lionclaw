@@ -29,7 +29,7 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
         .await
         .expect("propose");
     approve_plan(&h.engine, &mission_id).await;
-    let prompt_hash = "unfinished-request-prompt-hash";
+    let prompt_hash = "cf07194ee232eb531e15f690000d19846dea69cf05504782658afcfacb9228a2";
     let task_id = TaskId::new("fix").unwrap();
     let id = lionclaw::model::EffectId::for_role_request(
         lionclaw::model::TaskNamespace::Execution,

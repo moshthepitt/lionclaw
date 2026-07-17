@@ -277,7 +277,8 @@ mod tests {
     use crate::verdict::FinishClass;
     use crate::{TypedFailure, TypedFailureEvidence};
 
-    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+    const TEST_PROMPT_HASH: &str =
+        "ffc66f942549cd63f0fc01e069c3ca49ff918d55d78e633e0f2d72bd7221d5c9";
 
     fn mission_id() -> MissionId {
         MissionId::parse("mabc123abc123").expect("valid mission id")

@@ -111,7 +111,8 @@ mod tests {
     };
     use crate::MissionConfig;
 
-    const TEST_PROMPT_HASH: &str = "test-prompt-hash";
+    const TEST_PROMPT_HASH: &str =
+        "148de9c5a7a44d19e56cd9ae1a554bf67847afb0c58f6e12fa29ac7ddfca9940";
 
     fn role_effect(mission_id: &MissionId, task_id: &TaskId) -> EffectId {
         EffectId::for_role_request(

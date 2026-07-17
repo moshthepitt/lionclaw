@@ -94,6 +94,34 @@ fn mission_bundle_entry_count_is_bounded_before_semantic_loading() {
 }
 
 #[test]
+fn mission_bundle_bytes_are_bounded_before_snapshot_copy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::File::create(dir.path().join("oversized-resource"))
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("oversized bundle must be rejected before copying");
+    assert!(error.to_string().contains("byte limit"), "got {error:?}");
+}
+
+#[test]
+fn reserved_mission_lock_path_must_be_a_regular_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_minimal_bundle(dir.path());
+    std::fs::create_dir(dir.path().join("mission.lock.toml")).unwrap();
+
+    let error = load_mission_type(dir.path(), &AuthorityCeiling::default())
+        .expect_err("a directory cannot stand in for the optional lock file");
+    assert!(
+        error.to_string().contains("must be a regular file"),
+        "got {error:?}"
+    );
+}
+
+#[test]
 fn skill_control_text_is_bounded_before_whole_file_loading() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_minimal_bundle(dir.path());
