@@ -395,12 +395,29 @@ mod tests {
     }
 
     fn role_requested(task: &str, attempt_no: u32, key: &str) -> MissionEvent {
+        role_requested_as(
+            task,
+            attempt_no,
+            key,
+            "implementer",
+            crate::OutputSemantics::ProducesArtifact,
+        )
+    }
+
+    fn role_requested_as(
+        task: &str,
+        attempt_no: u32,
+        key: &str,
+        role: &str,
+        output: crate::OutputSemantics,
+    ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
             attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
-            role: rname("implementer"),
+            role: rname(role),
+            output,
             runtime: "codex".to_string(),
             prompt: PayloadRef::inline("assembled prompt"),
             base_sha: "sha-0".to_string(),
@@ -414,10 +431,19 @@ mod tests {
     }
 
     fn work_done(task: &str, key: &str, artifact: Option<(&str, &str)>) -> MissionEvent {
+        work_done_at(task, 1, key, artifact)
+    }
+
+    fn work_done_at(
+        task: &str,
+        attempt_no: u32,
+        key: &str,
+        artifact: Option<(&str, &str)>,
+    ) -> MissionEvent {
         MissionEvent::RoleRunCompleted {
             namespace: TaskNamespace::Execution,
             task_id: tid(task),
-            attempt_no: 1,
+            attempt_no,
             effect_id: EffectId::for_parts(&["test", key]),
             outcome: Ok(RoleRunSuccess {
                 handoff: Handoff::Work {
@@ -685,7 +711,13 @@ mod tests {
         let state = fold_log(vec![
             created("sha-0"),
             plan(vec![assertion("A1")], vec![validate("v1", &["A1"]), g]),
-            role_requested("v1", 1, "k-v1-1"),
+            role_requested_as(
+                "v1",
+                1,
+                "k-v1-1",
+                "checker",
+                crate::OutputSemantics::EmitsVerdict,
+            ),
         ]);
         // v1 is running (inflight), so the step idles rather than dispatching.
         assert_eq!(step(&state), StepDecision::Idle);
@@ -978,7 +1010,9 @@ mod tests {
         events.push(review_completed("k-tr-1", "sha-1", true, 0));
         // New work moves the head; the oracle re-judges; the clean sha-1
         // verdict is stale — a second review dispatches at the new head.
-        events.push(work_done("w1", "k-w1-2", Some(("sha-1", "sha-2"))));
+        events.push(role_requested("w1", 2, "k-w1-2"));
+        events.push(work_done_at("w1", 2, "k-w1-2", Some(("sha-1", "sha-2"))));
+        events.push(oracle_requested(&["A1"], "tests", "sha-2", 2, "k-tests-2"));
         events.push(oracle_completed(
             &["A1"],
             "tests",

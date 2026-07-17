@@ -210,6 +210,7 @@ mod tests {
                     attempt_no: 1,
                     effect_id: EffectId::for_parts(&["test", validator]),
                     role: RoleName::new("reviewer").unwrap(),
+                    output: crate::OutputSemantics::EmitsVerdict,
                     runtime: "codex".into(),
                     prompt: PayloadRef::inline("p"),
                     base_sha: "s0".into(),

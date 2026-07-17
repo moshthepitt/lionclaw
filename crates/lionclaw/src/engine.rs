@@ -318,8 +318,15 @@ impl Engine {
     ) -> Result<MissionId> {
         config
             .execution
-            .validate()
+            .validate_at(now_ms)
             .map_err(|error| anyhow::anyhow!("invalid execution policy: {error}"))?;
+        for role in self.mission_type.roles.values() {
+            if let Some(timeout_secs) = role.timeout_secs {
+                resolved_deadline(now_ms, timeout_secs).with_context(|| {
+                    format!("role '{}' deadline is not representable", role.name)
+                })?;
+            }
+        }
         // The loader enforces both rules for mission types; enforce them here
         // too so no direct caller can mint a config the closing gate cannot
         // honor (the fold is total and cannot refuse the config).
@@ -935,6 +942,7 @@ impl Engine {
             task_id,
             attempt_no,
             role: role_name,
+            output,
             runtime,
             prompt,
             base_sha,
@@ -961,6 +969,12 @@ impl Engine {
                 format!("role '{role_name}' is no longer provided by the mission type"),
             ))));
         };
+        if role.output != *output {
+            return Ok(completed(Err(TypedFailure::permanent(
+                "role.output_contract",
+                "the pinned mission role no longer matches the effect output contract",
+            ))));
+        }
         let prompt_text = self.store.blobs().resolve(prompt)?;
         let skills = match self.resolve_role_skills(role) {
             Ok(skills) => skills,
@@ -996,10 +1010,15 @@ impl Engine {
             .run_role_observed(state, effect_id, request, update_rx, true)
             .await?
         {
-            Ok(mut outcome) => {
-                outcome.runtime_configuration = outcome.runtime_configuration.projected();
-                outcome.final_response =
-                    lionclaw_runtime_api::bounded_text(&outcome.final_response);
+            Ok(outcome) => {
+                let outcome = outcome.projected();
+                if !outcome.handoff.matches_output(*output) {
+                    return Ok(completed(Err(invalid_role_outcome(
+                        "handoff.output_contract",
+                        "role handoff does not match the effect output contract",
+                        &outcome,
+                    ))));
+                }
                 let incomplete = match &outcome.handoff {
                     Handoff::Work { done: false, .. } => Some("role reported done=false"),
                     Handoff::Plan { done: false, .. } => {
@@ -1225,7 +1244,7 @@ impl Engine {
             .run_role_observed(state, effect_id, request, update_rx, false)
             .await?
         {
-            Ok(outcome) => outcome,
+            Ok(outcome) => outcome.projected(),
             Err(mut failure) => {
                 if failure.is_transient() {
                     let delay_ms = transient_backoff_ms(
@@ -1492,6 +1511,7 @@ impl Engine {
             attempt_no: intent.attempt_no,
             effect_id,
             role: intent.role,
+            output: role.output,
             runtime: role
                 .runtime
                 .clone()
@@ -2084,13 +2104,8 @@ fn has_owned_oracle_sibling(
 }
 
 fn resolved_deadline(requested_at_ms: i64, duration_secs: u64) -> Result<i64> {
-    let duration_ms = duration_secs
-        .checked_mul(1_000)
-        .context("execution duration overflows milliseconds")?;
-    let duration_ms = i64::try_from(duration_ms).context("execution duration is too large")?;
-    requested_at_ms
-        .checked_add(duration_ms)
-        .context("execution deadline overflows epoch milliseconds")
+    crate::model::resolve_execution_deadline_ms(requested_at_ms, duration_secs)
+        .map_err(anyhow::Error::msg)
 }
 
 fn runtime_configuration_evidence(
@@ -2178,10 +2193,13 @@ mod assignment_tests {
     }
 
     #[test]
-    fn largest_representable_duration_materializes_at_the_zero_epoch() {
+    fn absolute_deadline_boundary_is_exact_at_a_realistic_epoch() {
+        let requested_at_ms = 1_750_000_000_000_i64;
+        let maximum_secs = (i64::MAX - requested_at_ms) as u64 / 1_000;
         assert_eq!(
-            resolved_deadline(0, crate::model::MAX_EXECUTION_DURATION_SECS).unwrap(),
-            (crate::model::MAX_EXECUTION_DURATION_SECS * 1_000) as i64
+            resolved_deadline(requested_at_ms, maximum_secs).unwrap(),
+            requested_at_ms + (maximum_secs * 1_000) as i64
         );
+        assert!(resolved_deadline(requested_at_ms, maximum_secs + 1).is_err());
     }
 }

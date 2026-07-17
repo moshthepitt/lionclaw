@@ -16,14 +16,15 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{PlanProposal, PlanningDag};
+use super::plan::{OutputSemantics, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
-/// Bumped for the durable planning/execution task namespace on role effects.
-pub const SCHEMA_VERSION: u32 = 12;
+/// Bumped for namespaced task attention, durable output contracts, and exact
+/// outcome correlation.
+pub const SCHEMA_VERSION: u32 = 13;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskNamespace {
     Planning,
@@ -33,6 +34,23 @@ pub enum TaskNamespace {
 /// Largest whole-second duration that has an exact positive `i64`
 /// millisecond representation for an immutable effect request.
 pub const MAX_EXECUTION_DURATION_SECS: u64 = i64::MAX as u64 / 1_000;
+
+/// Resolve one immutable absolute deadline without truncation or saturation.
+/// Callers validate stored duration shape separately, then use this exact
+/// check at the epoch where an effect can actually be scheduled.
+pub fn resolve_execution_deadline_ms(
+    requested_at_ms: i64,
+    duration_secs: u64,
+) -> Result<i64, String> {
+    let duration_ms = duration_secs
+        .checked_mul(1_000)
+        .ok_or_else(|| "execution duration overflows milliseconds".to_string())?;
+    let duration_ms =
+        i64::try_from(duration_ms).map_err(|_| "execution duration is too large".to_string())?;
+    requested_at_ms
+        .checked_add(duration_ms)
+        .ok_or_else(|| "execution deadline overflows epoch milliseconds".to_string())
+}
 
 impl TaskNamespace {
     pub const fn slug(self) -> &'static str {
@@ -173,6 +191,11 @@ impl ExecutionPolicy {
         }
         Ok(())
     }
+
+    pub fn validate_at(&self, requested_at_ms: i64) -> Result<(), String> {
+        self.validate()?;
+        resolve_execution_deadline_ms(requested_at_ms, self.max_task_time_secs).map(|_| ())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +271,24 @@ pub enum Handoff {
         proposal: Option<PlanProposal>,
         request_attention: bool,
     },
+}
+
+impl Handoff {
+    /// Whether this payload has the exact schema promised by a role effect.
+    /// The predicate lives in the model so parsing, execution, and replay use
+    /// one closed contract rather than independently matching handoff tags.
+    pub const fn matches_output(&self, output: OutputSemantics) -> bool {
+        matches!(
+            (self, output),
+            (Self::Validate { .. }, OutputSemantics::EmitsVerdict)
+                | (Self::Review { .. }, OutputSemantics::EmitsGapVerdict)
+                | (Self::Plan { .. }, OutputSemantics::ProposesPlan)
+                | (
+                    Self::Work { .. },
+                    OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact
+                )
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +433,8 @@ pub enum MissionEvent {
         attempt_no: u32,
         effect_id: super::EffectId,
         role: RoleName,
+        /// Closed output contract resolved from the pinned mission type.
+        output: OutputSemantics,
         /// Effective runtime profile, resolved before the request is recorded.
         runtime: String,
         /// Assembled prompt, persisted before the request is recorded so a
@@ -622,6 +665,15 @@ impl MissionEvent {
             | Self::EffectCleanupFailed { .. } => None,
         }
     }
+
+    pub(crate) fn outcome_effect_id(&self) -> Option<&super::EffectId> {
+        match self {
+            Self::RoleRunCompleted { effect_id, .. }
+            | Self::OracleRunCompleted { effect_id, .. }
+            | Self::TerminalReviewCompleted { effect_id, .. } => Some(effect_id),
+            _ => None,
+        }
+    }
 }
 
 /// A persisted event with its log position and provenance.
@@ -753,13 +805,14 @@ mod compat_tests {
     }
 
     #[test]
-    fn role_effect_task_namespace_is_required_on_the_wire() {
+    fn role_effect_task_namespace_and_output_contract_are_required_on_the_wire() {
         let event = MissionEvent::RoleRunRequested {
             namespace: TaskNamespace::Planning,
             task_id: TaskId::new("author").unwrap(),
             attempt_no: 1,
             effect_id: crate::EffectId::for_parts(&["test", "author"]),
             role: RoleName::new("planner").unwrap(),
+            output: OutputSemantics::ProposesPlan,
             runtime: "codex".into(),
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
@@ -771,14 +824,21 @@ mod compat_tests {
             budget_deadline_ms: 3,
         };
 
-        let mut json = serde_json::to_value(&event).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["namespace"], "planning");
+        assert_eq!(json["output"], "proposes-plan");
         assert_eq!(
             serde_json::from_value::<MissionEvent>(json.clone()).unwrap(),
             event
         );
-        json.as_object_mut().unwrap().remove("namespace");
-        assert!(serde_json::from_value::<MissionEvent>(json).is_err());
+        for field in ["namespace", "output"] {
+            let mut missing = json.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<MissionEvent>(missing).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
     }
 
     #[test]

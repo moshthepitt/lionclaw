@@ -123,6 +123,54 @@ async fn a_clean_review_closes_verified_with_no_park() {
 }
 
 #[tokio::test]
+async fn terminal_review_outcomes_bound_alternate_runner_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oversized = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        if request.task_id.as_str() == REVIEW_TAG {
+            let mut outcome = review_verdict(request, true, vec![]);
+            outcome.runtime_configuration.applied_model = Some(oversized.clone());
+            outcome.final_response = oversized.clone();
+            Ok(outcome)
+        } else {
+            Ok(work_outcome(request, HEAD_SHA))
+        }
+    }));
+    let (h, mission_id) = started(&dir, runner).await;
+
+    h.engine.advance(&mission_id).await.expect("advance");
+    let events = h.engine.store().load(&mission_id).await.expect("events");
+    let success = events
+        .iter()
+        .find_map(|event| match &event.event {
+            MissionEvent::TerminalReviewCompleted {
+                outcome: Ok(success),
+                ..
+            } => Some(success),
+            _ => None,
+        })
+        .expect("terminal review success");
+    assert!(
+        success
+            .runtime_configuration
+            .applied_model
+            .as_ref()
+            .expect("applied model")
+            .len()
+            <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT
+    );
+    assert!(
+        h.engine
+            .store()
+            .blobs()
+            .resolve(&success.final_response)
+            .expect("final response")
+            .len()
+            <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT
+    );
+}
+
+#[tokio::test]
 async fn the_reviewer_prompt_is_fresh_context_and_contract_blind() {
     let dir = tempfile::tempdir().expect("tempdir");
     let captured = std::sync::Arc::new(Mutex::new(None::<String>));

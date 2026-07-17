@@ -771,3 +771,73 @@ async fn direct_mission_creation_rejects_an_invalid_execution_policy() {
 
     assert!(error.to_string().contains("invalid execution policy"));
 }
+
+#[tokio::test]
+async fn mission_creation_rejects_deadlines_unrepresentable_at_its_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mission_type = test_mission_type();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store,
+        mission_type,
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mut config = default_config();
+    config.execution.max_task_time_secs = lionclaw::model::MAX_EXECUTION_DURATION_SECS;
+
+    let error = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject an impossible absolute deadline",
+            BASE_SHA,
+            config,
+        )
+        .await
+        .expect_err("policy deadline must fit at the mission epoch");
+    assert!(
+        error.to_string().contains("deadline"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn mission_creation_rejects_unrepresentable_role_deadlines() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mission_type = test_mission_type();
+    mission_type.roles.values_mut().next().unwrap().timeout_secs =
+        Some(lionclaw::model::MAX_EXECUTION_DURATION_SECS);
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store,
+        mission_type,
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(lionclaw::testing::MockRoleRunner::happy(HEAD_SHA)),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+
+    let error = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "reject an impossible role deadline",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect_err("role deadline must fit at the mission epoch");
+    assert!(
+        error.to_string().contains("deadline"),
+        "unexpected error: {error:#}"
+    );
+}

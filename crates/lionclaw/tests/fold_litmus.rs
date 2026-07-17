@@ -256,6 +256,7 @@ async fn controlled_effect_log_satisfies_every_prefix_and_snapshot_law() {
                     attempt_no: 1,
                     effect_id: effect_id.clone(),
                     role: RoleName::new("implementer").unwrap(),
+                    output: lionclaw::model::OutputSemantics::ProducesArtifact,
                     runtime: "codex".into(),
                     prompt: PayloadRef::inline("prompt"),
                     base_sha: BASE_SHA.into(),

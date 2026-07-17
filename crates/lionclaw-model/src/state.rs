@@ -73,6 +73,22 @@ pub enum TaskStatus {
     Superseded,
 }
 
+/// Stable identity of one task runtime across the planning and execution
+/// namespaces. A bare `TaskId` is intentionally insufficient: both maps may
+/// contain the same id at once.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAddress {
+    pub namespace: super::TaskNamespace,
+    pub task_id: TaskId,
+}
+
+impl TaskAddress {
+    pub fn new(namespace: super::TaskNamespace, task_id: TaskId) -> Self {
+        Self { namespace, task_id }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRuntimeState {
     pub status: TaskStatus,
@@ -411,6 +427,7 @@ pub enum InflightEffect {
         task_id: TaskId,
         attempt_no: u32,
         role: RoleName,
+        output: super::OutputSemantics,
         runtime: String,
         prompt: PayloadRef,
         base_sha: String,
@@ -501,6 +518,7 @@ impl InflightEffect {
                 attempt_no,
                 effect_id,
                 role,
+                output,
                 runtime,
                 prompt,
                 base_sha,
@@ -517,6 +535,7 @@ impl InflightEffect {
                     task_id: task_id.clone(),
                     attempt_no: *attempt_no,
                     role: role.clone(),
+                    output: *output,
                     runtime: runtime.clone(),
                     prompt: prompt.clone(),
                     base_sha: base_sha.clone(),
@@ -597,6 +616,67 @@ impl InflightEffect {
             | MissionEvent::EffectCleanupFailed { .. } => None,
         }
     }
+
+    /// Whether an outcome fact names the exact immutable request identity.
+    /// Effect IDs are store-unique, but the redundant identity fields remain
+    /// part of the auditable wire contract and must agree before settlement.
+    pub(crate) fn matches_outcome(&self, event: &super::event::MissionEvent) -> bool {
+        use super::event::MissionEvent;
+        match (self, event) {
+            (
+                Self::RoleRun {
+                    namespace,
+                    task_id,
+                    attempt_no,
+                    ..
+                },
+                MissionEvent::RoleRunCompleted {
+                    namespace: completed_namespace,
+                    task_id: completed_task,
+                    attempt_no: completed_attempt,
+                    ..
+                },
+            ) => {
+                namespace == completed_namespace
+                    && task_id == completed_task
+                    && attempt_no == completed_attempt
+            }
+            (
+                Self::OracleRun {
+                    assertion_ids,
+                    oracle,
+                    judged_sha,
+                    attempt_no,
+                    ..
+                },
+                MissionEvent::OracleRunCompleted {
+                    assertion_ids: completed_assertions,
+                    oracle: completed_oracle,
+                    judged_sha: completed_sha,
+                    attempt_no: completed_attempt,
+                    ..
+                },
+            ) => {
+                assertion_ids == completed_assertions
+                    && oracle == completed_oracle
+                    && judged_sha == completed_sha
+                    && attempt_no == completed_attempt
+            }
+            (
+                Self::TerminalReview {
+                    attempt_no,
+                    judged_sha,
+                    ..
+                },
+                MissionEvent::TerminalReviewCompleted {
+                    attempt_no: completed_attempt,
+                    judged_sha: completed_sha,
+                    ..
+                },
+            ) => attempt_no == completed_attempt && judged_sha == completed_sha,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,9 +739,10 @@ pub struct MissionState {
     /// Gate checkpoints the human approved — the mission
     /// proceeds past them without re-raising the checkpoint.
     pub acknowledged_gates: BTreeSet<TaskId>,
-    /// Nodes whose handoff asked for a human look (`request_attention`),
-    /// until a decision clears them.
-    pub flagged_nodes: BTreeSet<TaskId>,
+    /// Tasks whose handoff asked for a human look (`request_attention`), until
+    /// a decision clears them. Namespaced because planning and execution may
+    /// legitimately use the same task id.
+    pub flagged_tasks: BTreeSet<TaskAddress>,
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
@@ -685,13 +766,17 @@ impl MissionState {
         &self.current_sha
     }
 
+    pub fn active_task_namespace(&self) -> super::TaskNamespace {
+        if self.planning_base_revision.is_some() {
+            super::TaskNamespace::Planning
+        } else {
+            super::TaskNamespace::Execution
+        }
+    }
+
     /// Runtime state for the task era currently allowed to dispatch roles.
     pub fn active_tasks(&self) -> &BTreeMap<TaskId, TaskRuntimeState> {
-        if self.planning_base_revision.is_some() {
-            &self.planning.tasks
-        } else {
-            &self.tasks
-        }
+        self.tasks_in(self.active_task_namespace())
     }
 
     pub fn tasks_in(&self, namespace: super::TaskNamespace) -> &BTreeMap<TaskId, TaskRuntimeState> {

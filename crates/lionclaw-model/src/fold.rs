@@ -13,19 +13,20 @@ use super::event::{
     RuntimeConfigurationEvidence,
 };
 use super::ids::{AssertionId, TaskId};
-use super::plan::Assertion;
+use super::plan::{Assertion, OutputSemantics};
 use super::state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, InflightEffect, MissionPhase,
     MissionState, ParkedEffect, PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance,
-    ReviewAcceptanceKind, ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
+    ReviewAcceptanceKind, ReviewOutcome, TaskAddress, TaskRuntimeState, TaskStatus,
+    TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
 use crate::prelude::*;
-use crate::TypedFailure;
+use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 15;
+pub const REDUCER_VERSION: u32 = 16;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -92,7 +93,7 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
         proposal_approved: false,
         revision: 0,
         acknowledged_gates: Default::default(),
-        flagged_nodes: Default::default(),
+        flagged_tasks: Default::default(),
         oracle_failures: Default::default(),
         waived_oracles: Default::default(),
         terminal_review: Default::default(),
@@ -105,6 +106,18 @@ fn bootstrap(envelope: &EventEnvelope) -> Option<MissionState> {
 /// wrote it.
 pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     let seq = envelope.sequence_no;
+    if let Some((effect_id, effect)) = envelope.event.outcome_effect_id().and_then(|effect_id| {
+        state
+            .inflight
+            .get(effect_id)
+            .filter(|effect| !effect.matches_outcome(&envelope.event))
+            .cloned()
+            .map(|effect| (effect_id.clone(), effect))
+    }) {
+        reject_mismatched_outcome(state, &effect_id, effect);
+        finish_apply(state, seq);
+        return;
+    }
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
         MissionEvent::PlanProposed { proposal, .. } => {
@@ -118,16 +131,38 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             namespace,
             task_id,
             attempt_no,
+            effect_id,
+            role,
+            output,
             ..
         } => {
+            let request_matches =
+                role_request_matches_task(state, *namespace, task_id, role, *output);
             state.parked_effects.retain(|_, parked| {
                 !matches!(parked, ParkedEffect::RoleRun { namespace: parked_namespace, task_id: parked_task } if parked_namespace == namespace && parked_task == task_id)
             });
-            let tasks = state.tasks_in_mut(*namespace);
-            let task = tasks.entry(task_id.clone()).or_insert_with(pending_task);
-            task.status = TaskStatus::Running;
-            task.attempts = *attempt_no;
-            track_inflight(state, &envelope.event, seq);
+            let task = state
+                .tasks_in_mut(*namespace)
+                .entry(task_id.clone())
+                .or_insert_with(pending_task);
+            if request_matches {
+                task.status = TaskStatus::Running;
+                task.attempts = *attempt_no;
+                track_inflight(state, &envelope.event, seq);
+            } else {
+                apply_role_failure(
+                    state,
+                    TaskAddress::new(*namespace, task_id.clone()),
+                    *attempt_no,
+                    effect_id,
+                    TypedFailure::permanent(
+                        "kernel.role_contract",
+                        "role effect does not match its task contract",
+                    ),
+                    None,
+                    None,
+                );
+            }
         }
         MissionEvent::TaskWorkspacePrepared {
             task_id,
@@ -199,77 +234,79 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             effect_id,
             outcome,
         } => {
-            let observed_configuration = state.inflight.get(effect_id).and_then(|effect| {
-                if let InflightEffect::RoleRun {
-                    runtime_configuration,
-                    ..
-                } = effect
-                {
-                    runtime_configuration.clone()
-                } else {
-                    None
-                }
-            });
+            let (observed_configuration, expected_output) = state
+                .inflight
+                .get(effect_id)
+                .and_then(|effect| {
+                    if let InflightEffect::RoleRun {
+                        output,
+                        runtime_configuration,
+                        ..
+                    } = effect
+                    {
+                        Some((runtime_configuration.clone(), *output))
+                    } else {
+                        None
+                    }
+                })
+                .map_or((None, None), |(configuration, output)| {
+                    (configuration, Some(output))
+                });
             state.inflight.remove(effect_id);
             state.stop_requests.remove(effect_id);
             state.reached_deadlines.remove(effect_id);
             clear_cleanup_failure(state, effect_id);
             match outcome {
                 Ok(success) => {
-                    if let Some(artifact) = &success.artifact {
-                        state.current_sha = artifact.head_sha.clone();
-                    }
-                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
-                        task.attempts = task.attempts.max(*attempt_no);
-                    }
-                    apply_handoff(state, *namespace, task_id, &success.handoff);
-                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
-                        task.last_runtime_configuration =
-                            Some(success.runtime_configuration.clone());
-                        task.final_response = Some(success.final_response.clone());
-                        if task.status == TaskStatus::Failed {
-                            task.consecutive_failures = task.consecutive_failures.saturating_add(1);
-                        } else {
-                            task.last_failure = None;
-                            task.consecutive_failures = 0;
+                    if expected_output.is_some_and(|output| success.handoff.matches_output(output))
+                    {
+                        if let Some(artifact) = &success.artifact {
+                            state.current_sha = artifact.head_sha.clone();
                         }
+                        if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
+                            task.attempts = task.attempts.max(*attempt_no);
+                        }
+                        apply_handoff(state, *namespace, task_id, &success.handoff);
+                        if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
+                            task.last_runtime_configuration =
+                                Some(success.runtime_configuration.clone());
+                            task.final_response = Some(success.final_response.clone());
+                            if task.status == TaskStatus::Failed {
+                                task.consecutive_failures =
+                                    task.consecutive_failures.saturating_add(1);
+                            } else {
+                                task.last_failure = None;
+                                task.consecutive_failures = 0;
+                            }
+                        }
+                    } else {
+                        let mut failure = TypedFailure::invalid(
+                            "handoff.output_contract",
+                            "role handoff does not match the effect output contract",
+                        );
+                        failure.evidence_mut().configuration =
+                            success.runtime_configuration.clone();
+                        apply_role_failure(
+                            state,
+                            TaskAddress::new(*namespace, task_id.clone()),
+                            *attempt_no,
+                            effect_id,
+                            failure,
+                            observed_configuration.as_ref(),
+                            Some(&success.final_response),
+                        );
                     }
                 }
                 Err(failure) => {
-                    let failure =
-                        merge_failure_configuration(failure, observed_configuration.as_ref());
-                    if let Some(task) = state.tasks_in_mut(*namespace).get_mut(task_id) {
-                        task.attempts = task.attempts.max(*attempt_no);
-                        task.status = TaskStatus::Failed;
-                        task.last_failure = Some(failure.clone());
-                        let evidence = failure.evidence();
-                        task.final_response = (!evidence.final_response.is_empty())
-                            .then(|| PayloadRef::inline(evidence.final_response.clone()));
-                        let failure_configuration = RuntimeConfigurationEvidence {
-                            requested_model: evidence.configuration.requested_model.clone(),
-                            applied_model: evidence.configuration.applied_model.clone(),
-                            model_confirmation: evidence.configuration.model_confirmation,
-                            requested_mode: evidence.configuration.requested_mode.clone(),
-                            applied_mode: evidence.configuration.applied_mode.clone(),
-                            mode_confirmation: evidence.configuration.mode_confirmation,
-                        };
-                        task.last_runtime_configuration = Some(merge_runtime_configuration(
-                            task.last_runtime_configuration.as_ref(),
-                            &failure_configuration,
-                        ));
-                        task.consecutive_failures = task.consecutive_failures.saturating_add(1);
-                        if !failure.automatically_retryable()
-                            || task.consecutive_failures >= state.config.recovery.max_attempts
-                        {
-                            state.parked_effects.insert(
-                                effect_id.clone(),
-                                ParkedEffect::RoleRun {
-                                    namespace: *namespace,
-                                    task_id: task_id.clone(),
-                                },
-                            );
-                        }
-                    }
+                    apply_role_failure(
+                        state,
+                        TaskAddress::new(*namespace, task_id.clone()),
+                        *attempt_no,
+                        effect_id,
+                        failure.clone(),
+                        observed_configuration.as_ref(),
+                        None,
+                    );
                 }
             }
         }
@@ -470,6 +507,10 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
             });
         }
     }
+    finish_apply(state, seq);
+}
+
+fn finish_apply(state: &mut MissionState, seq: u64) {
     state.head = seq;
     // Promotion runs first: a just-approved proposal must seed the contract
     // before gates/attention/phase are derived this same fold (a plan whose only
@@ -478,6 +519,66 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     derive_gates(state);
     derive_attention(state);
     derive_phase(state);
+}
+
+fn reject_mismatched_outcome(
+    state: &mut MissionState,
+    effect_id: &super::EffectId,
+    effect: InflightEffect,
+) {
+    state.inflight.remove(effect_id);
+    state.stop_requests.remove(effect_id);
+    state.reached_deadlines.remove(effect_id);
+    clear_cleanup_failure(state, effect_id);
+    let observed_configuration = match &effect {
+        InflightEffect::RoleRun {
+            runtime_configuration,
+            ..
+        }
+        | InflightEffect::TerminalReview {
+            runtime_configuration,
+            ..
+        } => runtime_configuration.clone(),
+        InflightEffect::OracleRun { .. } => None,
+    };
+    let mut failure = TypedFailure::permanent(
+        "kernel.effect_identity",
+        "effect outcome identity does not match its request",
+    );
+    if let Some(configuration) = observed_configuration {
+        failure.evidence_mut().configuration = configuration;
+    }
+    match effect {
+        InflightEffect::RoleRun {
+            namespace,
+            task_id,
+            attempt_no,
+            ..
+        } => apply_role_failure(
+            state,
+            TaskAddress::new(namespace, task_id),
+            attempt_no,
+            effect_id,
+            failure,
+            None,
+            None,
+        ),
+        InflightEffect::OracleRun { oracle, .. } => {
+            state.oracle_failures.insert(oracle.clone(), failure);
+            state
+                .parked_effects
+                .insert(effect_id.clone(), ParkedEffect::OracleRun { oracle });
+        }
+        InflightEffect::TerminalReview { attempt_no, .. } => {
+            state.terminal_review.attempts = state.terminal_review.attempts.max(attempt_no);
+            state.terminal_review.consecutive_failures =
+                state.terminal_review.consecutive_failures.saturating_add(1);
+            state.terminal_review.outcome = Some(ReviewOutcome::Failed { failure });
+            state
+                .parked_effects
+                .insert(effect_id.clone(), ParkedEffect::TerminalReview);
+        }
+    }
 }
 
 fn merge_runtime_configuration(
@@ -519,6 +620,78 @@ fn merge_failure_configuration(
         mode_confirmation: merged.mode_confirmation,
     };
     failure
+}
+
+fn role_request_matches_task(
+    state: &MissionState,
+    namespace: super::TaskNamespace,
+    task_id: &TaskId,
+    role: &RoleName,
+    output: OutputSemantics,
+) -> bool {
+    match namespace {
+        super::TaskNamespace::Planning => state
+            .config
+            .planning
+            .tasks
+            .iter()
+            .find(|task| &task.id == task_id)
+            .is_some_and(|task| {
+                &task.role == role
+                    && matches!(
+                        output,
+                        OutputSemantics::ProducesReport | OutputSemantics::ProposesPlan
+                    )
+            }),
+        super::TaskNamespace::Execution => state
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.tasks.iter().find(|task| &task.id == task_id))
+            .is_some_and(|task| {
+                task.role.as_ref() == Some(role) && output.execution_task_kind() == Some(task.kind)
+            }),
+    }
+}
+
+fn apply_role_failure(
+    state: &mut MissionState,
+    task: TaskAddress,
+    attempt_no: u32,
+    effect_id: &super::EffectId,
+    failure: TypedFailure,
+    observed_configuration: Option<&RuntimeConfigurationEvidence>,
+    final_response: Option<&PayloadRef>,
+) {
+    let failure = merge_failure_configuration(&failure, observed_configuration);
+    let max_attempts = state.config.recovery.max_attempts;
+    let should_park =
+        if let Some(runtime) = state.tasks_in_mut(task.namespace).get_mut(&task.task_id) {
+            runtime.attempts = runtime.attempts.max(attempt_no);
+            runtime.status = TaskStatus::Failed;
+            runtime.last_failure = Some(failure.clone());
+            let evidence = failure.evidence();
+            runtime.final_response = final_response.cloned().or_else(|| {
+                (!evidence.final_response.is_empty())
+                    .then(|| PayloadRef::inline(evidence.final_response.clone()))
+            });
+            runtime.last_runtime_configuration = Some(merge_runtime_configuration(
+                runtime.last_runtime_configuration.as_ref(),
+                &evidence.configuration,
+            ));
+            runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
+            !failure.automatically_retryable() || runtime.consecutive_failures >= max_attempts
+        } else {
+            false
+        };
+    if should_park {
+        state.parked_effects.insert(
+            effect_id.clone(),
+            ParkedEffect::RoleRun {
+                namespace: task.namespace,
+                task_id: task.task_id,
+            },
+        );
+    }
 }
 
 fn prune_reopened_parked_effects(state: &mut MissionState) {
@@ -577,7 +750,10 @@ fn derive_promotion(state: &mut MissionState) {
             task.status = TaskStatus::Superseded;
         }
         state.acknowledged_gates.remove(&task_id);
-        state.flagged_nodes.remove(&task_id);
+        state.flagged_tasks.remove(&TaskAddress::new(
+            crate::TaskNamespace::Execution,
+            task_id.clone(),
+        ));
         for assertion in state.contract.values_mut() {
             if assertion.last_advisory.remove(&task_id).is_some() {
                 assertion.advisory = recompute_advisory(&assertion.last_advisory);
@@ -694,6 +870,7 @@ fn apply_decision(
     let Some(item) = state.open_attention.get(attention_id).cloned() else {
         return; // unknown or already-resolved item
     };
+    let active_namespace = state.active_task_namespace();
     // Planning and execution ids live in separate maps. The active era owns
     // every node decision, even when both maps contain the same id.
     let node_status = |state: &mut MissionState, task_id, status| {
@@ -719,7 +896,9 @@ fn apply_decision(
                 if let Some(task) = state.active_tasks_mut().get_mut(task_id) {
                     task.consecutive_failures = 0;
                 }
-                state.flagged_nodes.remove(task_id);
+                state
+                    .flagged_tasks
+                    .remove(&TaskAddress::new(active_namespace, task_id.clone()));
             }
         }
         (DecisionAction::Accept, AttentionKind::NodeFailed) => {
@@ -732,7 +911,9 @@ fn apply_decision(
         }
         (DecisionAction::Accept, AttentionKind::NodeAttention) => {
             if let Some(task_id) = &item.task_id {
-                state.flagged_nodes.remove(task_id);
+                state
+                    .flagged_tasks
+                    .remove(&TaskAddress::new(active_namespace, task_id.clone()));
             }
         }
         (DecisionAction::Approve, AttentionKind::GateCheckpoint)
@@ -878,7 +1059,10 @@ fn start_replanning(state: &mut MissionState) {
         task.last_failure = None;
         task.consecutive_failures = 0;
         task.feedback.clear();
-        state.flagged_nodes.remove(id);
+        state.flagged_tasks.remove(&TaskAddress::new(
+            crate::TaskNamespace::Planning,
+            id.clone(),
+        ));
     }
 }
 
@@ -969,7 +1153,10 @@ fn derive_attention(state: &mut MissionState) {
                     None,
                     failure_report("planning task", task_id, rt),
                 );
-            } else if state.flagged_nodes.contains(task_id) {
+            } else if state.flagged_tasks.contains(&TaskAddress::new(
+                crate::TaskNamespace::Planning,
+                task_id.clone(),
+            )) {
                 raise(
                     AttentionKind::NodeAttention,
                     Some(task_id.clone()),
@@ -1097,7 +1284,10 @@ fn derive_attention(state: &mut MissionState) {
                         None,
                         failure_report("task", &task.id, &state.tasks[&task.id]),
                     );
-                } else if state.flagged_nodes.contains(&task.id) {
+                } else if state.flagged_tasks.contains(&TaskAddress::new(
+                    crate::TaskNamespace::Execution,
+                    task.id.clone(),
+                )) {
                     raise(
                         AttentionKind::NodeAttention,
                         Some(task.id.clone()),
@@ -1228,7 +1418,9 @@ fn apply_handoff(
             // node_attention item); a not-done task is Failed (derived into a
             // node_failed item).
             if *done && *request_attention {
-                state.flagged_nodes.insert(task_id.clone());
+                state
+                    .flagged_tasks
+                    .insert(TaskAddress::new(namespace, task_id.clone()));
             }
         }
         Handoff::Plan {
@@ -1245,9 +1437,6 @@ fn apply_handoff(
             } else {
                 TaskStatus::Failed
             };
-            if namespace != crate::TaskNamespace::Planning {
-                return;
-            }
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
@@ -1269,7 +1458,10 @@ fn apply_handoff(
                     }
                 }
                 if *request_attention {
-                    state.flagged_nodes.insert(task_id.clone());
+                    state.flagged_tasks.insert(TaskAddress::new(
+                        crate::TaskNamespace::Planning,
+                        task_id.clone(),
+                    ));
                 }
             }
         }
@@ -1281,9 +1473,6 @@ fn apply_handoff(
         } => {
             // Execution-only: validators always clear — they ran; their verdicts
             // are data folded into the contract.
-            if namespace != crate::TaskNamespace::Execution {
-                return;
-            }
             if let Some(task) = state.tasks.get_mut(task_id) {
                 task.status = TaskStatus::Cleared;
                 task.last_report = Some(report.clone());
@@ -1300,18 +1489,14 @@ fn apply_handoff(
                 }
             }
             if *request_attention {
-                state.flagged_nodes.insert(task_id.clone());
+                state.flagged_tasks.insert(TaskAddress::new(
+                    crate::TaskNamespace::Execution,
+                    task_id.clone(),
+                ));
             }
         }
-        // Terminal reviews are recorded as dedicated terminal-review events;
-        // a plan task can never consume this handoff contract. A hostile log
-        // that claims otherwise fails the task instead of leaving it running
-        // forever with no inflight effect.
-        Handoff::Review { .. } => {
-            if let Some(task) = state.tasks.get_mut(task_id) {
-                task.status = TaskStatus::Failed;
-            }
-        }
+        // Rejected by `handoff_matches_namespace` before this function.
+        Handoff::Review { .. } => {}
     }
 }
 
@@ -1393,7 +1578,7 @@ pub(crate) fn terminal_review_outstanding(state: &MissionState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::super::event::{
         ArtifactOutcome, MissionConfig, OracleRunSuccess, PayloadRef, RoleRunSuccess,
@@ -1429,7 +1614,84 @@ mod tests {
 
     /// Fold hand-built events with sequence numbers assigned by position.
     fn fold_log(events: Vec<MissionEvent>) -> Option<MissionState> {
-        let events = events.into_iter().flat_map(|event| {
+        let mut known_tasks = BTreeSet::new();
+        let mut requested_effects = BTreeSet::new();
+        let mut valid_log = Vec::new();
+        for event in events {
+            match &event {
+                MissionEvent::MissionCreated { config, .. } => {
+                    known_tasks.extend(config.planning.tasks.iter().map(|task| {
+                        TaskAddress::new(crate::TaskNamespace::Planning, task.id.clone())
+                    }));
+                }
+                MissionEvent::PlanProposed { proposal, .. } => {
+                    known_tasks.retain(|task| task.namespace == crate::TaskNamespace::Planning);
+                    known_tasks.extend(proposal.plan.tasks.iter().filter_map(|task| {
+                        task.role.as_ref().map(|_| {
+                            TaskAddress::new(crate::TaskNamespace::Execution, task.id.clone())
+                        })
+                    }));
+                }
+                _ => {}
+            }
+            if let MissionEvent::RoleRunRequested { effect_id, .. } = &event {
+                requested_effects.insert(effect_id.clone());
+            }
+            if let MissionEvent::RoleRunCompleted {
+                namespace,
+                task_id,
+                attempt_no,
+                effect_id,
+                outcome: Ok(success),
+            } = &event
+            {
+                if known_tasks.contains(&TaskAddress::new(*namespace, task_id.clone()))
+                    && requested_effects.insert(effect_id.clone())
+                {
+                    let (role, output) = match &success.handoff {
+                        Handoff::Work { .. } if *namespace == crate::TaskNamespace::Planning => (
+                            RoleName::new("planner").expect("role name"),
+                            OutputSemantics::ProducesReport,
+                        ),
+                        Handoff::Work { .. } => (
+                            RoleName::new("implementer").expect("role name"),
+                            OutputSemantics::ProducesArtifact,
+                        ),
+                        Handoff::Validate { .. } => (
+                            RoleName::new("reviewer").expect("role name"),
+                            OutputSemantics::EmitsVerdict,
+                        ),
+                        Handoff::Plan { .. } => (
+                            RoleName::new("planner").expect("role name"),
+                            OutputSemantics::ProposesPlan,
+                        ),
+                        Handoff::Review { .. } => (
+                            RoleName::new("implementer").expect("role name"),
+                            OutputSemantics::ProducesArtifact,
+                        ),
+                    };
+                    valid_log.push(MissionEvent::RoleRunRequested {
+                        namespace: *namespace,
+                        task_id: task_id.clone(),
+                        attempt_no: *attempt_no,
+                        effect_id: effect_id.clone(),
+                        role,
+                        output,
+                        runtime: "codex".into(),
+                        prompt: PayloadRef::inline("prompt"),
+                        base_sha: "base".into(),
+                        assignment_epoch: 1,
+                        recreate_workspace: true,
+                        requested_at_ms: 0,
+                        not_before_ms: 0,
+                        deadline_ms: 100_000,
+                        budget_deadline_ms: 100_000,
+                    });
+                }
+            }
+            valid_log.push(event);
+        }
+        let events = valid_log.into_iter().flat_map(|event| {
             let approve = matches!(&event, MissionEvent::PlanProposed { .. }).then(|| {
                 decision(
                     "plan_proposal:mission",
@@ -1549,20 +1811,39 @@ mod tests {
     }
 
     fn role_requested(task: &str, key: &str) -> MissionEvent {
-        role_requested_in(crate::TaskNamespace::Execution, task, key)
+        role_requested_in(
+            crate::TaskNamespace::Execution,
+            task,
+            key,
+            RoleName::new("implementer").expect("role name"),
+            OutputSemantics::ProducesArtifact,
+        )
     }
 
-    fn planning_role_requested(task: &str, key: &str) -> MissionEvent {
-        role_requested_in(crate::TaskNamespace::Planning, task, key)
+    fn planning_role_requested(task: &str, key: &str, output: OutputSemantics) -> MissionEvent {
+        role_requested_in(
+            crate::TaskNamespace::Planning,
+            task,
+            key,
+            RoleName::new("planner").expect("role name"),
+            output,
+        )
     }
 
-    fn role_requested_in(namespace: crate::TaskNamespace, task: &str, key: &str) -> MissionEvent {
+    fn role_requested_in(
+        namespace: crate::TaskNamespace,
+        task: &str,
+        key: &str,
+        role: RoleName,
+        output: OutputSemantics,
+    ) -> MissionEvent {
         MissionEvent::RoleRunRequested {
             namespace,
             task_id: tid(task),
             attempt_no: 1,
             effect_id: EffectId::for_parts(&["test", key]),
-            role: RoleName::new("implementer").expect("role name"),
+            role,
+            output,
             runtime: "codex".into(),
             prompt: PayloadRef::inline("prompt"),
             base_sha: "base".into(),
@@ -1744,6 +2025,7 @@ mod tests {
                 attempt_no: 2,
                 effect_id: second_effect.clone(),
                 role: RoleName::new("implementer").unwrap(),
+                output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".into(),
                 prompt: PayloadRef::inline("moved-base prompt"),
                 base_sha: "moved".into(),
@@ -2428,7 +2710,7 @@ mod tests {
         });
         let state = fold_log(vec![
             created,
-            planning_role_requested("same-id", "planning"),
+            planning_role_requested("same-id", "planning", OutputSemantics::ProducesReport),
             planning_role_completed("same-id", "planning", work_handoff(true, false), None),
             plan_proposed(vec![], vec![work_task("same-id")]),
             role_requested("same-id", "execution"),
@@ -2489,7 +2771,7 @@ mod tests {
             ),
             role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
             decision("gate_failed:g", super::super::event::DecisionAction::Revise),
-            planning_role_requested("same-id", "planning"),
+            planning_role_requested("same-id", "planning", OutputSemantics::ProposesPlan),
             planning_role_completed(
                 "same-id",
                 "planning",
@@ -2540,7 +2822,11 @@ mod tests {
             ),
             role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
             decision("gate_failed:g", super::super::event::DecisionAction::Revise),
-            planning_role_requested("same-id", "planning-failure"),
+            planning_role_requested(
+                "same-id",
+                "planning-failure",
+                OutputSemantics::ProducesReport,
+            ),
             MissionEvent::RoleRunCompleted {
                 namespace: crate::TaskNamespace::Planning,
                 task_id: tid("same-id"),
@@ -2569,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn role_handoffs_cannot_cross_task_namespaces() {
+    fn role_handoffs_must_match_the_request_output_contract() {
         let mut mission_created = created();
         let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
             unreachable!("created() builds MissionCreated");
@@ -2587,9 +2873,11 @@ mod tests {
         };
         let state = fold_log(vec![
             mission_created,
+            plan_proposed(vec![], vec![work_task("work")]),
+            role_requested("work", "wrong-namespace"),
             MissionEvent::RoleRunCompleted {
                 namespace: crate::TaskNamespace::Execution,
-                task_id: tid("author"),
+                task_id: tid("work"),
                 attempt_no: 1,
                 effect_id: EffectId::for_parts(&["test", "wrong-namespace"]),
                 outcome: Ok(RoleRunSuccess {
@@ -2599,7 +2887,10 @@ mod tests {
                         proposal: Some(proposal),
                         request_attention: false,
                     },
-                    artifact: None,
+                    artifact: Some(ArtifactOutcome {
+                        base_sha: "base".into(),
+                        head_sha: "must-not-promote".into(),
+                    }),
                     final_response: PayloadRef::inline("plan"),
                     runtime_configuration: RuntimeConfigurationEvidence::default(),
                 }),
@@ -2612,6 +2903,189 @@ mod tests {
             TaskStatus::Pending
         );
         assert!(state.proposal.is_none());
+        assert_eq!(state.tasks[&tid("work")].status, TaskStatus::Failed);
+        assert!(matches!(
+            state.tasks[&tid("work")].last_failure,
+            Some(TypedFailure::InvalidOutput { .. })
+        ));
+        assert_eq!(state.current_sha, "base");
+        assert!(state.inflight.is_empty());
+    }
+
+    #[test]
+    fn role_completion_must_match_the_exact_inflight_identity() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("original"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "plan".into(),
+            depends_on: vec![],
+        });
+        let base = vec![
+            mission_created,
+            plan_proposed(vec![], vec![work_task("original"), work_task("claimed")]),
+            role_requested("original", "identity"),
+        ];
+        let mismatches = [
+            (crate::TaskNamespace::Planning, "original", 1),
+            (crate::TaskNamespace::Execution, "claimed", 1),
+            (crate::TaskNamespace::Execution, "original", 2),
+        ];
+
+        for (namespace, task_id, attempt_no) in mismatches {
+            let mut events = base.clone();
+            events.push(MissionEvent::RoleRunCompleted {
+                namespace,
+                task_id: tid(task_id),
+                attempt_no,
+                effect_id: EffectId::for_parts(&["test", "identity"]),
+                outcome: Ok(RoleRunSuccess {
+                    handoff: work_handoff(true, false),
+                    artifact: None,
+                    final_response: PayloadRef::inline("wrong completion"),
+                    runtime_configuration: RuntimeConfigurationEvidence::default(),
+                }),
+            });
+            let state = fold_log(events).expect("state");
+            assert!(state.inflight.is_empty());
+            assert_eq!(state.tasks[&tid("original")].status, TaskStatus::Failed);
+            assert!(matches!(
+                state.tasks[&tid("original")].last_failure,
+                Some(TypedFailure::PermanentRuntime { .. })
+            ));
+            assert_eq!(state.tasks[&tid("claimed")].status, TaskStatus::Pending);
+            assert_eq!(
+                state.planning.tasks[&tid("original")].status,
+                TaskStatus::Pending
+            );
+            assert!(matches!(
+                state
+                    .parked_effects
+                    .get(&EffectId::for_parts(&["test", "identity"])),
+                Some(ParkedEffect::RoleRun {
+                    namespace: crate::TaskNamespace::Execution,
+                    task_id,
+                }) if task_id == &tid("original")
+            ));
+        }
+    }
+
+    #[test]
+    fn oracle_completion_identity_is_bound_to_its_request() {
+        let effect_id = EffectId::for_parts(&["test", "oracle-identity"]);
+        let state = fold_log(vec![
+            created(),
+            plan_proposed(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("work")],
+            ),
+            oracle_requested("TESTS-PASS", "base", "oracle-identity"),
+            MissionEvent::OracleRunCompleted {
+                assertion_ids: vec![aid("TESTS-PASS")],
+                oracle: oracle("different-oracle"),
+                judged_sha: "different-head".into(),
+                attempt_no: 2,
+                effect_id: effect_id.clone(),
+                outcome: Ok(OracleRunSuccess {
+                    exit_code: 0,
+                    exit_signal: None,
+                    stdout: PayloadRef::inline("out"),
+                    stderr: PayloadRef::inline("err"),
+                    prepared_inputs: Vec::new(),
+                    duration_ms: 1,
+                }),
+            },
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        assert!(matches!(
+            state.oracle_failures.get(&oracle("cargo-test")),
+            Some(TypedFailure::PermanentRuntime { .. })
+        ));
+        assert!(state.contract[&aid("TESTS-PASS")]
+            .last_authoritative
+            .is_none());
+        assert!(matches!(
+            state.parked_effects.get(&effect_id),
+            Some(ParkedEffect::OracleRun { oracle: parked })
+                if parked == &oracle("cargo-test")
+        ));
+    }
+
+    #[test]
+    fn planning_attention_cannot_leak_to_an_execution_task_with_the_same_id() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("same-id"),
+            role: RoleName::new("planner").expect("role name"),
+            body: "plan".into(),
+            depends_on: vec![],
+        });
+        let MissionEvent::PlanProposed { proposal, .. } =
+            plan_proposed(vec![], vec![work_task("same-id")])
+        else {
+            unreachable!("plan_proposed() builds PlanProposed");
+        };
+        let state = fold_log(vec![
+            mission_created,
+            planning_role_requested("same-id", "attention", OutputSemantics::ProposesPlan),
+            planning_role_completed(
+                "same-id",
+                "attention",
+                Handoff::Plan {
+                    done: true,
+                    report: PayloadRef::inline("plan"),
+                    proposal: Some(proposal),
+                    request_attention: true,
+                },
+                None,
+            ),
+            decision(
+                "plan_proposal:mission",
+                super::super::event::DecisionAction::Approve,
+            ),
+        ])
+        .expect("state");
+
+        assert_eq!(state.tasks[&tid("same-id")].status, TaskStatus::Pending);
+        assert!(!state.open_attention.contains_key("node_attention:same-id"));
+    }
+
+    #[test]
+    fn terminal_review_completion_identity_is_bound_to_its_request() {
+        let effect_id = EffectId::for_parts(&["test", "review-identity"]);
+        let observed = RuntimeConfigurationEvidence {
+            applied_model: Some("observed-model".into()),
+            ..Default::default()
+        };
+        let state = fold_log(vec![
+            created_with_review(),
+            review_requested(1, "review-identity", "base"),
+            MissionEvent::EffectRuntimeConfigured {
+                effect_id: effect_id.clone(),
+                configuration: observed.clone(),
+            },
+            review_completed_at(2, "review-identity", "different-head", true, vec![]),
+        ])
+        .expect("state");
+
+        assert!(state.inflight.is_empty());
+        let Some(ReviewOutcome::Failed { failure }) = state.terminal_review.outcome else {
+            panic!("mismatched review outcome must fail");
+        };
+        assert!(matches!(failure, TypedFailure::PermanentRuntime { .. }));
+        assert_eq!(failure.evidence().configuration, observed);
+        assert!(matches!(
+            state.parked_effects.get(&effect_id),
+            Some(ParkedEffect::TerminalReview)
+        ));
     }
 
     #[test]
@@ -2806,7 +3280,7 @@ mod tests {
         );
         // Later facts still fold; only the phase is pinned.
         assert_eq!(state.tasks[&tid("t1")].status, TaskStatus::Cleared);
-        assert_eq!(state.head, 4);
+        assert_eq!(state.head, 5);
     }
 
     #[test]
@@ -3365,7 +3839,7 @@ mod tests {
             super::super::event::DecisionAction::Retry,
         ));
         events.push(review_requested(2, "kr2", "h1"));
-        events.push(review_completed("kr2", "h1", true, vec![]));
+        events.push(review_completed_at(2, "kr2", "h1", true, vec![]));
         let state = fold_log(events).expect("state");
         assert_eq!(state.terminal_review.attempts, 2);
         assert!(matches!(

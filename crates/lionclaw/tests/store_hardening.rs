@@ -3,8 +3,10 @@
 
 mod common;
 
-use common::{default_config, effect_id, harness, BASE_SHA, HEAD_SHA};
-use lionclaw::model::{MissionEvent, PayloadRef, RoleName, TaskId};
+use common::{
+    approve_plan, default_config, effect_id, harness, proposal, simple_plan, BASE_SHA, HEAD_SHA,
+};
+use lionclaw::model::{MissionEvent, OutputSemantics, PayloadRef, RoleName, TaskId};
 use lionclaw::store::NewEvent;
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
 
@@ -27,6 +29,11 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
         )
         .await
         .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     let id = effect_id("unfinished");
     let state = h.engine.load_state(&mission_id).await.expect("state");
     h.engine
@@ -40,6 +47,7 @@ async fn unfinished_request_is_rebuilt_from_the_log_alone() {
                 attempt_no: 1,
                 effect_id: id.clone(),
                 role: RoleName::new("implementer").unwrap(),
+                output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".to_string(),
                 prompt: PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.to_string(),

@@ -36,12 +36,12 @@ pub mod verdict;
 
 pub use decision::{validate_decision, DecisionError};
 pub use event::{
-    ArtifactOutcome, BlobRef, ControlAction, DecisionAction, EffectEventClass, EffectResource,
-    EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff, MissionConfig, MissionEvent,
-    MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef, RecoveryConfig, RoleRunSuccess,
-    RuntimeConfigurationEvidence, StopBar, TaskNamespace, TerminalReviewConfig,
-    TerminalReviewSuccess, ValidationItem, VersionStamps, MAX_EXECUTION_DURATION_SECS,
-    SCHEMA_VERSION,
+    resolve_execution_deadline_ms, ArtifactOutcome, BlobRef, ControlAction, DecisionAction,
+    EffectEventClass, EffectResource, EventEnvelope, ExecutionPolicy, Gap, GapSeverity, Handoff,
+    MissionConfig, MissionEvent, MissionTypeRef, OracleRunSuccess, PayloadRef, PreparedInputRef,
+    RecoveryConfig, RoleRunSuccess, RuntimeConfigurationEvidence, StopBar, TaskNamespace,
+    TerminalReviewConfig, TerminalReviewSuccess, ValidationItem, VersionStamps,
+    MAX_EXECUTION_DURATION_SECS, SCHEMA_VERSION,
 };
 pub use failure::{
     bounded_text as bounded_failure_text, AppliedRuntimeConfiguration,
@@ -65,7 +65,8 @@ pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,
     FailureEvidence, FailureFeedback, InflightEffect, MissionPhase, MissionState, ParkedEffect,
     PlanningInput, PlanningRefinement, PlanningState, ReviewAcceptance, ReviewAcceptanceKind,
-    ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewState, TerminalReviewVerdict,
+    ReviewOutcome, TaskAddress, TaskRuntimeState, TaskStatus, TerminalReviewState,
+    TerminalReviewVerdict,
 };
 pub use step::{
     step, OracleDispatchIntent, RoleDispatchIntent, StepDecision, TerminalReviewDispatchIntent,

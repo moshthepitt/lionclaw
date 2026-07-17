@@ -77,6 +77,14 @@ pub struct RoleRunOutcome {
     pub final_response: String,
 }
 
+impl RoleRunOutcome {
+    pub(crate) fn projected(mut self) -> Self {
+        self.runtime_configuration = self.runtime_configuration.projected();
+        self.final_response = lionclaw_runtime_api::bounded_text(&self.final_response);
+        self
+    }
+}
+
 /// An engine-run, worker-independent, reproducible check. Exit 0 = pass.
 #[async_trait]
 pub trait OracleRunner: Send + Sync {

@@ -8,8 +8,8 @@ use common::{
 };
 use lionclaw::engine::MissionDisposition;
 use lionclaw::model::{
-    ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, PayloadRef, RoleRunSuccess,
-    RuntimeConfigurationEvidence, TaskId,
+    ArtifactOutcome, Handoff, MissionEvent, MissionPhase, OracleName, OutputSemantics, PayloadRef,
+    RoleRunSuccess, RuntimeConfigurationEvidence, TaskId,
 };
 use lionclaw::store::{AppendError, NewEvent};
 use lionclaw::testing::{MockOracleRunner, MockRoleRunner};
@@ -96,6 +96,7 @@ async fn inherited_role_request_is_interrupted_without_rerunning_the_llm() {
                 attempt_no: 1,
                 effect_id: id.clone(),
                 role: lionclaw::model::RoleName::new("implementer").expect("role"),
+                output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".to_string(),
                 prompt: lionclaw::model::PayloadRef::inline("prompt"),
                 base_sha: BASE_SHA.to_string(),
@@ -177,6 +178,7 @@ async fn inherited_oracle_request_is_interrupted_without_rerunning_the_oracle() 
                     attempt_no: 1,
                     effect_id: role_effect.clone(),
                     role: lionclaw::model::RoleName::new("implementer").expect("role"),
+                    output: OutputSemantics::ProducesArtifact,
                     runtime: "codex".to_string(),
                     prompt: PayloadRef::inline("prompt"),
                     base_sha: BASE_SHA.to_string(),
@@ -263,6 +265,11 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
         )
         .await
         .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
     let id = effect_id("rebuild-crash");
     let state = h.engine.load_state(&mission_id).await.expect("state");
     h.engine
@@ -276,6 +283,7 @@ async fn snapshot_rebuild_preserves_an_unfinished_request_for_recovery() {
                 attempt_no: 1,
                 effect_id: id.clone(),
                 role: lionclaw::model::RoleName::new("implementer").unwrap(),
+                output: OutputSemantics::ProducesArtifact,
                 runtime: "codex".to_string(),
                 prompt: lionclaw::model::PayloadRef::inline("p"),
                 base_sha: BASE_SHA.to_string(),

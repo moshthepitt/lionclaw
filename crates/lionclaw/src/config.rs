@@ -209,9 +209,13 @@ impl RuntimeProfileFile {
     fn apply(mut self, name: String, user_home: Option<&Path>) -> Result<MissionRuntimeProfile> {
         self.driver = required_trimmed("driver", self.driver)?;
         self.command = required_trimmed("command", self.command)?;
+        self.model = self
+            .model
+            .map(|value| runtime_selection("model", value))
+            .transpose()?;
         self.mode = self
             .mode
-            .map(|value| required_trimmed("mode", value))
+            .map(|value| runtime_selection("mode", value))
             .transpose()?;
         let auth = self
             .auth
@@ -295,6 +299,17 @@ fn required_trimmed(label: &str, value: String) -> Result<String> {
         return Err(anyhow!("runtime {label} is required"));
     }
     Ok(trimmed.to_string())
+}
+
+fn runtime_selection(label: &str, value: String) -> Result<String> {
+    let value = required_trimmed(label, value)?;
+    if value.len() > lionclaw_runtime_api::FAILURE_TEXT_LIMIT {
+        return Err(anyhow!(
+            "runtime {label} exceeds the {} byte evidence limit",
+            lionclaw_runtime_api::FAILURE_TEXT_LIMIT
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_runtime_name(name: &str) -> Result<()> {
@@ -412,6 +427,36 @@ mod tests {
             profiles.get("example").unwrap().mode.as_deref(),
             Some("autonomous")
         );
+    }
+
+    #[test]
+    fn requested_runtime_selections_must_fit_the_evidence_contract() {
+        let oversized = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+        for field in ["model", "mode"] {
+            let error = RuntimeProfiles::from_toml(
+                &format!(
+                    "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\n{field} = \"{oversized}\"\n"
+                ),
+                Path::new("/home/alice"),
+            )
+            .expect_err("oversized selection must fail at profile load");
+            assert!(
+                error.to_string().contains(field),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        let maximum = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+        let profiles = RuntimeProfiles::from_toml(
+            &format!(
+                "[runtimes.example]\ndriver = \"acp\"\ncommand = \"example\"\nmodel = \"{maximum}\"\nmode = \"{maximum}\"\n"
+            ),
+            Path::new("/home/alice"),
+        )
+        .expect("exact evidence boundary is representable");
+        let profile = profiles.get("example").unwrap();
+        assert_eq!(profile.model.as_deref(), Some(maximum.as_str()));
+        assert_eq!(profile.mode.as_deref(), Some(maximum.as_str()));
     }
 
     #[test]

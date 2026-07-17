@@ -127,17 +127,7 @@ fn parse_handoff(raw: &str, output: OutputSemantics) -> Result<Handoff, TypedFai
         }
     }
     // The schema string and the payload tag must agree with the role's output.
-    let tag_ok = matches!(
-        (&handoff, output),
-        (Handoff::Validate { .. }, OutputSemantics::EmitsVerdict)
-            | (Handoff::Review { .. }, OutputSemantics::EmitsGapVerdict)
-            | (Handoff::Plan { .. }, OutputSemantics::ProposesPlan)
-            | (
-                Handoff::Work { .. },
-                OutputSemantics::ProducesReport | OutputSemantics::ProducesArtifact
-            )
-    );
-    if !tag_ok {
+    if !handoff.matches_output(output) {
         return Err(invalid(format!(
             "handoff type does not match this role's output semantics ({output:?})"
         )));

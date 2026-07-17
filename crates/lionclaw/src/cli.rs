@@ -3133,6 +3133,23 @@ mod tests {
                 action: DecisionAction::Approve,
                 justification: "test fixture approves the plan".into(),
             },
+            MissionEvent::RoleRunRequested {
+                namespace: TaskNamespace::Execution,
+                task_id: TaskId::new("fix").unwrap(),
+                attempt_no: 1,
+                effect_id: EffectId::for_parts(&["test", "k1"]),
+                role: RoleName::new("implementer").unwrap(),
+                output: OutputSemantics::ProducesArtifact,
+                runtime: "codex".into(),
+                prompt: PayloadRef::inline("prompt"),
+                base_sha: "base".into(),
+                assignment_epoch: 1,
+                recreate_workspace: true,
+                requested_at_ms: 0,
+                not_before_ms: 0,
+                deadline_ms: 100_000,
+                budget_deadline_ms: 100_000,
+            },
             MissionEvent::RoleRunCompleted {
                 namespace: crate::model::TaskNamespace::Execution,
                 task_id: TaskId::new("fix").unwrap(),
@@ -3153,7 +3170,47 @@ mod tests {
                 }),
             },
         ];
-        events.extend(tail);
+        for event in tail {
+            match &event {
+                MissionEvent::OracleRunCompleted {
+                    assertion_ids,
+                    oracle,
+                    judged_sha,
+                    attempt_no,
+                    effect_id,
+                    ..
+                } => events.push(MissionEvent::OracleRunRequested {
+                    assertion_ids: assertion_ids.clone(),
+                    oracle: oracle.clone(),
+                    judged_sha: judged_sha.clone(),
+                    attempt_no: *attempt_no,
+                    effect_id: effect_id.clone(),
+                    requested_at_ms: 0,
+                    not_before_ms: 0,
+                    deadline_ms: 100_000,
+                }),
+                MissionEvent::TerminalReviewCompleted {
+                    attempt_no,
+                    effect_id,
+                    judged_sha,
+                    ..
+                } => events.push(MissionEvent::TerminalReviewRequested {
+                    attempt_no: *attempt_no,
+                    effect_id: effect_id.clone(),
+                    role: RoleName::new("gap-reviewer").unwrap(),
+                    runtime: "codex".into(),
+                    prompt: PayloadRef::inline("review prompt"),
+                    judged_sha: judged_sha.clone(),
+                    nonce: "test-nonce".into(),
+                    requested_at_ms: 0,
+                    not_before_ms: 0,
+                    deadline_ms: 100_000,
+                    budget_deadline_ms: 100_000,
+                }),
+                _ => {}
+            }
+            events.push(event);
+        }
         fold(
             events
                 .into_iter()

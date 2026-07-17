@@ -80,6 +80,65 @@ async fn invalid_handoff_is_reworked_automatically_with_exact_feedback() {
 }
 
 #[tokio::test]
+async fn wrong_handoff_schema_is_recorded_as_invalid_and_reworked() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let captured = prompts.clone();
+    let calls = Arc::new(Mutex::new(0_u32));
+    let seen = calls.clone();
+    let runner = MockRoleRunner::new(Box::new(move |request| {
+        captured.lock().unwrap().push(request.prompt.clone());
+        let mut count = seen.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            return Ok(RoleRunOutcome {
+                handoff: Handoff::Validate {
+                    done: true,
+                    report: PayloadRef::inline("wrong schema"),
+                    items: vec![],
+                    passed: true,
+                    request_attention: false,
+                },
+                artifact: Some(ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: HEAD_SHA.to_string(),
+                }),
+                runtime_configuration: Default::default(),
+                final_response: "wrong schema response".into(),
+            });
+        }
+        Ok(completed_work(&request.base_sha))
+    }));
+    let h = harness(dir.path(), runner, MockOracleRunner::exiting(0)).await;
+    let id = h
+        .engine
+        .create_mission("/repo", "recover wrong schema", BASE_SHA, default_config())
+        .await
+        .unwrap();
+    h.engine
+        .propose_plan(&id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&h.engine, &id).await;
+
+    let outcome = h.engine.advance(&id).await.unwrap();
+    assert_eq!(outcome.disposition, MissionDisposition::Terminal);
+    {
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("does not match the effect output contract"));
+    }
+    let events = h.engine.store().load(&id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        lionclaw::model::MissionEvent::RoleRunCompleted {
+            outcome: Err(TypedFailure::InvalidOutput { .. }),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn transient_runtime_failure_retries_but_launch_failure_parks_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let attempts = Arc::new(Mutex::new(0_u32));
