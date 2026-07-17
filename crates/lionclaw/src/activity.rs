@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rustix::fs::{open, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{InflightEffect, MissionState};
+use crate::model::{InflightEffect, MissionState, TaskId, TaskKind, TaskNamespace};
 
 const MAX_EFFECTS: usize = 32;
 const MAX_TEXT: usize = 4 * 1024;
@@ -218,7 +218,9 @@ pub async fn publish_observed(
         .iter()
         .take(MAX_EFFECTS)
         .filter_map(|(effect_id, effect)| match effect {
-            InflightEffect::RoleRun { task_id, .. } => Some((
+            InflightEffect::RoleRun {
+                namespace, task_id, ..
+            } if task_workspace_applicable(state, *namespace, task_id) => Some((
                 effect_id.clone(),
                 workspace_root.to_path_buf(),
                 mission_dir
@@ -234,7 +236,9 @@ pub async fn publish_observed(
                     .get(task_id)
                     .and_then(|task| task.workspace_base_sha.clone()),
             )),
-            InflightEffect::OracleRun { .. } | InflightEffect::TerminalReview { .. } => None,
+            InflightEffect::RoleRun { .. }
+            | InflightEffect::OracleRun { .. }
+            | InflightEffect::TerminalReview { .. } => None,
         })
         .collect();
     let workspace_observations = observe_workspaces(workspace_requests).await;
@@ -495,9 +499,16 @@ pub async fn task_workspace_observations(
     lionclaw_dir: &Path,
     state: &MissionState,
 ) -> std::collections::BTreeMap<crate::model::TaskId, WorkspaceObservation> {
+    let mut observations = state
+        .tasks
+        .keys()
+        .cloned()
+        .map(|task_id| (task_id, WorkspaceObservation::NotApplicable))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let requests = state
         .tasks
         .iter()
+        .filter(|(task_id, _)| task_workspace_applicable(state, TaskNamespace::Execution, task_id))
         .map(|(task_id, task)| {
             (
                 task_id.clone(),
@@ -521,7 +532,21 @@ pub async fn task_workspace_observations(
             )
         })
         .collect();
-    observe_workspaces(requests).await
+    observations.extend(observe_workspaces(requests).await);
+    observations
+}
+
+fn task_workspace_applicable(
+    state: &MissionState,
+    namespace: TaskNamespace,
+    task_id: &TaskId,
+) -> bool {
+    namespace == TaskNamespace::Execution
+        && state.plan.as_ref().is_some_and(|plan| {
+            plan.tasks
+                .iter()
+                .any(|task| task.id == *task_id && task.kind == TaskKind::Work)
+        })
 }
 
 async fn observe_workspaces<K>(
@@ -727,6 +752,89 @@ mod tests {
         assert!(matches!(
             observation,
             WorkspaceObservation::Unavailable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_execution_work_tasks_have_task_workspace_observations() {
+        use crate::model::{
+            DecisionAction, EventEnvelope, MissionConfig, MissionEvent, MissionId, MissionTypeRef,
+            Plan, PlanProposal, RoleName, Task, TaskId, TaskKind, TaskNamespace, VersionStamps,
+        };
+
+        let mission_id = MissionId::parse("mabc123abc123").unwrap();
+        let task = |id: &str, kind: TaskKind, role: Option<&str>| Task {
+            id: TaskId::new(id).unwrap(),
+            kind,
+            body: "test".into(),
+            targets: vec![],
+            role: role.map(|role| RoleName::new(role).unwrap()),
+            depends_on: vec![],
+        };
+        let events = vec![
+            MissionEvent::MissionCreated {
+                objective: "observe workspace applicability".into(),
+                mission_type: MissionTypeRef {
+                    name: "test".into(),
+                    digest: "digest".into(),
+                },
+                runtime: "codex".into(),
+                image_id: "image".into(),
+                workspace_dir: "/workspace".into(),
+                base_sha: "base".into(),
+                config: MissionConfig::default(),
+            },
+            MissionEvent::PlanProposed {
+                proposal: PlanProposal {
+                    base_revision: 0,
+                    plan: Plan {
+                        requirements: vec![],
+                        assertions: vec![],
+                        tasks: vec![
+                            task("work", TaskKind::Work, Some("worker")),
+                            task("validate", TaskKind::Validate, Some("validator")),
+                            task("gate", TaskKind::Gate, None),
+                        ],
+                    },
+                },
+                plan_hash: "hash".into(),
+            },
+            MissionEvent::DecisionRecorded {
+                attention_id: "plan_proposal:mission".into(),
+                action: DecisionAction::Approve,
+                justification: "approve".into(),
+            },
+        ];
+        let state = crate::model::fold(events.into_iter().enumerate().map(|(index, event)| {
+            EventEnvelope {
+                mission_id: mission_id.clone(),
+                sequence_no: index as u64,
+                recorded_at_ms: 0,
+                stamps: VersionStamps::default(),
+                event,
+            }
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let observations =
+            task_workspace_observations(&temp.path().join(".lionclaw"), &state).await;
+
+        assert_eq!(
+            observations[&TaskId::new("work").unwrap()],
+            WorkspaceObservation::NotCreated
+        );
+        assert_eq!(
+            observations[&TaskId::new("validate").unwrap()],
+            WorkspaceObservation::NotApplicable
+        );
+        assert_eq!(
+            observations[&TaskId::new("gate").unwrap()],
+            WorkspaceObservation::NotApplicable
+        );
+        assert!(!task_workspace_applicable(
+            &state,
+            TaskNamespace::Planning,
+            &TaskId::new("work").unwrap()
         ));
     }
 
