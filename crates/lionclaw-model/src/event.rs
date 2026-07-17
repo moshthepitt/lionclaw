@@ -783,12 +783,17 @@ mod compat_tests {
 
     #[test]
     fn execution_policy_rejects_the_first_unrepresentable_duration() {
-        let mut policy = ExecutionPolicy::default();
-        policy.max_task_time_secs = super::MAX_EXECUTION_DURATION_SECS + 1;
-        assert!(policy.validate().is_err());
+        let invalid = ExecutionPolicy {
+            max_task_time_secs: super::MAX_EXECUTION_DURATION_SECS + 1,
+            ..ExecutionPolicy::default()
+        };
+        assert!(invalid.validate().is_err());
 
-        policy.max_task_time_secs = super::MAX_EXECUTION_DURATION_SECS;
-        assert!(policy.validate().is_ok());
+        let maximum = ExecutionPolicy {
+            max_task_time_secs: super::MAX_EXECUTION_DURATION_SECS,
+            ..ExecutionPolicy::default()
+        };
+        assert!(maximum.validate().is_ok());
     }
 
     #[test]
