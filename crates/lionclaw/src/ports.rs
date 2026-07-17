@@ -68,10 +68,10 @@ pub enum RoleRunUpdate {
 #[derive(Debug, Clone)]
 pub struct RoleRunOutcome {
     pub handoff: Handoff,
-    /// Engine-observed commits (never agent-claimed); `Some` for every
-    /// artifact-producing role, even one that committed nothing — then
-    /// `head_sha == base_sha`. Readers/judges/planners are never captured, so
-    /// this is `None` for them.
+    /// Engine-observed commits (never agent-claimed). Writers return `Some`
+    /// only when a clean committed head was captured; work that was already
+    /// satisfied may legitimately return `None`. Read-only roles never return
+    /// an artifact.
     pub artifact: Option<ArtifactOutcome>,
     pub runtime_configuration: RuntimeConfigurationEvidence,
     pub final_response: String,

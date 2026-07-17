@@ -94,7 +94,7 @@ where
 }
 
 struct ProgramBackedAttemptOutcome {
-    buffered_errors: Option<Vec<RuntimeEvent>>,
+    buffered_errors: Option<Vec<TurnEvent>>,
     output: ExecutionOutput,
     saw_done: bool,
     last_error_text: Option<String>,
@@ -102,7 +102,7 @@ struct ProgramBackedAttemptOutcome {
 }
 
 struct ProgramOutputObservation {
-    buffered_errors: Option<Vec<RuntimeEvent>>,
+    buffered_errors: Option<Vec<TurnEvent>>,
     saw_done: bool,
     last_error_text: Option<String>,
     final_response: String,
@@ -155,7 +155,7 @@ where
                         adapter,
                         &mut output_parser,
                         journal,
-                        &line,
+                        line.as_str(),
                         &mut observation,
                     ).await,
                     None => {
@@ -176,7 +176,7 @@ where
                         adapter,
                         &mut output_parser,
                         journal,
-                        &line,
+                        line.as_str(),
                         &mut observation,
                     ).await;
                 }
@@ -225,35 +225,36 @@ async fn observe_program_output_events(
     observation: &mut ProgramOutputObservation,
 ) {
     for event in parsed_events {
-        crate::event::observe_final_response(&mut observation.final_response, &event);
-        if matches!(event, RuntimeEvent::Done) {
+        let event = TurnEvent::canonical(event);
+        crate::event::observe_final_response(&mut observation.final_response, event.event());
+        if matches!(event.event(), RuntimeEvent::Done) {
             observation.saw_done = true;
         }
-        if let RuntimeEvent::Error { text, .. } = &event {
+        if let RuntimeEvent::Error { text, .. } = event.event() {
             observation.last_error_text = Some(text.clone());
         }
-        if matches!(event, RuntimeEvent::Error { .. }) {
+        if matches!(event.event(), RuntimeEvent::Error { .. }) {
             if let Some(buffer) = observation.buffered_errors.as_mut() {
                 if buffer.len() == crate::event::RUNTIME_TURN_JOURNAL_CAPACITY {
                     buffer.remove(0);
                 }
                 buffer.push(event);
             } else {
-                drop(journal.send(TurnEvent::canonical(event)).await);
+                drop(journal.send(event).await);
             }
         } else {
-            drop(journal.send(TurnEvent::canonical(event)).await);
+            drop(journal.send(event).await);
         }
     }
 }
 
 async fn flush_buffered_program_output_events(
     journal: &RuntimeTurnJournalSender,
-    buffered_errors: Option<Vec<RuntimeEvent>>,
+    buffered_errors: Option<Vec<TurnEvent>>,
 ) {
     if let Some(buffered_errors) = buffered_errors {
         for event in buffered_errors {
-            drop(journal.send(TurnEvent::canonical(event)).await);
+            drop(journal.send(event).await);
         }
     }
 }

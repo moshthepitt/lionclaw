@@ -2753,7 +2753,7 @@ mod tests {
         EffectId, OracleRunSuccess, PayloadRef, RuntimeConfigurationEvidence, TerminalReviewSuccess,
     };
     use lionclaw_runtime_api::{TypedFailure, TypedFailureEvidence};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[cfg(unix)]
     #[test]
@@ -3091,6 +3091,19 @@ mod tests {
                 workspace_dir: "/w".into(),
                 base_sha: "base".into(),
                 config: MissionConfig {
+                    plan_inventory: PlanInventory {
+                        roles: BTreeMap::from([
+                            (
+                                RoleName::new("implementer").unwrap(),
+                                OutputSemantics::ProducesArtifact,
+                            ),
+                            (
+                                RoleName::new("gap-reviewer").unwrap(),
+                                OutputSemantics::EmitsGapVerdict,
+                            ),
+                        ]),
+                        oracles: BTreeSet::from([OracleName::new("cargo-test").unwrap()]),
+                    },
                     recovery: RecoveryConfig { max_attempts: 1 },
                     execution: Default::default(),
                     terminal_review: Some(TerminalReviewConfig {
@@ -3103,7 +3116,14 @@ mod tests {
                 proposal: PlanProposal {
                     base_revision: 0,
                     plan: Plan {
-                        requirements: vec![],
+                        requirements: vec![Requirement {
+                            id: RequirementId::new("REQ-1").unwrap(),
+                            kind: RequirementKind::Capability,
+                            prose: "tests pass".into(),
+                            disposition: RequirementDisposition::Covered {
+                                assertion_ids: vec![AssertionId::new("TESTS-PASS").unwrap()],
+                            },
+                        }],
                         assertions: vec![Assertion {
                             id: AssertionId::new("TESTS-PASS").unwrap(),
                             prose: "tests pass".into(),

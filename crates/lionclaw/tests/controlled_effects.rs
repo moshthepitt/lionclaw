@@ -42,6 +42,8 @@ struct ControlledRunner {
 
 struct SleepingRunner;
 
+struct ArtifactlessWriter;
+
 struct DeadlineRunner {
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -178,6 +180,30 @@ impl RoleRunner for SleepingRunner {
             }),
             runtime_configuration: Default::default(),
             final_response: String::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl RoleRunner for ArtifactlessWriter {
+    async fn run(&self, request: RoleRunRequest) -> Result<RoleRunOutcome, TypedFailure> {
+        request
+            .updates
+            .send(lionclaw::ports::RoleRunUpdate::WorkspacePrepared {
+                base_sha: request.base_sha,
+                assignment_epoch: request.assignment_epoch,
+            })
+            .await
+            .unwrap();
+        Ok(RoleRunOutcome {
+            handoff: Handoff::Work {
+                done: true,
+                report: PayloadRef::inline("the requested work was already satisfied"),
+                request_attention: false,
+            },
+            artifact: None,
+            runtime_configuration: Default::default(),
+            final_response: "no repository change was needed".into(),
         })
     }
 }
@@ -874,6 +900,58 @@ async fn policy_auto_continues_candidate_and_proof_with_recorded_controls() {
 
     let finished = engine.advance(&mission_id).await.unwrap();
     assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    let automatic = store
+        .load(&mission_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                lionclaw::model::MissionEvent::ControlRequested {
+                    action: ControlAction::Continue { automatic: true },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(automatic, 2);
+}
+
+#[tokio::test]
+async fn policy_auto_continues_an_artifactless_writer_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MissionStore::open(dir.path()).await.unwrap();
+    let engine = Engine::new(
+        store.clone(),
+        test_mission_type(),
+        "codex".into(),
+        "test-image".into(),
+        EngineServices::new(
+            Arc::new(ArtifactlessWriter),
+            Arc::new(MockOracleRunner::exiting(0)),
+            Arc::new(NoopEffectCleaner),
+            Arc::new(MockClock::default()),
+        ),
+    );
+    let mission_id = engine
+        .create_mission(
+            dir.path().to_str().unwrap(),
+            "continue a writer that needed no repository change",
+            BASE_SHA,
+        )
+        .await
+        .unwrap();
+    engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .unwrap();
+    approve_plan(&engine, &mission_id).await;
+
+    let finished = engine.advance(&mission_id).await.unwrap();
+
+    assert_eq!(finished.disposition, MissionDisposition::Terminal);
+    assert_eq!(finished.state.deliverable_head(), BASE_SHA);
     let automatic = store
         .load(&mission_id)
         .await

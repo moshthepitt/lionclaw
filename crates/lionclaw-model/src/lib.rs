@@ -55,12 +55,12 @@ pub use ids::{
     RoleName, TaskId, TERMINAL_REVIEW_TASK_TAG,
 };
 pub use plan::{
-    Assertion, OutputSemantics, Plan, PlanProposal, PlanningDag, PlanningTask, Requirement,
-    RequirementDisposition, RequirementKind, Task, TaskKind,
+    Assertion, OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningDag, PlanningTask,
+    Requirement, RequirementDisposition, RequirementKind, Task, TaskKind,
 };
 pub use plan_validation::{
-    validate_plan, validate_plan_proposal, validate_planning_dag, MissionTypeInventory,
-    PlanValidationError, ProposalError, MAX_TASK_DEPENDENCIES,
+    validate_plan, validate_plan_proposal, validate_planning_dag, PlanValidationError,
+    ProposalError, MAX_TASK_DEPENDENCIES,
 };
 pub use state::{
     AdvisoryStatus, AssertionState, AttentionItem, AttentionKind, EffectCleanupFailure,

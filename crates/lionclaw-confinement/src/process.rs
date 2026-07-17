@@ -4,10 +4,10 @@ use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::mpsc,
 };
 
 pub use lionclaw_runtime_api::ExecutionOutput as ProcessOutput;
+use lionclaw_runtime_api::{RuntimeProgramStdoutLine, RuntimeProgramStdoutSender};
 
 pub const PROCESS_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 pub const PROCESS_LINE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -73,7 +73,7 @@ impl fmt::Debug for ProcessInvocation {
 
 pub async fn run_process_streaming(
     invocation: &ProcessInvocation,
-    stream: Option<&mpsc::Sender<String>>,
+    stream: Option<&RuntimeProgramStdoutSender>,
 ) -> Result<ProcessOutput> {
     let mut command = Command::new(&invocation.executable);
     command.args(&invocation.args);
@@ -125,7 +125,7 @@ pub async fn run_process_streaming(
         };
         if let Some(stream) = stream {
             stream
-                .send(line)
+                .send(RuntimeProgramStdoutLine::new(line)?)
                 .await
                 .map_err(|_| anyhow::anyhow!("streaming stdout receiver closed"))?;
         }
@@ -541,7 +541,9 @@ mod tests {
         read_next_process_line, run_process_attached, run_process_streaming, spawn_process_session,
         BoundedCapture, ProcessInvocation,
     };
+    use lionclaw_runtime_api::RUNTIME_PROGRAM_STDOUT_LINE_LIMIT;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -723,6 +725,30 @@ mod tests {
             String::from_utf8(output.stderr).expect("stderr"),
             "details\n"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_process_rejects_an_oversized_record_before_enqueue() {
+        let (stdout, mut receiver) = mpsc::channel(1);
+        let output_bytes = RUNTIME_PROGRAM_STDOUT_LINE_LIMIT + 1;
+        let error = run_process_streaming(
+            &ProcessInvocation {
+                executable: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("printf '%*s\\n' {output_bytes} '' | tr ' ' x"),
+                ],
+                working_dir: None,
+                environment: Vec::new(),
+                input: String::new(),
+            },
+            Some(&stdout),
+        )
+        .await
+        .expect_err("oversized raw record must fail before enqueue");
+
+        assert!(error.to_string().contains("stdout record"));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(unix)]

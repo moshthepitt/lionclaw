@@ -2,9 +2,10 @@ use std::{fmt, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lionclaw_runtime_api::{RuntimeAuthContext, RuntimeAuthProvider, RuntimeProgramSession};
+use lionclaw_runtime_api::{
+    RuntimeAuthContext, RuntimeAuthProvider, RuntimeProgramSession, RuntimeProgramStdoutSender,
+};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::oci::OciExecutionBackend;
@@ -76,7 +77,7 @@ impl fmt::Debug for ExecutionRequest {
 
 pub type ExecutionOutput = super::process::ProcessOutput;
 
-pub type ExecutionStdoutSender = mpsc::Sender<String>;
+pub type ExecutionStdoutSender = RuntimeProgramStdoutSender;
 
 pub enum ExecutionSession {
     Oci(super::oci::OciExecutionSession),

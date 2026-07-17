@@ -71,7 +71,8 @@ pub use lionclaw_model::{
 };
 pub use program::{
     ExecutionOutput, NetworkMode, RuntimeProgramExecutor, RuntimeProgramSession,
-    RuntimeProgramSpec, RuntimeProgramStdoutSender,
+    RuntimeProgramSpec, RuntimeProgramStdoutLine, RuntimeProgramStdoutLineError,
+    RuntimeProgramStdoutSender, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT,
 };
 pub use program_backed::{execute_program_backed_turn, RuntimeProgramOutputParser};
 pub use registry::RuntimeRegistry;

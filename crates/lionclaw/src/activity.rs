@@ -764,8 +764,10 @@ mod tests {
     #[tokio::test]
     async fn only_execution_work_tasks_have_task_workspace_observations() {
         use crate::model::{
-            DecisionAction, EventEnvelope, MissionConfig, MissionEvent, MissionId, MissionTypeRef,
-            Plan, PlanProposal, RoleName, Task, TaskId, TaskKind, TaskNamespace, VersionStamps,
+            Assertion, AssertionId, DecisionAction, EventEnvelope, MissionConfig, MissionEvent,
+            MissionId, MissionTypeRef, OracleName, OutputSemantics, Plan, PlanInventory,
+            PlanProposal, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+            RoleName, Task, TaskId, TaskKind, TaskNamespace, VersionStamps,
         };
 
         let mission_id = MissionId::parse("mabc123abc123").unwrap();
@@ -788,18 +790,61 @@ mod tests {
                 image_id: "image".into(),
                 workspace_dir: "/workspace".into(),
                 base_sha: "base".into(),
-                config: MissionConfig::default(),
+                config: MissionConfig {
+                    plan_inventory: PlanInventory {
+                        roles: std::collections::BTreeMap::from([
+                            (
+                                RoleName::new("worker").unwrap(),
+                                OutputSemantics::ProducesArtifact,
+                            ),
+                            (
+                                RoleName::new("validator").unwrap(),
+                                OutputSemantics::EmitsVerdict,
+                            ),
+                        ]),
+                        oracles: std::collections::BTreeSet::from([
+                            OracleName::new("test-oracle").unwrap()
+                        ]),
+                    },
+                    ..Default::default()
+                },
             },
             MissionEvent::PlanProposed {
                 proposal: PlanProposal {
                     base_revision: 0,
                     plan: Plan {
-                        requirements: vec![],
-                        assertions: vec![],
+                        requirements: vec![Requirement {
+                            id: RequirementId::new("REQ-1").unwrap(),
+                            kind: RequirementKind::Capability,
+                            prose: "observe workspace applicability".into(),
+                            disposition: RequirementDisposition::Covered {
+                                assertion_ids: vec![AssertionId::new("OBSERVABLE").unwrap()],
+                            },
+                        }],
+                        assertions: vec![Assertion {
+                            id: AssertionId::new("OBSERVABLE").unwrap(),
+                            prose: "workspace applicability is observable".into(),
+                            oracle: Some(OracleName::new("test-oracle").unwrap()),
+                        }],
                         tasks: vec![
-                            task("work", TaskKind::Work, Some("worker")),
-                            task("validate", TaskKind::Validate, Some("validator")),
-                            task("gate", TaskKind::Gate, None),
+                            {
+                                let mut task = task("work", TaskKind::Work, Some("worker"));
+                                task.targets = vec![AssertionId::new("OBSERVABLE").unwrap()];
+                                task
+                            },
+                            {
+                                let mut task =
+                                    task("validate", TaskKind::Validate, Some("validator"));
+                                task.targets = vec![AssertionId::new("OBSERVABLE").unwrap()];
+                                task
+                            },
+                            {
+                                let mut task = task("gate", TaskKind::Gate, None);
+                                task.body.clear();
+                                task.targets = vec![AssertionId::new("OBSERVABLE").unwrap()];
+                                task.depends_on = vec![TaskId::new("validate").unwrap()];
+                                task
+                            },
                         ],
                     },
                 },

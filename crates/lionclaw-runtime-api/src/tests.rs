@@ -11,10 +11,11 @@ use super::{
     RuntimeCancellation, RuntimeCapabilityResult, RuntimeControlInput, RuntimeControlOrigin,
     RuntimeEvent, RuntimeEventSender, RuntimeExecutionContext, RuntimeMessageLane,
     RuntimeNativeHomeArtifactDir, RuntimePathProjection, RuntimeProgramExecutor,
-    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeRegistry,
-    RuntimeSessionHandle, RuntimeSessionReady, RuntimeSessionStartInput, RuntimeTerminalConfig,
-    RuntimeTurnInput, RuntimeTurnJournalSender, RuntimeTurnMode, TurnEvent,
-    RUNTIME_SESSION_READY_MARKER, RUNTIME_TURN_JOURNAL_CAPACITY,
+    RuntimeProgramSession, RuntimeProgramSpec, RuntimeProgramStdoutLine,
+    RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionReady,
+    RuntimeSessionStartInput, RuntimeTerminalConfig, RuntimeTurnInput, RuntimeTurnJournalSender,
+    RuntimeTurnMode, TurnEvent, RUNTIME_PROGRAM_STDOUT_LINE_LIMIT, RUNTIME_SESSION_READY_MARKER,
+    RUNTIME_TURN_JOURNAL_CAPACITY,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -199,7 +200,7 @@ impl RuntimeProgramExecutor for StubExecutor {
             .ok_or_else(|| anyhow!("no attempt configured"))?;
         for line in attempt.stdout_lines {
             stdout
-                .send(line)
+                .send(RuntimeProgramStdoutLine::new(line)?)
                 .await
                 .map_err(|_| anyhow!("stdout closed"))?;
         }
@@ -636,7 +637,7 @@ async fn program_backed_turn_observes_slow_stdout_before_completion() {
         ) -> Result<ExecutionOutput> {
             sleep(Duration::from_millis(20)).await;
             stdout
-                .send("answer:slow".to_string())
+                .send(RuntimeProgramStdoutLine::new("answer:slow".to_string())?)
                 .await
                 .map_err(|_| anyhow!("stdout closed"))?;
             Ok(success_output())
@@ -695,11 +696,13 @@ async fn program_backed_stdout_transport_applies_bounded_backpressure() {
             assert_eq!(stdout.max_capacity(), RUNTIME_TURN_JOURNAL_CAPACITY);
             for _ in 0..RUNTIME_TURN_JOURNAL_CAPACITY {
                 stdout
-                    .try_send("answer:x".to_string())
+                    .try_send(RuntimeProgramStdoutLine::new("answer:x".to_string()).unwrap())
                     .expect("declared stdout capacity");
             }
             assert!(matches!(
-                stdout.try_send("answer:overflow".to_string()),
+                stdout.try_send(
+                    RuntimeProgramStdoutLine::new("answer:overflow".to_string()).unwrap()
+                ),
                 Err(mpsc::error::TrySendError::Full(_))
             ));
             self.0.store(true, Ordering::Release);
@@ -748,6 +751,22 @@ async fn program_backed_stdout_transport_applies_bounded_backpressure() {
     assert_eq!(
         drain.await.expect("journal drain"),
         RUNTIME_TURN_JOURNAL_CAPACITY + 1
+    );
+}
+
+#[test]
+fn program_backed_stdout_transport_rejects_an_oversized_raw_record() {
+    let (stdout, _receiver) = mpsc::channel(RUNTIME_TURN_JOURNAL_CAPACITY);
+    stdout
+        .try_send(
+            RuntimeProgramStdoutLine::new("x".repeat(RUNTIME_PROGRAM_STDOUT_LINE_LIMIT))
+                .expect("record at the byte limit"),
+        )
+        .expect("queue accepts a checked record");
+
+    assert!(
+        RuntimeProgramStdoutLine::new("x".repeat(RUNTIME_PROGRAM_STDOUT_LINE_LIMIT + 1)).is_err(),
+        "raw provider records must be byte-bounded before entering the queue"
     );
 }
 

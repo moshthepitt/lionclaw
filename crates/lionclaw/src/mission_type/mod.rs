@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::model::{
-    InputName, MissionTypeInventory, OracleName, OutputSemantics, PlanningDag, RoleName, StopBar,
+    InputName, OracleName, OutputSemantics, PlanInventory, PlanningDag, RoleName, StopBar,
     TerminalReviewConfig,
 };
 
@@ -175,6 +175,7 @@ impl MissionType {
     pub fn mission_config(&self) -> crate::model::MissionConfig {
         crate::model::MissionConfig {
             stop: self.stop,
+            plan_inventory: self.inventory(),
             planning: self.planning.clone(),
             recovery: self.recovery.clone(),
             execution: self.execution.clone(),
@@ -183,15 +184,14 @@ impl MissionType {
     }
 
     /// The pure inventory plan validation runs against.
-    pub fn inventory(&self) -> MissionTypeInventory {
-        MissionTypeInventory {
+    fn inventory(&self) -> PlanInventory {
+        PlanInventory {
             roles: self
                 .roles
                 .iter()
                 .map(|(name, role)| (name.clone(), role.output))
                 .collect(),
             oracles: self.oracles.keys().cloned().collect::<BTreeSet<_>>(),
-            stop: self.stop,
         }
     }
 }

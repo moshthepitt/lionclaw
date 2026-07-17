@@ -83,6 +83,16 @@ impl OutputSemantics {
     }
 }
 
+/// Resolved mission-type names that a plan may bind. Persisted with mission
+/// policy so live ingress and replay enforce the same closed world without
+/// reopening bundle files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanInventory {
+    pub roles: BTreeMap<RoleName, OutputSemantics>,
+    pub oracles: BTreeSet<OracleName>,
+}
+
 /// One falsifiable claim in the mission contract. `oracle` binds it to a
 /// worker-independent engine-run check; without one it can only ever be
 /// covered by advisory verdicts.

@@ -314,6 +314,7 @@ mod sink_tests {
                 // Verified: a reviewed-bar config without a terminal review
                 // is a shape production refuses (create_mission + loader).
                 stop: StopBar::Verified,
+                plan_inventory: Default::default(),
                 planning: Default::default(),
                 recovery: Default::default(),
                 execution: Default::default(),

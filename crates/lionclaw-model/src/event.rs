@@ -16,12 +16,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
-use super::plan::{OutputSemantics, PlanProposal, PlanningDag};
+use super::plan::{OutputSemantics, PlanInventory, PlanProposal, PlanningDag};
 use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
-/// Bumped for engine-only payload-reference provenance.
-pub const SCHEMA_VERSION: u32 = 15;
+/// Bumped for the replay-authoritative plan inventory in `MissionConfig`.
+pub const SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +115,9 @@ pub struct MissionTypeRef {
 #[serde(deny_unknown_fields)]
 pub struct MissionConfig {
     pub stop: StopBar,
+    /// Resolved role outputs and oracle names available to every plan. This
+    /// immutable copy makes complete plan validation replayable.
+    pub plan_inventory: PlanInventory,
     /// The mission type's planning DAG (how an objective becomes a proposed
     /// contract). Empty ⇒ no in-engine planning; the mission awaits a manually
     /// proposed plan.
@@ -136,6 +139,7 @@ impl Default for MissionConfig {
     fn default() -> Self {
         Self {
             stop: StopBar::Verified,
+            plan_inventory: PlanInventory::default(),
             planning: PlanningDag::default(),
             recovery: RecoveryConfig::default(),
             execution: ExecutionPolicy::default(),

@@ -271,7 +271,9 @@ mod tests {
     };
     use crate::fold::fold;
     use crate::ids::{EffectId, MissionId};
-    use crate::plan::{Assertion, Plan, Task};
+    use crate::plan::{
+        Assertion, Plan, PlanInventory, Requirement, RequirementDisposition, RequirementKind, Task,
+    };
     use crate::verdict::FinishClass;
     use crate::{TypedFailure, TypedFailureEvidence};
 
@@ -295,7 +297,7 @@ mod tests {
         Assertion {
             id: aid(id),
             prose: format!("claim {id}"),
-            oracle: None,
+            oracle: Some(oname("tests")),
         }
     }
 
@@ -365,18 +367,58 @@ mod tests {
             workspace_dir: "/workspace".to_string(),
             base_sha: base_sha.to_string(),
             config: MissionConfig {
+                plan_inventory: PlanInventory {
+                    roles: BTreeMap::from([
+                        (
+                            rname("implementer"),
+                            crate::OutputSemantics::ProducesArtifact,
+                        ),
+                        (rname("checker"), crate::OutputSemantics::EmitsVerdict),
+                    ]),
+                    oracles: [oname("build"), oname("tests")].into_iter().collect(),
+                },
                 recovery: crate::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
     }
 
-    fn plan(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
+    fn plan(assertions: Vec<Assertion>, mut tasks: Vec<Task>) -> MissionEvent {
+        let assertion_ids = assertions
+            .iter()
+            .map(|assertion| assertion.id.clone())
+            .collect::<Vec<_>>();
+        let covered = tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Work)
+            .flat_map(|task| task.targets.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if let Some(first_writer) = tasks.iter_mut().find(|task| task.kind == TaskKind::Work) {
+            first_writer.targets.extend(
+                assertion_ids
+                    .iter()
+                    .filter(|id| !covered.contains(*id))
+                    .cloned(),
+            );
+        }
+        let requirements = assertions
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| Requirement {
+                id: crate::RequirementId::new(format!("REQ-{}", index + 1))
+                    .expect("requirement id"),
+                kind: RequirementKind::Capability,
+                prose: format!("requirement for {}", assertion.id),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.id.clone()],
+                },
+            })
+            .collect();
         MissionEvent::PlanProposed {
             proposal: crate::PlanProposal {
                 base_revision: 0,
                 plan: Plan {
-                    requirements: vec![],
+                    requirements,
                     assertions,
                     tasks,
                 },
@@ -586,18 +628,19 @@ mod tests {
         assert!(matches!(aborted.phase, MissionPhase::Aborted { .. }));
         assert_eq!(step(&aborted), StepDecision::Terminal);
 
-        // All tasks cleared, nothing owed → the fold auto-closes; A1 has no
-        // oracle binding and no advisory pass, so the finish is Unverified.
+        // All tasks and proof obligations cleared → the fold auto-closes.
         let done = fold_log(vec![
             created("sha-0"),
             plan(vec![assertion("A1")], vec![work("w1", &["A1"], &[])]),
             role_requested("w1", 1, "k-w1-1"),
             work_done("w1", "k-w1-1", None),
+            oracle_requested(&["A1"], "tests", "sha-0", 1, "k-tests-1"),
+            oracle_completed(&["A1"], "tests", "sha-0", 1, "k-tests-1", 0),
         ]);
         assert_eq!(
             done.phase,
             MissionPhase::Done {
-                finish: FinishClass::Unverified
+                finish: FinishClass::Verified
             }
         );
         assert_eq!(step(&done), StepDecision::Terminal);

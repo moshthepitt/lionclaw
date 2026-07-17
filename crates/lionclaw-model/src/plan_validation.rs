@@ -14,9 +14,12 @@
 //! only duplicates are checked here.
 
 use super::event::StopBar;
-use super::ids::{OracleName, RoleName, TaskId};
+use super::ids::TaskId;
+#[cfg(test)]
+use super::ids::{OracleName, RoleName};
 use super::plan::{
-    OutputSemantics, Plan, PlanProposal, PlanningDag, RequirementDisposition, TaskKind,
+    OutputSemantics, Plan, PlanInventory, PlanProposal, PlanningDag, RequirementDisposition,
+    TaskKind,
 };
 use super::state::MissionState;
 use crate::prelude::*;
@@ -40,16 +43,11 @@ fn err(code: &'static str, detail: impl Into<String>) -> PlanValidationError {
     }
 }
 
-/// The mission-type-supplied inventory the plan is validated against.
-pub struct MissionTypeInventory {
-    pub roles: BTreeMap<RoleName, OutputSemantics>,
-    pub oracles: BTreeSet<OracleName>,
-    /// The honesty bar the mission type declares — plans under `Verified` must
-    /// be provable (every assertion bound to an oracle).
-    pub stop: StopBar,
-}
-
-pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
+pub fn validate_plan(
+    plan: &Plan,
+    inventory: &PlanInventory,
+    stop: StopBar,
+) -> Vec<PlanValidationError> {
     // Group 0: emptiness (zenith empty_contract / empty_task_list).
     if plan.assertions.is_empty() {
         return vec![err(
@@ -110,7 +108,7 @@ pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanV
     // proposal *could* bind one, so this is a
     // launch-time policy, not a permanence claim; a domain with genuinely
     // unprovable claims declares `stop = reviewed`.)
-    check_stop_bar_reachable(plan, inventory.stop)
+    check_stop_bar_reachable(plan, stop)
 }
 
 /// Validate a mission type's planning DAG (at load, fail-closed): unique ids,
@@ -119,7 +117,7 @@ pub fn validate_plan(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanV
 /// DAG fully drains into the proposer with no orphan island.
 pub fn validate_planning_dag(
     dag: &PlanningDag,
-    inventory: &MissionTypeInventory,
+    inventory: &PlanInventory,
 ) -> Vec<PlanValidationError> {
     // An empty DAG is valid: it means "no in-engine planning" (the mission
     // awaits a manually proposed plan).
@@ -296,10 +294,13 @@ pub enum ProposalError {
 pub fn validate_plan_proposal(
     state: &MissionState,
     proposal: &PlanProposal,
-    inventory: &MissionTypeInventory,
 ) -> Result<(), ProposalError> {
     validate_plan_transition(state, proposal)?;
-    let errors = validate_plan(&proposal.plan, inventory);
+    let errors = validate_plan(
+        &proposal.plan,
+        &state.config.plan_inventory,
+        state.config.stop,
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -307,10 +308,9 @@ pub fn validate_plan_proposal(
     }
 }
 
-/// Validate the revision relationship without mission-type inventory. Shared
-/// with the fold so a malformed persisted proposal cannot weaken the contract
-/// even if an event bypassed the engine boundary.
-pub(crate) fn validate_plan_transition(
+/// Validate revision monotonicity and immutable ids before the caller checks
+/// the resulting complete plan against the persisted inventory.
+fn validate_plan_transition(
     state: &MissionState,
     proposal: &PlanProposal,
 ) -> Result<(), ProposalError> {
@@ -530,7 +530,7 @@ fn check_unique_ids(plan: &Plan) -> Vec<PlanValidationError> {
     errors
 }
 
-fn check_shape(plan: &Plan, inventory: &MissionTypeInventory) -> Vec<PlanValidationError> {
+fn check_shape(plan: &Plan, inventory: &PlanInventory) -> Vec<PlanValidationError> {
     let mut errors = Vec::new();
     for assertion in &plan.assertions {
         if let Some(oracle) = &assertion.oracle {
@@ -831,7 +831,7 @@ mod tests {
         task(id, TaskKind::Gate, None, "", targets, deps)
     }
 
-    fn inventory() -> MissionTypeInventory {
+    fn inventory() -> PlanInventory {
         let mut roles = BTreeMap::new();
         roles.insert(
             RoleName::new("implementer").expect("valid role name"),
@@ -851,12 +851,9 @@ mod tests {
             RoleName::new("author").expect("valid role name"),
             OutputSemantics::ProposesPlan,
         );
-        MissionTypeInventory {
+        PlanInventory {
             roles,
             oracles: BTreeSet::from([OracleName::new("cargo-test").expect("valid oracle name")]),
-            // `Reviewed` so these structural tests aren't also subject to the
-            // stop-bar-reachability check (exercised separately below).
-            stop: StopBar::Reviewed,
         }
     }
 
@@ -881,7 +878,7 @@ mod tests {
     }
 
     fn codes(plan: &Plan) -> Vec<&'static str> {
-        validate_plan(plan, &inventory())
+        validate_plan(plan, &inventory(), StopBar::Reviewed)
             .into_iter()
             .map(|e| e.code)
             .collect()
@@ -1339,10 +1336,8 @@ mod tests {
 
     #[test]
     fn verified_bar_rejects_an_oracle_less_assertion() {
-        let mut verified = inventory();
-        verified.stop = StopBar::Verified;
         let against = |sub: &Plan| -> Vec<&'static str> {
-            validate_plan(sub, &verified)
+            validate_plan(sub, &inventory(), StopBar::Verified)
                 .into_iter()
                 .map(|e| e.code)
                 .collect()

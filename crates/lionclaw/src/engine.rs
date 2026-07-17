@@ -337,7 +337,7 @@ impl Engine {
         if !state.inflight.is_empty() {
             return Err(ProposeError::MissionBusy);
         }
-        validate_plan_proposal(&state, &proposal, &self.mission_type.inventory())?;
+        validate_plan_proposal(&state, &proposal)?;
         let proposal_json = serde_json::to_string(&proposal).map_err(anyhow::Error::from)?;
         let plan_hash = hex::encode(Sha256::digest(proposal_json.as_bytes()));
         let event = NewEvent::new(MissionEvent::PlanProposed {
@@ -690,7 +690,7 @@ impl Engine {
         else {
             return Ok(false);
         };
-        let checkpoint = checkpoint_after(&outcome.event, &state.config.execution);
+        let checkpoint = checkpoint_after(&outcome.event, &effect, &state.config.execution);
         let Some((automatic, reason)) = checkpoint else {
             return Ok(true);
         };
@@ -1089,9 +1089,7 @@ impl Engine {
                             &outcome,
                         ))));
                     };
-                    if let Err(error) =
-                        validate_plan_proposal(state, proposal, &self.mission_type.inventory())
-                    {
+                    if let Err(error) = validate_plan_proposal(state, proposal) {
                         return Ok(completed(Err(invalid_role_outcome(
                             "plan.invalid",
                             format!("proposed plan is invalid: {error}"),
@@ -2221,32 +2219,41 @@ fn retry_not_before(now_ms: i64, failure: Option<&TypedFailure>) -> i64 {
 /// outcome. The driver only performs the returned action.
 fn checkpoint_after(
     event: &MissionEvent,
+    effect: &InflightEffect,
     policy: &crate::model::ExecutionPolicy,
 ) -> Option<(bool, &'static str)> {
-    match event {
-        MissionEvent::RoleRunCompleted {
-            outcome: Ok(success),
-            ..
-        } if success.artifact.is_some() => Some((
+    match (event, effect) {
+        (
+            MissionEvent::RoleRunCompleted { outcome: Ok(_), .. },
+            InflightEffect::RoleRun {
+                output: crate::model::OutputSemantics::ProducesArtifact,
+                ..
+            },
+        ) => Some((
             policy.auto_continue_candidate,
-            "mission policy auto-continued captured candidate",
+            "mission policy auto-continued writer completion",
         )),
-        MissionEvent::RoleRunCompleted {
-            outcome:
-                Ok(crate::model::RoleRunSuccess {
-                    handoff: Handoff::Validate { .. },
-                    ..
-                }),
-            ..
-        } => Some((
+        (
+            MissionEvent::RoleRunCompleted { outcome: Ok(_), .. },
+            InflightEffect::RoleRun {
+                output: crate::model::OutputSemantics::EmitsVerdict,
+                ..
+            },
+        ) => Some((
             policy.auto_continue_proof,
             "mission policy auto-continued advisory proof completion",
         )),
-        MissionEvent::RoleRunCompleted { outcome: Ok(_), .. } => {
+        (MissionEvent::RoleRunCompleted { outcome: Ok(_), .. }, InflightEffect::RoleRun { .. }) => {
             Some((false, "agent response checkpoint"))
         }
-        MissionEvent::OracleRunCompleted { outcome: Ok(_), .. }
-        | MissionEvent::TerminalReviewCompleted { outcome: Ok(_), .. } => Some((
+        (
+            MissionEvent::OracleRunCompleted { outcome: Ok(_), .. },
+            InflightEffect::OracleRun { .. },
+        )
+        | (
+            MissionEvent::TerminalReviewCompleted { outcome: Ok(_), .. },
+            InflightEffect::TerminalReview { .. },
+        ) => Some((
             policy.auto_continue_proof,
             "mission policy auto-continued proof completion",
         )),

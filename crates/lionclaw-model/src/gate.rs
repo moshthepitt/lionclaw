@@ -105,8 +105,10 @@ mod tests {
         EventEnvelope, Handoff, MissionEvent, PayloadRef, ValidationItem, VersionStamps,
     };
     use crate::fold::fold;
-    use crate::ids::{AssertionId, EffectId, MissionId, RoleName};
-    use crate::plan::{Assertion, Task};
+    use crate::ids::{AssertionId, EffectId, MissionId, OracleName, RequirementId, RoleName};
+    use crate::plan::{
+        Assertion, PlanInventory, Requirement, RequirementDisposition, RequirementKind, Task,
+    };
     use crate::MissionConfig;
 
     fn aid(s: &str) -> AssertionId {
@@ -117,8 +119,20 @@ mod tests {
     }
 
     fn plan_with(assertions: Vec<Assertion>, tasks: Vec<Task>) -> Plan {
+        let requirements = assertions
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| Requirement {
+                id: RequirementId::new(format!("REQ-{}", index + 1)).unwrap(),
+                kind: RequirementKind::Capability,
+                prose: format!("requirement for {}", assertion.id),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.id.clone()],
+                },
+            })
+            .collect();
         Plan {
-            requirements: vec![],
+            requirements,
             assertions,
             tasks,
         }
@@ -174,6 +188,19 @@ mod tests {
                     workspace_dir: "/w".into(),
                     base_sha: "s0".into(),
                     config: MissionConfig {
+                        plan_inventory: PlanInventory {
+                            roles: BTreeMap::from([
+                                (
+                                    RoleName::new("implementer").unwrap(),
+                                    crate::OutputSemantics::ProducesArtifact,
+                                ),
+                                (
+                                    RoleName::new("reviewer").unwrap(),
+                                    crate::OutputSemantics::EmitsVerdict,
+                                ),
+                            ]),
+                            oracles: BTreeSet::from([OracleName::new("tests").unwrap()]),
+                        },
                         ..Default::default()
                     },
                 },
@@ -318,7 +345,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -336,7 +363,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -359,12 +386,12 @@ mod tests {
                 Assertion {
                     id: aid("AA"),
                     prose: "a".into(),
-                    oracle: None,
+                    oracle: Some(OracleName::new("tests").unwrap()),
                 },
                 Assertion {
                     id: aid("BB"),
                     prose: "b".into(),
-                    oracle: None,
+                    oracle: Some(OracleName::new("tests").unwrap()),
                 },
             ],
             vec![
@@ -386,7 +413,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),
@@ -408,7 +435,7 @@ mod tests {
             vec![Assertion {
                 id: aid("AA"),
                 prose: "a".into(),
-                oracle: None,
+                oracle: Some(OracleName::new("tests").unwrap()),
             }],
             vec![
                 work("w", &["AA"]),

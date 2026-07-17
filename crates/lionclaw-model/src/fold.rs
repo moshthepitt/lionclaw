@@ -26,7 +26,7 @@ use crate::{RoleName, TypedFailure};
 
 /// Bump when fold semantics change; snapshots with a different version are
 /// discarded and rebuilt from sequence zero.
-pub const REDUCER_VERSION: u32 = 18;
+pub const REDUCER_VERSION: u32 = 19;
 
 /// Fold a mission's event stream. `None` until a `MissionCreated` arrives.
 pub fn fold(events: impl IntoIterator<Item = EventEnvelope>) -> Option<MissionState> {
@@ -120,7 +120,7 @@ pub fn apply(state: &mut MissionState, envelope: &EventEnvelope) {
     match &envelope.event {
         MissionEvent::MissionCreated { .. } => {}
         MissionEvent::PlanProposed { proposal, .. } => {
-            if super::plan_validation::validate_plan_transition(state, proposal).is_ok() {
+            if super::plan_validation::validate_plan_proposal(state, proposal).is_ok() {
                 state.proposal = Some(proposal.clone());
                 state.planning_base_revision = None;
                 state.proposal_approved = false;
@@ -808,7 +808,7 @@ fn derive_promotion(state: &mut MissionState) {
         return;
     }
     let proposal = state.proposal.as_ref().expect("proposal present");
-    if super::plan_validation::validate_plan_transition(state, proposal).is_err() {
+    if super::plan_validation::validate_plan_proposal(state, proposal).is_err() {
         return;
     }
     let proposal = state
@@ -1508,10 +1508,31 @@ fn apply_handoff(
             proposal,
             request_attention,
         } => {
-            // Planning-only: the author's handoff. A `done` proposal (the shell
-            // has already validated it) becomes the gradeless `state.proposal`;
-            // it seeds the contract only after approval (`derive_promotion`).
-            let status = if *done {
+            // Planning-only: the author's handoff. A complete valid proposal
+            // becomes the gradeless `state.proposal`; it seeds the contract
+            // only after approval (`derive_promotion`).
+            let proposal_error = if !done {
+                None
+            } else {
+                match proposal {
+                    None => Some("planning author completed without a plan proposal".to_string()),
+                    Some(proposal)
+                        if state.planning_base_revision != Some(proposal.base_revision) =>
+                    {
+                        Some(
+                            "plan proposal does not target the active planning revision"
+                                .to_string(),
+                        )
+                    }
+                    Some(proposal) => {
+                        super::plan_validation::validate_plan_proposal(state, proposal)
+                            .err()
+                            .map(|error| error.to_string())
+                    }
+                }
+            };
+            let succeeded = *done && proposal_error.is_none();
+            let status = if succeeded {
                 TaskStatus::Cleared
             } else {
                 TaskStatus::Failed
@@ -1519,18 +1540,20 @@ fn apply_handoff(
             if let Some(task) = state.planning.tasks.get_mut(task_id) {
                 task.status = status;
                 task.last_report = Some(report.clone());
-                task.last_failure = (!done).then(|| {
-                    TypedFailure::invalid(
+                task.last_failure = if !done {
+                    Some(TypedFailure::invalid(
                         "handoff.incomplete",
                         "planning author reported done=false",
-                    )
-                });
+                    ))
+                } else {
+                    proposal_error
+                        .as_ref()
+                        .map(|detail| TypedFailure::invalid("handoff.invalid_plan", detail.clone()))
+                };
             }
-            if *done {
+            if succeeded {
                 if let Some(proposal) = proposal {
-                    if state.proposal.is_none()
-                        && state.planning_base_revision == Some(proposal.base_revision)
-                    {
+                    if state.proposal.is_none() {
                         state.proposal = Some(proposal.clone());
                         state.planning_base_revision = None;
                         state.proposal_approved = false;
@@ -1664,7 +1687,10 @@ mod tests {
         RuntimeConfigurationEvidence, TerminalReviewSuccess, ValidationItem,
     };
     use super::super::ids::{AssertionId, EffectId, MissionId, OracleName, RoleName, TaskId};
-    use super::super::plan::{Assertion, Plan, PlanProposal, PlanningTask, Task, TaskKind};
+    use super::super::plan::{
+        Assertion, Plan, PlanInventory, PlanProposal, PlanningTask, Requirement,
+        RequirementDisposition, RequirementKind, Task, TaskKind,
+    };
     use super::super::verdict::FinishClass;
     use super::*;
     use crate::TypedFailureEvidence;
@@ -1840,6 +1866,22 @@ mod tests {
     }
 
     fn created() -> MissionEvent {
+        let plan_inventory = PlanInventory {
+            roles: BTreeMap::from([
+                (
+                    RoleName::new("implementer").expect("role name"),
+                    OutputSemantics::ProducesArtifact,
+                ),
+                (
+                    RoleName::new("reviewer").expect("role name"),
+                    OutputSemantics::EmitsVerdict,
+                ),
+            ]),
+            oracles: ["cargo-test", "different-oracle", "lint"]
+                .into_iter()
+                .map(oracle)
+                .collect(),
+        };
         MissionEvent::MissionCreated {
             objective: "objective".into(),
             mission_type: crate::MissionTypeRef {
@@ -1851,18 +1893,58 @@ mod tests {
             workspace_dir: "/w".into(),
             base_sha: "base".into(),
             config: MissionConfig {
+                plan_inventory,
                 recovery: super::super::event::RecoveryConfig { max_attempts: 1 },
                 ..Default::default()
             },
         }
     }
 
-    fn plan_proposed(assertions: Vec<Assertion>, tasks: Vec<Task>) -> MissionEvent {
+    fn plan_proposed(mut assertions: Vec<Assertion>, mut tasks: Vec<Task>) -> MissionEvent {
+        if assertions.is_empty() {
+            assertions.push(assertion("FIXTURE-CONTRACT", Some("cargo-test")));
+        }
+        let assertion_ids = assertions
+            .iter()
+            .map(|assertion| assertion.id.clone())
+            .collect::<Vec<_>>();
+        let covered = tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Work)
+            .flat_map(|task| task.targets.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if let Some(first_writer) = tasks.iter_mut().find(|task| task.kind == TaskKind::Work) {
+            first_writer.targets.extend(
+                assertion_ids
+                    .iter()
+                    .filter(|id| !covered.contains(*id))
+                    .cloned(),
+            );
+        }
+        for validator in tasks
+            .iter_mut()
+            .filter(|task| task.kind == TaskKind::Validate && task.targets.is_empty())
+        {
+            validator.targets.clone_from(&assertion_ids);
+        }
+        let requirements = assertions
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| Requirement {
+                id: super::super::ids::RequirementId::new(format!("REQ-{}", index + 1))
+                    .expect("requirement id"),
+                kind: RequirementKind::Capability,
+                prose: format!("fixture requirement for {}", assertion.id),
+                disposition: RequirementDisposition::Covered {
+                    assertion_ids: vec![assertion.id.clone()],
+                },
+            })
+            .collect();
         MissionEvent::PlanProposed {
             proposal: PlanProposal {
                 base_revision: 0,
                 plan: Plan {
-                    requirements: vec![],
+                    requirements,
                     assertions,
                     tasks,
                 },
@@ -2282,7 +2364,7 @@ mod tests {
         let base = vec![
             created(),
             plan_proposed(
-                vec![assertion("AA", None)],
+                vec![assertion("AA", Some("cargo-test"))],
                 vec![
                     work_task("w"),
                     validate_task("v"),
@@ -2344,7 +2426,7 @@ mod tests {
         let base = vec![
             created,
             plan_proposed(
-                vec![assertion("AA", None)],
+                vec![assertion("AA", Some("cargo-test"))],
                 vec![
                     work_task("w"),
                     validate_task("v"),
@@ -2444,7 +2526,7 @@ mod tests {
         let state = fold_log(vec![
             created(),
             plan_proposed(
-                vec![assertion("AA", None)],
+                vec![assertion("AA", Some("cargo-test"))],
                 vec![
                     work_task("w"),
                     validate_task("v"),
@@ -2496,13 +2578,87 @@ mod tests {
     }
 
     #[test]
+    fn replay_refuses_a_structurally_invalid_plan() {
+        let state = fold_log(vec![
+            created(),
+            MissionEvent::PlanProposed {
+                proposal: PlanProposal {
+                    base_revision: 0,
+                    plan: Plan {
+                        requirements: Vec::new(),
+                        assertions: vec![assertion("UNSUPPORTED", Some("cargo-test"))],
+                        tasks: vec![work_task("work")],
+                    },
+                },
+                plan_hash: "malformed-but-decodable".into(),
+            },
+        ])
+        .expect("mission creation remains replayable");
+
+        assert!(state.plan.is_none());
+        assert!(state.proposal.is_none());
+        assert_eq!(state.phase, MissionPhase::Planning);
+    }
+
+    #[test]
+    fn replay_classifies_an_invalid_planning_handoff_as_failed() {
+        let mut mission_created = created();
+        let MissionEvent::MissionCreated { config, .. } = &mut mission_created else {
+            unreachable!("created() builds MissionCreated");
+        };
+        config.planning.tasks.push(PlanningTask {
+            id: tid("author"),
+            role: RoleName::new("planner").expect("role name"),
+            output: OutputSemantics::ProposesPlan,
+            body: "author a complete plan".into(),
+            depends_on: Vec::new(),
+        });
+        let malformed = PlanProposal {
+            base_revision: 0,
+            plan: Plan {
+                requirements: Vec::new(),
+                assertions: vec![assertion("UNSUPPORTED", Some("cargo-test"))],
+                tasks: vec![work_task("work")],
+            },
+        };
+
+        let state = fold_log(vec![
+            mission_created,
+            planning_role_requested("author", "author", OutputSemantics::ProposesPlan),
+            planning_role_completed(
+                "author",
+                "author",
+                Handoff::Plan {
+                    done: true,
+                    report: PayloadRef::inline("malformed proposal"),
+                    proposal: Some(malformed),
+                    request_attention: false,
+                },
+                None,
+            ),
+        ])
+        .expect("mission remains replayable");
+
+        assert!(state.proposal.is_none());
+        assert_eq!(
+            state.planning.tasks[&tid("author")].status,
+            TaskStatus::Failed
+        );
+        assert!(matches!(
+            state.planning.tasks[&tid("author")].last_failure,
+            Some(TypedFailure::InvalidOutput { .. })
+        ));
+        assert!(state.open_attention.contains_key("node_failed:author"));
+    }
+
+    #[test]
     fn plan_proposed_initializes_contract_and_tasks() {
         let state = fold_log(vec![
             created(),
             plan_proposed(
                 vec![
                     assertion("TESTS-PASS", Some("cargo-test")),
-                    assertion("NO-ORACLE", None),
+                    assertion("SECOND-CLAIM", Some("cargo-test")),
                 ],
                 vec![work_task("t1"), validate_task("v1")],
             ),
@@ -2514,7 +2670,10 @@ mod tests {
         assert_eq!(bound.advisory, AdvisoryStatus::Pending);
         assert!(bound.last_advisory.is_empty());
         assert!(bound.last_authoritative.is_none());
-        assert_eq!(state.contract[&aid("NO-ORACLE")].oracle, None);
+        assert_eq!(
+            state.contract[&aid("SECOND-CLAIM")].oracle,
+            Some(oracle("cargo-test"))
+        );
         for id in ["t1", "v1"] {
             let task = &state.tasks[&tid(id)];
             assert_eq!(task.status, TaskStatus::Pending);
@@ -2584,7 +2743,7 @@ mod tests {
                 None => {
                     assert!(state.open_attention.is_empty(), "{}", case.name);
                     assert!(
-                        matches!(state.phase, MissionPhase::Done { .. }),
+                        matches!(state.phase, MissionPhase::Running),
                         "{}",
                         case.name
                     );
@@ -2657,15 +2816,16 @@ mod tests {
             },
         ];
         for case in cases {
+            let mut tasks = vec![work_task("work")];
+            tasks.extend(
+                case.verdicts
+                    .iter()
+                    .map(|(validator, _)| validate_task(validator)),
+            );
             let mut events = vec![
                 created(),
-                plan_proposed(
-                    vec![assertion("A1", None)],
-                    case.verdicts
-                        .iter()
-                        .map(|(v, _)| validate_task(v))
-                        .collect(),
-                ),
+                plan_proposed(vec![assertion("A1", Some("cargo-test"))], tasks),
+                role_completed("work", "work", work_handoff(true, false), None),
             ];
             for (i, (validator, passed)) in case.verdicts.iter().enumerate() {
                 events.push(role_completed(
@@ -2704,7 +2864,11 @@ mod tests {
         // fail on not-done. No attention is raised either.
         let state = fold_log(vec![
             created(),
-            plan_proposed(vec![assertion("A1", None)], vec![validate_task("v1")]),
+            plan_proposed(
+                vec![assertion("A1", Some("cargo-test"))],
+                vec![work_task("work"), validate_task("v1")],
+            ),
+            role_completed("work", "work", work_handoff(true, false), None),
             role_completed(
                 "v1",
                 "k1",
@@ -2725,7 +2889,7 @@ mod tests {
         assert_eq!(state.tasks[&tid("v1")].status, TaskStatus::Cleared);
         assert_eq!(state.contract[&aid("A1")].advisory, AdvisoryStatus::Failed);
         assert!(state.open_attention.is_empty());
-        assert!(matches!(state.phase, MissionPhase::Done { .. }));
+        assert!(matches!(state.phase, MissionPhase::Running));
     }
 
     #[test]
@@ -2902,7 +3066,10 @@ mod tests {
         let MissionEvent::PlanProposed {
             proposal: mut replacement,
             ..
-        } = plan_proposed(vec![assertion("AA", None)], vec![work_task("replacement")])
+        } = plan_proposed(
+            vec![assertion("AA", Some("cargo-test"))],
+            vec![work_task("replacement")],
+        )
         else {
             unreachable!("plan_proposed() builds PlanProposed");
         };
@@ -2912,7 +3079,7 @@ mod tests {
         let state = fold_log(vec![
             mission_created,
             plan_proposed(
-                vec![assertion("AA", None)],
+                vec![assertion("AA", Some("cargo-test"))],
                 vec![
                     blocked_work,
                     validate_task("v"),
@@ -2959,7 +3126,10 @@ mod tests {
         let MissionEvent::PlanProposed {
             proposal: mut replacement,
             ..
-        } = plan_proposed(vec![assertion("AA", None)], vec![work_task("same-id")])
+        } = plan_proposed(
+            vec![assertion("AA", Some("cargo-test"))],
+            vec![work_task("same-id")],
+        )
         else {
             unreachable!("plan_proposed() builds PlanProposed");
         };
@@ -2968,9 +3138,14 @@ mod tests {
         let state = fold_log(vec![
             mission_created,
             plan_proposed(
-                vec![assertion("AA", None)],
-                vec![validate_task("v"), gate_task("g", &["AA"], &["v"])],
+                vec![assertion("AA", Some("cargo-test"))],
+                vec![
+                    work_task("seed"),
+                    validate_task("v"),
+                    gate_task("g", &["AA"], &["v"]),
+                ],
             ),
+            role_completed("seed", "seed", work_handoff(true, false), None),
             role_completed("v", "validation", validate_handoff(&[("AA", false)]), None),
             decision("gate_failed:g", super::super::event::DecisionAction::Revise),
             planning_role_requested(
@@ -3300,7 +3475,8 @@ mod tests {
         *base_sha = "base".into();
         let validator = fold_log(vec![
             created(),
-            plan_proposed(vec![], vec![validate_task("validator")]),
+            plan_proposed(vec![], vec![work_task("work"), validate_task("validator")]),
+            role_completed("work", "work", work_handoff(true, false), None),
             validator_request,
             MissionEvent::RoleRunCompleted {
                 namespace: crate::TaskNamespace::Execution,
@@ -3666,7 +3842,11 @@ mod tests {
     fn oracle_run_failed_raises_attention_without_verdict() {
         let state = fold_log(vec![
             created(),
-            plan_proposed(vec![assertion("TESTS-PASS", Some("cargo-test"))], vec![]),
+            plan_proposed(
+                vec![assertion("TESTS-PASS", Some("cargo-test"))],
+                vec![work_task("work")],
+            ),
+            role_completed("work", "work", work_handoff(true, false), None),
             oracle_requested("TESTS-PASS", "base", "ko"),
             MissionEvent::OracleRunCompleted {
                 assertion_ids: vec![aid("TESTS-PASS")],
@@ -3744,7 +3924,11 @@ mod tests {
     fn unknown_ids_in_events_are_tolerated() {
         let state = fold_log(vec![
             created(),
-            plan_proposed(vec![assertion("KNOWN-1", None)], vec![]),
+            plan_proposed(
+                vec![assertion("KNOWN-1", Some("cargo-test"))],
+                vec![work_task("known")],
+            ),
+            role_completed("known", "known", work_handoff(true, false), None),
             // Task never declared by any plan.
             role_completed("ghost", "k1", work_handoff(true, false), None),
             // Validator verdict for an assertion the contract never heard of.
@@ -3766,7 +3950,8 @@ mod tests {
         // No panics and no phantom rows: outcomes only touch declared ids.
         // Because attention is derived from the declared plan, an outcome for
         // an undeclared task raises nothing (it cannot, and should not).
-        assert!(state.tasks.is_empty());
+        assert_eq!(state.tasks.len(), 1);
+        assert!(state.tasks.contains_key(&tid("known")));
         assert_eq!(state.contract.len(), 1);
         assert_eq!(
             state.contract[&aid("KNOWN-1")].advisory,
