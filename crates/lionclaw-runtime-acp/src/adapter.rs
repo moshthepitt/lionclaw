@@ -236,7 +236,8 @@ impl AcpTurnRunner {
                     &opened_session.session_id,
                     &opened_session.selections,
                 )
-                .await?;
+                .await?
+                .projected();
             applied_configuration = Some(configuration.clone());
             if configuration.requested_model.is_some() || configuration.requested_mode.is_some() {
                 drop(
@@ -269,7 +270,8 @@ impl AcpTurnRunner {
                 configuration,
                 final_response,
                 ..Default::default()
-            })
+            }
+            .projected())
         }
         .await;
 

@@ -129,13 +129,9 @@ pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 fn bounded_runtime_event(event: RuntimeEvent) -> RuntimeEvent {
     let bounded_optional = |value: Option<String>| value.map(|value| crate::bounded_text(&value));
     match event {
-        RuntimeEvent::Configuration { mut configuration } => {
-            configuration.requested_model = bounded_optional(configuration.requested_model);
-            configuration.applied_model = bounded_optional(configuration.applied_model);
-            configuration.requested_mode = bounded_optional(configuration.requested_mode);
-            configuration.applied_mode = bounded_optional(configuration.applied_mode);
-            RuntimeEvent::Configuration { configuration }
-        }
+        RuntimeEvent::Configuration { configuration } => RuntimeEvent::Configuration {
+            configuration: configuration.projected(),
+        },
         RuntimeEvent::MessageDelta { lane, text } => RuntimeEvent::MessageDelta {
             lane,
             text: crate::bounded_text(&text),

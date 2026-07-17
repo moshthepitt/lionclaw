@@ -2145,6 +2145,30 @@ fn codex_turn_failure_classification_uses_only_will_retry() {
     ));
 }
 
+#[test]
+fn codex_turn_failure_state_bounds_provider_codes_before_retention() {
+    let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+    let oversized_code = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+
+    for index in 0..256 {
+        client.remember_turn_failure(
+            &json!({
+                "turnId": format!("turn_{index}"),
+                "willRetry": false,
+                "code": oversized_code,
+            }),
+            "failed".into(),
+        );
+    }
+
+    assert!((0..256).all(|index| {
+        client
+            .turn_failure(Some(&format!("turn_{index}")))
+            .and_then(|failure| failure.evidence().code.as_ref())
+            .is_some_and(|code| code.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT)
+    }));
+}
+
 #[tokio::test]
 async fn codex_app_server_retryable_error_notification_does_not_fail_turn() {
     let (adapter, handle, thread_state) = start_codex_test_session(None).await;

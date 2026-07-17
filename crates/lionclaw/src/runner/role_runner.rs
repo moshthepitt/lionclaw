@@ -662,8 +662,9 @@ fn validate_completed_turn(
     profile: &MissionRuntimeProfile,
     result: lionclaw_runtime_api::RuntimeTurnResult,
 ) -> Result<(lionclaw_runtime_api::AppliedRuntimeConfiguration, String), TypedFailure> {
+    let result = result.projected();
     let configuration = result.configuration;
-    let final_response = lionclaw_runtime_api::bounded_text(&result.final_response);
+    let final_response = result.final_response;
     if configuration.requested_model != profile.model
         || configuration.requested_mode != profile.mode
         || profile.model.is_some() && configuration.applied_model.is_none()
@@ -940,6 +941,24 @@ mod tests {
             canonical.0.applied_model.as_deref(),
             Some("provider:requested")
         );
+
+        let oversized_applied = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+        let bounded = validate_completed_turn(
+            &profile,
+            lionclaw_runtime_api::RuntimeTurnResult {
+                configuration: lionclaw_runtime_api::AppliedRuntimeConfiguration {
+                    requested_model: Some("requested".into()),
+                    applied_model: Some(oversized_applied),
+                    model_confirmation: Some(
+                        lionclaw_runtime_api::RuntimeConfigurationConfirmation::Acknowledged,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the durable outcome boundary bounds adapter evidence");
+        assert!(bounded.0.applied_model.unwrap().len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
 
         let failure = validate_completed_turn(
             &profile,

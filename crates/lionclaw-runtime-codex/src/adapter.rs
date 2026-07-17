@@ -111,7 +111,8 @@ impl CodexAppServerTurnRunner<'_> {
                 requested_mode: None,
                 applied_mode: None,
                 mode_confirmation: None,
-            };
+            }
+            .projected();
             applied_configuration = Some(configuration.clone());
             validate_app_server_model(
                 self.adapter.config.model.as_deref(),
@@ -149,7 +150,8 @@ impl CodexAppServerTurnRunner<'_> {
                 },
                 final_response,
                 ..Default::default()
-            })
+            }
+            .projected())
         }
         .await;
 

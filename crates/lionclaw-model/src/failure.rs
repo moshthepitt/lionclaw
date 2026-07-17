@@ -13,6 +13,16 @@ pub struct AppliedRuntimeConfiguration {
     pub mode_confirmation: Option<RuntimeConfigurationConfirmation>,
 }
 
+impl AppliedRuntimeConfiguration {
+    pub fn projected(mut self) -> Self {
+        self.requested_model = self.requested_model.map(|value| bounded_text(&value));
+        self.applied_model = self.applied_model.map(|value| bounded_text(&value));
+        self.requested_mode = self.requested_mode.map(|value| bounded_text(&value));
+        self.applied_mode = self.applied_mode.map(|value| bounded_text(&value));
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeConfigurationConfirmation {
@@ -47,17 +57,19 @@ pub struct TypedFailureEvidence {
 impl TypedFailureEvidence {
     pub fn new(code: Option<String>, detail: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.map(|code| bounded_text(&code)),
             detail: bounded_text(&detail.into()),
             ..Self::default()
         }
     }
 
     pub fn project(mut self) -> Self {
+        self.code = self.code.map(|code| bounded_text(&code));
         self.detail = bounded_text(&self.detail);
         self.stderr = bounded_text(&self.stderr);
         self.final_response = bounded_text(&self.final_response);
         self.stop_reason = self.stop_reason.map(|reason| bounded_text(&reason));
+        self.configuration = self.configuration.projected();
         self
     }
 }
@@ -249,5 +261,39 @@ mod tests {
         let projected = bounded_text(&("a".repeat(FAILURE_TEXT_LIMIT) + "é-tail"));
         assert!(projected.len() <= FAILURE_TEXT_LIMIT);
         assert!(projected.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn evidence_projection_bounds_every_provider_controlled_string() {
+        let oversized = "x".repeat(FAILURE_TEXT_LIMIT + 1);
+        let evidence = TypedFailureEvidence {
+            code: Some(oversized.clone()),
+            detail: oversized.clone(),
+            stop_reason: Some(oversized.clone()),
+            stderr: oversized.clone(),
+            final_response: oversized.clone(),
+            configuration: AppliedRuntimeConfiguration {
+                requested_model: Some(oversized.clone()),
+                applied_model: Some(oversized.clone()),
+                requested_mode: Some(oversized.clone()),
+                applied_mode: Some(oversized),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .project();
+
+        let fields = [
+            evidence.code.as_deref().unwrap(),
+            &evidence.detail,
+            evidence.stop_reason.as_deref().unwrap(),
+            &evidence.stderr,
+            &evidence.final_response,
+            evidence.configuration.requested_model.as_deref().unwrap(),
+            evidence.configuration.applied_model.as_deref().unwrap(),
+            evidence.configuration.requested_mode.as_deref().unwrap(),
+            evidence.configuration.applied_mode.as_deref().unwrap(),
+        ];
+        assert!(fields.iter().all(|field| field.len() <= FAILURE_TEXT_LIMIT));
     }
 }

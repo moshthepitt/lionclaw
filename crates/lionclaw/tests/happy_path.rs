@@ -63,6 +63,61 @@ async fn passing_oracle_yields_verified_finish() {
 }
 
 #[tokio::test]
+async fn durable_role_outcomes_bound_adapter_configuration_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oversized = "x".repeat(lionclaw_runtime_api::FAILURE_TEXT_LIMIT + 1);
+    let h = harness(
+        dir.path(),
+        MockRoleRunner::new(Box::new(move |request| {
+            Ok(lionclaw::ports::RoleRunOutcome {
+                handoff: lionclaw::model::Handoff::Work {
+                    done: true,
+                    report: lionclaw::model::PayloadRef::inline("done"),
+                    request_attention: false,
+                },
+                artifact: Some(lionclaw::model::ArtifactOutcome {
+                    base_sha: request.base_sha.clone(),
+                    head_sha: HEAD_SHA.into(),
+                }),
+                runtime_configuration: lionclaw::model::RuntimeConfigurationEvidence {
+                    applied_model: Some(oversized.clone()),
+                    ..Default::default()
+                },
+                final_response: "done".into(),
+            })
+        })),
+        MockOracleRunner::exiting(0),
+    )
+    .await;
+    let mission_id = h
+        .engine
+        .create_mission(
+            dir.path().to_str().expect("utf8"),
+            "bound runtime evidence",
+            BASE_SHA,
+            default_config(),
+        )
+        .await
+        .expect("create");
+    h.engine
+        .propose_plan(&mission_id, proposal(0, simple_plan()))
+        .await
+        .expect("propose");
+    approve_plan(&h.engine, &mission_id).await;
+    h.engine.advance(&mission_id).await.expect("advance");
+
+    let state = h.engine.load_state(&mission_id).await.expect("state");
+    let applied_model = state
+        .tasks
+        .values()
+        .next()
+        .and_then(|task| task.last_runtime_configuration.as_ref())
+        .and_then(|configuration| configuration.applied_model.as_ref())
+        .expect("applied model evidence");
+    assert!(applied_model.len() <= lionclaw_runtime_api::FAILURE_TEXT_LIMIT);
+}
+
+#[tokio::test]
 async fn manual_proof_checkpoint_drains_the_whole_oracle_batch() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mission_type = test_mission_type();

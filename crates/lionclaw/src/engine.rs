@@ -880,6 +880,7 @@ impl Engine {
             }
             RoleRunUpdate::WorkspacePrepared { .. } => Ok(()),
             RoleRunUpdate::RuntimeConfigured(configuration) => {
+                let configuration = configuration.projected();
                 self.append_fact(
                     &state.mission_id,
                     state.head,
@@ -993,7 +994,10 @@ impl Engine {
             .run_role_observed(state, effect_id, request, update_rx, true)
             .await?
         {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                outcome.runtime_configuration = outcome.runtime_configuration.projected();
+                outcome.final_response =
+                    lionclaw_runtime_api::bounded_text(&outcome.final_response);
                 let incomplete = match &outcome.handoff {
                     Handoff::Work { done: false, .. } => Some("role reported done=false"),
                     Handoff::Plan { done: false, .. } => {
