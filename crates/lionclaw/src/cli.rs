@@ -1476,6 +1476,30 @@ fn isolate_driver_process_group(command: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn isolate_driver_process_group(_command: &mut std::process::Command) {}
 
+#[cfg(unix)]
+fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
+    let mut group_error = None;
+    if let Some(pid) = rustix::process::Pid::from_raw(process.id() as i32) {
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => group_error = Some(error),
+        }
+    }
+    let _ = process.kill();
+    let _ = process.wait();
+    match group_error {
+        Some(error) => Err(error).context("killing detached driver process group"),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_driver_process_group(process: &mut std::process::Child) -> Result<()> {
+    let _ = process.kill();
+    let _ = process.wait();
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriverStartup {
     Acquired,
@@ -1484,34 +1508,27 @@ enum DriverStartup {
 
 struct DetachedDriver {
     process: std::process::Child,
-    stderr_spool: std::process::Child,
+    stderr_spool: Option<std::process::Child>,
     cleanup_on_drop: bool,
 }
 
 impl DetachedDriver {
     async fn terminate_and_reap(&mut self) -> Result<()> {
-        let mut group_error = None;
-        #[cfg(unix)]
-        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
-            match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                Err(error) => group_error = Some(error),
-            }
-        }
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        let group_result = terminate_driver_process_group(&mut self.process);
         self.settle_stderr().await;
-        self.cleanup_on_drop = false;
-        match group_error {
-            Some(error) => Err(error).context("killing detached driver process group"),
-            None => Ok(()),
+        if group_result.is_ok() {
+            self.cleanup_on_drop = false;
         }
+        group_result
     }
 
     async fn settle_stderr(&mut self) {
+        let Some(stderr_spool) = &mut self.stderr_spool else {
+            return;
+        };
         let settled = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if self.stderr_spool.try_wait()?.is_some() {
+                if stderr_spool.try_wait()?.is_some() {
                     return std::io::Result::Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1519,8 +1536,8 @@ impl DetachedDriver {
         })
         .await;
         if !matches!(settled, Ok(Ok(()))) {
-            let _ = self.stderr_spool.kill();
-            let _ = self.stderr_spool.wait();
+            let _ = stderr_spool.kill();
+            let _ = stderr_spool.wait();
         }
     }
 
@@ -1534,6 +1551,10 @@ impl DetachedDriver {
         self.settle_stderr().await;
         Ok(status)
     }
+
+    fn detach(&mut self) {
+        self.cleanup_on_drop = false;
+    }
 }
 
 impl Drop for DetachedDriver {
@@ -1541,14 +1562,11 @@ impl Drop for DetachedDriver {
         if !self.cleanup_on_drop {
             return;
         }
-        #[cfg(unix)]
-        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        let _ = terminate_driver_process_group(&mut self.process);
+        if let Some(stderr_spool) = &mut self.stderr_spool {
+            let _ = stderr_spool.kill();
+            let _ = stderr_spool.wait();
         }
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-        let _ = self.stderr_spool.kill();
-        let _ = self.stderr_spool.wait();
     }
 }
 
@@ -1558,17 +1576,19 @@ fn spawn_detached_driver(
 ) -> Result<DetachedDriver> {
     let executable = std::env::current_exe()?;
     command.stderr(std::process::Stdio::piped());
-    let mut process = command
+    let process = command
         .spawn()
         .context("spawning detached mission driver")?;
-    let stderr = match process.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            let _ = process.kill();
-            let _ = process.wait();
-            bail!("detached mission driver did not expose stderr");
-        }
+    let mut child = DetachedDriver {
+        process,
+        stderr_spool: None,
+        cleanup_on_drop: true,
     };
+    let stderr = child
+        .process
+        .stderr
+        .take()
+        .context("detached mission driver did not expose stderr")?;
     let mut spool = std::process::Command::new(executable);
     spool
         .arg("mission")
@@ -1579,19 +1599,12 @@ fn spawn_detached_driver(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     isolate_driver_process_group(&mut spool);
-    let stderr_spool = match spool.spawn() {
-        Ok(spool) => spool,
-        Err(error) => {
-            let _ = process.kill();
-            let _ = process.wait();
-            return Err(error).context("spawning bounded driver stderr spool");
-        }
-    };
-    Ok(DetachedDriver {
-        process,
-        stderr_spool,
-        cleanup_on_drop: true,
-    })
+    child.stderr_spool = Some(
+        spool
+            .spawn()
+            .context("spawning bounded driver stderr spool")?,
+    );
+    Ok(child)
 }
 
 async fn await_driver_startup(
@@ -1629,9 +1642,13 @@ async fn await_driver_startup_with_timeout(
     .context("mission driver startup handshake timed out")
     .and_then(|result| result);
     match startup {
-        Ok(startup) => {
-            child.cleanup_on_drop = false;
-            Ok(startup)
+        Ok(DriverStartup::Acquired) => {
+            child.detach();
+            Ok(DriverStartup::Acquired)
+        }
+        Ok(DriverStartup::LostRace) => {
+            child.terminate_and_reap().await?;
+            Ok(DriverStartup::LostRace)
         }
         Err(startup_error) => match child.terminate_and_reap().await {
             Ok(()) => Err(startup_error),
@@ -3421,7 +3438,7 @@ mod tests {
             .unwrap();
         let mut child = DetachedDriver {
             process,
-            stderr_spool,
+            stderr_spool: Some(stderr_spool),
             cleanup_on_drop: true,
         };
 
@@ -3448,7 +3465,7 @@ mod tests {
             .unwrap();
         let mut child = DetachedDriver {
             process,
-            stderr_spool,
+            stderr_spool: Some(stderr_spool),
             cleanup_on_drop: true,
         };
 
@@ -3463,7 +3480,59 @@ mod tests {
 
         assert!(error.to_string().contains("handshake timed out"));
         assert!(child.process.try_wait().unwrap().is_some());
-        assert!(child.stderr_spool.try_wait().unwrap().is_some());
+        assert!(child
+            .stderr_spool
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_driver_cleanup_terminates_process_group_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & echo $! > \"$DESCENDANT_PID_PATH\"; wait")
+            .env("DESCENDANT_PID_PATH", &descendant_pid_path);
+        isolate_driver_process_group(&mut command);
+        let process = command.spawn().unwrap();
+        let driver_pid = process.id();
+        let mut descendant_pid = None;
+        for _ in 0..200 {
+            if let Ok(pid) = std::fs::read_to_string(&descendant_pid_path) {
+                descendant_pid = Some(pid.trim().parse::<i32>().unwrap());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = descendant_pid.expect("driver did not publish its descendant pid");
+
+        drop(DetachedDriver {
+            process,
+            stderr_spool: None,
+            cleanup_on_drop: true,
+        });
+
+        assert!(!Path::new(&format!("/proc/{driver_pid}")).exists());
+        let descendant_path = PathBuf::from(format!("/proc/{descendant_pid}"));
+        for _ in 0..50 {
+            if !descendant_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = descendant_path.exists();
+        if survived {
+            if let Some(pid) = rustix::process::Pid::from_raw(descendant_pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        assert!(!survived, "driver descendant survived constructor cleanup");
     }
 
     #[cfg(target_os = "linux")]
@@ -3482,7 +3551,7 @@ mod tests {
 
         drop(DetachedDriver {
             process,
-            stderr_spool,
+            stderr_spool: Some(stderr_spool),
             cleanup_on_drop: true,
         });
 
