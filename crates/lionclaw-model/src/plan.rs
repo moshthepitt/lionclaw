@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, OracleName, RequirementId, RoleName, TaskId};
+use crate::prelude::*;
 
 /// What part of the objective a requirement captures. This is descriptive
 /// contract structure for people and planning roles; enforcement remains in

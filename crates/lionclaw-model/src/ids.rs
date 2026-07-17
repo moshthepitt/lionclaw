@@ -4,9 +4,11 @@
 //! `models.py` — `ASSERTION_ID_REGEX`, `TASK_ID_REGEX`, `SKILL_NAME_REGEX` —
 //! hand-rolled as charset checks so the model stays regex-free.
 
-use std::fmt;
+use core::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::prelude::*;
 
 macro_rules! id_type {
     ($name:ident, $validate:ident, $doc:literal) => {
@@ -236,7 +238,7 @@ impl fmt::Display for MissionId {
     }
 }
 
-/// The first 12 chars of a sha/digest, for compact human display.
+/// Encode bytes as lowercase hexadecimal without another model dependency.
 fn lowercase_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -247,6 +249,7 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// The first 12 chars of a sha/digest, for compact human display.
 pub fn short_hex(hex: &str) -> String {
     hex.chars().take(12).collect()
 }

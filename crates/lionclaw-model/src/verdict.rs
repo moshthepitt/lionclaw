@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::event::{PayloadRef, PreparedInputRef, StopBar};
 use super::ids::OracleName;
 use super::state::{AdvisoryStatus, MissionState};
+use crate::prelude::*;
 
 /// A worker-independent, reproducible verdict from an engine-run oracle,
 /// with its evidence. The evidence floor is the constructor signature: no

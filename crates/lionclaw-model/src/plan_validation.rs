@@ -13,14 +13,13 @@
 //! rules are enforced by the id newtypes at every deserialization boundary, so
 //! only duplicates are checked here.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::event::StopBar;
 use super::ids::{OracleName, RoleName, TaskId};
 use super::plan::{
     OutputSemantics, Plan, PlanProposal, PlanningDag, RequirementDisposition, TaskKind,
 };
 use super::state::MissionState;
+use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]

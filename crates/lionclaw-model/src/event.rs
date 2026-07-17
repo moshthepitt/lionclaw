@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::{AssertionId, InputName, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{PlanProposal, PlanningDag};
+use crate::prelude::*;
 use crate::{AppliedRuntimeConfiguration, TypedFailure};
 
 /// Bumped for durable, effect-scoped runtime configuration evidence.

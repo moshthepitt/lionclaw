@@ -11,11 +11,10 @@
 //! verdicts — never an event. A cleared gate still pauses for a human
 //! checkpoint (zenith's discipline); a failed gate raises `gate_failed`.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::ids::TaskId;
 use super::plan::{Plan, TaskKind};
 use super::state::MissionState;
+use crate::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateResult {

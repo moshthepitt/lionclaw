@@ -12,7 +12,7 @@ pre-launch branch. Until the replacement docs land, the code is authoritative.)*
 - Product entrypoint and everyday command path: `crates/lionclaw/src/cli.rs`
 - Architecture, the determinism wall, and the honesty moat:
   `crates/lionclaw/src/lib.rs`, `crates/lionclaw-model/src/lib.rs`,
-  `crates/lionclaw/src/authority.rs`, and `crates/lionclaw/src/model/verdict.rs`
+  `crates/lionclaw/src/authority.rs`, and `crates/lionclaw-model/src/verdict.rs`
 - Mission-type contract: `crates/lionclaw/src/mission_type/` and
   `mission-types/software-dev/`
 

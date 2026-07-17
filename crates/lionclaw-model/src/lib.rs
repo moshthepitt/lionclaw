@@ -4,6 +4,24 @@
 //! Dependency wall: this crate has only deterministic value/hash dependencies.
 //! No I/O, clock, RNG, or async dependencies may enter the kernel model.
 
+#![no_std]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
+
+mod prelude {
+    pub(crate) use alloc::{
+        boxed::Box,
+        collections::{BTreeMap, BTreeSet},
+        format,
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
+}
+
 pub mod decision;
 pub mod event;
 pub mod failure;

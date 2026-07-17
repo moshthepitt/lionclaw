@@ -2,8 +2,6 @@
 //! only (`BTreeMap`), derives `PartialEq` so the fold-litmus test can assert
 //! rebuilt state equality. Wall-clock time never enters this type.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use super::event::{
@@ -13,6 +11,7 @@ use super::event::{
 use super::ids::{AssertionId, MissionId, OracleName, RoleName, TaskId};
 use super::plan::{Plan, PlanProposal};
 use super::verdict::{AuthoritativeVerdict, FinishClass};
+use crate::prelude::*;
 use crate::TypedFailure;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,10 +650,10 @@ pub struct MissionState {
     pub revision: u32,
     /// Gate checkpoints the human approved — the mission
     /// proceeds past them without re-raising the checkpoint.
-    pub acknowledged_gates: std::collections::BTreeSet<TaskId>,
+    pub acknowledged_gates: BTreeSet<TaskId>,
     /// Nodes whose handoff asked for a human look (`request_attention`),
     /// until a decision clears them.
-    pub flagged_nodes: std::collections::BTreeSet<TaskId>,
+    pub flagged_nodes: BTreeSet<TaskId>,
     /// Oracles that failed to *run* (infrastructure failure, distinct from a
     /// nonzero exit) → mapped to the failure detail, until a decision clears
     /// them. Prevents a broken oracle from re-requesting forever.
@@ -662,7 +661,7 @@ pub struct MissionState {
     /// Oracles whose obligation a human waived (`accept` on an oracle
     /// failure): the mission may finish, but never *verified* — there is no
     /// authoritative verdict.
-    pub waived_oracles: std::collections::BTreeSet<OracleName>,
+    pub waived_oracles: BTreeSet<OracleName>,
     /// Terminal-review runtime (config-gated; default-empty for every
     /// pre-feature mission and snapshot).
     #[serde(default)]

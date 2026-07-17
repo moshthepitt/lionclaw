@@ -8,8 +8,6 @@
 //! task that isn't `done` fails and raises attention; a validate task always
 //! clears and folds its per-assertion verdicts in with sticky passes.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::event::{
     ControlAction, EventEnvelope, GapSeverity, Handoff, MissionEvent, PayloadRef,
     RuntimeConfigurationEvidence,
@@ -22,6 +20,7 @@ use super::state::{
     ReviewAcceptanceKind, ReviewOutcome, TaskRuntimeState, TaskStatus, TerminalReviewVerdict,
 };
 use super::verdict::{classify_finish, AuthoritativeVerdict};
+use crate::prelude::*;
 use crate::TypedFailure;
 
 /// Bump when fold semantics change; snapshots with a different version are
@@ -512,7 +511,7 @@ fn merge_failure_configuration(
 }
 
 fn prune_reopened_parked_effects(state: &mut MissionState) {
-    let parked = std::mem::take(&mut state.parked_effects);
+    let parked = core::mem::take(&mut state.parked_effects);
     state.parked_effects = parked
         .into_iter()
         .filter(|(_, effect)| match effect {
